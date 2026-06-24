@@ -1,0 +1,19 @@
+# Portable (ggml) driver config — runs Qwen3-0.6B on CPU or Metal.
+# First run downloads ~1.2 GB of safetensors from HuggingFace.
+
+[auth]
+enabled = false
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "portable"
+device = ["cpu"]              # try ["metal"] if compiled with -DGGML_METAL=ON
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+max_batch_tokens = 4096
+max_batch_size = 16
+max_num_kv_pages = 256

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-openhands"
+version = "0.1.0"
+description = "OpenHands ↔ Pie integration (PieLLM, PieConversation, supporting inferlets)"
+requires-python = ">=3.12"
+dependencies = [
+  "openhands-sdk==1.21.1",
+  "pydantic>=2.7",
+  "transformers>=4.46",
+  "datasets>=2.20",
+  "tenacity>=8.0",
+  "websockets>=12",
+  "msgpack>=1.0",
+  "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
+bench = ["pandas>=2.2", "matplotlib>=3.9", "scipy>=1.13"]
+
+[tool.setuptools.packages.find]
+include = ["pie_openhands*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

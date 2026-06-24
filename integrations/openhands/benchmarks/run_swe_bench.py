@@ -1,0 +1,123 @@
+"""CLI wrapper around ``benchmarks.swe_bench``.
+
+Examples:
+
+  # Drive 1 problem with TestLLM (no model needed) — plumbing smoke
+  python -m benchmarks.run_swe_bench \\
+      --backend test \\
+      --instance-id astropy__astropy-12907 \\
+      --output /tmp/preds.jsonl
+
+  # Drive the deterministic 50-problem subset through PieLLM
+  # (pie serve must be running, inferlet installed)
+  python -m benchmarks.run_swe_bench \\
+      --backend pie \\
+      --pie-uri ws://127.0.0.1:8080 \\
+      --subset-size 50 \\
+      --output predictions/pie_qwen3.jsonl \\
+      --label pie+qwen3-coder-32b
+
+  # Drive the same subset through a vanilla vLLM OpenAI-compatible endpoint (baseline)
+  python -m benchmarks.run_swe_bench \\
+      --backend litellm \\
+      --model openai/qwen3-coder-32b \\
+      --base-url http://localhost:8000/v1 \\
+      --subset-size 50 \\
+      --output predictions/vllm_qwen3.jsonl \\
+      --label vllm+qwen3-coder-32b
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+from benchmarks import swe_bench
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--backend", choices=["pie", "litellm", "test"], default="test")
+
+    # Subset selection
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--subset-size", type=int, default=swe_bench.DEFAULT_SUBSET_N,
+                   help="Deterministic random subset size (default 50).")
+    g.add_argument("--instance-id", action="append", default=[],
+                   help="Specific instance_id(s); may be passed multiple times. "
+                        "Overrides --subset-size.")
+
+    # Backend tuning
+    p.add_argument("--model", default=None,
+                   help="Backend model name (for litellm / pie 'model' field).")
+    p.add_argument("--base-url", default=None,
+                   help="LiteLLM base_url (e.g. http://localhost:8000/v1 for a vLLM server).")
+    p.add_argument("--api-key", default=None,
+                   help="LiteLLM API key. If unset, uses LITELLM_API_KEY env var.")
+    p.add_argument("--pie-uri", default="ws://127.0.0.1:8080",
+                   help="Pie WebSocket URI.")
+    p.add_argument("--pie-inferlet", default="openhands-completion@0.1.0")
+    p.add_argument("--pie-render-strategy", default="hf_chat_template",
+                   choices=["hf_chat_template", "raw_concat"])
+    p.add_argument("--pie-request-timeout-s", type=float, default=1800.0,
+                   help="Per-completion timeout in seconds (Pie backend only). "
+                        "Default 1800s; one agent step on a CPU model can exceed 600s "
+                        "due to the size of OpenHands' system prompt.")
+
+    # Run shape
+    p.add_argument("--max-iterations", type=int, default=50)
+    p.add_argument("--output", "-o", type=Path, required=True,
+                   help="Output predictions JSONL file.")
+    p.add_argument("--label", default=None,
+                   help="model_name_or_path label in the predictions JSONL.")
+    p.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "swebench-clones",
+                   help="Bare-repo cache for fast multi-problem runs.")
+    p.add_argument("--verbose", action="store_true")
+
+    args = p.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
+
+    backend_kwargs: dict = {}
+    if args.backend == "litellm":
+        if not args.model:
+            p.error("--model is required when --backend litellm")
+        backend_kwargs["model"] = args.model
+        if args.base_url:
+            backend_kwargs["base_url"] = args.base_url
+        api_key = args.api_key or os.environ.get("LITELLM_API_KEY")
+        if api_key:
+            from pydantic import SecretStr
+            backend_kwargs["api_key"] = SecretStr(api_key)
+    elif args.backend == "pie":
+        backend_kwargs["pie_uri"] = args.pie_uri
+        backend_kwargs["pie_inferlet"] = args.pie_inferlet
+        backend_kwargs["pie_render_strategy"] = args.pie_render_strategy
+        backend_kwargs["pie_request_timeout_s"] = args.pie_request_timeout_s
+        if args.model:
+            backend_kwargs["model"] = args.model
+
+    options = swe_bench.RunOptions(
+        backend=args.backend,
+        backend_kwargs=backend_kwargs,
+        subset_size=args.subset_size,
+        instance_ids=args.instance_id or None,
+        max_iterations=args.max_iterations,
+        cache_dir=args.cache_dir,
+        output_path=args.output,
+        label=args.label or f"{args.backend}+{args.model or 'default'}",
+    )
+
+    swe_bench.run(options)
+    print(f"\nwrote {args.output}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

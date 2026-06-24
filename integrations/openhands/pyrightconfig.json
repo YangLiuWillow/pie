@@ -1,0 +1,7 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "include": ["pie_openhands", "tests", "benchmarks"],
+  "exclude": [".venv", "**/__pycache__"]
+}
