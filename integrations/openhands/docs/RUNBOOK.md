@@ -2,7 +2,7 @@
 
 This is the by-hand recipe for the Pie ↔ OpenHands Phase-1 integration. It is layered shortest → most integrated; each layer should pass before the next is worth attempting.
 
-For the higher-level project plan, see [`pie/docs/openhands-integration.md`](../../../docs/openhands-integration.md). For the verified internal API of `openhands-sdk`, see [`SDK_INTERNALS.md`](SDK_INTERNALS.md).
+For the higher-level project plan, see [`pie/docs/openhands-integration.md`](../../../docs/openhands-integration.md). For the verified internal API of `openhands-sdk`, see [`SDK_INTERNALS.md`](SDK_INTERNALS.md). For running a real SWE-Bench benchmark on GPU (Yale YCRC HPC), see [`GPU_BENCHMARK.md`](GPU_BENCHMARK.md) — this runbook's Layers A–F only cover local CPU/Metal plumbing checks.
 
 ---
 

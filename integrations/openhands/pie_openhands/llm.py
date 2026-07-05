@@ -63,6 +63,16 @@ class PieLLM(LLM):
         ),
     )
 
+    # `_wrap_as_model_response` always sets `tool_calls=None` (Phase 1 emits
+    # text only), so the base class's `native_tool_calling=True` default would
+    # make OpenHands skip its prompt-mock tool-call parsing entirely and
+    # silently drop every tool call the model emits in text (see
+    # `should_mock_tool_calls` / SDK_INTERNALS.md §1.2).
+    native_tool_calling: bool = Field(
+        default=False,
+        description="Phase 1 PieLLM never populates native tool_calls; keep this off.",
+    )
+
     # `LLM.model_config` already sets extra='ignore', so unknown kwargs in
     # base_url / api_key / api_version that we don't use here are harmless.
 

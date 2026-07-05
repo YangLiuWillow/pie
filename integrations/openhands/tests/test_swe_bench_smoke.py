@@ -72,6 +72,77 @@ def test_problem_from_row_extracts_needed_fields():
     assert not hasattr(p, "patch")
 
 
+class _FakeConversation:
+    """Duck-typed stand-in for openhands.sdk.Conversation's run-loop surface.
+
+    Scripted with a sequence of statuses to return from successive .run()
+    calls, so run_with_stuck_retries's nudge/retry control flow can be
+    tested without a real Agent/tool/workspace (that path needs network —
+    see test_drive_one_problem_end_to_end).
+    """
+
+    def __init__(self, statuses_after_run):
+        from openhands.sdk import ConversationExecutionStatus
+
+        self._statuses = list(statuses_after_run)
+        self._status_enum = ConversationExecutionStatus
+        self.messages_sent: list[str] = []
+        self.run_count = 0
+
+        class _State:
+            execution_status = None
+
+        self.state = _State()
+
+    def run(self):
+        self.run_count += 1
+        self.state.execution_status = self._statuses.pop(0)
+
+    def send_message(self, message):
+        self.messages_sent.append(message)
+
+
+def test_run_with_stuck_retries_nudges_then_recovers():
+    from openhands.sdk import ConversationExecutionStatus
+    from benchmarks.swe_bench import run_with_stuck_retries, STUCK_NUDGE_MESSAGE
+
+    conv = _FakeConversation([
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.FINISHED,
+    ])
+    retries = run_with_stuck_retries(conv, max_stuck_retries=2, instance_id="x__y-1")
+    assert retries == 1
+    assert conv.run_count == 2
+    assert conv.messages_sent == [STUCK_NUDGE_MESSAGE]
+    assert conv.state.execution_status == ConversationExecutionStatus.FINISHED
+
+
+def test_run_with_stuck_retries_gives_up_after_max():
+    from openhands.sdk import ConversationExecutionStatus
+    from benchmarks.swe_bench import run_with_stuck_retries
+
+    conv = _FakeConversation([
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.STUCK,
+        ConversationExecutionStatus.STUCK,
+    ])
+    retries = run_with_stuck_retries(conv, max_stuck_retries=2, instance_id="x__y-1")
+    assert retries == 2
+    assert conv.run_count == 3  # initial + 2 retries, then gives up
+    assert conv.state.execution_status == ConversationExecutionStatus.STUCK
+
+
+def test_run_with_stuck_retries_noop_when_not_stuck():
+    from openhands.sdk import ConversationExecutionStatus
+    from benchmarks.swe_bench import run_with_stuck_retries
+
+    conv = _FakeConversation([ConversationExecutionStatus.FINISHED])
+    retries = run_with_stuck_retries(conv, max_stuck_retries=2, instance_id="x__y-1")
+    assert retries == 0
+    assert conv.run_count == 1
+    assert conv.messages_sent == []
+
+
 def test_prediction_jsonl_matches_swebench_grader_schema():
     pred = swe_bench.Prediction(
         instance_id="x__y-1",
@@ -79,6 +150,7 @@ def test_prediction_jsonl_matches_swebench_grader_schema():
         model_patch="diff --git a/foo b/foo\n",
         wall_clock_s=1.234567,
         agent_iterations=3,
+        stuck_retries=1,
     )
     parsed = json.loads(pred.to_jsonl())
     # These three fields are what swebench.harness.run_evaluation reads.
@@ -86,6 +158,7 @@ def test_prediction_jsonl_matches_swebench_grader_schema():
     # Metadata is under a sentinel key, so the grader ignores it.
     assert "_metadata" in parsed
     assert parsed["_metadata"]["agent_iterations"] == 3
+    assert parsed["_metadata"]["stuck_retries"] == 1
 
 
 # ─── Network/IO smoke ────────────────────────────────────────────────────

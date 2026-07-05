@@ -101,6 +101,7 @@ class Prediction:
     wall_clock_s: float = 0.0
     agent_iterations: int = 0
     error: str = ""
+    stuck_retries: int = 0
 
     def to_jsonl(self) -> str:
         return json.dumps({
@@ -111,6 +112,7 @@ class Prediction:
                 "wall_clock_s": round(self.wall_clock_s, 3),
                 "agent_iterations": self.agent_iterations,
                 "error": self.error,
+                "stuck_retries": self.stuck_retries,
             },
         })
 
@@ -171,6 +173,12 @@ def build_llm(backend: str, **kwargs):
         backend: ``"pie"`` | ``"litellm"`` | ``"test"``.
         **kwargs: backend-specific overrides (model, base_url, api_key, ...).
     """
+    # Patches shared SDK machinery (both backends run through it), so install
+    # once regardless of which backend is selected — see editor_repair's
+    # module docstring for why this isn't Pie-specific.
+    from pie_openhands.editor_repair import install as _install_editor_repair
+    _install_editor_repair()
+
     if backend == "pie":
         from pie_openhands import PieLLM
         return PieLLM(
@@ -219,7 +227,7 @@ def build_agent(llm):
     from openhands.sdk import Agent
     from openhands.tools.preset.default import get_default_tools
 
-    tools = get_default_tools()
+    tools = get_default_tools(enable_browser=False)
     return Agent(
         llm=llm,
         tools=tools,
@@ -230,16 +238,77 @@ def build_agent(llm):
 # ─── Driver ─────────────────────────────────────────────────────────────
 
 
+# Sent when the SDK's StuckDetector fires (repeating/alternating action-
+# observation loops — see docs/openhands-integration.md investigation notes).
+# Confirmed via live traces that this pattern often comes from the model
+# fixating on a scratch file it created itself rather than the real bug
+# location, so the nudge calls that out explicitly rather than just saying
+# "try something different".
+STUCK_NUDGE_MESSAGE = (
+    "You appear to be stuck: repeating the same action without making "
+    "progress. Stop repeating that exact tool call. Re-read the problem "
+    "statement and double-check you are editing the actual source file "
+    "where the reported bug lives — not a scratch/test file you created to "
+    "explore the issue. If you already understand the fix, make the edit "
+    "directly."
+)
+
+
+def run_with_stuck_retries(
+    conv,
+    *,
+    max_stuck_retries: int = 2,
+    instance_id: str = "?",
+) -> int:
+    """Run ``conv`` to completion, nudging past StuckDetector triggers.
+
+    ``conv.run()`` already runs until FINISHED/STUCK/erroring/iteration-cap.
+    If it comes back STUCK, send ``STUCK_NUDGE_MESSAGE`` (which the SDK
+    treats as a normal user message, clearing the STUCK status — see
+    ``LocalConversation.send_message``) and call ``run()`` again, up to
+    ``max_stuck_retries`` times. Returns the number of nudges actually sent.
+
+    Takes a duck-typed ``conv`` (only ``.run()``, ``.send_message()``, and
+    ``.state.execution_status`` are used) so this is unit-testable without a
+    real Agent/tool/workspace.
+    """
+    from openhands.sdk import ConversationExecutionStatus
+
+    conv.run()
+
+    stuck_retries = 0
+    while (
+        conv.state.execution_status == ConversationExecutionStatus.STUCK
+        and stuck_retries < max_stuck_retries
+    ):
+        stuck_retries += 1
+        logger.warning(
+            "%s: stuck pattern detected, sending nudge (retry %d/%d)",
+            instance_id, stuck_retries, max_stuck_retries,
+        )
+        conv.send_message(STUCK_NUDGE_MESSAGE)
+        conv.run()
+
+    return stuck_retries
+
+
 def solve_one(
     problem: Problem,
     *,
     backend: str,
     backend_kwargs: dict[str, Any] | None = None,
     max_iterations: int = 50,
+    max_stuck_retries: int = 2,
     cache_dir: Path | None = None,
     label: str | None = None,
 ) -> Prediction:
-    """Run one OpenHands agent against one problem, return a Prediction."""
+    """Run one OpenHands agent against one problem, return a Prediction.
+
+    If the SDK's StuckDetector fires, sends ``STUCK_NUDGE_MESSAGE`` and
+    resumes the run (up to ``max_stuck_retries`` times) instead of giving up
+    immediately — see the stuck-loop investigation notes for why this is
+    needed even with the escape-bug repair layer installed.
+    """
     from openhands.sdk import Conversation
 
     label = label or f"{backend}+default"
@@ -257,7 +326,12 @@ def solve_one(
                 visualizer=None,
             )
             conv.send_message(_format_user_prompt(problem))
-            conv.run()
+            stuck_retries = run_with_stuck_retries(
+                conv,
+                max_stuck_retries=max_stuck_retries,
+                instance_id=problem.instance_id,
+            )
+
             patch = capture_patch(ws)
             return Prediction(
                 instance_id=problem.instance_id,
@@ -265,6 +339,7 @@ def solve_one(
                 model_patch=patch,
                 wall_clock_s=time.monotonic() - t0,
                 agent_iterations=_count_iterations(conv),
+                stuck_retries=stuck_retries,
             )
     except Exception as e:
         logger.exception("solve_one failed for %s", problem.instance_id)
@@ -310,6 +385,7 @@ class RunOptions:
     subset_indices: list[int] | None = None
     instance_ids: list[str] | None = None  # if set, takes precedence over subset
     max_iterations: int = 50
+    max_stuck_retries: int = 2
     cache_dir: Path | None = None
     output_path: Path = Path("predictions.jsonl")
     label: str | None = None
@@ -345,16 +421,18 @@ def run(options: RunOptions) -> Path:
                 backend=options.backend,
                 backend_kwargs=options.backend_kwargs,
                 max_iterations=options.max_iterations,
+                max_stuck_retries=options.max_stuck_retries,
                 cache_dir=options.cache_dir,
                 label=options.label,
             )
             f.write(pred.to_jsonl() + "\n")
             f.flush()
             logger.info(
-                "  → %s (%.1fs, %d iters, %d-byte patch%s)",
+                "  → %s (%.1fs, %d iters, %d-byte patch%s%s)",
                 "ok" if not pred.error else "ERROR",
                 pred.wall_clock_s, pred.agent_iterations,
                 len(pred.model_patch),
+                f", {pred.stuck_retries} stuck-retries" if pred.stuck_retries else "",
                 f", error={pred.error!r}" if pred.error else "",
             )
 

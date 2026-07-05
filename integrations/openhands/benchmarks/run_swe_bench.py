@@ -69,6 +69,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Run shape
     p.add_argument("--max-iterations", type=int, default=50)
+    p.add_argument("--max-stuck-retries", type=int, default=2,
+                   help="On StuckDetector firing, send a corrective nudge message "
+                        "and resume the run, up to this many times (0 disables — "
+                        "matches pre-nudge behavior of giving up immediately).")
     p.add_argument("--output", "-o", type=Path, required=True,
                    help="Output predictions JSONL file.")
     p.add_argument("--label", default=None,
@@ -76,6 +80,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "swebench-clones",
                    help="Bare-repo cache for fast multi-problem runs.")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--log-completions", type=Path, default=None,
+                   help="If set, write raw LLM request/response JSON per completion "
+                        "to this folder (openhands.sdk.llm.LLM's log_completions).")
+    p.add_argument("--native-tool-calling", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Override openhands.sdk.llm.LLM's native_tool_calling "
+                        "(default True upstream; PieLLM hardcodes False). Pass "
+                        "--no-native-tool-calling on the litellm backend for an "
+                        "apples-to-apples comparison against PieLLM's prompt-mocked "
+                        "tool calling, without needing --enable-auto-tool-choice on "
+                        "the vLLM server.")
 
     args = p.parse_args(argv)
 
@@ -85,6 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     backend_kwargs: dict = {}
+    if args.native_tool_calling is not None:
+        backend_kwargs["native_tool_calling"] = args.native_tool_calling
+    if args.log_completions:
+        args.log_completions.mkdir(parents=True, exist_ok=True)
+        backend_kwargs["log_completions"] = True
+        backend_kwargs["log_completions_folder"] = str(args.log_completions)
     if args.backend == "litellm":
         if not args.model:
             p.error("--model is required when --backend litellm")
@@ -109,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         subset_size=args.subset_size,
         instance_ids=args.instance_id or None,
         max_iterations=args.max_iterations,
+        max_stuck_retries=args.max_stuck_retries,
         cache_dir=args.cache_dir,
         output_path=args.output,
         label=args.label or f"{args.backend}+{args.model or 'default'}",
