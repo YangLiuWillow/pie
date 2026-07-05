@@ -1,11 +1,21 @@
-# Running the SWE-Bench GPU benchmark (Yale YCRC HPC)
+# Running the GPU benchmarks (Yale YCRC HPC)
 
-This is the recipe for driving a real SWE-Bench run against a GPU-backed model,
-either through Pie (`pie serve` + `pie-driver-vllm`) or the vanilla LiteLLM
-baseline (direct vLLM `api_server`). It picks up where
+This is the recipe for driving a real benchmark run against a GPU-backed
+model, either through Pie (`pie serve` + `pie-driver-vllm`) or the vanilla
+LiteLLM baseline (direct vLLM `api_server`). It picks up where
 [`RUNBOOK.md`](RUNBOOK.md) Layers A–F leave off — those layers validate the
 plumbing on CPU/Metal with dummy or tiny models; this doc is for the actual
-GPU/HPC path used for Phase 1 numbers.
+GPU/HPC path.
+
+Two harnesses are available:
+
+- **HumanEvalFix** (`benchmarks/humanevalfix.py`) — single-file bug fixes, no
+  repo clone, no Docker (scoring is a local subprocess). Minutes, not tens of
+  minutes, per problem. Use this first — it's the fast smoke test for "is the
+  tool-calling path actually working."
+- **SWE-Bench Verified** (`benchmarks/swe_bench.py`) — the real Phase-1
+  acceptance benchmark (full repo, Docker-gated scoring). Slower and gated on
+  model capability more than plumbing; run this once HumanEvalFix looks healthy.
 
 For the code-level status of this work (what's fixed, what's still an open
 problem), see the project memory / prior session notes — the short version:
@@ -83,7 +93,44 @@ longer `--time` — observed per-problem latency is ~250–900s with PieLLM.
 
 ---
 
-## 2. Run the Pie backend
+## 2. Quick smoke test: HumanEvalFix
+
+`run_pie_backend.sh` defaults to driving SWE-Bench; set `HARNESS` to point it
+at the lighter harness instead:
+
+```bash
+cd /nfs/roberts/project/pi_ql324/ly337/pie/integrations/openhands
+HARNESS=benchmarks.run_humanevalfix OUTPUT_PREFIX=humanevalfix_qwen25_coder_7b \
+  bash run_pie_backend.sh --subset-size 3
+```
+
+(Use `--task-id Python/85` etc. instead of `--instance-id` for specific
+problems; `--subset-size` defaults to 20 here, not 50, and the full set is
+only 164.) No Docker, no repo clone — `run_pie_backend.sh` boots `pie serve`,
+installs the inferlet, and the harness scores each fix immediately via a
+local subprocess running the held-out asserts. Results land in
+`predictions/<prefix>_<timestamp>.jsonl` with a `passed` field per row and a
+`Resolved-rate: N/M` summary line at the end.
+
+**Verified working end-to-end on live GPU (2026-07-05, H200, 7B
+Qwen2.5-Coder, `--subset-size 3`): 2/3 passed.** The failure (`Python/155`)
+hit the 15-iteration cap with the file left syntactically broken from
+repeated overlapping edits — the same class of malformed-edit failure SWE-Bench
+surfaces, just reproduced in ~4 minutes total instead of tens of minutes per
+problem. This is exactly the value case for using this harness as a first
+pass before a full SWE-Bench run.
+
+A pure-plumbing check with no model/GPU at all (`TestLLM`, scripted to make
+no edits, so every problem reports `passed: false`):
+
+```bash
+PYTHONPATH="" .venv/bin/python -m benchmarks.run_humanevalfix \
+  --backend test --subset-size 3 --output /tmp/heval_test.jsonl
+```
+
+---
+
+## 3. Run the Pie backend (SWE-Bench)
 
 ```bash
 cd /nfs/roberts/project/pi_ql324/ly337/pie/integrations/openhands
@@ -113,11 +160,16 @@ bash run_pie_backend.sh --subset-size 2
 
 ---
 
-## 3. Run the LiteLLM baseline (for comparison)
+## 4. Run the LiteLLM baseline (for comparison)
 
 ```bash
 bash run_litellm_baseline.sh --subset-size 2
 ```
+
+(`run_litellm_baseline.sh` is SWE-Bench-only for now; there's no
+`HARNESS` env var wired into it yet. To run HumanEvalFix against the litellm
+backend directly: boot the same vLLM `api_server` it starts, then call
+`python -m benchmarks.run_humanevalfix --backend litellm --model openai/<model> --base-url http://localhost:<port>/v1 ...`.)
 
 Boots a plain vLLM `api_server` (no Pie) against the same 7B model and runs
 the harness through `--backend litellm`. This is the thing PieLLM's
@@ -130,27 +182,30 @@ couple minutes per run; not worth fixing unless this script sees heavier use.
 
 ---
 
-## 4. Useful CLI flags (`benchmarks/run_swe_bench.py`)
+## 5. Useful CLI flags
 
+`run_swe_bench.py` and `run_humanevalfix.py` share almost all flag names.
 Both wrapper scripts pass extra args straight through, so any of these work
 appended to `run_pie_backend.sh` / `run_litellm_baseline.sh`, or directly via
-`python -m benchmarks.run_swe_bench`:
+`python -m benchmarks.run_swe_bench` / `python -m benchmarks.run_humanevalfix`:
 
 | Flag | Purpose |
 |---|---|
 | `--backend {pie,litellm,test}` | Which model backend to drive |
-| `--subset-size N` / `--instance-id ID` (repeatable) | Deterministic N-problem subset, or specific instance(s) |
-| `--max-iterations N` | Cap agent steps per problem (default 50) |
+| `--subset-size N` | Deterministic N-problem subset (default 50 for SWE-Bench, 20 for HumanEvalFix — full sets are 500/164 respectively) |
+| `--instance-id ID` (SWE-Bench) / `--task-id ID` (HumanEvalFix), repeatable | Specific problem(s); overrides `--subset-size` |
+| `--max-iterations N` | Cap agent steps per problem (default 50 for SWE-Bench, 15 for HumanEvalFix) |
 | `--max-stuck-retries N` | How many times to nudge-and-retry when the SDK's `StuckDetector` fires (default 2) |
 | `--native-tool-calling` / `--no-native-tool-calling` | Only `PieLLM` hardcodes this off internally — pass explicitly for a fair PieLLM-vs-LiteLLM comparison, since vanilla `litellm` defaults to `native_tool_calling=True` (a different, untested code path requiring `--enable-auto-tool-choice`/`--tool-call-parser` on the vLLM server) |
 | `--log-completions DIR` | Dump one JSON file per raw LLM completion to `DIR` for debugging. **Always point this at a path under a directory named `logs/`** (e.g. `logs/completions/`) — that name is gitignored repo-wide, so dumps won't show up as untracked clutter. Don't pass `.` or the repo root. |
-| `--output PATH` | Predictions JSONL (required) |
+| `--output PATH` | Predictions/results JSONL (required) |
 | `--label TEXT` | Free-text label recorded in the JSONL `_metadata` |
 | `--verbose` | Stream agent events to stdout |
+| `--score-timeout-s S` (HumanEvalFix only) | Timeout for the held-out-test subprocess that scores each fix (default 10s) |
 
 ---
 
-## 5. Known limitations (as of the last debugging session)
+## 6. Known limitations (as of the last debugging session)
 
 Tool-calling plumbing itself is solved and verified live on GPU
 (`native_tool_calling` override + the `editor_repair.py` escape-bug fix both
@@ -183,7 +238,8 @@ confirmed working). What's still open:
 - PieLLM: `integrations/openhands/pie_openhands/llm.py`
 - Escape-bug repair: `integrations/openhands/pie_openhands/editor_repair.py`
 - SWE-Bench harness: `integrations/openhands/benchmarks/swe_bench.py`, `run_swe_bench.py`
-- Run scripts: `integrations/openhands/run_pie_backend.sh`, `run_litellm_baseline.sh`
+- HumanEvalFix harness: `integrations/openhands/benchmarks/humanevalfix.py`, `run_humanevalfix.py`
+- Run scripts: `integrations/openhands/run_pie_backend.sh` (set `HARNESS=benchmarks.run_humanevalfix` for the lighter harness), `run_litellm_baseline.sh`
 - Sbatch smoke tests: `integrations/openhands/smoke_test.sbatch`, `smoke_test_priority.sbatch`
 - Shared vLLM driver venv: `/nfs/roberts/scratch/pi_ql324/ly337/pie-vllm-env`
 - HF cache: `/nfs/roberts/scratch/pi_ql324/ly337/hf_cache`

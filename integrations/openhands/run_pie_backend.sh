@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Phase 1 SWE-Bench run — Pie backend (PieLLM → pie serve → vllm driver → GPU)
+# Phase 1 benchmark run — Pie backend (PieLLM → pie serve → vllm driver → GPU)
 # Usage: bash run_pie_backend.sh [--subset-size N] [--instance-id ID]
+# Set HARNESS=benchmarks.run_humanevalfix for the lighter smoke-test harness
+# instead of the default SWE-Bench one (in which case pass --task-id instead
+# of --instance-id, and note --subset-size defaults to 20 there, not 50).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +14,8 @@ CFG=${CFG:-$SCRIPT_DIR/tests/fixtures/pie_cuda_vllm_config.toml}
 MODEL=${MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}
 LABEL=${LABEL:-pie+qwen2.5-coder-7b}
 OUTPUT_PREFIX=${OUTPUT_PREFIX:-pie_qwen25_coder_7b}
+HARNESS=${HARNESS:-benchmarks.run_swe_bench}
+REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-1800}
 VENV=$SCRIPT_DIR/.venv
 HF_HOME=/nfs/roberts/scratch/pi_ql324/ly337/hf_cache
 LOG_DIR=$SCRIPT_DIR/logs
@@ -19,7 +24,7 @@ PIE_PORT=18080
 
 mkdir -p "$LOG_DIR" "$PRED_DIR"
 
-# Pass remaining args through to run_swe_bench
+# Pass remaining args through to $HARNESS
 EXTRA_ARGS=("$@")
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
     EXTRA_ARGS=(--subset-size 50)
@@ -89,14 +94,14 @@ PY
 
 # Run the benchmark
 echo ""
-echo "[3/3] Running SWE-Bench harness (Pie backend)..."
+echo "[3/3] Running $HARNESS (Pie backend)..."
 PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 HF_HOME=$HF_HOME \
-  $VENV/bin/python -m benchmarks.run_swe_bench \
+  $VENV/bin/python -m "$HARNESS" \
     --backend pie \
     --pie-uri ws://127.0.0.1:$PIE_PORT \
     --model "$MODEL" \
     --pie-render-strategy hf_chat_template \
-    --pie-request-timeout-s 1800 \
+    --pie-request-timeout-s "$REQUEST_TIMEOUT_S" \
     --output "$OUTPUT" \
     --label "$LABEL" \
     --verbose \
