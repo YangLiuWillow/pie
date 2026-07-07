@@ -64,8 +64,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pie-uri", default="ws://127.0.0.1:8080",
                    help="Pie WebSocket URI.")
     p.add_argument("--pie-inferlet", default="openhands-completion@0.1.0")
-    p.add_argument("--pie-render-strategy", default="hf_chat_template",
-                   choices=["hf_chat_template", "raw_concat"])
     p.add_argument("--pie-request-timeout-s", type=float, default=300.0,
                    help="Per-completion timeout in seconds (Pie backend only). "
                         "Default is much lower than SWE-Bench's since these are "
@@ -121,7 +119,6 @@ def main(argv: list[str] | None = None) -> int:
     elif args.backend == "pie":
         backend_kwargs["pie_uri"] = args.pie_uri
         backend_kwargs["pie_inferlet"] = args.pie_inferlet
-        backend_kwargs["pie_render_strategy"] = args.pie_render_strategy
         backend_kwargs["pie_request_timeout_s"] = args.pie_request_timeout_s
         if args.model:
             backend_kwargs["model"] = args.model

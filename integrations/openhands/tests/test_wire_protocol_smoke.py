@@ -6,9 +6,9 @@ tokenizer download on first run for the Qwen3-0.6B vocab), uploads our
 that:
 
   1. PieLLM can connect via PieClient.
-  2. The inferlet receives our input dict, generates *some* tokens (random),
-     and returns the contract dict {text, stop_reason, prompt_tokens,
-     tokens_generated}.
+  2. The inferlet receives our structured messages/tools input, generates
+     *some* tokens (random), and returns the contract dict {text, tool_calls,
+     stop_reason, prompt_tokens, tokens_generated}.
   3. PieLLM wraps that into a litellm.ModelResponse and (via the parent
      LLM.completion path) returns an LLMResponse.
 
@@ -134,7 +134,6 @@ def test_pie_llm_against_real_pie_serve(pie_server):
         pie_uri=uri,
         pie_username="local-dev",
         pie_inferlet=INFERLET_NAME,
-        pie_render_strategy="raw_concat",
         num_retries=1,
         retry_min_wait=0,
         retry_max_wait=0,

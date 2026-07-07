@@ -186,7 +186,6 @@ def build_llm(backend: str, **kwargs):
             pie_uri=kwargs.pop("pie_uri", "ws://127.0.0.1:8080"),
             pie_username=kwargs.pop("pie_username", "local-dev"),
             pie_inferlet=kwargs.pop("pie_inferlet", "openhands-completion@0.1.0"),
-            pie_render_strategy=kwargs.pop("pie_render_strategy", "hf_chat_template"),
             num_retries=kwargs.pop("num_retries", 3),
             **kwargs,
         )

@@ -49,10 +49,9 @@ def test_build_llm_test_backend():
 
 def test_build_llm_pie_backend_returns_piellm():
     from pie_openhands import PieLLM
-    llm = swe_bench.build_llm("pie", model="default", pie_render_strategy="raw_concat")
+    llm = swe_bench.build_llm("pie", model="default")
     assert isinstance(llm, PieLLM)
     assert llm.pie_inferlet == "openhands-completion@0.1.0"
-    assert llm.pie_render_strategy == "raw_concat"
 
 
 def test_problem_from_row_extracts_needed_fields():

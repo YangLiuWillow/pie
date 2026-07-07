@@ -82,7 +82,11 @@ def _transport_call(
 }
 ```
 
-For Phase 1 we emit text only (no native tool calls); OpenHands' non-native-FC mock path will parse tool calls out of the text.
+`PieLLM` now populates real `tool_calls` (see `_wrap_as_model_response` in
+`pie_openhands/llm.py`) from the inferlet's structured output, so
+`native_tool_calling` is left at the base class's default (`True`) and
+OpenHands' native tool-calling path is used — not the non-native-FC prompt
+mock this section originally described.
 
 ## 2. Message types
 

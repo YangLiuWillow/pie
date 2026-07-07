@@ -38,12 +38,12 @@ If `~/.pie/` is wiped and recreated, the directory `~/.pie/auth/` may come back 
 
 ## Layer A — unit tests (no Pie, no Agent, ~3 s)
 
-Verifies the `PieLLM` class wiring against a mocked `_call_pie`. Catches Pydantic field bugs, render-strategy regressions, and `ModelResponse` construction errors.
+Verifies the `PieLLM` class wiring against a mocked `_call_pie`. Catches Pydantic field bugs, wire-contract regressions, and `ModelResponse`/tool-call construction errors.
 
 ```bash
 cd /Users/yangliu/Desktop/Lin_startup/pie/integrations/openhands
 .venv/bin/pytest tests/test_pie_llm.py -v
-# expected: 13 passed
+# expected: 14 passed
 ```
 
 ---
@@ -70,16 +70,16 @@ MAN=/Users/yangliu/Desktop/Lin_startup/pie/inferlets/openhands-completion/Pie.to
 CFG=/Users/yangliu/Desktop/Lin_startup/pie/integrations/openhands/tests/fixtures/pie_dummy_config.toml
 
 $PIE run --path "$WASM" --manifest "$MAN" --config "$CFG" \
-  --input '{"prompt":"hello world","max_tokens":8,"temperature":0.0}'
+  --input '{"messages":[{"role":"user","content":"hello world"}],"max_tokens":8,"temperature":0.0}'
 ```
 
 Expected output (single JSON line):
 
 ```json
-{"text":"唑-hours_mat diet filing Melanie dessa tether","stop_reason":"length","prompt_tokens":2,"tokens_generated":8}
+{"text":"唑-hours_mat diet filing Melanie dessa tether","tool_calls":[],"stop_reason":"length","prompt_tokens":2,"tokens_generated":8}
 ```
 
-The dummy driver returns random token IDs — content is meaningless, **the *shape* is the smoke signal**: `text` exists, `stop_reason` is one of `stop|length|eos`, the token counts are populated.
+The dummy driver returns random token IDs — content is meaningless, **the *shape* is the smoke signal**: `text` exists, `tool_calls` is a (possibly empty) list, `stop_reason` is one of `stop|length|eos|tool_calls`, the token counts are populated.
 
 ---
 
@@ -138,7 +138,6 @@ llm = PieLLM(
     model="default",
     pie_uri="ws://127.0.0.1:8080",
     pie_inferlet="openhands-completion@0.1.0",
-    pie_render_strategy="raw_concat",
     num_retries=1,
 )
 resp = llm.completion(
@@ -173,7 +172,7 @@ activation_dtype = "bfloat16"
 
 Then re-run any layer above with `PIE_CONFIG=` pointed at the new file.
 
-**First call downloads ~1.2 GB** of weights to the HF cache, so plan accordingly. Also: `raw_concat` rendering will not produce coherent output against a real chat-tuned model — switch the LLM to `pie_render_strategy="hf_chat_template"`, which calls `transformers.AutoTokenizer.apply_chat_template` and renders the model's native chat template.
+**First call downloads ~1.2 GB** of weights to the HF cache, so plan accordingly. Chat-template rendering and tool-call formatting now happen inside the inferlet itself (see `inferlets/openhands-completion/src/lib.rs` and `docs/TOOL_CALL_HISTORY_REPLAY_DESIGN.md`), so there's no `pie_render_strategy` to set on the Python side anymore.
 
 When you graduate to H100 for benchmarking, the driver becomes `cuda_native`. Run `pie doctor` to see what's missing on the host (CUDA toolkit, nvidia-smi visibility, etc.).
 
@@ -235,7 +234,6 @@ Boot `pie serve` and install the inferlet first (see Layer D / ad-hoc section). 
   --backend pie \
   --pie-uri ws://127.0.0.1:8080 \
   --model default \
-  --pie-render-strategy hf_chat_template \
   --subset-size 50 \
   --output predictions/pie_qwen3.jsonl \
   --label pie+qwen3-coder-32b
@@ -296,7 +294,6 @@ cd /Users/yangliu/Desktop/Lin_startup/pie/integrations/openhands
   --backend pie \
   --pie-uri ws://127.0.0.1:8181 \
   --model Qwen/Qwen3-0.6B \
-  --pie-render-strategy hf_chat_template \
   --pie-request-timeout-s 1800 \
   --instance-id psf__requests-1142 \
   --max-iterations 3 \

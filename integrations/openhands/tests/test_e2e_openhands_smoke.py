@@ -35,6 +35,7 @@ def _mock_pie_response(text: str, stop_reason: str = "stop"):
     """Build the dict shape that the openhands-completion inferlet returns."""
     return {
         "text": text,
+        "tool_calls": [],
         "stop_reason": stop_reason,
         "prompt_tokens": 42,
         "tokens_generated": max(1, len(text) // 4),
@@ -51,8 +52,10 @@ def _patch_call_pie(llm: PieLLM, responses: list[dict]):
     queue = list(responses)
     captured = {"calls": []}
 
-    async def fake(self, prompt, gen_params):
-        captured["calls"].append({"prompt": prompt, "gen_params": gen_params})
+    async def fake(self, messages, tools, gen_params):
+        captured["calls"].append(
+            {"messages": messages, "tools": tools, "gen_params": gen_params}
+        )
         if not queue:
             raise AssertionError(
                 f"_call_pie called more times than scripted "
@@ -67,13 +70,10 @@ def _patch_call_pie(llm: PieLLM, responses: list[dict]):
 def _make_pie_llm(**overrides) -> PieLLM:
     """Build a PieLLM configured for the smoke test.
 
-    Uses raw_concat rendering so transformers does NOT get invoked
-    (no real tokenizer download), and disables retries so a bad mock fails
-    loudly instead of being retried 5x.
+    Disables retries so a bad mock fails loudly instead of being retried 5x.
     """
     defaults = dict(
         model="qwen3-coder-32b",
-        pie_render_strategy="raw_concat",
         usage_id="agent",
         num_retries=1,
         retry_min_wait=0,
@@ -111,11 +111,11 @@ def test_direct_completion_runs_full_sdk_pipeline():
     )
     assert "Hi there!" in text
 
-    # Our mock got the rendered prompt
+    # Our mock got the structured messages (formatted by the SDK's own
+    # format_messages_for_llm), not a pre-rendered prompt string.
     assert len(captured["calls"]) == 1
-    rendered = captured["calls"][0]["prompt"]
-    assert "Hello" in rendered
-    assert rendered.endswith("assistant:")
+    sent_messages = captured["calls"][0]["messages"]
+    assert any(m.get("role") == "user" and "Hello" in (m.get("content") or "") for m in sent_messages)
 
 
 def test_direct_completion_passes_temperature_and_max_tokens():

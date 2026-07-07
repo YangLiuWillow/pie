@@ -1,10 +1,14 @@
 """PieLLM: an openhands.sdk.LLM that routes the LiteLLM HTTP call through Pie.
 
-Phase 1 ("dumb integration"): we keep all of OpenHands' message formatting,
-tool-call mocking, retry decoration, telemetry, and LLMResponse construction.
-We only override `_transport_call`, which is where the parent class would
-otherwise call `litellm.completion(...)`. Instead, we launch a Pie inferlet
-that consumes the rendered prompt and returns generated text.
+We keep all of OpenHands' message formatting, retry decoration, telemetry,
+and LLMResponse construction. We only override `_transport_call`, which is
+where the parent class would otherwise call `litellm.completion(...)`.
+Instead, we launch a Pie inferlet that consumes the structured message/tool
+history and returns generated text plus any native tool calls.
+
+The inferlet (not PieLLM) owns chat-template rendering and history replay —
+see `inferlets/openhands-completion/src/lib.rs` and
+`integrations/openhands/docs/TOOL_CALL_HISTORY_REPLAY_DESIGN.md`.
 
 See: pie/integrations/openhands/docs/SDK_INTERNALS.md  §1.2
 """
@@ -18,7 +22,9 @@ import uuid
 from typing import Any
 
 from litellm.types.utils import (
+    ChatCompletionMessageToolCall,
     Choices,
+    Function,
     Message as LiteLLMMessage,
     ModelResponse,
     Usage,
@@ -33,8 +39,8 @@ class PieLLM(LLM):
     """openhands.sdk.LLM subclass that routes the transport layer to Pie.
 
     All openhands-sdk machinery (retry, telemetry, message formatting, native
-    and non-native tool calling, prompt caching markers, fallback strategies)
-    continues to work — we hook in *below* it.
+    tool calling, prompt caching markers, fallback strategies) continues to
+    work — we hook in *below* it.
     """
 
     # ------- Pie-specific config (extra fields on top of LLM) ----------
@@ -54,24 +60,11 @@ class PieLLM(LLM):
         default=600.0,
         description="Hard timeout per Pie request",
     )
-    pie_render_strategy: str = Field(
-        default="hf_chat_template",
-        description=(
-            "How to convert OpenAI-format messages into a Pie prompt string. "
-            "One of: 'hf_chat_template' (transformers.AutoTokenizer), 'raw_concat' "
-            "(debug-only: role: content concatenation)."
-        ),
-    )
 
-    # `_wrap_as_model_response` always sets `tool_calls=None` (Phase 1 emits
-    # text only), so the base class's `native_tool_calling=True` default would
-    # make OpenHands skip its prompt-mock tool-call parsing entirely and
-    # silently drop every tool call the model emits in text (see
-    # `should_mock_tool_calls` / SDK_INTERNALS.md §1.2).
-    native_tool_calling: bool = Field(
-        default=False,
-        description="Phase 1 PieLLM never populates native tool_calls; keep this off.",
-    )
+    # `_wrap_as_model_response` now populates real `tool_calls` from the
+    # inferlet's structured output (see `assistant_with_tool_calls`/
+    # `answer_batch` on the runtime's `Instruct` trait), so the base class's
+    # native tool-calling path is used instead of its prompt-mocked one.
 
     # `LLM.model_config` already sets extra='ignore', so unknown kwargs in
     # base_url / api_key / api_version that we don't use here are harmless.
@@ -90,71 +83,24 @@ class PieLLM(LLM):
         """Replace litellm.completion(...) with a Pie inferlet round-trip.
 
         ``messages`` arrives already formatted as OpenAI-style chat dicts
-        (the parent class ran format_messages_for_llm before us).
-        We render to a single prompt string, ship it to Pie, and translate
-        the inferlet's response back into a ``ModelResponse``.
+        (the parent class ran format_messages_for_llm before us). We forward
+        them — plus any ``tools`` — to the inferlet as structured JSON; the
+        inferlet does its own chat-template rendering and history replay.
 
-        Streaming is **not** supported in Phase 1 — we raise if requested.
+        Streaming is **not** supported yet — we raise if requested.
         """
         if enable_streaming:
-            _ = on_token  # signature parity with parent; consumed in Phase 2
+            _ = on_token  # signature parity with parent; consumed in a later phase
             raise NotImplementedError(
-                "PieLLM does not support streaming in Phase 1. "
-                "Wire on_token through the inferlet's session.send chunks in Phase 2."
+                "PieLLM does not support streaming yet. "
+                "Wire on_token through the inferlet's session.send chunks."
             )
 
-        prompt = self._render_prompt(messages, kwargs.get("tools"))
+        wire_messages = [_flatten_content(m) for m in messages]
+        tools = kwargs.get("tools") or []
         gen_params = self._extract_gen_params(kwargs)
-        raw = asyncio.run(self._call_pie(prompt, gen_params))
-        return self._wrap_as_model_response(raw, prompt)
-
-    # ------------------------------------------------------------------
-    # Rendering: messages (list[dict]) -> single prompt string
-    # ------------------------------------------------------------------
-    def _render_prompt(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict] | None,
-    ) -> str:
-        strategy = self.pie_render_strategy
-        if strategy == "hf_chat_template":
-            return self._render_via_hf_chat_template(messages, tools)
-        if strategy == "raw_concat":
-            return self._render_via_raw_concat(messages)
-        raise ValueError(f"Unknown pie_render_strategy: {strategy!r}")
-
-    def _render_via_hf_chat_template(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict] | None,
-    ) -> str:
-        # Lazy import — keeps test suite fast when caller mocks _call_pie.
-        from transformers import AutoTokenizer  # type: ignore
-
-        tok = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
-        # Normalize message dicts: ensure 'content' is a string. OpenHands sometimes
-        # emits structured content (list of parts) when vision is active; for
-        # Phase 1 we collapse those to text.
-        norm = [_flatten_content(m) for m in messages]
-        kwargs: dict[str, Any] = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
-        if tools:
-            kwargs["tools"] = tools
-        return tok.apply_chat_template(norm, **kwargs)
-
-    def _render_via_raw_concat(self, messages: list[dict[str, Any]]) -> str:
-        parts: list[str] = []
-        for m in messages:
-            content = m.get("content")
-            if isinstance(content, list):
-                content = "".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            parts.append(f"{m.get('role', 'user')}: {content or ''}")
-        parts.append("assistant:")
-        return "\n".join(parts)
+        raw = asyncio.run(self._call_pie(wire_messages, tools, gen_params))
+        return self._wrap_as_model_response(raw)
 
     # ------------------------------------------------------------------
     # Parameter extraction from kwargs
@@ -173,12 +119,17 @@ class PieLLM(LLM):
     # ------------------------------------------------------------------
     # The Pie round-trip
     # ------------------------------------------------------------------
-    async def _call_pie(self, prompt: str, gen_params: dict[str, Any]) -> dict[str, Any]:
+    async def _call_pie(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        gen_params: dict[str, Any],
+    ) -> dict[str, Any]:
         """Launch the inferlet, collect its Return payload, return as dict.
 
         Override this in tests with a mock to avoid spinning up a Pie server.
         """
-        input_payload = {"prompt": prompt, **gen_params}
+        input_payload = {"messages": messages, "tools": tools, **gen_params}
         async with PieClient(self.pie_uri) as client:
             await client.authenticate(self.pie_username)
             proc = await client.launch_process(self.pie_inferlet, input=input_payload)
@@ -201,12 +152,10 @@ class PieLLM(LLM):
     # ------------------------------------------------------------------
     # Pie response -> ModelResponse
     # ------------------------------------------------------------------
-    def _wrap_as_model_response(
-        self, pie_out: dict[str, Any], prompt: str
-    ) -> ModelResponse:
+    def _wrap_as_model_response(self, pie_out: dict[str, Any]) -> ModelResponse:
         text = pie_out.get("text", "")
         stop_reason = pie_out.get("stop_reason") or "stop"
-        prompt_tokens = int(pie_out.get("prompt_tokens") or _approx_token_count(prompt))
+        prompt_tokens = int(pie_out.get("prompt_tokens") or 0)
         completion_tokens = int(
             pie_out.get("tokens_generated")
             or pie_out.get("completion_tokens")
@@ -217,9 +166,19 @@ class PieLLM(LLM):
             "stop": "stop",
             "eos": "stop",
             "length": "length",
+            "tool_calls": "tool_calls",
         }.get(stop_reason, "stop")
 
-        msg = LiteLLMMessage(role="assistant", content=text, tool_calls=None)
+        tool_calls = [
+            ChatCompletionMessageToolCall(
+                id=tc["id"],
+                type="function",
+                function=Function(name=tc["name"], arguments=tc["arguments"]),
+            )
+            for tc in (pie_out.get("tool_calls") or [])
+        ] or None
+
+        msg = LiteLLMMessage(role="assistant", content=text, tool_calls=tool_calls)
         choice = Choices(index=0, message=msg, finish_reason=finish_reason)
         usage = Usage(
             prompt_tokens=prompt_tokens,

@@ -1,8 +1,8 @@
 """Unit tests for PieLLM.
 
-We avoid spinning up a real Pie server or downloading a real tokenizer by
-(a) mocking _call_pie at the instance level, and (b) using the raw_concat
-render strategy so transformers is not imported.
+We avoid spinning up a real Pie server by mocking _call_pie at the instance
+level — it captures the structured messages/tools/gen_params PieLLM would
+otherwise ship to the inferlet.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ from pie_openhands import PieLLM
 def _patch_call_pie(llm: PieLLM, response: dict):
     """Replace _call_pie with an async lambda that returns ``response``.
 
-    Captures the rendered prompt and gen params on the LLM instance so the
-    test can assert on them.
+    Captures the messages/tools/gen params on the LLM instance so the test
+    can assert on them.
     """
     captured = {}
 
-    async def fake(self, prompt, gen_params):
-        captured["prompt"] = prompt
+    async def fake(self, messages, tools, gen_params):
+        captured["messages"] = messages
+        captured["tools"] = tools
         captured["gen_params"] = gen_params
         return response
 
@@ -40,7 +41,6 @@ def _patch_call_pie(llm: PieLLM, response: dict):
 def _make_llm(**overrides):
     defaults = dict(
         model="qwen3-coder-32b",
-        pie_render_strategy="raw_concat",
         pie_uri="ws://127.0.0.1:8080",
         # Belts and braces — keep retry quick for tests
         num_retries=1,
@@ -53,51 +53,17 @@ def _make_llm(**overrides):
 
 
 # ---------------------------------------------------------------
-# Rendering tests
-# ---------------------------------------------------------------
-
-
-def test_raw_concat_renders_simple_conversation():
-    llm = _make_llm()
-    prompt = llm._render_prompt(
-        [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hi"},
-        ],
-        tools=None,
-    )
-    assert "system: You are helpful." in prompt
-    assert "user: Hi" in prompt
-    assert prompt.endswith("assistant:")
-
-
-def test_raw_concat_handles_list_content():
-    """OpenHands sometimes emits structured content (vision); we flatten."""
-    llm = _make_llm()
-    prompt = llm._render_prompt(
-        [{"role": "user", "content": [{"type": "text", "text": "hello world"}]}],
-        tools=None,
-    )
-    assert "hello world" in prompt
-
-
-def test_unknown_render_strategy_raises():
-    llm = _make_llm(pie_render_strategy="from_scratch")
-    with pytest.raises(ValueError, match="Unknown pie_render_strategy"):
-        llm._render_prompt([{"role": "user", "content": "x"}], tools=None)
-
-
-# ---------------------------------------------------------------
 # Transport tests
 # ---------------------------------------------------------------
 
 
-def test_transport_call_translates_pie_response_into_model_response():
+def test_transport_call_forwards_structured_messages_and_tools():
     llm = _make_llm()
     captured = _patch_call_pie(
         llm,
         response={
             "text": "Hello back.",
+            "tool_calls": [],
             "stop_reason": "stop",
             "prompt_tokens": 7,
             "tokens_generated": 3,
@@ -105,14 +71,21 @@ def test_transport_call_translates_pie_response_into_model_response():
     )
 
     resp = llm._transport_call(
-        messages=[{"role": "user", "content": "Hi"}],
+        messages=[
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+        ],
         temperature=0.0,
         max_tokens=64,
         stop=["<eot>"],
     )
 
-    # Pie call was made
-    assert "user: Hi" in captured["prompt"]
+    # Pie call got the structured messages, unflattened role/content intact.
+    assert captured["messages"] == [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ]
+    assert captured["tools"] == []
     assert captured["gen_params"]["max_tokens"] == 64
     assert captured["gen_params"]["temperature"] == 0.0
     assert captured["gen_params"]["stop"] == ["<eot>"]
@@ -122,10 +95,84 @@ def test_transport_call_translates_pie_response_into_model_response():
     assert isinstance(resp, ModelResponse)
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].message.content == "Hello back."
+    assert resp.choices[0].message.tool_calls is None
     assert resp.usage.prompt_tokens == 7
     assert resp.usage.completion_tokens == 3
     assert resp.usage.total_tokens == 10
     assert resp.model == "qwen3-coder-32b"
+
+
+def test_transport_call_flattens_vision_style_content():
+    """OpenHands sometimes emits structured content (vision); we flatten it
+    to a plain string before it reaches the inferlet's JSON contract."""
+    llm = _make_llm()
+    captured = _patch_call_pie(llm, {"text": "ok"})
+
+    llm._transport_call(
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "hello world"}]},
+        ],
+    )
+
+    assert captured["messages"] == [{"role": "user", "content": "hello world"}]
+
+
+def test_transport_call_passes_tool_calls_through():
+    llm = _make_llm()
+    captured = _patch_call_pie(llm, {"text": "ok"})
+
+    llm._transport_call(
+        messages=[
+            {"role": "user", "content": "search for cats"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": '{"q": "cats"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "no results"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "search", "description": "Search the web", "parameters": {}},
+            }
+        ],
+    )
+
+    assert captured["messages"][1]["tool_calls"][0]["function"]["name"] == "search"
+    assert captured["messages"][2]["tool_call_id"] == "call_0"
+    assert captured["tools"][0]["function"]["name"] == "search"
+
+
+def test_transport_call_builds_native_tool_calls_in_response():
+    llm = _make_llm()
+    _patch_call_pie(
+        llm,
+        {
+            "text": "",
+            "tool_calls": [{"id": "call_0", "name": "search", "arguments": '{"q": "cats"}'}],
+            "stop_reason": "tool_calls",
+            "prompt_tokens": 10,
+            "tokens_generated": 5,
+        },
+    )
+
+    resp = llm._transport_call(messages=[{"role": "user", "content": "search for cats"}])
+
+    assert resp.choices[0].finish_reason == "tool_calls"
+    tool_calls = resp.choices[0].message.tool_calls
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].id == "call_0"
+    assert tool_calls[0].type == "function"
+    assert tool_calls[0].function.name == "search"
+    assert tool_calls[0].function.arguments == '{"q": "cats"}'
 
 
 def test_transport_call_maps_length_stop_reason():
@@ -142,7 +189,7 @@ def test_transport_call_maps_eos_to_stop():
     assert resp.choices[0].finish_reason == "stop"
 
 
-def test_streaming_is_unsupported_in_phase_1():
+def test_streaming_is_unsupported():
     llm = _make_llm()
     with pytest.raises(NotImplementedError, match="streaming"):
         llm._transport_call(
@@ -164,6 +211,13 @@ def test_max_tokens_falls_back_to_max_output_tokens():
     captured = _patch_call_pie(llm, {"text": "ok"})
     llm._transport_call(messages=[{"role": "user", "content": "x"}])
     assert captured["gen_params"]["max_tokens"] == 512
+
+
+def test_native_tool_calling_defaults_to_true():
+    """PieLLM now populates real tool_calls, so the base class's native
+    tool-calling path (not its prompt-mocked one) should be used."""
+    llm = _make_llm()
+    assert llm.native_tool_calling is True
 
 
 # ---------------------------------------------------------------
