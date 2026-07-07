@@ -70,6 +70,29 @@ pub fn answer_prefix(model: &Model, name: &str, value: &str) -> Vec<u32> {
     tool_use::answer(model, name, value)
 }
 
+/// Token sequence replaying a past assistant turn that made one or more
+/// tool calls — for reconstructing multi-turn history in a stateless
+/// inferlet (append instead of `assistant()` for turns with `tool_calls`).
+/// `content` is any free text that preceded the call(s); `calls` are
+/// `(name, arguments_json)` pairs, in order. Falls back to a plain
+/// assistant-text replay of `content` for models without tool support.
+pub fn assistant_with_tool_calls_prefix(
+    model: &Model,
+    content: Option<&str>,
+    calls: &[(String, String)],
+) -> Vec<u32> {
+    tool_use::assistant_with_tool_calls(model, content, calls)
+}
+
+/// Token sequence replaying one or more past tool results as a single
+/// merged turn — most chat templates group consecutive tool results into
+/// one turn rather than one per result, so prefer this over repeated
+/// [`answer_prefix`] calls when replaying history. `results` are `(name,
+/// value)` pairs, in order.
+pub fn answer_batch_prefix(model: &Model, results: &[(String, String)]) -> Vec<u32> {
+    tool_use::answer_batch(model, results)
+}
+
 // =============================================================================
 // Native grammar / matcher
 // =============================================================================

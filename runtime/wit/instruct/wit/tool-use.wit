@@ -16,6 +16,17 @@ interface tool-use {
     /// Provide a tool result (after a tool-call reply)
     answer: func(model: borrow<model>, name: string, value: string) -> list<u32>;
 
+    /// Replay a past assistant turn that made one or more tool calls.
+    /// `content` is any free text that preceded the call(s); `calls` are
+    /// (name, arguments-json) pairs, in order. For models without tool
+    /// support, falls back to a plain assistant-text replay of `content`.
+    assistant-with-tool-calls: func(model: borrow<model>, content: option<string>, calls: list<tuple<string, string>>) -> list<u32>;
+
+    /// Replay one or more past tool results as a single merged turn — most
+    /// chat templates group consecutive tool results into one turn rather
+    /// than one per result. `results` are (name, value) pairs, in order.
+    answer-batch: func(model: borrow<model>, results: list<tuple<string, string>>) -> list<u32>;
+
     /// Create a decoder to detect tool calls in generated tokens
     create-decoder: func(model: borrow<model>) -> decoder;
 
