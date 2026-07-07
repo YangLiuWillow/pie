@@ -93,6 +93,44 @@ pub trait Instruct: Send + Sync {
     fn seal(&self) -> Vec<u32>;
     fn equip(&self, tools: &[String]) -> Vec<u32>;
     fn answer(&self, name: &str, value: &str) -> Vec<u32>;
+
+    /// Build tokens for a *replayed* assistant turn that made one or more
+    /// tool calls: `content` is any free text that preceded the call(s), and
+    /// `calls` are `(name, arguments_json)` pairs — `arguments_json` must
+    /// already be a valid JSON-encoded string (the shape
+    /// [`ToolDecoder::feed`]'s [`ToolEvent::Call`] produces). This exists
+    /// because a plain [`Instruct::assistant`] only knows how to wrap a
+    /// string, but reconstructing a past tool-calling turn byte-for-byte
+    /// (to match the architecture's own template) requires knowing where
+    /// the content ends and each call begins, not just concatenated text.
+    ///
+    /// Default falls back to a plain `assistant()` replay of `content` only,
+    /// silently dropping `calls` — correct for architectures that don't
+    /// support tools (mirrors `equip`/`answer`'s no-tool-support behavior
+    /// elsewhere in this trait). Override when the architecture supports
+    /// tool calling; see `QwenInstruct` for a worked example.
+    fn assistant_with_tool_calls(&self, content: Option<&str>, calls: &[(String, String)]) -> Vec<u32> {
+        let _ = calls;
+        self.assistant(content.unwrap_or(""))
+    }
+
+    /// Build tokens for one or more tool results that should be replayed as
+    /// a single merged reply turn — most chat templates group consecutive
+    /// tool-role messages into one turn rather than one per result, and
+    /// calling [`Instruct::answer`] once per result produces a *different*
+    /// (and wrong) token sequence than the template's merged form.
+    ///
+    /// Default folds to repeated single-result `answer()` calls (one turn
+    /// per result — the old, pre-merge behavior). Override when the
+    /// architecture's template merges consecutive results into one turn;
+    /// see `QwenInstruct` for a worked example.
+    fn answer_batch(&self, results: &[(String, String)]) -> Vec<u32> {
+        results
+            .iter()
+            .flat_map(|(name, value)| self.answer(name, value))
+            .collect()
+    }
+
     fn chat_decoder(&self) -> Box<dyn ChatDecoder>;
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
