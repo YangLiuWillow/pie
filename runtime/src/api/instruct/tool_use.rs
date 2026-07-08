@@ -34,6 +34,20 @@ impl pie::instruct::tool_use::Host for InstanceState {
         Ok(Ok(tokens))
     }
 
+    async fn equip_after_system(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        system_content: Option<String>,
+        tools: Vec<String>,
+    ) -> Result<Result<Vec<u32>, pie::core::types::Error>> {
+        let model = self.ctx().table.get(&model)?;
+        let tokens = model
+            .model
+            .instruct()
+            .equip_after_system(system_content.as_deref(), &tools);
+        Ok(Ok(tokens))
+    }
+
     async fn answer(
         &mut self,
         model: Resource<crate::api::model::Model>,

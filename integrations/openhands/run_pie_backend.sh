@@ -100,7 +100,6 @@ PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 HF_HOME=$HF_HOME \
     --backend pie \
     --pie-uri ws://127.0.0.1:$PIE_PORT \
     --model "$MODEL" \
-    --pie-render-strategy hf_chat_template \
     --pie-request-timeout-s "$REQUEST_TIMEOUT_S" \
     --output "$OUTPUT" \
     --label "$LABEL" \

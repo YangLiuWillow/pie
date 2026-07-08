@@ -245,7 +245,17 @@ impl Tokenizer {
                 Some(raw) => String::from_utf8_lossy(raw).into_owned(),
                 None => String::new(),
             };
-            if !decoded.is_empty() {
+            // Special tokens (e.g. `<|im_end|>`) often have a non-empty
+            // decoded form, but they must never be offered as a candidate
+            // for grammar-constrained decoding: their literal text can
+            // happen to satisfy an in-progress rule (e.g. any printable
+            // token is valid inside a JSON string's char class), which
+            // would let the model sample a real EOS/control token out of
+            // an incomplete grammar state. `sorted_vocab` backs exactly
+            // that candidate enumeration (see `compiled_grammar`/`matcher`),
+            // so special tokens are excluded here — same intent as
+            // `accept_token`'s explicit `special_token_ids` rejection.
+            if !decoded.is_empty() && special_token_ids.binary_search(&id).is_err() {
                 sorted_vocab.push((id, decoded.clone()));
             }
             decoded_vocab.push(decoded);

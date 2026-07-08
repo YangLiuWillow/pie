@@ -63,6 +63,20 @@ pub fn equip_prefix(model: &Model, tool_schemas: &[String]) -> Result<Vec<u32>> 
     tool_use::equip(model, tool_schemas)
 }
 
+/// Like [`equip_prefix`], but merges `system_content` (a caller-supplied
+/// leading system message, if any) into the same system turn as the tool
+/// schemas instead of emitting two separate consecutive system turns —
+/// matching chat templates (e.g. Qwen's) that fold both together. Prefer
+/// this over separately calling [`Context::system`](crate::Context::system)
+/// + `equip_prefix` whenever the conversation has a leading system message.
+pub fn equip_after_system_prefix(
+    model: &Model,
+    system_content: Option<&str>,
+    tool_schemas: &[String],
+) -> Result<Vec<u32>> {
+    tool_use::equip_after_system(model, system_content, tool_schemas)
+}
+
 /// Token sequence that frames a tool result for the next turn. `name`
 /// matches the call the model made; `value` is typically a JSON-encoded
 /// result.

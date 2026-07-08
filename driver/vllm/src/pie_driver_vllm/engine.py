@@ -19,6 +19,22 @@ from pie_driver_dev import telemetry
 from . import _require_vllm
 
 
+def _normalize_arch_name(raw_arch: str) -> str:
+    """"Qwen2ForCausalLM" -> "qwen2".
+
+    Mirrors the heuristic in `server/src/embedded_driver.rs`'s
+    `read_hf_config_defaults` — pie's runtime matches `arch_name` against
+    short lowercase names (`instruct::create` in
+    `runtime/src/model/instruct.rs`) and silently falls back to a
+    no-tools/no-thinking generic config for anything that doesn't match, so
+    reporting the raw HF architecture string here would disable tool
+    support for every model this driver serves.
+    """
+    lowered = raw_arch.lower()
+    suffix = "forcausallm"
+    return lowered[: -len(suffix)] if lowered.endswith(suffix) else lowered
+
+
 class VllmEngine:
     """Inference engine that delegates the forward pass to a vllm model.
 
@@ -400,7 +416,7 @@ class VllmEngine:
             swap_pool_size=int(self.swap_pool_size),
             max_batch_tokens=max_batch_tokens,
             max_batch_size=max_batch_size,
-            arch_name=self.arch_type,
+            arch_name=_normalize_arch_name(self.arch_type),
             vocab_size=int(mc.get_vocab_size()),
             max_model_len=int(mc.max_model_len),
             activation_dtype=dtype_str,

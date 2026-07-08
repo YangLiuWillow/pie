@@ -94,6 +94,27 @@ pub trait Instruct: Send + Sync {
     fn equip(&self, tools: &[String]) -> Vec<u32>;
     fn answer(&self, name: &str, value: &str) -> Vec<u32>;
 
+    /// Register `tools`, merging `system_content` (a caller-supplied leading
+    /// system message, if any) into the *same* system turn as the tool
+    /// schemas — some chat templates (Qwen's, notably) fold both into one
+    /// turn rather than emitting two separate consecutive system turns,
+    /// and feeding the model the latter (out-of-distribution) shape hurts
+    /// its tool-call-format reliability.
+    ///
+    /// Default concatenates a plain `system()` turn (if `system_content` is
+    /// present) with `equip()`'s own turn — the old, pre-merge behavior,
+    /// correct for architectures without a specific merge rule. Override
+    /// when the architecture's template merges them; see `QwenInstruct` for
+    /// a worked example.
+    fn equip_after_system(&self, system_content: Option<&str>, tools: &[String]) -> Vec<u32> {
+        let mut out = Vec::new();
+        if let Some(c) = system_content {
+            out.extend(self.system(c));
+        }
+        out.extend(self.equip(tools));
+        out
+    }
+
     /// Build tokens for a *replayed* assistant turn that made one or more
     /// tool calls: `content` is any free text that preceded the call(s), and
     /// `calls` are `(name, arguments_json)` pairs — `arguments_json` must

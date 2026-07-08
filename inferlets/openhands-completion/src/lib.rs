@@ -179,6 +179,10 @@ async fn main(input: Input) -> Result<Output> {
         .max_tokens(input.max_tokens)
         .stop(&stop_token_ids);
 
+    if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
+        g = g.constrain(inferlet::GrammarConstraint::new(matcher));
+    }
+
     'outer: while let Some(step) = g.next()? {
         let out = step.execute().await?;
 
@@ -267,6 +271,19 @@ fn replay_history(
 ) -> Result<()> {
     let mut equipped = false;
     let mut i = 0;
+
+    // The model's chat template folds a leading system message's content
+    // into the *same* system turn as the tool schemas (see
+    // `equip_after_system_prefix`'s doc comment) rather than two separate
+    // consecutive system turns — handle that one turn specially before the
+    // general per-message loop below.
+    if !tool_schemas.is_empty() && messages.first().map(|m| m.role.as_str()) == Some("system") {
+        let content = messages[0].content.as_deref();
+        ctx.append(&tools::equip_after_system_prefix(model, content, tool_schemas)?);
+        equipped = true;
+        i = 1;
+    }
+
     while i < messages.len() {
         let msg = &messages[i];
 

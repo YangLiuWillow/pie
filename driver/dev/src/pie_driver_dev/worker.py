@@ -17,6 +17,25 @@ import warnings
 # =============================================================================
 
 
+def _resolve_vocab_size(model_config) -> int:
+    """Resolve the real vocab size across driver-specific `model_config` shapes.
+
+    `driver_dev`'s own model configs (portable/dummy) expose `num_vocabs`
+    directly. vLLM's `ModelConfig` has neither `num_vocabs` nor a plain
+    `vocab_size` attribute — only a `get_vocab_size()` method — so a bare
+    `getattr(..., "vocab_size", 128000)` silently falls through to the
+    hardcoded default on that driver every time, regardless of the real
+    model's vocab size. That mismatch only surfaces once something actually
+    builds a `sampling_masks` tensor sized to the wrong vocab (e.g. grammar-
+    constrained decoding), where it fails/hangs downstream in `sample_common`.
+    """
+    if (n := getattr(model_config, "num_vocabs", None)) is not None:
+        return n
+    if hasattr(model_config, "get_vocab_size"):
+        return model_config.get_vocab_size()
+    return getattr(model_config, "vocab_size", 128000)
+
+
 def calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:
     """Calculate process group topology from world size and TP degree.
 
@@ -509,11 +528,7 @@ def _leader_loop(
             _kv_page_size,
             _max_dist_size,
             engine.adapters,
-            vocab_size=getattr(
-                engine.model_config,
-                "num_vocabs",
-                getattr(engine.model_config, "vocab_size", 128000),
-            ),
+            vocab_size=_resolve_vocab_size(engine.model_config),
         )
         build_timing = batch.timing
         t_build_batch = time.perf_counter() - t0

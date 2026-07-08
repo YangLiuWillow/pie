@@ -364,6 +364,25 @@ impl Instruct for QwenInstruct {
         self.system(&prompt)
     }
 
+    fn equip_after_system(&self, system_content: Option<&str>, tools: &[String]) -> Vec<u32> {
+        // Reference (qwen2.rs's embedded Jinja template, top-of-prompt
+        // preamble): when tools are present, the leading system message's
+        // content (if any) and the tools block are folded into ONE system
+        // turn ('content' + '\n\n' + tools-block), not two separate turns.
+        if !self.config.has_tools || tools.is_empty() {
+            return match system_content {
+                Some(c) => self.system(c),
+                None => Vec::new(),
+            };
+        }
+        let tools_block = Self::build_tool_system_prompt(tools);
+        let merged = match system_content {
+            Some(c) if !c.is_empty() => format!("{c}\n\n{tools_block}"),
+            _ => tools_block,
+        };
+        self.system(&merged)
+    }
+
     fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
         if !self.config.has_tools {
             return Vec::new();
