@@ -1,0 +1,3 @@
+[submodule "integrations/openhands/vendor/benchmarks"]
+	path = integrations/openhands/vendor/benchmarks
+	url = https://github.com/All-Hands-AI/benchmarks.git

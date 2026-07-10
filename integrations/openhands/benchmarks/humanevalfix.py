@@ -115,6 +115,11 @@ class Result:
     stuck_retries: int = 0
     error: str = ""
     score_detail: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    num_llm_calls: int = 0
+    response_latencies: list[float] = field(default_factory=list)
 
     def to_jsonl(self) -> str:
         return json.dumps({
@@ -128,6 +133,11 @@ class Result:
                 "stuck_retries": self.stuck_retries,
                 "error": self.error,
                 "score_detail": self.score_detail,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "num_llm_calls": self.num_llm_calls,
+                "response_latencies": [round(l, 4) for l in self.response_latencies],
             },
         })
 
@@ -228,6 +238,7 @@ def solve_one(
     backend_kwargs: dict[str, Any] | None = None,
     max_iterations: int = 15,
     max_stuck_retries: int = 2,
+    max_fake_responses: int = 10,
     score_timeout_s: float = 10.0,
     label: str | None = None,
 ) -> Result:
@@ -253,11 +264,14 @@ def solve_one(
             stuck_retries = run_with_stuck_retries(
                 conv,
                 max_stuck_retries=max_stuck_retries,
+                max_fake_responses=max_fake_responses,
                 instance_id=problem.task_id,
             )
 
             fixed_solution = (ws / SOLUTION_FILENAME).read_text()
             passed, detail = score_fix(problem, fixed_solution, timeout_s=score_timeout_s)
+            from benchmarks.swe_bench import _extract_metrics
+            metrics = _extract_metrics(conv)
             return Result(
                 task_id=problem.task_id,
                 model_name_or_path=label,
@@ -267,6 +281,7 @@ def solve_one(
                 agent_iterations=_count_iterations(conv),
                 stuck_retries=stuck_retries,
                 score_detail=detail,
+                **metrics,
             )
     except Exception as e:
         logger.exception("solve_one failed for %s", problem.task_id)

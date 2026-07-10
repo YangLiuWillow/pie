@@ -66,11 +66,17 @@ def main(argv: list[str] | None = None) -> int:
                         "due to the size of OpenHands' system prompt.")
 
     # Run shape
-    p.add_argument("--max-iterations", type=int, default=50)
+    p.add_argument("--max-iterations", type=int, default=100,
+                   help="Max agent iterations per run (default 100, matching "
+                        "official OpenHands evaluation).")
     p.add_argument("--max-stuck-retries", type=int, default=2,
                    help="On StuckDetector firing, send a corrective nudge message "
-                        "and resume the run, up to this many times (0 disables — "
-                        "matches pre-nudge behavior of giving up immediately).")
+                        "and resume the run, up to this many times (0 disables).")
+    p.add_argument("--max-fake-responses", type=int, default=10,
+                   help="Max fake user responses when agent sends content-only "
+                        "messages instead of using tools (0 disables).")
+    p.add_argument("--no-condenser", action="store_true",
+                   help="Disable the LLMSummarizingCondenser (enabled by default).")
     p.add_argument("--output", "-o", type=Path, required=True,
                    help="Output predictions JSONL file.")
     p.add_argument("--label", default=None,
@@ -128,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         instance_ids=args.instance_id or None,
         max_iterations=args.max_iterations,
         max_stuck_retries=args.max_stuck_retries,
+        max_fake_responses=args.max_fake_responses,
+        enable_condenser=not args.no_condenser,
         cache_dir=args.cache_dir,
         output_path=args.output,
         label=args.label or f"{args.backend}+{args.model or 'default'}",

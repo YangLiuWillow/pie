@@ -1,4 +1,4 @@
-"""Phase-1 SWE-Bench Verified harness — driving half.
+"""SWE-Bench Verified harness — driving half.
 
 The two halves of SWE-Bench:
 
@@ -29,6 +29,18 @@ Three "backends" are supported for development:
                     (OpenAI / Anthropic / local OpenAI-compat endpoint).
   * ``"test"``    — TestLLM scripted to return a no-op finish. Useful for
                     smoke-testing the harness plumbing without a model.
+
+Key features ported from the official OpenHands benchmarks repo
+(All-Hands-AI/benchmarks):
+
+  * **Fake user response loop** — when the agent responds with a plain-text
+    message instead of a tool call, send a nudge and re-run instead of
+    letting FINISHED fire after a single turn.
+  * **Condenser** — ``LLMSummarizingCondenser`` truncates long conversation
+    history to prevent context degradation on multi-turn agent loops.
+  * **Structured 8-phase prompt** — guides the model through a systematic
+    read → run → explore → test → analyze → fix → verify → review workflow,
+    matching the official evaluation template.
 """
 
 from __future__ import annotations
@@ -102,6 +114,11 @@ class Prediction:
     agent_iterations: int = 0
     error: str = ""
     stuck_retries: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    num_llm_calls: int = 0
+    response_latencies: list[float] = field(default_factory=list)
 
     def to_jsonl(self) -> str:
         return json.dumps({
@@ -113,6 +130,11 @@ class Prediction:
                 "agent_iterations": self.agent_iterations,
                 "error": self.error,
                 "stuck_retries": self.stuck_retries,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "num_llm_calls": self.num_llm_calls,
+                "response_latencies": [round(l, 4) for l in self.response_latencies],
             },
         })
 
@@ -208,29 +230,102 @@ def build_llm(backend: str, **kwargs):
 
 
 SWE_BENCH_SYSTEM_SUFFIX = textwrap.dedent("""\
-    You are solving a software-engineering problem from SWE-Bench Verified.
-    You have direct file access to a checked-out repository in your workspace
-    and a bash terminal. Read the bug report, locate the relevant code, make
-    the minimum edit that fixes the bug, and stop.
+    I've already taken care of all changes to any of the test files described \
+    in the issue. This means you DON'T have to modify the testing logic or \
+    any of the tests in any way!
+    Also the development Python environment is already set up for you \
+    (i.e., all dependencies already installed), so you don't need to install \
+    other packages.
+    Your task is to make the minimal changes to non-test files in the \
+    repository directory to ensure the issue is satisfied.
 
-    Constraints:
-      * Do not run the test suite — the grader will do that.
-      * Do not create new files unless the bug requires it.
-      * Make no commits, no branches, no git operations at all.
-      * Keep changes scoped to the reported bug. Do not refactor.
+    Follow these phases to resolve the issue:
+
+    Phase 1. READING: read the problem and reword it in clearer terms
+       1.1 If there are code or config snippets, express in words any best practices or conventions in them.
+       1.2 Highlight message errors, method names, variables, file names, stack traces, and technical details.
+       1.3 Explain the problem in clear terms.
+       1.4 Enumerate the steps to reproduce the problem.
+       1.5 Highlight any best practices to take into account when testing and fixing the issue.
+
+    Phase 2. RUNNING: install and run the tests on the repository
+       2.1 Follow the readme.
+       2.2 Install the environment and anything needed.
+       2.3 Iterate and figure out how to run the tests.
+
+    Phase 3. EXPLORATION: find the files that are related to the problem and possible solutions
+       3.1 Use `grep` to search for relevant methods, classes, keywords and error messages.
+       3.2 Identify all files related to the problem statement.
+       3.3 Propose the methods and files to fix the issue and explain why.
+       3.4 From the possible file locations, select the most likely location to fix the issue.
+
+    Phase 4. TEST CREATION: before implementing any fix, create a script to reproduce and verify the issue
+       4.1 Look at existing test files in the repository to understand the test format/structure.
+       4.2 Create a minimal reproduction script that reproduces the located issue.
+       4.3 Run the reproduction script to confirm you are reproducing the issue.
+       4.4 Adjust the reproduction script as necessary.
+
+    Phase 5. FIX ANALYSIS: state clearly the problem and how to fix it
+       5.1 State clearly what the problem is.
+       5.2 State clearly where the problem is located.
+       5.3 State clearly how the test reproduces the issue.
+       5.4 State clearly the best practices to take into account in the fix.
+       5.5 State clearly how to fix the problem.
+
+    Phase 6. FIX IMPLEMENTATION: Edit the source code to implement your chosen solution
+       6.1 Make minimal, focused changes to fix the issue.
+
+    Phase 7. VERIFICATION: Test your implementation thoroughly
+       7.1 Run your reproduction script to verify the fix works.
+       7.2 Add edge cases to your test script to ensure comprehensive coverage.
+       7.3 Run existing tests related to the modified code to ensure you haven't broken anything.
+
+    Phase 8. FINAL REVIEW: Carefully re-read the problem description and compare your changes.
+       8.1 Ensure you've fully addressed all requirements.
+       8.2 Run any tests in the repository related to:
+         8.2.1 The issue you are fixing
+         8.2.2 The files you modified
+         8.2.3 The functions you changed
+       8.3 If any tests fail, revise your implementation until all tests pass.
+
+    Be thorough in your exploration, testing, and reasoning. It's fine if \
+    your thinking process is lengthy - quality and completeness are more \
+    important than brevity.
 """)
 
 
-def build_agent(llm):
-    """Return an ``Agent`` configured with the default file/terminal tools."""
+def build_agent(llm, *, enable_condenser: bool = True):
+    """Return an ``Agent`` configured with the default file/terminal tools.
+
+    When ``enable_condenser`` is True (the default), wraps the agent with an
+    ``LLMSummarizingCondenser`` that truncates conversation history after 240
+    events — matching the official OpenHands evaluation defaults.
+    """
     from openhands.sdk import Agent
     from openhands.tools.preset.default import get_default_tools
 
     tools = get_default_tools(enable_browser=False)
+
+    condenser = None
+    if enable_condenser:
+        try:
+            from openhands.sdk.context.condenser import LLMSummarizingCondenser
+            condenser = LLMSummarizingCondenser(
+                llm=llm,
+                max_size=240,
+                keep_first=2,
+            )
+        except Exception:
+            logger.warning("Failed to create condenser, proceeding without one")
+
     return Agent(
         llm=llm,
         tools=tools,
-        system_prompt_kwargs={"cli_mode": False, "extra_instructions": SWE_BENCH_SYSTEM_SUFFIX},
+        system_prompt_kwargs={
+            "cli_mode": True,
+            "extra_instructions": SWE_BENCH_SYSTEM_SUFFIX,
+        },
+        condenser=condenser,
     )
 
 
@@ -239,10 +334,6 @@ def build_agent(llm):
 
 # Sent when the SDK's StuckDetector fires (repeating/alternating action-
 # observation loops — see docs/openhands-integration.md investigation notes).
-# Confirmed via live traces that this pattern often comes from the model
-# fixating on a scratch file it created itself rather than the real bug
-# location, so the nudge calls that out explicitly rather than just saying
-# "try something different".
 STUCK_NUDGE_MESSAGE = (
     "You appear to be stuck: repeating the same action without making "
     "progress. Stop repeating that exact tool call. Re-read the problem "
@@ -252,43 +343,131 @@ STUCK_NUDGE_MESSAGE = (
     "directly."
 )
 
+# Sent when the agent replies with a plain-text message (no tool calls)
+# instead of using its tools. Without this, the SDK sets FINISHED after
+# a single content-only turn, ending the run before the agent ever
+# explored the codebase.
+FAKE_USER_RESPONSE = (
+    "Please continue working on the task on whatever approach you think is "
+    "suitable.\n"
+    "When you think you have solved the question, please use the finish tool "
+    "and include your final answer in the message parameter of the finish "
+    "tool.\n"
+    "IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n"
+)
+
+
+def _agent_finished_with_finish_action(events) -> bool:
+    """Check if the agent's last action was a FinishAction."""
+    try:
+        from openhands.sdk.event import ActionEvent
+        from openhands.sdk.tool.builtins.finish import FinishAction
+    except ImportError:
+        return False
+    for event in reversed(list(events)):
+        if isinstance(event, ActionEvent):
+            if event.action is not None and isinstance(event.action, FinishAction):
+                return True
+            return False
+    return False
+
+
+def _agent_sent_message(events) -> bool:
+    """Check if the agent's last event was a message (not a tool call)."""
+    try:
+        from openhands.sdk.event import ActionEvent, MessageEvent
+    except ImportError:
+        return False
+    for event in reversed(list(events)):
+        if isinstance(event, MessageEvent) and event.source == "agent":
+            return True
+        if isinstance(event, ActionEvent):
+            return False
+    return False
+
 
 def run_with_stuck_retries(
     conv,
     *,
     max_stuck_retries: int = 2,
+    max_fake_responses: int = 10,
     instance_id: str = "?",
 ) -> int:
-    """Run ``conv`` to completion, nudging past StuckDetector triggers.
+    """Run ``conv`` to completion with two recovery mechanisms.
 
-    ``conv.run()`` already runs until FINISHED/STUCK/erroring/iteration-cap.
-    If it comes back STUCK, send ``STUCK_NUDGE_MESSAGE`` (which the SDK
-    treats as a normal user message, clearing the STUCK status — see
-    ``LocalConversation.send_message``) and call ``run()`` again, up to
-    ``max_stuck_retries`` times. Returns the number of nudges actually sent.
+    1. **Fake user responses** — when the agent sends a content-only message
+       (no tool calls), the SDK sets FINISHED. This function detects that
+       case and sends a nudge to keep the agent working (matching the official
+       OpenHands evaluation harness behavior).
 
-    Takes a duck-typed ``conv`` (only ``.run()``, ``.send_message()``, and
-    ``.state.execution_status`` are used) so this is unit-testable without a
-    real Agent/tool/workspace.
+    2. **Stuck retries** — when the SDK's StuckDetector fires (repeating
+       action-observation loops), sends ``STUCK_NUDGE_MESSAGE`` to break out.
+
+    Returns the total number of nudges sent (both types combined).
     """
     from openhands.sdk import ConversationExecutionStatus
 
-    conv.run()
+    total_nudges = 0
+    fake_responses_sent = 0
 
-    stuck_retries = 0
-    while (
-        conv.state.execution_status == ConversationExecutionStatus.STUCK
-        and stuck_retries < max_stuck_retries
-    ):
-        stuck_retries += 1
-        logger.warning(
-            "%s: stuck pattern detected, sending nudge (retry %d/%d)",
-            instance_id, stuck_retries, max_stuck_retries,
-        )
-        conv.send_message(STUCK_NUDGE_MESSAGE)
+    while True:
         conv.run()
+        status = conv.state.execution_status
 
-    return stuck_retries
+        # Handle STUCK status
+        if status == ConversationExecutionStatus.STUCK:
+            if total_nudges < max_stuck_retries:
+                total_nudges += 1
+                logger.warning(
+                    "%s: stuck pattern detected, sending nudge (%d)",
+                    instance_id, total_nudges,
+                )
+                conv.send_message(STUCK_NUDGE_MESSAGE)
+                continue
+            else:
+                logger.warning("%s: stuck, max retries exhausted", instance_id)
+                break
+
+        # Handle FINISHED status — check if agent actually called finish
+        if status == ConversationExecutionStatus.FINISHED:
+            try:
+                events = list(conv.state.events)
+            except Exception:
+                break
+
+            if _agent_finished_with_finish_action(events):
+                break
+
+            if not _agent_sent_message(events):
+                break
+
+            if fake_responses_sent >= max_fake_responses:
+                logger.warning(
+                    "%s: max fake responses (%d) reached, stopping",
+                    instance_id, max_fake_responses,
+                )
+                break
+
+            fake_responses_sent += 1
+            total_nudges += 1
+            logger.info(
+                "%s: agent sent message without tool calls, sending fake "
+                "user response (%d/%d)",
+                instance_id, fake_responses_sent, max_fake_responses,
+            )
+            msg = FAKE_USER_RESPONSE
+            if fake_responses_sent >= 2:
+                msg += (
+                    'If you want to give up, use the "finish" tool to '
+                    "finish the interaction.\n"
+                )
+            conv.send_message(msg)
+            continue
+
+        # Any other status (ERROR, PAUSED, etc.) — stop
+        break
+
+    return total_nudges
 
 
 def solve_one(
@@ -296,18 +475,14 @@ def solve_one(
     *,
     backend: str,
     backend_kwargs: dict[str, Any] | None = None,
-    max_iterations: int = 50,
+    max_iterations: int = 100,
     max_stuck_retries: int = 2,
+    max_fake_responses: int = 10,
+    enable_condenser: bool = True,
     cache_dir: Path | None = None,
     label: str | None = None,
 ) -> Prediction:
-    """Run one OpenHands agent against one problem, return a Prediction.
-
-    If the SDK's StuckDetector fires, sends ``STUCK_NUDGE_MESSAGE`` and
-    resumes the run (up to ``max_stuck_retries`` times) instead of giving up
-    immediately — see the stuck-loop investigation notes for why this is
-    needed even with the escape-bug repair layer installed.
-    """
+    """Run one OpenHands agent against one problem, return a Prediction."""
     from openhands.sdk import Conversation
 
     label = label or f"{backend}+default"
@@ -317,7 +492,7 @@ def solve_one(
     try:
         with checked_out_repo(problem, cache_dir=cache_dir) as ws:
             llm = build_llm(backend, **backend_kwargs)
-            agent = build_agent(llm)
+            agent = build_agent(llm, enable_condenser=enable_condenser)
             conv = Conversation(
                 agent=agent,
                 workspace=str(ws),
@@ -325,20 +500,23 @@ def solve_one(
                 visualizer=None,
             )
             conv.send_message(_format_user_prompt(problem))
-            stuck_retries = run_with_stuck_retries(
+            nudges = run_with_stuck_retries(
                 conv,
                 max_stuck_retries=max_stuck_retries,
+                max_fake_responses=max_fake_responses,
                 instance_id=problem.instance_id,
             )
 
             patch = capture_patch(ws)
+            metrics = _extract_metrics(conv)
             return Prediction(
                 instance_id=problem.instance_id,
                 model_name_or_path=label,
                 model_patch=patch,
                 wall_clock_s=time.monotonic() - t0,
                 agent_iterations=_count_iterations(conv),
-                stuck_retries=stuck_retries,
+                stuck_retries=nudges,
+                **metrics,
             )
     except Exception as e:
         logger.exception("solve_one failed for %s", problem.instance_id)
@@ -353,15 +531,14 @@ def solve_one(
 
 
 def _format_user_prompt(problem: Problem) -> str:
-    hints = (
-        f"\n\nMaintainer hints:\n{problem.hints_text}"
-        if problem.hints_text.strip() else ""
-    )
+    repo_dir = problem.repo.split("/")[-1]
     return (
-        f"Repository: {problem.repo}\n"
-        f"Base commit: {problem.base_commit}\n\n"
-        f"## Problem statement\n\n{problem.problem_statement}{hints}\n\n"
-        "Please make the minimum edit to fix this bug. Do not run tests."
+        f"I have access to a python code repository in the directory "
+        f"/workspace/{repo_dir} . You can explore and modify files using "
+        f"the available tools. Consider the following issue description:\n\n"
+        f"<issue_description>\n{problem.problem_statement}\n</issue_description>\n\n"
+        f"Can you help me implement the necessary changes to the repository "
+        f"so that the requirements specified in the <issue_description> are met?"
     )
 
 
@@ -371,6 +548,25 @@ def _count_iterations(conv) -> int:
         return sum(1 for _ in conv.state.events)
     except Exception:
         return 0
+
+
+def _extract_metrics(conv) -> dict[str, Any]:
+    """Pull token counts and per-call latencies from a finished conversation."""
+    try:
+        m = conv.state.stats.get_combined_metrics()
+        usage = m.accumulated_token_usage
+        pt = usage.prompt_tokens if usage else 0
+        ct = usage.completion_tokens if usage else 0
+        latencies = [r.latency for r in m.response_latencies]
+        return {
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": pt + ct,
+            "num_llm_calls": len(m.token_usages),
+            "response_latencies": latencies,
+        }
+    except Exception:
+        return {}
 
 
 # ─── Top-level run loop ─────────────────────────────────────────────────
@@ -383,8 +579,10 @@ class RunOptions:
     subset_size: int = DEFAULT_SUBSET_N
     subset_indices: list[int] | None = None
     instance_ids: list[str] | None = None  # if set, takes precedence over subset
-    max_iterations: int = 50
+    max_iterations: int = 100
     max_stuck_retries: int = 2
+    max_fake_responses: int = 10
+    enable_condenser: bool = True
     cache_dir: Path | None = None
     output_path: Path = Path("predictions.jsonl")
     label: str | None = None
@@ -421,6 +619,8 @@ def run(options: RunOptions) -> Path:
                 backend_kwargs=options.backend_kwargs,
                 max_iterations=options.max_iterations,
                 max_stuck_retries=options.max_stuck_retries,
+                max_fake_responses=options.max_fake_responses,
+                enable_condenser=options.enable_condenser,
                 cache_dir=options.cache_dir,
                 label=options.label,
             )

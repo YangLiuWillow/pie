@@ -71,34 +71,73 @@ def test_problem_from_row_extracts_needed_fields():
     assert not hasattr(p, "patch")
 
 
+class _FakeEvent:
+    """Minimal event stub for testing fake-user-response detection."""
+    def __init__(self, kind, source=None, action=None):
+        self._kind = kind
+        self.source = source
+        self.action = action
+
+
 class _FakeConversation:
     """Duck-typed stand-in for openhands.sdk.Conversation's run-loop surface.
 
     Scripted with a sequence of statuses to return from successive .run()
     calls, so run_with_stuck_retries's nudge/retry control flow can be
-    tested without a real Agent/tool/workspace (that path needs network —
-    see test_drive_one_problem_end_to_end).
+    tested without a real Agent/tool/workspace.
+
+    ``event_scripts`` maps run index (0-based) to a list of _FakeEvent
+    objects that ``state.events`` should return after that run() call.
+    If not provided, defaults to events that look like a FinishAction
+    on FINISHED status (so the fake-user-response path doesn't fire).
     """
 
-    def __init__(self, statuses_after_run):
+    def __init__(self, statuses_after_run, event_scripts=None):
         from openhands.sdk import ConversationExecutionStatus
 
         self._statuses = list(statuses_after_run)
+        self._event_scripts = event_scripts or {}
         self._status_enum = ConversationExecutionStatus
         self.messages_sent: list[str] = []
         self.run_count = 0
 
         class _State:
             execution_status = None
+            events = []
 
         self.state = _State()
 
     def run(self):
+        idx = self.run_count
         self.run_count += 1
         self.state.execution_status = self._statuses.pop(0)
+        if idx in self._event_scripts:
+            self.state.events = self._event_scripts[idx]
+        elif self.state.execution_status == self._status_enum.FINISHED:
+            self.state.events = [_make_finish_event()]
 
     def send_message(self, message):
         self.messages_sent.append(message)
+
+
+def _make_finish_event():
+    """Create a fake event that looks like a FinishAction to the detector."""
+    try:
+        from openhands.sdk.event import ActionEvent
+        from openhands.sdk.tool.builtins.finish import FinishAction
+        action = FinishAction(message="done")
+        return ActionEvent.model_construct(action=action)
+    except (ImportError, Exception):
+        return _FakeEvent("action", action=type("FinishAction", (), {})())
+
+
+def _make_agent_message_event():
+    """Create a fake event that looks like an agent message (no tool call)."""
+    try:
+        from openhands.sdk.event import MessageEvent
+        return MessageEvent.model_construct(source="agent")
+    except (ImportError, Exception):
+        return _FakeEvent("message", source="agent")
 
 
 def test_run_with_stuck_retries_nudges_then_recovers():
@@ -127,19 +166,63 @@ def test_run_with_stuck_retries_gives_up_after_max():
     ])
     retries = run_with_stuck_retries(conv, max_stuck_retries=2, instance_id="x__y-1")
     assert retries == 2
-    assert conv.run_count == 3  # initial + 2 retries, then gives up
+    assert conv.run_count == 3
     assert conv.state.execution_status == ConversationExecutionStatus.STUCK
 
 
-def test_run_with_stuck_retries_noop_when_not_stuck():
+def test_run_with_stuck_retries_noop_when_finish_action():
+    """When agent calls finish, the run ends cleanly with zero nudges."""
     from openhands.sdk import ConversationExecutionStatus
     from benchmarks.swe_bench import run_with_stuck_retries
 
-    conv = _FakeConversation([ConversationExecutionStatus.FINISHED])
+    conv = _FakeConversation(
+        [ConversationExecutionStatus.FINISHED],
+        event_scripts={0: [_make_finish_event()]},
+    )
     retries = run_with_stuck_retries(conv, max_stuck_retries=2, instance_id="x__y-1")
     assert retries == 0
     assert conv.run_count == 1
     assert conv.messages_sent == []
+
+
+def test_fake_user_response_on_content_only_reply():
+    """When agent sends a message (no tool calls), send a fake user response
+    to keep the conversation going — matching official OpenHands eval."""
+    from openhands.sdk import ConversationExecutionStatus
+    from benchmarks.swe_bench import run_with_stuck_retries, FAKE_USER_RESPONSE
+
+    conv = _FakeConversation(
+        [
+            ConversationExecutionStatus.FINISHED,  # agent sent content-only
+            ConversationExecutionStatus.FINISHED,  # then finishes properly
+        ],
+        event_scripts={
+            0: [_make_agent_message_event()],
+            1: [_make_finish_event()],
+        },
+    )
+    nudges = run_with_stuck_retries(
+        conv, max_stuck_retries=2, max_fake_responses=10, instance_id="x__y-1",
+    )
+    assert nudges == 1
+    assert conv.run_count == 2
+    assert FAKE_USER_RESPONSE in conv.messages_sent[0]
+
+
+def test_fake_user_response_max_limit():
+    """Fake user responses respect the max_fake_responses limit."""
+    from openhands.sdk import ConversationExecutionStatus
+    from benchmarks.swe_bench import run_with_stuck_retries
+
+    conv = _FakeConversation(
+        [ConversationExecutionStatus.FINISHED] * 5,
+        event_scripts={i: [_make_agent_message_event()] for i in range(5)},
+    )
+    nudges = run_with_stuck_retries(
+        conv, max_stuck_retries=2, max_fake_responses=3, instance_id="x__y-1",
+    )
+    assert nudges == 3
+    assert conv.run_count == 4  # initial + 3 fake responses, then cap
 
 
 def test_prediction_jsonl_matches_swebench_grader_schema():
