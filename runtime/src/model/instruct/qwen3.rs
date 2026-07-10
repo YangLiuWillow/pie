@@ -266,15 +266,25 @@ impl QwenInstruct {
     /// Build the tool system prompt matching the Qwen reference format.
     /// Both Qwen3 and Qwen2.5 use identical `<tools>` XML + `<tool_call>` format.
     fn build_tool_system_prompt(tools: &[String]) -> String {
+        // Must match the Jinja2 chat template's output exactly — the model
+        // was fine-tuned on that format and won't produce <tool_call> blocks
+        // if the preamble diverges.
         let mut prompt = String::from(
-            " # Tools\n\n\
+            "\n# Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>"
         );
         for tool in tools {
             prompt.push('\n');
-            prompt.push_str(tool);
+            // Wrap in {"type": "function", "function": ...} if not already
+            // wrapped — the Jinja template renders tools in this envelope and
+            // the model was fine-tuned on it.
+            if tool.contains("\"type\"") && tool.contains("\"function\"") {
+                prompt.push_str(tool);
+            } else {
+                prompt.push_str(&format!("{{\"type\": \"function\", \"function\": {tool}}}"));
+            }
         }
         prompt.push_str(
             "\n</tools>\n\n\
@@ -287,31 +297,77 @@ impl QwenInstruct {
         prompt
     }
 
+    /// Escape a string for embedding in an EBNF string-literal token.
+    fn escape_ebnf_literal(s: &str) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
+    ///
+    /// The grammar enforces well-formed `<tool_call>` blocks with a valid
+    /// tool name and syntactically-valid JSON arguments. The model is free
+    /// to include any properties in any order within the arguments object,
+    /// guided by the few-shot examples and tool descriptions in the prompt.
     fn build_tool_call_grammar(tools: &[String]) -> Option<String> {
-        let mut names: Vec<String> = Vec::new();
+        struct ToolSpec {
+            name: String,
+            #[allow(dead_code)]
+            parameters: Option<serde_json::Value>,
+        }
+
+        let mut specs: Vec<ToolSpec> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                let name = parsed.get("function")
+                let func = parsed.get("function");
+                let name = func
                     .and_then(|f| f.get("name"))
                     .or_else(|| parsed.get("name"))
                     .and_then(|n| n.as_str());
                 if let Some(n) = name {
-                    names.push(format!("\"{}\"", n));
+                    let parameters = func
+                        .and_then(|f| f.get("parameters"))
+                        .or_else(|| parsed.get("parameters"))
+                        .cloned();
+                    specs.push(ToolSpec { name: n.to_string(), parameters });
                 }
             }
         }
-        if names.is_empty() {
+        if specs.is_empty() {
             return None;
         }
 
-        let name_alt = names.join(" | ");
+        let mut tool_json_alts: Vec<String> = Vec::with_capacity(specs.len());
+        let mut extra_rules = String::new();
+
+        // Layer 1: the grammar enforces well-formed `<tool_call>` blocks
+        // with a valid tool name and JSON arguments. Per-tool schema
+        // constraints (layer 2) are intentionally omitted — the model is
+        // free to include any properties in any order, guided by the
+        // few-shot examples and its own training.
+        for (i, spec) in specs.iter().enumerate() {
+            let alt_name = format!("tool-json-{i}");
+            let escaped_name = Self::escape_ebnf_literal(&spec.name);
+            extra_rules.push_str(&format!(
+                "{alt_name} ::= \"{{\\\"name\\\": \\\"{escaped_name}\\\", \\\"arguments\\\": \" json-object \"}}\"\n",
+            ));
+            tool_json_alts.push(alt_name);
+        }
+
+        let tool_json_alt = tool_json_alts.join(" | ");
+
         let grammar = format!(
             r#"root ::= tool-call ("\n" tool-call)*
 tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
-tool-json ::= "{{"  "\"name\": \"" tool-name "\", \"arguments\": " json-object "}}"
-tool-name ::= {name_alt}
-json-object ::= "{{" json-members? "}}"
+tool-json ::= {tool_json_alt}
+{extra_rules}json-object ::= "{{" json-members? "}}"
 json-members ::= json-pair ("," json-pair)*
 json-pair ::= json-string ":" json-value
 json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
@@ -320,8 +376,7 @@ json-chars ::= json-char*
 json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
 json-array ::= "[" (json-value ("," json-value)*)? "]"
-"#,
-            name_alt = name_alt
+"#
         );
         Some(grammar)
     }
@@ -645,6 +700,124 @@ mod tests {
         assert!(inst.tool_call_grammar(&["{}".to_string()]).is_none());
     }
 
+    /// Whether `s` is a complete, legally-terminatable match for `tg`'s
+    /// grammar. `accept_string` walks raw bytes directly, so the tokenizer
+    /// passed to `GrammarMatcher` is irrelevant here (no token-boundary
+    /// concerns for this check).
+    fn matches_grammar(tg: &ToolGrammar, s: &str) -> bool {
+        let mut m = crate::inference::structured::matcher::GrammarMatcher::new(
+            tg.grammar.clone(), make_tok(), vec![], 10,
+        );
+        m.accept_string(s) && m.can_terminate()
+    }
+
+    #[test]
+    fn tool_call_grammar_constrains_arguments_by_schema() {
+        let inst = qwen3();
+        let tool = serde_json::json!({
+            "name": "calculator",
+            "description": "Evaluate an arithmetic expression.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"}
+                },
+                "required": ["expression"],
+                "additionalProperties": false
+            }
+        })
+        .to_string();
+
+        let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
+
+        let valid = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, valid), "well-typed arguments should match");
+
+        // Without per-tool schema constraints, any valid JSON arguments are accepted.
+        let any_args = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
+        assert!(matches_grammar(&tg, any_args), "any valid JSON arguments should be accepted");
+
+        let extra_prop = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\",\"extra\":\"x\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, extra_prop), "extra properties should be accepted");
+
+        let empty_args = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {}}\n</tool_call>";
+        assert!(matches_grammar(&tg, empty_args), "empty arguments should be accepted");
+    }
+
+    #[test]
+    fn tool_call_grammar_multiple_tools_use_independent_names() {
+        let inst = qwen3();
+        let tools = vec![
+            serde_json::json!({
+                "name": "calculator",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expression": {"type": "string"}},
+                    "required": ["expression"]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            })
+            .to_string(),
+        ];
+        let tg = inst.tool_call_grammar(&tools).expect("grammar should build");
+
+        let calc_call = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, calc_call));
+
+        let weather_call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"NYC\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, weather_call));
+
+        // Tool name must match one of the declared tools.
+        let wrong_name = "<tool_call>\n{\"name\": \"unknown\", \"arguments\": {}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, wrong_name), "undeclared tool name must be rejected");
+    }
+
+    #[test]
+    fn tool_call_grammar_falls_back_to_generic_json_without_schema() {
+        // A tool with no "parameters" at all should still produce a usable
+        // grammar (falls back to the generic, unconstrained json-object).
+        let inst = qwen3();
+        let tool = serde_json::json!({"name": "no_args_tool"}).to_string();
+        let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
+
+        let call = "<tool_call>\n{\"name\": \"no_args_tool\", \"arguments\": {\"anything\":123}}\n</tool_call>";
+        assert!(matches_grammar(&tg, call));
+    }
+
+    #[test]
+    fn tool_call_grammar_rejects_free_text() {
+        // OpenHands provides a `finish` tool for signaling completion, so
+        // the model never needs free text — it must always produce a
+        // well-formed tool call.
+        let inst = qwen3();
+        let tool = serde_json::json!({
+            "name": "calculator",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+                "additionalProperties": false
+            }
+        })
+        .to_string();
+        let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
+
+        assert!(!matches_grammar(&tg, "I'm done with the task."));
+        assert!(!matches_grammar(&tg, "The answer is 42."));
+
+        // Tool calls should still be accepted.
+        let valid = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, valid));
+    }
+
     #[test]
     fn full_conversation() {
         let inst = qwen3();
@@ -817,5 +990,24 @@ mod tests {
             text,
             "<|im_start|>user\n<tool_response>\nHello\n</tool_response>\n<tool_response>\nworld\n</tool_response><|im_end|>\n"
         );
+    }
+
+    #[test]
+    fn tool_call_grammar_accepts_any_json_arguments() {
+        let inst = qwen3();
+        let file_editor = r#"{"name": "file_editor"}"#.to_string();
+        let tg = inst.tool_call_grammar(&[file_editor]).expect("grammar should build");
+
+        // Any valid JSON arguments should be accepted
+        let with_old_new = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\":\"str_replace\",\"path\":\"/tmp/test.py\",\"old_str\":\"x\",\"new_str\":\"y\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, with_old_new));
+
+        // Any property order is fine
+        let diff_order = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"old_str\":\"x\",\"command\":\"str_replace\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, diff_order));
+
+        // Empty arguments
+        let empty = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {}}\n</tool_call>";
+        assert!(matches_grammar(&tg, empty));
     }
 }

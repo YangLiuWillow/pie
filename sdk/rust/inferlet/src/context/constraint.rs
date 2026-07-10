@@ -155,7 +155,13 @@ impl GrammarConstraint {
 impl Constrain for GrammarConstraint {
     fn step(&mut self, accepted: &[u32]) -> &[u32] {
         if !accepted.is_empty() {
-            let _ = self.matcher.accept_tokens(accepted);
+            if let Err(e) = self.matcher.accept_tokens(accepted) {
+                debug_assert!(
+                    false,
+                    "GrammarConstraint: accept_tokens failed ({e}) — \
+                     constraint is now out of sync with the model"
+                );
+            }
         }
         self.cached_mask = self.matcher.next_token_logit_mask();
         &self.cached_mask

@@ -169,7 +169,11 @@ def test_transport_call_builds_native_tool_calls_in_response():
     tool_calls = resp.choices[0].message.tool_calls
     assert tool_calls is not None
     assert len(tool_calls) == 1
-    assert tool_calls[0].id == "call_0"
+    # The id is regenerated as a fresh uuid rather than passed through from
+    # the inferlet verbatim (see the comment in `_wrap_as_model_response`) —
+    # only its uniqueness/format matters here, not the exact value.
+    assert tool_calls[0].id.startswith("call_")
+    assert tool_calls[0].id != "call_0"
     assert tool_calls[0].type == "function"
     assert tool_calls[0].function.name == "search"
     assert tool_calls[0].function.arguments == '{"q": "cats"}'
@@ -223,6 +227,86 @@ def test_native_tool_calling_defaults_to_true():
 # ---------------------------------------------------------------
 # Return-value parsing
 # ---------------------------------------------------------------
+
+
+def test_sanitize_tool_args_strips_garbage_keys():
+    """Regression test for the SWE-Bench stuck-loop bug: the 7B model
+    appends garbage keys like ``", "`` that Pydantic ``extra='forbid'``
+    rejects."""
+    from pie_openhands.llm import _sanitize_tool_args
+
+    pie_out = {
+        "tool_calls": [
+            {"name": "terminal", "arguments": '{"command":"pwd && ls",", ":", "}'},
+        ],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "parameters": {
+                    "properties": {
+                        "command": {"type": "string"},
+                        "security_risk": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                },
+            },
+        },
+    ]
+    _sanitize_tool_args(pie_out, tools)
+    import json
+
+    cleaned = json.loads(pie_out["tool_calls"][0]["arguments"])
+    assert cleaned == {"command": "pwd && ls"}
+
+
+def test_sanitize_tool_args_preserves_valid_args():
+    from pie_openhands.llm import _sanitize_tool_args
+
+    pie_out = {
+        "tool_calls": [
+            {
+                "name": "terminal",
+                "arguments": '{"command":"ls","security_risk":"LOW","summary":"List files"}',
+            },
+        ],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "parameters": {
+                    "properties": {
+                        "command": {"type": "string"},
+                        "security_risk": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                },
+            },
+        },
+    ]
+    _sanitize_tool_args(pie_out, tools)
+    import json
+
+    cleaned = json.loads(pie_out["tool_calls"][0]["arguments"])
+    assert cleaned == {"command": "ls", "security_risk": "LOW", "summary": "List files"}
+
+
+def test_sanitize_tool_args_no_op_when_tool_unknown():
+    from pie_openhands.llm import _sanitize_tool_args
+
+    pie_out = {
+        "tool_calls": [
+            {"name": "unknown_tool", "arguments": '{"foo":"bar","junk":"x"}'},
+        ],
+    }
+    _sanitize_tool_args(pie_out, [])
+    import json
+
+    assert json.loads(pie_out["tool_calls"][0]["arguments"]) == {"foo": "bar", "junk": "x"}
 
 
 def test_parse_return_value_handles_json_string():
