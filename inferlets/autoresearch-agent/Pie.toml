@@ -1,0 +1,16 @@
+[package]
+name = "autoresearch-agent"
+version = "0.1.0"
+description = "Autonomous ML research agent (Karpathy's autoresearch) with JSON-schema-constrained generation"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+program = {type = "string", description = "Contents of program.md -- the research instructions"}
+tool_server_url = {type = "string", description = "URL of the tool execution server (e.g. http://127.0.0.1:PORT)"}
+max_experiments = {type = "int", optional = true, description = "Maximum experiment iterations (default: 100)"}
+max_tokens_per_step = {type = "int", optional = true, description = "Max tokens per generation step (default: 4096)"}
+context_token_limit = {type = "int", optional = true, description = "Context window budget in tokens; triggers condensation when approached (default: 28000)"}
+max_observation_chars = {type = "int", optional = true, description = "Max characters per tool observation before truncation (default: 8000)"}
