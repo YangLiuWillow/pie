@@ -4,6 +4,10 @@ The inferlet runs inside a WASM sandbox (no shell access). It sends
 tool-execution requests here via HTTP POST; we run them on the host and
 return the observation text.
 
+Uses OpenHands SDK's ``FileEditor`` for file operations (view, create,
+str_replace, insert, undo_edit) when available, falling back to a simple
+built-in implementation otherwise.
+
 Start with ``start_tool_server(working_dir)`` → ``(server, port)``.
 Stop with ``server.shutdown()``.
 """
@@ -11,14 +15,25 @@ Stop with ``server.shutdown()``.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-MAX_OUTPUT_CHARS = 10_000
+MAX_OUTPUT_CHARS = 16_000
 BASH_TIMEOUT_S = 120
+MAX_EDIT_OLD_LINES = 50
+MAX_EDIT_NEW_LINES = 100
+
+try:
+    from openhands.tools.file_editor.editor import FileEditor
+    from openhands.tools.file_editor.exceptions import ToolError as EditorToolError
+    _HAS_FILE_EDITOR = True
+except ImportError:
+    _HAS_FILE_EDITOR = False
 
 
 def start_tool_server(working_dir: str, *, host: str = "127.0.0.1", port: int = 0) -> tuple[HTTPServer, int]:
@@ -35,7 +50,17 @@ def start_tool_server(working_dir: str, *, host: str = "127.0.0.1", port: int = 
     return server, actual_port
 
 
+def _to_abs_path(path: str, working_dir: str) -> str:
+    """Resolve *path* to an absolute path rooted at *working_dir*."""
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    return str(Path(working_dir) / path)
+
+
 def _make_handler(working_dir: str):
+    editor = FileEditor(workspace_root=working_dir) if _HAS_FILE_EDITOR else None
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             from urllib.parse import urlparse, parse_qs, unquote
@@ -95,11 +120,30 @@ def _make_handler(working_dir: str):
                     result = _exec_bash(req.get("command", ""), working_dir)
                 elif action == "edit":
                     result = _exec_edit(
+                        editor,
                         req.get("path", ""),
                         req.get("old_str", ""),
                         req.get("new_str", ""),
                         working_dir,
                     )
+                elif action == "read_file":
+                    result = _exec_read_file(
+                        editor,
+                        req.get("path", ""),
+                        working_dir,
+                        start_line=req.get("start_line"),
+                        end_line=req.get("end_line"),
+                    )
+                elif action == "insert":
+                    result = _exec_insert(
+                        editor,
+                        req.get("path", ""),
+                        req.get("insert_line", 0),
+                        req.get("new_str", ""),
+                        working_dir,
+                    )
+                elif action == "undo_edit":
+                    result = _exec_undo(editor, req.get("path", ""), working_dir)
                 elif action == "finish":
                     result = {"observation": "Task finished.", "exit_code": 0}
                 else:
@@ -122,70 +166,245 @@ def _make_handler(working_dir: str):
     return Handler
 
 
+# ---------------------------------------------------------------------------
+# Bash
+# ---------------------------------------------------------------------------
+
 def _exec_bash(command: str, working_dir: str) -> dict[str, Any]:
     if not command.strip():
         return {"observation": "(empty command)", "exit_code": 1}
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=working_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            timeout=BASH_TIMEOUT_S,
-        )
+        stdout, stderr = proc.communicate(timeout=BASH_TIMEOUT_S)
     except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
         return {"observation": f"Command timed out after {BASH_TIMEOUT_S}s", "exit_code": 124}
-    output = proc.stdout + proc.stderr
+    output = stdout + stderr
     if len(output) > MAX_OUTPUT_CHARS:
         half = MAX_OUTPUT_CHARS // 2
         output = output[:half] + f"\n\n... ({len(output) - MAX_OUTPUT_CHARS} chars truncated) ...\n\n" + output[-half:]
     return {"observation": output, "exit_code": proc.returncode}
 
 
-def _exec_edit(path: str, old_str: str, new_str: str, working_dir: str) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# File operations — delegated to OpenHands FileEditor when available
+# ---------------------------------------------------------------------------
+
+def _obs_text(obs) -> str:
+    """Extract the text string from a ``FileEditorObservation``."""
+    if hasattr(obs, "content") and obs.content:
+        return obs.content[0].text
+    return str(obs)
+
+
+def _exec_edit(
+    editor: "FileEditor | None",
+    path: str,
+    old_str: str,
+    new_str: str,
+    working_dir: str,
+) -> dict[str, Any]:
     if not path:
         return {"observation": "Error: path is required for edit", "exit_code": 1}
-    file_path = Path(working_dir) / path.lstrip("/")
+
+    abs_path = _to_abs_path(path, working_dir)
+
+    # --- Create ---
     if not old_str:
+        if editor is not None:
+            try:
+                obs = editor(command="create", path=abs_path, file_text=new_str)
+                return {"observation": _obs_text(obs), "exit_code": 0}
+            except EditorToolError:
+                pass
+        # Fallback: simple write (handles overwrite, which FileEditor rejects)
+        file_path = Path(abs_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(new_str)
         return {"observation": f"File created: {path}", "exit_code": 0}
+
+    # --- str_replace ---
+    old_lines = old_str.count("\n") + 1
+    new_lines = new_str.count("\n") + 1
+    if old_lines > MAX_EDIT_OLD_LINES:
+        return {"observation": f"Error: old_str has {old_lines} lines (max {MAX_EDIT_OLD_LINES}). Break into smaller edits.", "exit_code": 1}
+    if new_lines > MAX_EDIT_NEW_LINES:
+        return {"observation": f"Error: new_str has {new_lines} lines (max {MAX_EDIT_NEW_LINES}). Break into smaller edits.", "exit_code": 1}
+
+    if editor is not None:
+        try:
+            obs = editor(
+                command="str_replace",
+                path=abs_path,
+                old_str=old_str,
+                new_str=new_str,
+            )
+            text = _obs_text(obs)
+            # Python syntax check on top of FileEditor's response
+            if path.endswith(".py"):
+                new_content = Path(abs_path).read_text()
+                try:
+                    compile(new_content, path, "exec")
+                except SyntaxError as e:
+                    text += f"\nWARNING: SyntaxError after edit — {e.msg} (line {e.lineno}). Please fix."
+            return {"observation": text, "exit_code": 0}
+        except EditorToolError as e:
+            return {"observation": f"Error: {e.message}", "exit_code": 1}
+
+    # Fallback: built-in str_replace
+    return _exec_edit_builtin(path, old_str, new_str, working_dir)
+
+
+def _exec_edit_builtin(path: str, old_str: str, new_str: str, working_dir: str) -> dict[str, Any]:
+    """Built-in str_replace for when FileEditor is unavailable."""
+    file_path = Path(working_dir) / path.lstrip("/")
     if not file_path.exists():
         return {"observation": f"Error: file not found: {path}", "exit_code": 1}
     content = file_path.read_text()
     count = content.count(old_str)
     if count == 0:
-        return {"observation": f"Error: old_str not found in {path}", "exit_code": 1}
+        return {"observation": f"Error: old_str not found in {path}. Use read_file to see the actual content.", "exit_code": 1}
     if count > 1:
-        return {"observation": f"Error: old_str found {count} times in {path} (must be unique)", "exit_code": 1}
+        return {"observation": f"Error: old_str found {count} times in {path} (must be unique — add more surrounding context)", "exit_code": 1}
     new_content = content.replace(old_str, new_str, 1)
     file_path.write_text(new_content)
 
     obs_parts = [f"File edited: {path}"]
-
-    # Syntax check for Python files
     if path.endswith(".py"):
         try:
             compile(new_content, path, "exec")
         except SyntaxError as e:
             obs_parts.append(f"WARNING: SyntaxError after edit — {e.msg} (line {e.lineno}). Please fix.")
 
-    # Show context around the edit location
     edit_start = content.find(old_str)
-    new_start = edit_start
     lines = new_content.splitlines()
     char_count = 0
     edit_line = 0
     for i, line in enumerate(lines):
         char_count += len(line) + 1
-        if char_count > new_start:
+        if char_count > edit_start:
             edit_line = i
             break
-    ctx_start = max(0, edit_line - 2)
-    ctx_end = min(len(lines), edit_line + len(new_str.splitlines()) + 2)
+    ctx_start = max(0, edit_line - 4)
+    ctx_end = min(len(lines), edit_line + len(new_str.splitlines()) + 4)
     context_lines = lines[ctx_start:ctx_end]
-    snippet = "\n".join(f"  {ctx_start + j + 1:4d} | {l}" for j, l in enumerate(context_lines))
+    snippet = "\n".join(f"{ctx_start + j + 1:6}\t{l}" for j, l in enumerate(context_lines))
     obs_parts.append(f"Context:\n{snippet}")
-
     return {"observation": "\n".join(obs_parts), "exit_code": 0}
+
+
+def _exec_read_file(
+    editor: "FileEditor | None",
+    path: str,
+    working_dir: str,
+    *,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> dict[str, Any]:
+    if not path:
+        return {"observation": "Error: path is required for read_file", "exit_code": 1}
+
+    abs_path = _to_abs_path(path, working_dir)
+
+    if editor is not None:
+        try:
+            view_range = None
+            if start_line is not None and end_line is not None:
+                view_range = [int(start_line), int(end_line)]
+            elif start_line is not None:
+                view_range = [int(start_line), -1]
+            obs = editor(command="view", path=abs_path, view_range=view_range)
+            return {"observation": _obs_text(obs), "exit_code": 0}
+        except EditorToolError as e:
+            return {"observation": f"Error: {e.message}", "exit_code": 1}
+
+    # Fallback: built-in
+    return _exec_read_file_builtin(path, working_dir)
+
+
+def _exec_read_file_builtin(path: str, working_dir: str) -> dict[str, Any]:
+    file_path = Path(working_dir) / path.lstrip("/")
+    if not file_path.exists():
+        return {"observation": f"Error: file not found: {path}", "exit_code": 1}
+    content = file_path.read_text()
+    lines = content.splitlines()
+    numbered = "\n".join(f"{i+1:6}\t{l}" for i, l in enumerate(lines))
+    if len(numbered) > MAX_OUTPUT_CHARS:
+        half = MAX_OUTPUT_CHARS // 2
+        numbered = numbered[:half] + f"\n\n... ({len(numbered) - MAX_OUTPUT_CHARS} chars truncated) ...\n\n" + numbered[-half:]
+    return {"observation": numbered, "exit_code": 0}
+
+
+def _exec_insert(
+    editor: "FileEditor | None",
+    path: str,
+    insert_line: int,
+    new_str: str,
+    working_dir: str,
+) -> dict[str, Any]:
+    if not path:
+        return {"observation": "Error: path is required for insert", "exit_code": 1}
+
+    abs_path = _to_abs_path(path, working_dir)
+
+    if editor is not None:
+        try:
+            obs = editor(
+                command="insert",
+                path=abs_path,
+                insert_line=int(insert_line),
+                new_str=new_str,
+            )
+            text = _obs_text(obs)
+            if path.endswith(".py"):
+                new_content = Path(abs_path).read_text()
+                try:
+                    compile(new_content, path, "exec")
+                except SyntaxError as e:
+                    text += f"\nWARNING: SyntaxError after edit — {e.msg} (line {e.lineno}). Please fix."
+            return {"observation": text, "exit_code": 0}
+        except EditorToolError as e:
+            return {"observation": f"Error: {e.message}", "exit_code": 1}
+
+    # Fallback: built-in line insertion
+    file_path = Path(working_dir) / path.lstrip("/")
+    if not file_path.exists():
+        return {"observation": f"Error: file not found: {path}", "exit_code": 1}
+    lines = file_path.read_text().splitlines(keepends=True)
+    insert_line = int(insert_line)
+    if insert_line < 0 or insert_line > len(lines):
+        return {"observation": f"Error: insert_line {insert_line} out of range [0, {len(lines)}]", "exit_code": 1}
+    new_lines = new_str.split("\n")
+    for i, nl in enumerate(new_lines):
+        lines.insert(insert_line + i, nl + "\n")
+    file_path.write_text("".join(lines))
+    return {"observation": f"Inserted {len(new_lines)} line(s) after line {insert_line} in {path}", "exit_code": 0}
+
+
+def _exec_undo(
+    editor: "FileEditor | None",
+    path: str,
+    working_dir: str,
+) -> dict[str, Any]:
+    if not path:
+        return {"observation": "Error: path is required for undo_edit", "exit_code": 1}
+
+    abs_path = _to_abs_path(path, working_dir)
+
+    if editor is not None:
+        try:
+            obs = editor(command="undo_edit", path=abs_path)
+            return {"observation": _obs_text(obs), "exit_code": 0}
+        except EditorToolError as e:
+            return {"observation": f"Error: {e.message}", "exit_code": 1}
+
+    return {"observation": "Error: undo_edit requires OpenHands SDK (not installed)", "exit_code": 1}
