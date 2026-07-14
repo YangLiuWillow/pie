@@ -1,0 +1,18 @@
+[package]
+name = "openclaw-chat"
+version = "0.1.0"
+description = "Chat completion inferlet for the OpenClaw integration. Accepts OpenAI-style messages and tools, streams text deltas, returns structured output with tool calls."
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+messages    = {type = "string", description = "JSON array of chat messages (OpenAI shape: role/content/tool_calls/tool_call_id)"}
+tools       = {type = "string", optional = true, description = "JSON array of tool specs (OpenAI shape: {function: {name, description, parameters}})"}
+max_tokens  = {type = "int",    optional = true, description = "Hard cap on generated tokens. Default 4096."}
+temperature = {type = "float",  optional = true, description = "Sampling temperature. 0 = greedy. Default 0.0."}
+top_p       = {type = "float",  optional = true, description = "Nucleus sampling threshold. Default 0.95."}
+stop        = {type = "string", optional = true, description = "JSON array of stop strings."}
+session_id  = {type = "string", optional = true, description = "Save/resume KV cache under this name for multi-turn persistence."}
+resume_from = {type = "int",    optional = true, description = "Number of messages already in the saved context. Only messages[resume_from..] are appended."}
