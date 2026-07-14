@@ -8,6 +8,7 @@ imported directly from `pie_driver`.
 
 from __future__ import annotations
 
+import re
 import random
 
 import numpy as np
@@ -32,7 +33,15 @@ def _normalize_arch_name(raw_arch: str) -> str:
     """
     lowered = raw_arch.lower()
     suffix = "forcausallm"
-    return lowered[: -len(suffix)] if lowered.endswith(suffix) else lowered
+    name = lowered[: -len(suffix)] if lowered.endswith(suffix) else lowered
+    # The Rust instruct::create() match arms use underscores before component
+    # words (e.g. "qwen3_moe", "gemma3_text") but the HF CamelCase architecture
+    # string collapses them (Qwen3MoeForCausalLM → "qwen3moe").  Re-insert
+    # the underscore so the Rust side picks the correct instruct config
+    # (has_tools / has_thinking) instead of falling through to the generic
+    # default.
+    name = re.sub(r"(?<=[a-z0-9])(moe|text)(?=$|_)", r"_\1", name)
+    return name
 
 
 class VllmEngine:
@@ -130,6 +139,14 @@ class VllmEngine:
             config, driver_config, log_queue=log_queue,
         )
         _log("Loaded vllm model", "DEBUG")
+
+        # vLLM >=0.16 requires WorkspaceManager for MoE fused-expert kernels.
+        try:
+            from vllm.v1.worker.workspace import init_workspace_manager
+            device = torch.device(config.devices[config.rank])
+            init_workspace_manager(device)
+        except (ImportError, AttributeError):
+            pass
 
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)

@@ -8,8 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIE=/nfs/roberts/project/pi_ql324/ly337/pie/target/release/pie
-WASM=/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-completion/target/wasm32-wasip2/release/openhands_completion.wasm
-MANIFEST=/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-completion/Pie.toml
+BACKEND=${BACKEND:-pie}
 CFG=${CFG:-$SCRIPT_DIR/tests/fixtures/pie_cuda_vllm_config.toml}
 MODEL=${MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}
 LABEL=${LABEL:-pie+qwen2.5-coder-7b}
@@ -22,6 +21,16 @@ LOG_DIR=$SCRIPT_DIR/logs
 PRED_DIR=$SCRIPT_DIR/predictions
 PIE_PORT=18080
 
+if [ "$BACKEND" = "pie-agent" ]; then
+    WASM=/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-agent/target/wasm32-wasip2/release/openhands_agent.wasm
+    MANIFEST=/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-agent/Pie.toml
+    INFERLET_NAME="openhands-agent@0.1.0"
+else
+    WASM=/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-completion/target/wasm32-wasip2/release/openhands_completion.wasm
+    MANIFEST=/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-completion/Pie.toml
+    INFERLET_NAME="openhands-completion@0.1.0"
+fi
+
 mkdir -p "$LOG_DIR" "$PRED_DIR"
 
 # Pass remaining args through to $HARNESS
@@ -31,7 +40,7 @@ if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT="$PRED_DIR/${OUTPUT_PREFIX}_${TIMESTAMP}.jsonl"
+OUTPUT=${OUTPUT:-"$PRED_DIR/${OUTPUT_PREFIX}_${TIMESTAMP}.jsonl"}
 PIE_LOG="$LOG_DIR/pie_serve_${TIMESTAMP}.log"
 
 echo "=== Phase 1 SWE-Bench: Pie backend ==="
@@ -74,19 +83,17 @@ fi
 
 # Install the inferlet
 echo ""
-echo "[2/3] Installing openhands-completion inferlet..."
+echo "[2/3] Installing $INFERLET_NAME inferlet..."
 PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 \
+  WASM="$WASM" MANIFEST="$MANIFEST" \
   $VENV/bin/python - <<'PY'
-import asyncio
+import asyncio, os
 from pie_client import PieClient
-
-WASM = "/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-completion/target/wasm32-wasip2/release/openhands_completion.wasm"
-MANIFEST = "/nfs/roberts/project/pi_ql324/ly337/pie/inferlets/openhands-completion/Pie.toml"
 
 async def install():
     async with PieClient("ws://127.0.0.1:18080") as c:
         await c.authenticate("local-dev")
-        await c.install_program(WASM, MANIFEST, force_overwrite=True)
+        await c.install_program(os.environ["WASM"], os.environ["MANIFEST"], force_overwrite=True)
         print("  inferlet installed")
 
 asyncio.run(install())
@@ -94,11 +101,12 @@ PY
 
 # Run the benchmark
 echo ""
-echo "[3/3] Running $HARNESS (Pie backend)..."
+echo "[3/3] Running $HARNESS ($BACKEND backend)..."
 PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 HF_HOME=$HF_HOME \
   $VENV/bin/python -m "$HARNESS" \
-    --backend pie \
+    --backend "$BACKEND" \
     --pie-uri ws://127.0.0.1:$PIE_PORT \
+    --pie-inferlet "$INFERLET_NAME" \
     --model "$MODEL" \
     --pie-request-timeout-s "$REQUEST_TIMEOUT_S" \
     --output "$OUTPUT" \

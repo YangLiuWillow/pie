@@ -40,7 +40,7 @@ from benchmarks import swe_bench
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--backend", choices=["pie", "litellm", "test"], default="test")
+    p.add_argument("--backend", choices=["pie", "pie-agent", "litellm", "test"], default="test")
 
     # Subset selection
     g = p.add_mutually_exclusive_group()
@@ -83,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="model_name_or_path label in the predictions JSONL.")
     p.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "swebench-clones",
                    help="Bare-repo cache for fast multi-problem runs.")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip instances already present in the output file. "
+                        "Useful for resuming after preemption.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--log-completions", type=Path, default=None,
                    help="If set, write raw LLM request/response JSON per completion "
@@ -126,6 +129,11 @@ def main(argv: list[str] | None = None) -> int:
         backend_kwargs["pie_request_timeout_s"] = args.pie_request_timeout_s
         if args.model:
             backend_kwargs["model"] = args.model
+    elif args.backend == "pie-agent":
+        backend_kwargs["pie_uri"] = args.pie_uri
+        backend_kwargs["pie_inferlet"] = args.pie_inferlet
+        backend_kwargs["timeout_s"] = args.pie_request_timeout_s
+        backend_kwargs["max_steps"] = args.max_iterations
 
     options = swe_bench.RunOptions(
         backend=args.backend,
@@ -139,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_dir=args.cache_dir,
         output_path=args.output,
         label=args.label or f"{args.backend}+{args.model or 'default'}",
+        resume=args.resume,
     )
 
     swe_bench.run(options)

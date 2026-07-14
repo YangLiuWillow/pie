@@ -45,6 +45,7 @@ Key features ported from the official OpenHands benchmarks repo
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
@@ -530,11 +531,18 @@ def solve_one(
         )
 
 
-def _format_user_prompt(problem: Problem) -> str:
+def _format_user_prompt(problem: Problem, *, use_cwd: bool = False) -> str:
     repo_dir = problem.repo.split("/")[-1]
+    if use_cwd:
+        location = (
+            "the current working directory (use `pwd` to see the absolute "
+            "path, and relative paths like `./django/` to explore)"
+        )
+    else:
+        location = f"/workspace/{repo_dir}"
     return (
-        f"I have access to a python code repository in the directory "
-        f"/workspace/{repo_dir} . You can explore and modify files using "
+        f"I have access to a python code repository in {location} . "
+        f"You can explore and modify files using "
         f"the available tools. Consider the following issue description:\n\n"
         f"<issue_description>\n{problem.problem_statement}\n</issue_description>\n\n"
         f"Can you help me implement the necessary changes to the repository "
@@ -569,6 +577,105 @@ def _extract_metrics(conv) -> dict[str, Any]:
         return {}
 
 
+# ─── Pattern A: pie-agent backend (full loop inside inferlet) ───────────
+
+
+async def _run_agent_inferlet(
+    pie_uri: str,
+    pie_inferlet: str,
+    *,
+    task: str,
+    tool_server_url: str,
+    max_steps: int,
+    max_tokens_per_step: int = 4096,
+    timeout_s: float = 3600.0,
+) -> dict[str, Any]:
+    """Launch the openhands-agent inferlet and wait for it to finish."""
+    from pie_client import Event, PieClient
+
+    input_payload = {
+        "task": task,
+        "tool_server_url": tool_server_url,
+        "max_steps": max_steps,
+        "max_tokens_per_step": max_tokens_per_step,
+    }
+    async with PieClient(pie_uri) as client:
+        await client.authenticate("local-dev")
+        proc = await client.launch_process(pie_inferlet, input=input_payload)
+        stdout_chunks: list[str] = []
+        while True:
+            event, value = await asyncio.wait_for(proc.recv(), timeout=timeout_s)
+            if event == Event.Stdout:
+                chunk = value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value)
+                stdout_chunks.append(chunk)
+                logger.debug("inferlet stdout: %s", chunk.rstrip())
+            elif event == Event.Return:
+                if value is None:
+                    return {"finished": False, "message": "".join(stdout_chunks)}
+                if isinstance(value, dict):
+                    return value
+                s = value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value)
+                try:
+                    return json.loads(s)
+                except json.JSONDecodeError:
+                    return {"finished": False, "message": s}
+            elif event == Event.Error:
+                raise RuntimeError(f"Inferlet error: {value!r}")
+
+
+def solve_one_agent(
+    problem: Problem,
+    *,
+    pie_uri: str = "ws://127.0.0.1:8080",
+    pie_inferlet: str = "openhands-agent@0.1.0",
+    max_steps: int = 50,
+    max_tokens_per_step: int = 4096,
+    timeout_s: float = 3600.0,
+    cache_dir: Path | None = None,
+    label: str | None = None,
+) -> Prediction:
+    """Run one problem using the Pattern A agent (full loop inside inferlet)."""
+    from tool_server import start_tool_server
+
+    label = label or "pie-agent+default"
+    t0 = time.monotonic()
+
+    try:
+        with checked_out_repo(problem, cache_dir=cache_dir) as ws:
+            server, port = start_tool_server(str(ws))
+            try:
+                result = asyncio.run(_run_agent_inferlet(
+                    pie_uri,
+                    pie_inferlet,
+                    task=_format_user_prompt(problem, use_cwd=True),
+                    tool_server_url=f"http://127.0.0.1:{port}",
+                    max_steps=max_steps,
+                    max_tokens_per_step=max_tokens_per_step,
+                    timeout_s=timeout_s,
+                ))
+            finally:
+                server.shutdown()
+
+            patch = capture_patch(ws)
+            return Prediction(
+                instance_id=problem.instance_id,
+                model_name_or_path=label,
+                model_patch=patch,
+                wall_clock_s=time.monotonic() - t0,
+                agent_iterations=0,
+            )
+    except Exception as e:
+        logger.exception("solve_one_agent failed for %s", problem.instance_id)
+        return Prediction(
+            instance_id=problem.instance_id,
+            model_name_or_path=label,
+            model_patch="",
+            wall_clock_s=time.monotonic() - t0,
+            agent_iterations=0,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
 # ─── Top-level run loop ─────────────────────────────────────────────────
 
 
@@ -586,6 +693,7 @@ class RunOptions:
     cache_dir: Path | None = None
     output_path: Path = Path("predictions.jsonl")
     label: str | None = None
+    resume: bool = False
 
 
 def run(options: RunOptions) -> Path:
@@ -609,21 +717,48 @@ def run(options: RunOptions) -> Path:
         selected = [rows[i] for i in indices]
 
     options.output_path.parent.mkdir(parents=True, exist_ok=True)
-    with options.output_path.open("w") as f:
+
+    done_ids: set[str] = set()
+    if options.resume and options.output_path.exists():
+        with options.output_path.open() as existing:
+            for line in existing:
+                line = line.strip()
+                if line:
+                    done_ids.add(json.loads(line)["instance_id"])
+        if done_ids:
+            logger.info("resume: skipping %d already-completed instances", len(done_ids))
+
+    with options.output_path.open("a" if options.resume else "w") as f:
         for row in selected:
             problem = Problem.from_row(row)
+            if problem.instance_id in done_ids:
+                logger.info("skipping %s (already completed)", problem.instance_id)
+                continue
             logger.info("solving %s (%s)", problem.instance_id, problem.repo)
-            pred = solve_one(
-                problem,
-                backend=options.backend,
-                backend_kwargs=options.backend_kwargs,
-                max_iterations=options.max_iterations,
-                max_stuck_retries=options.max_stuck_retries,
-                max_fake_responses=options.max_fake_responses,
-                enable_condenser=options.enable_condenser,
-                cache_dir=options.cache_dir,
-                label=options.label,
-            )
+            if options.backend == "pie-agent":
+                bk = options.backend_kwargs
+                pred = solve_one_agent(
+                    problem,
+                    pie_uri=bk.get("pie_uri", "ws://127.0.0.1:8080"),
+                    pie_inferlet=bk.get("pie_inferlet", "openhands-agent@0.1.0"),
+                    max_steps=bk.get("max_steps", options.max_iterations),
+                    max_tokens_per_step=bk.get("max_tokens_per_step", 4096),
+                    timeout_s=bk.get("timeout_s", 3600.0),
+                    cache_dir=options.cache_dir,
+                    label=options.label,
+                )
+            else:
+                pred = solve_one(
+                    problem,
+                    backend=options.backend,
+                    backend_kwargs=options.backend_kwargs,
+                    max_iterations=options.max_iterations,
+                    max_stuck_retries=options.max_stuck_retries,
+                    max_fake_responses=options.max_fake_responses,
+                    enable_condenser=options.enable_condenser,
+                    cache_dir=options.cache_dir,
+                    label=options.label,
+                )
             f.write(pred.to_jsonl() + "\n")
             f.flush()
             logger.info(

@@ -14,6 +14,17 @@ VLLM_PORT=18000
 HARNESS=${HARNESS:-benchmarks.run_swe_bench}
 
 MODEL=${MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}
+LABEL=${LABEL:-litellm+$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]')}
+VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS:-}
+
+# Auto-select tool-call parser based on model name
+if [ -z "${TOOL_CALL_PARSER:-}" ]; then
+    case "$MODEL" in
+        *Qwen3-Coder*) TOOL_CALL_PARSER=qwen3_coder ;;
+        *Qwen3*)       TOOL_CALL_PARSER=qwen3_xml ;;
+        *)             TOOL_CALL_PARSER=hermes ;;
+    esac
+fi
 
 mkdir -p "$LOG_DIR" "$PRED_DIR"
 
@@ -23,12 +34,13 @@ if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT="$PRED_DIR/litellm_qwen25_coder_7b_${TIMESTAMP}.jsonl"
+OUTPUT=${OUTPUT:-"$PRED_DIR/litellm_${TIMESTAMP}.jsonl"}
 VLLM_LOG="$LOG_DIR/vllm_serve_${TIMESTAMP}.log"
 
 echo "=== Baseline: LiteLLM + vLLM (no Pie) ==="
 echo "  Harness:  $HARNESS"
 echo "  Model:    $MODEL"
+echo "  Label:    $LABEL"
 echo "  Output:   $OUTPUT"
 echo "  vLLM log: $VLLM_LOG"
 echo "  Args:     ${EXTRA_ARGS[*]}"
@@ -41,10 +53,13 @@ PYTHONPATH="" HF_HOME=$HF_HOME \
     --model "$MODEL" \
     --port $VLLM_PORT \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.90 \
     --max-model-len 32768 \
+    --enforce-eager \
+    --generation-config vllm \
     --enable-auto-tool-choice \
-    --tool-call-parser hermes \
+    --tool-call-parser "$TOOL_CALL_PARSER" \
+    $VLLM_EXTRA_ARGS \
     > "$VLLM_LOG" 2>&1 &
 VLLM_PID=$!
 trap "echo 'Stopping vllm (PID $VLLM_PID)'; kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null" EXIT
@@ -80,7 +95,7 @@ PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 HF_HOME=$HF_HOME \
     --base-url "http://localhost:$VLLM_PORT/v1" \
     --api-key dummy \
     --output "$OUTPUT" \
-    --label "litellm+qwen2.5-coder-7b" \
+    --label "$LABEL" \
     --verbose \
     "${EXTRA_ARGS[@]}"
 
