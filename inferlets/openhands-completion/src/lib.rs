@@ -231,13 +231,40 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
+    // The Generator consumes its stop token internally, so a natural stop
+    // can fall through the explicit eos/stop-string checks above with the
+    // "length" default still in place. Only report "length" when the token
+    // budget was actually exhausted — OpenHands treats "length" as a
+    // truncated response.
+    if stop_reason == "length" && generated.len() < input.max_tokens {
+        stop_reason = "eos";
+    }
+
     let full_text = model
         .tokenizer()
         .decode(&generated)
         .unwrap_or_else(|_| String::from("[decode error]"));
 
+    // Fallback for models that write a tool call as a fenced JSON block
+    // instead of <tool_call> tags (observed on Qwen2.5-Coder-32B at t=0
+    // with the grammar constraint off — traj job 18819521).
+    let mut fence_split_at: Option<usize> = None;
+    if tool_calls.is_empty() {
+        for (offset, name, args) in parse_fenced_tool_calls(&full_text) {
+            fence_split_at.get_or_insert(offset);
+            tool_calls.push(ToolCallOut {
+                id: format!("call_{}", tool_calls.len()),
+                name,
+                arguments: args,
+            });
+        }
+    }
+
     let text = if tool_calls.is_empty() {
         trim_trailing_stop(&full_text, &input.stop).to_string()
+    } else if let Some(at) = fence_split_at {
+        // Fence-parsed calls: content is the prose before the first fence.
+        full_text[..at].trim().to_string()
     } else {
         // Only the free text that preceded the first tool call is meaningful
         // content — the <tool_call> blocks themselves are already captured
@@ -350,6 +377,34 @@ fn replay_history(
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
+/// Extract tool calls written as fenced JSON blocks: a ``` fence (with or
+/// without a language tag) whose body is an object with a string `name`
+/// and an object `arguments`. Returns `(fence_byte_offset, name,
+/// arguments_json)` per match, in order.
+fn parse_fenced_tool_calls(text: &str) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find("```") {
+        let fence_at = pos + rel;
+        let after = &text[fence_at + 3..];
+        // Skip the language tag line (e.g. "json\n"); a fence with no
+        // newline at all has no body.
+        let Some(nl) = after.find('\n') else { break };
+        let body_and_more = &after[nl + 1..];
+        let Some(end) = body_and_more.find("```") else { break };
+        let body = body_and_more[..end].trim();
+        pos = fence_at + 3 + nl + 1 + end + 3;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            let name = v.get("name").and_then(|n| n.as_str());
+            let args = v.get("arguments").filter(|a| a.is_object());
+            if let (Some(name), Some(args)) = (name, args) {
+                out.push((fence_at, name.to_string(), args.to_string()));
+            }
+        }
+    }
+    out
+}
+
 fn trim_trailing_stop<'a>(text: &'a str, stops: &[String]) -> &'a str {
     for s in stops {
         if let Some(stripped) = text.strip_suffix(s.as_str()) {
@@ -357,4 +412,45 @@ fn trim_trailing_stop<'a>(text: &'a str, stops: &[String]) -> &'a str {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fenced_tool_calls;
+
+    #[test]
+    fn fenced_tool_call_is_extracted() {
+        let text = "Let's search first.\n\n```json\n{\"name\": \"terminal\", \"arguments\": {\"command\": \"grep -r x .\"}}\n```";
+        let calls = parse_fenced_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        let (at, name, args) = &calls[0];
+        assert_eq!(name, "terminal");
+        assert!(args.contains("grep -r x ."));
+        assert_eq!(&text[..*at], "Let's search first.\n\n");
+    }
+
+    #[test]
+    fn non_tool_fences_are_ignored() {
+        let text = "Example:\n```python\nprint('hi')\n```\nand JSON that is not a call:\n```json\n{\"foo\": 1}\n```";
+        assert!(parse_fenced_tool_calls(text).is_empty());
+    }
+
+    #[test]
+    fn multiple_fences_mixed() {
+        let text = "```json\n{\"name\": \"a\", \"arguments\": {}}\n```\ntext\n```json\n{\"name\": \"b\", \"arguments\": {\"k\": 2}}\n```";
+        let calls = parse_fenced_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, "a");
+        assert_eq!(calls[1].1, "b");
+    }
+
+    #[test]
+    fn unterminated_fence_is_ignored() {
+        assert!(parse_fenced_tool_calls("```json\n{\"name\": \"a\", \"arguments\": {}}").is_empty());
+    }
+
+    #[test]
+    fn arguments_must_be_object() {
+        assert!(parse_fenced_tool_calls("```json\n{\"name\": \"a\", \"arguments\": \"str\"}\n```").is_empty());
+    }
 }

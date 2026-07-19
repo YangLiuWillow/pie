@@ -306,13 +306,40 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
+    // The Generator consumes its stop token internally, so a natural stop
+    // can fall through the explicit eos/stop-string checks above with the
+    // "length" default still in place. Only report "length" when the token
+    // budget was actually exhausted — OpenHands treats "length" as a
+    // truncated response.
+    if stop_reason == "length" && generated.len() < input.max_tokens {
+        stop_reason = "eos";
+    }
+
     let full_text = model
         .tokenizer()
         .decode(&generated)
         .unwrap_or_else(|_| String::from("[decode error]"));
 
+    // Fallback for models that write a tool call as a fenced JSON block
+    // instead of <tool_call> tags (observed on Qwen2.5-Coder-32B at t=0
+    // with the grammar constraint off — traj job 18819521).
+    let mut fence_split_at: Option<usize> = None;
+    if tool_calls.is_empty() {
+        for (offset, name, args) in parse_fenced_tool_calls(&full_text) {
+            fence_split_at.get_or_insert(offset);
+            tool_calls.push(ToolCallOut {
+                id: format!("call_{}", tool_calls.len()),
+                name,
+                arguments: args,
+            });
+        }
+    }
+
     let text = if tool_calls.is_empty() {
         trim_trailing_stop(&full_text, &input.stop).to_string()
+    } else if let Some(at) = fence_split_at {
+        // Fence-parsed calls: content is the prose before the first fence.
+        full_text[..at].trim().to_string()
     } else {
         // Only the free text that preceded the first tool call is meaningful
         // content — the <tool_call> blocks themselves are already captured
@@ -337,6 +364,34 @@ async fn main(input: Input) -> Result<Output> {
         tokens_generated: generated.len(),
         session,
     })
+}
+
+/// Extract tool calls written as fenced JSON blocks: a ``` fence (with or
+/// without a language tag) whose body is an object with a string `name`
+/// and an object `arguments`. Returns `(fence_byte_offset, name,
+/// arguments_json)` per match, in order.
+fn parse_fenced_tool_calls(text: &str) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find("```") {
+        let fence_at = pos + rel;
+        let after = &text[fence_at + 3..];
+        // Skip the language tag line (e.g. "json\n"); a fence with no
+        // newline at all has no body.
+        let Some(nl) = after.find('\n') else { break };
+        let body_and_more = &after[nl + 1..];
+        let Some(end) = body_and_more.find("```") else { break };
+        let body = body_and_more[..end].trim();
+        pos = fence_at + 3 + nl + 1 + end + 3;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            let name = v.get("name").and_then(|n| n.as_str());
+            let args = v.get("arguments").filter(|a| a.is_object());
+            if let (Some(name), Some(args)) = (name, args) {
+                out.push((fence_at, name.to_string(), args.to_string()));
+            }
+        }
+    }
+    out
 }
 
 // ─── Session context construction ──────────────────────────────────────────
