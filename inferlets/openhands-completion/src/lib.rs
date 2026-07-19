@@ -308,12 +308,13 @@ async fn main(input: Input) -> Result<Output> {
                 }
                 drop(g2);
             }
-            fk.destroy();
+            // Plain drop, not destroy(): eager destroy + the handle's own
+            // resource drop double-deletes host-side. Instance exit
+            // collects the anonymous fork.
+            drop(fk);
         }
     }
-    if let Some(fk) = phase2_fork.take() {
-        fk.destroy();
-    }
+    drop(phase2_fork.take());
 
     let text = if tool_calls.is_empty() {
         trim_trailing_stop(&full_text, &input.stop).to_string()

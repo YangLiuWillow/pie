@@ -158,7 +158,11 @@ impl pie::core::context::HostContext for InstanceState {
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
         // Context cleanup is handled by DestroyAll on instance drop.
         // Individual handle drops just remove the resource table entry.
-        self.ctx().table.delete(this)?;
+        // Tolerate a missing entry: `destroy` deletes it eagerly, and the
+        // guest's resource handle still runs this drop afterwards —
+        // erroring here traps the whole instance on a legitimate
+        // destroy-then-drop sequence.
+        let _ = self.ctx().table.delete(this);
         Ok(())
     }
 
