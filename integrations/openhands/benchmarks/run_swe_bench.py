@@ -60,10 +60,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pie-uri", default="ws://127.0.0.1:8080",
                    help="Pie WebSocket URI.")
     p.add_argument("--pie-inferlet", default="openhands-completion@0.1.0")
+    p.add_argument("--pie-session", action="store_true",
+                   help="Keep each conversation's prompt KV alive across calls "
+                        "via a named Pie context (requires a session-capable "
+                        "inferlet, e.g. openhands-coder-session@0.1.0). Only "
+                        "the token delta since the previous call is prefilled; "
+                        "history rewrites fall back to a full rebuild.")
+    p.add_argument("--kv-verify", action="store_true",
+                   help="Fidelity mode (with --pie-session): the inferlet "
+                        "asserts on every call that the session context's "
+                        "accumulated tokens equal the from-scratch prompt "
+                        "render, erroring out on mismatch.")
     p.add_argument("--pie-request-timeout-s", type=float, default=1800.0,
                    help="Per-completion timeout in seconds (Pie backend only). "
                         "Default 1800s; one agent step on a CPU model can exceed 600s "
                         "due to the size of OpenHands' system prompt.")
+    p.add_argument("--idle-timeout-s", type=float, default=300.0,
+                   help="Max seconds between consecutive recv events from the "
+                        "inferlet (pie-agent only). Detects generation hangs "
+                        "after e.g. condensation. Default 300s.")
+    p.add_argument("--instance-timeout-s", type=float, default=1200.0,
+                   help="Wall-clock cap per instance in seconds (pie-agent only). "
+                        "Prevents one hard problem from burning the whole Slurm "
+                        "allocation. Default 1200s (20 min).")
 
     # Run shape
     p.add_argument("--max-iterations", type=int, default=100,
@@ -98,6 +117,12 @@ def main(argv: list[str] | None = None) -> int:
                         "apples-to-apples comparison against PieLLM's prompt-mocked "
                         "tool calling, without needing --enable-auto-tool-choice on "
                         "the vLLM server.")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="LLM sampling temperature (0 = greedy). Passed to the "
+                        "litellm/pie backend's LLM constructor.")
+    p.add_argument("--context-token-limit", type=int, default=None,
+                   help="Context token limit for pie-agent inferlet "
+                        "(default 28000 in the inferlet).")
 
     args = p.parse_args(argv)
 
@@ -107,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     backend_kwargs: dict = {}
+    if args.temperature is not None:
+        backend_kwargs["temperature"] = args.temperature
     if args.native_tool_calling is not None:
         backend_kwargs["native_tool_calling"] = args.native_tool_calling
     if args.log_completions:
@@ -127,13 +154,21 @@ def main(argv: list[str] | None = None) -> int:
         backend_kwargs["pie_uri"] = args.pie_uri
         backend_kwargs["pie_inferlet"] = args.pie_inferlet
         backend_kwargs["pie_request_timeout_s"] = args.pie_request_timeout_s
+        if args.pie_session:
+            backend_kwargs["pie_session"] = True
+        if args.kv_verify:
+            backend_kwargs["pie_kv_verify"] = True
         if args.model:
             backend_kwargs["model"] = args.model
     elif args.backend == "pie-agent":
         backend_kwargs["pie_uri"] = args.pie_uri
         backend_kwargs["pie_inferlet"] = args.pie_inferlet
         backend_kwargs["timeout_s"] = args.pie_request_timeout_s
+        backend_kwargs["idle_timeout_s"] = args.idle_timeout_s
+        backend_kwargs["instance_timeout_s"] = args.instance_timeout_s
         backend_kwargs["max_steps"] = args.max_iterations
+        if args.context_token_limit is not None:
+            backend_kwargs["context_token_limit"] = args.context_token_limit
 
     options = swe_bench.RunOptions(
         backend=args.backend,
@@ -150,7 +185,16 @@ def main(argv: list[str] | None = None) -> int:
         resume=args.resume,
     )
 
-    swe_bench.run(options)
+    try:
+        swe_bench.run(options)
+    except SystemExit as e:
+        if e.code == 42:
+            print(
+                "\nPie server died — aborting. Use --resume to continue "
+                "after restarting the server.",
+                file=sys.stderr,
+            )
+        raise
     print(f"\nwrote {args.output}", file=sys.stderr)
     return 0
 

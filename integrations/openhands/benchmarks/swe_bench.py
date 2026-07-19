@@ -48,7 +48,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -120,6 +122,12 @@ class Prediction:
     total_tokens: int = 0
     num_llm_calls: int = 0
     response_latencies: list[float] = field(default_factory=list)
+    # Per-step breakdown (populated by Pattern A agent inferlet).
+    generate_s: float = 0.0
+    tool_s: float = 0.0
+    per_step: list[dict[str, Any]] = field(default_factory=list)
+    # KV-session telemetry (populated by the pie backend with --pie-session).
+    pie_session: dict[str, Any] = field(default_factory=dict)
 
     def to_jsonl(self) -> str:
         return json.dumps({
@@ -136,6 +144,10 @@ class Prediction:
                 "total_tokens": self.total_tokens,
                 "num_llm_calls": self.num_llm_calls,
                 "response_latencies": [round(l, 4) for l in self.response_latencies],
+                "generate_s": round(self.generate_s, 3),
+                "tool_s": round(self.tool_s, 3),
+                "per_step": self.per_step,
+                "pie_session": self.pie_session,
             },
         })
 
@@ -150,22 +162,44 @@ def checked_out_repo(problem: Problem, *, cache_dir: Path | None = None) -> Iter
     If ``cache_dir`` is given, we maintain a bare clone there and only copy
     the working tree into the temp dir — much faster across many problems
     that share a repo.
-    """
-    with tempfile.TemporaryDirectory(prefix=f"sweb-{problem.instance_id}-") as tmp:
-        ws = Path(tmp) / "repo"
-        url = f"https://github.com/{problem.repo}.git"
-        if cache_dir is not None:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            bare = cache_dir / (problem.repo.replace("/", "__") + ".git")
-            if not bare.exists():
-                _run(["git", "clone", "--bare", url, str(bare)])
-            _run(["git", "clone", str(bare), str(ws)])
-        else:
-            _run(["git", "clone", "--depth", "200", url, str(ws)])
 
-        _run(["git", "-C", str(ws), "fetch", "origin", problem.base_commit])
-        _run(["git", "-C", str(ws), "checkout", problem.base_commit])
-        yield ws
+    If ``$SWEB_WS_ROOT`` is set, the working tree lives at the deterministic
+    path ``$SWEB_WS_ROOT/sweb-<instance_id>/repo`` instead of a randomized
+    tempdir. Equivalence runs need this: the workspace path leaks into the
+    prompts via tool output (FileEditor cwd, terminal output, tracebacks), so
+    two arms only see identical prompts — a precondition for identical t=0
+    trajectories — if the path is identical too.
+    """
+    ws_root = os.environ.get("SWEB_WS_ROOT")
+    if ws_root:
+        base = Path(ws_root) / f"sweb-{problem.instance_id}"
+        if base.exists():
+            shutil.rmtree(base)
+        base.mkdir(parents=True)
+        try:
+            yield _clone_into(base, problem, cache_dir)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+    else:
+        with tempfile.TemporaryDirectory(prefix=f"sweb-{problem.instance_id}-") as tmp:
+            yield _clone_into(Path(tmp), problem, cache_dir)
+
+
+def _clone_into(base: Path, problem: Problem, cache_dir: Path | None) -> Path:
+    ws = base / "repo"
+    url = f"https://github.com/{problem.repo}.git"
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        bare = cache_dir / (problem.repo.replace("/", "__") + ".git")
+        if not bare.exists():
+            _run(["git", "clone", "--bare", url, str(bare)])
+        _run(["git", "clone", str(bare), str(ws)])
+    else:
+        _run(["git", "clone", "--depth", "200", url, str(ws)])
+
+    _run(["git", "-C", str(ws), "fetch", "origin", problem.base_commit])
+    _run(["git", "-C", str(ws), "checkout", problem.base_commit])
+    return ws
 
 
 def _run(cmd: list[str]) -> None:
@@ -490,6 +524,7 @@ def solve_one(
     backend_kwargs = backend_kwargs or {}
     t0 = time.monotonic()
 
+    llm = None
     try:
         with checked_out_repo(problem, cache_dir=cache_dir) as ws:
             llm = build_llm(backend, **backend_kwargs)
@@ -500,7 +535,7 @@ def solve_one(
                 max_iteration_per_run=max_iterations,
                 visualizer=None,
             )
-            conv.send_message(_format_user_prompt(problem))
+            conv.send_message(_format_user_prompt(problem, ws=ws))
             nudges = run_with_stuck_retries(
                 conv,
                 max_stuck_retries=max_stuck_retries,
@@ -510,6 +545,16 @@ def solve_one(
 
             patch = capture_patch(ws)
             metrics = _extract_metrics(conv)
+            session_stats = _pie_session_stats(llm)
+            if session_stats:
+                logger.info(
+                    "%s: pie session — %d calls, %d/%d prompt tokens prefilled, modes=%s",
+                    problem.instance_id,
+                    session_stats.get("num_calls", 0),
+                    session_stats.get("prompt_tokens_prefilled", 0),
+                    session_stats.get("prompt_tokens_rendered", 0),
+                    session_stats.get("modes", {}),
+                )
             return Prediction(
                 instance_id=problem.instance_id,
                 model_name_or_path=label,
@@ -517,6 +562,7 @@ def solve_one(
                 wall_clock_s=time.monotonic() - t0,
                 agent_iterations=_count_iterations(conv),
                 stuck_retries=nudges,
+                pie_session=session_stats,
                 **metrics,
             )
     except Exception as e:
@@ -528,12 +574,37 @@ def solve_one(
             wall_clock_s=time.monotonic() - t0,
             agent_iterations=0,
             error=f"{type(e).__name__}: {e}",
+            pie_session=_pie_session_stats(llm),
         )
+    finally:
+        # A leaked session pins its KV snapshot server-side; deletion is
+        # idempotent and must run on the error path too.
+        if llm is not None and hasattr(llm, "close_pie_session"):
+            llm.close_pie_session()
 
 
-def _format_user_prompt(problem: Problem, *, use_cwd: bool = False) -> str:
+def _pie_session_stats(llm) -> dict[str, Any]:
+    """Session telemetry from a PieLLM in session mode, else empty."""
+    if llm is not None and getattr(llm, "pie_session", False):
+        try:
+            return llm.pie_session_summary()
+        except Exception:
+            return {}
+    return {}
+
+
+def _format_user_prompt(
+    problem: Problem, *, use_cwd: bool = False, ws: Path | None = None
+) -> str:
     repo_dir = problem.repo.split("/")[-1]
-    if use_cwd:
+    if ws is not None:
+        # The real checkout path. The `/workspace/<repo>` fallback is a
+        # leftover from the dockerized official harness and does not exist
+        # here; pointing the model at a nonexistent directory makes small
+        # models loop on `ls /workspace/...` failures at t=0 until the
+        # iteration budget runs out (job 18783763, 0-byte patches).
+        location = str(ws)
+    elif use_cwd:
         location = (
             "the current working directory (use `pwd` to see the absolute "
             "path, and relative paths like `./django/` to explore)"
@@ -589,9 +660,24 @@ async def _run_agent_inferlet(
     max_steps: int,
     max_tokens_per_step: int = 4096,
     timeout_s: float = 3600.0,
+    idle_timeout_s: float = 300.0,
+    instance_timeout_s: float = 1200.0,
+    context_token_limit: int | None = None,
 ) -> dict[str, Any]:
-    """Launch the openhands-agent inferlet and wait for it to finish."""
+    """Launch the openhands-agent inferlet and wait for it to finish.
+
+    Three timeout layers:
+      - idle_timeout_s: max seconds between consecutive recv() events (detects
+        generation hangs after e.g. condensation).
+      - instance_timeout_s: wall-clock cap for the entire instance (prevents
+        one hard problem from burning the whole Slurm allocation).
+      - timeout_s: legacy per-recv timeout (kept for backwards compat but
+        idle_timeout_s is the effective one when it's shorter).
+    """
     from pie_client import Event, PieClient
+
+    recv_timeout = min(timeout_s, idle_timeout_s)
+    deadline = time.monotonic() + instance_timeout_s
 
     input_payload = {
         "task": task,
@@ -599,16 +685,34 @@ async def _run_agent_inferlet(
         "max_steps": max_steps,
         "max_tokens_per_step": max_tokens_per_step,
     }
+    if context_token_limit is not None:
+        input_payload["context_token_limit"] = context_token_limit
     async with PieClient(pie_uri) as client:
         await client.authenticate("local-dev")
         proc = await client.launch_process(pie_inferlet, input=input_payload)
         stdout_chunks: list[str] = []
         while True:
-            event, value = await asyncio.wait_for(proc.recv(), timeout=timeout_s)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("instance wall-clock timeout (%.0fs)", instance_timeout_s)
+                return {"finished": False, "message": "".join(stdout_chunks), "timeout": True}
+            effective_timeout = min(recv_timeout, remaining)
+            try:
+                event, value = await asyncio.wait_for(proc.recv(), timeout=effective_timeout)
+            except asyncio.TimeoutError:
+                if time.monotonic() >= deadline:
+                    logger.warning("instance wall-clock timeout (%.0fs)", instance_timeout_s)
+                else:
+                    logger.warning("idle timeout — no event for %.0fs, generation likely hung", recv_timeout)
+                return {"finished": False, "message": "".join(stdout_chunks), "timeout": True}
             if event == Event.Stdout:
                 chunk = value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value)
                 stdout_chunks.append(chunk)
-                logger.debug("inferlet stdout: %s", chunk.rstrip())
+                stripped = chunk.rstrip()
+                if stripped.startswith("[step") or stripped.startswith("[condense"):
+                    logger.info("inferlet: %s", stripped)
+                else:
+                    logger.debug("inferlet stdout: %s", stripped)
             elif event == Event.Return:
                 if value is None:
                     return {"finished": False, "message": "".join(stdout_chunks)}
@@ -631,6 +735,9 @@ def solve_one_agent(
     max_steps: int = 50,
     max_tokens_per_step: int = 4096,
     timeout_s: float = 3600.0,
+    idle_timeout_s: float = 300.0,
+    instance_timeout_s: float = 1200.0,
+    context_token_limit: int | None = None,
     cache_dir: Path | None = None,
     label: str | None = None,
 ) -> Prediction:
@@ -652,17 +759,34 @@ def solve_one_agent(
                     max_steps=max_steps,
                     max_tokens_per_step=max_tokens_per_step,
                     timeout_s=timeout_s,
+                    idle_timeout_s=idle_timeout_s,
+                    instance_timeout_s=instance_timeout_s,
+                    context_token_limit=context_token_limit,
                 ))
             finally:
                 server.shutdown()
 
+            steps = result.get("steps", 0) if isinstance(result, dict) else 0
+            finished = result.get("finished", False) if isinstance(result, dict) else False
             patch = capture_patch(ws)
+            metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+            logger.info(
+                "%s: inferlet returned (finished=%s, steps=%d, patch=%dB)",
+                problem.instance_id, finished, steps, len(patch),
+            )
             return Prediction(
                 instance_id=problem.instance_id,
                 model_name_or_path=label,
                 model_patch=patch,
                 wall_clock_s=time.monotonic() - t0,
-                agent_iterations=0,
+                agent_iterations=steps,
+                prompt_tokens=metrics.get("total_prompt_tokens", 0),
+                completion_tokens=metrics.get("total_completion_tokens", 0),
+                total_tokens=metrics.get("total_prompt_tokens", 0) + metrics.get("total_completion_tokens", 0),
+                num_llm_calls=metrics.get("num_generate_calls", 0),
+                generate_s=metrics.get("total_generate_s", 0.0),
+                tool_s=metrics.get("total_tool_s", 0.0),
+                per_step=metrics.get("per_step", []),
             )
     except Exception as e:
         logger.exception("solve_one_agent failed for %s", problem.instance_id)
@@ -744,6 +868,9 @@ def run(options: RunOptions) -> Path:
                     max_steps=bk.get("max_steps", options.max_iterations),
                     max_tokens_per_step=bk.get("max_tokens_per_step", 4096),
                     timeout_s=bk.get("timeout_s", 3600.0),
+                    idle_timeout_s=bk.get("idle_timeout_s", 300.0),
+                    instance_timeout_s=bk.get("instance_timeout_s", 1200.0),
+                    context_token_limit=bk.get("context_token_limit"),
                     cache_dir=options.cache_dir,
                     label=options.label,
                 )
@@ -759,6 +886,14 @@ def run(options: RunOptions) -> Path:
                     cache_dir=options.cache_dir,
                     label=options.label,
                 )
+            if "ConnectionRefusedError" in pred.error:
+                logger.error(
+                    "Pie server is down (ConnectionRefusedError for %s). "
+                    "Aborting run — use --resume to continue after restart.",
+                    problem.instance_id,
+                )
+                raise SystemExit(42)
+
             f.write(pred.to_jsonl() + "\n")
             f.flush()
             logger.info(

@@ -15,4 +15,5 @@ device = ["cuda:0"]
 [model.driver.options]
 venv = "/nfs/roberts/scratch/pi_ql324/ly337/pie-vllm-env"
 enforce_eager = true
-gpu_memory_utilization = 0.90
+gpu_memory_utilization = 0.80
+max_model_len = 65536
