@@ -76,6 +76,16 @@ class PieLLM(LLM):
                     "from-scratch prompt render (Phase 2 of the coder-session "
                     "design). Errors out instead of proceeding on mismatch.",
     )
+    pie_use_grammar: bool = Field(
+        default=True,
+        description="Constrain tool-call generation with the runtime's "
+                    "tool-call grammar. Disable for parity with an "
+                    "unconstrained vLLM baseline: the model then emits its "
+                    "native ChatML tool-call format and the inferlet's "
+                    "decoder parses it without masking. Only honored by "
+                    "inferlets that read `use_grammar` (openhands-coder-"
+                    "session); openhands-completion always constrains.",
+    )
 
     # Session bookkeeping — the inferlet is stateless between invocations, so
     # the host carries the previous prompt render's (length, hash) and echoes
@@ -129,6 +139,8 @@ class PieLLM(LLM):
             _inject_native_examples(wire_messages, tools)
 
         gen_params = self._extract_gen_params(kwargs)
+        if not self.pie_use_grammar:
+            gen_params["use_grammar"] = False
         if self.pie_session:
             gen_params.update(self._session_request_fields())
         raw = asyncio.run(self._call_pie(wire_messages, tools, gen_params))

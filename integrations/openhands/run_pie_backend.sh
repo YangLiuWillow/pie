@@ -47,6 +47,9 @@ if [ "$BACKEND" = "pie-session" ]; then
     if [ "${KV_VERIFY:-0}" = "1" ]; then
         SESSION_ARGS+=(--kv-verify)
     fi
+    if [ "${NO_GRAMMAR:-0}" = "1" ]; then
+        SESSION_ARGS+=(--no-grammar)
+    fi
 fi
 
 mkdir -p "$LOG_DIR" "$PRED_DIR"

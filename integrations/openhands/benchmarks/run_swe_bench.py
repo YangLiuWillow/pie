@@ -71,6 +71,12 @@ def main(argv: list[str] | None = None) -> int:
                         "asserts on every call that the session context's "
                         "accumulated tokens equal the from-scratch prompt "
                         "render, erroring out on mismatch.")
+    p.add_argument("--no-grammar", action="store_true",
+                   help="Disable the runtime's tool-call grammar constraint "
+                        "(pie backend, session-capable inferlet only): the "
+                        "model emits its native ChatML tool-call format and "
+                        "the inferlet decoder parses it unconstrained — "
+                        "parity with an unconstrained vLLM baseline.")
     p.add_argument("--pie-request-timeout-s", type=float, default=1800.0,
                    help="Per-completion timeout in seconds (Pie backend only). "
                         "Default 1800s; one agent step on a CPU model can exceed 600s "
@@ -158,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
             backend_kwargs["pie_session"] = True
         if args.kv_verify:
             backend_kwargs["pie_kv_verify"] = True
+        if args.no_grammar:
+            backend_kwargs["pie_use_grammar"] = False
         if args.model:
             backend_kwargs["model"] = args.model
     elif args.backend == "pie-agent":
