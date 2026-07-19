@@ -95,6 +95,10 @@ struct Input {
 }
 
 fn default_max_tokens() -> usize { 2048 }
+
+/// Token budget for the phase-2 forced tool call — one call plus slack
+/// (multi-line editor arguments can run long).
+const FORCED_CALL_MAX_TOKENS: usize = 1024;
 fn default_temperature() -> f32 { 0.0 }
 fn default_top_p() -> f32 { 0.95 }
 fn default_true() -> bool { true }
@@ -246,22 +250,29 @@ async fn main(input: Input) -> Result<Output> {
     let has_tools = !tool_schemas.is_empty();
     let mut tool_decoder = has_tools.then(|| tools::Decoder::new(&model));
 
+    // Phase 1 below runs UNCONSTRAINED — constraining the whole turn with
+    // the tool-call grammar suppressed all reasoning text and collapsed
+    // t=0 agent trajectories into action loops. The fork snapshots the
+    // cued prompt so that, when the model produces no tool call at all, a
+    // short phase-2 pass can replay the prose and force one well-formed
+    // call under the grammar (tool_choice=required at a natural boundary).
+    // `use_grammar: false` disables phase 2 for parity with a fully
+    // unconstrained baseline. The fork is transient and destroyed before
+    // returning, so session snapshot bookkeeping is unaffected.
+    let mut phase2_fork = if input.use_grammar && has_tools {
+        Some(ctx.fork()?)
+    } else {
+        None
+    };
+
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut tool_calls: Vec<ToolCallOut> = Vec::new();
     let mut stop_reason = "length";
 
     let mut g = ctx
-        .generate(sampler)
+        .generate(sampler.clone())
         .max_tokens(input.max_tokens)
         .stop(&stop_token_ids);
-
-    // `native_matcher` traps host-side on an empty schema list, so gate on
-    // has_tools as well as the flag.
-    if input.use_grammar && has_tools {
-        if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
-            g = g.constrain(inferlet::GrammarConstraint::new(matcher));
-        }
-    }
 
     'outer: while let Some(step) = g.next()? {
         let out = step.execute().await?;
@@ -333,6 +344,58 @@ async fn main(input: Input) -> Result<Output> {
                 arguments: args,
             });
         }
+    }
+
+    // Phase 2 — forced tool call. The model narrated without acting
+    // (no <tool_call>, no fence); at t=0 that repeats verbatim through
+    // every nudge until the run stucks out. Replay the prose on the
+    // pre-generation fork (raw token ids — no re-encode) and force one
+    // well-formed call under the tool-call grammar.
+    if tool_calls.is_empty() && !generated.is_empty() {
+        if let Some(mut fk) = phase2_fork.take() {
+            if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
+                let mut prose = generated.clone();
+                if prose.last().is_some_and(|t| stop_token_ids.contains(t)) {
+                    prose.pop();
+                }
+                // Template renders content, then '\n', then the first
+                // <tool_call> block.
+                fk.append(&prose);
+                fk.append(&model.tokenizer().encode("\n"));
+
+                let mut dec2 = tools::Decoder::new(&model);
+                let mut g2 = fk
+                    .generate(sampler)
+                    .max_tokens(FORCED_CALL_MAX_TOKENS)
+                    .stop(&stop_token_ids)
+                    .constrain(inferlet::GrammarConstraint::new(matcher));
+                let mut forced = 0usize;
+                'forced: while let Some(step) = g2.next()? {
+                    let out = step.execute().await?;
+                    for &t in &out.tokens {
+                        forced += 1;
+                        if let tools::Event::Call(name, arguments) = dec2.feed(&[t])? {
+                            tool_calls.push(ToolCallOut {
+                                id: format!("call_{}", tool_calls.len()),
+                                name,
+                                arguments,
+                            });
+                        }
+                        if stop_token_ids.contains(&t) {
+                            break 'forced;
+                        }
+                    }
+                    if forced >= FORCED_CALL_MAX_TOKENS {
+                        break;
+                    }
+                }
+                drop(g2);
+            }
+            fk.destroy();
+        }
+    }
+    if let Some(fk) = phase2_fork.take() {
+        fk.destroy();
     }
 
     let text = if tool_calls.is_empty() {

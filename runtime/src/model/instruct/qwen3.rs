@@ -391,51 +391,25 @@ impl QwenInstruct {
 
         let tool_json_alt = tool_json_alts.join(" | ");
 
-        // Free-text prefix: any text that does not contain the full literal
-        // "<tool_call>". Right-linear expansion of the literal's prefix
-        // automaton: state tp-i = "the last consumed chars match the
-        // literal's first i chars". On the expected char advance, on '<'
-        // restart at tp-1, on anything else fall back to tp-0; every state
-        // is epsilon-accepting (the prefix may end anywhere). The final '>'
-        // transition is deliberately absent, so free text can never
-        // COMPLETE the literal — once the model emits the whole
-        // "<tool_call>" the only surviving parse is the tool-call branch:
-        // generation is unconstrained until the model actually opens a tool
-        // call and schema-constrained inside it. Forcing a tool call from
-        // token 0 (the previous root) suppressed all reasoning text and
-        // degraded t=0 agent trajectories into action loops; fully
-        // unconstrained generation instead loses format compliance. This
-        // trigger-style prefix keeps both.
-        const LIT: &[u8] = b"<tool_call>";
-        let mut prefix_rules = String::new();
-        for i in 0..LIT.len() {
-            let alts = if i == 0 {
-                "\"<\" tp-1 | [^<] tp-0".to_string()
-            } else if i + 1 < LIT.len() {
-                let c = LIT[i] as char;
-                format!("\"{c}\" tp-{} | \"<\" tp-1 | [^{c}<] tp-0", i + 1)
-            } else {
-                "\"<\" tp-1 | [^><] tp-0".to_string()
-            };
-            prefix_rules.push_str(&format!("tp-{i} ::= ({alts})?\n"));
-        }
-
-        // The tool call itself is REQUIRED (tool_choice=required semantics):
-        // a reasoning prefix followed by no call at all leaves EOS masked,
-        // so a model that narrates its next action and tries to stop gets
-        // pushed into actually emitting the call it just announced —
-        // t=0 trajectories otherwise die in announce-without-acting nudge
-        // loops (traj job 18820715). OpenHands supplies `finish` and
-        // `think` tools, so a mandatory call always has a sensible target.
-        // Repetition is capped at 4 calls per turn (mc-* chain): the
-        // unbounded tail let a degenerate t=0 decode emit 15 identical
-        // calls in one response (traj job 18818735).
+        // The grammar begins directly at "<tool_call>" — no free-text
+        // prefix. Callers must NOT constrain a whole assistant turn with it
+        // (that suppresses all reasoning text and collapses t=0 agent
+        // trajectories into action loops — traj job 18818735); a
+        // prefix-automaton variant that allowed free text was tried and
+        // abandoned: the parse ambiguity blew up per-token mask cost 3-18x
+        // and long constrained generations crashed the driver (traj jobs
+        // 18820715/18821389). The intended use is two-phase: generate the
+        // turn unconstrained, and only when no tool call was produced,
+        // re-run the tail of the turn under this grammar to force one
+        // well-formed call (see the openhands inferlets). Repetition is
+        // capped at 4 calls per turn (mc-* chain): the unbounded tail let
+        // a degenerate t=0 decode emit 15 identical calls in one response.
         let grammar = format!(
-            r#"root ::= tp-0 tool-call mc-1
+            r#"root ::= tool-call mc-1
 mc-1 ::= ("\n" tool-call mc-2)?
 mc-2 ::= ("\n" tool-call mc-3)?
 mc-3 ::= ("\n" tool-call)?
-{prefix_rules}tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
+tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
 tool-json ::= {tool_json_alt}
 {extra_rules}json-object ::= "{{" json-ws (json-pair (json-ws "," json-ws json-pair)*)? json-ws "}}"
 json-pair ::= json-string json-ws ":" json-ws json-value
@@ -868,12 +842,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_grammar_allows_free_text_until_tool_call_opens() {
-        // Forcing a tool call from token 0 suppressed all reasoning text
-        // and collapsed t=0 agent trajectories into action loops (32B A/B
-        // trajectory comparison, jobs 18818735/18819521). The grammar must
-        // leave text unconstrained and only bind once the model emits the
-        // full "<tool_call>" literal.
+    fn tool_call_grammar_forces_immediate_capped_calls() {
+        // This grammar is for the forced phase-2 tail of a turn (see
+        // build_tool_call_grammar's comment): it must start at
+        // "<tool_call>" immediately, enforce the schema inside, and cap
+        // repetition at 4 calls.
         let inst = qwen3();
         let tool = serde_json::json!({
             "name": "calculator",
@@ -887,46 +860,24 @@ mod tests {
         .to_string();
         let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
 
-        // A tool call is REQUIRED (tool_choice=required semantics):
-        // content-only turns cannot terminate, so a model that narrates
-        // its next action without acting keeps EOS masked until it emits
-        // the call. OpenHands supplies finish/think tools, so a mandatory
-        // call always has a sensible target.
+        // No free text anywhere — not before, not instead of, a call.
         assert!(!matches_grammar(&tg, "I'm done with the task."));
-        assert!(!matches_grammar(&tg, "The answer is 42."));
         assert!(!matches_grammar(&tg, ""));
-
-        // Text containing '<' and near-misses of the literal stays free —
-        // legal as a prefix (followed by a call), non-terminatable alone.
         let call = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
-        let with_markers = format!(
-            "compare a < b and use <tools> or </tool_call> markers\n{call}"
-        );
-        assert!(matches_grammar(&tg, &with_markers));
-        let with_almost = format!("almost: <tool_call left open, anyway:\n{call}");
-        assert!(matches_grammar(&tg, &with_almost));
-        // '<' restarting mid-almost-literal must still be tracked:
-        // this string CONTAINS the full literal starting at index 2.
-        assert!(!matches_grammar(&tg, "<t<tool_call>"));
+        let reasoned = format!("Let me compute the sum first.\n\n{call}");
+        assert!(!matches_grammar(&tg, &reasoned));
 
-        // Reasoning text followed by a well-formed call is the intended
-        // happy path.
-        let reasoned = "Let me compute the sum first.\n\n<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
-        assert!(matches_grammar(&tg, reasoned));
+        // Bare tool calls work.
+        assert!(matches_grammar(&tg, call));
 
-        // Bare tool calls still work.
-        let valid = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
-        assert!(matches_grammar(&tg, valid));
-
-        // Once the literal completes, the schema binds: garbage inside a
-        // tool call cannot be re-interpreted as free text.
+        // Schema binds inside the call.
         assert!(!matches_grammar(&tg, "<tool_call>\nnot json\n</tool_call>"));
-        let wrong_type = "some thoughts\n<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
+        let wrong_type = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
         assert!(!matches_grammar(&tg, wrong_type));
 
         // Text after a completed tool call is not part of the template.
-        let trailing = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>\nand then some";
-        assert!(!matches_grammar(&tg, trailing));
+        let trailing = format!("{call}\nand then some");
+        assert!(!matches_grammar(&tg, &trailing));
 
         // Repetition is capped at 4 calls per turn — a degenerate t=0
         // decode once emitted 15 identical calls in one response.
