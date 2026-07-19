@@ -415,8 +415,22 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             user_cleared_sampler,
         } = self;
 
-        let n_pending = pending.len() as u32;
         let n_drafted = drafts.len() as u32;
+
+        // Cap tokens per forward: prefill everything except a bounded tail
+        // through pure fill passes (see `MAX_FILL_CHUNK`), and let only the
+        // tail ride with the sampling step. Skipped when drafts are present —
+        // speculative flows manage their own positions.
+        let mut pending = pending;
+        if n_drafted == 0 && pending.len() > crate::context::MAX_FILL_CHUNK {
+            let tail_len = ((pending.len() - 1) % crate::context::MAX_FILL_CHUNK) + 1;
+            let tail = pending.split_off(pending.len() - tail_len);
+            for chunk in pending.chunks(crate::context::MAX_FILL_CHUNK) {
+                parent.ctx.flush_chunk(chunk).await?;
+            }
+            pending = tail;
+        }
+        let n_pending = pending.len() as u32;
 
         if n_pending == 0 && n_drafted == 0 && user_cleared_sampler && extra_probes.is_empty() {
             // Truly nothing to do — no input, no sampler, no probes.

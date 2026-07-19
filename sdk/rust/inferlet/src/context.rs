@@ -61,6 +61,14 @@ pub(crate) fn compute_bid(
 // Context
 // =============================================================================
 
+/// Upper bound on tokens fed to a single fill forward pass. Activation
+/// memory scales with tokens per forward, and devices sized to hold the
+/// model weights + KV cache have limited headroom for transients — a
+/// ~13k-token single-pass prefill on a 32B model OOM'd a 96 GB GPU.
+/// Fills above this are split into sequential passes (identical result:
+/// KV accumulates across chunks and prefill logits are discarded).
+pub(crate) const MAX_FILL_CHUNK: usize = 4096;
+
 /// High-level inference context.
 ///
 /// Wraps the native WIT [`RawContext`] resource and provides:
@@ -357,16 +365,32 @@ impl Context {
 
     // ── Flush ───────────────────────────────────────────────────────
 
-    /// Drain the buffered tokens through a forward pass and commit pages.
+    /// Drain the buffered tokens through forward passes and commit pages.
     ///
     /// After flush, the buffer is empty and `seq_len` reflects all
-    /// consumed tokens.
+    /// consumed tokens. Fills larger than [`MAX_FILL_CHUNK`] are split
+    /// into sequential passes: activation memory scales with tokens per
+    /// forward, and a single multi-thousand-token pass can OOM the device
+    /// (a ~13k-token fill on a 32B model needs >1.3 GiB for one MLP
+    /// intermediate alone). KV accumulates across chunks, so the result
+    /// is identical to a single pass.
     pub async fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
 
         let tokens = std::mem::take(&mut self.buffer);
+        for chunk in tokens.chunks(MAX_FILL_CHUNK) {
+            self.flush_chunk(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// One bounded fill pass — the single-forward body of [`flush`](Self::flush).
+    pub(crate) async fn flush_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
         let num_tokens = tokens.len() as u32;
 
         // Reserve additional pages if we need more than currently allocated.
@@ -385,7 +409,7 @@ impl Context {
         pass.context(&self.inner);
 
         let positions: Vec<u32> = (self.seq_len..self.seq_len + num_tokens).collect();
-        pass.input_tokens(&tokens, &positions);
+        pass.input_tokens(tokens, &positions);
 
         pass.execute_async()
             .await
