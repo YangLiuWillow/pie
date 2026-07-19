@@ -217,6 +217,10 @@ class PieClient:
         for _, future in pending:
             if not future.done():
                 future.set_exception(exc)
+        for process_id in list(self.process_event_queues):
+            queue = self.process_event_queues.pop(process_id, None)
+            if queue is not None:
+                queue.put_nowait(("error", f"WebSocket disconnected: {exc}"))
 
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""

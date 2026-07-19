@@ -141,7 +141,7 @@ class Batch:
         if self.single_token_mode:
             self.attention_masks = None
         else:
-            token_acc_seq_lens_np = np.zeros(self.total_tokens + 1, dtype=np.int32)
+            token_acc_seq_lens_np = np.zeros(self.total_tokens + 1, dtype=np.int64)
             np.cumsum(all_seq_lens, out=token_acc_seq_lens_np[1:])
             self.attention_masks = decode_brle_batch(
                 flattened_masks_u32, mask_indptr, position_ids_np, token_acc_seq_lens_np
@@ -1040,7 +1040,7 @@ def decode_brle_batch(
         flattened_masks: Concatenated BRLE run lengths (int32)
         mask_indptr: Pointers to BRLE ranges per token (int32)
         position_ids: Position of each token, defines valid_len (int32)
-        token_acc_seq_lens: Cumulative bit offsets per token (int32)
+        token_acc_seq_lens: Cumulative bit offsets per token (int64)
 
     Returns:
         Flat boolean array with all mask values

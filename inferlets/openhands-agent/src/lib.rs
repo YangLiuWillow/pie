@@ -14,6 +14,8 @@
 //!   - Context condensation — saves a checkpoint after the system prompt
 //!     and rebuilds from it when the context nears the model's limit.
 
+use std::time::Instant;
+
 use inferlet::{
     sample::Sampler, model::Model, runtime, Context, Result,
     wstd::http::{Client, Request, body::IntoBody},
@@ -33,17 +35,26 @@ struct Input {
     context_token_limit: u32,
     #[serde(default = "default_obs_limit")]
     max_observation_chars: usize,
+    #[serde(default = "default_max_empty_finishes")]
+    max_empty_finishes: u32,
 }
 
 fn default_max_steps() -> u32 { 50 }
 fn default_max_tokens() -> usize { 16384 }
 fn default_context_limit() -> u32 { 28000 }
 fn default_obs_limit() -> usize { 8000 }
+fn default_max_empty_finishes() -> u32 { 3 }
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const DEGENERATE_THRESHOLD: f64 = 0.4;
 const CONDENSE_HEADROOM: u32 = 8000;
 const STUCK_WINDOW: usize = 5;
+// After condensing, skip the next N condensation checks to avoid pathological
+// condense-every-step loops when turns fill right up to the budget.
+const CONDENSE_COOLDOWN: u32 = 5;
+// When condensing, target this fraction of the budget — leaving room for
+// several more steps before the next condensation trigger.
+const CONDENSE_TARGET_FRAC: f64 = 0.70;
 
 const SYSTEM_PROMPT: &str = "\
 You are an expert software engineer solving a GitHub issue. Each turn you \
@@ -118,17 +129,40 @@ so the new code is placed inside the function body.
 see the exact target lines, (b) use insert to add code at a line number, or \
 (c) use undo_edit to revert and try again.
 
+CRITICAL fix-quality rules:
+  - Fix the ROOT CAUSE, not the symptom. If a function returns a wrong value, \
+trace backward through the code to find WHERE the wrong value is produced. \
+The bug is usually upstream of where the error manifests — in the logic that \
+computes the value, not in the code that uses it.
+  - NEVER add an if-guard or special case at the error site without first \
+understanding why the bad state occurs. A guard that papers over the symptom \
+(e.g., \"if x >= n: return fallback\") will fail the project's tests because \
+it does not fix the underlying logic.
+  - Before writing your fix, state the root cause in your thought: which \
+variable has the wrong value, why, and which line of code is responsible.
+  - If the fix is a one-line guard at the crash/error site, it is almost \
+certainly wrong. Look upstream.
+
 Follow these phases:
   1. READING: Read and understand the problem. Identify error messages, \
 method names, file names, stack traces.
   2. EXPLORATION: Use grep/find to locate relevant files and code. Use \
-read_file to examine them.
-  3. TEST CREATION: Create a minimal reproduction script before fixing.
-  4. FIX IMPLEMENTATION: Use read_file to see exact content, then make \
-the minimal edit to fix the issue.
-  5. VERIFICATION: Run your reproduction script to confirm the fix. Run \
-existing tests related to the modified code.
-  6. FINAL REVIEW: Re-read the problem and ensure all requirements are met.";
+read_file to examine them. Trace the data flow from the bug's origin to \
+where the symptom appears — the fix belongs at the origin.
+  3. TEST CREATION: Create a minimal reproduction script that demonstrates \
+the bug (e.g., prints wrong output or raises the error). Run it to confirm \
+it fails.
+  4. ROOT CAUSE ANALYSIS: Before coding the fix, identify the exact line(s) \
+that produce the wrong behavior. Add debug prints or read surrounding code \
+to confirm your diagnosis.
+  5. FIX IMPLEMENTATION: Use read_file to see exact content, then make \
+the minimal edit to fix the root cause.
+  6. VERIFICATION: Run your reproduction script to confirm the fix produces \
+the correct output. Then find and run the existing test suite for the module \
+you changed (e.g., `python -m pytest path/to/tests/ -x -q`). If tests fail, \
+your fix is wrong — go back to step 4.
+  7. FINAL REVIEW: Re-read the problem and ensure all requirements are met. \
+Confirm `git diff` shows your changes.";
 
 const ACTION_SCHEMA: &str = r#"{
     "type": "object",
@@ -178,6 +212,17 @@ struct ToolRequest<'a> {
     end_line: i64,
 }
 
+#[derive(Serialize)]
+struct StepMetrics {
+    step: u32,
+    action: String,
+    generate_s: f64,
+    tool_s: f64,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    seq_len_after: u32,
+}
+
 /// A recorded turn for context condensation replay.
 struct Turn {
     assistant_json: String,
@@ -186,6 +231,7 @@ struct Turn {
 
 struct RecentAction {
     action: String,
+    command: String,
     path: String,
     failed: bool,
 }
@@ -238,7 +284,33 @@ fn detect_stuck(recent: &[RecentAction]) -> Option<&'static str> {
         }
     }
 
-    // Pattern 3: 5 consecutive actions on the same path with at least 3 failures.
+    // Pattern 3: same bash command repeated 3+ times.
+    if tail3.len() == 3
+        && tail3.iter().all(|a| a.action == "bash" && !a.command.is_empty())
+        && tail3.iter().all(|a| a.command == tail3[0].command)
+    {
+        return Some(
+            "STUCK: You have run the exact same bash command 3 times. \
+             The output is not changing. Try a different command or approach."
+        );
+    }
+
+    // Pattern 4: alternating between two actions (A, B, A, B) with failures.
+    if tail4.len() == 4 {
+        let alternating = tail4[0].action == tail4[2].action
+            && tail4[1].action == tail4[3].action
+            && tail4[0].action != tail4[1].action
+            && tail4.iter().filter(|a| a.failed).count() >= 2;
+        if alternating {
+            return Some(
+                "STUCK: You are alternating between two actions without making progress. \
+                 Step back, re-read the problem statement, and try a completely different \
+                 approach to locate and fix the issue."
+            );
+        }
+    }
+
+    // Pattern 5: 5 consecutive actions on the same path with at least 3 failures.
     let tail5 = &recent[last.saturating_sub(STUCK_WINDOW)..];
     if tail5.len() == STUCK_WINDOW
         && tail5.iter().all(|a| a.path == tail5[0].path && !a.path.is_empty())
@@ -324,14 +396,117 @@ async fn call_tool_server(
         .to_string())
 }
 
-/// Rebuild the context from scratch using the saved system-prompt checkpoint,
-/// replaying only the most recent turns to stay within the token budget.
-fn condense_context(
+async fn check_has_diff(tool_server_url: &str) -> bool {
+    let payload = ToolRequest {
+        action: "has_diff",
+        command: "",
+        path: "",
+        old_str: "",
+        new_str: "",
+        insert_line: 0,
+        start_line: 0,
+        end_line: 0,
+    };
+    let body = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let uri = format!("{}/execute", tool_server_url);
+    let request = match Request::post(&uri)
+        .header("Content-Type", "application/json")
+        .body(body.into_body())
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let response = match Client::new().send(request).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut resp_body = response.into_body();
+    let mut buf = Vec::new();
+    use inferlet::wstd::io::AsyncRead;
+    if resp_body.read_to_end(&mut buf).await.is_err() {
+        return false;
+    }
+    let resp: Value = match serde_json::from_slice(&buf) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    resp.get("has_diff").and_then(Value::as_bool).unwrap_or(false)
+}
+
+const SUMMARIZE_PROMPT: &str = "\
+Summarize this coding-assistant conversation concisely. Include:
+1. Files examined and their relevant sections (paths, line numbers)
+2. Root cause or key findings so far
+3. Changes made (edits, file creations) — include exact paths
+4. What worked and what failed
+5. Current state and likely next steps
+
+Be specific about file paths, function/class names, and line numbers. \
+Under 400 words.";
+
+const MAX_SUMMARY_INPUT_CHARS: usize = 40_000;
+const MAX_TURN_CHARS_FOR_SUMMARY: usize = 2000;
+
+fn safe_truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+async fn summarize_dropped_turns(
+    model: &Model,
+    turns: &[Turn],
+) -> Result<String> {
+    let mut ctx = Context::new(model)?;
+    ctx.system(SUMMARIZE_PROMPT);
+
+    let mut conversation = String::new();
+    let mut total_chars = 0;
+    for (i, turn) in turns.iter().enumerate() {
+        let turn_text = format!(
+            "--- Step {} ---\nAssistant: {}\nObservation:\n{}\n\n",
+            i + 1,
+            safe_truncate(&turn.assistant_json, MAX_TURN_CHARS_FOR_SUMMARY),
+            safe_truncate(&turn.observation, MAX_TURN_CHARS_FOR_SUMMARY),
+        );
+        total_chars += turn_text.len();
+        if total_chars > MAX_SUMMARY_INPUT_CHARS {
+            conversation.push_str(&format!(
+                "(... {} more steps omitted ...)\n",
+                turns.len() - i
+            ));
+            break;
+        }
+        conversation.push_str(&turn_text);
+    }
+    ctx.user(&conversation);
+    ctx.cue();
+
+    let summary = ctx
+        .generate(Sampler::Argmax)
+        .max_tokens(1024)
+        .collect_text()
+        .await?;
+
+    Ok(summary)
+}
+
+/// Rebuild the context from scratch, using an LLM-generated summary of
+/// dropped turns to preserve context from early exploration.
+async fn condense_context(
     model: &Model,
     task: &str,
     history: &[Turn],
     context_token_limit: u32,
-) -> Result<Context> {
+) -> Result<Option<Context>> {
     println!("[condense] rebuilding context ({} turns in history)", history.len());
 
     // Start with system + task to measure the fixed prefix cost.
@@ -339,17 +514,26 @@ fn condense_context(
     ctx.system(SYSTEM_PROMPT);
     ctx.user(task);
 
-    // Estimate tokens consumed by the fixed prefix (rough: 4 chars/token).
-    let prefix_tokens = ctx.buffer().len() as u32;
-    let budget = context_token_limit.saturating_sub(prefix_tokens + CONDENSE_HEADROOM);
+    // Estimate tokens consumed by the fixed prefix.
+    // buffer().len() returns chars; divide by 3 for a conservative token estimate
+    // (most code/JSON tokenizes at ~3-3.5 chars/token, not 4).
+    let prefix_tokens = (ctx.buffer().len() / 3) as u32;
+    // Reserve 1200 tokens for the LLM summary.
+    let summary_budget: u32 = 1200;
+    let budget = context_token_limit
+        .saturating_sub(prefix_tokens + CONDENSE_HEADROOM + summary_budget);
+
+    // Target a fraction of the budget so there's headroom for several more
+    // steps before the next condensation trigger.
+    let target_budget = (budget as f64 * CONDENSE_TARGET_FRAC) as u32;
 
     // Walk backward through history, accumulating turns until we'd exceed budget.
     let mut replay_start = history.len();
     let mut est_tokens: u32 = 0;
     for (i, turn) in history.iter().enumerate().rev() {
         let turn_chars = turn.assistant_json.len() + turn.observation.len() + 30;
-        let turn_tokens = (turn_chars / 4) as u32;
-        if est_tokens + turn_tokens > budget {
+        let turn_tokens = (turn_chars / 3) as u32;
+        if est_tokens + turn_tokens > target_budget {
             break;
         }
         est_tokens += turn_tokens;
@@ -358,12 +542,36 @@ fn condense_context(
 
     let dropped = replay_start;
     let kept = history.len() - dropped;
-    if dropped > 0 {
-        let summary = format!(
-            "[Earlier conversation with {dropped} turns has been condensed. \
-             The {kept} most recent turns follow.]"
-        );
-        ctx.user(&summary);
+
+    // Nothing to drop → skip the expensive rebuild entirely.
+    if dropped == 0 {
+        println!("[condense] nothing to drop ({kept} turns fit), skipping rebuild");
+        return Ok(None);
+    }
+
+    {
+        let dropped_turns = &history[..replay_start];
+        let summary = match summarize_dropped_turns(model, dropped_turns).await {
+            Ok(s) => {
+                println!("[condense] LLM summary generated ({} chars)", s.len());
+                s
+            }
+            Err(e) => {
+                println!("[condense] summarization failed ({e}), using simple note");
+                format!(
+                    "Earlier conversation explored the codebase for {dropped} steps. \
+                     Details were condensed due to context limits."
+                )
+            }
+        };
+
+        // Rebuild context with the LLM summary.
+        ctx = Context::new(model)?;
+        ctx.system(SYSTEM_PROMPT);
+        ctx.user(task);
+        ctx.user(&format!(
+            "[Summary of earlier exploration ({dropped} steps)]\n{summary}"
+        ));
     }
 
     // Replay the kept turns.
@@ -376,7 +584,7 @@ fn condense_context(
     ctx.cue();
 
     println!("[condense] dropped {dropped}, replaying {kept} turns (est {est_tokens} tokens)");
-    Ok(ctx)
+    Ok(Some(ctx))
 }
 
 #[inferlet::main]
@@ -392,16 +600,33 @@ async fn main(input: Input) -> Result<String> {
     ctx.user(&input.task);
     ctx.cue();
 
+    let run_start = Instant::now();
     let mut final_message: Option<String> = None;
     let mut consecutive_failures: u32 = 0;
+    let mut empty_finishes: u32 = 0;
     let mut history: Vec<Turn> = Vec::new();
     let mut recent_actions: Vec<RecentAction> = Vec::new();
+    let mut ran_tests_after_edit = false;
+    let mut test_nudged = false;
+    let mut condense_cooldown: u32 = 0;
+    let mut step_metrics: Vec<StepMetrics> = Vec::new();
+    let mut total_prompt_tokens: u32 = 0;
+    let mut total_completion_tokens: u32 = 0;
 
     for step in 1..=input.max_steps {
         // Check if we need to condense before generating.
+        if condense_cooldown > 0 {
+            condense_cooldown -= 1;
+        }
         let est_seq_len = ctx.seq_len() + ctx.buffer().len() as u32;
-        if est_seq_len + CONDENSE_HEADROOM > input.context_token_limit && !history.is_empty() {
-            ctx = condense_context(&model, &input.task, &history, input.context_token_limit)?;
+        if condense_cooldown == 0
+            && est_seq_len + CONDENSE_HEADROOM > input.context_token_limit
+            && !history.is_empty()
+        {
+            if let Some(new_ctx) = condense_context(&model, &input.task, &history, input.context_token_limit).await? {
+                ctx = new_ctx;
+            }
+            condense_cooldown = CONDENSE_COOLDOWN;
         }
 
         let schema = if step == input.max_steps {
@@ -410,12 +635,20 @@ async fn main(input: Input) -> Result<String> {
             ACTION_SCHEMA
         };
 
+        let tokens_before = ctx.seq_len() + ctx.buffer().len() as u32;
+        let gen_start = Instant::now();
         let raw = ctx
-            .generate(Sampler::Multinomial { temperature: 0.7, draws: 0 })
+            .generate(Sampler::Argmax)
             .max_tokens(input.max_tokens_per_step)
             .constrain_with(inferlet::JsonSchema(schema))?
             .collect_text()
             .await?;
+        let gen_elapsed = gen_start.elapsed();
+        let tokens_after = ctx.seq_len();
+        let step_prompt = tokens_before;
+        let step_completion = tokens_after.saturating_sub(tokens_before);
+        total_prompt_tokens += step_prompt;
+        total_completion_tokens += step_completion;
 
         let v = match serde_json::from_str::<Value>(&raw) {
             Ok(v) => v,
@@ -453,7 +686,10 @@ async fn main(input: Input) -> Result<String> {
             }
             // Condense and retry — degeneration usually means context overflow.
             if !history.is_empty() {
-                ctx = condense_context(&model, &input.task, &history, input.context_token_limit)?;
+                if let Some(new_ctx) = condense_context(&model, &input.task, &history, input.context_token_limit).await? {
+                    ctx = new_ctx;
+                }
+                condense_cooldown = CONDENSE_COOLDOWN;
             }
             continue;
         }
@@ -464,11 +700,67 @@ async fn main(input: Input) -> Result<String> {
 
         if action == "finish" {
             println!("[step {step}] message: {message}");
+            let _idle = ctx.idle();
+            let has_diff = check_has_diff(&input.tool_server_url).await;
+            drop(_idle);
+            if !has_diff && empty_finishes < input.max_empty_finishes {
+                empty_finishes += 1;
+                println!("[step {step}] finish with no diff (attempt {empty_finishes}/{}), nudging", input.max_empty_finishes);
+                history.push(Turn {
+                    assistant_json: raw.clone(),
+                    observation: String::new(),
+                });
+                step_metrics.push(StepMetrics {
+                    step, action: action.to_string(), generate_s: gen_elapsed.as_secs_f64(),
+                    tool_s: 0.0, prompt_tokens: step_prompt, completion_tokens: step_completion,
+                    seq_len_after: tokens_after,
+                });
+                ctx.user(
+                    "Observation: Your changes produced no diff — the repository is \
+                     identical to its starting state. The issue is NOT resolved yet. \
+                     Re-read the problem statement carefully, explore the codebase to \
+                     find the right file and function, and make the necessary code change. \
+                     Do NOT finish until you have verified that your edit shows up in \
+                     `git diff`."
+                );
+                ctx.cue();
+                continue;
+            }
+            if has_diff && !ran_tests_after_edit && !test_nudged {
+                test_nudged = true;
+                println!("[step {step}] finish without running tests, nudging");
+                history.push(Turn {
+                    assistant_json: raw.clone(),
+                    observation: String::new(),
+                });
+                step_metrics.push(StepMetrics {
+                    step, action: action.to_string(), generate_s: gen_elapsed.as_secs_f64(),
+                    tool_s: 0.0, prompt_tokens: step_prompt, completion_tokens: step_completion,
+                    seq_len_after: tokens_after,
+                });
+                ctx.user(
+                    "Observation: You have not verified your fix by running the \
+                     relevant test suite. Before finishing, you MUST: \
+                     1) Run your reproduction script to confirm it now produces correct output. \
+                     2) Find and run the existing tests for the module you changed \
+                     (e.g., `python -m pytest path/to/tests/test_module.py -x -q`). \
+                     If any test fails, your fix is WRONG — go back and fix the root cause. \
+                     Do NOT finish until tests pass."
+                );
+                ctx.cue();
+                continue;
+            }
+            step_metrics.push(StepMetrics {
+                step, action: action.to_string(), generate_s: gen_elapsed.as_secs_f64(),
+                tool_s: 0.0, prompt_tokens: step_prompt, completion_tokens: step_completion,
+                seq_len_after: tokens_after,
+            });
             final_message = Some(message.to_string());
             break;
         }
 
         let _idle = ctx.idle();
+        let tool_start = Instant::now();
         let observation = match call_tool_server(
             &input.tool_server_url,
             action,
@@ -485,16 +777,26 @@ async fn main(input: Input) -> Result<String> {
             Ok(obs) => obs,
             Err(e) => format!("Tool server error: {e}"),
         };
+        let tool_elapsed = tool_start.elapsed();
         drop(_idle);
 
         let failed = observation.contains("Error:") || observation.contains("not found");
         recent_actions.push(RecentAction {
             action: action.to_string(),
+            command: command.to_string(),
             path: path.to_string(),
             failed,
         });
         if recent_actions.len() > STUCK_WINDOW + 2 {
             recent_actions.remove(0);
+        }
+
+        // Track whether the agent verified its fix with tests.
+        if (action == "edit" || action == "insert") && !failed {
+            ran_tests_after_edit = false;
+        }
+        if action == "bash" && (command.contains("pytest") || command.contains("unittest")) {
+            ran_tests_after_edit = true;
         }
 
         let observation = truncate_observation(&observation, input.max_observation_chars);
@@ -520,6 +822,16 @@ async fn main(input: Input) -> Result<String> {
             obs_with_hint = format!("{obs_with_hint}\n\n{stuck_hint}");
         }
 
+        step_metrics.push(StepMetrics {
+            step,
+            action: action.to_string(),
+            generate_s: gen_elapsed.as_secs_f64(),
+            tool_s: tool_elapsed.as_secs_f64(),
+            prompt_tokens: step_prompt,
+            completion_tokens: step_completion,
+            seq_len_after: tokens_after,
+        });
+
         history.push(Turn {
             assistant_json: raw.clone(),
             observation: observation.clone(),
@@ -534,10 +846,22 @@ async fn main(input: Input) -> Result<String> {
         None => println!("\nAgent did not finish within {max} steps", max = input.max_steps),
     }
 
+    let total_generate_s: f64 = step_metrics.iter().map(|m| m.generate_s).sum();
+    let total_tool_s: f64 = step_metrics.iter().map(|m| m.tool_s).sum();
+
     let result = serde_json::json!({
         "finished": final_message.is_some(),
         "message": final_message.unwrap_or_default(),
         "steps": history.len(),
+        "metrics": {
+            "total_wall_s": run_start.elapsed().as_secs_f64(),
+            "total_generate_s": total_generate_s,
+            "total_tool_s": total_tool_s,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
+            "num_generate_calls": step_metrics.len(),
+            "per_step": step_metrics,
+        },
     });
     Ok(result.to_string())
 }

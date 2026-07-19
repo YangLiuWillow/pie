@@ -35,6 +35,11 @@ class VllmDriverConfig:
     # Max tokens (across all sequences) in a batch. None = vllm's default.
     max_num_batched_tokens: int | None = None
 
+    # Override the model's native max sequence length. None = use the value
+    # from the HF config (e.g. 262144 for Qwen3). Lowering this reduces KV
+    # cache pre-allocation and frees GPU memory for activations.
+    max_model_len: int | None = None
+
     # KV cache block size override. None = vllm picks based on attention
     # backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32).
     block_size: int | None = None
