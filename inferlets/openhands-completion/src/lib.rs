@@ -179,8 +179,13 @@ async fn main(input: Input) -> Result<Output> {
         .max_tokens(input.max_tokens)
         .stop(&stop_token_ids);
 
-    if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
-        g = g.constrain(inferlet::GrammarConstraint::new(matcher));
+    // `native_matcher` traps host-side on an empty schema list, so gate on
+    // has_tools. Tool-less calls happen in practice: the LLMSummarizingCondenser
+    // sends its summarization request without tools.
+    if has_tools {
+        if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
+            g = g.constrain(inferlet::GrammarConstraint::new(matcher));
+        }
     }
 
     'outer: while let Some(step) = g.next()? {
