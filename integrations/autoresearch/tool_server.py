@@ -14,6 +14,7 @@ Stop with ``server.shutdown()``.
 
 from __future__ import annotations
 
+import difflib
 import json
 import subprocess
 import threading
@@ -23,6 +24,8 @@ from typing import Any
 
 MAX_OUTPUT_CHARS = 10_000
 BASH_TIMEOUT_S = 360
+MAX_EDIT_OLD_LINES = 50
+MAX_EDIT_NEW_LINES = 100
 
 
 def start_tool_server(working_dir: str, *, host: str = "127.0.0.1", port: int = 0) -> tuple[HTTPServer, int]:
@@ -159,12 +162,32 @@ def _exec_edit(path: str, old_str: str, new_str: str, working_dir: str) -> dict[
         return {"observation": f"File created: {path}", "exit_code": 0}
     if not file_path.exists():
         return {"observation": f"Error: file not found: {path}", "exit_code": 1}
+    old_lines = old_str.splitlines()
+    new_lines = new_str.splitlines()
+    if len(old_lines) > MAX_EDIT_OLD_LINES:
+        return {
+            "observation": (
+                f"Error: old_str is {len(old_lines)} lines (max {MAX_EDIT_OLD_LINES}). "
+                "Make smaller, targeted edits instead of replacing large blocks."
+            ),
+            "exit_code": 1,
+        }
+    if len(new_lines) > MAX_EDIT_NEW_LINES:
+        return {
+            "observation": (
+                f"Error: new_str is {len(new_lines)} lines (max {MAX_EDIT_NEW_LINES}). "
+                "Make smaller, targeted edits instead of rewriting large blocks."
+            ),
+            "exit_code": 1,
+        }
+
     content = file_path.read_text()
     count = content.count(old_str)
     if count == 0:
-        return {"observation": f"Error: old_str not found in {path}", "exit_code": 1}
+        hint = _find_similar_lines(content, old_str)
+        return {"observation": f"Error: old_str not found in {path}. {hint}", "exit_code": 1}
     if count > 1:
-        return {"observation": f"Error: old_str found {count} times in {path} (must be unique)", "exit_code": 1}
+        return {"observation": f"Error: old_str found {count} times in {path} (must be unique — add more surrounding context)", "exit_code": 1}
     new_content = content.replace(old_str, new_str, 1)
     file_path.write_text(new_content)
 
@@ -193,6 +216,31 @@ def _exec_edit(path: str, old_str: str, new_str: str, working_dir: str) -> dict[
     obs_parts.append(f"Context:\n{snippet}")
 
     return {"observation": "\n".join(obs_parts), "exit_code": 0}
+
+
+def _find_similar_lines(content: str, old_str: str) -> str:
+    old_lines = old_str.splitlines()
+    if not old_lines:
+        return "old_str is empty."
+    first_line = old_lines[0].strip()
+    if not first_line:
+        first_line = old_lines[1].strip() if len(old_lines) > 1 else ""
+    if not first_line:
+        return "Use read_file to see the actual file content, then retry with the exact text."
+
+    file_lines = content.splitlines()
+    matches = difflib.get_close_matches(first_line, [l.strip() for l in file_lines], n=3, cutoff=0.5)
+    if not matches:
+        return "Use read_file to see the actual file content, then retry with the exact text."
+
+    parts = ["Did you mean one of these lines?"]
+    for match in matches:
+        for i, fl in enumerate(file_lines):
+            if fl.strip() == match:
+                parts.append(f"  line {i+1}: {fl}")
+                break
+    parts.append("Use read_file to see exact content around the target lines, then retry.")
+    return "\n".join(parts)
 
 
 def _exec_read_file(path: str, working_dir: str) -> dict[str, Any]:

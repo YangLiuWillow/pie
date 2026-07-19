@@ -105,7 +105,10 @@ class TestEdit:
             "new_str": "anything",
         })
         assert result["exit_code"] == 1
-        assert "not found" in result["observation"]
+        # Homegrown editor says "not found"; the wrapped OpenHands FileEditor
+        # says "No replacement was performed ... did not appear verbatim".
+        obs = result["observation"].lower()
+        assert "not found" in obs or "no replacement" in obs
 
     def test_missing_file(self, server_and_dir):
         _, port, _ = server_and_dir
@@ -259,3 +262,18 @@ class TestMisc:
         _, port, _ = server_and_dir
         result = _post(port, {"action": "finish"})
         assert result["exit_code"] == 0
+
+    def test_has_diff_no_changes(self, server_and_dir):
+        _, port, tmpdir = server_and_dir
+        _post(port, {"action": "bash", "command": "git init && git add -A && git commit -m init --allow-empty"})
+        result = _post(port, {"action": "has_diff"})
+        assert result["exit_code"] == 0
+        assert result["has_diff"] is False
+
+    def test_has_diff_with_changes(self, server_and_dir):
+        _, port, tmpdir = server_and_dir
+        _post(port, {"action": "bash", "command": "git init && git add -A && git commit -m init --allow-empty"})
+        _post(port, {"action": "bash", "command": "echo changed > somefile.txt"})
+        result = _post(port, {"action": "has_diff"})
+        assert result["exit_code"] == 0
+        assert result["has_diff"] is True

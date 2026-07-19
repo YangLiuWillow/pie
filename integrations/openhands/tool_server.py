@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -28,12 +30,131 @@ BASH_TIMEOUT_S = 120
 MAX_EDIT_OLD_LINES = 50
 MAX_EDIT_NEW_LINES = 100
 
+import logging as _logging
+
+_HAS_FILE_EDITOR = False
+_saved_root_level = _logging.root.level
 try:
     from openhands.tools.file_editor.editor import FileEditor
     from openhands.tools.file_editor.exceptions import ToolError as EditorToolError
     _HAS_FILE_EDITOR = True
 except ImportError:
-    _HAS_FILE_EDITOR = False
+    pass
+finally:
+    _logging.root.setLevel(_saved_root_level)
+
+
+# ---------------------------------------------------------------------------
+# Persistent bash session
+# ---------------------------------------------------------------------------
+
+class PersistentBash:
+    """A long-lived bash process that preserves cwd and env across commands."""
+
+    def __init__(self, cwd: str):
+        self._init_cwd = cwd
+        self._proc = subprocess.Popen(
+            ["bash", "--norc", "--noprofile"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            env={**os.environ, "PS1": "", "TERM": "dumb", "LANG": "C.UTF-8"},
+        )
+        self._lock = threading.Lock()
+
+    def run(self, command: str, timeout: int = BASH_TIMEOUT_S) -> tuple[str, int]:
+        with self._lock:
+            if self._proc.poll() is not None:
+                self._restart()
+
+            marker = f"___PIE_DONE_{os.urandom(8).hex()}___"
+            wrapped = f"{command}\n_pie_ec=$?\nprintf '\\n{marker}%d\\n' \"$_pie_ec\"\n"
+
+            try:
+                self._proc.stdin.write(wrapped.encode())
+                self._proc.stdin.flush()
+            except BrokenPipeError:
+                self._restart()
+                return "(bash session died, restarted for next command)", 1
+
+            output_lines: list[str] = []
+            deadline = time.monotonic() + timeout
+            buf = b""
+            fd = self._proc.stdout.fileno()
+
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return (
+                        "\n".join(output_lines)
+                        + f"\n(command timed out after {timeout}s)",
+                        124,
+                    )
+
+                ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
+                if not ready:
+                    continue
+
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    # EOF: the command terminated the shell itself (e.g. a
+                    # bare `exit 42`). Bash's own exit status *is* the
+                    # command's status — harvest it before restarting so the
+                    # agent sees the real code, matching one-shot semantics.
+                    try:
+                        exit_code = self._proc.wait(timeout=5)
+                    except Exception:
+                        exit_code = 1
+                    tail = buf.decode("utf-8", "replace").strip()
+                    if tail and marker not in tail:
+                        output_lines.append(tail)
+                    self._restart()
+                    return "\n".join(output_lines), exit_code
+
+                buf += chunk
+                while b"\n" in buf:
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    line = line_bytes.decode("utf-8", "replace")
+                    if marker in line:
+                        ec_str = line.split(marker)[1].strip()
+                        exit_code = int(ec_str) if ec_str.isdigit() else 0
+                        return "\n".join(output_lines), exit_code
+                    output_lines.append(line)
+
+    def _restart(self):
+        # Preserve the agent's cwd across the restart when the old shell is
+        # still inspectable; once it's dead /proc is gone, so fall back to
+        # the workspace root (not /tmp — the agent must stay in its repo).
+        cwd = self._init_cwd
+        try:
+            link = os.readlink(f"/proc/{self._proc.pid}/cwd")
+            if os.path.isdir(link):
+                cwd = link
+        except Exception:
+            pass
+        try:
+            self._proc.kill()
+            self._proc.wait(timeout=2)
+        except Exception:
+            pass
+        self._proc = subprocess.Popen(
+            ["bash", "--norc", "--noprofile"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            env={**os.environ, "PS1": "", "TERM": "dumb", "LANG": "C.UTF-8"},
+        )
+
+    def close(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.stdin.close()
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
 
 
 def start_tool_server(working_dir: str, *, host: str = "127.0.0.1", port: int = 0) -> tuple[HTTPServer, int]:
@@ -42,9 +163,15 @@ def start_tool_server(working_dir: str, *, host: str = "127.0.0.1", port: int = 
     Returns ``(server, port)`` where *port* is the OS-assigned port when
     *port* is 0.
     """
-    handler = _make_handler(working_dir)
+    bash = PersistentBash(working_dir)
+    handler = _make_handler(working_dir, bash)
     server = HTTPServer((host, port), handler)
     actual_port = server.server_address[1]
+    _orig_shutdown = server.shutdown
+    def _shutdown():
+        _orig_shutdown()
+        bash.close()
+    server.shutdown = _shutdown
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, actual_port
@@ -58,7 +185,7 @@ def _to_abs_path(path: str, working_dir: str) -> str:
     return str(Path(working_dir) / path)
 
 
-def _make_handler(working_dir: str):
+def _make_handler(working_dir: str, bash: PersistentBash):
     editor = FileEditor(workspace_root=working_dir) if _HAS_FILE_EDITOR else None
 
     class Handler(BaseHTTPRequestHandler):
@@ -117,7 +244,7 @@ def _make_handler(working_dir: str):
             action = req.get("action", "")
             try:
                 if action == "bash":
-                    result = _exec_bash(req.get("command", ""), working_dir)
+                    result = _exec_bash(bash, req.get("command", ""))
                 elif action == "edit":
                     result = _exec_edit(
                         editor,
@@ -146,6 +273,8 @@ def _make_handler(working_dir: str):
                     result = _exec_undo(editor, req.get("path", ""), working_dir)
                 elif action == "finish":
                     result = {"observation": "Task finished.", "exit_code": 0}
+                elif action == "has_diff":
+                    result = _exec_has_diff(bash)
                 else:
                     result = {"observation": f"Unknown action: {action!r}", "exit_code": 1}
             except Exception as e:
@@ -170,29 +299,25 @@ def _make_handler(working_dir: str):
 # Bash
 # ---------------------------------------------------------------------------
 
-def _exec_bash(command: str, working_dir: str) -> dict[str, Any]:
+def _exec_bash(bash: PersistentBash, command: str) -> dict[str, Any]:
     if not command.strip():
         return {"observation": "(empty command)", "exit_code": 1}
-    proc = subprocess.Popen(
-        command,
-        shell=True,
-        cwd=working_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=BASH_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
-        return {"observation": f"Command timed out after {BASH_TIMEOUT_S}s", "exit_code": 124}
-    output = stdout + stderr
+    output, exit_code = bash.run(command)
     if len(output) > MAX_OUTPUT_CHARS:
         half = MAX_OUTPUT_CHARS // 2
         output = output[:half] + f"\n\n... ({len(output) - MAX_OUTPUT_CHARS} chars truncated) ...\n\n" + output[-half:]
-    return {"observation": output, "exit_code": proc.returncode}
+    return {"observation": output, "exit_code": exit_code}
+
+
+# ---------------------------------------------------------------------------
+# Diff check
+# ---------------------------------------------------------------------------
+
+def _exec_has_diff(bash: PersistentBash) -> dict[str, Any]:
+    """Check whether the working directory has any changes (tracked or untracked)."""
+    output, _ = bash.run("git diff HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null")
+    has_diff = len(output.strip()) > 0
+    return {"observation": str(has_diff).lower(), "has_diff": has_diff, "exit_code": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +439,18 @@ def _exec_read_file(
         return {"observation": "Error: path is required for read_file", "exit_code": 1}
 
     abs_path = _to_abs_path(path, working_dir)
+
+    # Directory listing
+    if Path(abs_path).is_dir():
+        try:
+            entries = sorted(Path(abs_path).iterdir())
+            listing = "\n".join(
+                f"  {e.name}/" if e.is_dir() else f"  {e.name}"
+                for e in entries
+            )
+            return {"observation": f"Directory: {path}\n{listing}", "exit_code": 0}
+        except OSError as e:
+            return {"observation": f"Error listing directory: {e}", "exit_code": 1}
 
     if editor is not None:
         try:
