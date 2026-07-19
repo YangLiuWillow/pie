@@ -1,0 +1,25 @@
+[package]
+name = "openhands-coder-session"
+version = "0.1.0"
+description = "Stateful OpenHands ↔ Pie transport. Same contract as openhands-completion, plus persistent per-conversation KV via named contexts: each call extends the saved session snapshot when the new prompt is a token-level extension of the previous one, and rebuilds from scratch otherwise. See integrations/openhands/docs/OPENHANDS_CODER_SESSION_DESIGN.md."
+authors = ["Lin Startup"]
+repository = "https://github.com/pie-project/pie"
+readme = "README.md"
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+session_id        = {type = "string", optional = true, description = "Conversation identity. When set, the prompt KV is kept across calls under a named context. Omit for fully stateless behavior."}
+session_prev_len  = {type = "int",    optional = true, description = "Token count of the previous call's prompt render (echo of the last response's session.len). 0 or absent on the first call."}
+session_prev_hash = {type = "string", optional = true, description = "FNV-1a-64 hex hash of the previous call's prompt render (echo of the last response's session.hash)."}
+session_action    = {type = "string", optional = true, description = "'delete' deletes the saved session context and exits (conversation end)."}
+kv_verify         = {type = "bool",   optional = true, description = "Assert token-level bookkeeping invariants on every call (Phase 2 fidelity mode). Errors instead of silently rebuilding on mismatch."}
+max_tokens        = {type = "int",    optional = true, description = "Hard cap on generated tokens. Default 2048."}
+temperature       = {type = "float",  optional = true, description = "Sampling temperature. 0 = greedy. Default 0.0."}
+top_p             = {type = "float",  optional = true, description = "Nucleus sampling threshold. Default 0.95."}
+use_grammar       = {type = "bool",   optional = true, description = "Constrain decoding with the native tool-call grammar. Default true. Disable for byte-parity with an unconstrained vLLM baseline."}
+model             = {type = "string", optional = true, description = "Model name (informational only — the runtime's first model is used)."}
+# `messages`, `tools`, and `stop` are structured arrays; the manifest TOML type
+# system only supports scalar types, so they are declared implicitly — the
+# inferlet's Input struct (serde) accepts and validates them at runtime.

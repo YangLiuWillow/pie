@@ -31,7 +31,7 @@ from litellm.types.utils import (
 )
 from openhands.sdk.llm import LLM
 from openhands.sdk.llm.streaming import TokenCallbackType
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 from pie_client import Event, PieClient
 
 
@@ -60,6 +60,30 @@ class PieLLM(LLM):
         default=600.0,
         description="Hard timeout per Pie request",
     )
+    pie_session: bool = Field(
+        default=False,
+        description="Keep the conversation's prompt KV alive across calls via "
+                    "a named Pie context (requires a session-capable inferlet, "
+                    "e.g. openhands-coder-session). Each call then prefills "
+                    "only the token delta since the previous call; on any "
+                    "history rewrite the inferlet rebuilds from scratch, so "
+                    "semantics are unchanged either way.",
+    )
+    pie_kv_verify: bool = Field(
+        default=False,
+        description="Fidelity mode: the inferlet asserts on every call that "
+                    "the session context's accumulated tokens equal the "
+                    "from-scratch prompt render (Phase 2 of the coder-session "
+                    "design). Errors out instead of proceeding on mismatch.",
+    )
+
+    # Session bookkeeping — the inferlet is stateless between invocations, so
+    # the host carries the previous prompt render's (length, hash) and echoes
+    # it back; the inferlet uses it for the token-level extension check.
+    _pie_session_id: str | None = PrivateAttr(default=None)
+    _pie_session_len: int = PrivateAttr(default=0)
+    _pie_session_hash: str | None = PrivateAttr(default=None)
+    _pie_session_stats: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
     # `_wrap_as_model_response` now populates real `tool_calls` from the
     # inferlet's structured output (see `assistant_with_tool_calls`/
@@ -105,9 +129,74 @@ class PieLLM(LLM):
             _inject_native_examples(wire_messages, tools)
 
         gen_params = self._extract_gen_params(kwargs)
+        if self.pie_session:
+            gen_params.update(self._session_request_fields())
         raw = asyncio.run(self._call_pie(wire_messages, tools, gen_params))
+        if self.pie_session:
+            self._record_session_response(raw)
         _sanitize_tool_args(raw, tools)
         return self._wrap_as_model_response(raw)
+
+    # ------------------------------------------------------------------
+    # Session protocol (openhands-coder-session inferlet)
+    # ------------------------------------------------------------------
+    def _session_request_fields(self) -> dict[str, Any]:
+        if self._pie_session_id is None:
+            self._pie_session_id = uuid.uuid4().hex
+        fields: dict[str, Any] = {
+            "session_id": self._pie_session_id,
+            "session_prev_len": self._pie_session_len,
+        }
+        if self._pie_session_hash is not None:
+            fields["session_prev_hash"] = self._pie_session_hash
+        if self.pie_kv_verify:
+            fields["kv_verify"] = True
+        return fields
+
+    def _record_session_response(self, raw: dict[str, Any]) -> None:
+        session = raw.get("session")
+        if not isinstance(session, dict):
+            return
+        self._pie_session_len = int(session.get("len") or 0)
+        self._pie_session_hash = session.get("hash") or None
+        self._pie_session_stats.append({
+            "mode": session.get("mode"),
+            "prompt_len": self._pie_session_len,
+            "prefill_tokens": int(session.get("prefill_tokens") or 0),
+        })
+
+    def close_pie_session(self) -> None:
+        """Delete the server-side session context (idempotent, never raises).
+
+        Call when the conversation ends — a leaked session would pin its KV
+        snapshot until an external sweep removes it.
+        """
+        if not self.pie_session or self._pie_session_id is None:
+            return
+        try:
+            asyncio.run(self._call_pie(
+                [], [],
+                {"session_id": self._pie_session_id, "session_action": "delete"},
+            ))
+        except Exception:
+            pass
+        self._pie_session_id = None
+        self._pie_session_len = 0
+        self._pie_session_hash = None
+
+    def pie_session_summary(self) -> dict[str, Any]:
+        """Aggregate per-call session telemetry for benchmark metadata."""
+        stats = self._pie_session_stats
+        modes: dict[str, int] = {}
+        for s in stats:
+            m = str(s.get("mode"))
+            modes[m] = modes.get(m, 0) + 1
+        return {
+            "num_calls": len(stats),
+            "prompt_tokens_rendered": sum(s["prompt_len"] for s in stats),
+            "prompt_tokens_prefilled": sum(s["prefill_tokens"] for s in stats),
+            "modes": modes,
+        }
 
     # ------------------------------------------------------------------
     # Parameter extraction from kwargs
