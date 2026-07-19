@@ -420,8 +420,21 @@ impl QwenInstruct {
             prefix_rules.push_str(&format!("tp-{i} ::= ({alts})?\n"));
         }
 
+        // The tool call itself is REQUIRED (tool_choice=required semantics):
+        // a reasoning prefix followed by no call at all leaves EOS masked,
+        // so a model that narrates its next action and tries to stop gets
+        // pushed into actually emitting the call it just announced —
+        // t=0 trajectories otherwise die in announce-without-acting nudge
+        // loops (traj job 18820715). OpenHands supplies `finish` and
+        // `think` tools, so a mandatory call always has a sensible target.
+        // Repetition is capped at 4 calls per turn (mc-* chain): the
+        // unbounded tail let a degenerate t=0 decode emit 15 identical
+        // calls in one response (traj job 18818735).
         let grammar = format!(
-            r#"root ::= tp-0 (tool-call ("\n" tool-call)*)?
+            r#"root ::= tp-0 tool-call mc-1
+mc-1 ::= ("\n" tool-call mc-2)?
+mc-2 ::= ("\n" tool-call mc-3)?
+mc-3 ::= ("\n" tool-call)?
 {prefix_rules}tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
 tool-json ::= {tool_json_alt}
 {extra_rules}json-object ::= "{{" json-ws (json-pair (json-ws "," json-ws json-pair)*)? json-ws "}}"
@@ -874,15 +887,24 @@ mod tests {
         .to_string();
         let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
 
-        // Content-only turns are legal (OpenHands treats them as agent
-        // messages).
-        assert!(matches_grammar(&tg, "I'm done with the task."));
-        assert!(matches_grammar(&tg, "The answer is 42."));
-        assert!(matches_grammar(&tg, ""));
+        // A tool call is REQUIRED (tool_choice=required semantics):
+        // content-only turns cannot terminate, so a model that narrates
+        // its next action without acting keeps EOS masked until it emits
+        // the call. OpenHands supplies finish/think tools, so a mandatory
+        // call always has a sensible target.
+        assert!(!matches_grammar(&tg, "I'm done with the task."));
+        assert!(!matches_grammar(&tg, "The answer is 42."));
+        assert!(!matches_grammar(&tg, ""));
 
-        // Text containing '<' and near-misses of the literal stays free.
-        assert!(matches_grammar(&tg, "compare a < b and use <tools> or </tool_call> markers"));
-        assert!(matches_grammar(&tg, "almost: <tool_call left open"));
+        // Text containing '<' and near-misses of the literal stays free —
+        // legal as a prefix (followed by a call), non-terminatable alone.
+        let call = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        let with_markers = format!(
+            "compare a < b and use <tools> or </tool_call> markers\n{call}"
+        );
+        assert!(matches_grammar(&tg, &with_markers));
+        let with_almost = format!("almost: <tool_call left open, anyway:\n{call}");
+        assert!(matches_grammar(&tg, &with_almost));
         // '<' restarting mid-almost-literal must still be tracked:
         // this string CONTAINS the full literal starting at index 2.
         assert!(!matches_grammar(&tg, "<t<tool_call>"));
@@ -905,6 +927,13 @@ mod tests {
         // Text after a completed tool call is not part of the template.
         let trailing = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>\nand then some";
         assert!(!matches_grammar(&tg, trailing));
+
+        // Repetition is capped at 4 calls per turn — a degenerate t=0
+        // decode once emitted 15 identical calls in one response.
+        let four = std::iter::repeat(call).take(4).collect::<Vec<_>>().join("\n");
+        assert!(matches_grammar(&tg, &four));
+        let five = std::iter::repeat(call).take(5).collect::<Vec<_>>().join("\n");
+        assert!(!matches_grammar(&tg, &five));
     }
 
     #[test]
