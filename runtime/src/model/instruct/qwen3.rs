@@ -313,13 +313,20 @@ impl QwenInstruct {
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
     ///
     /// The grammar enforces well-formed `<tool_call>` blocks with a valid
-    /// tool name and syntactically-valid JSON arguments. The model is free
-    /// to include any properties in any order within the arguments object,
-    /// guided by the few-shot examples and tool descriptions in the prompt.
+    /// tool name (layer 1) and, when the tool declares a `parameters`
+    /// schema with properties, arguments constrained to that schema
+    /// (layer 2, via `json_schema_to_ebnf_named`). Tools without a usable
+    /// schema fall back to generic JSON arguments. Both paths permit the
+    /// model's natural JSON whitespace (e.g. a space after `:`); masking
+    /// out those high-probability tokens forces sampling into the logit
+    /// noise floor, where grammar-legal garbage wins per-tool.
     fn build_tool_call_grammar(tools: &[String]) -> Option<String> {
+        use crate::inference::structured::json_schema::{
+            json_schema_to_ebnf_named, JsonSchemaOptions,
+        };
+
         struct ToolSpec {
             name: String,
-            #[allow(dead_code)]
             parameters: Option<serde_json::Value>,
         }
 
@@ -347,16 +354,37 @@ impl QwenInstruct {
         let mut tool_json_alts: Vec<String> = Vec::with_capacity(specs.len());
         let mut extra_rules = String::new();
 
-        // Layer 1: the grammar enforces well-formed `<tool_call>` blocks
-        // with a valid tool name and JSON arguments. Per-tool schema
-        // constraints (layer 2) are intentionally omitted — the model is
-        // free to include any properties in any order, guided by the
-        // few-shot examples and its own training.
         for (i, spec) in specs.iter().enumerate() {
             let alt_name = format!("tool-json-{i}");
             let escaped_name = Self::escape_ebnf_literal(&spec.name);
+            // Layer 2: constrain arguments to the tool's parameter schema
+            // when it declares properties; a schema that fails to convert
+            // (or declares none) falls back to generic JSON.
+            let schema_args = spec.parameters.as_ref().and_then(|params| {
+                let has_props = params
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .is_some_and(|o| !o.is_empty());
+                if !has_props {
+                    return None;
+                }
+                let args_root = format!("tool-args-{i}");
+                json_schema_to_ebnf_named(params, &args_root, &JsonSchemaOptions::default())
+                    .ok()
+                    .map(|ebnf| (args_root, ebnf))
+            });
+            let args_rule = match &schema_args {
+                Some((args_root, ebnf)) => {
+                    extra_rules.push_str(ebnf);
+                    if !ebnf.ends_with('\n') {
+                        extra_rules.push('\n');
+                    }
+                    args_root.as_str()
+                }
+                None => "json-object",
+            };
             extra_rules.push_str(&format!(
-                "{alt_name} ::= \"{{\\\"name\\\": \\\"{escaped_name}\\\", \\\"arguments\\\": \" json-object \"}}\"\n",
+                "{alt_name} ::= \"{{\\\"name\\\": \\\"{escaped_name}\\\", \\\"arguments\\\": \" {args_rule} \"}}\"\n",
             ));
             tool_json_alts.push(alt_name);
         }
@@ -367,15 +395,15 @@ impl QwenInstruct {
             r#"root ::= tool-call ("\n" tool-call)*
 tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
 tool-json ::= {tool_json_alt}
-{extra_rules}json-object ::= "{{" json-members? "}}"
-json-members ::= json-pair ("," json-pair)*
-json-pair ::= json-string ":" json-value
+{extra_rules}json-object ::= "{{" json-ws (json-pair (json-ws "," json-ws json-pair)*)? json-ws "}}"
+json-pair ::= json-string json-ws ":" json-ws json-value
 json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
 json-string ::= "\"" json-chars "\""
 json-chars ::= json-char*
 json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
-json-array ::= "[" (json-value ("," json-value)*)? "]"
+json-array ::= "[" json-ws (json-value (json-ws "," json-ws json-value)*)? json-ws "]"
+json-ws ::= [ \t\n\r]*
 "#
         );
         Some(grammar)
@@ -733,15 +761,20 @@ mod tests {
         let valid = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
         assert!(matches_grammar(&tg, valid), "well-typed arguments should match");
 
-        // Without per-tool schema constraints, any valid JSON arguments are accepted.
-        let any_args = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
-        assert!(matches_grammar(&tg, any_args), "any valid JSON arguments should be accepted");
+        // The model's natural whitespace style must be legal — masking it
+        // out is what pushed sampling into the noise floor on GPU.
+        let spaced = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\": \"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, spaced), "space after ':' should be accepted");
+
+        // Schema-constrained: wrong value type is rejected.
+        let wrong_type = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, wrong_type), "wrong argument type must be rejected");
 
         let extra_prop = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\",\"extra\":\"x\"}}\n</tool_call>";
-        assert!(matches_grammar(&tg, extra_prop), "extra properties should be accepted");
+        assert!(!matches_grammar(&tg, extra_prop), "extra properties must be rejected");
 
         let empty_args = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {}}\n</tool_call>";
-        assert!(matches_grammar(&tg, empty_args), "empty arguments should be accepted");
+        assert!(!matches_grammar(&tg, empty_args), "missing required property must be rejected");
     }
 
     #[test]
@@ -1009,5 +1042,202 @@ mod tests {
         // Empty arguments
         let empty = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {}}\n</tool_call>";
         assert!(matches_grammar(&tg, empty));
+
+        // Natural whitespace after ':' and ',' in the generic fallback too
+        let spaced = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, spaced));
+    }
+
+    /// Regression for the GPU degeneracy found via mask-debug job 18734943:
+    /// with the real file_editor schema (command is an enum), the exact
+    /// garbage the constrained run produced must be grammar-illegal, and
+    /// the model's natural spaced rendering must be legal.
+    #[test]
+    fn tool_call_grammar_rejects_observed_degenerate_output() {
+        let inst = qwen3();
+        // Real OpenHands file_editor shape: the FIRST declared property
+        // (summary) is optional — omitting it must not strand the grammar
+        // on a leading comma.
+        let file_editor = serde_json::json!({
+            "name": "file_editor",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+                    "path": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"}
+                },
+                "required": ["command", "path"]
+            }
+        })
+        .to_string();
+        let tg = inst.tool_call_grammar(&[file_editor]).expect("grammar should build");
+
+        let degenerate = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\":\"}}\n</tool_call> \n{\"}}\n</tool_call>";
+        assert!(
+            !matches_grammar(&tg, degenerate),
+            "observed degenerate output must be rejected by the schema layer"
+        );
+
+        let sane = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, sane), "omitting the leading optional property must be accepted");
+
+        let with_summary = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"summary\": \"look\", \"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, with_summary), "leading optional property present must be accepted");
+
+        let str_replace = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"str_replace\", \"path\": \"/tmp/x.py\", \"old_str\": \"a\", \"new_str\": \"b\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, str_replace), "optional tail properties must be accepted");
+
+        let leading_comma = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {, \"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, leading_comma), "leading comma must be rejected");
+    }
+
+    /// Diagnostic (needs the real Qwen2.5 tokenizer on NFS): walk a realistic
+    /// tool call token-by-token and assert every expected token survives the
+    /// next-token bitmask. Reproduces the GPU-side degenerate-mask failure.
+    #[test]
+    #[ignore]
+    fn debug_mask_walk_real_tokenizer() {
+        let path = std::env::var("QWEN_TOKENIZER_JSON").expect("set QWEN_TOKENIZER_JSON");
+        let tok = Arc::new(Tokenizer::from_file(std::path::Path::new(&path)).unwrap());
+        let inst = QwenInstruct::new(
+            tok.clone(),
+            ChatMLConfig {
+                has_thinking: false,
+                has_tools: true,
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        );
+
+        // Accuracy-preservation invariant: for any well-formed,
+        // schema-conformant rendering the model would naturally produce
+        // (compact or spaced, optional properties omitted or present), the
+        // mask must allow every expected token at every step — i.e. the
+        // constraint never binds on correct output, so constrained
+        // greedy decoding equals unconstrained greedy decoding whenever
+        // the unconstrained output is well-formed.
+        let file_editor_schema = r#"{"type":"function","function":{"name":"file_editor","parameters":{"type":"object","properties":{"summary":{"type":"string"},"command":{"type":"string","enum":["view","create","str_replace","insert","undo_edit"]},"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"}},"required":["command","path"]}}}"#;
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "terminal",
+                r#"{"type":"function","function":{"name":"terminal","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"terminal\", \"arguments\": {\"command\":\"ls\"}}\n</tool_call>",
+            ),
+            (
+                "terminal-spaced",
+                r#"{"type":"function","function":{"name":"terminal","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"terminal\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>",
+            ),
+            (
+                "file_editor",
+                file_editor_schema.to_string(),
+                "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\":\"view\",\"path\":\"/tmp/x.py\"}}\n</tool_call>",
+            ),
+            (
+                "file_editor-spaced-no-summary",
+                file_editor_schema.to_string(),
+                "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>",
+            ),
+            (
+                "file_editor-str-replace",
+                file_editor_schema.to_string(),
+                "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"summary\": \"fix bug\", \"command\": \"str_replace\", \"path\": \"/tmp/x.py\", \"old_str\": \"a = 1\", \"new_str\": \"a = 2\"}}\n</tool_call>",
+            ),
+            (
+                "think",
+                r#"{"type":"function","function":{"name":"think","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"think\", \"arguments\": {\"thought\":\"I should list the files.\"}}\n</tool_call>",
+            ),
+            (
+                "think-spaced",
+                r#"{"type":"function","function":{"name":"think","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"think\", \"arguments\": {\"thought\": \"I should list the files first.\"}}\n</tool_call>",
+            ),
+        ];
+
+        for (name, schema, target) in cases {
+            let tg = inst.tool_call_grammar(&[schema]).expect("grammar builds");
+            let mut m = crate::inference::structured::matcher::GrammarMatcher::new(
+                tg.grammar.clone(),
+                tok.clone(),
+                vec![],
+                10,
+            );
+            let ids = tok.encode(target);
+            let words = (tok.vocab_size() + 31) / 32;
+            let mut mask = vec![0u32; words];
+            let mut failed = false;
+            let dump_dir = std::env::var("MASK_DUMP_DIR").ok();
+            for (i, &id) in ids.iter().enumerate() {
+                // Serving path: BRLE-encoded mask (what the driver actually sees).
+                let brle = m.fill_next_token_brle();
+                if let Some(dir) = &dump_dir {
+                    let mut popcount = 0usize;
+                    for (val, start, end) in brle.iter_runs() {
+                        if val {
+                            popcount += end.min(tok.vocab_size()) - start;
+                        }
+                    }
+                    let rec = serde_json::json!({
+                        "case": name,
+                        "step": i,
+                        "next_id": id,
+                        "popcount": popcount,
+                        "total_size": brle.total_size,
+                        "brle": brle.buffer,
+                    });
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/brle_dump.jsonl"))
+                        .unwrap();
+                    writeln!(f, "{rec}").unwrap();
+                }
+                let mut brle_bits = vec![false; tok.vocab_size()];
+                for (val, start, end) in brle.iter_runs() {
+                    for t in start..end.min(tok.vocab_size()) {
+                        brle_bits[t] = val;
+                    }
+                }
+                m.fill_next_token_bitmask(&mut mask);
+                for t in 0..tok.vocab_size() {
+                    let raw = (mask[t / 32] >> (t % 32)) & 1 == 1;
+                    if raw != brle_bits[t] {
+                        panic!(
+                            "[{name}] step {i}: BRLE/bitmask disagree at token {t} ({:?}): raw={raw} brle={}",
+                            tok.decode(&[t as u32], false),
+                            brle_bits[t]
+                        );
+                    }
+                }
+                let allowed = (mask[id as usize / 32] >> (id % 32)) & 1 == 1;
+                if !allowed {
+                    let mut sample = Vec::new();
+                    for t in 0..tok.vocab_size() {
+                        if (mask[t / 32] >> (t % 32)) & 1 == 1 {
+                            sample.push(format!("{:?}", tok.decode(&[t as u32], false)));
+                            if sample.len() >= 25 {
+                                break;
+                            }
+                        }
+                    }
+                    println!(
+                        "[{name}] step {i}: token {id} {:?} MASKED OUT\n  prefix: {:?}\n  allowed sample: {}",
+                        tok.decode(&[id], false),
+                        tok.decode(&ids[..i], false),
+                        sample.join(", ")
+                    );
+                    failed = true;
+                    break;
+                }
+                assert!(m.accept_token(id), "[{name}] accept_token failed at step {i}");
+            }
+            if !failed {
+                println!("[{name}] full walk OK ({} tokens)", ids.len());
+            }
+        }
     }
 }
