@@ -291,7 +291,10 @@ async fn main(mut input: Input) -> Result<Output> {
     // every nudge until the run stucks out. Replay the prose on the
     // pre-generation fork (raw token ids — no re-encode) and force one
     // well-formed call under the tool-call grammar.
-    if tool_calls.is_empty() && !generated.is_empty() {
+    // Runs even when phase 1 produced nothing at all (immediate stop
+    // token, traj job 18904720 completion 5) — an empty response forces
+    // OpenHands into a no-op nudge round-trip.
+    if tool_calls.is_empty() {
         if let Some(mut fk) = phase2_fork.take() {
             if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
                 let mut prose = generated.clone();
@@ -320,6 +323,11 @@ async fn main(mut input: Input) -> Result<Output> {
                                 name,
                                 arguments,
                             });
+                            // One forced call is the point of phase 2 —
+                            // letting the grammar run on pads the turn
+                            // with junk-argument extra calls (traj job
+                            // 18904720 completion 6).
+                            break 'forced;
                         }
                         if stop_token_ids.contains(&t) {
                             break 'forced;
