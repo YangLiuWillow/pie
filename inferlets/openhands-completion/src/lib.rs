@@ -133,10 +133,12 @@ struct ToolCallOut {
 // ─── Entry point ───────────────────────────────────────────────────────────
 
 #[inferlet::main]
-async fn main(input: Input) -> Result<Output> {
+async fn main(mut input: Input) -> Result<Output> {
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
+
+    sanitize_messages(&mut input.messages, &model);
 
     let tool_schemas: Vec<String> = input
         .tools
@@ -170,7 +172,16 @@ async fn main(input: Input) -> Result<Output> {
         }
     };
 
-    let stop_token_ids = chat::stop_tokens(&model);
+    // Also stop at the turn-START marker: at t=0 a looping model starts
+    // simulating the next turn instead of stopping, and the leaked
+    // "<|im_start|>" text round-trips through OpenHands message content
+    // into fake turn boundaries on the next request, degenerating into
+    // token salad (traj job 18825434).
+    let mut stop_token_ids = chat::stop_tokens(&model);
+    let turn_start = model.tokenizer().encode("<|im_start|>");
+    if turn_start.len() == 1 && !stop_token_ids.contains(&turn_start[0]) {
+        stop_token_ids.push(turn_start[0]);
+    }
     let has_tools = !tool_schemas.is_empty();
     let mut tool_decoder = has_tools.then(|| tools::Decoder::new(&model));
 
@@ -199,11 +210,18 @@ async fn main(input: Input) -> Result<Output> {
 
             if let Some(dec) = tool_decoder.as_mut() {
                 if let tools::Event::Call(name, arguments) = dec.feed(&[t])? {
-                    tool_calls.push(ToolCallOut {
-                        id: format!("call_{}", tool_calls.len()),
-                        name,
-                        arguments,
-                    });
+                    // Looping models emit the same call several times in one
+                    // turn; executing the copies just burns agent iterations.
+                    let dup = tool_calls
+                        .iter()
+                        .any(|c| c.name == name && c.arguments == arguments);
+                    if !dup {
+                        tool_calls.push(ToolCallOut {
+                            id: format!("call_{}", tool_calls.len()),
+                            name,
+                            arguments,
+                        });
+                    }
                 }
             }
 
@@ -255,11 +273,16 @@ async fn main(input: Input) -> Result<Output> {
     if tool_calls.is_empty() {
         for (offset, name, args) in parse_fenced_tool_calls(&full_text) {
             fence_split_at.get_or_insert(offset);
-            tool_calls.push(ToolCallOut {
-                id: format!("call_{}", tool_calls.len()),
-                name,
-                arguments: args,
-            });
+            let dup = tool_calls
+                .iter()
+                .any(|c| c.name == name && c.arguments == args);
+            if !dup {
+                tool_calls.push(ToolCallOut {
+                    id: format!("call_{}", tool_calls.len()),
+                    name,
+                    arguments: args,
+                });
+            }
         }
     }
 
@@ -351,6 +374,42 @@ async fn main(input: Input) -> Result<Output> {
 /// Replay `messages` turn by turn, matching the model's chat template
 /// byte-for-byte (including merged tool-call/tool-response turns) rather
 /// than concatenating hand-formatted strings.
+/// Strip the tokenizer's special-token strings out of round-tripped message
+/// content. `Tokenizer::encode` maps a literal special-token string (e.g.
+/// "<|im_start|>" leaked into an assistant reply) back to the real token id,
+/// so replaying it would plant fake turn boundaries mid-message and corrupt
+/// the chat structure (traj job 18825434 degenerated into token salad this
+/// way).
+fn sanitize_messages(messages: &mut [Message], model: &Model) {
+    let (_ids, byte_seqs) = model.tokenizer().special_tokens();
+    let specials: Vec<String> = byte_seqs
+        .into_iter()
+        .filter_map(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if specials.is_empty() {
+        return;
+    }
+    let clean = |s: &mut String| {
+        for sp in &specials {
+            if s.contains(sp.as_str()) {
+                *s = s.replace(sp.as_str(), "");
+            }
+        }
+    };
+    for m in messages.iter_mut() {
+        if let Some(c) = m.content.as_mut() {
+            clean(c);
+        }
+        if let Some(calls) = m.tool_calls.as_mut() {
+            for c in calls.iter_mut() {
+                clean(&mut c.function.name);
+                clean(&mut c.function.arguments);
+            }
+        }
+    }
+}
+
 fn replay_history(
     ctx: &mut Context,
     model: &Model,
