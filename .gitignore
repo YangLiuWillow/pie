@@ -249,3 +249,6 @@ website/src/data/models.json
 PIEX.md
 pie/rollout_logs/
 *.out
+
+# CPM (CMake) download cache for the native CUDA driver build (flashinfer, etc.)
+/.cpm-cache/

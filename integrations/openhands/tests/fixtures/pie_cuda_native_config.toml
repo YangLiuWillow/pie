@@ -1,0 +1,36 @@
+# Native CUDA driver (in-process, no Python/vLLM subprocess).
+# Qwen2.5-Coder-7B — 1:1 swap of pie_cuda_vllm_config.toml onto the
+# embedded cuda_native driver. Requires a `pie` built with
+# `--features driver-portable,driver-cuda` (see build_pie_cuda.sh);
+# check with `pie driver list`.
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+# NOTE: the cuda_native C++ side sizes its KV cache directly from
+# max_num_kv_pages × kv_page_size (a hard allocation); gpu_mem_utilization
+# is NOT consumed by the driver, so pick pages to fit the GPU by hand.
+# 2048 pages × 32 = 65536 KV tokens (~4 GB at 7B), leaving ample room
+# beside the ~14 GB of bf16 weights.
+gpu_mem_utilization = 0.85
+kv_page_size = 32
+max_num_kv_pages = 2048
+max_batch_tokens = 10240
+max_batch_size = 512
+weight_dtype = "bfloat16"
+# CPU-offload swap. Left at 0: the in-process cuda driver does not yet wire
+# the swap control-fd (see server/src/embedded_driver.rs write_cuda_startup_toml),
+# so >0 allocates a pool the runtime cannot drive. Admission control keeps
+# the engine from overcommitting KV instead.
+swap_pool_size = 0

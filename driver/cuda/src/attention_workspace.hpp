@@ -17,9 +17,14 @@ namespace pie_cuda_driver {
 
 class AttentionWorkspace {
 public:
+    // flashinfer's prefill plan carries split-KV tmp buffers (batch_prefill_tmp_v
+    // et al.) in the float workspace; their footprint grows with prefill token
+    // count × KV length. The old 64 MiB default overflowed on large 30B agent
+    // prefills (needed ~162 MiB for a single fire). 512 MiB gives generous
+    // headroom and is negligible beside model weights + KV on the GPU.
     static AttentionWorkspace allocate(
-        std::size_t float_workspace_bytes = 64 * 1024 * 1024,   // 64 MiB
-        std::size_t int_workspace_bytes  =  8 * 1024 * 1024);   // 8  MiB
+        std::size_t float_workspace_bytes = 512ull * 1024 * 1024,  // 512 MiB
+        std::size_t int_workspace_bytes   =   8ull * 1024 * 1024); // 8  MiB
 
     AttentionWorkspace() = default;
     AttentionWorkspace(const AttentionWorkspace&) = delete;
