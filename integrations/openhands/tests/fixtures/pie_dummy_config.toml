@@ -1,0 +1,19 @@
+# Smoke-test config: dummy driver, no real model weights.
+# Tokenizer is still downloaded from HF on first run (~few MB).
+
+[auth]
+enabled = false
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
+kv_page_size = 16
+max_num_kv_pages = 256

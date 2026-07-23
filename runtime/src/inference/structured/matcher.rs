@@ -1177,4 +1177,191 @@ ws ::= [ \t\n\r]*
         let input = format!(r#"{{"name":"{}"}}"#, long_name);
         assert!(m.accept_string(&input));
     }
+
+    #[test]
+    fn test_repeat_star_only_allows_continuation_after_first_match() {
+        // Simplified model of the tool-call grammar's root rule:
+        //   root ::= item ("\n" item)*
+        //   item ::= "<" [a-z]+ ">"
+        //
+        // After completing the first `item`, only "\n" (to start another
+        // item) or termination should be valid — no arbitrary text.
+        let ebnf = r#"
+            root ::= item rest
+            rest ::= ("\n" item)*
+            item ::= "<" body ">"
+            body ::= [a-z]+
+        "#;
+        let vocab: &[&str] = &[
+            "<", ">", "\n", "a", "b", " ", "X", ".", "hello",
+        ];
+        let mut m = make_matcher_with_stop(ebnf, "root", vocab, vec![]);
+
+        // Complete the first item
+        assert!(m.accept_string("<abc>"));
+        assert!(m.can_terminate(), "should be terminable after first item");
+
+        // Now check bitmask: only "\n" (token 2) and ">" (no, we're past
+        // item) should be valid; arbitrary text like " " (5), "X" (6),
+        // "." (7), "hello" (8) must NOT be valid.
+        let mut bm = vec![0u32; bitmask_size(vocab.len())];
+        m.fill_next_token_bitmask(&mut bm);
+
+        assert!(
+            bitmask::get_bit(&bm, 2),
+            "newline token should be allowed (starts another item)"
+        );
+        assert!(
+            !bitmask::get_bit(&bm, 5),
+            "space should NOT be allowed after a complete item"
+        );
+        assert!(
+            !bitmask::get_bit(&bm, 6),
+            "'X' should NOT be allowed after a complete item"
+        );
+        assert!(
+            !bitmask::get_bit(&bm, 7),
+            "'.' should NOT be allowed after a complete item"
+        );
+        assert!(
+            !bitmask::get_bit(&bm, 8),
+            "'hello' should NOT be allowed after a complete item"
+        );
+    }
+
+    #[test]
+    fn test_tool_call_grammar_rejects_arbitrary_text_after_first_call() {
+        // The actual tool-call grammar structure, with the real
+        // <tool_call> / </tool_call> tags and JSON body.
+        let ebnf = r#"
+root ::= tool-call ("\n" tool-call)*
+tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
+tool-json ::= "{\"name\": \"calculator\", \"arguments\": " json-object "}"
+json-object ::= "{" json-members? "}"
+json-members ::= json-pair ("," json-pair)*
+json-pair ::= json-string ":" json-value
+json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
+json-string ::= "\"" json-chars "\""
+json-chars ::= json-char*
+json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
+json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+json-array ::= "[" (json-value ("," json-value)*)? "]"
+"#;
+        // Build a vocab with single-byte tokens + some multi-byte tokens
+        // that shouldn't be allowed after the first </tool_call>.
+        let mut vocab_strs: Vec<String> = Vec::new();
+        // All printable ASCII as single-byte tokens
+        for c in 0u8..=127 {
+            vocab_strs.push(String::from(c as char));
+        }
+        // Add some multi-byte tokens that represent "arbitrary text"
+        vocab_strs.push(" 47".to_string());      // 128
+        vocab_strs.push(" * ".to_string());       // 129
+        vocab_strs.push("hello".to_string());     // 130
+        vocab_strs.push("world".to_string());     // 131
+        vocab_strs.push("\n<tool_call>".to_string()); // 132: valid continuation prefix
+
+        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
+        let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab_strs));
+        let mut m = GrammarMatcher::new(grammar, tokenizer, vec![], 10);
+
+        // Feed a complete first tool call
+        let first_call = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        assert!(m.accept_string(first_call), "first tool call should be accepted");
+        assert!(m.can_terminate(), "grammar should be terminable after first call");
+
+        // Check bitmask at this point
+        let mut bm = vec![0u32; bitmask_size(vocab_strs.len())];
+        m.fill_next_token_bitmask(&mut bm);
+
+        // "\n" (token 10) should be allowed — it starts the continuation
+        assert!(bitmask::get_bit(&bm, b'\n' as usize),
+            "newline should be allowed (starts another tool-call)");
+
+        // Arbitrary text tokens must NOT be allowed
+        assert!(!bitmask::get_bit(&bm, b' ' as usize),
+            "space should not be allowed after </tool_call>");
+        assert!(!bitmask::get_bit(&bm, b'4' as usize),
+            "'4' should not be allowed after </tool_call>");
+        assert!(!bitmask::get_bit(&bm, b'a' as usize),
+            "'a' should not be allowed after </tool_call>");
+        assert!(!bitmask::get_bit(&bm, 128),
+            "' 47' token should not be allowed after </tool_call>");
+        assert!(!bitmask::get_bit(&bm, 129),
+            "' * ' token should not be allowed after </tool_call>");
+        assert!(!bitmask::get_bit(&bm, 130),
+            "'hello' token should not be allowed after </tool_call>");
+        assert!(!bitmask::get_bit(&bm, 131),
+            "'world' token should not be allowed after </tool_call>");
+
+        // "\n<tool_call>" (token 132) should be valid — it's a valid
+        // continuation prefix ("\n" starts the repeat, then "<" starts
+        // the next tool-call).
+        assert!(bitmask::get_bit(&bm, 132),
+            "newline+<tool_call> should be allowed (valid continuation)");
+    }
+
+    #[test]
+    fn test_tool_call_grammar_newline_prefix_tokens_rejected_after_call() {
+        // Same grammar, but test tokens that START with \n then continue
+        // with bytes not matching "<tool_call>..." — these should be
+        // rejected because the only valid continuation is "\n<tool_call>".
+        let ebnf = r#"
+root ::= tool-call ("\n" tool-call)*
+tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
+tool-json ::= "{\"name\": \"calc\", \"arguments\": " json-object "}"
+json-object ::= "{" json-members? "}"
+json-members ::= json-pair ("," json-pair)*
+json-pair ::= json-string ":" json-value
+json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
+json-string ::= "\"" json-chars "\""
+json-chars ::= json-char*
+json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
+json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+json-array ::= "[" (json-value ("," json-value)*)? "]"
+"#;
+        let mut vocab_strs: Vec<String> = Vec::new();
+        for c in 0u8..=127 {
+            vocab_strs.push(String::from(c as char));
+        }
+        // Tokens starting with \n that should NOT be valid (wrong continuation)
+        vocab_strs.push("\n ".to_string());       // 128: newline+space
+        vocab_strs.push("\n4".to_string());        // 129: newline+digit
+        vocab_strs.push("\n\n".to_string());       // 130: double newline
+        vocab_strs.push("\nhello".to_string());    // 131: newline+text
+        // Tokens starting with \n that SHOULD be valid
+        vocab_strs.push("\n<".to_string());        // 132: valid continuation prefix
+        vocab_strs.push("\n<tool_call>\n".to_string()); // 133: full valid prefix
+
+        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
+        let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab_strs));
+        let mut m = GrammarMatcher::new(grammar, tokenizer, vec![], 10);
+
+        let first_call = "<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"x\":\"1\"}}\n</tool_call>";
+        assert!(m.accept_string(first_call));
+        assert!(m.can_terminate());
+
+        let mut bm = vec![0u32; bitmask_size(vocab_strs.len())];
+        m.fill_next_token_bitmask(&mut bm);
+
+        // Bare \n is valid (starts continuation)
+        assert!(bitmask::get_bit(&bm, b'\n' as usize),
+            "bare newline should be allowed");
+
+        // \n followed by wrong continuation bytes must be rejected
+        assert!(!bitmask::get_bit(&bm, 128),
+            "'\\n ' should not be allowed (space is not '<')");
+        assert!(!bitmask::get_bit(&bm, 129),
+            "'\\n4' should not be allowed (digit is not '<')");
+        assert!(!bitmask::get_bit(&bm, 130),
+            "'\\n\\n' should not be allowed (double newline)");
+        assert!(!bitmask::get_bit(&bm, 131),
+            "'\\nhello' should not be allowed");
+
+        // \n followed by correct continuation bytes should be accepted
+        assert!(bitmask::get_bit(&bm, 132),
+            "'\\n<' should be allowed (valid tool-call start)");
+        assert!(bitmask::get_bit(&bm, 133),
+            "'\\n<tool_call>\\n' should be allowed (full tool-call prefix)");
+    }
 }

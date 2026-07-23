@@ -63,11 +63,48 @@ pub fn equip_prefix(model: &Model, tool_schemas: &[String]) -> Result<Vec<u32>> 
     tool_use::equip(model, tool_schemas)
 }
 
+/// Like [`equip_prefix`], but merges `system_content` (a caller-supplied
+/// leading system message, if any) into the same system turn as the tool
+/// schemas instead of emitting two separate consecutive system turns —
+/// matching chat templates (e.g. Qwen's) that fold both together. Prefer
+/// this over separately calling [`Context::system`](crate::Context::system)
+/// + `equip_prefix` whenever the conversation has a leading system message.
+pub fn equip_after_system_prefix(
+    model: &Model,
+    system_content: Option<&str>,
+    tool_schemas: &[String],
+) -> Result<Vec<u32>> {
+    tool_use::equip_after_system(model, system_content, tool_schemas)
+}
+
 /// Token sequence that frames a tool result for the next turn. `name`
 /// matches the call the model made; `value` is typically a JSON-encoded
 /// result.
 pub fn answer_prefix(model: &Model, name: &str, value: &str) -> Vec<u32> {
     tool_use::answer(model, name, value)
+}
+
+/// Token sequence replaying a past assistant turn that made one or more
+/// tool calls — for reconstructing multi-turn history in a stateless
+/// inferlet (append instead of `assistant()` for turns with `tool_calls`).
+/// `content` is any free text that preceded the call(s); `calls` are
+/// `(name, arguments_json)` pairs, in order. Falls back to a plain
+/// assistant-text replay of `content` for models without tool support.
+pub fn assistant_with_tool_calls_prefix(
+    model: &Model,
+    content: Option<&str>,
+    calls: &[(String, String)],
+) -> Vec<u32> {
+    tool_use::assistant_with_tool_calls(model, content, calls)
+}
+
+/// Token sequence replaying one or more past tool results as a single
+/// merged turn — most chat templates group consecutive tool results into
+/// one turn rather than one per result, so prefer this over repeated
+/// [`answer_prefix`] calls when replaying history. `results` are `(name,
+/// value)` pairs, in order.
+pub fn answer_batch_prefix(model: &Model, results: &[(String, String)]) -> Vec<u32> {
+    tool_use::answer_batch(model, results)
 }
 
 // =============================================================================
@@ -86,6 +123,12 @@ pub fn native_grammar(model: &Model, tool_schemas: &[String]) -> Option<Grammar>
 /// [`GrammarConstraint::new`](crate::GrammarConstraint::new) for
 /// constrained generation.
 pub fn native_matcher(model: &Model, tool_schemas: &[String]) -> Option<Matcher> {
+    // `create_matcher` traps for models with no tool-call grammar (host
+    // returns an error, and the WIT signature is `-> matcher`, not a
+    // result). Gate on `format`, which reports `None` for those models
+    // (e.g. Qwen3-Coder, whose `<function=…>` format has no grammar yet),
+    // so callers cleanly skip the constrained/forced-call path.
+    native_grammar(model, tool_schemas)?;
     Some(tool_use::create_matcher(model, tool_schemas))
 }
 

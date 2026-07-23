@@ -1,0 +1,18 @@
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+[model.driver]
+type = "vllm"
+device = ["cuda:0"]
+
+[model.driver.options]
+venv = "/nfs/roberts/scratch/pi_ql324/ly337/pie-vllm-env"
+enforce_eager = true
+gpu_memory_utilization = 0.85

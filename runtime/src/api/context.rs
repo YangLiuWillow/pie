@@ -186,7 +186,11 @@ impl pie::core::context::HostContext for InstanceState {
         // speculative state attached to it goes away here. Idempotent
         // if no chain exists.
         crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
-        self.ctx().table.delete(this)?;
+        // Tolerate a missing entry: `destroy` deletes it eagerly, and the
+        // guest's resource handle still runs this drop afterwards —
+        // erroring here traps the whole instance on a legitimate
+        // destroy-then-drop sequence.
+        let _ = self.ctx().table.delete(this);
         Ok(())
     }
 

@@ -39,7 +39,12 @@ pub fn register(
     enable_system_speculation: bool,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
-    let instruct = instruct::create(arch_name, tokenizer.clone());
+    // Detect tool/chat format from the registered `name` and the tokenizer
+    // path (the HF cache path embeds the repo id, e.g.
+    // "models--Qwen--Qwen3-Coder-30B-A3B-Instruct/…"), so a generic alias
+    // like "default" still resolves to the right format.
+    let detect = format!("{name} {}", tokenizer_path.to_string_lossy());
+    let instruct = instruct::create(arch_name, &detect, tokenizer.clone());
 
     let model = Arc::new(Model {
         name,

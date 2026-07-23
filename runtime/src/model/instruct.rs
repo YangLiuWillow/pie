@@ -102,6 +102,65 @@ pub trait Instruct: Send + Sync {
     fn seal(&self) -> Vec<u32>;
     fn equip(&self, tools: &[String]) -> Vec<u32>;
     fn answer(&self, name: &str, value: &str) -> Vec<u32>;
+
+    /// Register `tools`, merging `system_content` (a caller-supplied leading
+    /// system message, if any) into the *same* system turn as the tool
+    /// schemas — some chat templates (Qwen's, notably) fold both into one
+    /// turn rather than emitting two separate consecutive system turns,
+    /// and feeding the model the latter (out-of-distribution) shape hurts
+    /// its tool-call-format reliability.
+    ///
+    /// Default concatenates a plain `system()` turn (if `system_content` is
+    /// present) with `equip()`'s own turn — the old, pre-merge behavior,
+    /// correct for architectures without a specific merge rule. Override
+    /// when the architecture's template merges them; see `QwenInstruct` for
+    /// a worked example.
+    fn equip_after_system(&self, system_content: Option<&str>, tools: &[String]) -> Vec<u32> {
+        let mut out = Vec::new();
+        if let Some(c) = system_content {
+            out.extend(self.system(c));
+        }
+        out.extend(self.equip(tools));
+        out
+    }
+
+    /// Build tokens for a *replayed* assistant turn that made one or more
+    /// tool calls: `content` is any free text that preceded the call(s), and
+    /// `calls` are `(name, arguments_json)` pairs — `arguments_json` must
+    /// already be a valid JSON-encoded string (the shape
+    /// [`ToolDecoder::feed`]'s [`ToolEvent::Call`] produces). This exists
+    /// because a plain [`Instruct::assistant`] only knows how to wrap a
+    /// string, but reconstructing a past tool-calling turn byte-for-byte
+    /// (to match the architecture's own template) requires knowing where
+    /// the content ends and each call begins, not just concatenated text.
+    ///
+    /// Default falls back to a plain `assistant()` replay of `content` only,
+    /// silently dropping `calls` — correct for architectures that don't
+    /// support tools (mirrors `equip`/`answer`'s no-tool-support behavior
+    /// elsewhere in this trait). Override when the architecture supports
+    /// tool calling; see `QwenInstruct` for a worked example.
+    fn assistant_with_tool_calls(&self, content: Option<&str>, calls: &[(String, String)]) -> Vec<u32> {
+        let _ = calls;
+        self.assistant(content.unwrap_or(""))
+    }
+
+    /// Build tokens for one or more tool results that should be replayed as
+    /// a single merged reply turn — most chat templates group consecutive
+    /// tool-role messages into one turn rather than one per result, and
+    /// calling [`Instruct::answer`] once per result produces a *different*
+    /// (and wrong) token sequence than the template's merged form.
+    ///
+    /// Default folds to repeated single-result `answer()` calls (one turn
+    /// per result — the old, pre-merge behavior). Override when the
+    /// architecture's template merges consecutive results into one turn;
+    /// see `QwenInstruct` for a worked example.
+    fn answer_batch(&self, results: &[(String, String)]) -> Vec<u32> {
+        results
+            .iter()
+            .flat_map(|(name, value)| self.answer(name, value))
+            .collect()
+    }
+
     fn chat_decoder(&self) -> Box<dyn ChatDecoder>;
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
@@ -115,8 +174,15 @@ pub trait Instruct: Send + Sync {
 }
 
 /// Create the appropriate instruct implementation for the given architecture.
-pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use self::qwen3::{ChatMLConfig, QwenInstruct};
+///
+/// `model_name` disambiguates architectures that share a `model_type` but use
+/// different chat/tool formats — notably Qwen3-Coder (model_type `qwen3_moe`,
+/// but a `<function=…>/<parameter=…>` tool format rather than the
+/// `<tool_call>{json}` format used by non-coder Qwen3-MoE).
+pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
+    use self::qwen3::{ChatMLConfig, QwenInstruct, ToolFormat};
+
+    let is_coder = model_name.to_lowercase().contains("coder");
 
     match arch_name {
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_moe"
@@ -124,10 +190,11 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             Arc::new(QwenInstruct::new(
                 tokenizer,
                 ChatMLConfig {
-                    has_thinking: true,
+                    has_thinking: !is_coder,
                     has_tools: true,
                     generation_suffix: "",
                     stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                    tool_format: if is_coder { ToolFormat::Coder } else { ToolFormat::Json },
                 },
             ))
         }
@@ -138,6 +205,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: false,
                 generation_suffix: "<think>\n",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                tool_format: ToolFormat::Json,
             },
         )),
         "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
@@ -152,6 +220,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: true,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
+                tool_format: ToolFormat::Json,
             },
         )),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
@@ -191,6 +260,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 has_tools: false,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                tool_format: ToolFormat::Json,
             },
         )),
     }

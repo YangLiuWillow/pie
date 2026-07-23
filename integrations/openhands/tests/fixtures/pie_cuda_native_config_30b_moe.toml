@@ -1,0 +1,32 @@
+# Native CUDA driver (in-process, no Python/vLLM subprocess).
+# Qwen3-Coder-30B-A3B (MoE) — cuda_native counterpart of
+# pie_cuda_vllm_config_30b_moe.toml. Requires a `pie` built with
+# `--features driver-portable,driver-cuda` (see build_pie_cuda.sh).
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+# KV cache is a hard allocation of max_num_kv_pages × kv_page_size; the
+# driver ignores gpu_mem_utilization. Qwen3-Coder-30B-A3B: 48 layers,
+# 4 KV heads, head_dim 128 => ~96 KB/token. 4096 pages × 32 = 131072 KV
+# tokens (~12.5 GB), which sits comfortably beside the ~60 GB of bf16
+# weights on a 96 GB RTX Pro 6000 Blackwell (gpu_rtx6000).
+gpu_mem_utilization = 0.80
+kv_page_size = 32
+max_num_kv_pages = 4096
+max_batch_tokens = 8192
+max_batch_size = 256
+weight_dtype = "bfloat16"
+# See the 7B config: in-process swap control-fd is not wired yet, so keep 0.
+swap_pool_size = 0

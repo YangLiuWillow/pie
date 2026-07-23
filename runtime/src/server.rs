@@ -350,11 +350,31 @@ impl Session {
         // WebSocket receive pump - forwards to session actor
         let recv_pump = {
             let client_id = id;
+            let close_tx = ws_msg_tx.clone();
             task::spawn(async move {
                 while let Some(Ok(ws_msg)) = ws_reader.next().await {
                     let bytes = match ws_msg {
                         WsMessage::Binary(bytes) => bytes,
-                        WsMessage::Close(_) => break,
+                        WsMessage::Close(frame) => {
+                            // Echo the Close frame back so the client's closing
+                            // handshake completes now.
+                            //
+                            // The stream is split, so the reader half cannot
+                            // reply on its own — tungstenite's automatic close
+                            // handshake needs both halves driven together. The
+                            // writer only ever closed as a side effect of the
+                            // send pump's channel draining when the Session was
+                            // dropped, which is far too late: the client sits in
+                            // `ws.close()` until its own close_timeout expires.
+                            // With the Python client's default that is 10 s, and
+                            // since it opens a connection per call, job 19249847
+                            // measured a flat 10009 ms of teardown on every
+                            // single call — 68% of that instance's wallclock —
+                            // with sub-millisecond variance, the signature of a
+                            // timeout rather than of work.
+                            let _ = close_tx.send(WsMessage::Close(frame)).await;
+                            break;
+                        }
                         _ => continue,
                     };
 

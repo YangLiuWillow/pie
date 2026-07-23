@@ -1,0 +1,22 @@
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+[model.driver]
+type = "vllm"
+device = ["cuda:0"]
+
+[model.driver.options]
+venv = "/nfs/roberts/scratch/pi_ql324/ly337/pie-vllm-env"
+enforce_eager = true
+gpu_memory_utilization = 0.78
+max_model_len = 32768
+# Cap tokens per forward: job 18790263 OOM'd allocating ~1.25 GiB of MLP
+# activations for a ~12k-token prefill batch on top of the 0.80 KV budget.
+max_num_batched_tokens = 4096

@@ -1,0 +1,9 @@
+# Force textual diffs for Rust sources.
+#
+# runtime/src/inference/structured/json_schema.rs embeds a literal NUL inside
+# a raw string — the JSON grammar's control-character range
+# `char ::= [^"\\<NUL>-<0x1F>]`. That is semantically correct and cannot be
+# written as an escape inside `r#"..."#`, but git's binary heuristic keys on
+# the NUL and stops diffing the file, so a 43 KB core source became
+# unreviewable ("Bin 39417 -> 42956 bytes"). This restores diff and blame.
+*.rs diff

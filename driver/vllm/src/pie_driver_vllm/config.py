@@ -61,6 +61,10 @@ class VllmDriverConfig:
     # step can resume normally.
     decode_lookahead_tokens: int = 1
 
+    # KV cache block size override. None = vllm picks based on the attention
+    # backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32).
+    block_size: int | None = None
+
     # ---- Speculative decoding (NGRAM, driver-supplied drafts) ----
     # When True, VllmEngine.spec_step proposes linear draft continuations.
     # Verification + splice run in the shared `._bridge.batching.Batch`
