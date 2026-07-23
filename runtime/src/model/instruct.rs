@@ -165,17 +165,25 @@ pub trait Instruct: Send + Sync {
 }
 
 /// Create the appropriate instruct implementation for the given architecture.
-pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use self::qwen3::{QwenInstruct, ChatMLConfig};
+///
+/// `model_name` disambiguates architectures that share a `model_type` but
+/// use different chat/tool formats — notably Qwen3-Coder (model_type
+/// `qwen3_moe`, but a `<function=…>/<parameter=…>` tool format rather than
+/// the `<tool_call>{json}` format used by non-coder Qwen3-MoE).
+pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
+    use self::qwen3::{QwenInstruct, ChatMLConfig, ToolFormat};
+
+    let is_coder = model_name.to_lowercase().contains("coder");
 
     match arch_name {
         "qwen3" |
         "qwen3_5" | "qwen3_5_text" |
         "qwen3_5_moe" | "qwen3_5_moe_text" |
         "qwen3_moe" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
-            has_thinking: true,
+            has_thinking: !is_coder,
             has_tools: true,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            tool_format: if is_coder { ToolFormat::Coder } else { ToolFormat::Json },
         })),
         "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
         "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),
@@ -196,6 +204,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             has_thinking: false,
             has_tools: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            tool_format: ToolFormat::Json,
         })),
     }
 }

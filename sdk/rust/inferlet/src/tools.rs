@@ -123,6 +123,12 @@ pub fn native_grammar(model: &Model, tool_schemas: &[String]) -> Option<Grammar>
 /// [`GrammarConstraint::new`](crate::GrammarConstraint::new) for
 /// constrained generation.
 pub fn native_matcher(model: &Model, tool_schemas: &[String]) -> Option<Matcher> {
+    // `create_matcher` traps for models with no tool-call grammar (host
+    // returns an error, and the WIT signature is `-> matcher`, not a
+    // result). Gate on `format`, which reports `None` for those models
+    // (e.g. Qwen3-Coder, whose `<function=…>` format has no grammar yet),
+    // so callers cleanly skip the constrained/forced-call path.
+    native_grammar(model, tool_schemas)?;
     Some(tool_use::create_matcher(model, tool_schemas))
 }
 

@@ -78,5 +78,6 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
         has_thinking: false,
         has_tools: true,
         stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+        tool_format: super::qwen3::ToolFormat::Json,
     })
 }
