@@ -1,0 +1,14 @@
+[package]
+name = "decode-bench"
+version = "0.1.0"
+description = "Decode-throughput diagnostic: prefill an L-token prompt, decode exactly N tokens (no early stop), report token counts. Client measures wallclock; slope over two N isolates decode from prefill."
+authors = ["ly337"]
+repository = "https://github.com/pie-project/pie"
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "Prompt to prefill (padded to a target length by the caller)"}
+decode_tokens = {type = "int", optional = true, description = "Exact number of tokens to decode, ignoring EOS (default: 128)"}

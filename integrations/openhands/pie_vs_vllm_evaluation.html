@@ -1,0 +1,542 @@
+<style>
+  :root{
+    --paper:#ffffff; --bg:#f1f4f7; --panel:#f7f9fb;
+    --ink:#1a1f26; --ink-soft:#47515e; --ink-faint:#727d8a;
+    --rule:#e3e7ec; --rule-strong:#cfd6dd;
+    --accent:#2f56c9; --accent-soft:#e9eef9; --accent-ink:#24449c;
+    --good:#1f8a54; --good-soft:#e6f4ec;
+    --bad:#c33b32;  --bad-soft:#fbeae7;
+    --diag:#b06f12; --diag-soft:#f9f0dd;
+    --neutral:#5f6b78; --neutral-soft:#eceff2;
+    --code-bg:#eef1f5; --code-ink:#25303c;
+    --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#161b22; --bg:#0e1218; --panel:#1b212a;
+      --ink:#e7ecf2; --ink-soft:#a7b3c0; --ink-faint:#7e8b98;
+      --rule:#262d37; --rule-strong:#343d49;
+      --accent:#84a0ff; --accent-soft:#1b2740; --accent-ink:#a9beff;
+      --good:#4fcb8c; --good-soft:#14301f;
+      --bad:#f2776d;  --bad-soft:#3a1d1b;
+      --diag:#e2ab4e; --diag-soft:#332810;
+      --neutral:#8b97a4; --neutral-soft:#222932;
+      --code-bg:#1b222c; --code-ink:#cdd7e2;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#161b22; --bg:#0e1218; --panel:#1b212a;
+    --ink:#e7ecf2; --ink-soft:#a7b3c0; --ink-faint:#7e8b98;
+    --rule:#262d37; --rule-strong:#343d49;
+    --accent:#84a0ff; --accent-soft:#1b2740; --accent-ink:#a9beff;
+    --good:#4fcb8c; --good-soft:#14301f;
+    --bad:#f2776d;  --bad-soft:#3a1d1b;
+    --diag:#e2ab4e; --diag-soft:#332810;
+    --neutral:#8b97a4; --neutral-soft:#222932;
+    --code-bg:#1b222c; --code-ink:#cdd7e2;
+  }
+  :root[data-theme="light"]{
+    --paper:#ffffff; --bg:#f1f4f7; --panel:#f7f9fb;
+    --ink:#1a1f26; --ink-soft:#47515e; --ink-faint:#727d8a;
+    --rule:#e3e7ec; --rule-strong:#cfd6dd;
+    --accent:#2f56c9; --accent-soft:#e9eef9; --accent-ink:#24449c;
+    --good:#1f8a54; --good-soft:#e6f4ec;
+    --bad:#c33b32;  --bad-soft:#fbeae7;
+    --diag:#b06f12; --diag-soft:#f9f0dd;
+    --neutral:#5f6b78; --neutral-soft:#eceff2;
+    --code-bg:#eef1f5; --code-ink:#25303c;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:60rem;margin:0 auto;padding:clamp(1.25rem,4vw,3.5rem) clamp(1rem,4vw,2rem) 5rem;}
+  .prose{max-width:44rem;}
+  p{margin:0 0 1rem;color:var(--ink-soft);}
+  strong{color:var(--ink);font-weight:650;}
+  a{color:var(--accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--accent) 35%,transparent);}
+  a:hover{border-bottom-color:var(--accent);}
+  code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);color:var(--code-ink);
+    padding:.1em .38em;border-radius:4px;}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent-ink);font-weight:600;}
+
+  /* header */
+  header.masthead{border-bottom:1px solid var(--rule-strong);padding-bottom:1.6rem;margin-bottom:2.4rem;}
+  h1{font-size:clamp(1.9rem,4.4vw,2.85rem);line-height:1.08;margin:.5rem 0 .5rem;letter-spacing:-.02em;
+    text-wrap:balance;font-weight:720;color:var(--ink);}
+  .dek{font-size:1.05rem;color:var(--ink-soft);max-width:40rem;margin:.2rem 0 0;}
+  .meta{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);margin-top:1.1rem;
+    display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;}
+  .meta span{white-space:nowrap;}
+
+  /* thesis */
+  .thesis{background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--accent);
+    border-radius:10px;padding:1.3rem 1.4rem;margin:0 0 1.6rem;}
+  .thesis .lead{font-size:1.14rem;color:var(--ink);margin:0;line-height:1.5;}
+  .thesis .lead b{color:var(--accent-ink);}
+
+  /* stat tiles */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));gap:.7rem;margin:1.4rem 0 .4rem;}
+  .stat{background:var(--paper);border:1px solid var(--rule);border-radius:9px;padding:.85rem .95rem;}
+  .stat .n{font-family:var(--mono);font-size:1.42rem;font-weight:650;letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;line-height:1.1;}
+  .stat .k{font-size:.76rem;color:var(--ink-faint);margin-top:.3rem;line-height:1.3;}
+  .stat.bad .n{color:var(--bad);} .stat.good .n{color:var(--good);}
+  .stat.diag .n{color:var(--diag);} .stat.neu .n{color:var(--ink);}
+
+  /* sections */
+  section{margin-top:3rem;}
+  h2{font-size:1.5rem;letter-spacing:-.015em;margin:0 0 .3rem;font-weight:680;color:var(--ink);
+    display:flex;align-items:baseline;gap:.7rem;text-wrap:balance;}
+  h2 .sn{font-family:var(--mono);font-size:.9rem;color:var(--accent);font-weight:600;
+    border:1px solid var(--rule-strong);border-radius:6px;padding:.12rem .45rem;flex:none;}
+  h3{font-size:1.08rem;margin:2rem 0 .5rem;font-weight:640;color:var(--ink);letter-spacing:-.01em;}
+  .section-rule{height:1px;background:var(--rule);border:0;margin:0;}
+
+  /* tables */
+  .tbl{overflow-x:auto;margin:1rem 0 1.2rem;border:1px solid var(--rule);border-radius:10px;
+    background:var(--paper);}
+  table{border-collapse:collapse;width:100%;font-size:.9rem;}
+  th,td{text-align:left;padding:.62rem .8rem;border-bottom:1px solid var(--rule);vertical-align:top;}
+  thead th{font-family:var(--mono);font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--ink-faint);font-weight:600;background:var(--panel);position:sticky;top:0;white-space:nowrap;}
+  tbody tr:last-child td{border-bottom:0;}
+  td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;}
+  tbody tr:hover{background:color-mix(in srgb,var(--accent-soft) 55%,transparent);}
+  .win td{color:var(--good);} /* used sparingly */
+  caption{caption-side:top;text-align:left;font-size:.82rem;color:var(--ink-faint);padding:0 0 .55rem;}
+
+  /* verdict chips */
+  .chip{display:inline-flex;align-items:center;gap:.35rem;font-family:var(--mono);font-size:.7rem;
+    font-weight:600;letter-spacing:.04em;text-transform:uppercase;padding:.2rem .5rem;border-radius:999px;
+    white-space:nowrap;border:1px solid transparent;}
+  .chip::before{content:"";width:.5rem;height:.5rem;border-radius:50%;background:currentColor;opacity:.9;}
+  .chip.bad{color:var(--bad);background:var(--bad-soft);border-color:color-mix(in srgb,var(--bad) 25%,transparent);}
+  .chip.good{color:var(--good);background:var(--good-soft);border-color:color-mix(in srgb,var(--good) 25%,transparent);}
+  .chip.diag{color:var(--diag);background:var(--diag-soft);border-color:color-mix(in srgb,var(--diag) 25%,transparent);}
+  .chip.neu{color:var(--neutral);background:var(--neutral-soft);border-color:color-mix(in srgb,var(--neutral) 22%,transparent);}
+
+  .legend{display:flex;flex-wrap:wrap;gap:.5rem .9rem;margin:.2rem 0 1.4rem;font-size:.82rem;color:var(--ink-soft);}
+  .legend .li{display:inline-flex;align-items:center;gap:.45rem;}
+
+  /* experiment ledger cards */
+  .ledger{display:flex;flex-direction:column;gap:.85rem;margin-top:1.2rem;}
+  .card{background:var(--paper);border:1px solid var(--rule);border-radius:11px;padding:1.05rem 1.15rem;
+    border-left:3px solid var(--edge,var(--rule-strong));}
+  .card.bad{--edge:var(--bad);} .card.good{--edge:var(--good);}
+  .card.diag{--edge:var(--diag);} .card.neu{--edge:var(--neutral);}
+  .card .top{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;}
+  .card .id{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint);font-weight:600;
+    border:1px solid var(--rule-strong);border-radius:5px;padding:.08rem .4rem;}
+  .card .name{font-weight:650;color:var(--ink);font-size:1.02rem;letter-spacing:-.01em;flex:1 1 12rem;}
+  .card dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:.32rem .9rem;font-size:.92rem;}
+  .card dt{font-family:var(--mono);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--ink-faint);font-weight:600;padding-top:.18rem;white-space:nowrap;}
+  .card dd{margin:0;color:var(--ink-soft);}
+  .card dd.res{color:var(--ink);}
+  .card .jobs{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);}
+
+  /* code */
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:10px;overflow-x:auto;
+    padding:1rem 1.1rem;margin:1rem 0 1.3rem;}
+  pre code{background:none;padding:0;font-size:.82rem;color:var(--code-ink);line-height:1.55;}
+  .cmt{color:var(--ink-faint);} .kw{color:var(--accent);}
+
+  /* lists */
+  ul.clean{list-style:none;padding:0;margin:1rem 0;display:flex;flex-direction:column;gap:.7rem;}
+  ul.clean>li{position:relative;padding-left:1.4rem;color:var(--ink-soft);}
+  ul.clean>li::before{content:"";position:absolute;left:.15rem;top:.62em;width:.42rem;height:.42rem;
+    border-radius:1px;background:var(--accent);transform:rotate(45deg);}
+  ol.steps{margin:1rem 0;padding-left:0;list-style:none;counter-reset:s;display:flex;flex-direction:column;gap:.7rem;}
+  ol.steps>li{counter-increment:s;position:relative;padding-left:2.1rem;color:var(--ink-soft);}
+  ol.steps>li::before{content:counter(s);position:absolute;left:0;top:.05rem;font-family:var(--mono);
+    font-size:.76rem;font-weight:650;color:var(--accent);background:var(--accent-soft);
+    width:1.5rem;height:1.5rem;border-radius:6px;display:grid;place-items:center;}
+
+  .foot{margin-top:3.5rem;padding-top:1.4rem;border-top:1px solid var(--rule-strong);
+    font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important;}}
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">Serving-system evaluation · LLM inference</div>
+    <h1>Can Pie outperform vLLM + APC?</h1>
+    <p class="dek">An honest, aggregated evaluation of the Pie serving system as a backend for two integrations — genetic code evolution (OpenEvolve) and agentic SWE-bench (OpenHands) — against vLLM with automatic prefix caching.</p>
+    <div class="meta">
+      <span>Model · Qwen3-Coder-30B-A3B</span>
+      <span>GPU · RTX PRO 6000 Blackwell 96 GB</span>
+      <span>Baseline · vLLM + APC</span>
+      <span>2026-07-21</span>
+    </div>
+  </header>
+
+  <!-- 0 -->
+  <section id="bottom-line" style="margin-top:0">
+    <h2><span class="sn">0</span>Bottom line</h2>
+    <div class="thesis">
+      <p class="lead">On a single local GPU with vLLM's automatic prefix caching enabled, <b>Pie does not beat vLLM on wallclock</b> for our workloads. Its best observed case is a <b>tie</b>; in the agentic setting it is up to <b>3.65× slower</b>. The cause is structural — vLLM's APC captures the <em>same</em> KV reuse that Pie's fork/session provides, so Pie's headline mechanism is not a differentiator, and Pie then loses on secondary overheads.</p>
+    </div>
+    <div class="stats">
+      <div class="stat bad"><div class="n">10×</div><div class="k">slower at N=64 fan-out (serial fork-decode)</div></div>
+      <div class="stat bad"><div class="n">3.65×</div><div class="k">slower on OpenHands (coder-session vs litellm)</div></div>
+      <div class="stat neu"><div class="n">≈ parity</div><div class="k">decode throughput, flat to 50k ctx</div></div>
+      <div class="stat diag"><div class="n">3.1×</div><div class="k">faster than coder-session once loop moves in-inferlet</div></div>
+    </div>
+    <div class="prose">
+      <p>Pie's mechanisms <em>work</em> — they eliminate 95–97 % of prefill in agentic loops and fork shared prefixes perfectly — but that saving does not convert to wallclock, because the baseline already gets the same reuse for free. The paper's real wins (1.3–3.4× on agentic workflows) are genuine but conditional: they need a <em>small model + a real network gap + many I/O interactions + concurrency that makes APC evict + tools that run inside the inferlet</em>. Our environment removes every one of those conditions.</p>
+    </div>
+  </section>
+
+  <!-- 1 -->
+  <section id="through-line">
+    <h2><span class="sn">1</span>Why the two engines tie on reuse</h2>
+    <div class="prose">
+      <p>vLLM's <strong>APC</strong> hashes KV-cache blocks by token content and reuses them <em>across</em> requests. A multi-turn agentic loop is, turn by turn, an <strong>append-only growing prefix</strong>:</p>
+    </div>
+    <pre><code><span class="cmt">turn 1:  [system + task]</span>
+<span class="cmt">turn 2:  [system + task + assistant_1 + tool_result_1]</span>
+<span class="cmt">turn 3:  [system + task + assistant_1 + tool_result_1 + assistant_2 + tool_result_2]</span></code></pre>
+    <div class="prose">
+      <p>A growing prefix is exactly what APC reuses: on turn 3 it recognizes turns 1–2 as cached and prefills only the new tail — the <strong>same computational saving</strong> Pie's session gives. So "multi-turn / agentic" is <em>not</em>, by itself, a Pie advantage. Pie beats APC only when the app does something that is <strong>not</strong> a plain growing prefix (mid-context drop, mid-decode branching, custom attention) — or when the transport/round-trip around the reuse dominates (a network gap), or when the tool runs <em>inside</em> the inferlet (co-location).</p>
+    </div>
+  </section>
+
+  <!-- 2 -->
+  <section id="variants">
+    <h2><span class="sn">2</span>The integration variants we built</h2>
+
+    <h3>2.1 · OpenHands (agentic SWE-bench)</h3>
+    <div class="prose">
+      <p>OpenHands drives an agent that reads a GitHub issue, explores the repo, edits source, runs the tests, and submits a patch — a long multi-turn loop with heavy tool use. We wired it to Pie <strong>four ways</strong>. What separates them is two design axes: <em>where the agent loop runs</em> (in a Python client, or inside the WASM inferlet), and <em>how the KV context is carried between turns</em> (re-established each call, or kept live).</p>
+    </div>
+    <div class="tbl"><table>
+      <thead><tr><th>Variant</th><th>Inferlet</th><th>Loop runs in</th><th>KV across turns</th><th>Per-turn cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Baseline</strong></td><td>— (litellm→vLLM)</td><td>Python client</td><td>vLLM APC (implicit)</td><td>re-send full history; APC reuses prefix</td></tr>
+        <tr><td>"pie" completion</td><td><code>openhands-completion</code></td><td>Python client</td><td>generic prefix-hash only</td><td>one stateless completion / call</td></tr>
+        <tr><td><strong>Pattern B</strong><br>coder-session</td><td><code>openhands-coder-session</code></td><td>Python client</td><td>named-snapshot session (= APC-equivalent)</td><td><strong>re-open + refresh snapshot every call</strong></td></tr>
+        <tr><td><strong>Pattern A</strong><br>agent</td><td><code>openhands-agent</code></td><td><strong>the inferlet</strong></td><td><strong>live in-memory ctx</strong> (never torn down)</td><td>append the new turn only</td></tr>
+        <tr><td>Fork / delegation</td><td><code>coder-session</code> (fork)</td><td>Python client</td><td>fork share of parent's KV</td><td>child forks parent; ~0 re-prefill</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose">
+      <p><strong>Pattern B vs Pattern A is the load-bearing distinction.</strong> In Pattern B the Python loop calls a <em>stateless</em> inferlet once per turn; the inferlet re-opens the session's KV snapshot and refreshes it (a <code>delete + save</code>) on every call. In Pattern A the entire loop lives inside one long-running inferlet, so the KV context is created once and simply appended to — no per-call teardown. Experiments <a href="#detail">#02, #06, #11</a> show that per-call teardown was most of Pattern B's 3.65× deficit.</p>
+    </div>
+
+    <h4 style="font-size:.96rem;margin:1.8rem 0 .2rem;color:var(--ink);font-weight:640;">Anatomy of Pattern A <span style="font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);font-weight:600;">openhands-agent</span></h4>
+    <div class="prose">
+      <p>One <code>Context</code> is created, seeded with the system prompt + task, and then driven through a fixed step loop. Every step's action is <strong>grammar-constrained to a flat JSON schema</strong> (<code>constrain_with(JsonSchema)</code>), so the model must emit a valid action — <code>{thought, action, command, path, old_str, new_str, …}</code> — with <code>action ∈ {bash, edit, read_file, insert, undo_edit, finish}</code>:</p>
+    </div>
+    <ol class="steps">
+      <li><strong>Condense if needed</strong> — before generating, if the effective context nears <code>context_token_limit</code>, either <em>rebuild</em> (summarize dropped turns + re-prefill) or <em>mask</em> (drop stale-middle KV out of attention, 0 re-prefill). A cooldown prevents condense-every-step.</li>
+      <li><strong>Generate the action</strong> — decode a grammar-constrained JSON step into the <em>same</em> live <code>ctx</code> (the last step is forced to a <code>finish</code> schema).</li>
+      <li><strong>Yield the GPU</strong> — <code>ctx.idle()</code> releases the KV pages while the tool runs, so a slow bash/test call doesn't hold GPU memory idle.</li>
+      <li><strong>Run the tool on the host</strong> — POST a <code>ToolRequest</code> over HTTP to <code>tool_server.py</code>, which executes it against the real repo and returns an observation.</li>
+      <li><strong>Append &amp; loop</strong> — truncate the observation, append it as the next user turn, record per-step metrics, and repeat until <code>finish</code> or <code>max_steps</code>.</li>
+    </ol>
+    <div class="tbl"><table>
+      <caption>What runs where — the WASM/host split that CodeACT avoids</caption>
+      <thead><tr><th>Inside the inferlet (WASM)</th><th>On the host (<code>tool_server.py</code>)</th></tr></thead>
+      <tbody>
+        <tr><td>The whole agent loop &amp; control flow</td><td><code>bash</code> via <code>PersistentBash</code> (preserves cwd/env)</td></tr>
+        <tr><td>Grammar-constrained generation + live KV ctx</td><td>File edits via OpenHands <code>FileEditor</code> (view / str_replace / insert / undo)</td></tr>
+        <tr><td>Condensation, robustness guards, metrics</td><td>Running the repo's tests</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose">
+      <p><strong>Why the split exists:</strong> OpenHands' real tools need a host shell + Python env + the repo checkout, so they <strong>cannot run inside a WASM inferlet</strong>. Unlike CodeACT — whose tool is Boa-JS <code>eval</code> and <em>does</em> run in WASM — Pattern A must proxy tools over HTTP to the host. That means it keeps the paper's <em>live-KV / no-re-prefill</em> benefit but not the <em>co-location / no-round-trip</em> benefit (and on localhost the round-trip is ≈ 0 anyway).</p>
+      <p>Two more capabilities sit on the same structure. <strong>Robustness guards</strong> catch truncated JSON, degenerate "symbol-soup" output, and stuck read↔edit / repeated-bash cycles, nudging or force-finishing rather than looping forever. And a <strong>test-time-scaling fork</strong> (<code>num_branches</code> / <code>branch_at_step</code>) runs a shared trunk to step <em>k</em>, then forks both the live KV context <em>and</em> the tool-server workspace into N candidate trajectories that share steps 1…<em>k</em> — a branch operation a stateless client cannot express cleanly.</p>
+    </div>
+
+    <h3>2.2 · OpenEvolve (MAP-Elites genetic code evolution)</h3>
+    <div class="tbl"><table>
+      <thead><tr><th>Component</th><th>Where</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td>Generation inferlet</td><td><code>openevolve-generation</code></td><td>B2 "analyze-then-diverge": generate a shared analysis A once, fork N children off <code>P+A</code>, per-leaf steer. 3-level named-snapshot key tree for cross-worker reuse.</td></tr>
+        <tr><td>PieLLM backend</td><td><code>openevolve/llm/pie.py</code></td><td><code>LLMInterface</code> over <code>PieClient</code>; batched <code>generate_children()</code>; drop-in via <code>init_client=PieLLM</code>.</td></tr>
+        <tr><td>Controller wiring</td><td><code>ensemble / process_parallel</code></td><td>Least-invasive: per-worker result stays one child; same-parent workers reuse the shared L1g analysis snapshot cross-process.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="ledger">
+    <h2><span class="sn">3</span>Every experiment &amp; hypothesis</h2>
+    <div class="legend">
+      <span class="li"><span class="chip bad">loss / no win</span></span>
+      <span class="li"><span class="chip diag">diagnostic</span> isolated a cause</span>
+      <span class="li"><span class="chip good">mechanism works</span> but not a wallclock win</span>
+      <span class="li"><span class="chip neu">informational</span></span>
+    </div>
+
+    <div class="ledger">
+
+      <div class="card bad">
+        <div class="top"><span class="id">01</span><span class="name">Fan-out fork</span><span class="chip bad">loss</span></div>
+        <dl>
+          <dt>Setup</dt><dd>One Pie call forks a ~10k-token shared prefix into N children (analyze-then-diverge, conc=1, 64 decode tok each) vs vLLM two-phase + APC, matched prefixes.</dd>
+          <dt>Hypothesis</dt><dd>A single server-side N-fork beats vLLM issuing N separate requests (saves N round-trips + N re-prefills).</dd>
+          <dt>Result</dt><dd class="res">Tie at N=1 (5.5 s = 5.5 s); Pie <strong>10× slower at N=64</strong> (71.5 s vs 7.1 s). Fork <em>did</em> save prefill perfectly (<code>leaves_prefill=0</code>, <strong>668k tokens</strong>) but the N child decodes run <strong>serially</strong> while vLLM continuous-batches them.</dd>
+          <dt>Why</dt><dd>Prefill saving buys nothing — decode dominates and Pie doesn't batch the forked decodes; even fixed it would only <em>tie</em> (APC also reuses the prefix).</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19074533 / 19074534</div>
+      </div>
+
+      <div class="card bad">
+        <div class="top"><span class="id">02</span><span class="name">OpenHands SWE-bench head-to-head</span><span class="chip bad">loss</span></div>
+        <dl>
+          <dt>Setup</dt><dd>13 SWE-bench-Verified instances, identical agent / tools / condenser / model; Pie <code>coder-session</code> (session KV-retain) vs litellm→vLLM w/ <code>caching_prompt</code> (APC), client on localhost.</dd>
+          <dt>Hypothesis</dt><dd>Retaining KV across agent turns makes the loop faster than re-sending each turn.</dd>
+          <dt>Result</dt><dd class="res"><strong>Pie 3.65× slower</strong> total (7,227 s vs 1,978 s), 3.4×/iter, at ~matched iterations (961 vs 906). Yet Pie saved <strong>94.8 %</strong> of prefill (33,614 / 641,195 tokens), zero rebuilds.</dd>
+          <dt>Why</dt><dd>The baseline gets the same reuse via APC; localhost erases the round-trip win; Pie's per-turn overhead dominates. Not divergence — iterations match.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 18951267 / 18962143</div>
+      </div>
+
+      <div class="card bad">
+        <div class="top"><span class="id">03</span><span class="name">Memory-pressure overcommit</span><span class="chip bad">loss</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Push the working set past the shared 244,704-token KV cache (~29k-tok prefixes, conc 8→32).</dd>
+          <dt>Hypothesis</dt><dd>Pie's atomic fork + CPU-offload of cold KV beats vLLM's APC evict-then-recompute under pressure.</dd>
+          <dt>Result</dt><dd class="res">At conc that fits, vLLM slightly faster; at <strong>1.9× overcommit Pie OOM-crashes</strong> (server dies) while vLLM degrades gracefully (59 s, completes via evict+recompute).</dd>
+          <dt>Why</dt><dd>Pie's offload never fires — the vLLM driver has <strong>no CPU-swap backstop</strong>, so Pie hits the same wall and crashes before it can exploit APC's weakness.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19068668 / 19068669</div>
+      </div>
+
+      <div class="card bad">
+        <div class="top"><span class="id">04</span><span class="name">Admission factor = 1.0</span><span class="chip bad">loss</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Set Pie's scheduler to refuse/queue beyond capacity instead of oversubscribing 4×.</dd>
+          <dt>Hypothesis</dt><dd>Throttling admission lets Pie <em>survive</em> overcommit gracefully like vLLM.</dd>
+          <dt>Result</dt><dd class="res">conc 8 fine; conc ≥ 16 <strong>still CUDA-OOMs</strong>.</dd>
+          <dt>Why</dt><dd>The admission gate is a soft market-weight check that relies on swap as the physical backstop; with no swap, no config value prevents OOM.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19070291</div>
+      </div>
+
+      <div class="card neu">
+        <div class="top"><span class="id">05</span><span class="name">Native-CUDA-driver offload</span><span class="chip neu">dropped</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Investigate building <code>--features driver-cuda</code> + swap pool to give Pie a real offload path.</dd>
+          <dt>Hypothesis</dt><dd>A native driver with a working swap pool lets effective KV exceed GPU RAM → Pie survives and wins overcommit.</dd>
+          <dt>Result</dt><dd class="res">Build succeeds and the SwapPool primitives exist, but offload is <strong>blocked on a missing aux-IPC (PIEA) listener</strong> in the cuda driver — a substantial port. <strong>Abandoned</strong> to stay on the vLLM driver.</dd>
+          <dt>Why</dt><dd>A real engineering gap, not a quick fix; deferred.</dd>
+        </dl>
+      </div>
+
+      <div class="card diag">
+        <div class="top"><span class="id">06</span><span class="name">Decode-tps vs context length</span><span class="chip diag">diagnostic</span></div>
+        <dl>
+          <dt>Setup</dt><dd><code>decode-bench</code> inferlet prefills L tokens, decodes exactly N; slope <code>(t₅₁₂−t₆₄)/448</code> cancels prefill to isolate pure decode tok/s; L = 2k / 5k / 20k / 50k.</dd>
+          <dt>Hypothesis</dt><dd>Pie's decode slows over a long retained context (would explain the #02 per-turn gap).</dd>
+          <dt>Result</dt><dd class="res"><strong>Refuted</strong> — Pie flat <strong>~63 tok/s</strong> across 2k→50k; vLLM flat ~65. Pie decode ≈ vLLM, no collapse.</dd>
+          <dt>Why</dt><dd>With prefill (#02) and decode both ruled out, the OpenHands gap must be <strong>per-call session-management overhead</strong>, not raw inference. Corollary: mask-condense can't be a decode speedup.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19078674 / 19078675</div>
+      </div>
+
+      <div class="card good">
+        <div class="top"><span class="id">07</span><span class="name">Mask-condense quality</span><span class="chip good">works</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Masked drop-middle KV (sink + keep-recent) vs full rebuild; quality by output ratio.</dd>
+          <dt>Hypothesis</dt><dd>Dropping middle KV from attention (no re-prefill) is quality-neutral.</dd>
+          <dt>Result</dt><dd class="res"><strong>Yes</strong> — ratio 1.002 ± 0.021 at P=48k (straddles 1.0), 0 re-prefill; tiny ~2 % mid-context penalty vanishes by 48k.</dd>
+          <dt>Why</dt><dd>Proves masking is safe to use — sets up 07b as the structural lever.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19070781</div>
+      </div>
+
+      <div class="card bad">
+        <div class="top"><span class="id">07b</span><span class="name">Mask-condense inside Pattern A</span><span class="chip bad">no win</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Same 13 instances, <code>condense_mode=mask</code> (drop stale-middle via <code>mask_range</code>, 0 re-prefill, no summary call) vs <code>rebuild</code> (summary LLM call + re-prefill).</dd>
+          <dt>Hypothesis</dt><dd>Doing the mid-context drop APC <em>cannot</em> express speeds up the agent.</dd>
+          <dt>Result</dt><dd class="res">Mask engaged (7 mask events, 0 summaries, 0 re-prefill), 13/13 patches — but <strong>wash</strong> (2,374 s vs 2,329 s, ~2 % slower).</dd>
+          <dt>Why</dt><dd>The per-condense saving caps at ~3 % of runtime, and engine non-determinism (#12) swings trajectories far more than that. Would only matter under memory pressure.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19089013 vs 19080944</div>
+      </div>
+
+      <div class="card good">
+        <div class="top"><span class="id">08</span><span class="name">Cross-worker L1g reuse (OpenEvolve 30B)</span><span class="chip good">works</span></div>
+        <dl>
+          <dt>Setup</dt><dd>OpenEvolve 30B analyze-then-diverge; workers on the same parent should reuse the shared generated-analysis snapshot across processes.</dd>
+          <dt>Hypothesis</dt><dd>The generated-analysis node (KV over <em>generated</em> tokens) is reused by sibling workers via named snapshot.</dd>
+          <dt>Result</dt><dd class="res"><strong>Yes, organic</strong> — reused 3 / generated 9; later same-parent workers show <code>l1p=opened l1g=reused</code> (skip ~1.8k-tok P+A prefill + analysis decode).</dd>
+          <dt>Why</dt><dd>Cross-process generated-KV reuse is real; it doesn't become a wallclock win because APC captures the same reuse when it fits.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19065839</div>
+      </div>
+
+      <div class="card good">
+        <div class="top"><span class="id">09</span><span class="name">Fork delegation (OpenHands Slice 3)</span><span class="chip good">works</span></div>
+        <dl>
+          <dt>Setup</dt><dd>A critic / sub-agent turn forks the parent conversation's KV instead of re-prefilling.</dd>
+          <dt>Hypothesis</dt><dd>A delegated turn can fork the parent's live KV — something litellm/APC can't express as cleanly.</dd>
+          <dt>Result</dt><dd class="res"><strong>Yes</strong> — fork engaged on all 4 cases, prefill 30k+ → 128 tokens (<strong>99.5–99.7 % saved</strong>), <code>kv_verify</code> passed, parent uncorrupted.</dd>
+          <dt>Why</dt><dd>Biggest token saving of any experiment; wall win instance-dependent (decode still dominates).</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19039792</div>
+      </div>
+
+      <div class="card bad">
+        <div class="top"><span class="id">10</span><span class="name">circle_packing (~100 iters)</span><span class="chip bad">predicted loss</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Would the harder OpenEvolve task (full-rewrite, ~8k decode tok/candidate, 100 iters) make Pie win? Analysis, no GPU run.</dd>
+          <dt>Hypothesis</dt><dd>More iterations amortize Pie's shared-prefix reuse → Pie pulls ahead.</dd>
+          <dt>Result</dt><dd class="res"><strong>No</strong> — the 100 iters are independent one-shot generations, so more iters just repeat a per-iteration tie; full-rewrite is decode-heavy (Pie's parity axis), and APC captures the prefix anyway.</dd>
+          <dt>Why</dt><dd>Harder task multiplies a tie, doesn't create a crossover.</dd>
+        </dl>
+      </div>
+
+      <div class="card diag">
+        <div class="top"><span class="id">11</span><span class="name">Pattern A: loop-in-inferlet</span><span class="chip diag">confirms cause</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Same 13 instances via <code>openhands-agent</code> (full loop in one live inferlet, tools over HTTP) vs the per-turn <code>coder-session</code> (#02).</dd>
+          <dt>Hypothesis</dt><dd>Keeping the ctx live across turns removes the per-call session overhead (#06) → back to parity.</dd>
+          <dt>Result</dt><dd class="res"><strong>Partly</strong> — Pattern A <strong>3.1× faster than coder-session</strong> (2,329 s vs 7,227 s), 34 %/iter (4.99 vs 7.52), 13/13 patches; but still <strong>1.18× slower total</strong> than litellm.</dd>
+          <dt>Why</dt><dd>Per-call session teardown <em>was</em> most of the #02 loss (mostly self-inflicted, not fundamental); good architecture approaches but doesn't beat vLLM on localhost.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19080944</div>
+      </div>
+
+      <div class="card neu">
+        <div class="top"><span class="id">12</span><span class="name">Trajectory divergence</span><span class="chip neu">root-caused</span></div>
+        <dl>
+          <dt>Setup</dt><dd>Why do Pie agent runs take different / longer trajectories than litellm? Is it the tool-call parser?</dd>
+          <dt>Hypothesis</dt><dd>The longer / divergent trajectories come from a tool-parser mismatch.</dd>
+          <dt>Result</dt><dd class="res"><strong>No</strong> — two identical temp-0 cold calls (same prompt/tools) gave different outputs 8/8: the <strong>engine itself is non-deterministic</strong> (<code>engine_det=False</code>), independent of parsing.</dd>
+          <dt>Why</dt><dd>Sets the noise floor; also why #07b / #11 carry trajectory-variance caveats.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">job 19039792</div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section id="detail">
+    <h2><span class="sn">4</span>Key experiments in detail</h2>
+
+    <h3>4.1 · Fan-out fork (OpenEvolve shape)</h3>
+    <div class="prose"><p>Shared prefix ~10k tokens, fork into N children, conc=1, decode 64/child. Pie B2 (single-call fork) vs vLLM two-phase + APC, matched prefixes.</p></div>
+    <div class="tbl"><table>
+      <thead><tr><th class="num">N</th><th class="num">Pie (fork)</th><th class="num">vLLM two-phase</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td class="num">5.5 s</td><td class="num">5.5 s</td></tr>
+        <tr><td class="num">4</td><td class="num">8.6 s</td><td class="num">5.6 s</td></tr>
+        <tr><td class="num">16</td><td class="num">21.7 s</td><td class="num">5.9 s</td></tr>
+        <tr><td class="num">64</td><td class="num" style="color:var(--bad)">71.5 s</td><td class="num">7.1 s</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose"><p>N=1 tie → the <code>pie-serve → vLLM-driver</code> layer has no overhead. Pie scales ~linearly while vLLM stays flat: fork saved prefill perfectly (N=64: <code>leaves_prefill=0</code>, 667,926 tokens) but the child decodes are serialized instead of batched. The huge prefill saving buys zero wallclock.</p></div>
+
+    <h3>4.2 · OpenHands SWE-bench head-to-head</h3>
+    <div class="tbl"><table>
+      <thead><tr><th>Metric</th><th class="num">Pie coder-session</th><th class="num">litellm + vLLM</th><th class="num">Ratio</th></tr></thead>
+      <tbody>
+        <tr><td>Total time</td><td class="num">7,227 s</td><td class="num">1,978 s</td><td class="num" style="color:var(--bad)">3.65× slower</td></tr>
+        <tr><td>Total iters</td><td class="num">961</td><td class="num">906</td><td class="num">~matched</td></tr>
+        <tr><td>Per iteration</td><td class="num">7.52 s</td><td class="num">2.18 s</td><td class="num" style="color:var(--bad)">3.4× slower</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose"><p>KV-retention works (94.8 % prefill saved, zero rebuilds) — prefill is not the problem, and it's not divergence (iterations match). The baseline gets the same reuse via APC, localhost erases the round-trip win, and the coder-session uses <em>no masking</em> — naive prefix-extend-or-rebuild, functionally identical to APC. Both win-mechanisms neutralized → Pie loses on per-turn overhead.</p></div>
+
+    <h3>4.3 · Decode throughput vs context length <span style="color:var(--diag);font-family:var(--mono);font-size:.72rem">— the decisive isolation</span></h3>
+    <div class="tbl"><table>
+      <thead><tr><th class="num">Context L</th><th class="num">Pie decode</th><th class="num">vLLM decode</th></tr></thead>
+      <tbody>
+        <tr><td class="num">2 k</td><td class="num">63.1 tok/s</td><td class="num">66.0 tok/s</td></tr>
+        <tr><td class="num">5 k</td><td class="num">62.8 tok/s</td><td class="num">66.3 tok/s</td></tr>
+        <tr><td class="num">20 k</td><td class="num">63.3 tok/s</td><td class="num">65.0 tok/s</td></tr>
+        <tr><td class="num">50 k</td><td class="num">63.1 tok/s</td><td class="num">64.8 tok/s</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose"><p>Both flat, within ~4 %. Pie decode does <strong>not</strong> collapse with context. Combined with §4.2 (prefill saved), this rules out both raw-inference axes as the cause of the OpenHands loss — the remaining suspect is the <strong>session-management path</strong> (per-call snapshot open + refresh, <code>kv_verify</code>). Corollary: mask-condense would not speed up decode; its value is purely the structural mid-context drop APC can't express.</p></div>
+
+    <h3>4.4 · Pattern A: loop-in-inferlet</h3>
+    <div class="tbl"><table>
+      <thead><tr><th>Arm</th><th class="num">Total (13 inst.)</th><th class="num">Iters</th><th class="num">s/iter</th></tr></thead>
+      <tbody>
+        <tr><td>litellm + vLLM (baseline)</td><td class="num">1,978 s</td><td class="num">906</td><td class="num">2.18</td></tr>
+        <tr><td><strong>Pattern A</strong> (live ctx)</td><td class="num">2,329 s</td><td class="num">467</td><td class="num" style="color:var(--diag)">4.99</td></tr>
+        <tr><td>Pattern B (coder-session)</td><td class="num">7,227 s</td><td class="num">961</td><td class="num" style="color:var(--bad)">7.52</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose"><p>Pattern A is <strong>3.1× faster than the coder-session</strong> and 34 % faster per iteration — the per-call session teardown was a real, large chunk of the loss. But it's still 1.18× slower total than litellm. Caveats: it's a <em>different, simpler</em> agent loop (467 vs 906 iters, which flatters its total); since decode is at parity, the per-iter residual is most plausibly tokens-per-iteration differences, not a Pie inference gap.</p></div>
+
+    <h3>4.4b · Mask-condense inside Pattern A <span style="color:var(--ink-faint);font-family:var(--mono);font-size:.72rem">— the APC-impossible lever</span></h3>
+    <div class="tbl"><table>
+      <thead><tr><th>Arm</th><th class="num">Total</th><th class="num">Iters</th><th class="num">s/iter</th><th>Condensation</th></tr></thead>
+      <tbody>
+        <tr><td>Rebuild</td><td class="num">2,329 s</td><td class="num">467</td><td class="num">4.99</td><td>11 × (summary call + ~12k re-prefill)</td></tr>
+        <tr><td>Mask</td><td class="num">2,374 s</td><td class="num">441</td><td class="num">5.38</td><td>7 × mask-range (0 summary, 0 re-prefill)</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose"><p>Mask engaged correctly (zero summaries, zero re-prefill) and kept 13/13 patches — but it's a wash on wallclock (~2 % slower). The only cost it removes caps at ~3 % of runtime, and engine non-determinism swings trajectories far more than that. Even the one structural lever APC cannot match yields no measurable single-GPU win — it would only matter under memory pressure or with a slow / expensive summarizer.</p></div>
+
+    <h3>4.5 · Memory-pressure / overcommit</h3>
+    <div class="prose"><p>Both engines share the same 244,704-token cache. At conc that barely fits, vLLM is slightly faster; at 1.9× overcommit, <strong>Pie OOM-crashes</strong> (no CPU-swap backstop on the vLLM driver) while vLLM degrades gracefully via APC evict + recompute. The "atomic fork + offload beats APC" thesis does not hold — Pie hits the wall at the same working-set size and crashes before it can exploit APC's weakness.</p></div>
+  </section>
+
+  <!-- 5 -->
+  <section id="paper">
+    <h2><span class="sn">5</span>Where the paper's agentic win comes from</h2>
+    <div class="prose"><p>The paper's ReACT / CodeACT / Swarm inferlets share one structure (ReACT shown):</p></div>
+    <pre><code><span class="kw">let mut</span> ctx = Context::new(&amp;model)?;              <span class="cmt">// ONE context, created ONCE</span>
+ctx.system(SYSTEM_PROMPT); ctx.user("Question: …"); ctx.cue();
+<span class="kw">for</span> step <span class="kw">in</span> 1..=max_steps {                       <span class="cmt">// 8 (ReACT/CodeACT), 32 (Swarm)</span>
+    <span class="kw">let</span> raw = ctx.generate(…).await?;             <span class="cmt">// decode action — appends to SAME ctx</span>
+    <span class="kw">let</span> observation = <span class="kw">match</span> tool {
+        "Calculator" =&gt; calculator(arg),          <span class="cmt">// ← TOOL RUNS IN-PROCESS</span>
+        …
+    };
+    ctx.user("Observation: {observation}…"); ctx.cue(); <span class="cmt">// append to SAME live ctx</span>
+}</code></pre>
+    <div class="prose"><p>The loop lives <strong>inside the server</strong>, the tool runs <strong>in-process between steps</strong>. Versus a Python-client baseline, Pie eliminates three per-interaction costs — but only in the paper's setup; all vanish in ours:</p></div>
+    <div class="tbl"><table>
+      <thead><tr><th>Win condition</th><th>Paper</th><th>Our runs</th></tr></thead>
+      <tbody>
+        <tr><td>Model</td><td>1B/3B (gen ≈ few ms → RTT is a big fraction)</td><td>30B (gen dominates)</td></tr>
+        <tr><td>Client</td><td>remote, campus network (real RTT)</td><td><strong>localhost</strong> (RTT ≈ 0)</td></tr>
+        <tr><td># I/Os</td><td>8 / 8 / 32 (win scales)</td><td>fewer, diluted by long gens</td></tr>
+        <tr><td>Concurrency</td><td>up to 128 agents → APC evicts</td><td>fits → APC never evicts</td></tr>
+        <tr><td>Tool location</td><td><strong>in-WASM</strong> (Rust fn, Boa JS)</td><td>bash/edits → <strong>must be on host</strong></td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- 6 -->
+  <section id="could-win">
+    <h2><span class="sn">6</span>Where a real Pie win could still live</h2>
+    <div class="prose"><p>None is single-GPU-localhost-wallclock:</p></div>
+    <ul class="clean">
+      <li><strong>A genuine network gap</strong> between workers and the server → vLLM pays re-transmit + round-trip that Pie's server-side session avoids. The paper's dominant small-model mechanism; does not trigger Pie's OOM.</li>
+      <li><strong>Mask-condense (structural, APC-impossible)</strong> → at condensation points the summarizing baseline emits new text → APC miss → re-prefill; Pie drops the stale middle and keeps the rest valid. A re-prefill-avoidance + capability win (not a decode speedup) — and, per §4.4b, only pays off under pressure.</li>
+      <li><strong>Effective-KV &gt; GPU with working offload</strong> → the only regime where fork + restore structurally beats APC-evict-recompute; blocked on the native-driver swap path.</li>
+      <li><strong>Fix decode batching across forks</strong> → turns the fan-out loss into a tie, not a win.</li>
+    </ul>
+  </section>
+
+  <!-- 7 -->
+  <section id="conclusions">
+    <h2><span class="sn">7</span>Conclusions</h2>
+    <ul class="clean">
+      <li><strong>Pie's KV-reuse mechanisms are real and large</strong> (94.8 % prefill saved in OpenHands; 668k tokens in fan-out; organic cross-worker reuse; 99.7 % on fork delegation). They are <strong>not wallclock wins</strong> because vLLM APC captures the same reuse for free when it fits.</li>
+      <li><strong>On a single local GPU, Pie's best case is a tie</strong> (N=1 fan-out + decode-parity). Every tie-breaker is either blocked by a Pie engine gap (serial fork-decode; OOM under pressure; per-call session overhead) or matched by APC.</li>
+      <li><strong>Architecture matters a lot.</strong> The stateless coder-session was 3.65× slower; the loop-in-inferlet agent recovered most of that (3.1× faster), landing 1.18× off the baseline — so the huge deficit was mostly self-inflicted, not fundamental. But even the good architecture only <em>approaches</em> parity on localhost.</li>
+      <li>The <strong>paper's agentic win is genuine but conditional</strong> — small model, real network, many I/Os, concurrency, in-WASM tools — and our Python/bash-tool workloads on localhost with a big model satisfy none of them.</li>
+      <li>The honest, defensible contribution is <strong>deterministic prefill/token elimination + programmability</strong> (strategies APC cannot express), which matters for compute / energy / cost — not a wallclock win, unless one of the §6 conditions is built.</li>
+    </ul>
+  </section>
+
+  <div class="foot">
+    Artifacts &amp; jobs — fan-out 19074533/19074534 · OpenHands 18951267/18962143 · decode-tps 19078674/19078675 · Pattern A 19080944 · mask 19089013 · fork delegation 19039792 · memory-pressure 19068668/19068669 · OpenEvolve 19065839 · mask-quality 19070781. Source: <code>PIE_VS_VLLM_EVALUATION.md</code>. Paper: Gim, Ma, Lee, Zhong — <em>Pie</em>, SOSP '25.
+  </div>
+
+</div>
