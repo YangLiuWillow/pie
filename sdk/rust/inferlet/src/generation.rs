@@ -501,6 +501,21 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             pass.output_speculative_tokens(true);
         }
 
+        // Drop-middle condensation mask (see `Context::mask_range`): exclude the
+        // masked KV ranges from attention for the pending query positions. No-op
+        // when no ranges are set (→ synthesized causal). Skipped under
+        // speculative verify/drafts, which condensation does not use.
+        if !parent.ctx.masked_ranges.is_empty()
+            && !do_sdk_verify
+            && drafts.is_empty()
+            && n_pending > 0
+        {
+            let masks = parent.ctx.attn_masks_for(parent.ctx.seq_len, n_pending);
+            if !masks.is_empty() {
+                pass.attention_mask(&masks);
+            }
+        }
+
         // Sampler attach. Custom-with-drafts attaches (1 + n_drafted)
         // consecutive samplers: one for the anchor's free pick plus one
         // per draft position. The walk below compares each pick against

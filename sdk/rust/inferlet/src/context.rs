@@ -92,6 +92,70 @@ pub struct Context {
     pub(crate) working_pages: u32,
     /// Number of tokens in working (uncommitted) pages (tracked locally).
     pub(crate) working_tokens: u32,
+    /// Dropped KV position ranges `[start, end)` masked out of attention on
+    /// every subsequent prefill/decode (context "condensation" without a
+    /// rebuild/re-prefill). Empty = plain causal attention. See
+    /// [`Context::mask_range`].
+    pub(crate) masked_ranges: Vec<(u32, u32)>,
+}
+
+/// Merge overlapping/adjacent `[start,end)` ranges (sorted, disjoint out).
+pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut rs: Vec<(u32, u32)> = ranges.iter().copied().filter(|(s, e)| s < e).collect();
+    rs.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(rs.len());
+    for (s, e) in rs {
+        if let Some(last) = out.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        out.push((s, e));
+    }
+    out
+}
+
+/// BRLE (run lengths, starts-with-False, even=False/odd=True) over positions
+/// `[0, p]` (causal): a position is True (attended) unless it falls in a masked
+/// range. `masked` must be merged+sorted. Returns `vec![0, p+1]` (all-true)
+/// when nothing in `[0,p]` is masked.
+pub(crate) fn brle_causal_minus(masked: &[(u32, u32)], p: u32) -> Vec<u32> {
+    let end = p + 1; // positions [0, end)
+    // Alternating (attended, len) segments over [0, end).
+    let mut segs: Vec<(bool, u32)> = Vec::new();
+    let mut cursor = 0u32;
+    for &(s, e) in masked {
+        let s = s.min(end);
+        let e = e.min(end);
+        if s >= e {
+            continue;
+        }
+        if s > cursor {
+            segs.push((true, s - cursor)); // attended gap
+        }
+        segs.push((false, e - s)); // masked
+        cursor = e;
+    }
+    if cursor < end {
+        segs.push((true, end - cursor)); // trailing attended
+    }
+    // Convert to BRLE: run lengths, starts with a False run, strict alternation.
+    let mut brle: Vec<u32> = Vec::new();
+    let mut expect_false = true;
+    for (attended, len) in segs {
+        let is_false = !attended;
+        if is_false != expect_false {
+            brle.push(0); // zero-length run to reach the right parity (leading True only)
+            expect_false = !expect_false;
+        }
+        brle.push(len);
+        expect_false = !expect_false;
+    }
+    if brle.is_empty() {
+        brle.push(end);
+    }
+    brle
 }
 
 impl Context {
@@ -137,6 +201,7 @@ impl Context {
             committed_pages,
             working_pages,
             working_tokens,
+            masked_ranges: Vec::new(),
         }
     }
 
@@ -157,7 +222,44 @@ impl Context {
             committed_pages: self.committed_pages,
             working_pages: self.working_pages,
             working_tokens: self.working_tokens,
+            masked_ranges: self.masked_ranges.clone(),
         })
+    }
+
+    /// Mark KV positions `[start, end)` as dropped: masked out of attention on
+    /// every subsequent prefill and decode. This is context "condensation"
+    /// without a rebuild — the dropped tokens' KV stays resident (recoverable
+    /// via [`clear_masked_ranges`](Self::clear_masked_ranges)) but is excluded
+    /// from attention (and the runtime trims fully-masked pages from the
+    /// kernel). Ranges are merged; out-of-range parts are clipped at use time.
+    pub fn mask_range(&mut self, start: u32, end: u32) {
+        if start < end {
+            self.masked_ranges.push((start, end));
+            self.masked_ranges = merge_ranges(&self.masked_ranges);
+        }
+    }
+
+    /// Clear all masked ranges — attention returns to plain causal over the
+    /// full resident KV.
+    pub fn clear_masked_ranges(&mut self) {
+        self.masked_ranges.clear();
+    }
+
+    /// The current merged masked ranges `[start, end)`.
+    pub fn masked_ranges(&self) -> &[(u32, u32)] {
+        &self.masked_ranges
+    }
+
+    /// Per-query-position BRLE attention masks for `n` tokens starting at
+    /// `first_pos` (causal minus the masked ranges). Empty when no ranges are
+    /// set (caller should fall back to the synthesized causal mask).
+    pub(crate) fn attn_masks_for(&self, first_pos: u32, n: u32) -> Vec<Vec<u32>> {
+        if self.masked_ranges.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        (0..n)
+            .map(|i| brle_causal_minus(&self.masked_ranges, first_pos + i))
+            .collect()
     }
 
     /// Save the context under a user-chosen name.
@@ -410,6 +512,13 @@ impl Context {
 
         let positions: Vec<u32> = (self.seq_len..self.seq_len + num_tokens).collect();
         pass.input_tokens(tokens, &positions);
+
+        // Drop-middle condensation: mask the recorded ranges out of attention
+        // for these query positions (no-op when no ranges are set → causal).
+        let masks = self.attn_masks_for(self.seq_len, num_tokens);
+        if !masks.is_empty() {
+            pass.attention_mask(&masks);
+        }
 
         pass.execute_async()
             .await

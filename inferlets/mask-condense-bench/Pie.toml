@@ -1,0 +1,15 @@
+[package]
+name = "mask-condense-bench"
+version = "0.1.0"
+description = "B2-mask Stage-1: mask-condense (0 re-prefill) vs rebuild-condense (re-prefill) — the structural win over vLLM+prefix-caching"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+history_tokens = {type = "int", optional = true, description = "Full pre-condensation context length in tokens (default: 8000)"}
+sink_size = {type = "int", optional = true, description = "Kept head/sink tokens (default: 64)"}
+window_size = {type = "int", optional = true, description = "Kept recent-window tokens (default: 1024)"}
+decode_steps = {type = "int", optional = true, description = "Tokens to decode after condensing (default: 128)"}
