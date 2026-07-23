@@ -21,7 +21,7 @@ import signal
 import subprocess
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -157,20 +157,107 @@ class PersistentBash:
                 self._proc.kill()
 
 
+class Workspace:
+    """One isolated tool-execution context: a repo working tree with its own
+    long-lived bash and (optional) FileEditor."""
+
+    def __init__(self, root: str):
+        self.root = root
+        self.bash = PersistentBash(root)
+        self.editor = FileEditor(workspace_root=root) if _HAS_FILE_EDITOR else None
+
+    def close(self):
+        self.bash.close()
+
+
+class WorkspaceRegistry:
+    """Maps ``workspace_id -> Workspace`` so one tool server can host several
+    forked repo copies concurrently. Seeded with ``"0"`` = the initial checkout.
+
+    Fork/drop mutate the map under a lock (the server is threaded); per-workspace
+    bash locks serialize commands within a workspace.
+    """
+
+    TRUNK = "0"
+
+    def __init__(self, root0: str):
+        self._lock = threading.Lock()
+        self._ws: dict[str, Workspace] = {self.TRUNK: Workspace(root0)}
+
+    def get(self, workspace_id: str) -> Workspace:
+        with self._lock:
+            ws = self._ws.get(workspace_id)
+        if ws is None:
+            raise KeyError(f"unknown workspace_id {workspace_id!r}")
+        return ws
+
+    def fork(self, from_id: str, to_ids: list[str]) -> dict[str, Any]:
+        """Snapshot ``from_id``'s working tree (incl. uncommitted edits) into a
+        sibling dir per ``to_id`` and register a fresh Workspace for each."""
+        src = self.get(from_id).root
+        created: list[str] = []
+        for tid in to_ids:
+            dst = f"{src.rstrip('/')}__fork{tid}"
+            # cp -a preserves the exact (possibly dirty) tree; git clone would
+            # miss uncommitted edits. --reflink=auto is cheap on CoW FS.
+            if os.path.exists(dst):
+                subprocess.run(["rm", "-rf", dst], check=False)
+            res = subprocess.run(
+                ["cp", "-a", "--reflink=auto", src, dst],
+                capture_output=True, text=True,
+            )
+            if res.returncode != 0:
+                # fall back to plain cp -a (older/non-GNU cp lacks --reflink)
+                subprocess.run(["rm", "-rf", dst], check=False)
+                subprocess.run(["cp", "-a", src, dst], check=True)
+            ws = Workspace(dst)
+            with self._lock:
+                self._ws[tid] = ws
+            created.append(tid)
+        return {"observation": f"forked {from_id} -> {created}", "forked": created,
+                "exit_code": 0}
+
+    def drop(self, workspace_id: str) -> dict[str, Any]:
+        if workspace_id == self.TRUNK:
+            return {"observation": "refusing to drop trunk workspace '0'",
+                    "exit_code": 1}
+        with self._lock:
+            ws = self._ws.pop(workspace_id, None)
+        if ws is None:
+            return {"observation": f"unknown workspace_id {workspace_id!r}",
+                    "exit_code": 1}
+        ws.close()
+        subprocess.run(["rm", "-rf", ws.root], check=False)
+        return {"observation": f"dropped {workspace_id}", "exit_code": 0}
+
+    def close_all(self):
+        with self._lock:
+            items = list(self._ws.items())
+            self._ws.clear()
+        for wid, ws in items:
+            ws.close()
+            if wid != self.TRUNK:  # trunk dir is owned by the caller/harness
+                subprocess.run(["rm", "-rf", ws.root], check=False)
+
+
 def start_tool_server(working_dir: str, *, host: str = "127.0.0.1", port: int = 0) -> tuple[HTTPServer, int]:
     """Start the tool server in a background thread.
 
     Returns ``(server, port)`` where *port* is the OS-assigned port when
-    *port* is 0.
+    *port* is 0. Requests may target a forked workspace via ``workspace_id``
+    (default ``"0"``); use the ``fork_workspace`` / ``drop_workspace`` actions
+    to create/remove them.
     """
-    bash = PersistentBash(working_dir)
-    handler = _make_handler(working_dir, bash)
-    server = HTTPServer((host, port), handler)
+    registry = WorkspaceRegistry(working_dir)
+    handler = _make_handler(registry)
+    # ThreadingHTTPServer so K forked branches' tool calls run concurrently.
+    server = ThreadingHTTPServer((host, port), handler)
+    server.daemon_threads = True
     actual_port = server.server_address[1]
     _orig_shutdown = server.shutdown
     def _shutdown():
         _orig_shutdown()
-        bash.close()
+        registry.close_all()
     server.shutdown = _shutdown
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -185,8 +272,7 @@ def _to_abs_path(path: str, working_dir: str) -> str:
     return str(Path(working_dir) / path)
 
 
-def _make_handler(working_dir: str, bash: PersistentBash):
-    editor = FileEditor(workspace_root=working_dir) if _HAS_FILE_EDITOR else None
+def _make_handler(registry: "WorkspaceRegistry"):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -243,6 +329,24 @@ def _make_handler(working_dir: str, bash: PersistentBash):
         def _handle_request(self, req):
             action = req.get("action", "")
             try:
+                # Workspace lifecycle (control actions) — not workspace-scoped.
+                if action == "fork_workspace":
+                    result = registry.fork(
+                        req.get("from_id", WorkspaceRegistry.TRUNK),
+                        list(req.get("to_ids", [])),
+                    )
+                    self._reply(200, result)
+                    return
+                if action == "drop_workspace":
+                    result = registry.drop(req.get("workspace_id", ""))
+                    self._reply(200, result)
+                    return
+
+                # Everything else runs against a specific workspace (default
+                # "0" keeps the single-trajectory path backward-compatible).
+                ws = registry.get(req.get("workspace_id", WorkspaceRegistry.TRUNK))
+                bash, editor, working_dir = ws.bash, ws.editor, ws.root
+
                 if action == "bash":
                     result = _exec_bash(bash, req.get("command", ""))
                 elif action == "edit":
@@ -277,6 +381,8 @@ def _make_handler(working_dir: str, bash: PersistentBash):
                     result = _exec_has_diff(bash)
                 else:
                     result = {"observation": f"Unknown action: {action!r}", "exit_code": 1}
+            except KeyError as e:
+                result = {"observation": f"Error: {e}", "exit_code": 1}
             except Exception as e:
                 result = {"observation": f"Error: {type(e).__name__}: {e}", "exit_code": 1}
             self._reply(200, result)

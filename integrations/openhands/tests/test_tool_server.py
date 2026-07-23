@@ -31,6 +31,48 @@ def _post(port: int, body: dict) -> dict:
         return json.loads(resp.read())
 
 
+class TestWorkspaceFork:
+    def test_fork_isolates_edits(self, server_and_dir):
+        _, port, tmpdir = server_and_dir
+        # seed a file in the trunk workspace
+        _post(port, {"action": "bash", "command": "echo trunk > f.txt"})
+
+        # fork trunk -> "1"; the file should be copied in
+        r = _post(port, {"action": "fork_workspace", "from_id": "0", "to_ids": ["1"]})
+        assert r["exit_code"] == 0 and "1" in r["forked"]
+        r = _post(port, {"action": "bash", "command": "cat f.txt", "workspace_id": "1"})
+        assert "trunk" in r["observation"]
+
+        # diverge: overwrite in each workspace independently
+        _post(port, {"action": "bash", "command": "echo A > f.txt", "workspace_id": "0"})
+        _post(port, {"action": "bash", "command": "echo B > f.txt", "workspace_id": "1"})
+        r0 = _post(port, {"action": "bash", "command": "cat f.txt", "workspace_id": "0"})
+        r1 = _post(port, {"action": "bash", "command": "cat f.txt", "workspace_id": "1"})
+        assert "A" in r0["observation"] and "B" not in r0["observation"]
+        assert "B" in r1["observation"] and "A" not in r1["observation"]
+
+    def test_default_workspace_is_trunk(self, server_and_dir):
+        # a request with no workspace_id must hit trunk (backward compat)
+        _, port, _ = server_and_dir
+        _post(port, {"action": "bash", "command": "echo hi > g.txt", "workspace_id": "0"})
+        r = _post(port, {"action": "bash", "command": "cat g.txt"})  # no workspace_id
+        assert "hi" in r["observation"]
+
+    def test_drop_workspace(self, server_and_dir):
+        _, port, _ = server_and_dir
+        _post(port, {"action": "fork_workspace", "from_id": "0", "to_ids": ["9"]})
+        r = _post(port, {"action": "drop_workspace", "workspace_id": "9"})
+        assert r["exit_code"] == 0
+        # subsequent use of the dropped id errors
+        r = _post(port, {"action": "bash", "command": "pwd", "workspace_id": "9"})
+        assert r["exit_code"] == 1 and "unknown workspace" in r["observation"]
+
+    def test_cannot_drop_trunk(self, server_and_dir):
+        _, port, _ = server_and_dir
+        r = _post(port, {"action": "drop_workspace", "workspace_id": "0"})
+        assert r["exit_code"] == 1
+
+
 class TestBash:
     def test_echo(self, server_and_dir):
         _, port, _ = server_and_dir
