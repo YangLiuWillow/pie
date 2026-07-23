@@ -254,3 +254,7 @@ pie/rollout_logs/
 /.cpm-cache/
 # Apptainer/Singularity images (large binaries, built locally)
 *.sif
+# tau2-bench is cloned in-place as its own git repo (~1.4 GB) to run against
+# Pie. Ignore it so a stray `git add -A` cannot swallow a nested checkout, the
+# same footgun the *.sif rule above closes.
+/integrations/tau2-bench/
