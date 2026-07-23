@@ -6,7 +6,7 @@
 #SBATCH --gpus=rtx_pro_6000_blackwell:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
-#SBATCH --time=10:00:00
+#SBATCH --time=4:00:00
 #SBATCH --output=/nfs/roberts/project/pi_ql324/ly337/pie/integrations/openhands/logs/ab_cuda_native_13b_%j.out
 
 # A/B PIE ARM: pie-glued OpenHands on the NATIVE CUDA driver + self-keyed
@@ -25,10 +25,17 @@
 # KV crossed the hard 4096-page budget during instance 5 and every later call
 # blocked forever waiting for pages. Fixed by namespace-prefix snapshot delete
 # at session teardown (runtime ContextManager::delete + coder-session).
-# Two limits raised accordingly: 4h → 10h (Pie needs ~2-3x the baseline's
-# wallclock per instance, so 13 instances never fit in 4h even healthy), and
-# the per-request timeout 3600s → 900s (~70x the observed per-call time) so a
-# wedge costs minutes instead of burning an hour per instance.
+# The per-request timeout is 3600s → 900s (~70x the observed per-call time) so
+# a wedge costs minutes instead of burning an hour per instance.
+#
+# Walltime stayed at 4h. It was briefly raised to 10h when Pie looked ~2-3x
+# slower than the baseline, but that turned out to be an unanswered WebSocket
+# Close frame costing a flat 10 s/call (fixed in e4626e5b). django-13028 now
+# runs in 185.4s against the baseline's 246.7s, so 13 instances fit in 4h with
+# room to spare — and a shorter walltime backfills onto a GPU sooner.
+#
+# Requires the pie binary rebuilt after e4626e5b (job 19250970) — PIE_BIN below
+# points at the repo build, which is that one.
 set -euo pipefail
 cd /nfs/roberts/project/pi_ql324/ly337/pie/integrations/openhands
 

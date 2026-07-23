@@ -76,13 +76,20 @@ VRAM headroom).
 | Partition | Account | QOS | GPU flag | Notes |
 |---|---|---|---|---|
 | `gpu_h200` | `pi_ql324` | `normal` | `--gpus=h200:1` | Fair-share queue, can sit `PD` a while |
-| `priority_gpu` | `prio_ql324` | (implied by account) | `--gpus=<type>:1` (`a100`, `rtx_5000_ada`, `h200`, `rtx_pro_6000_blackwell`, `b200`) | Priority tier, faster scheduling, but **only** with the `prio_ql324` account — it rejects `pi_ql324` and vice versa |
+| `gpu_rtx6000` | `pi_ql324` | `normal` | `--gpus=rtx_pro_6000_blackwell:1` | What the cuda_native runs use |
+| `scavenge` | `pi_ql324` | `normal` | (CPU builds) | Preemptible; used for the `pie` CUDA rebuilds |
 
-Two ready-made sbatch scripts (2-problem smoke test, Pie backend):
+> **Do not submit to any priority partition, account, or QOS** (`priority_gpu`,
+> `prio_ql324`, and friends). This is a standing rule for this project. The
+> three `*_priority.sbatch` scripts that used to live here were deleted for
+> that reason — don't reintroduce them. Prefer `scavenge` when you want
+> something scheduled sooner, and keep walltime requests tight so jobs
+> backfill.
+
+One ready-made sbatch script (2-problem smoke test, Pie backend):
 
 ```bash
 sbatch integrations/openhands/smoke_test.sbatch           # gpu_h200 / pi_ql324 / h200
-sbatch integrations/openhands/smoke_test_priority.sbatch  # priority_gpu / prio_ql324 / rtx_5000_ada
 ```
 
 Logs land in `integrations/openhands/logs/smoke_<jobid>.out`.

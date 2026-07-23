@@ -252,3 +252,5 @@ pie/rollout_logs/
 
 # CPM (CMake) download cache for the native CUDA driver build (flashinfer, etc.)
 /.cpm-cache/
+# Apptainer/Singularity images (large binaries, built locally)
+*.sif

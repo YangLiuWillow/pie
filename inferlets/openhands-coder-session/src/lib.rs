@@ -8,8 +8,6 @@
 //!
 //!   Input adds:
 //!     session_id:        Option<String>  (enables session mode)
-//!     session_prev_len:  usize           (echo of last response's session.len; 0 first call)
-//!     session_prev_hash: Option<String>  (echo of last response's session.hash, hex)
 //!     session_action:    Option<String>  ("delete" → drop the saved context and exit)
 //!     kv_verify:         bool            (Phase 2 fidelity assertions)
 //!     use_grammar:       bool            (default true; disable for parity with an
@@ -95,33 +93,15 @@ struct Input {
     model: Option<String>,
 
     // ── Session protocol ──────────────────────────────────────────────
+    //
+    // `session_id` alone is the cache namespace: the prefix cache self-keys
+    // from token content. The legacy host-coordination hints that used to sit
+    // here (`session_prev_len` / `session_prev_hash` and the `session_fork_*`
+    // parent pointers) are gone — the harness stopped sending them when
+    // self-keying landed, and serde ignores unknown fields, so an older caller
+    // that still emits them keeps deserializing fine.
     #[serde(default)]
     session_id: Option<String>,
-
-    // Legacy host-coordination hints (previous render length + hash, and the
-    // parent-fork pointers). The content-addressed prefix cache self-keys from
-    // the token content and no longer consults these, but they stay declared
-    // so payloads the current harness still sends keep deserializing. Delete
-    // once the harness stops emitting them.
-    #[serde(default)]
-    #[allow(dead_code)]
-    session_prev_len: usize,
-
-    #[serde(default)]
-    #[allow(dead_code)]
-    session_prev_hash: Option<String>,
-
-    #[serde(default)]
-    #[allow(dead_code)]
-    session_fork_from: Option<String>,
-
-    #[serde(default)]
-    #[allow(dead_code)]
-    session_fork_prev_len: usize,
-
-    #[serde(default)]
-    #[allow(dead_code)]
-    session_fork_prev_hash: Option<String>,
 
     #[serde(default)]
     session_action: Option<String>,
@@ -397,6 +377,19 @@ async fn main(mut input: Input) -> Result<Output> {
     // `use_grammar: false` disables phase 2 for parity with a fully
     // unconstrained baseline. The fork is transient and destroyed before
     // returning, so session snapshot bookkeeping is unaffected.
+    //
+    // STATUS: phase 2 belongs to grammar mode only, and grammar mode is not
+    // the path currently in use. `--python-tool-parser` forces
+    // `use_grammar: false` (llm.py), so the gate below is false and no fork is
+    // taken — job 19249847 measured fork_ms at 0.0. Across debug logs, phase 2
+    // fired 12 of 13 calls on v7 (job 18937308, Qwen2.5-Coder-32B, grammar
+    // mode) and 0 of 753 calls over the twelve runs since, all of which used
+    // the Python parser. Kept deliberately: it is the fallback that makes
+    // grammar mode usable on a model that narrates instead of calling, it
+    // costs nothing when disabled, and deleting it would throw away working
+    // behaviour for no measured gain. Revisit only if grammar mode is dropped
+    // outright — at which point `use_grammar`, the matcher plumbing, and this
+    // whole path go together.
     let t0 = Instant::now();
     let mut phase2_fork = if input.use_grammar && has_tools {
         Some(ctx.fork()?)
