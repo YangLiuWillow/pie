@@ -1,0 +1,28 @@
+[package]
+name = "openevolve-generation"
+version = "0.1.0"
+description = "OpenEvolve candidate-generation inferlet. One call = one sampled parent's generation batch: generate a shared analysis (L1g) once, then fork it into N diverse children (SEARCH/REPLACE diffs), all sharing the parent-prompt (L1p) and analysis KV. See memory project_openevolve_integration."
+authors = ["Pie / OpenEvolve integration"]
+repository = "https://github.com/pie-project/pie"
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+run_id       = {type = "string", optional = false, description = "Run identity. Namespaces the L1p/L1g named snapshots so parallel workers of the same run share them (must share the same Pie username)."}
+parent_id    = {type = "string", optional = false, description = "Sampled parent program id. Part of the L1p/L1g snapshot key."}
+topk_sig     = {type = "string", optional = false, description = "Backend-computed hash of the ordered top-K program ids + parent code + parent metrics. Changes → clean cache miss (staleness handled by key, not invalidation)."}
+num_children = {type = "int",    optional = true,  description = "N children (leaf diffs) to fork off the shared analysis. Default 4."}
+reuse_analysis = {type = "bool", optional = true,  description = "Try to open a previously-saved L1g (same parent+topk) and fork it instead of regenerating the analysis. Default false (fresh analysis each batch)."}
+keep_analysis  = {type = "bool", optional = true,  description = "Keep the L1g snapshot after this batch (for cross-generation resample reuse). Default false → L1g is deleted at end-of-batch to bound memory. Implied true when reuse_analysis=true."}
+skip_analysis  = {type = "bool", optional = true,  description = "Skip Stage 1: no shared analysis; the N leaves fork the L1p prompt block directly. num_children=1 + skip_analysis = a plain L1p-cached completion (the LLMInterface single-call path)."}
+action       = {type = "string", optional = true,  description = "'delete' → delete the L1p and L1g snapshots for (run_id,parent_id,topk_sig) and exit (backend-driven lifecycle pruning of dropped elites)."}
+analysis_max_tokens = {type = "int",   optional = true, description = "Max tokens for the shared analysis A. Default 512."}
+child_max_tokens    = {type = "int",   optional = true, description = "Max tokens for each child diff. Default 1024."}
+# Structured / array parameters (declared implicitly, validated by the serde
+# Input at runtime; the manifest TOML type system is scalar-only):
+#   sections           : { system, task, parent_block, analysis_instruction }
+#   steers             : [string]  (len 0 or N) per-leaf divergence steer
+#   analysis_temperature: float
+#   child_temperature  : [float]   (len 0 = default, 1 = broadcast, N = per-leaf)
+#   child_top_p        : [float]   (same broadcast rule)
