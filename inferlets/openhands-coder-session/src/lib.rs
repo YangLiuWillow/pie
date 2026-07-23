@@ -23,28 +23,42 @@
 //!       actually computed this call (vs `prompt_tokens`, which stays the full
 //!       prompt length for OpenHands usage-accounting parity with the baseline).
 //!
-//! How the session works (design doc §1):
+//! How the session works (content-addressed prefix cache — see
+//! [`prefix_cache`]):
 //!
 //! 1. Render the **full** message list to tokens exactly as the stateless
 //!    inferlet would — semantics unchanged; every token the model sees is
 //!    byte-identical to the stateless render. The render excludes the trailing
-//!    generation cue so the snapshot ends on a message boundary.
-//! 2. If the previous prompt (identified by the host-echoed length + FNV-1a
-//!    hash) is a token-level prefix of the new render, `Context::open` the
-//!    saved snapshot and append only the suffix. Otherwise (condenser rewrote
-//!    history, first call, snapshot lost) rebuild from scratch — always
-//!    semantically safe, just slower.
-//! 3. Refresh the snapshot (delete + save under the same name) *before*
-//!    generation, so the saved KV always equals the canonical prompt render —
-//!    never the model's own sampled tokens, whose bytes can differ from the
-//!    replayed form after argument re-serialization on the host.
+//!    generation cue so the snapshot ends on a message boundary, and it also
+//!    reports the token length at each safe render-unit boundary.
+//! 2. Every call saves its full render under `hash(tokens)`. History is
+//!    append-only, so the previous turn's full render is a literal token-prefix
+//!    of this render and re-appears as one of the reported boundaries. Scan the
+//!    boundaries longest-first, `Context::open`-ing `hash(full[..L])`; the most
+//!    recent saved boundary hits and we append only the suffix. Any miss
+//!    (first call, snapshot lost, condenser rewrote history) falls through to a
+//!    clean rebuild — always semantically safe, just slower.
+//! 3. The lookup key is self-derived from token content, not host-echoed
+//!    hints, and names only *full host renders* (never a predicted assistant
+//!    reply), so the save-side and lookup-side names match byte-for-byte —
+//!    argument re-serialization on the host can never cause a miss.
 //!
 //! The snapshot is a prompt-only checkpoint: each new call re-prefills the
 //! previous assistant turn plus the new tool results (O(delta)), not the full
-//! history (O(conversation)).
+//! history (O(conversation)). Because names are content-addressed, distinct
+//! boundaries coexist, so retry / branch / truncate re-hit their still-valid
+//! earlier boundary and a delegated sub-agent that shares a task prefix hits
+//! the parent's boundary with no explicit fork protocol.
 
 use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, tools};
 use serde::{Deserialize, Serialize};
+
+mod prefix_cache;
+
+/// Cache `compat` namespace component — the host bumps this (via a future
+/// input field) to invalidate all snapshots on app-schema drift. Empty for
+/// now; `snapshot_name` maps empty → "0".
+const CACHE_COMPAT: &str = "";
 use serde_json::Value;
 
 // ─── Input ─────────────────────────────────────────────────────────────────
@@ -78,11 +92,30 @@ struct Input {
     #[serde(default)]
     session_id: Option<String>,
 
+    // Legacy host-coordination hints (previous render length + hash, and the
+    // parent-fork pointers). The content-addressed prefix cache self-keys from
+    // the token content and no longer consults these, but they stay declared
+    // so payloads the current harness still sends keep deserializing. Delete
+    // once the harness stops emitting them.
     #[serde(default)]
+    #[allow(dead_code)]
     session_prev_len: usize,
 
     #[serde(default)]
+    #[allow(dead_code)]
     session_prev_hash: Option<String>,
+
+    #[serde(default)]
+    #[allow(dead_code)]
+    session_fork_from: Option<String>,
+
+    #[serde(default)]
+    #[allow(dead_code)]
+    session_fork_prev_len: usize,
+
+    #[serde(default)]
+    #[allow(dead_code)]
+    session_fork_prev_hash: Option<String>,
 
     #[serde(default)]
     session_action: Option<String>,
@@ -154,6 +187,15 @@ struct Output {
     tokens_generated: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<SessionOut>,
+    // ── Temporary phase-1/phase-2 diagnostics (job 18932089 follow-up) ──
+    // `debug_full_text` is phase-1's raw decoded generation (pre tool-call
+    // stripping); `debug_phase1_marker` is whether it contained a literal
+    // `<tool_call>` block the decoder may have failed to parse;
+    // `debug_phase2_fired` records whether the forced-call fallback ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug_full_text: Option<String>,
+    debug_phase1_marker: bool,
+    debug_phase2_fired: bool,
 }
 
 #[derive(Serialize)]
@@ -166,7 +208,7 @@ struct ToolCallOut {
 #[derive(Serialize)]
 struct SessionOut {
     id: String,
-    /// "fresh" | "extended" | "rebuilt" | "stateless" | "deleted"
+    /// "fresh" | "extended" | "forked" | "rebuilt" | "stateless" | "deleted"
     mode: String,
     /// Token count of this call's prompt render (excluding the cue).
     len: usize,
@@ -208,6 +250,9 @@ async fn main(mut input: Input) -> Result<Output> {
                 hash: String::new(),
                 prefill_tokens: 0,
             }),
+            debug_full_text: None,
+            debug_phase1_marker: false,
+            debug_phase2_fired: false,
         });
     }
 
@@ -226,11 +271,14 @@ async fn main(mut input: Input) -> Result<Output> {
 
     // Canonical prompt render — identical to the stateless inferlet's
     // token stream, minus the trailing cue (appended after session
-    // bookkeeping so the snapshot ends on a message boundary).
-    let full_tokens = render_prompt(&model, &input.messages, &tool_schemas)?;
+    // bookkeeping so the snapshot ends on a message boundary). `boundaries`
+    // marks the token length at each safe render-unit split, so the reuse
+    // search below can name candidate prefixes without re-rendering.
+    let (full_tokens, boundaries) = render_prompt(&model, &input.messages, &tool_schemas)?;
     let full_hash = fnv1a64(&full_tokens);
 
-    let (mut ctx, session) = build_context(&model, &input, &full_tokens, full_hash).await?;
+    let (mut ctx, session) =
+        build_context(&model, &input, model_name, &full_tokens, full_hash, &boundaries).await?;
 
     ctx.cue();
 
@@ -377,9 +425,11 @@ async fn main(mut input: Input) -> Result<Output> {
     // Runs even when phase 1 produced nothing at all (immediate stop
     // token, traj job 18904720 completion 5) — an empty response forces
     // OpenHands into a no-op nudge round-trip.
+    let mut phase2_fired = false;
     if tool_calls.is_empty() {
         if let Some(mut fk) = phase2_fork.take() {
             if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
+                phase2_fired = true;
                 let mut prose = generated.clone();
                 if prose.last().is_some_and(|t| stop_token_ids.contains(t)) {
                     prose.pop();
@@ -451,6 +501,13 @@ async fn main(mut input: Input) -> Result<Output> {
         stop_reason = "tool_calls";
     }
 
+    // No next-boundary prediction: the reusable boundary is always a full
+    // host-message render (saved in `build_context`), never a guessed
+    // assistant reply. History is append-only, so this call's saved full
+    // render is a literal token-prefix of the next call's render and is
+    // re-discovered there by the boundary search — byte-identical name, no
+    // re-serialization drift.
+    let debug_phase1_marker = full_text.contains("<tool_call>");
     Ok(Output {
         text,
         tool_calls,
@@ -458,6 +515,9 @@ async fn main(mut input: Input) -> Result<Output> {
         prompt_tokens: prompt_token_count,
         tokens_generated: generated.len(),
         session,
+        debug_full_text: Some(full_text.clone()),
+        debug_phase1_marker,
+        debug_phase2_fired: phase2_fired,
     })
 }
 
@@ -500,8 +560,10 @@ fn parse_fenced_tool_calls(text: &str) -> Vec<(usize, String, String)> {
 async fn build_context(
     model: &Model,
     input: &Input,
+    model_id: &str,
     full_tokens: &[u32],
     full_hash: u64,
+    boundaries: &[usize],
 ) -> Result<(Context, Option<SessionOut>)> {
     let Some(sid) = input.session_id.as_deref() else {
         // Stateless: behave exactly like openhands-completion. Leave the
@@ -512,44 +574,69 @@ async fn build_context(
         return Ok((ctx, None));
     };
 
-    let name = session_name(sid);
-    let prev_len = input.session_prev_len;
-    let prev_hash = input
-        .session_prev_hash
-        .as_deref()
-        .and_then(|h| u64::from_str_radix(h, 16).ok());
-
-    // Extension test at the token level (design doc §1): the previous
-    // prompt render must be a literal prefix of the new one.
-    let is_extension = prev_len > 0
-        && prev_len <= full_tokens.len()
-        && prev_hash.is_some()
-        && fnv1a64(&full_tokens[..prev_len]) == prev_hash.unwrap();
-
-    let mut opened: Option<Context> = None;
-    if is_extension {
+    // Content-addressed reuse, self-keyed from token content alone. Every call
+    // saves its *full* host-message render under `hash(full_tokens)`. Because
+    // OpenHands history is append-only, a previous turn's full render is a
+    // literal token-prefix of this render and re-appears here as one of
+    // `boundaries` (the safe render-unit split points). So we scan those
+    // boundaries longest-first, opening `hash(full[..L])`; the most recent
+    // saved boundary wins. Both save and lookup name a full host render — no
+    // predicted assistant reply — so the names match byte-for-byte and JSON
+    // re-serialization drift can never cause a miss.
+    //
+    // A candidate slice is by construction a literal prefix of `full_tokens`,
+    // so no strict-prefix recheck is needed: the `seq_len()` guard below only
+    // rejects a snapshot whose stored length disagrees (never a wrong suffix).
+    //
+    // This also subsumes the old fork protocol: delegation reuse happens for
+    // free when a sub-agent's prefix tokens equal a boundary the parent already
+    // saved (same tokens ⇒ same name ⇒ hit), with no `session_fork_*` hints.
+    //
+    // The scan is capped: the previous turn's boundary sits within the handful
+    // of messages appended since (assistant reply + tool/user results), so a
+    // small window always covers it; an older-than-window boundary just costs a
+    // clean rebuild.
+    const MAX_OPEN_ATTEMPTS: usize = 8;
+    let full_len = full_tokens.len();
+    let mut had_candidates = false;
+    let mut opened: Option<(Context, usize)> = None;
+    let mut attempts = 0;
+    for &len in boundaries.iter().rev() {
+        if len == 0 || len >= full_len {
+            continue;
+        }
+        had_candidates = true;
+        if attempts >= MAX_OPEN_ATTEMPTS {
+            break;
+        }
+        attempts += 1;
+        let name = prefix_cache::snapshot_name(sid, CACHE_COMPAT, model_id, &full_tokens[..len]);
         if let Ok(c) = Context::open(model, &name) {
-            // The snapshot must hold exactly the tokens the host thinks it
-            // does. A mismatch is not a fidelity violation, just a stale
-            // snapshot (e.g. a retried call whose previous attempt updated
-            // the snapshot but never delivered its response) — rebuild.
-            if c.seq_len() as usize == prev_len {
-                opened = Some(c);
+            // Opening shares the snapshot's committed KV pages by refcount;
+            // appending the suffix allocates fresh pages, so the immutable
+            // snapshot is never mutated by the live generation past here.
+            if c.seq_len() as usize == len {
+                opened = Some((c, len));
+                break;
             }
         }
-        // Open failure: snapshot lost (server restart) — rebuild.
+        // Open failure / length mismatch: snapshot lost or unsafe — try the
+        // next-shorter boundary, else fall through to a clean rebuild.
     }
 
     let (mut ctx, mode, prefill) = match opened {
-        Some(mut c) => {
-            let suffix = &full_tokens[prev_len..];
+        Some((mut c, len)) => {
+            let suffix = &full_tokens[len..];
             c.append(suffix);
             (c, "extended", suffix.len())
         }
         None => {
             let mut c = Context::new(model)?;
             c.append(full_tokens);
-            let mode = if prev_len == 0 { "fresh" } else { "rebuilt" };
+            // "fresh" when there was no interior boundary to reuse (first turn /
+            // single render unit); "rebuilt" when candidates existed but all
+            // missed (snapshot lost, or the condenser rewrote history).
+            let mode = if had_candidates { "rebuilt" } else { "fresh" };
             (c, mode, full_tokens.len())
         }
     };
@@ -566,12 +653,13 @@ async fn build_context(
         ));
     }
 
-    // Refresh the snapshot: the saved context must always equal this
-    // call's canonical prompt render. Committed pages are content-hashed
-    // and shared by refcount, so the live context generating past this
-    // point cannot mutate the snapshot.
-    let _ = Context::delete(model, &name);
-    ctx.save(&name)?;
+    // Save this call's full render under its own content-addressed name so a
+    // later turn whose reusable prefix equals this render hits it. An identical
+    // name means identical KV is already saved (benign) — ignore the save
+    // error rather than delete+resave, so distinct boundaries coexist (that is
+    // what makes retry / branch / truncate re-hit their earlier boundary).
+    let full_name = prefix_cache::snapshot_name(sid, CACHE_COMPAT, model_id, full_tokens);
+    let _ = ctx.save(&full_name);
 
     let session = SessionOut {
         id: sid.to_string(),
@@ -644,12 +732,21 @@ fn sanitize_messages(messages: &mut [Message], model: &Model) {
     }
 }
 
+/// Renders the full token stream and, alongside it, the token length at each
+/// safe render-unit boundary (after the system+tools block, after each
+/// user/assistant/system message, and after each merged tool batch). These
+/// boundaries are exactly the points at which a prior turn's full render could
+/// end, so `build_context` names KV-snapshot lookup candidates by slicing
+/// `full[..len]` at them — no per-candidate re-render, and every slice is a
+/// literal prefix of the full render. The final boundary equals the full
+/// length; the reuse search skips it.
 fn render_prompt(
     model: &Model,
     messages: &[Message],
     tool_schemas: &[String],
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, Vec<usize>)> {
     let mut out: Vec<u32> = Vec::new();
+    let mut boundaries: Vec<usize> = Vec::new();
     let mut equipped = false;
     let mut i = 0;
 
@@ -663,11 +760,15 @@ fn render_prompt(
         out.extend(tools::equip_after_system_prefix(model, content, tool_schemas)?);
         equipped = true;
         i = 1;
+        boundaries.push(out.len());
     }
 
     while i < messages.len() {
         let msg = &messages[i];
 
+        // `equip_prefix` glues the tool schemas onto the *following* message's
+        // turn — no boundary is recorded between them, so a split never falls
+        // mid-turn.
         if !equipped && !tool_schemas.is_empty() && msg.role != "system" {
             out.extend(tools::equip_prefix(model, tool_schemas)?);
             equipped = true;
@@ -714,13 +815,14 @@ fn render_prompt(
             }
             other => return Err(format!("unsupported message role: {other}")),
         }
+        boundaries.push(out.len());
     }
 
     if !equipped && !tool_schemas.is_empty() {
         out.extend(tools::equip_prefix(model, tool_schemas)?);
     }
 
-    Ok(out)
+    Ok((out, boundaries))
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
