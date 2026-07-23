@@ -9,6 +9,10 @@ description = "OpenHands ↔ Pie integration (PieLLM, PieConversation, supportin
 requires-python = ">=3.12"
 dependencies = [
   "openhands-sdk==1.21.1",
+  # `pie_openhands.llm` imports PieClient directly, so this is a hard runtime
+  # dependency, not an optional extra. Published on PyPI; installing the
+  # Pie repo's `client/python` in editable mode also satisfies it.
+  "pie-client>=0.3",
   "pydantic>=2.7",
   "transformers>=4.46",
   "datasets>=2.20",

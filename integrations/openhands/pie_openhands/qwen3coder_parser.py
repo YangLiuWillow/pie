@@ -22,13 +22,19 @@
 # Returns a list of ``{"name": str, "arguments": <json-string>}`` — the shape
 # the inferlet already produces and that ``PieLLM._wrap_as_model_response``
 # consumes.
+#
+# One deliberate deviation: vLLM imports the third-party ``regex`` module,
+# this port uses the standard library's ``re``. None of the patterns below
+# use a ``regex``-only feature, and the full parser test suite passes either
+# way, so the dependency buys nothing here — and it was never declared in
+# our pyproject (it arrived transitively via ``transformers``). Do not
+# "restore" it to match vLLM without a failing test to justify it.
 from __future__ import annotations
 
 import ast
 import json
+import re
 from typing import Any
-
-import regex as re
 
 # Regex patterns — copied verbatim from the vLLM parser.
 _TOOL_CALL_REGEX = re.compile(

@@ -226,32 +226,32 @@ def _make_parent_with_live_session(*, length=100, hash_="abc123", **overrides):
     return llm
 
 
-def test_model_copy_of_live_session_points_child_at_parent_fork_source():
+def test_model_copy_gives_the_child_its_own_session_identity():
+    """The one invariant `model_copy` has to hold: a delegated child must not
+    inherit the parent's session id, or the two conversations would interleave
+    inside one cache namespace. Nothing else needs passing down — the child's
+    shared task prefix hashes to a name the parent already saved, so reuse is
+    found by content, not handed over."""
     parent = _make_parent_with_live_session(length=100, hash_="abc123")
     parent_sid = parent._pie_session_id
 
     child = parent.model_copy()
 
-    # Child forks from the parent...
-    assert child._pie_fork_from == parent_sid
-    assert child._pie_fork_prev_len == 100
-    assert child._pie_fork_prev_hash == "abc123"
-    # ...and does NOT inherit the parent's own session identity.
+    # Child does NOT inherit the parent's session identity.
     assert child._pie_session_id is None
     assert child._pie_session_len == 0
     assert child._pie_session_hash is None
-    # Parent is untouched — its snapshot must survive the fork.
+    # Parent is untouched — its snapshot must survive the copy.
     assert parent._pie_session_id == parent_sid
     assert parent._pie_session_len == 100
-    assert parent._pie_fork_from is None
 
 
 def test_child_first_call_uses_a_fresh_id_and_sends_no_fork_fields():
     """Delegation no longer needs an explicit fork handshake. The child gets its
     own namespace, and reuse of the parent's prefix happens implicitly: the
     child's leading tokens equal a boundary the parent already saved, so the
-    content-addressed lookup hits it. `_pie_fork_from` survives only to stop the
-    child inheriting — and then extending — the parent's own session id."""
+    content-addressed lookup hits it. All `model_copy` has to do is clear the
+    inherited session id."""
     parent = _make_parent_with_live_session(length=100, hash_="abc123", pie_kv_verify=True)
     parent_sid = parent._pie_session_id
     child = parent.model_copy()
@@ -286,29 +286,29 @@ def test_child_keeps_one_id_across_its_own_turns():
     assert "session_prev_len" not in second
 
 
-def test_double_copy_preserves_fork_source():
-    """The SDK copies twice (parent→child, then a stream-flip copy). The second
-    copy's source is the child, which has no live session of its own, so the
-    fork source it already carries must survive."""
+def test_double_copy_still_leaves_the_child_without_a_session():
+    """The SDK copies twice (parent→child, then a stream-flip copy). Clearing an
+    already-cleared id is a no-op, so the grandchild is in the same clean state
+    as the child and neither can touch the parent's namespace."""
     parent = _make_parent_with_live_session(length=100, hash_="abc123")
     parent_sid = parent._pie_session_id
 
     child = parent.model_copy()
     grandchild = child.model_copy()  # simulates manager.py's stream-flip copy
 
-    assert grandchild._pie_fork_from == parent_sid
-    assert grandchild._pie_fork_prev_len == 100
-    assert grandchild._pie_fork_prev_hash == "abc123"
     assert grandchild._pie_session_id is None
+    assert grandchild._pie_session_len == 0
+    assert grandchild._pie_session_hash is None
+    assert parent._pie_session_id == parent_sid  # parent survives both copies
 
 
-def test_model_copy_without_live_session_sets_no_fork():
+def test_model_copy_without_live_session_is_harmless():
     parent = _make_llm(pie_session=True)  # never called → no snapshot
     child = parent.model_copy()
-    assert child._pie_fork_from is None
+    assert child._pie_session_id is None
 
     calls = _patch_call_pie_scripted(
-        child, [_session_response(mode="fresh", length=50, hash_="zz", prefill=50)]
+        child, [_session_response(mode="rebuilt", length=50, hash_="zz", prefill=50)]
     )
     child._transport_call(messages=[{"role": "user", "content": "x"}])
     assert "session_fork_from" not in calls[0]["gen_params"]

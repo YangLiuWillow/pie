@@ -102,22 +102,15 @@ class PieLLM(LLM):
                     "post-generation and host-side.",
     )
 
-    # Session bookkeeping — the inferlet is stateless between invocations, so
-    # the host carries the previous prompt render's (length, hash) and echoes
-    # it back; the inferlet uses it for the token-level extension check.
+    # Session bookkeeping. `session_id` is the only thing that goes on the
+    # wire: the inferlet's prefix cache self-keys from the token content it
+    # renders, so the host never tells it where the previous turn ended. The
+    # length/hash below are what the inferlet *reported* back, kept for
+    # telemetry (`pie_session_summary`) and debugging only.
     _pie_session_id: str | None = PrivateAttr(default=None)
     _pie_session_len: int = PrivateAttr(default=0)
     _pie_session_hash: str | None = PrivateAttr(default=None)
     _pie_session_stats: list[dict[str, Any]] = PrivateAttr(default_factory=list)
-
-    # Fork source (delegation KV reuse): when this LLM was derived from a
-    # parent conversation's LLM (see `model_copy`), these carry the parent
-    # session's identity so the child's first call forks the parent's prompt
-    # KV instead of rebuilding from scratch. Cleared implicitly once the child
-    # establishes its own snapshot (`_pie_session_len > 0`).
-    _pie_fork_from: str | None = PrivateAttr(default=None)
-    _pie_fork_prev_len: int = PrivateAttr(default=0)
-    _pie_fork_prev_hash: str | None = PrivateAttr(default=None)
 
     # `_wrap_as_model_response` now populates real `tool_calls` from the
     # inferlet's structured output (see `assistant_with_tool_calls`/
@@ -209,31 +202,30 @@ class PieLLM(LLM):
         return fields
 
     def model_copy(self, *, update: Any = None, deep: bool = False) -> "PieLLM":
-        """Propagate session identity across SDK-level copies (delegation).
+        """Give a delegated sub-agent's LLM its own session identity.
 
         The SDK builds a delegated sub-agent's LLM by ``model_copy``-ing the
         parent's (see ``openhands.tools.task.manager``). Pydantic copies our
-        private session attrs verbatim, so without intervention the child would
-        inherit the parent's ``_pie_session_id`` and *extend* — and thereby
-        overwrite — the parent's KV snapshot. Instead we hand the child a clean
-        session and point it at the parent as a fork source: its first call
-        reuses the parent's prompt KV (the coder-session inferlet's fork
-        branch) while the parent snapshot stays intact.
+        private attrs verbatim, so without intervention the child would inherit
+        the parent's ``_pie_session_id``, extend the parent's cache namespace,
+        and interleave two conversations in one. Clearing the id hands the
+        child a namespace of its own.
+
+        The child still reuses the parent's KV — it just needs no help doing
+        so. Its first render shares the task prefix, and identical tokens hash
+        to the name the parent already saved, so the content-addressed lookup
+        hits it. That is why there is no fork handshake here: an earlier
+        version passed the parent's id and render length along, and self-keyed
+        caching made every one of those hints redundant.
 
         Idempotent across the SDK's double copy (parent→child, then a second
-        copy that flips ``stream``): the second copy's source is the child,
-        whose ``_pie_session_id`` is already ``None``, so we preserve the
-        fork source it already carries rather than clobbering it.
+        copy that flips ``stream``), since clearing an already-cleared id is a
+        no-op.
         """
         child = super().model_copy(update=update, deep=deep)
         # Shallow copy aliases the parent's telemetry list — give a fresh one.
         child._pie_session_stats = []
-        if self._pie_session_id is not None:
-            # Copy of a parent that has a live session → fork from it.
-            child._pie_fork_from = self._pie_session_id
-            child._pie_fork_prev_len = self._pie_session_len
-            child._pie_fork_prev_hash = self._pie_session_hash
-        # Either way, the child must not share the parent's session identity.
+        # The child must not share the parent's session identity.
         child._pie_session_id = None
         child._pie_session_len = 0
         child._pie_session_hash = None
