@@ -37,6 +37,38 @@ struct Input {
     max_observation_chars: usize,
     #[serde(default = "default_max_empty_finishes")]
     max_empty_finishes: u32,
+    /// Test-time scaling: number of candidate branches to fork (default 1 =
+    /// single trajectory, fully backward-compatible).
+    #[serde(default = "default_num_branches")]
+    num_branches: usize,
+    /// Fork before generating step `branch_at_step + 1`. All branches share
+    /// the identical prefix (steps 1..=branch_at_step) and diverge from there.
+    /// 0 = fork at the very start (only system+task shared). Only used when
+    /// num_branches > 1.
+    #[serde(default)]
+    branch_at_step: u32,
+    /// Sampling temperature. 0 = greedy (Argmax). Branches only diverge with
+    /// temperature > 0 (forked greedy contexts generate identically).
+    #[serde(default)]
+    temperature: f32,
+    #[serde(default = "default_top_p")]
+    top_p: f32,
+    /// Context condensation strategy: "rebuild" (default — summarize dropped
+    /// turns + re-prefill a fresh context) or "mask" (drop stale middle turns
+    /// by masking their KV out of attention — 0 re-prefill, the B2-mask win).
+    #[serde(default = "default_condense_mode")]
+    condense_mode: String,
+    /// mask mode: number of most-recent turns to keep attended (older middle
+    /// turns are masked).
+    #[serde(default = "default_condense_keep_recent")]
+    condense_keep_recent: u32,
+    /// Capture mode: when true (single-trajectory only), emit the full recorded
+    /// trajectory (per-turn assistant JSON + observation strings + turn_starts)
+    /// in the output so it can be REPLAYED offline through both condensers over
+    /// the identical token stream — removing the layer-B nondeterminism confound
+    /// that made the live A/B (job 19059956) run two different trajectories.
+    #[serde(default)]
+    dump_trajectory: bool,
 }
 
 fn default_max_steps() -> u32 { 50 }
@@ -44,6 +76,10 @@ fn default_max_tokens() -> usize { 16384 }
 fn default_context_limit() -> u32 { 28000 }
 fn default_obs_limit() -> usize { 8000 }
 fn default_max_empty_finishes() -> u32 { 3 }
+fn default_num_branches() -> usize { 1 }
+fn default_top_p() -> f32 { 1.0 }
+fn default_condense_mode() -> String { "rebuild".to_string() }
+fn default_condense_keep_recent() -> u32 { 12 }
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const DEGENERATE_THRESHOLD: f64 = 0.4;
@@ -210,9 +246,10 @@ struct ToolRequest<'a> {
     insert_line: i64,
     start_line: i64,
     end_line: i64,
+    workspace_id: &'a str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct StepMetrics {
     step: u32,
     action: String,
@@ -224,11 +261,13 @@ struct StepMetrics {
 }
 
 /// A recorded turn for context condensation replay.
+#[derive(Clone)]
 struct Turn {
     assistant_json: String,
     observation: String,
 }
 
+#[derive(Clone)]
 struct RecentAction {
     action: String,
     command: String,
@@ -355,6 +394,7 @@ fn truncate_observation(obs: &str, max_chars: usize) -> String {
 
 async fn call_tool_server(
     tool_server_url: &str,
+    workspace_id: &str,
     action: &str,
     command: &str,
     path: &str,
@@ -364,7 +404,7 @@ async fn call_tool_server(
     start_line: i64,
     end_line: i64,
 ) -> std::result::Result<String, String> {
-    let payload = ToolRequest { action, command, path, old_str, new_str, insert_line, start_line, end_line };
+    let payload = ToolRequest { action, command, path, old_str, new_str, insert_line, start_line, end_line, workspace_id };
     let body = serde_json::to_vec(&payload).map_err(|e| format!("serialize: {e}"))?;
     let uri = format!("{}/execute", tool_server_url);
 
@@ -396,7 +436,7 @@ async fn call_tool_server(
         .to_string())
 }
 
-async fn check_has_diff(tool_server_url: &str) -> bool {
+async fn check_has_diff(tool_server_url: &str, workspace_id: &str) -> bool {
     let payload = ToolRequest {
         action: "has_diff",
         command: "",
@@ -406,6 +446,7 @@ async fn check_has_diff(tool_server_url: &str) -> bool {
         insert_line: 0,
         start_line: 0,
         end_line: 0,
+        workspace_id,
     };
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => b,
@@ -587,49 +628,190 @@ async fn condense_context(
     Ok(Some(ctx))
 }
 
-#[inferlet::main]
-async fn main(input: Input) -> Result<String> {
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+/// Immutable per-run configuration shared by all branches.
+struct BranchCfg<'a> {
+    model: &'a Model,
+    task: &'a str,
+    tool_server_url: &'a str,
+    max_steps: u32,
+    max_tokens_per_step: usize,
+    context_token_limit: u32,
+    max_observation_chars: usize,
+    max_empty_finishes: u32,
+    temperature: f32,
+    top_p: f32,
+    condense_mode: CondenseMode,
+    condense_keep_recent: u32,
+    dump_trajectory: bool,
+}
 
-    let mut ctx = Context::new(&model)?;
-    ctx.system(SYSTEM_PROMPT);
-    ctx.user(&input.task);
-    ctx.cue();
+#[derive(Clone, Copy, PartialEq)]
+enum CondenseMode { Rebuild, Mask }
 
-    let run_start = Instant::now();
+/// Mutable loop state carried across a suspend/resume (fork) boundary and
+/// cloned once per branch at the fork point.
+#[derive(Default, Clone)]
+struct LoopState {
+    consecutive_failures: u32,
+    empty_finishes: u32,
+    history: Vec<Turn>,
+    recent_actions: Vec<RecentAction>,
+    ran_tests_after_edit: bool,
+    test_nudged: bool,
+    condense_cooldown: u32,
+    step_metrics: Vec<StepMetrics>,
+    total_prompt_tokens: u32,
+    total_completion_tokens: u32,
+    /// mask-mode: KV start position of each recorded history turn (parallel to
+    /// `history`). Used to compute the drop-middle mask range.
+    turn_starts: Vec<u32>,
+}
+
+/// Effective (attended) context length = resident seq_len minus masked tokens.
+fn effective_len(ctx: &Context) -> u32 {
+    let masked: u32 = ctx.masked_ranges().iter().map(|(s, e)| e - s).sum();
+    (ctx.seq_len() + ctx.buffer().len() as u32).saturating_sub(masked)
+}
+
+/// mask-mode condensation: keep the fixed prefix (system+task) + the last
+/// `keep_recent` turns attended; mask the middle turns' KV out of attention.
+/// No rebuild, no re-prefill. Returns true if a new range was masked.
+fn mask_condense(ctx: &mut Context, turn_starts: &[u32], keep_recent: u32) -> bool {
+    let n = turn_starts.len();
+    let keep = keep_recent as usize;
+    if n <= keep || turn_starts.is_empty() {
+        return false;
+    }
+    let prefix_end = turn_starts[0]; // start of the first turn = end of system+task
+    let kept_start = turn_starts[n - keep]; // start of the first kept recent turn
+    if kept_start <= prefix_end {
+        return false;
+    }
+    ctx.mask_range(prefix_end, kept_start);
+    println!(
+        "[condense-mask] masked KV [{prefix_end}, {kept_start}) ({} turns dropped, {keep} kept)",
+        n - keep,
+    );
+    true
+}
+
+#[derive(Serialize)]
+struct BranchResult {
+    workspace_id: String,
+    finished: bool,
+    message: String,
+    steps: usize,
+    total_wall_s: f64,
+    total_generate_s: f64,
+    total_tool_s: f64,
+    total_prompt_tokens: u32,
+    total_completion_tokens: u32,
+    #[serde(rename = "per_step")]
+    step_metrics: Vec<StepMetrics>,
+    /// Captured trajectory for offline replay (only populated when
+    /// `dump_trajectory`); empty otherwise so the normal output shape is
+    /// unchanged.
+    #[serde(skip_serializing, default)]
+    history: Vec<TurnDump>,
+    #[serde(skip_serializing, default)]
+    turn_starts: Vec<u32>,
+}
+
+#[derive(Serialize, Default)]
+struct TurnDump {
+    assistant: String,
+    observation: String,
+}
+
+enum BranchOutcome {
+    Finished(BranchResult),
+    /// Trunk hit the branch point: hand back the live context + state so the
+    /// caller can fork K ways and resume each from `next_step`.
+    Suspended { ctx: Context, state: LoopState, next_step: u32 },
+}
+
+fn make_sampler(temperature: f32, top_p: f32) -> Sampler {
+    if temperature > 0.0 {
+        Sampler::TopP { temperature, p: top_p }
+    } else {
+        Sampler::Argmax
+    }
+}
+
+/// Snapshot the `from_id` workspace into a fresh copy per `to_id`.
+async fn fork_workspace(
+    tool_server_url: &str,
+    from_id: &str,
+    to_ids: &[String],
+) -> std::result::Result<(), String> {
+    let payload = serde_json::json!({
+        "action": "fork_workspace",
+        "from_id": from_id,
+        "to_ids": to_ids,
+    });
+    let body = serde_json::to_vec(&payload).map_err(|e| format!("serialize: {e}"))?;
+    let uri = format!("{}/execute", tool_server_url);
+    let request = Request::post(&uri)
+        .header("Content-Type", "application/json")
+        .body(body.into_body())
+        .map_err(|e| format!("build request: {e}"))?;
+    let response = Client::new().send(request).await.map_err(|e| format!("send: {e}"))?;
+    let mut resp_body = response.into_body();
+    let mut buf = Vec::new();
+    use inferlet::wstd::io::AsyncRead;
+    resp_body.read_to_end(&mut buf).await.map_err(|e| format!("read: {e}"))?;
+    let resp: Value = serde_json::from_slice(&buf).map_err(|e| format!("parse: {e}"))?;
+    if resp.get("exit_code").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        return Err(resp.get("observation").and_then(Value::as_str).unwrap_or("fork failed").to_string());
+    }
+    Ok(())
+}
+
+/// Run one agent trajectory from `start_step` on the given `workspace_id`.
+/// If `branch_at_step > 0`, suspend (return the live ctx + state) right before
+/// generating step `branch_at_step + 1`, so the caller can fork.
+async fn run_branch(
+    cfg: &BranchCfg<'_>,
+    mut ctx: Context,
+    workspace_id: &str,
+    mut state: LoopState,
+    start_step: u32,
+    branch_at_step: u32,
+) -> Result<BranchOutcome> {
+    let branch_start = Instant::now();
     let mut final_message: Option<String> = None;
-    let mut consecutive_failures: u32 = 0;
-    let mut empty_finishes: u32 = 0;
-    let mut history: Vec<Turn> = Vec::new();
-    let mut recent_actions: Vec<RecentAction> = Vec::new();
-    let mut ran_tests_after_edit = false;
-    let mut test_nudged = false;
-    let mut condense_cooldown: u32 = 0;
-    let mut step_metrics: Vec<StepMetrics> = Vec::new();
-    let mut total_prompt_tokens: u32 = 0;
-    let mut total_completion_tokens: u32 = 0;
 
-    for step in 1..=input.max_steps {
-        // Check if we need to condense before generating.
-        if condense_cooldown > 0 {
-            condense_cooldown -= 1;
+    for step in start_step..=cfg.max_steps {
+        // Fork point: suspend before generating step (branch_at_step + 1).
+        if branch_at_step > 0 && step > branch_at_step {
+            return Ok(BranchOutcome::Suspended { ctx, state, next_step: step });
         }
-        let est_seq_len = ctx.seq_len() + ctx.buffer().len() as u32;
-        if condense_cooldown == 0
-            && est_seq_len + CONDENSE_HEADROOM > input.context_token_limit
-            && !history.is_empty()
+
+        // Check if we need to condense before generating. Effective length
+        // subtracts already-masked KV (mask mode), so a masked context doesn't
+        // re-trigger every step.
+        if state.condense_cooldown > 0 {
+            state.condense_cooldown -= 1;
+        }
+        let est_seq_len = effective_len(&ctx);
+        if state.condense_cooldown == 0
+            && est_seq_len + CONDENSE_HEADROOM > cfg.context_token_limit
+            && !state.history.is_empty()
         {
-            if let Some(new_ctx) = condense_context(&model, &input.task, &history, input.context_token_limit).await? {
-                ctx = new_ctx;
+            match cfg.condense_mode {
+                CondenseMode::Mask => {
+                    mask_condense(&mut ctx, &state.turn_starts, cfg.condense_keep_recent);
+                }
+                CondenseMode::Rebuild => {
+                    if let Some(new_ctx) = condense_context(cfg.model, cfg.task, &state.history, cfg.context_token_limit).await? {
+                        ctx = new_ctx;
+                    }
+                }
             }
-            condense_cooldown = CONDENSE_COOLDOWN;
+            state.condense_cooldown = CONDENSE_COOLDOWN;
         }
 
-        let schema = if step == input.max_steps {
+        let schema = if step == cfg.max_steps {
             FINISH_SCHEMA
         } else {
             ACTION_SCHEMA
@@ -638,8 +820,8 @@ async fn main(input: Input) -> Result<String> {
         let tokens_before = ctx.seq_len() + ctx.buffer().len() as u32;
         let gen_start = Instant::now();
         let raw = ctx
-            .generate(Sampler::Argmax)
-            .max_tokens(input.max_tokens_per_step)
+            .generate(make_sampler(cfg.temperature, cfg.top_p))
+            .max_tokens(cfg.max_tokens_per_step)
             .constrain_with(inferlet::JsonSchema(schema))?
             .collect_text()
             .await?;
@@ -647,16 +829,16 @@ async fn main(input: Input) -> Result<String> {
         let tokens_after = ctx.seq_len();
         let step_prompt = tokens_before;
         let step_completion = tokens_after.saturating_sub(tokens_before);
-        total_prompt_tokens += step_prompt;
-        total_completion_tokens += step_completion;
+        state.total_prompt_tokens += step_prompt;
+        state.total_completion_tokens += step_completion;
 
         let v = match serde_json::from_str::<Value>(&raw) {
             Ok(v) => v,
             Err(e) => {
-                consecutive_failures += 1;
-                println!("[step {step}] truncated at max_tokens ({e}), skipping (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})");
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[step {step}] too many consecutive failures, forcing finish");
+                state.consecutive_failures += 1;
+                println!("[{workspace_id}][step {step}] truncated at max_tokens ({e}), skipping (failure {}/{MAX_CONSECUTIVE_FAILURES})", state.consecutive_failures);
+                if state.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    println!("[{workspace_id}][step {step}] too many consecutive failures, forcing finish");
                     break;
                 }
                 ctx.user("Observation: Your response was truncated because it was too long. Be more concise — use smaller edits and shorter commands.");
@@ -678,39 +860,47 @@ async fn main(input: Input) -> Result<String> {
 
         // Detect degenerate output (garbled CJK/symbol soup).
         if is_degenerate(thought) {
-            consecutive_failures += 1;
-            println!("[step {step}] degenerate output detected (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})");
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                println!("[step {step}] too many degenerate outputs, forcing finish");
+            state.consecutive_failures += 1;
+            println!("[{workspace_id}][step {step}] degenerate output detected (failure {}/{MAX_CONSECUTIVE_FAILURES})", state.consecutive_failures);
+            if state.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                println!("[{workspace_id}][step {step}] too many degenerate outputs, forcing finish");
                 break;
             }
             // Condense and retry — degeneration usually means context overflow.
-            if !history.is_empty() {
-                if let Some(new_ctx) = condense_context(&model, &input.task, &history, input.context_token_limit).await? {
-                    ctx = new_ctx;
+            if !state.history.is_empty() {
+                match cfg.condense_mode {
+                    CondenseMode::Mask => {
+                        mask_condense(&mut ctx, &state.turn_starts, cfg.condense_keep_recent);
+                    }
+                    CondenseMode::Rebuild => {
+                        if let Some(new_ctx) = condense_context(cfg.model, cfg.task, &state.history, cfg.context_token_limit).await? {
+                            ctx = new_ctx;
+                        }
+                    }
                 }
-                condense_cooldown = CONDENSE_COOLDOWN;
+                state.condense_cooldown = CONDENSE_COOLDOWN;
             }
             continue;
         }
 
-        consecutive_failures = 0;
-        println!("[step {step}] thought: {thought}");
-        println!("[step {step}] action: {action}");
+        state.consecutive_failures = 0;
+        println!("[{workspace_id}][step {step}] thought: {thought}");
+        println!("[{workspace_id}][step {step}] action: {action}");
 
         if action == "finish" {
-            println!("[step {step}] message: {message}");
+            println!("[{workspace_id}][step {step}] message: {message}");
             let _idle = ctx.idle();
-            let has_diff = check_has_diff(&input.tool_server_url).await;
+            let has_diff = check_has_diff(cfg.tool_server_url, workspace_id).await;
             drop(_idle);
-            if !has_diff && empty_finishes < input.max_empty_finishes {
-                empty_finishes += 1;
-                println!("[step {step}] finish with no diff (attempt {empty_finishes}/{}), nudging", input.max_empty_finishes);
-                history.push(Turn {
+            if !has_diff && state.empty_finishes < cfg.max_empty_finishes {
+                state.empty_finishes += 1;
+                println!("[{workspace_id}][step {step}] finish with no diff (attempt {}/{}), nudging", state.empty_finishes, cfg.max_empty_finishes);
+                state.history.push(Turn {
                     assistant_json: raw.clone(),
                     observation: String::new(),
                 });
-                step_metrics.push(StepMetrics {
+                state.turn_starts.push(tokens_before);
+                state.step_metrics.push(StepMetrics {
                     step, action: action.to_string(), generate_s: gen_elapsed.as_secs_f64(),
                     tool_s: 0.0, prompt_tokens: step_prompt, completion_tokens: step_completion,
                     seq_len_after: tokens_after,
@@ -726,14 +916,15 @@ async fn main(input: Input) -> Result<String> {
                 ctx.cue();
                 continue;
             }
-            if has_diff && !ran_tests_after_edit && !test_nudged {
-                test_nudged = true;
-                println!("[step {step}] finish without running tests, nudging");
-                history.push(Turn {
+            if has_diff && !state.ran_tests_after_edit && !state.test_nudged {
+                state.test_nudged = true;
+                println!("[{workspace_id}][step {step}] finish without running tests, nudging");
+                state.history.push(Turn {
                     assistant_json: raw.clone(),
                     observation: String::new(),
                 });
-                step_metrics.push(StepMetrics {
+                state.turn_starts.push(tokens_before);
+                state.step_metrics.push(StepMetrics {
                     step, action: action.to_string(), generate_s: gen_elapsed.as_secs_f64(),
                     tool_s: 0.0, prompt_tokens: step_prompt, completion_tokens: step_completion,
                     seq_len_after: tokens_after,
@@ -750,7 +941,7 @@ async fn main(input: Input) -> Result<String> {
                 ctx.cue();
                 continue;
             }
-            step_metrics.push(StepMetrics {
+            state.step_metrics.push(StepMetrics {
                 step, action: action.to_string(), generate_s: gen_elapsed.as_secs_f64(),
                 tool_s: 0.0, prompt_tokens: step_prompt, completion_tokens: step_completion,
                 seq_len_after: tokens_after,
@@ -762,7 +953,8 @@ async fn main(input: Input) -> Result<String> {
         let _idle = ctx.idle();
         let tool_start = Instant::now();
         let observation = match call_tool_server(
-            &input.tool_server_url,
+            cfg.tool_server_url,
+            workspace_id,
             action,
             command,
             path,
@@ -781,26 +973,26 @@ async fn main(input: Input) -> Result<String> {
         drop(_idle);
 
         let failed = observation.contains("Error:") || observation.contains("not found");
-        recent_actions.push(RecentAction {
+        state.recent_actions.push(RecentAction {
             action: action.to_string(),
             command: command.to_string(),
             path: path.to_string(),
             failed,
         });
-        if recent_actions.len() > STUCK_WINDOW + 2 {
-            recent_actions.remove(0);
+        if state.recent_actions.len() > STUCK_WINDOW + 2 {
+            state.recent_actions.remove(0);
         }
 
         // Track whether the agent verified its fix with tests.
         if (action == "edit" || action == "insert") && !failed {
-            ran_tests_after_edit = false;
+            state.ran_tests_after_edit = false;
         }
         if action == "bash" && (command.contains("pytest") || command.contains("unittest")) {
-            ran_tests_after_edit = true;
+            state.ran_tests_after_edit = true;
         }
 
-        let observation = truncate_observation(&observation, input.max_observation_chars);
-        println!("[step {step}] observation ({} chars)", observation.len());
+        let observation = truncate_observation(&observation, cfg.max_observation_chars);
+        println!("[{workspace_id}][step {step}] observation ({} chars)", observation.len());
 
         let mut obs_with_hint = if observation.contains("old_str not found") {
             format!(
@@ -817,12 +1009,12 @@ async fn main(input: Input) -> Result<String> {
             observation.clone()
         };
 
-        if let Some(stuck_hint) = detect_stuck(&recent_actions) {
-            println!("[step {step}] stuck detected");
+        if let Some(stuck_hint) = detect_stuck(&state.recent_actions) {
+            println!("[{workspace_id}][step {step}] stuck detected");
             obs_with_hint = format!("{obs_with_hint}\n\n{stuck_hint}");
         }
 
-        step_metrics.push(StepMetrics {
+        state.step_metrics.push(StepMetrics {
             step,
             action: action.to_string(),
             generate_s: gen_elapsed.as_secs_f64(),
@@ -832,36 +1024,178 @@ async fn main(input: Input) -> Result<String> {
             seq_len_after: tokens_after,
         });
 
-        history.push(Turn {
+        state.history.push(Turn {
             assistant_json: raw.clone(),
             observation: observation.clone(),
         });
+        state.turn_starts.push(tokens_before);
 
         ctx.user(&format!("Observation:\n{obs_with_hint}"));
         ctx.cue();
     }
 
     match &final_message {
-        Some(m) => println!("\nAgent finished: {m}"),
-        None => println!("\nAgent did not finish within {max} steps", max = input.max_steps),
+        Some(m) => println!("[{workspace_id}] finished: {m}"),
+        None => println!("[{workspace_id}] did not finish within {} steps", cfg.max_steps),
     }
 
-    let total_generate_s: f64 = step_metrics.iter().map(|m| m.generate_s).sum();
-    let total_tool_s: f64 = step_metrics.iter().map(|m| m.tool_s).sum();
+    let total_generate_s: f64 = state.step_metrics.iter().map(|m| m.generate_s).sum();
+    let total_tool_s: f64 = state.step_metrics.iter().map(|m| m.tool_s).sum();
+
+    let (history, turn_starts) = if cfg.dump_trajectory {
+        let dump = state
+            .history
+            .iter()
+            .map(|t| TurnDump {
+                assistant: t.assistant_json.clone(),
+                observation: t.observation.clone(),
+            })
+            .collect();
+        (dump, state.turn_starts.clone())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok(BranchOutcome::Finished(BranchResult {
+        workspace_id: workspace_id.to_string(),
+        finished: final_message.is_some(),
+        message: final_message.unwrap_or_default(),
+        steps: state.history.len(),
+        total_wall_s: branch_start.elapsed().as_secs_f64(),
+        total_generate_s,
+        total_tool_s,
+        total_prompt_tokens: state.total_prompt_tokens,
+        total_completion_tokens: state.total_completion_tokens,
+        step_metrics: state.step_metrics,
+        history,
+        turn_starts,
+    }))
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    let model_name = runtime::models()
+        .first()
+        .cloned()
+        .ok_or("No models available")?;
+    let model = Model::load(&model_name)?;
+
+    let cfg = BranchCfg {
+        model: &model,
+        task: &input.task,
+        tool_server_url: &input.tool_server_url,
+        max_steps: input.max_steps,
+        max_tokens_per_step: input.max_tokens_per_step,
+        context_token_limit: input.context_token_limit,
+        max_observation_chars: input.max_observation_chars,
+        max_empty_finishes: input.max_empty_finishes,
+        temperature: input.temperature,
+        top_p: input.top_p,
+        condense_mode: if input.condense_mode == "mask" {
+            CondenseMode::Mask
+        } else {
+            CondenseMode::Rebuild
+        },
+        condense_keep_recent: input.condense_keep_recent,
+        dump_trajectory: input.dump_trajectory,
+    };
+
+    let mut ctx = Context::new(&model)?;
+    ctx.system(SYSTEM_PROMPT);
+    ctx.user(&input.task);
+    ctx.cue();
+
+    let run_start = Instant::now();
+    let num_branches = input.num_branches.max(1);
+
+    // ── Single-trajectory (backward-compatible) path ──────────────────────
+    if num_branches == 1 {
+        let r = match run_branch(&cfg, ctx, "0", LoopState::default(), 1, 0).await? {
+            BranchOutcome::Finished(r) => r,
+            BranchOutcome::Suspended { .. } => unreachable!("branch_at_step=0 never suspends"),
+        };
+        let mut result = serde_json::json!({
+            "finished": r.finished,
+            "message": r.message,
+            "steps": r.steps,
+            "metrics": {
+                "total_wall_s": run_start.elapsed().as_secs_f64(),
+                "total_generate_s": r.total_generate_s,
+                "total_tool_s": r.total_tool_s,
+                "total_prompt_tokens": r.total_prompt_tokens,
+                "total_completion_tokens": r.total_completion_tokens,
+                "num_generate_calls": r.step_metrics.len(),
+                "per_step": r.step_metrics,
+            },
+        });
+        if input.dump_trajectory {
+            result["trajectory"] = serde_json::json!({
+                "system": SYSTEM_PROMPT,
+                "task": input.task,
+                "turns": r.history,
+                "turn_starts": r.turn_starts,
+            });
+        }
+        return Ok(result.to_string());
+    }
+
+    // ── Multi-branch (test-time scaling) path ─────────────────────────────
+    // Run the trunk on workspace "0" up to the branch point.
+    let (base_ctx, base_state, next_step) =
+        match run_branch(&cfg, ctx, "0", LoopState::default(), 1, input.branch_at_step).await? {
+            BranchOutcome::Suspended { ctx, state, next_step } => (ctx, state, next_step),
+            BranchOutcome::Finished(r) => {
+                // Trunk finished before reaching the branch point — no fan-out.
+                let result = serde_json::json!({
+                    "branches": [serde_json::to_value(&r).unwrap_or(Value::Null)],
+                    "branch_step": input.branch_at_step,
+                    "num_branches": 1,
+                    "note": "trunk finished before branch point",
+                    "total_wall_s": run_start.elapsed().as_secs_f64(),
+                });
+                return Ok(result.to_string());
+            }
+        };
+
+    // Snapshot the trunk workspace into per-branch copies "1".."K-1".
+    let to_ids: Vec<String> = (1..num_branches).map(|i| i.to_string()).collect();
+    fork_workspace(cfg.tool_server_url, "0", &to_ids)
+        .await
+        .map_err(|e| format!("fork_workspace: {e}"))?;
+
+    // Fork the KV context K ways: index 0 = trunk (workspace "0"), 1.. = copies.
+    let mut forks: Vec<Context> = Vec::with_capacity(num_branches - 1);
+    for _ in 1..num_branches {
+        forks.push(base_ctx.fork()?);
+    }
+    let mut branch_ctxs: Vec<Context> = Vec::with_capacity(num_branches);
+    branch_ctxs.push(base_ctx);
+    branch_ctxs.extend(forks);
+
+    // Resume all branches concurrently from the branch point.
+    let futs = branch_ctxs.into_iter().enumerate().map(|(i, bctx)| {
+        let wid = i.to_string();
+        let st = base_state.clone();
+        let cfg = &cfg;
+        async move { run_branch(cfg, bctx, &wid, st, next_step, 0).await }
+    });
+    let outcomes = futures::future::join_all(futs).await;
+
+    let mut branch_vals: Vec<Value> = Vec::new();
+    let mut any_finished = false;
+    for oc in outcomes {
+        if let BranchOutcome::Finished(r) = oc? {
+            any_finished |= r.finished;
+            branch_vals.push(serde_json::to_value(&r).unwrap_or(Value::Null));
+        }
+    }
 
     let result = serde_json::json!({
-        "finished": final_message.is_some(),
-        "message": final_message.unwrap_or_default(),
-        "steps": history.len(),
-        "metrics": {
-            "total_wall_s": run_start.elapsed().as_secs_f64(),
-            "total_generate_s": total_generate_s,
-            "total_tool_s": total_tool_s,
-            "total_prompt_tokens": total_prompt_tokens,
-            "total_completion_tokens": total_completion_tokens,
-            "num_generate_calls": step_metrics.len(),
-            "per_step": step_metrics,
-        },
+        "branches": branch_vals,
+        "branch_step": input.branch_at_step,
+        "num_branches": num_branches,
+        "any_finished": any_finished,
+        "total_wall_s": run_start.elapsed().as_secs_f64(),
     });
     Ok(result.to_string())
 }
