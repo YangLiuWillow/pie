@@ -1,0 +1,418 @@
+<style>
+  :root{
+    --paper:#ffffff; --bg:#f1f4f7; --panel:#f7f9fb;
+    --ink:#1a1f26; --ink-soft:#47515e; --ink-faint:#727d8a;
+    --rule:#e3e7ec; --rule-strong:#cfd6dd;
+    --accent:#2f56c9; --accent-soft:#e9eef9; --accent-ink:#24449c;
+    --good:#1f8a54; --good-soft:#e6f4ec;
+    --bad:#c33b32;  --bad-soft:#fbeae7;
+    --diag:#b06f12; --diag-soft:#f9f0dd;
+    --neutral:#5f6b78; --neutral-soft:#eceff2;
+    --code-bg:#eef1f5; --code-ink:#25303c;
+    --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#161b22; --bg:#0e1218; --panel:#1b212a;
+      --ink:#e7ecf2; --ink-soft:#a7b3c0; --ink-faint:#7e8b98;
+      --rule:#262d37; --rule-strong:#343d49;
+      --accent:#84a0ff; --accent-soft:#1b2740; --accent-ink:#a9beff;
+      --good:#4fcb8c; --good-soft:#14301f;
+      --bad:#f2776d;  --bad-soft:#3a1d1b;
+      --diag:#e2ab4e; --diag-soft:#332810;
+      --neutral:#8b97a4; --neutral-soft:#222932;
+      --code-bg:#1b222c; --code-ink:#cdd7e2;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#161b22; --bg:#0e1218; --panel:#1b212a;
+    --ink:#e7ecf2; --ink-soft:#a7b3c0; --ink-faint:#7e8b98;
+    --rule:#262d37; --rule-strong:#343d49;
+    --accent:#84a0ff; --accent-soft:#1b2740; --accent-ink:#a9beff;
+    --good:#4fcb8c; --good-soft:#14301f;
+    --bad:#f2776d;  --bad-soft:#3a1d1b;
+    --diag:#e2ab4e; --diag-soft:#332810;
+    --neutral:#8b97a4; --neutral-soft:#222932;
+    --code-bg:#1b222c; --code-ink:#cdd7e2;
+  }
+  :root[data-theme="light"]{
+    --paper:#ffffff; --bg:#f1f4f7; --panel:#f7f9fb;
+    --ink:#1a1f26; --ink-soft:#47515e; --ink-faint:#727d8a;
+    --rule:#e3e7ec; --rule-strong:#cfd6dd;
+    --accent:#2f56c9; --accent-soft:#e9eef9; --accent-ink:#24449c;
+    --good:#1f8a54; --good-soft:#e6f4ec;
+    --bad:#c33b32;  --bad-soft:#fbeae7;
+    --diag:#b06f12; --diag-soft:#f9f0dd;
+    --neutral:#5f6b78; --neutral-soft:#eceff2;
+    --code-bg:#eef1f5; --code-ink:#25303c;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:60rem;margin:0 auto;padding:clamp(1.25rem,4vw,3.5rem) clamp(1rem,4vw,2rem) 5rem;}
+  .prose{max-width:44rem;}
+  p{margin:0 0 1rem;color:var(--ink-soft);}
+  strong{color:var(--ink);font-weight:650;}
+  a{color:var(--accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--accent) 35%,transparent);}
+  a:hover{border-bottom-color:var(--accent);}
+  code{font-family:var(--mono);font-size:.86em;background:var(--code-bg);color:var(--code-ink);
+    padding:.1em .38em;border-radius:4px;}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent-ink);font-weight:600;}
+
+  /* header */
+  header.masthead{border-bottom:1px solid var(--rule-strong);padding-bottom:1.6rem;margin-bottom:2.4rem;}
+  h1{font-size:clamp(1.9rem,4.4vw,2.85rem);line-height:1.08;margin:.5rem 0 .5rem;letter-spacing:-.02em;
+    text-wrap:balance;font-weight:720;color:var(--ink);}
+  .dek{font-size:1.05rem;color:var(--ink-soft);max-width:40rem;margin:.2rem 0 0;}
+  .meta{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);margin-top:1.1rem;
+    display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;}
+  .meta span{white-space:nowrap;}
+
+  /* thesis */
+  .thesis{background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--accent);
+    border-radius:10px;padding:1.3rem 1.4rem;margin:0 0 1.6rem;}
+  .thesis .lead{font-size:1.14rem;color:var(--ink);margin:0;line-height:1.5;}
+  .thesis .lead b{color:var(--accent-ink);}
+
+  /* stat tiles */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));gap:.7rem;margin:1.4rem 0 .4rem;}
+  .stat{background:var(--paper);border:1px solid var(--rule);border-radius:9px;padding:.85rem .95rem;}
+  .stat .n{font-family:var(--mono);font-size:1.42rem;font-weight:650;letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;line-height:1.1;}
+  .stat .k{font-size:.76rem;color:var(--ink-faint);margin-top:.3rem;line-height:1.3;}
+  .stat.bad .n{color:var(--bad);} .stat.good .n{color:var(--good);}
+  .stat.diag .n{color:var(--diag);} .stat.neu .n{color:var(--ink);}
+
+  /* sections */
+  section{margin-top:3rem;}
+  h2{font-size:1.5rem;letter-spacing:-.015em;margin:0 0 .3rem;font-weight:680;color:var(--ink);
+    display:flex;align-items:baseline;gap:.7rem;text-wrap:balance;}
+  h2 .sn{font-family:var(--mono);font-size:.9rem;color:var(--accent);font-weight:600;
+    border:1px solid var(--rule-strong);border-radius:6px;padding:.12rem .45rem;flex:none;}
+  h3{font-size:1.08rem;margin:2rem 0 .5rem;font-weight:640;color:var(--ink);letter-spacing:-.01em;}
+  .section-rule{height:1px;background:var(--rule);border:0;margin:0;}
+
+  /* tables */
+  .tbl{overflow-x:auto;margin:1rem 0 1.2rem;border:1px solid var(--rule);border-radius:10px;
+    background:var(--paper);}
+  table{border-collapse:collapse;width:100%;font-size:.9rem;}
+  th,td{text-align:left;padding:.62rem .8rem;border-bottom:1px solid var(--rule);vertical-align:top;}
+  thead th{font-family:var(--mono);font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--ink-faint);font-weight:600;background:var(--panel);position:sticky;top:0;white-space:nowrap;}
+  tbody tr:last-child td{border-bottom:0;}
+  td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;}
+  tbody tr:hover{background:color-mix(in srgb,var(--accent-soft) 55%,transparent);}
+  .win td{color:var(--good);} /* used sparingly */
+  caption{caption-side:top;text-align:left;font-size:.82rem;color:var(--ink-faint);padding:0 0 .55rem;}
+
+  /* verdict chips */
+  .chip{display:inline-flex;align-items:center;gap:.35rem;font-family:var(--mono);font-size:.7rem;
+    font-weight:600;letter-spacing:.04em;text-transform:uppercase;padding:.2rem .5rem;border-radius:999px;
+    white-space:nowrap;border:1px solid transparent;}
+  .chip::before{content:"";width:.5rem;height:.5rem;border-radius:50%;background:currentColor;opacity:.9;}
+  .chip.bad{color:var(--bad);background:var(--bad-soft);border-color:color-mix(in srgb,var(--bad) 25%,transparent);}
+  .chip.good{color:var(--good);background:var(--good-soft);border-color:color-mix(in srgb,var(--good) 25%,transparent);}
+  .chip.diag{color:var(--diag);background:var(--diag-soft);border-color:color-mix(in srgb,var(--diag) 25%,transparent);}
+  .chip.neu{color:var(--neutral);background:var(--neutral-soft);border-color:color-mix(in srgb,var(--neutral) 22%,transparent);}
+
+  .legend{display:flex;flex-wrap:wrap;gap:.5rem .9rem;margin:.2rem 0 1.4rem;font-size:.82rem;color:var(--ink-soft);}
+  .legend .li{display:inline-flex;align-items:center;gap:.45rem;}
+
+  /* experiment ledger cards */
+  .ledger{display:flex;flex-direction:column;gap:.85rem;margin-top:1.2rem;}
+  .card{background:var(--paper);border:1px solid var(--rule);border-radius:11px;padding:1.05rem 1.15rem;
+    border-left:3px solid var(--edge,var(--rule-strong));}
+  .card.bad{--edge:var(--bad);} .card.good{--edge:var(--good);}
+  .card.diag{--edge:var(--diag);} .card.neu{--edge:var(--neutral);}
+  .card .top{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;}
+  .card .id{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint);font-weight:600;
+    border:1px solid var(--rule-strong);border-radius:5px;padding:.08rem .4rem;}
+  .card .name{font-weight:650;color:var(--ink);font-size:1.02rem;letter-spacing:-.01em;flex:1 1 12rem;}
+  .card dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:.32rem .9rem;font-size:.92rem;}
+  .card dt{font-family:var(--mono);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--ink-faint);font-weight:600;padding-top:.18rem;white-space:nowrap;}
+  .card dd{margin:0;color:var(--ink-soft);}
+  .card dd.res{color:var(--ink);}
+  .card .jobs{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);}
+
+  /* code */
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:10px;overflow-x:auto;
+    padding:1rem 1.1rem;margin:1rem 0 1.3rem;}
+  pre code{background:none;padding:0;font-size:.82rem;color:var(--code-ink);line-height:1.55;}
+  .cmt{color:var(--ink-faint);} .kw{color:var(--accent);}
+
+  /* lists */
+  ul.clean{list-style:none;padding:0;margin:1rem 0;display:flex;flex-direction:column;gap:.7rem;}
+  ul.clean>li{position:relative;padding-left:1.4rem;color:var(--ink-soft);}
+  ul.clean>li::before{content:"";position:absolute;left:.15rem;top:.62em;width:.42rem;height:.42rem;
+    border-radius:1px;background:var(--accent);transform:rotate(45deg);}
+  ol.steps{margin:1rem 0;padding-left:0;list-style:none;counter-reset:s;display:flex;flex-direction:column;gap:.7rem;}
+  ol.steps>li{counter-increment:s;position:relative;padding-left:2.1rem;color:var(--ink-soft);}
+  ol.steps>li::before{content:counter(s);position:absolute;left:0;top:.05rem;font-family:var(--mono);
+    font-size:.76rem;font-weight:650;color:var(--accent);background:var(--accent-soft);
+    width:1.5rem;height:1.5rem;border-radius:6px;display:grid;place-items:center;}
+
+  .foot{margin-top:3.5rem;padding-top:1.4rem;border-top:1px solid var(--rule-strong);
+    font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important;}}
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">Tutorial · local coding agent</div>
+    <h1>Run a coding agent on your own GPU</h1>
+    <p class="dek">OpenHands + Pie, from an empty machine to the agent editing your own repository. No prior knowledge of either project assumed.</p>
+    <div class="meta">
+      <span>~60–90 min first time</span>
+      <span>NVIDIA GPU required</span>
+      <span>Smallest model · ~19 GB VRAM</span>
+      <span>Linux</span>
+    </div>
+  </header>
+
+  <div class="thesis" style="border-left-color:var(--diag);background:var(--diag-soft);">
+    <div class="eyebrow" style="color:var(--diag);margin-bottom:.5rem;">Read this first — is this the thing you want?</div>
+    <p style="margin-bottom:.9rem;"><b>If you only want to try an open-source coding agent, you do not need Pie at all.</b> Install OpenHands, point it at any model API, and you are done in five minutes. That is the shortest path and there is no shame in it.</p>
+    <p style="margin-bottom:0;">You want <em>this</em> setup when you want the model to run <b>on your own GPU</b> — no API keys, no per-token cost, nothing leaving your machine — and you want it to be fast. The "fast" part is what coder-session adds. Be honest with yourself about the cost: this is a research integration, not a packaged product. Expect <b>60–90 minutes</b> the first time, most of it compiling, and expect things to go wrong — §8 lists the ones we hit.</p>
+  </div>
+
+  <div class="prose"><p>Three separate pieces of software are involved, and it helps to keep them straight:</p></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Piece</th><th>What it is</th><th>Analogy</th></tr></thead>
+    <tbody>
+      <tr><td><strong>OpenHands</strong></td><td>The coding <em>agent</em>. Reads your issue, explores the repo, edits files, runs tests.</td><td>The developer</td></tr>
+      <tr><td><strong>Pie</strong></td><td>An <em>inference engine</em> — loads a model onto your GPU and generates tokens.</td><td>The brain</td></tr>
+      <tr><td><strong>coder-session</strong></td><td>A small WASM program running inside Pie that stops it re-reading the whole conversation every turn.</td><td>The brain's short-term memory</td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 1 -->
+  <section id="requirements">
+    <h2><span class="sn">1</span>What you need</h2>
+    <div class="prose"><p>A CUDA GPU, and the model has to fit in its memory <em>alongside</em> the KV cache:</p></div>
+    <div class="tbl"><table>
+      <thead><tr><th>Model</th><th class="num">Weights (bf16)</th><th class="num">KV cache</th><th class="num">Total</th><th>Realistic card</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen2.5-Coder-7B</td><td class="num">~14 GB</td><td class="num">~4 GB</td><td class="num"><strong>~19 GB</strong></td><td>RTX 3090 / 4090 (24 GB)</td></tr>
+        <tr><td>Qwen3-Coder-30B-A3B</td><td class="num">~60 GB</td><td class="num">~12.5 GB</td><td class="num"><strong>~73 GB</strong></td><td>A100 80 GB, RTX PRO 6000</td></tr>
+      </tbody>
+    </table></div>
+    <div class="prose">
+      <p><strong>Start with the 7B config.</strong> It is the one most people can actually run. The 30B is where the benchmark numbers come from, but it needs a data-centre card.</p>
+      <p>You also need <strong>CUDA toolkit 12.x</strong> (<code>nvcc --version</code>), <strong>CMake ≥ 3.31</strong>, <strong>Rust stable ≥ 1.87</strong> (<code>rustup toolchain install stable</code>), <strong>Python 3.12</strong>, and <strong>~80 GB of disk</strong> for weights and build artifacts.</p>
+    </div>
+    <div class="thesis" style="border-left-color:var(--good);background:var(--good-soft);padding:1rem 1.2rem;">
+      <p style="margin:0;"><b>No GPU?</b> You can still see the machinery work. Skip to §7 — a dummy driver runs the entire protocol on CPU and prints real cache statistics. It generates nonsense text, but it proves your setup is wired correctly, and it takes two minutes.</p>
+    </div>
+  </section>
+
+  <!-- 2 -->
+  <section id="build-pie">
+    <h2><span class="sn">2</span>Build Pie</h2>
+    <div class="prose"><p>Pie does not ship a binary; you compile it. The CUDA driver is <em>not</em> in the default build, so the feature flags matter.</p></div>
+<pre><code>git clone https://github.com/pie-project/pie      <span class="cmt"># or your fork</span>
+cd pie
+
+<span class="cmt"># Point the build at your CUDA toolchain.</span>
+export CUDACXX=$(which nvcc)
+<span class="cmt"># Your GPU's compute capability WITHOUT the dot:</span>
+<span class="cmt">#   80 = A100 · 86 = RTX 3090 · 89 = RTX 4090 · 90 = H100 · 120 = RTX PRO 6000</span>
+export CMAKE_CUDA_ARCHITECTURES=89
+
+cargo build -p pie-server --release --features driver-portable,driver-cuda</code></pre>
+    <div class="prose">
+      <p>This takes <strong>10–20 minutes</strong> — it fetches and compiles FlashInfer and CUTLASS through CMake. Setting <code>CMAKE_CUDA_ARCHITECTURES</code> wrong is the single most common failure: the build <em>succeeds</em> and the server dies at model load.</p>
+      <p>Verify the CUDA driver actually made it into the binary:</p>
+    </div>
+<pre><code>./target/release/pie driver list</code></pre>
+    <div class="prose"><p><code>cuda_native</code> must appear. If you only see <code>portable</code> and <code>dummy</code>, the feature flags did not take — rebuild. On a cluster with environment modules, load <code>CUDA</code>, <code>CMake</code> and <code>NCCL</code> first; <code>integrations/openhands/build_pie_cuda.sh</code> is a worked example.</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="build-inferlet">
+    <h2><span class="sn">3</span>Build the coder-session inferlet</h2>
+    <div class="prose"><p>An <strong>inferlet</strong> is a small program compiled to WebAssembly that runs <em>inside</em> the Pie server, right next to the KV cache. coder-session is the one that makes the agent fast.</p></div>
+<pre><code>rustup target add wasm32-wasip2
+cd inferlets/openhands-coder-session
+cargo build --target wasm32-wasip2 --release
+cd ../..</code></pre>
+    <div class="prose"><p>Fast — about 30 seconds. Produces <code>openhands_coder_session.wasm</code> (~320 KB) under that crate's <code>target/wasm32-wasip2/release/</code>.</p></div>
+  </section>
+
+  <!-- 4 -->
+  <section id="python">
+    <h2><span class="sn">4</span>Set up the Python side</h2>
+    <div class="prose"><p>This installs OpenHands' SDK, the Pie client, and the glue package that connects them.</p></div>
+<pre><code>cd integrations/openhands
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e ../../client/python
+
+<span class="cmt"># Sanity check — no GPU needed</span>
+.venv/bin/pytest tests/ -q          <span class="cmt"># expect ~97 passed</span></code></pre>
+  </section>
+
+  <!-- 5 -->
+  <section id="serve">
+    <h2><span class="sn">5</span>Start the server and load the model</h2>
+    <div class="prose"><p>Pie is configured with a TOML file. A ready-made one for the 7B model lives at <code>tests/fixtures/pie_cuda_native_config.toml</code>:</p></div>
+<pre><code><span class="cmt">[auth]</span>
+enabled = false                     <span class="cmt"># local use, no tokens</span>
+
+<span class="cmt">[[model]]</span>
+name = "default"
+hf_repo = "Qwen/Qwen2.5-Coder-7B-Instruct"   <span class="cmt"># pulled from HuggingFace</span>
+
+<span class="cmt">[model.driver]</span>
+type = "cuda_native"                <span class="cmt"># the in-process CUDA engine</span>
+device = ["cuda:0"]
+
+<span class="cmt">[model.driver.options]</span>
+kv_page_size = 32
+max_num_kv_pages = 2048             <span class="cmt"># 2048 × 32 = 65,536 KV tokens ≈ 4 GB</span>
+weight_dtype = "bfloat16"
+swap_pool_size = 0</code></pre>
+    <div class="thesis" style="padding:1rem 1.2rem;">
+      <p style="margin:0;"><b>The one knob to understand:</b> <code>max_num_kv_pages × kv_page_size</code> is your conversation-memory budget in tokens, and the CUDA driver allocates it <b>up front as a hard block</b>. It ignores <code>gpu_mem_utilization</code>. Too high and you get an out-of-memory error at startup; too low and long agent conversations run out of room. 65,536 tokens is comfortable for the 7B.</p>
+    </div>
+    <div class="prose"><p>Start it — the first run downloads ~14 GB of weights:</p></div>
+<pre><code>cd integrations/openhands
+../../target/release/pie serve \
+    --config tests/fixtures/pie_cuda_native_config.toml \
+    --port 8080 --no-auth</code></pre>
+    <div class="prose"><p>Wait for <code>pie-server serving on</code>. Leave it running and open a second terminal. Now <strong>install the inferlet</strong> into the running server — one upload per server start:</p></div>
+<pre><code>cd integrations/openhands
+.venv/bin/python - &lt;&lt;'EOF'
+<span class="kw">import</span> asyncio
+<span class="kw">from</span> pie_client <span class="kw">import</span> PieClient
+
+WASM = "../../inferlets/openhands-coder-session/target/wasm32-wasip2/release/openhands_coder_session.wasm"
+MANIFEST = "../../inferlets/openhands-coder-session/Pie.toml"
+
+<span class="kw">async def</span> main():
+    <span class="kw">async with</span> PieClient("ws://127.0.0.1:8080") <span class="kw">as</span> c:
+        <span class="kw">await</span> c.authenticate("local-dev")
+        <span class="kw">await</span> c.install_program(WASM, MANIFEST, force_overwrite=<span class="kw">True</span>)
+        print("coder-session installed")
+
+asyncio.run(main())
+EOF</code></pre>
+  </section>
+
+  <!-- 6 -->
+  <section id="run">
+    <h2><span class="sn">6</span>Point the agent at your own code</h2>
+    <div class="prose"><p>Save this as <code>run_agent.py</code> inside <code>integrations/openhands</code>. It is the whole integration in about twenty lines.</p></div>
+<pre><code><span class="cmt">"""Run the OpenHands agent against a local repo, served by Pie."""</span>
+<span class="kw">import</span> sys
+<span class="kw">from</span> pie_openhands <span class="kw">import</span> PieLLM
+<span class="kw">from</span> openhands.sdk <span class="kw">import</span> Agent, Conversation
+<span class="kw">from</span> openhands.tools.preset.default <span class="kw">import</span> get_default_tools
+
+repo, task = sys.argv[1], sys.argv[2]
+
+llm = PieLLM(
+    model="Qwen/Qwen2.5-Coder-7B-Instruct",
+    pie_uri="ws://127.0.0.1:8080",
+    pie_inferlet="openhands-coder-session@0.1.0",
+    pie_session=<span class="kw">True</span>,             <span class="cmt"># ← turn ON the KV prefix cache</span>
+    pie_python_tool_parser=<span class="kw">True</span>,  <span class="cmt"># ← parse Qwen-Coder's XML tool calls</span>
+    temperature=0.0,
+)
+
+agent = Agent(
+    llm=llm,
+    tools=get_default_tools(enable_browser=<span class="kw">False</span>),   <span class="cmt"># terminal, file_editor, task_tracker</span>
+    system_prompt_kwargs={"cli_mode": <span class="kw">True</span>},
+)
+
+conv = Conversation(agent=agent, workspace=repo, max_iteration_per_run=50)
+<span class="kw">try</span>:
+    conv.send_message(task)
+    conv.run()
+<span class="kw">finally</span>:
+    llm.close_pie_session()       <span class="cmt"># ← REQUIRED. See below.</span>
+    print(llm.pie_session_summary())</code></pre>
+    <div class="prose"><p>Run it:</p></div>
+<pre><code>.venv/bin/python run_agent.py /path/to/your/repo \
+    "The CLI crashes when --output is passed without a value. Find the bug and fix it."</code></pre>
+    <div class="prose"><p>The agent explores your repo, edits files, and runs commands <strong>directly on that directory</strong> — it is not sandboxed. Point it at a git checkout with everything committed, so <code>git diff</code> shows you exactly what it did.</p></div>
+
+    <div class="prose"><p>Two lines carry the weight:</p></div>
+    <ul class="clean">
+      <li><code>pie_session=True</code> enables the prefix cache. Without it, every turn re-reads the entire conversation from scratch.</li>
+      <li><code>llm.close_pie_session()</code> in a <code>finally</code> block is <strong>not optional</strong> — see the warning below.</li>
+    </ul>
+    <div class="thesis" style="border-left-color:var(--bad);background:var(--bad-soft);padding:1rem 1.2rem;">
+      <p style="margin:0;"><b>⚠ Always close the session.</b> <code>close_pie_session()</code> releases the KV snapshots the conversation accumulated. Skip it and each conversation permanently leaks its memory; on a hard-allocated cache, a few back-to-back runs exhaust the budget and the next one <b>hangs forever</b> waiting for pages that will never be freed. This exact bug cost us a 4-hour benchmark run.</p>
+    </div>
+  </section>
+
+  <!-- 7 -->
+  <section id="verify">
+    <h2><span class="sn">7</span>Check that the cache is actually working</h2>
+    <div class="prose"><p><code>pie_session_summary()</code> prints something like:</p></div>
+<pre><code>{'num_calls': 28, 'prompt_tokens_rendered': 804743,
+ 'prompt_tokens_prefilled': 43516, 'modes': {'rebuilt': 1, 'extended': 27}}</code></pre>
+    <div class="stats">
+      <div class="stat good"><div class="n">95 %</div><div class="k">of prompt tokens never recomputed</div></div>
+      <div class="stat good"><div class="n">rebuilt: 1</div><div class="k">only the first call starts cold</div></div>
+      <div class="stat neu"><div class="n">extended: 27</div><div class="k">every later call reused the cache</div></div>
+    </div>
+    <div class="prose">
+      <p><strong><code>modes: {rebuilt: 1, extended: N}</code> is the shape you want.</strong> One rebuild — the first call, nothing cached yet — and everything after it extending the cache. If <code>rebuilt</code> keeps climbing, the cache is missing and something is wrong.</p>
+      <p><strong>prefilled ÷ rendered is the work you avoided.</strong> Here 43,516 of 804,743 tokens were actually computed. The agent sends the full history every turn; the cache means Pie only processes what is new.</p>
+      <p><strong>No GPU? Try this now.</strong> The dummy driver runs the entire protocol on CPU:</p>
+    </div>
+<pre><code>../../target/release/pie serve --config tests/fixtures/pie_dummy_config.toml \
+    --port 18099 --no-auth &amp;
+.venv/bin/python session_smoke.py</code></pre>
+    <div class="prose"><p>It walks the protocol — first call, extension, history rewrite, retry, delete — and asserts the cache behaves correctly at each step. The generated text is gibberish, but the bookkeeping is real, and it is the fastest way to confirm your build works.</p></div>
+  </section>
+
+  <!-- 8 -->
+  <section id="troubleshooting">
+    <h2><span class="sn">8</span>When it goes wrong</h2>
+    <div class="tbl"><table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>pie driver list</code> shows no <code>cuda_native</code></td><td>Built without the feature</td><td>Rebuild with <code>--features driver-portable,driver-cuda</code></td></tr>
+        <tr><td>CUDA error at model load</td><td><code>CMAKE_CUDA_ARCHITECTURES</code> ≠ your GPU</td><td>Rebuild with the right value (§2)</td></tr>
+        <tr><td>OOM at startup, before any request</td><td><code>max_num_kv_pages</code> too large</td><td>Lower it; the driver ignores <code>gpu_mem_utilization</code></td></tr>
+        <tr><td>Everything hangs after a few conversations</td><td><code>close_pie_session()</code> not called</td><td>Add the <code>finally</code> block (§6)</td></tr>
+        <tr><td><code>modes</code> shows <code>rebuilt</code> every call</td><td>Cache is missing</td><td>Confirm <code>pie_session=True</code>; changing model/tools/template invalidates by design</td></tr>
+        <tr><td>Model narrates instead of using tools</td><td>Tool format mismatch</td><td>Keep <code>pie_python_tool_parser=True</code> for Qwen-Coder models</td></tr>
+        <tr><td>Empty patch, agent looped</td><td>Usually the model's own limits</td><td>Try a bigger model before suspecting the plumbing</td></tr>
+      </tbody>
+    </table></div>
+    <div class="thesis" style="padding:1rem 1.2rem;">
+      <p style="margin:0;"><b>On what to expect from the model.</b> A 7B model will fail tasks a 30B solves. In our benchmark the 30B produced correct patches for 11 of 13 real Django and scikit-learn issues; <em>both</em> failures were the model's own reasoning rather than the machinery — one wrote a plausible but wrong fix, the other mistyped its own file path and never recovered. Judge the <em>setup</em> by the cache statistics in §7; judge the <em>model</em> by its patches.</p>
+    </div>
+  </section>
+
+  <!-- 9 -->
+  <section id="next">
+    <h2><span class="sn">9</span>Where to go next</h2>
+    <ul class="clean">
+      <li><code>docs/RUNBOOK.md</code> — layered by-hand verification, shortest to most integrated</li>
+      <li><code>docs/OPENHANDS_CODER_SESSION_DESIGN.md</code> — the design behind the prefix cache</li>
+      <li><code>PIE_VS_VLLM_EVALUATION.md</code> — measured results against vLLM, including where Pie <em>loses</em></li>
+      <li><code>inferlets/openhands-coder-session/src/prefix_cache.rs</code> — the cache itself; short and commented</li>
+    </ul>
+    <div class="prose"><p>To run the SWE-bench benchmark instead of your own repo, <code>run_pie_backend.sh</code> wraps all of the above:</p></div>
+<pre><code>BACKEND=pie-session \
+CFG=tests/fixtures/pie_cuda_native_config.toml \
+MODEL=Qwen/Qwen2.5-Coder-7B-Instruct \
+OUTPUT=predictions/my_run.jsonl \
+  bash run_pie_backend.sh --subset-size 5 --python-tool-parser --temperature 0</code></pre>
+  </section>
+
+  <div class="foot">
+    Source: <code>integrations/openhands/docs/TUTORIAL_CODER_SESSION.md</code> · Pie: <a href="https://github.com/pie-project/pie">github.com/pie-project/pie</a> · OpenHands: <a href="https://github.com/All-Hands-AI/OpenHands">github.com/All-Hands-AI/OpenHands</a> · Benchmark results: <code>PIE_VS_VLLM_EVALUATION.md</code>
+  </div>
+
+</div>
