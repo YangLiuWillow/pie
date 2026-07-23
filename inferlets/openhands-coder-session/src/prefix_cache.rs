@@ -89,11 +89,22 @@ pub fn content_hash(model_id: &str, template: &str, prefix_tokens: &[u32]) -> St
     format!("{a:016x}{b:016x}")
 }
 
+/// Namespace every snapshot for `(key, compat)` lives under, with the trailing
+/// `/` that makes `Context::delete` treat it as a prefix.
+///
+/// Teardown deletes this one name instead of the per-call names: those are
+/// derived from token content nobody retains after the call, so enumerating
+/// them later is impossible. Built from the same pieces as [`snapshot_name`]
+/// so the two can't drift out of agreement.
+pub fn namespace(key: &str, compat: &str) -> String {
+    let compat = if compat.is_empty() { "0" } else { compat };
+    format!("apc/{key}/{compat}/")
+}
+
 /// Full snapshot name: `apc/{key}/{compat}/{content_hash}`.
 pub fn snapshot_name(key: &str, compat: &str, model_id: &str, prefix_tokens: &[u32]) -> String {
-    let compat = if compat.is_empty() { "0" } else { compat };
     let h = content_hash(model_id, TEMPLATE_MARKER, prefix_tokens);
-    format!("apc/{key}/{compat}/{h}")
+    format!("{}{h}", namespace(key, compat))
 }
 
 #[cfg(test)]
@@ -122,5 +133,20 @@ mod tests {
         let n = snapshot_name("chatA", "", "model-x", &[1, 2, 3]);
         assert!(n.starts_with("apc/chatA/0/"));
         assert_eq!(n.rsplit('/').next().unwrap().len(), 32);
+    }
+
+    /// Teardown deletes the namespace; every name the session saved must sit
+    /// under it, or its KV pages leak.
+    #[test]
+    fn namespace_is_a_prefix_of_every_name_it_covers() {
+        let ns = namespace("chatA", "v2");
+        assert!(ns.ends_with('/'), "prefix delete needs the trailing slash");
+        for toks in [&[][..], &[1][..], &[1, 2, 3][..]] {
+            assert!(snapshot_name("chatA", "v2", "model-x", toks).starts_with(&ns));
+        }
+        // Another conversation's namespace must not be swept up with it.
+        assert!(!snapshot_name("chatB", "v2", "model-x", &[1]).starts_with(&ns));
+        // Nor another compat generation's.
+        assert!(!snapshot_name("chatA", "v3", "model-x", &[1]).starts_with(&ns));
     }
 }

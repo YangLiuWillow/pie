@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from typing import Any
@@ -86,6 +87,20 @@ class PieLLM(LLM):
                     "inferlets that read `use_grammar` (openhands-coder-"
                     "session); openhands-completion always constrains.",
     )
+    pie_python_tool_parser: bool = Field(
+        default=False,
+        description="Parse tool calls host-side from the inferlet's raw "
+                    "generation using a verbatim port of vLLM's `qwen3_coder` "
+                    "tool parser (the exact parser the litellm baseline runs), "
+                    "instead of trusting the inferlet's own Rust decoder. "
+                    "Implies unconstrained generation (forces use_grammar=off) "
+                    "and skips the JSON-format few-shot examples, so the model "
+                    "emits its native Qwen3-Coder XML `<function=…>` format and "
+                    "we parse it exactly as the baseline does. Maximizes "
+                    "tool-call parity. Cache reuse is unaffected: the inferlet "
+                    "still snapshots re-rendered prompt tokens, so parsing is "
+                    "post-generation and host-side.",
+    )
 
     # Session bookkeeping — the inferlet is stateless between invocations, so
     # the host carries the previous prompt render's (length, hash) and echoes
@@ -94,6 +109,15 @@ class PieLLM(LLM):
     _pie_session_len: int = PrivateAttr(default=0)
     _pie_session_hash: str | None = PrivateAttr(default=None)
     _pie_session_stats: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+
+    # Fork source (delegation KV reuse): when this LLM was derived from a
+    # parent conversation's LLM (see `model_copy`), these carry the parent
+    # session's identity so the child's first call forks the parent's prompt
+    # KV instead of rebuilding from scratch. Cleared implicitly once the child
+    # establishes its own snapshot (`_pie_session_len > 0`).
+    _pie_fork_from: str | None = PrivateAttr(default=None)
+    _pie_fork_prev_len: int = PrivateAttr(default=0)
+    _pie_fork_prev_hash: str | None = PrivateAttr(default=None)
 
     # `_wrap_as_model_response` now populates real `tool_calls` from the
     # inferlet's structured output (see `assistant_with_tool_calls`/
@@ -135,17 +159,32 @@ class PieLLM(LLM):
         # text and passes tools in a flat format the inferlet can't parse.
         tools = (kwargs.get("tools") or []) if self.native_tool_calling else []
 
-        if tools and self.native_tool_calling:
+        # The Python-side parser reproduces the vLLM baseline's tool-calling
+        # path: unconstrained generation + native Qwen3-Coder XML, no JSON
+        # few-shot nudges (which would push the model off the XML format the
+        # parser expects).
+        if tools and self.native_tool_calling and not self.pie_python_tool_parser:
             _inject_native_examples(wire_messages, tools)
 
         gen_params = self._extract_gen_params(kwargs)
-        if not self.pie_use_grammar:
+        if not self.pie_use_grammar or self.pie_python_tool_parser:
             gen_params["use_grammar"] = False
         if self.pie_session:
             gen_params.update(self._session_request_fields())
+        # Host-side wallclock around the whole Pie round trip. The inferlet's
+        # own `timings.total_ms` starts at inferlet entry, so it cannot see
+        # process launch, the request/response hop, or serializing the message
+        # history. `host_ms - timings.total_ms` is exactly that transport cost,
+        # which job 19245724 left as the open question: the inferlet accounted
+        # for 4.35 s of a call while the instance wallclock implied far more.
+        _t0 = time.monotonic()
         raw = asyncio.run(self._call_pie(wire_messages, tools, gen_params))
+        _host_ms = (time.monotonic() - _t0) * 1000.0
+        _maybe_debug_dump(raw, _host_ms)
         if self.pie_session:
             self._record_session_response(raw)
+        if self.pie_python_tool_parser:
+            _reparse_tool_calls_python(raw, tools)
         _sanitize_tool_args(raw, tools)
         return self._wrap_as_model_response(raw)
 
@@ -155,15 +194,50 @@ class PieLLM(LLM):
     def _session_request_fields(self) -> dict[str, Any]:
         if self._pie_session_id is None:
             self._pie_session_id = uuid.uuid4().hex
-        fields: dict[str, Any] = {
-            "session_id": self._pie_session_id,
-            "session_prev_len": self._pie_session_len,
-        }
-        if self._pie_session_hash is not None:
-            fields["session_prev_hash"] = self._pie_session_hash
+        # The coder-session inferlet now self-keys its KV prefix cache from the
+        # token content (content-addressed `apc/{session_id}/…` snapshots), so
+        # it no longer needs the host to echo the previous render's length/hash
+        # or the parent fork pointers — `session_id` alone is the cache
+        # namespace. The legacy `session_prev_*` / `session_fork_*` hints are
+        # therefore no longer sent (the inferlet would ignore them). Strong
+        # cross-agent (delegation) reuse under content addressing is a
+        # follow-up: it needs the child to share the parent's namespace AND the
+        # shared-prefix boundary to have been saved — see model_copy.
+        fields: dict[str, Any] = {"session_id": self._pie_session_id}
         if self.pie_kv_verify:
             fields["kv_verify"] = True
         return fields
+
+    def model_copy(self, *, update: Any = None, deep: bool = False) -> "PieLLM":
+        """Propagate session identity across SDK-level copies (delegation).
+
+        The SDK builds a delegated sub-agent's LLM by ``model_copy``-ing the
+        parent's (see ``openhands.tools.task.manager``). Pydantic copies our
+        private session attrs verbatim, so without intervention the child would
+        inherit the parent's ``_pie_session_id`` and *extend* — and thereby
+        overwrite — the parent's KV snapshot. Instead we hand the child a clean
+        session and point it at the parent as a fork source: its first call
+        reuses the parent's prompt KV (the coder-session inferlet's fork
+        branch) while the parent snapshot stays intact.
+
+        Idempotent across the SDK's double copy (parent→child, then a second
+        copy that flips ``stream``): the second copy's source is the child,
+        whose ``_pie_session_id`` is already ``None``, so we preserve the
+        fork source it already carries rather than clobbering it.
+        """
+        child = super().model_copy(update=update, deep=deep)
+        # Shallow copy aliases the parent's telemetry list — give a fresh one.
+        child._pie_session_stats = []
+        if self._pie_session_id is not None:
+            # Copy of a parent that has a live session → fork from it.
+            child._pie_fork_from = self._pie_session_id
+            child._pie_fork_prev_len = self._pie_session_len
+            child._pie_fork_prev_hash = self._pie_session_hash
+        # Either way, the child must not share the parent's session identity.
+        child._pie_session_id = None
+        child._pie_session_len = 0
+        child._pie_session_hash = None
+        return child
 
     def _record_session_response(self, raw: dict[str, Any]) -> None:
         session = raw.get("session")
@@ -236,26 +310,66 @@ class PieLLM(LLM):
         """Launch the inferlet, collect its Return payload, return as dict.
 
         Override this in tests with a mock to avoid spinning up a Pie server.
+
+        Every call opens its own connection, authenticates, and launches a
+        fresh process — the inferlet is torn down between calls, which is why
+        the KV has to be recovered from a named APC snapshot each turn. Job
+        19247969 measured this whole round trip at 13.6 s/call against only
+        3.6 s spent inside the inferlet, i.e. ~10 s/call unaccounted for. The
+        `_transport` block below splits that 10 s across the individual steps
+        so it can be attributed rather than guessed at.
         """
         input_payload = {"messages": messages, "tools": tools, **gen_params}
-        async with PieClient(self.pie_uri) as client:
+        t: dict[str, float] = {}
+        clock = time.monotonic
+
+        t0 = clock()
+        client_cm = PieClient(self.pie_uri)
+        client = await client_cm.__aenter__()
+        t["connect_ms"] = (clock() - t0) * 1000.0
+        try:
+            t0 = clock()
             await client.authenticate(self.pie_username)
+            t["auth_ms"] = (clock() - t0) * 1000.0
+
+            t0 = clock()
             proc = await client.launch_process(self.pie_inferlet, input=input_payload)
+            t["launch_ms"] = (clock() - t0) * 1000.0
+
+            # Time until the *first* event of any kind comes back. The
+            # inferlet's own clock starts at its entry point, so anything
+            # before that first event is queueing/admission plus request
+            # delivery — the part neither side currently sees.
+            t0 = clock()
+            first_seen = False
             stdout_chunks: list[str] = []
             while True:
                 event, value = await asyncio.wait_for(
                     proc.recv(), timeout=self.pie_request_timeout_s
                 )
+                if not first_seen:
+                    t["first_event_ms"] = (clock() - t0) * 1000.0
+                    first_seen = True
                 if event == Event.Stdout:
                     if isinstance(value, (bytes, bytearray)):
                         stdout_chunks.append(value.decode("utf-8", "replace"))
                     else:
                         stdout_chunks.append(str(value))
                 elif event == Event.Return:
-                    return _parse_return_value(value, stdout_chunks)
+                    t["wait_ms"] = (clock() - t0) * 1000.0
+                    out = _parse_return_value(value, stdout_chunks)
+                    break
                 elif event == Event.Error:
                     raise RuntimeError(f"Pie inferlet error: {value!r}")
                 # Stderr / Message / File: ignore in Phase 1
+        finally:
+            t0 = clock()
+            await client_cm.__aexit__(None, None, None)
+            t["close_ms"] = (clock() - t0) * 1000.0
+
+        if isinstance(out, dict):
+            out["_transport"] = t
+        return out
 
     # ------------------------------------------------------------------
     # Pie response -> ModelResponse
@@ -338,6 +452,51 @@ def _flatten_content(message: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
+def _reparse_tool_calls_python(
+    pie_out: dict[str, Any],
+    tools: list[dict[str, Any]],
+) -> None:
+    """Re-parse tool calls host-side from the raw generation, in place.
+
+    Replaces the inferlet's Rust-decoded ``tool_calls`` with the result of
+    vLLM's ``qwen3_coder`` parser (see ``qwen3coder_parser``) run on the raw
+    phase-1 generation. This reproduces the litellm+vLLM baseline's tool-call
+    extraction exactly — most importantly its lenient back-off, which recovers
+    a ``<function=…>`` call even when the ``<tool_call>`` wrapper is malformed
+    or missing (the failure mode that stalled coder-session on django-13028).
+
+    Cache-safety note: we do NOT strip tokenizer special-token strings here.
+    The coder-session inferlet's ``sanitize_messages`` already scrubs replayed
+    tool-call names/args with the real tokenizer at render time (commit
+    d094ed69), which is where the round-trip contract that protects prefix
+    reuse actually lives.
+    """
+    from . import qwen3coder_parser
+
+    raw_text = pie_out.get("debug_full_text")
+    if not isinstance(raw_text, str) or not raw_text:
+        raw_text = pie_out.get("text") or ""
+
+    parsed = qwen3coder_parser.extract_tool_calls(raw_text, tools)
+    if not parsed:
+        # No call recovered — leave the inferlet's own tool_calls untouched so
+        # we never regress a turn the Rust decoder handled but the port didn't.
+        return
+
+    pie_out["tool_calls"] = parsed
+    pie_out["stop_reason"] = "tool_calls"
+
+    # Match vLLM's content handling: assistant content is whatever precedes the
+    # first tool-call marker (so the XML markup isn't duplicated into content).
+    idx_call = raw_text.find("<tool_call>")
+    idx_fn = raw_text.find("<function=")
+    cut = min(i for i in (idx_call, idx_fn) if i >= 0) if (
+        idx_call >= 0 or idx_fn >= 0
+    ) else -1
+    if cut >= 0:
+        pie_out["text"] = raw_text[:cut]
+
+
 def _sanitize_tool_args(
     pie_out: dict[str, Any],
     tools: list[dict[str, Any]],
@@ -370,6 +529,47 @@ def _sanitize_tool_args(
         sanitized = {k: v for k, v in args.items() if k in valid_keys}
         if sanitized != args:
             tc["arguments"] = json.dumps(sanitized)
+
+
+def _maybe_debug_dump(raw: dict[str, Any], host_ms: float | None = None) -> None:
+    """Append the raw inferlet output to ``$PIE_DEBUG_LOG`` (JSONL) if set.
+
+    Temporary diagnostic for the phase-1/phase-2 tool-call investigation:
+    surfaces the inferlet's ``debug_full_text`` / ``debug_phase1_marker`` /
+    ``debug_phase2_fired`` fields, which the OpenHands completion logger
+    drops (it only records the wrapped LiteLLM response).
+    """
+    path = os.environ.get("PIE_DEBUG_LOG")
+    if not path or not isinstance(raw, dict):
+        return
+    rec = {
+        "text": raw.get("text"),
+        "tool_calls": raw.get("tool_calls"),
+        "stop_reason": raw.get("stop_reason"),
+        "debug_phase1_marker": raw.get("debug_phase1_marker"),
+        "debug_phase2_fired": raw.get("debug_phase2_fired"),
+        "debug_full_text": raw.get("debug_full_text"),
+        "session": raw.get("session"),
+        # Per-phase wallclock inside the inferlet (setup/render/hash/open/
+        # prefill/save/fork/decode/total, ms). Attributes the non-decode time
+        # per call; see the Timings struct in the coder-session inferlet.
+        "timings": raw.get("timings"),
+        # Whole round trip as the host sees it; minus timings.total_ms this is
+        # the transport + process-launch cost the inferlet cannot measure.
+        "host_ms": host_ms,
+        # Actual token counts, so generated-length differences between engines
+        # can be normalized instead of inferred from character counts.
+        "tokens_generated": raw.get("tokens_generated"),
+        "prompt_tokens": raw.get("prompt_tokens"),
+        # connect / auth / launch / first_event / wait / close, ms — splits the
+        # ~10 s/call that sits between host_ms and the inferlet's total_ms.
+        "transport": raw.get("_transport"),
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
 
 
 def _parse_return_value(value: Any, stdout_chunks: list[str]) -> dict[str, Any]:

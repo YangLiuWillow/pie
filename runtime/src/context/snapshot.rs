@@ -244,10 +244,44 @@ impl ContextManager {
         Ok(if auto_generated { Some(name) } else { None })
     }
 
+    /// Delete saved snapshots by name.
+    ///
+    /// A `name` ending in `/` is a **namespace prefix**: every snapshot of
+    /// `username` whose name starts with it is deleted. This is how a caller
+    /// that saves many content-addressed names under one namespace (e.g. the
+    /// coder-session prefix cache's `apc/{session}/…`) releases the whole set
+    /// at teardown — without it, the caller would have to enumerate names it
+    /// no longer knows, and the snapshots pin their KV pages forever.
+    ///
+    /// A trailing `/` is unambiguous as a marker because it can only ever
+    /// address a namespace: a snapshot saved under a name ending in `/` would
+    /// be an empty leaf under that namespace, which prefix deletion also
+    /// removes. Prefix deletion of an empty namespace is a no-op, not an
+    /// error — teardown must stay idempotent.
     pub(crate) fn delete(&mut self, username: String, name: String) -> Result<()> {
+        if name.ends_with('/') {
+            let victims: Vec<(String, String)> = self
+                .snapshots
+                .keys()
+                .filter(|(u, n)| *u == username && n.starts_with(&name))
+                .cloned()
+                .collect();
+            for key in victims {
+                let snapshot_id = self.snapshots.remove(&key).expect("key just collected");
+                self.release_snapshot(snapshot_id);
+            }
+            return Ok(());
+        }
+
         let snapshot_id = self.snapshots.remove(&(username, name))
             .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
+        self.release_snapshot(snapshot_id);
 
+        Ok(())
+    }
+
+    /// Drop a snapshot context and return its pages to the stores.
+    fn release_snapshot(&mut self, snapshot_id: ContextId) {
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
             let dev_idx = ctx.device.unwrap_or(0) as usize;
             if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
@@ -260,8 +294,6 @@ impl ContextManager {
                 self.gpu_stores[dev_idx].free(&ctx.working_pages);
             }
         }
-
-        Ok(())
     }
 
 

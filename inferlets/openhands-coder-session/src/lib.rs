@@ -52,8 +52,14 @@
 
 use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, tools};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 mod prefix_cache;
+
+/// Milliseconds elapsed since `t`, as f64.
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
 
 /// Cache `compat` namespace component — the host bumps this (via a future
 /// input field) to invalidate all snapshots on app-schema drift. Empty for
@@ -196,6 +202,10 @@ struct Output {
     debug_full_text: Option<String>,
     debug_phase1_marker: bool,
     debug_phase2_fired: bool,
+
+    /// Per-phase wallclock breakdown of this call. See [`Timings`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<Timings>,
 }
 
 #[derive(Serialize)]
@@ -203,6 +213,44 @@ struct ToolCallOut {
     id: String,
     name: String,
     arguments: String,
+}
+
+/// Per-phase wallclock inside one call, in milliseconds.
+///
+/// Diagnostic for the ~9.5 s/call of non-decode time measured on A/B job
+/// 19212030: decode ran at parity with vLLM (63 vs 65 tok/s), generated token
+/// counts matched, and APC cut prefill to ~5%, yet Pie took 13.5 s/call
+/// against the baseline's 3.9 s. These fields split the call so the residual
+/// can be attributed instead of guessed at. Always emitted — the cost is a
+/// handful of clock reads.
+#[derive(Serialize, Default)]
+struct Timings {
+    /// `runtime::models` + `Model::load` + `sanitize_messages`.
+    setup_ms: f64,
+    /// `render_prompt`: one tokenizer round-trip per message, over the whole
+    /// history, every call (the inferlet is a fresh wasm instance per call and
+    /// cannot carry the previous render forward).
+    render_ms: f64,
+    /// `fnv1a64` over the full render, plus one `content_hash` per reuse
+    /// candidate — each of which re-hashes from token 0.
+    hash_ms: f64,
+    /// `Context::open` attempts against candidate boundary names.
+    open_ms: f64,
+    /// How many `Context::open` calls were made (cap is MAX_OPEN_ATTEMPTS).
+    open_attempts: usize,
+    /// `append` + `flush` — the actual prompt prefill.
+    prefill_ms: f64,
+    /// `ctx.save` of this call's full render.
+    save_ms: f64,
+    /// `ctx.fork()` for the phase-2 fallback. Taken on every call whenever
+    /// grammar + tools are on, even though phase 2 fired 0/169 times in
+    /// 19212030 — forking copies the cued prompt's working pages, so at ~30k
+    /// tokens this is a prime suspect for the residual.
+    fork_ms: f64,
+    /// The phase-1 generation loop (decode + tool-call parsing).
+    decode_ms: f64,
+    /// Whole call, entry to exit.
+    total_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -222,11 +270,15 @@ struct SessionOut {
 
 #[inferlet::main]
 async fn main(mut input: Input) -> Result<Output> {
+    let t_call = Instant::now();
+    let mut timings = Timings::default();
+
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
     sanitize_messages(&mut input.messages, &model);
+    timings.setup_ms = ms(t_call);
 
     // ── Session teardown (conversation ended on the host) ──────────────
     if input.session_action.as_deref() == Some("delete") {
@@ -236,7 +288,19 @@ async fn main(mut input: Input) -> Result<Output> {
             .ok_or("session_action=delete requires session_id")?;
         // Ignore "not found" — deletion must be idempotent (the harness
         // calls it from a finally block, including after failed runs).
+        //
+        // Two names to clear. The legacy single-slot snapshot from the
+        // pre-APC scheme, and — the one that matters — the whole
+        // `apc/{sid}/` namespace this session filled with one
+        // content-addressed snapshot per call. Those pin their KV pages
+        // until deleted, and their names are derived from token content the
+        // host does not keep, so a namespace-prefix delete is the only way
+        // to release them. Skipping it leaks a full conversation's KV per
+        // conversation: on a hard-allocated cache (cuda_native,
+        // swap_pool_size=0) a few back-to-back conversations exhaust the
+        // budget and later ones block forever waiting for pages.
         let _ = Context::delete(&model, &session_name(sid));
+        let _ = Context::delete(&model, &prefix_cache::namespace(sid, CACHE_COMPAT));
         return Ok(Output {
             text: String::new(),
             tool_calls: Vec::new(),
@@ -253,6 +317,8 @@ async fn main(mut input: Input) -> Result<Output> {
             debug_full_text: None,
             debug_phase1_marker: false,
             debug_phase2_fired: false,
+            // Teardown does no rendering or inference — nothing to attribute.
+            timings: None,
         });
     }
 
@@ -274,11 +340,24 @@ async fn main(mut input: Input) -> Result<Output> {
     // bookkeeping so the snapshot ends on a message boundary). `boundaries`
     // marks the token length at each safe render-unit split, so the reuse
     // search below can name candidate prefixes without re-rendering.
+    let t0 = Instant::now();
     let (full_tokens, boundaries) = render_prompt(&model, &input.messages, &tool_schemas)?;
-    let full_hash = fnv1a64(&full_tokens);
+    timings.render_ms = ms(t0);
 
-    let (mut ctx, session) =
-        build_context(&model, &input, model_name, &full_tokens, full_hash, &boundaries).await?;
+    let t0 = Instant::now();
+    let full_hash = fnv1a64(&full_tokens);
+    timings.hash_ms = ms(t0);
+
+    let (mut ctx, session) = build_context(
+        &model,
+        &input,
+        model_name,
+        &full_tokens,
+        full_hash,
+        &boundaries,
+        &mut timings,
+    )
+    .await?;
 
     ctx.cue();
 
@@ -318,16 +397,19 @@ async fn main(mut input: Input) -> Result<Output> {
     // `use_grammar: false` disables phase 2 for parity with a fully
     // unconstrained baseline. The fork is transient and destroyed before
     // returning, so session snapshot bookkeeping is unaffected.
+    let t0 = Instant::now();
     let mut phase2_fork = if input.use_grammar && has_tools {
         Some(ctx.fork()?)
     } else {
         None
     };
+    timings.fork_ms = ms(t0);
 
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut tool_calls: Vec<ToolCallOut> = Vec::new();
     let mut stop_reason = "length";
 
+    let t_decode = Instant::now();
     let mut g = ctx
         .generate(sampler.clone())
         .max_tokens(input.max_tokens)
@@ -382,6 +464,8 @@ async fn main(mut input: Input) -> Result<Output> {
             break;
         }
     }
+
+    timings.decode_ms = ms(t_decode);
 
     // The Generator consumes its stop token internally, so a natural stop
     // can fall through the explicit eos/stop-string checks above with the
@@ -518,6 +602,10 @@ async fn main(mut input: Input) -> Result<Output> {
         debug_full_text: Some(full_text.clone()),
         debug_phase1_marker,
         debug_phase2_fired: phase2_fired,
+        timings: Some(Timings {
+            total_ms: ms(t_call),
+            ..timings
+        }),
     })
 }
 
@@ -564,6 +652,7 @@ async fn build_context(
     full_tokens: &[u32],
     full_hash: u64,
     boundaries: &[usize],
+    timings: &mut Timings,
 ) -> Result<(Context, Option<SessionOut>)> {
     let Some(sid) = input.session_id.as_deref() else {
         // Stateless: behave exactly like openhands-completion. Leave the
@@ -610,8 +699,13 @@ async fn build_context(
             break;
         }
         attempts += 1;
+        let t_h = Instant::now();
         let name = prefix_cache::snapshot_name(sid, CACHE_COMPAT, model_id, &full_tokens[..len]);
-        if let Ok(c) = Context::open(model, &name) {
+        timings.hash_ms += ms(t_h);
+        let t_o = Instant::now();
+        let open_result = Context::open(model, &name);
+        timings.open_ms += ms(t_o);
+        if let Ok(c) = open_result {
             // Opening shares the snapshot's committed KV pages by refcount;
             // appending the suffix allocates fresh pages, so the immutable
             // snapshot is never mutated by the live generation past here.
@@ -624,6 +718,9 @@ async fn build_context(
         // next-shorter boundary, else fall through to a clean rebuild.
     }
 
+    timings.open_attempts = attempts;
+
+    let t_prefill = Instant::now();
     let (mut ctx, mode, prefill) = match opened {
         Some((mut c, len)) => {
             let suffix = &full_tokens[len..];
@@ -644,6 +741,7 @@ async fn build_context(
     // Materialize the prompt KV so the snapshot below captures it. (An
     // empty append — identical retried prompt — makes this a no-op.)
     ctx.flush().await?;
+    timings.prefill_ms = ms(t_prefill);
 
     if input.kv_verify && ctx.seq_len() as usize != full_tokens.len() {
         return Err(format!(
@@ -658,8 +756,12 @@ async fn build_context(
     // name means identical KV is already saved (benign) — ignore the save
     // error rather than delete+resave, so distinct boundaries coexist (that is
     // what makes retry / branch / truncate re-hit their earlier boundary).
+    let t_h = Instant::now();
     let full_name = prefix_cache::snapshot_name(sid, CACHE_COMPAT, model_id, full_tokens);
+    timings.hash_ms += ms(t_h);
+    let t_save = Instant::now();
     let _ = ctx.save(&full_name);
+    timings.save_ms = ms(t_save);
 
     let session = SessionOut {
         id: sid.to_string(),
