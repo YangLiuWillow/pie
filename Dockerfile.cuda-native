@@ -1,0 +1,106 @@
+# Dockerfile.cuda-native — Pie with the in-process native CUDA driver
+# (`[model.driver] type = "cuda_native"`, Cargo feature `driver-cuda`), for the
+# OpenHands↔Pie RunPod path (see integrations/openhands/runpod_submit.sh).
+#
+# This is a container transcription of the Slurm-validated build recipe in
+# integrations/openhands/build_pie_cuda.sh (build job 19188593) — same package,
+# same feature flags, same arch knob — with the EasyBuild `module load`s swapped
+# for the CUDA base image + apt, and the offline `.cpm-cache` staging dropped
+# (Docker build has network, so CPM fetches flashinfer/cutlass/… directly).
+#
+# WHY the runtime stage is slim (`-runtime`, not `-devel`):
+#   driver/cuda/CMakeLists.txt AOT-compiles the driver's own translation units
+#   into a STATIC lib linked with cudart_static + cublas_static + … ("a binary
+#   with zero CUDA shared deps"). flashinfer is DOWNLOAD_ONLY (headers/csrc at
+#   build time only). So there is NO runtime JIT, no nvcc, no flashinfer sources
+#   at runtime — the only dynamic CUDA dep is NCCL (linked, but never loaded on
+#   single-GPU tp_size=1 runs), which `libnccl2` supplies.
+#
+# ARCH: kernels are compiled AOT for CUDA_ARCH — it MUST match the GPU:
+#   80 = A100 (RunPod spot sweet spot; default)   90 = H100   120 = RTX 6000 Blackwell
+#
+#   docker build -f Dockerfile.cuda-native --build-arg CUDA_ARCH=80 -t <you>/pie-cuda-native:a100 .
+#
+# The repo, HF model cache, OpenHands .venv, inferlet .wasm, and configs all
+# live on the RunPod network volume at runtime (mounted at $MOUNT, default
+# /workspace) — NOT baked in here. The `pie` binary is installed to
+# /usr/local/bin (outside the mount) so the volume never shadows it.
+#
+# Caveat: .dockerignore excludes Cargo.lock, so deps resolve fresh here rather
+# than from the lockfile the Slurm build used. If a dep bump ever breaks the
+# build, un-ignore Cargo.lock (keep `!Cargo.lock`) and rebuild.
+
+ARG CUDA_TAG=12.8.0
+ARG UBUNTU=ubuntu24.04
+
+# ============================================================================
+# Stage 1: Builder — full CUDA devel toolchain, builds pie with driver-cuda
+# ============================================================================
+FROM nvidia/cuda:${CUDA_TAG}-devel-${UBUNTU} AS builder
+
+# sm_80 = A100. Override with --build-arg CUDA_ARCH=90 (H100) / 120 (Blackwell).
+ARG CUDA_ARCH=80
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH="/usr/local/cargo/bin:/usr/local/cuda/bin:${PATH}"
+
+# Build deps. NCCL headers (libnccl-dev) satisfy driver/cuda/CMakeLists.txt's
+# find_path(nccl.h)/find_library(nccl) via the standard /usr paths — so the
+# Slurm recipe's PIE_NCCL_HOME hint is unnecessary here. Static CUDA libs
+# (cublas_static/cudart_static/culibos) are already in the -devel base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake ninja-build curl wget build-essential pkg-config ca-certificates \
+        libzmq3-dev libcbor-dev libzstd-dev libssl-dev \
+        libnccl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+        -y --default-toolchain stable --profile minimal \
+    && . "$CARGO_HOME/env" \
+    && rustup target add wasm32-wasip2
+
+WORKDIR /workspace
+COPY . .
+
+# The one build that matters: pie with the native CUDA driver statically linked
+# in. Matches build_pie_cuda.sh verbatim (package pie-server → target/release/pie).
+# `driver-portable` stays on so the same binary can also run the portable engine.
+# CPM_SOURCE_CACHE reuses any .cpm-cache copied from the context; otherwise CPM
+# fetches from GitHub (network is available in the build).
+ENV CUDACXX=/usr/local/cuda/bin/nvcc \
+    CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+    CPM_SOURCE_CACHE=/workspace/.cpm-cache
+RUN cargo build -p pie-server --release --features driver-portable,driver-cuda \
+    && /workspace/target/release/pie driver list
+
+# ============================================================================
+# Stage 2: Runtime — slim CUDA runtime + sshd; the pie binary is self-contained
+# ============================================================================
+FROM nvidia/cuda:${CUDA_TAG}-runtime-${UBUNTU}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH="/usr/local/bin:${PATH}"
+
+# Runtime libs pie links dynamically (zmq/cbor/zstd/ssl) + libnccl2 (the only
+# dynamic CUDA dep) + openssh-server (runpod_submit.sh SSHes in) + a Python
+# runtime so the OpenHands harness venv on the volume has a matching interpreter
+# + git/curl for the harness. GPU driver (libcuda.so) is injected by RunPod.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libzmq5 libcbor0.10 libzstd1 libssl3 \
+        libnccl2 \
+        openssh-server \
+        python3.12 python3.12-venv python3-pip \
+        git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd \
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Self-contained pie (cuda_native compiled in) — placed outside the volume
+# mount so a mounted network volume never hides it.
+COPY --from=builder /workspace/target/release/pie /usr/local/bin/pie
+
+# Standalone default: run sshd in the foreground. runpod_submit.sh overrides
+# this via the pod's dockerArgs (it injects the authorized key and starts sshd
+# itself), so this CMD only matters when the image is run by hand.
+CMD ["/bin/bash", "-lc", "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"]
