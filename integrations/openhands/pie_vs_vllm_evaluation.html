@@ -170,24 +170,33 @@
       <span>Model · Qwen3-Coder-30B-A3B</span>
       <span>GPU · RTX PRO 6000 Blackwell 96 GB</span>
       <span>Baseline · vLLM + APC</span>
-      <span>2026-07-21</span>
+      <span>2026-07-21 · revised 2026-07-23</span>
     </div>
   </header>
+
+  <div class="thesis" style="border-left-color:var(--bad);background:var(--bad-soft);margin-bottom:2.2rem;">
+    <div class="eyebrow" style="color:var(--bad);margin-bottom:.5rem;">⚠ Revision notice — the headline result of the first version was wrong</div>
+    <p style="margin-bottom:.9rem;">The 2026-07-21 version's central claim was that Pie is <b>3.65× slower</b> than litellm + vLLM on the agentic workload. Everything downstream of it — "Pie's best case is a tie", "the honest contribution is token elimination, not wallclock" — was built on that number.</p>
+    <p style="margin-bottom:.9rem;"><b>The cause was a bug in Pie's WebSocket server, not a property of Pie.</b> <code>runtime/src/server.rs</code> handled an incoming Close frame with <code>WsMessage::Close(_) =&gt; break</code> and never replied. The stream is split, so tungstenite's automatic close handshake cannot run — the reader half cannot write. The Python client opens <b>one connection per LLM call</b> and its default <code>close_timeout</code> is 10 s, so every call sat out the full timeout. Measured across 32 calls: <b>10009.4 ms mean, 10010.4 median, 10010.5 max</b>. Sub-millisecond variance is a timeout, not work.</p>
+    <p style="margin-bottom:0;">Fixed in <code>e4626e5b</code> by echoing the frame back through the existing send channel (RFC 6455). <b>After the fix, on the same 13 instances and the same settings, Pie is ~26 % faster than the baseline.</b> Superseded claims below are struck through rather than deleted — the wrong numbers are part of the record, and <em>why</em> they were wrong is the transferable lesson.</p>
+  </div>
 
   <!-- 0 -->
   <section id="bottom-line" style="margin-top:0">
     <h2><span class="sn">0</span>Bottom line</h2>
     <div class="thesis">
-      <p class="lead">On a single local GPU with vLLM's automatic prefix caching enabled, <b>Pie does not beat vLLM on wallclock</b> for our workloads. Its best observed case is a <b>tie</b>; in the agentic setting it is up to <b>3.65× slower</b>. The cause is structural — vLLM's APC captures the <em>same</em> KV reuse that Pie's fork/session provides, so Pie's headline mechanism is not a differentiator, and Pie then loses on secondary overheads.</p>
+      <p class="lead">On a single local GPU with vLLM's automatic prefix caching enabled, <b>Pie is faster than vLLM on the agentic workload</b>: 13 SWE-bench-Verified instances in <b>1,430.4 s against the baseline's 1,938.9 s</b> — ~26 % faster, a 1.36× speedup — at 95 %+ KV reuse and zero <code>kv_verify</code> errors.</p>
     </div>
     <div class="stats">
+      <div class="stat good"><div class="n">1.36×</div><div class="k">faster on OpenHands, 13 instances</div></div>
+      <div class="stat good"><div class="n">90.1</div><div class="k">tok/s decode vs baseline's ~64</div></div>
       <div class="stat bad"><div class="n">10×</div><div class="k">slower at N=64 fan-out (serial fork-decode)</div></div>
-      <div class="stat bad"><div class="n">3.65×</div><div class="k">slower on OpenHands (coder-session vs litellm)</div></div>
-      <div class="stat neu"><div class="n">≈ parity</div><div class="k">decode throughput, flat to 50k ctx</div></div>
-      <div class="stat diag"><div class="n">3.1×</div><div class="k">faster than coder-session once loop moves in-inferlet</div></div>
+      <div class="stat diag"><div class="n">&lt; 9 ms</div><div class="k">total cost of the entire APC apparatus per call</div></div>
     </div>
     <div class="prose">
-      <p>Pie's mechanisms <em>work</em> — they eliminate 95–97 % of prefill in agentic loops and fork shared prefixes perfectly — but that saving does not convert to wallclock, because the baseline already gets the same reuse for free. The paper's real wins (1.3–3.4× on agentic workflows) are genuine but conditional: they need a <em>small model + a real network gap + many I/O interactions + concurrency that makes APC evict + tools that run inside the inferlet</em>. Our environment removes every one of those conditions.</p>
+      <p>Two things had to be true for that to show up, and <b>neither was about inference</b>. First, the transport had to stop burning 10 s per call — that fix alone took one instance from 467.6 s to 185.4 s. Second, session snapshots had to be released at teardown (<code>f1aac6eb</code>): the APC rewrite began saving dozens of snapshots per conversation under <code>apc/{sid}/…</code>, but the inferlet's delete branch still removed only the legacy single-slot name, so cleanup was a silent no-op. On the native CUDA driver, whose KV is a hard allocation with <code>swap_pool_size=0</code>, the cache does not evict — it <b>blocks forever</b>. The first A/B run wedged at 4 of 13 instances.</p>
+      <p>The original conclusion — that Pie's KV reuse is real but never converts to wallclock — was <b>half right for the wrong reason</b>. The reuse is real, and §1 below still holds: APC captures the same prefix reuse when it fits, so prefill saving is <em>not</em> where the win comes from. But Pie was not losing to APC; it was losing to its own dead time. With that removed, Pie leads on <b>decode throughput</b> — 97,343 tokens at 90.1 tok/s of pure decode across the run's 416 calls, against a baseline near 64 — an axis the earlier analysis had measured as parity and therefore stopped examining.</p>
+      <p><b>What is still not established: an accuracy claim.</b> Pie reproduces 11 of the baseline's 13 resolved instances. That set <em>is</em> the baseline's own <code>resolved_ids</code>, so the baseline scores 13/13 by construction and parity is the ceiling — the comparison cannot show Pie more accurate, only less. A neutral 50-instance run is in flight.</p>
     </div>
   </section>
 
@@ -201,7 +210,8 @@
 <span class="cmt">turn 2:  [system + task + assistant_1 + tool_result_1]</span>
 <span class="cmt">turn 3:  [system + task + assistant_1 + tool_result_1 + assistant_2 + tool_result_2]</span></code></pre>
     <div class="prose">
-      <p>A growing prefix is exactly what APC reuses: on turn 3 it recognizes turns 1–2 as cached and prefills only the new tail — the <strong>same computational saving</strong> Pie's session gives. So "multi-turn / agentic" is <em>not</em>, by itself, a Pie advantage. Pie beats APC only when the app does something that is <strong>not</strong> a plain growing prefix (mid-context drop, mid-decode branching, custom attention) — or when the transport/round-trip around the reuse dominates (a network gap), or when the tool runs <em>inside</em> the inferlet (co-location).</p>
+      <p>A growing prefix is exactly what APC reuses: on turn 3 it recognizes turns 1–2 as cached and prefills only the new tail — the <strong>same computational saving</strong> Pie's session gives. So "multi-turn / agentic" is <em>not</em>, by itself, a Pie advantage, and <strong>the 95 % prefill saving is not what makes Pie faster here.</strong></p>
+      <p style="color:var(--ink-faint);font-size:.92rem;">This section survives the revision unchanged — it was never the flawed part. The corrected result does not contradict it; it <em>relocates</em> the win. Pie's margin comes from decode throughput and from no longer paying a self-inflicted per-call tax, not from out-reusing APC.</p>
     </div>
   </section>
 
@@ -218,13 +228,42 @@
       <tbody>
         <tr><td><strong>Baseline</strong></td><td>— (litellm→vLLM)</td><td>Python client</td><td>vLLM APC (implicit)</td><td>re-send full history; APC reuses prefix</td></tr>
         <tr><td>"pie" completion</td><td><code>openhands-completion</code></td><td>Python client</td><td>generic prefix-hash only</td><td>one stateless completion / call</td></tr>
-        <tr><td><strong>Pattern B</strong><br>coder-session</td><td><code>openhands-coder-session</code></td><td>Python client</td><td>named-snapshot session (= APC-equivalent)</td><td><strong>re-open + refresh snapshot every call</strong></td></tr>
+        <tr><td><strong>coder-session</strong></td><td><code>openhands-coder-session</code></td><td>Python client</td><td>content-addressed APC snapshots</td><td>render → hash → open longest match → append suffix</td></tr>
         <tr><td><strong>Pattern A</strong><br>agent</td><td><code>openhands-agent</code></td><td><strong>the inferlet</strong></td><td><strong>live in-memory ctx</strong> (never torn down)</td><td>append the new turn only</td></tr>
         <tr><td>Fork / delegation</td><td><code>coder-session</code> (fork)</td><td>Python client</td><td>fork share of parent's KV</td><td>child forks parent; ~0 re-prefill</td></tr>
       </tbody>
     </table></div>
     <div class="prose">
-      <p><strong>Pattern B vs Pattern A is the load-bearing distinction.</strong> In Pattern B the Python loop calls a <em>stateless</em> inferlet once per turn; the inferlet re-opens the session's KV snapshot and refreshes it (a <code>delete + save</code>) on every call. In Pattern A the entire loop lives inside one long-running inferlet, so the KV context is created once and simply appended to — no per-call teardown. Experiments <a href="#detail">#02, #06, #11</a> show that per-call teardown was most of Pattern B's 3.65× deficit.</p>
+      <p><strong>coder-session is the load-bearing variant</strong>, and the one all current results use. The reason is not performance but <strong>experimental validity</strong>: it runs the <em>real</em> upstream OpenHands agent, so the baseline and the Pie arm differ only in the engine. Pattern A reimplements the agent loop, which confounds any accuracy comparison — a win or loss cannot be attributed to Pie.</p>
+      <p style="color:var(--ink-faint);font-size:.92rem;"><b>Superseded:</b> the earlier version framed this as "Pattern B vs Pattern A is the load-bearing distinction", on the theory that coder-session's per-call teardown caused a 3.65× deficit. That teardown cost was the WebSocket close timeout, not session management — the whole session apparatus is under 9 ms per call. See §4.4.</p>
+    </div>
+
+    <h4 style="font-size:.96rem;margin:1.8rem 0 .2rem;color:var(--ink);font-weight:640;">Anatomy of coder-session <span style="font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);font-weight:600;">openhands-coder-session</span></h4>
+    <div class="prose">
+      <p>The inferlet is <strong>a completion endpoint, not an agent</strong>. Upstream OpenHands runs the loop on the host and issues one <code>launch_process</code> per LLM call, resending the <em>entire</em> message history each time. Everything the inferlet adds exists to avoid re-prefilling that history.</p>
+    </div>
+    <div class="tbl"><table>
+      <thead><tr><th>On the host (real OpenHands)</th><th>Inside the inferlet (WASM)</th></tr></thead>
+      <tbody>
+        <tr><td>The agent loop, prompts, condenser</td><td>Render history → tokens</td></tr>
+        <tr><td>All tools (terminal, file_editor, task_tracker)</td><td>Content-addressed KV prefix cache</td></tr>
+        <tr><td>Message history, resent in full per call</td><td>Decode + tool-call parsing</td></tr>
+      </tbody>
+    </table></div>
+    <ol class="steps">
+      <li><strong>Render</strong> — <code>render_prompt</code> turns the full message list into a token stream byte-identical to the stateless inferlet's, minus the trailing generation cue (omitted so the snapshot ends on a message boundary). It also returns <code>boundaries</code>: the token length at each <em>safe render-unit split</em> — after the system+tools block, after each user/assistant/system message, after each merged tool batch.</li>
+      <li><strong>Name</strong> — <code>content_hash(model_id ‖ TEMPLATE_MARKER ‖ prefix_tokens)</code>, two FNV-1a lanes as 32 hex chars, under <code>apc/{session_id}/{compat}/{hash}</code>. A name match means <em>identical tokens for the same model</em>, so a false hit is impossible; any drift in model, template, history or tool schemas changes the tokens, changes the hash, and misses cleanly.</li>
+      <li><strong>Look up</strong> — scan the boundaries <strong>longest-first</strong> (capped at 8 attempts), calling <code>Context::open</code> on <code>hash(full[..L])</code>; the most recent saved boundary wins. Each hit is gated on <code>seq_len() == L</code>, so a collision or a truncated snapshot is <em>rejected</em> rather than trusted. Candidates are slices of the caller's own render, so a bad split cannot plant a wrong suffix.</li>
+      <li><strong>Extend or rebuild</strong> — on a hit, append only <code>full_tokens[L..]</code>: the previous assistant turn plus new tool results, <strong>O(delta), not O(conversation)</strong> → mode <code>extended</code>. On a miss, a fresh <code>Context</code> and a full append → <code>rebuilt</code>. A miss is always semantically safe, just slower.</li>
+      <li><strong>Flush and verify</strong> — materialize the prompt KV; under <code>kv_verify</code>, assert <code>ctx.seq_len() == full_tokens.len()</code> and error rather than silently rebuilding.</li>
+      <li><strong>Save</strong> — store this render under <code>hash(full_tokens)</code>. A duplicate name means identical KV is already saved — benign, and ignored rather than delete-and-resave, which is what lets <strong>distinct boundaries coexist</strong>.</li>
+      <li><strong>Cue and decode</strong> — <code>ctx.cue()</code>, then decode against the stop-token set, with a streaming tool decoder parsing calls as tokens arrive and deduping identical <code>(name, arguments)</code> pairs within a turn.</li>
+      <li><strong>Teardown</strong> — on <code>session_action: "delete"</code>, remove both the legacy single-slot name <em>and</em> the whole <code>apc/{sid}/</code> namespace by prefix. Skipping this leaks a conversation's KV per conversation.</li>
+    </ol>
+    <div class="prose">
+      <p><strong>Why the naming rule is the load-bearing detail.</strong> Both save and lookup name a <strong>full host render</strong>, never a <em>predicted</em> assistant reply. An earlier version predicted the next turn's boundary from the inferlet's own text and tool_calls; the host re-serializes JSON arguments with different bytes, so <code>hash(predicted) ≠ hash(host resend)</code> and the hit rate collapsed to <strong>~3 %</strong>. Naming only full renders — which are append-only, so call <em>N</em>'s render reappears as an interior boundary of call <em>N+1</em> — restored <strong>96.6 %</strong>.</p>
+      <p><strong>What falls out for free.</strong> Because names are content-addressed and many boundaries coexist, a retry, a branch, or a truncation re-hits its still-valid earlier boundary automatically, and a delegated sub-agent sharing a task prefix hits the <em>parent's</em> boundary — with no explicit fork protocol and no host hints. The host sends nothing but <code>session_id</code>.</p>
+      <p><strong>What it costs.</strong> The entire apparatus is <strong>under 9 ms per call</strong> — render 6.8 ms, hash 0.3, open 0.6 across 1.97 attempts, save 0.6, fork 0.0 — against 92.9 % of the call spent in decode. A two-phase forced-tool-call path also exists for grammar mode, but <code>--python-tool-parser</code> sets <code>use_grammar: false</code>, so it is inert on the current path (0 of 753 calls).</p>
     </div>
 
     <h4 style="font-size:.96rem;margin:1.8rem 0 .2rem;color:var(--ink);font-weight:640;">Anatomy of Pattern A <span style="font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);font-weight:600;">openhands-agent</span></h4>
@@ -267,10 +306,11 @@
   <section id="ledger">
     <h2><span class="sn">3</span>Every experiment &amp; hypothesis</h2>
     <div class="legend">
+      <span class="li"><span class="chip good">win</span> Pie is faster</span>
       <span class="li"><span class="chip bad">loss / no win</span></span>
       <span class="li"><span class="chip diag">diagnostic</span> isolated a cause</span>
       <span class="li"><span class="chip good">mechanism works</span> but not a wallclock win</span>
-      <span class="li"><span class="chip neu">informational</span></span>
+      <span class="li"><span class="chip neu">superseded</span> do not cite</span>
     </div>
 
     <div class="ledger">
@@ -286,13 +326,13 @@
         <div class="jobs" style="margin-top:.6rem">jobs 19074533 / 19074534</div>
       </div>
 
-      <div class="card bad">
-        <div class="top"><span class="id">02</span><span class="name">OpenHands SWE-bench head-to-head</span><span class="chip bad">loss</span></div>
+      <div class="card neu" style="opacity:.72">
+        <div class="top"><span class="id">02</span><span class="name" style="text-decoration:line-through">OpenHands SWE-bench head-to-head</span><span class="chip neu">superseded</span></div>
         <dl>
-          <dt>Setup</dt><dd>13 SWE-bench-Verified instances, identical agent / tools / condenser / model; Pie <code>coder-session</code> (session KV-retain) vs litellm→vLLM w/ <code>caching_prompt</code> (APC), client on localhost.</dd>
+          <dt>Setup</dt><dd>13 SWE-bench-Verified instances, identical agent / tools / condenser / model; Pie <code>coder-session</code> vs litellm→vLLM w/ <code>caching_prompt</code> (APC), client on localhost.</dd>
           <dt>Hypothesis</dt><dd>Retaining KV across agent turns makes the loop faster than re-sending each turn.</dd>
-          <dt>Result</dt><dd class="res"><strong>Pie 3.65× slower</strong> total (7,227 s vs 1,978 s), 3.4×/iter, at ~matched iterations (961 vs 906). Yet Pie saved <strong>94.8 %</strong> of prefill (33,614 / 641,195 tokens), zero rebuilds.</dd>
-          <dt>Why</dt><dd>The baseline gets the same reuse via APC; localhost erases the round-trip win; Pie's per-turn overhead dominates. Not divergence — iterations match.</dd>
+          <dt>Result</dt><dd class="res"><s><strong>Pie 3.65× slower</strong> total (7,227 s vs 1,978 s), 3.4×/iter.</s> The prefill saving (<strong>94.8 %</strong>, zero rebuilds) was real and still stands.</dd>
+          <dt>Why it was wrong</dt><dd><strong>Superseded by #13.</strong> The deficit was the unanswered Close frame: <strong>468 calls</strong> — counted from the run's own log, not estimated — × 10 s ≈ <strong>4,680 s</strong>, i.e. ~89 % of the 5,249 s gap.</dd>
         </dl>
         <div class="jobs" style="margin-top:.6rem">jobs 18951267 / 18962143</div>
       </div>
@@ -320,13 +360,14 @@
       </div>
 
       <div class="card neu">
-        <div class="top"><span class="id">05</span><span class="name">Native-CUDA-driver offload</span><span class="chip neu">dropped</span></div>
+        <div class="top"><span class="id">05</span><span class="name">Native-CUDA driver</span><span class="chip diag">partly resolved</span></div>
         <dl>
-          <dt>Setup</dt><dd>Investigate building <code>--features driver-cuda</code> + swap pool to give Pie a real offload path.</dd>
+          <dt>Setup</dt><dd>Build <code>--features driver-cuda</code> + swap pool to give Pie a real offload path.</dd>
           <dt>Hypothesis</dt><dd>A native driver with a working swap pool lets effective KV exceed GPU RAM → Pie survives and wins overcommit.</dd>
-          <dt>Result</dt><dd class="res">Build succeeds and the SwapPool primitives exist, but offload is <strong>blocked on a missing aux-IPC (PIEA) listener</strong> in the cuda driver — a substantial port. <strong>Abandoned</strong> to stay on the vLLM driver.</dd>
-          <dt>Why</dt><dd>A real engineering gap, not a quick fix; deferred.</dd>
+          <dt>Result</dt><dd class="res"><strong>Built, and now the production backend</strong> for every result in this document — boots 30B in ~11 s, decodes correctly, snapshots verified. But <strong>swap is still not wired</strong>: the embedded path has no aux-IPC control-fd, so <code>swap_pool_size</code> must stay 0.</dd>
+          <dt>Why</dt><dd>The earlier version said this build was <em>abandoned</em>. It was not — the driver landed and everything since runs on it. What remains blocked is specifically <strong>offload</strong>.</dd>
         </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19188593, 19203530</div>
       </div>
 
       <div class="card diag">
@@ -334,8 +375,8 @@
         <dl>
           <dt>Setup</dt><dd><code>decode-bench</code> inferlet prefills L tokens, decodes exactly N; slope <code>(t₅₁₂−t₆₄)/448</code> cancels prefill to isolate pure decode tok/s; L = 2k / 5k / 20k / 50k.</dd>
           <dt>Hypothesis</dt><dd>Pie's decode slows over a long retained context (would explain the #02 per-turn gap).</dd>
-          <dt>Result</dt><dd class="res"><strong>Refuted</strong> — Pie flat <strong>~63 tok/s</strong> across 2k→50k; vLLM flat ~65. Pie decode ≈ vLLM, no collapse.</dd>
-          <dt>Why</dt><dd>With prefill (#02) and decode both ruled out, the OpenHands gap must be <strong>per-call session-management overhead</strong>, not raw inference. Corollary: mask-condense can't be a decode speedup.</dd>
+          <dt>Result</dt><dd class="res"><strong>Refuted</strong> — Pie flat <strong>~63 tok/s</strong> across 2k→50k; vLLM flat ~65. Decode does not degrade with context length.</dd>
+          <dt>Why</dt><dd><strong>Valid, and immune to the transport bug</strong> — a slope subtracts two timings, so a constant 10 s per call cancels exactly. This is <em>why</em> decode looked clean while every aggregate measurement was contaminated. Read it as "decode does not degrade with context", not as an absolute throughput figure.</dd>
         </dl>
         <div class="jobs" style="margin-top:.6rem">jobs 19078674 / 19078675</div>
       </div>
@@ -394,13 +435,13 @@
         </dl>
       </div>
 
-      <div class="card diag">
-        <div class="top"><span class="id">11</span><span class="name">Pattern A: loop-in-inferlet</span><span class="chip diag">confirms cause</span></div>
+      <div class="card neu" style="opacity:.72">
+        <div class="top"><span class="id">11</span><span class="name">Pattern A: loop-in-inferlet</span><span class="chip neu">misattributed</span></div>
         <dl>
-          <dt>Setup</dt><dd>Same 13 instances via <code>openhands-agent</code> (full loop in one live inferlet, tools over HTTP) vs the per-turn <code>coder-session</code> (#02).</dd>
+          <dt>Setup</dt><dd>Same 13 instances via <code>openhands-agent</code> (full loop in one live inferlet, tools over HTTP) vs the per-call <code>coder-session</code> (#02).</dd>
           <dt>Hypothesis</dt><dd>Keeping the ctx live across turns removes the per-call session overhead (#06) → back to parity.</dd>
-          <dt>Result</dt><dd class="res"><strong>Partly</strong> — Pattern A <strong>3.1× faster than coder-session</strong> (2,329 s vs 7,227 s), 34 %/iter (4.99 vs 7.52), 13/13 patches; but still <strong>1.18× slower total</strong> than litellm.</dd>
-          <dt>Why</dt><dd>Per-call session teardown <em>was</em> most of the #02 loss (mostly self-inflicted, not fundamental); good architecture approaches but doesn't beat vLLM on localhost.</dd>
+          <dt>Result</dt><dd class="res">Pattern A 2,329 s vs coder-session's 7,227 s and the baseline's 1,978 s.</dd>
+          <dt>Why it was wrong</dt><dd>Pattern A connects <strong>once per instance</strong>, so it paid the 10 s close ~13 times instead of 468. It was never "better architecture" — it was less exposure to the bug. Subtract the exposure and the 3.1× gap between the two Pie variants collapses to ~1.16×.</dd>
         </dl>
         <div class="jobs" style="margin-top:.6rem">job 19080944</div>
       </div>
@@ -414,6 +455,39 @@
           <dt>Why</dt><dd>Sets the noise floor; also why #07b / #11 carry trajectory-variance caveats.</dd>
         </dl>
         <div class="jobs" style="margin-top:.6rem">job 19039792</div>
+      </div>
+
+      <div class="card good" style="border-width:2px">
+        <div class="top"><span class="id">13</span><span class="name">OpenHands head-to-head, corrected</span><span class="chip good">★ win</span></div>
+        <dl>
+          <dt>Setup</dt><dd>The same 13 instances, on the native CUDA driver with self-keyed APC, after the snapshot-leak fix (<code>f1aac6eb</code>) and the Close-frame fix (<code>e4626e5b</code>).</dd>
+          <dt>Hypothesis</dt><dd>With the dead time removed, does Pie beat the baseline?</dd>
+          <dt>Result</dt><dd class="res"><strong>Yes — 1,430.4 s vs 1,938.9 s (~26 % faster, 1.36×)</strong>. All 13 complete; every instance <code>modes={rebuilt:1, extended:N}</code> (95 %+ reuse); 0 kv-verify errors; 97,343 tokens at 90.1 tok/s decode.</dd>
+          <dt>Why</dt><dd><strong>Supersedes #02 and #11.</strong> The margin is decode throughput, not prefix reuse — §1 still holds. Wallclock is measured independently per arm, so it carries none of the selection bias affecting the accuracy comparison.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19251912 / 19251913</div>
+      </div>
+
+      <div class="card diag">
+        <div class="top"><span class="id">14</span><span class="name">Where a call's time actually goes</span><span class="chip diag">found the bug</span></div>
+        <dl>
+          <dt>Setup</dt><dd>A <code>Timings</code> struct inside the inferlet plus <code>host_ms</code> measured around the whole round trip, so <code>host_ms − timings.total_ms</code> isolates transport.</dd>
+          <dt>Hypothesis</dt><dd>The per-call overhead is in re-rendering the history, hashing, or the per-call <code>ctx.fork()</code>.</dd>
+          <dt>Result</dt><dd class="res">Accounting closes to 0.1 ms: <strong>decode 92.9 %, prefill 6.9 %, and the entire APC apparatus under 9 ms</strong> (render 6.8, hash 0.3, open 0.6 @1.97 attempts, save 0.6, fork 0.0). Transport was <strong>10009.4 ms</strong>.</dd>
+          <dt>Why</dt><dd>Killed the re-render and per-call-fork suspicions outright and located the real cost. The 0.5 ms spread across 32 samples is what identified it as a timeout rather than work.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19245724, 19249847, 19251176</div>
+      </div>
+
+      <div class="card neu">
+        <div class="top"><span class="id">15</span><span class="name">Neutral 50-instance accuracy</span><span class="chip neu">pending</span></div>
+        <dl>
+          <dt>Setup</dt><dd>The full 50-instance subset the 13 were drawn from — a fixed-seed deterministic sample of SWE-bench Verified, chosen before any Pie result existed.</dd>
+          <dt>Hypothesis</dt><dd>Is Pie's accuracy equal to the baseline's on a set that <em>can</em> show a difference?</dd>
+          <dt>Result</dt><dd class="res">Baseline half already scored at <strong>13/50</strong> under identical settings. Pie arm in flight.</dd>
+          <dt>Why</dt><dd>Every accuracy comparison so far ran on the baseline's own wins, where parity is the ceiling. This is the first that can show Pie ahead.</dd>
+        </dl>
+        <div class="jobs" style="margin-top:.6rem">jobs 19276292 / 19276293</div>
       </div>
 
     </div>
@@ -434,20 +508,30 @@
         <tr><td class="num">64</td><td class="num" style="color:var(--bad)">71.5 s</td><td class="num">7.1 s</td></tr>
       </tbody>
     </table></div>
-    <div class="prose"><p>N=1 tie → the <code>pie-serve → vLLM-driver</code> layer has no overhead. Pie scales ~linearly while vLLM stays flat: fork saved prefill perfectly (N=64: <code>leaves_prefill=0</code>, 667,926 tokens) but the child decodes are serialized instead of batched. The huge prefill saving buys zero wallclock.</p></div>
+    <div class="prose"><p>N=1 tie → the <code>pie-serve → vLLM-driver</code> layer has no overhead. Pie scales ~linearly while vLLM stays flat: fork saved prefill perfectly (N=64: <code>leaves_prefill=0</code>, 667,926 tokens) but the child decodes are serialized instead of batched. The huge prefill saving buys zero wallclock.</p>
+      <p style="color:var(--ink-faint);font-size:.92rem;"><b>This result survives the revision</b>, and the N=1 tie at 5.5 s is the proof: had this harness paid the 10 s close timeout, no data point could have come in under 10 s. It holds one connection across the benchmark. The serial-fork-decode gap is a genuine Pie engine limitation.</p></div>
 
-    <h3>4.2 · OpenHands SWE-bench head-to-head</h3>
+    <h3>4.2 · OpenHands SWE-bench head-to-head <span style="color:var(--good);font-family:var(--mono);font-size:.72rem">— corrected</span></h3>
+    <div class="thesis" style="border-left-color:var(--bad);padding:.9rem 1.1rem;margin-bottom:1.1rem;">
+      <p style="margin:0;font-size:.93rem;"><b>The 2026-07-21 numbers in this section were wrong</b> — <s>7,227 s vs 1,978 s, "Pie 3.65× slower"</s>. They are kept struck through because the <em>shape</em> of the error is instructive: every mechanism-level measurement said Pie should be fine, and only the aggregate said otherwise. That contradiction was the signal, and it was misread three times before anyone measured the layer directly.</p>
+    </div>
     <div class="tbl"><table>
       <thead><tr><th>Metric</th><th class="num">Pie coder-session</th><th class="num">litellm + vLLM</th><th class="num">Ratio</th></tr></thead>
       <tbody>
-        <tr><td>Total time</td><td class="num">7,227 s</td><td class="num">1,978 s</td><td class="num" style="color:var(--bad)">3.65× slower</td></tr>
-        <tr><td>Total iters</td><td class="num">961</td><td class="num">906</td><td class="num">~matched</td></tr>
-        <tr><td>Per iteration</td><td class="num">7.52 s</td><td class="num">2.18 s</td><td class="num" style="color:var(--bad)">3.4× slower</td></tr>
+        <tr><td>Solve time, 13 instances</td><td class="num">1,430.4 s</td><td class="num">1,938.9 s</td><td class="num" style="color:var(--good)">26 % faster (1.36×)</td></tr>
+        <tr><td>django-13028</td><td class="num">140.6 s / 68 it</td><td class="num">246.7 s / 88 it</td><td class="num" style="color:var(--good)">1.75× faster</td></tr>
+        <tr><td>Decode throughput</td><td class="num">90.1 tok/s</td><td class="num">~64 tok/s</td><td class="num" style="color:var(--good)">~1.4×</td></tr>
+        <tr><td>KV reuse</td><td class="num">95 %+ (all 13)</td><td class="num">APC (implicit)</td><td class="num">—</td></tr>
+        <tr><td>kv-verify errors</td><td class="num">0</td><td class="num">n/a</td><td class="num">—</td></tr>
       </tbody>
     </table></div>
-    <div class="prose"><p>KV-retention works (94.8 % prefill saved, zero rebuilds) — prefill is not the problem, and it's not divergence (iterations match). The baseline gets the same reuse via APC, localhost erases the round-trip win, and the coder-session uses <em>no masking</em> — naive prefix-extend-or-rebuild, functionally identical to APC. Both win-mechanisms neutralized → Pie loses on per-turn overhead.</p></div>
+    <div class="prose">
+      <p>Totals are the sum of per-instance solve times from each run's own log, which excludes one-time engine startup (where Pie's ~11 s model load is itself an advantage). For scale: <code>django-13028</code> took <strong>524.7 s on Pie before the Close-frame fix</strong> and 140.6 s after — against the baseline's 246.7 s, the same instance went from 2.1× slower to 1.75× faster.</p>
+      <p><strong>Accuracy: Pie 11/13, baseline 13/13</strong> — both resolved 11; only-baseline is <code>pydata__xarray-4966</code> and <code>scikit-learn__scikit-learn-10908</code>; only-Pie is none. Both losses are model-side, not machinery. <code>xarray-4966</code> is a <em>wrong fix</em> (patch applied cleanly, PASS_TO_PASS 21/21, FAIL_TO_PASS 0/4). <code>sklearn-10908</code> is a <strong>0-byte patch</strong> after 63 calls: at call 19 the model corrupted its own workspace path, dropping <code>learn-</code>, then thrashed — every <code>str_replace</code> targeted a nonexistent file. All 63 tool calls were well-formed and parsed, with no grammar or KV involvement.</p>
+      <p><strong>The 13/13 is by construction.</strong> These 13 instances <em>are</em> the baseline's <code>resolved_ids</code>, so it cannot score below 13/13 on its own wins and parity is Pie's ceiling. Honest phrasing: <em>"reproduces 11 of 13"</em>, not <em>"2 worse"</em>. The failure set also <strong>moved</strong> relative to an earlier 11/13 run (which missed <code>django-13028</code> and <code>sklearn-12973</code>, both now passing) — trajectory divergence (#12), not regression.</p>
+    </div>
 
-    <h3>4.3 · Decode throughput vs context length <span style="color:var(--diag);font-family:var(--mono);font-size:.72rem">— the decisive isolation</span></h3>
+    <h3>4.3 · Decode throughput vs context length <span style="color:var(--diag);font-family:var(--mono);font-size:.72rem">— the one clean measurement</span></h3>
     <div class="tbl"><table>
       <thead><tr><th class="num">Context L</th><th class="num">Pie decode</th><th class="num">vLLM decode</th></tr></thead>
       <tbody>
@@ -457,18 +541,26 @@
         <tr><td class="num">50 k</td><td class="num">63.1 tok/s</td><td class="num">64.8 tok/s</td></tr>
       </tbody>
     </table></div>
-    <div class="prose"><p>Both flat, within ~4 %. Pie decode does <strong>not</strong> collapse with context. Combined with §4.2 (prefill saved), this rules out both raw-inference axes as the cause of the OpenHands loss — the remaining suspect is the <strong>session-management path</strong> (per-call snapshot open + refresh, <code>kv_verify</code>). Corollary: mask-condense would not speed up decode; its value is purely the structural mid-context drop APC can't express.</p></div>
+    <div class="prose">
+      <p>Both flat, within ~4 %. Pie decode does <strong>not</strong> collapse with context — and this measurement <strong>was never contaminated</strong>, for a reason worth stating: the slope <code>(t₅₁₂ − t₆₄)/448</code> subtracts two timings, so a <em>constant</em> per-call cost, including a 10 s close timeout, cancels exactly. Decode looked clean because the metric was constructed to be immune to the thing that was wrong — which is also why it never pointed at the problem.</p>
+      <p><strong>Two claims read off this bench were wrong and are retracted.</strong> <s>"Native-cuda decode throughput is the bottleneck"</s> — decode is at parity, per the slope above. <s>"Pie pays a ~60× per-call context-proportional overhead"</s> — read off the <code>t₆₄</code> intercept by misinterpreting <code>prefill_M64: 0</code> as a cache hit. It is <code>ctx.seq_len()</code> <em>before</em> flush, a reporting artifact: <code>decode-bench</code> builds a fresh <code>Context</code> per call and <strong>never caches</strong>, while vLLM's server APC <em>was</em> hitting, so the intercept compared Pie-uncached against vLLM-cached. Pie's 4.94 s at L=50k is an ordinary uncached prefill at ~10.1k tok/s.</p>
+      <p>Note also that in the corrected head-to-head Pie's <em>effective</em> decode throughput is <strong>90.1 tok/s</strong> — well above this microbenchmark's flat ~63. That gap is a property of the bench, not the engine: it decodes a short burst from a cold context, while the real workload decodes into a warm, extended session. Read §4.3 as "decode does not degrade with context length", not as an absolute throughput figure.</p>
+    </div>
 
-    <h3>4.4 · Pattern A: loop-in-inferlet</h3>
+    <h3>4.4 · Pattern A: loop-in-inferlet <span style="color:var(--neutral);font-family:var(--mono);font-size:.72rem">— reinterpreted</span></h3>
     <div class="tbl"><table>
-      <thead><tr><th>Arm</th><th class="num">Total (13 inst.)</th><th class="num">Iters</th><th class="num">s/iter</th></tr></thead>
+      <thead><tr><th>Arm</th><th class="num">Total (13 inst.)</th><th class="num">Connections</th><th class="num">Close-timeout exposure</th><th class="num">Total less exposure</th></tr></thead>
       <tbody>
-        <tr><td>litellm + vLLM (baseline)</td><td class="num">1,978 s</td><td class="num">906</td><td class="num">2.18</td></tr>
-        <tr><td><strong>Pattern A</strong> (live ctx)</td><td class="num">2,329 s</td><td class="num">467</td><td class="num" style="color:var(--diag)">4.99</td></tr>
-        <tr><td>Pattern B (coder-session)</td><td class="num">7,227 s</td><td class="num">961</td><td class="num" style="color:var(--bad)">7.52</td></tr>
+        <tr><td>litellm + vLLM (baseline)</td><td class="num">1,978 s</td><td class="num">n/a</td><td class="num">none</td><td class="num">1,978 s</td></tr>
+        <tr><td><strong>Pattern A</strong> (live ctx)</td><td class="num">2,329 s</td><td class="num">13</td><td class="num">~130 s</td><td class="num">~2,199 s</td></tr>
+        <tr><td>coder-session (per-call)</td><td class="num">7,227 s</td><td class="num">468</td><td class="num" style="color:var(--bad)">~4,680 s</td><td class="num">~2,547 s</td></tr>
       </tbody>
     </table></div>
-    <div class="prose"><p>Pattern A is <strong>3.1× faster than the coder-session</strong> and 34 % faster per iteration — the per-call session teardown was a real, large chunk of the loss. But it's still 1.18× slower total than litellm. Caveats: it's a <em>different, simpler</em> agent loop (467 vs 906 iters, which flatters its total); since decode is at parity, the per-iter residual is most plausibly tokens-per-iteration differences, not a Pie inference gap.</p></div>
+    <div class="prose">
+      <p>The original reading was that Pattern A's live context removed a real per-call session-management cost, proving architecture was the issue. <strong>That conclusion was largely an artifact.</strong> The variable that tracked the timings was <em>how many WebSocket connections each variant opened</em>, because each one cost a flat 10 s. Pattern A looked good because it connects once per instance, not once per call. Call counts are from each run's own log, not estimated.</p>
+      <p>Subtract the exposure and the 3.1× gap between the two Pie variants collapses to roughly 1.16× — and even that residual is not architecture, because the two runs did different amounts of work (961 vs 467 iterations). §4.3's instrumentation settles it directly: the entire session apparatus — render, hash, snapshot open, save, fork — totals <strong>under 9 ms per call</strong>. There was no meaningful per-call session overhead to remove.</p>
+      <p style="color:var(--ink-faint);font-size:.92rem;">Treat the subtracted column as an estimate: it assumes exactly one full 10 s timeout per connection, which the later direct measurement (10009.4 ms mean, 0.5 ms spread) supports but which was not instrumented during these two runs.</p>
+    </div>
 
     <h3>4.4b · Mask-condense inside Pattern A <span style="color:var(--ink-faint);font-family:var(--mono);font-size:.72rem">— the APC-impossible lever</span></h3>
     <div class="tbl"><table>
@@ -478,10 +570,23 @@
         <tr><td>Mask</td><td class="num">2,374 s</td><td class="num">441</td><td class="num">5.38</td><td>7 × mask-range (0 summary, 0 re-prefill)</td></tr>
       </tbody>
     </table></div>
-    <div class="prose"><p>Mask engaged correctly (zero summaries, zero re-prefill) and kept 13/13 patches — but it's a wash on wallclock (~2 % slower). The only cost it removes caps at ~3 % of runtime, and engine non-determinism swings trajectories far more than that. Even the one structural lever APC cannot match yields no measurable single-GPU win — it would only matter under memory pressure or with a slow / expensive summarizer.</p></div>
+    <div class="prose">
+      <p>Mask engaged correctly (zero summaries, zero re-prefill) and kept 13/13 patches — but it's a wash on wallclock (~2 % slower). The only cost it removes caps at ~3 % of runtime, and engine non-determinism swings trajectories far more than that. Even the one structural lever APC cannot match yields no measurable single-GPU win — it would only matter under memory pressure or with a slow / expensive summarizer.</p>
+      <p style="color:var(--ink-faint);font-size:.92rem;">This conclusion is only mildly affected by the transport fix: both arms are Pattern A, so both carried the same ~130 s of exposure, and the comparison between them stays valid.</p>
+    </div>
 
     <h3>4.5 · Memory-pressure / overcommit</h3>
-    <div class="prose"><p>Both engines share the same 244,704-token cache. At conc that barely fits, vLLM is slightly faster; at 1.9× overcommit, <strong>Pie OOM-crashes</strong> (no CPU-swap backstop on the vLLM driver) while vLLM degrades gracefully via APC evict + recompute. The "atomic fork + offload beats APC" thesis does not hold — Pie hits the wall at the same working-set size and crashes before it can exploit APC's weakness.</p></div>
+    <div class="prose">
+      <p>Both engines share the same 244,704-token cache. At conc that barely fits, vLLM is slightly faster; at 1.9× overcommit, <strong>Pie OOM-crashes</strong> while vLLM degrades gracefully via APC evict + recompute. Pie oversubscribes ~4× betting on swap, but the vLLM driver has no swap and bootstrap pins <code>swap_pool_size</code> to 0, so the bet has no backstop; admission control at 1.0 does not help either, being a soft market weight that also relies on swap.</p>
+      <p><strong>Update:</strong> the earlier version said this build was <em>abandoned</em>. It was not — the <strong>native CUDA driver was built and is now the production backend</strong> for every result in this document. What remains blocked is specifically <strong>offload</strong>: the embedded driver has no aux-IPC control-fd wiring, so the swap pool cannot be driven. The overcommit conclusion stands, but for a narrower reason than "we didn't build it".</p>
+      <p>The native driver's hard KV allocation is also what turned the snapshot leak into a hang rather than a slowdown: with no eviction path, exhausting the 4096-page budget blocks instead of degrading.</p>
+    </div>
+
+    <h3>4.7 · Neutral accuracy set <span style="color:var(--neutral);font-family:var(--mono);font-size:.72rem">— in flight</span></h3>
+    <div class="prose">
+      <p>Every accuracy comparison so far ran on the 13 instances that are the baseline's own wins, where parity is the ceiling. The neutral set is the <strong>50-instance subset those 13 were drawn from</strong> — a fixed-seed deterministic sample of SWE-bench Verified, chosen before any Pie result existed.</p>
+      <p>The baseline half is already scored: <strong>13/50</strong>, same model, temperature 0, 100 iterations, same <code>qwen3_coder</code> parser. Only the Pie arm was missing. Instance ids are read out of the baseline's own report rather than regenerated, so both arms are provably the same 50. <strong>This is the first comparison on which Pie can come out ahead on accuracy.</strong></p>
+    </div>
   </section>
 
   <!-- 5 -->
@@ -514,12 +619,13 @@ ctx.system(SYSTEM_PROMPT); ctx.user("Question: …"); ctx.cue();
   <!-- 6 -->
   <section id="could-win">
     <h2><span class="sn">6</span>Where a real Pie win could still live</h2>
-    <div class="prose"><p>None is single-GPU-localhost-wallclock:</p></div>
     <ul class="clean">
+      <li><strong style="color:var(--good)">★ Agentic wallclock on the native CUDA driver</strong> → <em>achieved</em> (§4.2), driven by decode throughput rather than prefix reuse.</li>
       <li><strong>A genuine network gap</strong> between workers and the server → vLLM pays re-transmit + round-trip that Pie's server-side session avoids. The paper's dominant small-model mechanism; does not trigger Pie's OOM.</li>
       <li><strong>Mask-condense (structural, APC-impossible)</strong> → at condensation points the summarizing baseline emits new text → APC miss → re-prefill; Pie drops the stale middle and keeps the rest valid. A re-prefill-avoidance + capability win (not a decode speedup) — and, per §4.4b, only pays off under pressure.</li>
       <li><strong>Effective-KV &gt; GPU with working offload</strong> → the only regime where fork + restore structurally beats APC-evict-recompute; blocked on the native-driver swap path.</li>
       <li><strong>Fix decode batching across forks</strong> → turns the fan-out loss into a tie, not a win.</li>
+      <li><strong>Accuracy on a neutral set</strong> → in flight (§4.7).</li>
     </ul>
   </section>
 
@@ -527,16 +633,25 @@ ctx.system(SYSTEM_PROMPT); ctx.user("Question: …"); ctx.cue();
   <section id="conclusions">
     <h2><span class="sn">7</span>Conclusions</h2>
     <ul class="clean">
-      <li><strong>Pie's KV-reuse mechanisms are real and large</strong> (94.8 % prefill saved in OpenHands; 668k tokens in fan-out; organic cross-worker reuse; 99.7 % on fork delegation). They are <strong>not wallclock wins</strong> because vLLM APC captures the same reuse for free when it fits.</li>
-      <li><strong>On a single local GPU, Pie's best case is a tie</strong> (N=1 fan-out + decode-parity). Every tie-breaker is either blocked by a Pie engine gap (serial fork-decode; OOM under pressure; per-call session overhead) or matched by APC.</li>
-      <li><strong>Architecture matters a lot.</strong> The stateless coder-session was 3.65× slower; the loop-in-inferlet agent recovered most of that (3.1× faster), landing 1.18× off the baseline — so the huge deficit was mostly self-inflicted, not fundamental. But even the good architecture only <em>approaches</em> parity on localhost.</li>
-      <li>The <strong>paper's agentic win is genuine but conditional</strong> — small model, real network, many I/Os, concurrency, in-WASM tools — and our Python/bash-tool workloads on localhost with a big model satisfy none of them.</li>
-      <li>The honest, defensible contribution is <strong>deterministic prefill/token elimination + programmability</strong> (strategies APC cannot express), which matters for compute / energy / cost — not a wallclock win, unless one of the §6 conditions is built.</li>
+      <li><strong style="color:var(--good)">★ Pie is ~26 % faster than litellm + vLLM on the agentic SWE-bench workload</strong> (1,430.4 s vs 1,938.9 s over 13 instances, a 1.36× speedup), with 95 %+ KV reuse and zero kv-verify errors. This supersedes the previous version's "3.65× slower".</li>
+      <li><strong>The reversal was one unanswered WebSocket Close frame.</strong> A flat 10 s per call, on a connection-per-call client. It is now ~4 ms.</li>
+      <li><strong>The win is not the prefix reuse.</strong> §1 still holds — APC captures the same reuse when the working set fits, and the entire APC apparatus costs under 9 ms per call. The margin comes from <strong>decode throughput</strong> (90.1 tok/s pure decode, 80.5 end-to-end, vs ~64).</li>
+      <li><strong>Pie's KV-reuse mechanisms are real and large</strong> (95 %+ prefill saved in OpenHands; 668k tokens in fan-out; organic cross-worker reuse; 99.7 % on fork delegation) — but they are a <strong>compute / energy / cost</strong> argument, not the source of the wallclock win.</li>
+      <li><strong>Genuine Pie limitations remain</strong>: forked decodes are serialized (§4.1), and overcommit OOMs because offload is not wired into the embedded driver (§4.5).</li>
+      <li><strong>No accuracy claim is established yet.</strong> 11/13 on a set whose ceiling is parity says only "reproduces the baseline's wins". §4.7 is the run that can say more.</li>
+    </ul>
+
+    <h3 style="margin-top:2rem">Method lessons <span style="color:var(--ink-faint);font-family:var(--mono);font-size:.72rem">— the expensive ones</span></h3>
+    <ul class="clean">
+      <li><strong>Measure the layer, don't divide the aggregate.</strong> Three wrong conclusions came from dividing wallclock by a count: "3.65× slower per call", "13.5 s/call vs 3.9" (which silently bundled <em>tool execution</em> into "engine time"), and "60× per-call overhead". Each survived because it was arithmetically consistent with a true total.</li>
+      <li><strong>Sub-millisecond variance across dozens of samples is a timeout, not work.</strong> 10009.4 mean / 10010.4 median / 10010.5 max named the bug before any code was read.</li>
+      <li><strong>A metric built to cancel a constant will hide a constant bug.</strong> The decode slope (§4.3) was the one clean measurement precisely because it subtracted the 10 s away — which is also why it never pointed at the problem.</li>
+      <li><strong>Validate at the scale you will run at.</strong> The snapshot leak was invisible across every prior validation because all of them were single-instance.</li>
     </ul>
   </section>
 
   <div class="foot">
-    Artifacts &amp; jobs — fan-out 19074533/19074534 · OpenHands 18951267/18962143 · decode-tps 19078674/19078675 · Pattern A 19080944 · mask 19089013 · fork delegation 19039792 · memory-pressure 19068668/19068669 · OpenEvolve 19065839 · mask-quality 19070781. Source: <code>PIE_VS_VLLM_EVALUATION.md</code>. Paper: Gim, Ma, Lee, Zhong — <em>Pie</em>, SOSP '25.
+    Artifacts &amp; jobs — <strong>corrected head-to-head 19251912/19251913</strong> · <strong>neutral 50 (pending) 19276292/19276293</strong> · baseline-on-50 18397164 · timing probes 19245724/19249847/19251176 · native CUDA driver 19188593/19203530 · fan-out 19074533/19074534 · superseded head-to-head 18951267/18962143 · decode-tps 19078674/19078675 · Pattern A 19080944 · mask 19089013 · fork delegation 19039792 · memory-pressure 19068668/19068669 · OpenEvolve 19065839 · mask-quality 19070781. Fixes: Close frame <code>e4626e5b</code>, snapshot leak <code>f1aac6eb</code>. Source: <code>PIE_VS_VLLM_EVALUATION.md</code>. Paper: Gim, Ma, Lee, Zhong — <em>Pie</em>, SOSP '25.
   </div>
 
 </div>
