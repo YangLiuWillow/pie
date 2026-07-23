@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV=$SCRIPT_DIR/.venv
 PIE_VENV=/nfs/roberts/scratch/pi_ql324/ly337/pie-vllm-env
-HF_HOME=/nfs/roberts/scratch/pi_ql324/ly337/hf_cache
+HF_HOME=${HF_HOME:-/nfs/roberts/scratch/pi_ql324/ly337/hf_cache}
 LOG_DIR=$SCRIPT_DIR/logs
 PRED_DIR=$SCRIPT_DIR/predictions
 VLLM_PORT=18000

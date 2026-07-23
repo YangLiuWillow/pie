@@ -43,12 +43,20 @@ HARNESS_BACKEND=$BACKEND
 SESSION_ARGS=()
 if [ "$BACKEND" = "pie-session" ]; then
     HARNESS_BACKEND=pie
-    SESSION_ARGS+=(--pie-session)
-    if [ "${KV_VERIFY:-0}" = "1" ]; then
-        SESSION_ARGS+=(--kv-verify)
-    fi
-    if [ "${NO_GRAMMAR:-0}" = "1" ]; then
-        SESSION_ARGS+=(--no-grammar)
+    # STATELESS=1 runs the SAME coder-session inferlet but omits --pie-session,
+    # so the inferlet rebuilds (full re-prefill) every call. This is the clean
+    # "no acceleration" control for measuring what the session snapshot buys
+    # (Pie's driver has no vLLM prefix caching, so stateless truly re-prefills).
+    if [ "${STATELESS:-0}" = "1" ]; then
+        :  # no session flags — kv-verify/no-grammar require a session
+    else
+        SESSION_ARGS+=(--pie-session)
+        if [ "${KV_VERIFY:-0}" = "1" ]; then
+            SESSION_ARGS+=(--kv-verify)
+        fi
+        if [ "${NO_GRAMMAR:-0}" = "1" ]; then
+            SESSION_ARGS+=(--no-grammar)
+        fi
     fi
 fi
 

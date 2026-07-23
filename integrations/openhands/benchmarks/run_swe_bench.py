@@ -77,6 +77,13 @@ def main(argv: list[str] | None = None) -> int:
                         "model emits its native ChatML tool-call format and "
                         "the inferlet decoder parses it unconstrained — "
                         "parity with an unconstrained vLLM baseline.")
+    p.add_argument("--python-tool-parser", action="store_true",
+                   help="Parse tool calls host-side with a verbatim port of "
+                        "vLLM's qwen3_coder parser (the parser the litellm "
+                        "baseline runs) instead of the inferlet's Rust decoder. "
+                        "Implies --no-grammar and skips the JSON few-shot "
+                        "examples so the model emits native Qwen3-Coder XML. "
+                        "Maximizes tool-call parity with the baseline.")
     p.add_argument("--pie-request-timeout-s", type=float, default=1800.0,
                    help="Per-completion timeout in seconds (Pie backend only). "
                         "Default 1800s; one agent step on a CPU model can exceed 600s "
@@ -111,6 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--resume", action="store_true",
                    help="Skip instances already present in the output file. "
                         "Useful for resuming after preemption.")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Number of instances to solve concurrently against one "
+                        "Pie server (default 1 = serial). Raising this is the "
+                        "primary throughput lever: it fills the runtime's decode "
+                        "batch. vLLM self-regulates against KV memory, so "
+                        "over-subscribing queues rather than OOMs. Bound in "
+                        "practice by host CPU/sandboxes (--cpus-per-task).")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--log-completions", type=Path, default=None,
                    help="If set, write raw LLM request/response JSON per completion "
@@ -129,6 +143,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--context-token-limit", type=int, default=None,
                    help="Context token limit for pie-agent inferlet "
                         "(default 28000 in the inferlet).")
+    p.add_argument("--num-branches", type=int, default=1,
+                   help="Fork test-time scaling (pie-agent only): number of "
+                        "candidate branches. 1 = single trajectory.")
+    p.add_argument("--branch-at-step", type=int, default=0,
+                   help="Fork before generating step branch_at_step+1 "
+                        "(pie-agent fork). Branches share steps 1..branch_at_step.")
+    p.add_argument("--top-p", type=float, default=1.0,
+                   help="Top-p nucleus sampling for pie-agent fork branches "
+                        "(used with --temperature > 0).")
 
     args = p.parse_args(argv)
 
@@ -166,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
             backend_kwargs["pie_kv_verify"] = True
         if args.no_grammar:
             backend_kwargs["pie_use_grammar"] = False
+        if args.python_tool_parser:
+            backend_kwargs["pie_python_tool_parser"] = True
         if args.model:
             backend_kwargs["model"] = args.model
     elif args.backend == "pie-agent":
@@ -177,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
         backend_kwargs["max_steps"] = args.max_iterations
         if args.context_token_limit is not None:
             backend_kwargs["context_token_limit"] = args.context_token_limit
+        # Fork test-time scaling passthrough (num_branches=1 → single trajectory).
+        backend_kwargs["num_branches"] = args.num_branches
+        backend_kwargs["branch_at_step"] = args.branch_at_step
+        backend_kwargs["top_p"] = args.top_p
+        if args.temperature is not None:
+            backend_kwargs["temperature"] = args.temperature
 
     options = swe_bench.RunOptions(
         backend=args.backend,
@@ -191,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path=args.output,
         label=args.label or f"{args.backend}+{args.model or 'default'}",
         resume=args.resume,
+        concurrency=args.concurrency,
     )
 
     try:

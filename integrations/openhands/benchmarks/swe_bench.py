@@ -54,7 +54,9 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,6 +130,10 @@ class Prediction:
     per_step: list[dict[str, Any]] = field(default_factory=list)
     # KV-session telemetry (populated by the pie backend with --pie-session).
     pie_session: dict[str, Any] = field(default_factory=dict)
+    # Fork test-time scaling: K candidate patches (one per forked branch). The
+    # top-level model_patch is branch 0; best-of-K is computed downstream by
+    # bestofk_split.py + scoring each candidate file.
+    candidates: list[dict[str, Any]] = field(default_factory=list)
 
     def to_jsonl(self) -> str:
         return json.dumps({
@@ -148,6 +154,7 @@ class Prediction:
                 "tool_s": round(self.tool_s, 3),
                 "per_step": self.per_step,
                 "pie_session": self.pie_session,
+                "candidates": self.candidates,
             },
         })
 
@@ -185,14 +192,37 @@ def checked_out_repo(problem: Problem, *, cache_dir: Path | None = None) -> Iter
             yield _clone_into(Path(tmp), problem, cache_dir)
 
 
+class _Aborted(Exception):
+    """Raised by a worker that declines to start because the run is aborting."""
+
+
+# Per-bare-path locks guarding the shared cache_dir clones (see _clone_into).
+_bare_clone_locks: dict[str, threading.Lock] = {}
+_bare_clone_locks_guard = threading.Lock()
+
+
+def _bare_clone_lock(key: str) -> threading.Lock:
+    with _bare_clone_locks_guard:
+        return _bare_clone_locks.setdefault(key, threading.Lock())
+
+
 def _clone_into(base: Path, problem: Problem, cache_dir: Path | None) -> Path:
     ws = base / "repo"
     url = f"https://github.com/{problem.repo}.git"
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         bare = cache_dir / (problem.repo.replace("/", "__") + ".git")
-        if not bare.exists():
-            _run(["git", "clone", "--bare", url, str(bare)])
+        # The bare clone is shared across all instances of the same repo, so
+        # under --concurrency two threads solving two instances of that repo
+        # would otherwise race on the check-then-clone below. Serialize the
+        # create per bare path, and publish atomically via a tmp-then-rename so
+        # a concurrent reader never sees a half-written bare repo.
+        with _bare_clone_lock(str(bare)):
+            if not bare.exists():
+                tmp_bare = bare.with_name(bare.name + ".tmp")
+                shutil.rmtree(tmp_bare, ignore_errors=True)
+                _run(["git", "clone", "--bare", url, str(tmp_bare)])
+                tmp_bare.rename(bare)
         _run(["git", "clone", str(bare), str(ws)])
     else:
         _run(["git", "clone", "--depth", "200", url, str(ws)])
@@ -663,6 +693,13 @@ async def _run_agent_inferlet(
     idle_timeout_s: float = 300.0,
     instance_timeout_s: float = 1200.0,
     context_token_limit: int | None = None,
+    num_branches: int = 1,
+    branch_at_step: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    condense_mode: str = "rebuild",
+    condense_keep_recent: int = 12,
+    dump_trajectory: bool = False,
 ) -> dict[str, Any]:
     """Launch the openhands-agent inferlet and wait for it to finish.
 
@@ -679,6 +716,15 @@ async def _run_agent_inferlet(
     recv_timeout = min(timeout_s, idle_timeout_s)
     deadline = time.monotonic() + instance_timeout_s
 
+    # Env-var override for the condensation strategy so a benchmark can flip
+    # "rebuild" (summarize-LLM-call + re-prefill) vs "mask" (drop stale-middle
+    # KV out of attention — 0 re-prefill, no summary call) without threading
+    # the flag through every layer. Set PIE_OH_CONDENSE_MODE=mask to test it.
+    condense_mode = os.environ.get("PIE_OH_CONDENSE_MODE", condense_mode)
+    condense_keep_recent = int(
+        os.environ.get("PIE_OH_CONDENSE_KEEP_RECENT", condense_keep_recent)
+    )
+
     input_payload = {
         "task": task,
         "tool_server_url": tool_server_url,
@@ -687,6 +733,18 @@ async def _run_agent_inferlet(
     }
     if context_token_limit is not None:
         input_payload["context_token_limit"] = context_token_limit
+    # Test-time-scaling fork params — only injected when fanning out, so
+    # single-trajectory launches keep an identical payload (inferlet defaults).
+    if num_branches > 1:
+        input_payload["num_branches"] = num_branches
+        input_payload["branch_at_step"] = branch_at_step
+        input_payload["temperature"] = temperature
+        input_payload["top_p"] = top_p
+    if condense_mode != "rebuild":
+        input_payload["condense_mode"] = condense_mode
+        input_payload["condense_keep_recent"] = condense_keep_recent
+    if dump_trajectory:
+        input_payload["dump_trajectory"] = True
     async with PieClient(pie_uri) as client:
         await client.authenticate("local-dev")
         proc = await client.launch_process(pie_inferlet, input=input_payload)
@@ -709,7 +767,11 @@ async def _run_agent_inferlet(
                 chunk = value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value)
                 stdout_chunks.append(chunk)
                 stripped = chunk.rstrip()
-                if stripped.startswith("[step") or stripped.startswith("[condense"):
+                # Surface both single-trajectory ("[step"/"[condense") and
+                # branch-tagged ("[<wid>][step"/"[<wid>][condense") progress
+                # lines so multi-branch fork runs are debuggable.
+                if (stripped.startswith("[step") or stripped.startswith("[condense")
+                        or "][step" in stripped or "][condense" in stripped):
                     logger.info("inferlet: %s", stripped)
                 else:
                     logger.debug("inferlet stdout: %s", stripped)
@@ -740,12 +802,33 @@ def solve_one_agent(
     context_token_limit: int | None = None,
     cache_dir: Path | None = None,
     label: str | None = None,
+    num_branches: int = 1,
+    branch_at_step: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> Prediction:
-    """Run one problem using the Pattern A agent (full loop inside inferlet)."""
+    """Run one problem using the Pattern A agent (full loop inside inferlet).
+
+    With ``num_branches > 1``, the agent runs a trunk trajectory to
+    ``branch_at_step`` then forks the KV context AND the tool-server workspace
+    K ways, finishing each branch independently. Each branch's patch is captured
+    from its own workspace copy and stored in ``Prediction.candidates`` (branch 0
+    is the primary ``model_patch``); best-of-K is computed downstream.
+    """
     from tool_server import start_tool_server
 
     label = label or "pie-agent+default"
     t0 = time.monotonic()
+
+    if num_branches > 1:
+        return _solve_one_agent_fork(
+            problem, pie_uri=pie_uri, pie_inferlet=pie_inferlet, max_steps=max_steps,
+            max_tokens_per_step=max_tokens_per_step, timeout_s=timeout_s,
+            idle_timeout_s=idle_timeout_s, instance_timeout_s=instance_timeout_s,
+            context_token_limit=context_token_limit, cache_dir=cache_dir, label=label,
+            num_branches=num_branches, branch_at_step=branch_at_step,
+            temperature=temperature, top_p=top_p, t0=t0,
+        )
 
     try:
         with checked_out_repo(problem, cache_dir=cache_dir) as ws:
@@ -800,6 +883,99 @@ def solve_one_agent(
         )
 
 
+def _solve_one_agent_fork(
+    problem: Problem,
+    *,
+    pie_uri: str,
+    pie_inferlet: str,
+    max_steps: int,
+    max_tokens_per_step: int,
+    timeout_s: float,
+    idle_timeout_s: float,
+    instance_timeout_s: float,
+    context_token_limit: int | None,
+    cache_dir: Path | None,
+    label: str,
+    num_branches: int,
+    branch_at_step: int,
+    temperature: float,
+    top_p: float,
+    t0: float,
+) -> Prediction:
+    """Fork test-time scaling: run K branches, capture each branch's patch from
+    its own workspace, return a Prediction with all K in ``candidates``."""
+    from tool_server import start_tool_server
+
+    try:
+        with checked_out_repo(problem, cache_dir=cache_dir) as ws:
+            server, port = start_tool_server(str(ws))
+            try:
+                result = asyncio.run(_run_agent_inferlet(
+                    pie_uri, pie_inferlet,
+                    task=_format_user_prompt(problem, use_cwd=True),
+                    tool_server_url=f"http://127.0.0.1:{port}",
+                    max_steps=max_steps,
+                    max_tokens_per_step=max_tokens_per_step,
+                    timeout_s=timeout_s,
+                    idle_timeout_s=idle_timeout_s,
+                    instance_timeout_s=instance_timeout_s,
+                    context_token_limit=context_token_limit,
+                    num_branches=num_branches,
+                    branch_at_step=branch_at_step,
+                    temperature=temperature,
+                    top_p=top_p,
+                ))
+                # Capture each branch's patch from its OWN workspace before the
+                # tool server drops the forked copies on shutdown. Branch 0 =
+                # the trunk checkout; branch i = "<ws>__fork<i>".
+                trunk_root = str(ws).rstrip("/")
+                branch_meta = {
+                    str(b.get("workspace_id")): b
+                    for b in (result.get("branches", []) if isinstance(result, dict) else [])
+                }
+                candidates: list[dict[str, Any]] = []
+                for i in range(num_branches):
+                    wid = str(i)
+                    root = Path(trunk_root if i == 0 else f"{trunk_root}__fork{wid}")
+                    patch = capture_patch(root) if root.exists() else ""
+                    b = branch_meta.get(wid, {})
+                    candidates.append({
+                        "workspace_id": wid,
+                        "model_patch": patch,
+                        "finished": b.get("finished", False),
+                        "steps": b.get("steps", 0),
+                        "total_wall_s": b.get("total_wall_s", 0.0),
+                    })
+            finally:
+                server.shutdown()
+
+            branch_step = result.get("branch_step") if isinstance(result, dict) else branch_at_step
+            n_nonempty = sum(1 for c in candidates if c["model_patch"])
+            n_distinct = len({c["model_patch"] for c in candidates})
+            logger.info(
+                "%s: fork returned %d branches (branch_step=%s, %d non-empty, %d distinct patches)",
+                problem.instance_id, len(candidates), branch_step, n_nonempty, n_distinct,
+            )
+            primary = candidates[0] if candidates else {"model_patch": ""}
+            return Prediction(
+                instance_id=problem.instance_id,
+                model_name_or_path=label,
+                model_patch=primary["model_patch"],
+                wall_clock_s=time.monotonic() - t0,
+                agent_iterations=primary.get("steps", 0),
+                candidates=candidates,
+            )
+    except Exception as e:
+        logger.exception("_solve_one_agent_fork failed for %s", problem.instance_id)
+        return Prediction(
+            instance_id=problem.instance_id,
+            model_name_or_path=label,
+            model_patch="",
+            wall_clock_s=time.monotonic() - t0,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
 # ─── Top-level run loop ─────────────────────────────────────────────────
 
 
@@ -818,6 +994,7 @@ class RunOptions:
     output_path: Path = Path("predictions.jsonl")
     label: str | None = None
     resume: bool = False
+    concurrency: int = 1  # instances solved in parallel; 1 == serial (unchanged)
 
 
 def run(options: RunOptions) -> Path:
@@ -852,57 +1029,95 @@ def run(options: RunOptions) -> Path:
         if done_ids:
             logger.info("resume: skipping %d already-completed instances", len(done_ids))
 
-    with options.output_path.open("a" if options.resume else "w") as f:
-        for row in selected:
-            problem = Problem.from_row(row)
-            if problem.instance_id in done_ids:
-                logger.info("skipping %s (already completed)", problem.instance_id)
-                continue
-            logger.info("solving %s (%s)", problem.instance_id, problem.repo)
-            if options.backend == "pie-agent":
-                bk = options.backend_kwargs
-                pred = solve_one_agent(
-                    problem,
-                    pie_uri=bk.get("pie_uri", "ws://127.0.0.1:8080"),
-                    pie_inferlet=bk.get("pie_inferlet", "openhands-agent@0.1.0"),
-                    max_steps=bk.get("max_steps", options.max_iterations),
-                    max_tokens_per_step=bk.get("max_tokens_per_step", 4096),
-                    timeout_s=bk.get("timeout_s", 3600.0),
-                    idle_timeout_s=bk.get("idle_timeout_s", 300.0),
-                    instance_timeout_s=bk.get("instance_timeout_s", 1200.0),
-                    context_token_limit=bk.get("context_token_limit"),
-                    cache_dir=options.cache_dir,
-                    label=options.label,
-                )
-            else:
-                pred = solve_one(
-                    problem,
-                    backend=options.backend,
-                    backend_kwargs=options.backend_kwargs,
-                    max_iterations=options.max_iterations,
-                    max_stuck_retries=options.max_stuck_retries,
-                    max_fake_responses=options.max_fake_responses,
-                    enable_condenser=options.enable_condenser,
-                    cache_dir=options.cache_dir,
-                    label=options.label,
-                )
-            if "ConnectionRefusedError" in pred.error:
-                logger.error(
-                    "Pie server is down (ConnectionRefusedError for %s). "
-                    "Aborting run — use --resume to continue after restart.",
-                    problem.instance_id,
-                )
-                raise SystemExit(42)
+    todo: list[Problem] = []
+    for row in selected:
+        problem = Problem.from_row(row)
+        if problem.instance_id in done_ids:
+            logger.info("skipping %s (already completed)", problem.instance_id)
+            continue
+        todo.append(problem)
 
-            f.write(pred.to_jsonl() + "\n")
-            f.flush()
-            logger.info(
-                "  → %s (%.1fs, %d iters, %d-byte patch%s%s)",
-                "ok" if not pred.error else "ERROR",
-                pred.wall_clock_s, pred.agent_iterations,
-                len(pred.model_patch),
-                f", {pred.stuck_retries} stuck-retries" if pred.stuck_retries else "",
-                f", error={pred.error!r}" if pred.error else "",
+    write_lock = threading.Lock()
+    abort = threading.Event()  # tripped when the Pie server goes down
+
+    def _solve(problem: Problem) -> Prediction:
+        # Don't begin new work once the server has been declared down.
+        if abort.is_set():
+            raise _Aborted(problem.instance_id)
+        logger.info("solving %s (%s)", problem.instance_id, problem.repo)
+        if options.backend == "pie-agent":
+            bk = options.backend_kwargs
+            return solve_one_agent(
+                problem,
+                pie_uri=bk.get("pie_uri", "ws://127.0.0.1:8080"),
+                pie_inferlet=bk.get("pie_inferlet", "openhands-agent@0.1.0"),
+                max_steps=bk.get("max_steps", options.max_iterations),
+                max_tokens_per_step=bk.get("max_tokens_per_step", 4096),
+                timeout_s=bk.get("timeout_s", 3600.0),
+                idle_timeout_s=bk.get("idle_timeout_s", 300.0),
+                instance_timeout_s=bk.get("instance_timeout_s", 1200.0),
+                context_token_limit=bk.get("context_token_limit"),
+                cache_dir=options.cache_dir,
+                label=options.label,
+                num_branches=bk.get("num_branches", 1),
+                branch_at_step=bk.get("branch_at_step", 0),
+                temperature=bk.get("temperature", 0.0),
+                top_p=bk.get("top_p", 1.0),
             )
+        return solve_one(
+            problem,
+            backend=options.backend,
+            backend_kwargs=options.backend_kwargs,
+            max_iterations=options.max_iterations,
+            max_stuck_retries=options.max_stuck_retries,
+            max_fake_responses=options.max_fake_responses,
+            enable_condenser=options.enable_condenser,
+            cache_dir=options.cache_dir,
+            label=options.label,
+        )
 
+    # concurrency == 1 keeps the original strictly-serial behavior (a pool of
+    # one worker drains futures in submission order); the fan-out only matters
+    # for N > 1, where the runtime batches the concurrent decode requests.
+    workers = max(1, options.concurrency)
+    with options.output_path.open("a" if options.resume else "w") as f:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_solve, p): p for p in todo}
+            for fut in as_completed(futures):
+                problem = futures[fut]
+                try:
+                    pred = fut.result()
+                except _Aborted:
+                    continue
+                except Exception as e:  # a worker crashed — log and keep going
+                    logger.error(
+                        "instance %s crashed: %s",
+                        problem.instance_id, e, exc_info=True,
+                    )
+                    continue
+
+                if "ConnectionRefusedError" in pred.error:
+                    logger.error(
+                        "Pie server is down (ConnectionRefusedError for %s). "
+                        "Aborting run — use --resume to continue after restart.",
+                        problem.instance_id,
+                    )
+                    abort.set()  # stop *new* work; in-flight workers still finish
+                    continue
+
+                with write_lock:  # the only place the output file is touched
+                    f.write(pred.to_jsonl() + "\n")
+                    f.flush()
+                logger.info(
+                    "  → %s %s (%.1fs, %d iters, %d-byte patch%s%s)",
+                    problem.instance_id,
+                    "ok" if not pred.error else "ERROR",
+                    pred.wall_clock_s, pred.agent_iterations,
+                    len(pred.model_patch),
+                    f", {pred.stuck_retries} stuck-retries" if pred.stuck_retries else "",
+                    f", error={pred.error!r}" if pred.error else "",
+                )
+
+    if abort.is_set():
+        raise SystemExit(42)  # preserve the existing abort contract for --resume
     return options.output_path
