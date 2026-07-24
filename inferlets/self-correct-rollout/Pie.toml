@@ -1,0 +1,11 @@
+[package]
+name = "self-correct-rollout"
+version = "0.1.0"
+description = "Step 2a: two-turn self-correction rollout (answer -> injected reflect -> final), with env_mask over the injected turn"
+authors = ["Pie RL"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
