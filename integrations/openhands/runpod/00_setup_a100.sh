@@ -15,28 +15,31 @@
 set -euo pipefail
 
 # ---- paths (edit for the runpod box) ----------------------------------------
+# Everything reusable lives on $WORK (the persistent /workspace volume) so it
+# survives pod stop/restart AND does not consume the ephemeral container disk.
+# See TEST_PLAN.md §10 for sizing (persistent 150 GB, container disk 40–60 GB).
 export WORK=${WORK:-/workspace}
 export PIE_SRC=${PIE_SRC:-$WORK/pie}                      # pie checkout
-export PIE_VENV=${PIE_VENV:-$HOME/.venvs/pie-vllm}        # vLLM venv
+export PIE_VENV=${PIE_VENV:-$WORK/venvs/pie-vllm}        # vLLM venv (on /workspace)
 export HF_HOME=${HF_HOME:-$WORK/hf-cache}
 export MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 export CPM_SOURCE_CACHE=${CPM_SOURCE_CACHE:-$WORK/.cpm-cache}
+export PIP_CACHE_DIR=${PIP_CACHE_DIR:-$WORK/.pip-cache}   # keep pip cache off container disk
+mkdir -p "$WORK/venvs" "$PIP_CACHE_DIR"
 
 # =============================================================================
 # LOGISTICS — READ FIRST
 # =============================================================================
 # 1. GIT REF: the working harness + the §4 CUDA fix (cuda_memory_planner.cpp:
-#    output_rows R0->N) + bug C (drain_queues starvation) live on the
-#    `openhands-integration-updated` branch, and per the handover those fixes
-#    are COMMITTED BUT NOT PUSHED. A fresh `git clone` from the remote will NOT
-#    have them. Options, best first:
-#      (a) push that branch, then clone it here; OR
-#      (b) `git bundle create pie.bundle --all` on the cluster, scp it here,
-#          `git clone pie.bundle`; OR
-#      (c) rsync the whole `pie-updated-wt` tree to $PIE_SRC.
-#    Without the §4 fix, any coder-session prefill >512 tokens faults the driver.
-# 2. DISK: model (~60 GB bf16) + HF cache + two builds. runpod A100 volumes are
-#    often 20-50 GB by default — provision a big /workspace volume first.
+#    output_rows R0->N) + bug C (drain_queues starvation) + this runpod/ bundle
+#    are all on `openhands-integration-updated`, which IS PUSHED to origin. So a
+#    plain clone gets everything:
+#      git clone -b openhands-integration-updated https://github.com/YangLiuWillow/pie.git $PIE_SRC
+#    (Without the §4 fix, any coder-session prefill >512 tokens faults the driver
+#     — so do not check out an older ref.)
+# 2. DISK: see TEST_PLAN.md §10. Persistent /workspace 150 GB (200 GB if scoring
+#    SWE-bench here); container disk 40-60 GB. runpod defaults are far too small
+#    — resize BEFORE starting the pod (model alone is ~60 GB bf16).
 # 3. GPU: confirm it is actually an A100 SXM (sm_80), not a PCIe/40GB variant —
 #    the 80 GB config assumes 80 GB. `nvidia-smi --query-gpu=name,memory.total`.
 # =============================================================================
