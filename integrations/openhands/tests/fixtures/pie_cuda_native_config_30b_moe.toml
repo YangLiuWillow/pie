@@ -2,6 +2,11 @@
 # Qwen3-Coder-30B-A3B (MoE) — cuda_native counterpart of
 # pie_cuda_vllm_config_30b_moe.toml. Requires a `pie` built with
 # `--features driver-portable,driver-cuda` (see build_pie_cuda.sh).
+#
+# NEW-SCHEMA config for the c77d91d9 worktree binary: the driver auto-plans KV
+# and batch sizing from `memory_profile` + `gpu_mem_utilization`; the old
+# max_num_kv_pages / max_batch_tokens / max_batch_size knobs were REMOVED and
+# now make the server refuse to boot ("unknown field").
 [auth]
 enabled = false
 
@@ -17,16 +22,12 @@ type = "cuda_native"
 device = ["cuda:0"]
 
 [model.driver.options]
-# KV cache is a hard allocation of max_num_kv_pages × kv_page_size; the
-# driver ignores gpu_mem_utilization. Qwen3-Coder-30B-A3B: 48 layers,
-# 4 KV heads, head_dim 128 => ~96 KB/token. 4096 pages × 32 = 131072 KV
-# tokens (~12.5 GB), which sits comfortably beside the ~60 GB of bf16
-# weights on a 96 GB RTX Pro 6000 Blackwell (gpu_rtx6000).
-gpu_mem_utilization = 0.80
+# ~60 GB of bf16 weights on a 96 GB RTX Pro 6000 Blackwell (gpu_rtx6000); the
+# planner spends the rest of the 0.90 budget on KV pages.
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
 kv_page_size = 32
-max_num_kv_pages = 4096
-max_batch_tokens = 8192
-max_batch_size = 256
 weight_dtype = "bfloat16"
-# See the 7B config: in-process swap control-fd is not wired yet, so keep 0.
+# No host-backed KV offload tier here — this is the plain/base config. See
+# pie_cuda_native_config_30b_moe_swap.toml for the swap-enabled variant.
 swap_pool_size = 0

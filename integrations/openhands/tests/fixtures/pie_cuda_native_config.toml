@@ -18,16 +18,14 @@ type = "cuda_native"
 device = ["cuda:0"]
 
 [model.driver.options]
-# NOTE: the cuda_native C++ side sizes its KV cache directly from
-# max_num_kv_pages × kv_page_size (a hard allocation); gpu_mem_utilization
-# is NOT consumed by the driver, so pick pages to fit the GPU by hand.
-# 2048 pages × 32 = 65536 KV tokens (~4 GB at 7B), leaving ample room
-# beside the ~14 GB of bf16 weights.
+# NOTE (c77d91d9 and later): the driver AUTO-PLANS KV and batch sizing from
+# memory_profile + gpu_mem_utilization. The old max_num_kv_pages /
+# max_batch_tokens / max_batch_size knobs were removed and now make the server
+# refuse to boot ("unknown field"). The planner also picks kv_page_size itself
+# when the profile says so — the value below is only a hint.
 gpu_mem_utilization = 0.85
+memory_profile = "auto"
 kv_page_size = 32
-max_num_kv_pages = 2048
-max_batch_tokens = 10240
-max_batch_size = 512
 weight_dtype = "bfloat16"
 # CPU-offload swap. Left at 0: the in-process cuda driver does not yet wire
 # the swap control-fd (see server/src/embedded_driver.rs write_cuda_startup_toml),
