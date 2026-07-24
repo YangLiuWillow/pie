@@ -1,22 +1,23 @@
-//! `self-correct-rollout` — Step 2a: two-turn self-correction with env_mask.
+//! `self-correct-rollout` — Step 2a: two-turn self-correction, CHAT-TEMPLATED.
 //!
-//! Per rollout (one of `n`), from the prompt:
-//!   turn 1  — the model's initial answer            (trainable, env_mask 1)
-//!   inject  — a fixed "reflect / correct" prompt     (masked,   env_mask 0)
-//!   turn 2  — the model's final (corrected) answer  (trainable, env_mask 1)
+//! A proper multi-turn chat, so an instruct model answers focused and stops on
+//! `<|im_end|>` instead of rambling past the token cap:
+//!   system + user(question) + cue          → the PROMPT
+//!   turn 1  (assistant answer)               → trainable, env_mask 1
+//!   inject: seal + user(reflect) + cue       → masked,   env_mask 0
+//!   turn 2  (assistant final answer)         → trainable, env_mask 1
 //!
 //! Emits one flat training row per rollout:
-//!   completion_ids = t1 ++ inject ++ t2   (the full linear sequence)
+//!   prompt_ids     = system ++ user(question) ++ cue
+//!   completion_ids = t1 ++ inject ++ t2
 //!   env_mask       = 1*|t1| ++ 0*|inject| ++ 1*|t2|
 //!   logprobs       = zeros  (TRL's GRPO loss on our path — num_iterations=1,
-//!                    use_vllm=False — does NOT use the sampling logprobs:
-//!                    the ratio is 1 and the KL is to the ref model. So we skip
-//!                    the expensive teacher-force scoring entirely.)
-//!   final_answer   = decoded t2  (the reward reads THIS, not the full text,
-//!                    so turn-1 numbers don't confuse extraction)
+//!                    use_vllm=False — ignores the sampling logprobs: ratio is 1
+//!                    and the KL is to the ref model. So we skip teacher-force scoring.)
+//!   final_answer   = decoded t2   (the reward reads THIS, not turn-1 numbers)
 //!
 //! The adapter (on-policy LoRA) is applied on the prompt prefill and both turns.
-//! Generation only — no scoring pass (see logprobs note).
+//! Generation only — no scoring pass.
 
 use inferlet::adapter::Adapter;
 use inferlet::model::Model;
@@ -26,6 +27,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Input {
+    /// The question (raw text; the inferlet chat-templates it).
     prompt: String,
     #[serde(default = "d_n")]
     n: usize,
@@ -37,16 +39,23 @@ struct Input {
     top_p: f32,
     #[serde(default)]
     adapter_path: Option<String>,
+    #[serde(default = "d_system")]
+    system: String,
     #[serde(default = "d_reflect")]
     reflect_prompt: String,
 }
 
 fn d_n() -> usize { 4 }
-fn d_max_tokens() -> usize { 200 }
+fn d_max_tokens() -> usize { 256 }
 fn d_temperature() -> f32 { 0.8 }
 fn d_top_p() -> f32 { 0.95 }
+fn d_system() -> String {
+    "You are a careful math assistant. Solve the problem step by step, then end \
+     with the final answer as a single number.".to_string()
+}
 fn d_reflect() -> String {
-    "\n\nReview the solution above for mistakes and give the corrected final answer.\nFinal answer: ".to_string()
+    "Review your solution above for any mistake. Give the corrected final answer \
+     as a single number.".to_string()
 }
 
 const BEGIN: &str = "<<<ROLLOUT_JSON>>>";
@@ -59,11 +68,22 @@ async fn main(input: Input) -> Result<String> {
     let model = Model::load(&model_name)?;
     let tokenizer = model.tokenizer();
 
-    let prompt_ids = tokenizer.encode(&input.prompt);
+    // Prompt = system + user(question) + cue (chat-templated).
+    let mut prompt_ids = Vec::new();
+    prompt_ids.extend(chat::system(&model, &input.system));
+    prompt_ids.extend(chat::user(&model, &input.prompt));
+    prompt_ids.extend(chat::cue(&model));
     if prompt_ids.is_empty() {
         return Err("empty prompt".into());
     }
-    let reflect_ids = tokenizer.encode(&input.reflect_prompt);
+
+    // Injected turn = close assistant + user(reflect) + cue (all masked).
+    let mut inject = Vec::new();
+    inject.extend(chat::seal(&model));
+    inject.extend(chat::user(&model, &input.reflect_prompt));
+    inject.extend(chat::cue(&model));
+
+    let stops = chat::stop_tokens(&model);
 
     let adapter = match &input.adapter_path {
         Some(path) => {
@@ -76,8 +96,6 @@ async fn main(input: Input) -> Result<String> {
         }
         None => None,
     };
-
-    let stops = chat::stop_tokens(&model);
 
     // Prefill the prompt head WITH the adapter; keep the last token as the anchor.
     let split = prompt_ids.len() - 1;
@@ -99,7 +117,7 @@ async fn main(input: Input) -> Result<String> {
         let mut ctx = base.fork()?;
         ctx.append(&[tail]); // last prompt token pending → first turn drains it
 
-        // Turn 1: initial answer.
+        // Turn 1: initial answer (stops on <|im_end|>).
         let t1 = {
             let mut g = ctx.generate(sampler.clone()).max_tokens(input.max_tokens).stop(&stops);
             if let Some(a) = &adapter {
@@ -108,8 +126,8 @@ async fn main(input: Input) -> Result<String> {
             g.collect_tokens().await?
         };
 
-        // Inject the reflect prompt (masked), then Turn 2: final answer.
-        ctx.append(&reflect_ids);
+        // Inject the reflect turn (masked), then Turn 2: final answer.
+        ctx.append(&inject);
         let t2 = {
             let mut g = ctx.generate(sampler.clone()).max_tokens(input.max_tokens).stop(&stops);
             if let Some(a) = &adapter {
@@ -118,15 +136,15 @@ async fn main(input: Input) -> Result<String> {
             g.collect_tokens().await?
         };
 
-        // Linearize: completion = t1 ++ inject ++ t2 ; mask injected out.
-        let mut completion_ids = Vec::with_capacity(t1.len() + reflect_ids.len() + t2.len());
+        // Linearize: completion = t1 ++ inject ++ t2 ; mask the injected turn out.
+        let mut completion_ids = Vec::with_capacity(t1.len() + inject.len() + t2.len());
         completion_ids.extend_from_slice(&t1);
-        completion_ids.extend_from_slice(&reflect_ids);
+        completion_ids.extend_from_slice(&inject);
         completion_ids.extend_from_slice(&t2);
 
         let mut env_mask = Vec::with_capacity(completion_ids.len());
         env_mask.extend(std::iter::repeat(1u32).take(t1.len()));
-        env_mask.extend(std::iter::repeat(0u32).take(reflect_ids.len()));
+        env_mask.extend(std::iter::repeat(0u32).take(inject.len()));
         env_mask.extend(std::iter::repeat(1u32).take(t2.len()));
 
         let logprobs = vec![0.0f32; completion_ids.len()]; // unused by TRL on our path
