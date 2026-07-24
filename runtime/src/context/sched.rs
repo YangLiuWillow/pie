@@ -937,6 +937,102 @@ impl ContextManager {
         best.map(|(_, _, _, ctx_id)| ctx_id)
     }
 
+    /// Is any context mid-forward-pass?
+    ///
+    /// A `Pinned` context is the only thing that guarantees a future event
+    /// (its unpin) which frees pages and re-drains the queues. The scheduler's
+    /// deferral gates are only safe while this holds.
+    pub(crate) fn has_work_in_flight(&self) -> bool {
+        self.contexts.values().any(|c| c.is_pinned())
+    }
+
+    /// Suspend one evictable context on `driver_idx`, releasing its GPU pages.
+    ///
+    /// Returns `false` when no eligible victim remains. A `Pinned` victim's
+    /// pages are in use by a running pass and cannot be freed now, so it is
+    /// marked `pending_suspend` — which both claims its pages for the unpin
+    /// path and makes `find_eviction_victim` skip it — and the search
+    /// continues. That marking is what bounds the inner loop.
+    fn evict_one(&mut self, driver_idx: usize, requester: ContextId, bid: f64) -> bool {
+        loop {
+            let Some(victim) = self.find_eviction_victim(driver_idx, bid, Some(requester)) else {
+                return false;
+            };
+            if self.contexts.get(&victim).map(|v| v.is_pinned()).unwrap_or(false) {
+                if let Some(v) = self.contexts.get_mut(&victim) {
+                    v.pending_suspend = true;
+                }
+                continue;
+            }
+            self.sched_counters.eviction_suspends += 1;
+            self.suspend(victim);
+            self.enqueue_restore(victim);
+            return true;
+        }
+    }
+
+    /// Free room for a stalled restore by evicting lower-bid contexts.
+    ///
+    /// `when_allocated` evicts when a *live* context asks for pages, but a
+    /// Suspended context wanting to come back only ever asked `can_restore`
+    /// and gave up. That asymmetry turns an over-committed engine into a dead
+    /// one: contexts that want to run sit Suspended while idle Active
+    /// contexts keep their pages, and with nothing in flight nobody yields.
+    ///
+    /// Returns whether `ctx_id` can now be restored. Bounded by the context
+    /// count, and every iteration removes one context from future victim
+    /// searches.
+    pub(crate) fn evict_for_restore(&mut self, ctx_id: ContextId) -> bool {
+        let (driver_idx, bid) = match self.contexts.get(&ctx_id) {
+            Some(c) => (c.driver.unwrap_or(0) as usize, c.bid),
+            None => return false,
+        };
+
+        for _ in 0..self.contexts.len() {
+            if self.can_restore(ctx_id) {
+                return true;
+            }
+            if !self.evict_one(driver_idx, ctx_id, bid) {
+                return false;
+            }
+            self.sched_counters.restore_evictions += 1;
+        }
+
+        self.can_restore(ctx_id)
+    }
+
+    /// Free `num_pages` on `driver_idx` for a context waiting in `alloc_queue`.
+    ///
+    /// `fire_deferred_ops` allocates strictly from the free pool, so a queued
+    /// alloc is served only if pages happen to appear. The eviction retry that
+    /// `when_allocated` performs on the first attempt is never repeated once
+    /// the request has been deferred — so when the pages it was promised do
+    /// not materialise (a `pending_suspend` victim's committed pages can be
+    /// shared, and shared pages do not free on suspend), it waits forever.
+    pub(crate) fn evict_for_alloc(
+        &mut self,
+        ctx_id: ContextId,
+        driver_idx: usize,
+        num_pages: usize,
+    ) -> bool {
+        let bid = match self.contexts.get(&ctx_id) {
+            Some(c) => c.bid,
+            None => return false,
+        };
+
+        for _ in 0..self.contexts.len() {
+            if self.gpu_stores[driver_idx].available() >= num_pages {
+                return true;
+            }
+            if !self.evict_one(driver_idx, ctx_id, bid) {
+                return false;
+            }
+            self.sched_counters.alloc_evictions += 1;
+        }
+
+        self.gpu_stores[driver_idx].available() >= num_pages
+    }
+
     /// Helper: enqueue a context for restoration.
     pub(crate) fn enqueue_restore(&mut self, ctx_id: ContextId) {
         let (bid, defaulted) = self
