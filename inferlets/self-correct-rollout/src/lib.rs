@@ -49,13 +49,19 @@ fn d_n() -> usize { 4 }
 fn d_max_tokens() -> usize { 256 }
 fn d_temperature() -> f32 { 0.8 }
 fn d_top_p() -> f32 { 0.95 }
+// `/no_think` is Qwen3's soft switch to skip the <think> block: without it a
+// reasoning model spends the whole token budget inside <think> and the turn gets
+// truncated before it answers. It also makes self-correction a real test — with
+// thinking ON the model already corrects itself inside <think>, so the injected
+// reflect turn would be redundant; OFF, the reflect turn is where correction has
+// to happen, which is what we want RL to teach.
 fn d_system() -> String {
-    "You are a careful math assistant. Solve the problem step by step, then end \
-     with the final answer as a single number.".to_string()
+    "You are a careful math assistant. Solve the problem and give the final answer \
+     as a single number. /no_think".to_string()
 }
 fn d_reflect() -> String {
     "Review your solution above for any mistake. Give the corrected final answer \
-     as a single number.".to_string()
+     as a single number. /no_think".to_string()
 }
 
 const BEGIN: &str = "<<<ROLLOUT_JSON>>>";
