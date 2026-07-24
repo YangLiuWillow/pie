@@ -1,0 +1,11 @@
+[package]
+name = "adapter-score"
+version = "0.1.0"
+description = "1c-ii: teacher-force a fixed target with an optional LoRA, return per-token logprobs (LoRA parity probe)"
+authors = ["Pie RL"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]

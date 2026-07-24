@@ -1,0 +1,11 @@
+[package]
+name = "tokenizer-probe"
+version = "0.1.0"
+description = "Step 0 diagnostic: dump Pie tokenizer ids for HF parity checking"
+authors = ["Pie RL"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]

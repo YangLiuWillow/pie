@@ -277,18 +277,27 @@ impl ServiceHandler for AdapterService {
             }
             Message::Load { id, path, response } => {
                 let result = if self.adapters.contains_key(&id) {
-                    let args = LoadAdapterArgs {
-                        adapter_ptr: id,
-                        name: path.clone(),
-                        adapter_data: vec![],
-                    };
-                    match self.call_all_devices("load_adapter", &args).await {
-                        Ok(()) => {
-                            // Safe: we checked contains_key above and no removal in between.
-                            self.adapters.get_mut(&id).unwrap().weights_path = Some(path);
-                            Ok(())
+                    // Read the safetensors bytes so they travel to the driver as
+                    // `adapter_data`; `rpc_loop` materializes them to a temp file
+                    // the driver mmaps. Without this the driver gets an empty file
+                    // and fails with "safetensors: file too small".
+                    match std::fs::read(&path) {
+                        Ok(adapter_data) => {
+                            let args = LoadAdapterArgs {
+                                adapter_ptr: id,
+                                name: path.clone(),
+                                adapter_data,
+                            };
+                            match self.call_all_devices("load_adapter", &args).await {
+                                Ok(()) => {
+                                    // Safe: we checked contains_key above and no removal in between.
+                                    self.adapters.get_mut(&id).unwrap().weights_path = Some(path);
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
-                        Err(e) => Err(e),
+                        Err(e) => Err(anyhow::anyhow!("read adapter file '{}': {}", path, e)),
                     }
                 } else {
                     Err(anyhow::anyhow!("Adapter not found"))

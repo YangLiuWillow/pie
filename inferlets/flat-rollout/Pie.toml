@@ -1,0 +1,11 @@
+[package]
+name = "flat-rollout"
+version = "0.1.0"
+description = "Step 1a: single-completion rollout emitting ids + per-token logprobs for GRPO"
+authors = ["Pie RL"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
