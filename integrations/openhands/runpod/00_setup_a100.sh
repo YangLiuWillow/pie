@@ -93,11 +93,15 @@ if [ ! -x "$HARNESS_VENV/bin/python" ]; then
 fi
 
 echo "=== [7] download the model ==="
+if [ "${SKIP_MODEL:-0}" = "1" ]; then
+    echo "  SKIP_MODEL=1 — skipping the ~60 GB snapshot_download of $MODEL"
+else
 HF_HOME="$HF_HOME" "$PIE_VENV/bin/python" - <<PY
 from huggingface_hub import snapshot_download
 snapshot_download("$MODEL")
 print("model cached under \$HF_HOME")
 PY
+fi
 
 echo ""
 echo "=== setup done ==="

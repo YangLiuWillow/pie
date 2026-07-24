@@ -63,6 +63,7 @@ accuracy) don't depend on decode speed.
 
 | File | Role |
 |---|---|
+| `bootstrap_runpod.sh` | **start here on a bare pod**: preflight, toolchain, python 3.12, clone, NCCL, one shared env file, venvs — then hands off to `00_setup_a100.sh`. Idempotent/resumable. |
 | `00_setup_a100.sh` | one-time: rebuild Pie for sm_80, build coder-session wasm, vLLM venv, harness venv, model download. **Read its LOGISTICS block first.** |
 | `10_vllm_serve_fair.sh` | launch vLLM at `VLLM_TIER`; asserts the banner matches the tier before serving |
 | `11_autotune_moe.sh` | run vLLM's `benchmark_moe.py` once to generate the tuned MoE config (the `fair` tier) |
@@ -76,8 +77,12 @@ accuracy) don't depend on decode speed.
 ## Run order
 
 ```bash
-# 0. one-time (read LOGISTICS in the script — git ref w/ §4+bugC fixes, disk, GPU)
-bash 00_setup_a100.sh
+# 0. one-time, on a bare pod: provisions the box, clones this ref, then runs
+#    00_setup_a100.sh itself. Run it under tmux — the CUDA build is 30-60 min.
+#    (If the box is already provisioned, skip straight to 00_setup_a100.sh and
+#     read its LOGISTICS block — git ref w/ §4+bugC fixes, disk, GPU.)
+bash bootstrap_runpod.sh
+source /workspace/pie-bench-env.sh   # every later shell needs this
 
 # 1. generate the tuned MoE config once (only needed for the `fair` tier)
 bash 11_autotune_moe.sh
