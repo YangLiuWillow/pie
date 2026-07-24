@@ -540,7 +540,16 @@ CudaMemoryPlan plan_cuda_memory(
                                   static_cast<int>(
                                       (static_cast<std::int64_t>(N) *
                                        std::max(1024, R0 * 64) + 7) / 8)));
-            const int output_rows = R0;
+            // Size the logits/prob/sampler workspaces for the worst case the
+            // executor can actually write, which is N — not R0. In the
+            // non-compact path (custom mask, logit mask, top-k/top-p, spec
+            // drafts, msgpack slots) `logit_rows_required` and
+            // `prob_rows_required` are N, not `num_sampling`
+            // (executor.cpp:1994-1998). Sizing `ws.logits`/`ws.prob` at R0 rows
+            // let the lm_head GEMM write N rows into an R0-row buffer, an
+            // out-of-bounds GPU write for any prefill with N > R0 (the §4 fault:
+            // 512-row logits, 624-token prefill). `R0 <= N` is guaranteed above.
+            const int output_rows = N;
             std::size_t arena = 0;
             arena += pie_cuda_driver::model::qwen3_workspace_bytes(
                 hf, N, output_rows, max_intermediate, max_Hq, max_Hk);

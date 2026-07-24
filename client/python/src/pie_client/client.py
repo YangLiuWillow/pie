@@ -222,6 +222,10 @@ class PieClient:
         for _, future in pending:
             if not future.done():
                 future.set_exception(exc)
+        for process_id in list(self.process_event_queues):
+            queue = self.process_event_queues.pop(process_id, None)
+            if queue is not None:
+                queue.put_nowait(("error", f"WebSocket disconnected: {exc}"))
 
     def _fail_process_event_queues(self, exc: Exception):
         """Wake process recv() waiters when the connection goes away."""

@@ -287,7 +287,7 @@ pub fn spawn(
     let model_idx = SERVICES.len();
     PAGE_SIZES.push(page_size);
     MARKET.push(Market::new(default_endowment_pages));
-    SERVICES
+    let handle = SERVICES
         .spawn(move || {
             ContextManager::new(
                 model_idx,
@@ -303,7 +303,52 @@ pub fn spawn(
                 restore_pause_at_utilization,
             )
         })
-        .expect("Failed to spawn context manager")
+        .expect("Failed to spawn context manager");
+
+    // Optional scheduler tracing. Off unless PIE_SCHED_DEBUG is set, so it
+    // costs nothing in normal runs. The snapshot it prints is the only way to
+    // tell a wedged scheduler (queues stuck, no restores) from a merely slow
+    // one — and it must be time-driven, since a wedged engine completes no
+    // batches and therefore fires no ticks.
+    if std::env::var_os("PIE_SCHED_DEBUG").is_some() {
+        let period = std::env::var("PIE_SCHED_DEBUG_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3);
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(period.max(1)));
+            loop {
+                ticker.tick().await;
+                if SERVICES.send(model_idx, Message::DumpSched).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Forward-progress watchdog.
+    //
+    // `drain_queues` runs only on events that free pages — an unpin, a
+    // suspend, a completed alloc. When the engine over-commits hard enough
+    // that nothing is left in flight, no such event is coming and the queues
+    // simply stop being looked at: the deferral logic is correct but never
+    // gets to run. This re-drains while anything is queued, which is the only
+    // thing that can restart a stalled engine from the outside. It no-ops on
+    // empty queues, so the steady-state cost is one message per period.
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_millis(200));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if SERVICES.send(model_idx, Message::DrainKick).is_err() {
+                break;
+            }
+        }
+    });
+
+    handle
 }
 
 // ---------- Actor-routed ----------
@@ -1141,6 +1186,16 @@ pub(crate) struct SchedCounters {
     pub defaults_flagged: u64,
     /// Total eviction victim searches.
     pub eviction_searches: u64,
+    /// Times `drain_queues` skipped Phase 2 because `alloc_queue` was
+    /// non-empty (allocs hold strict priority over restores).
+    pub drain_alloc_priority_returns: u64,
+    /// Times `drain_queues` skipped Phase 2 because a driver sat above
+    /// `restore_pause_at_utilization`.
+    pub drain_over_capacity_returns: u64,
+    /// Contexts evicted specifically to make room for a stalled restore.
+    pub restore_evictions: u64,
+    /// Contexts evicted specifically to make room for a queued alloc.
+    pub alloc_evictions: u64,
 
     // --- Per-message-type cumulative timing (microseconds) ---
     pub tick_us: u64,
@@ -1987,36 +2042,68 @@ impl ContextManager {
     ///          context, with per-restore placement evaluation (§4.3).
     pub(crate) fn drain_queues(&mut self) {
         let t0 = Instant::now();
-        // Phase 1: alloc_queue FIFO — serve deferred ops for head context.
-        while let Some(&front_ctx_id) = self.alloc_queue.front() {
+        // Phase 1: alloc_queue, FIFO-preferring — serve deferred ops.
+        //
+        // Walks the queue instead of stopping at the head: one request whose
+        // demand cannot be met must not freeze every request behind it, nor
+        // (via the gate below) the restore queue with it.
+        let mut idx = 0;
+        while idx < self.alloc_queue.len() {
+            let ctx_id = self.alloc_queue[idx];
             // Skip stale entries (destroyed contexts or empty deferred_ops).
-            let front_op = match self
+            let op = match self
                 .contexts
-                .get(&front_ctx_id)
+                .get(&ctx_id)
                 .and_then(|c| c.deferred_ops.first())
             {
                 Some(op) => op,
                 None => {
-                    self.alloc_queue.pop_front();
+                    self.alloc_queue.remove(idx);
                     continue;
                 }
             };
             let (driver_idx, n, needs_rs_slot) =
-                (front_op.driver, front_op.num_pages, front_op.needs_rs_slot);
+                (op.driver, op.num_pages, op.needs_rs_slot);
             if n > 0 && self.gpu_stores[driver_idx].available() < n {
-                break;
+                // `fire_deferred_ops` only allocates from the free pool, so
+                // this entry is served only if pages appear on their own.
+                // While something is in flight they still might; otherwise
+                // evict to make room, or leave it queued and try the next.
+                if self.has_work_in_flight() || !self.evict_for_alloc(ctx_id, driver_idx, n) {
+                    idx += 1;
+                    continue;
+                }
             }
             if needs_rs_slot && self.rs_stores[driver_idx].available() == 0 {
-                break;
+                // Recurrent-state slots are not freed by page eviction, so
+                // there is nothing to reclaim here — walk past this entry
+                // rather than freezing the queue (and Phase 2) behind it.
+                idx += 1;
+                continue;
             }
-            let ctx_id = self.alloc_queue.pop_front().unwrap();
+            // `fire_deferred_ops` re-queues at the back if it stalls partway,
+            // so removing here cannot lose the entry.
+            self.alloc_queue.remove(idx);
             self.fire_deferred_ops(ctx_id);
         }
+
+        // Both gates below defer restores in the expectation that pages will
+        // free up shortly on their own. `Pinned` is what makes that true: a
+        // pinned context is mid-forward-pass and releases pages when it
+        // unpins, which re-enters this function. With nothing pinned, no such
+        // event is ever coming — deferring then strands the restore queue
+        // permanently and the engine sits at 0% GPU forever. That is the
+        // observed wedge at high concurrency: many Active contexts holding
+        // nearly all pages, some Suspended waiting to run, nothing in flight.
+        let work_in_flight = self.has_work_in_flight();
 
         // Phase 2: restore_queue — pop highest-bid Suspended context from heap.
         // Only proceed if alloc_queue is empty (allocs have strict priority).
         if !self.alloc_queue.is_empty() {
-            return;
+            self.sched_counters.drain_alloc_priority_returns += 1;
+            if work_in_flight {
+                return;
+            }
         }
 
         // Hard admission control: don't restore when any driver is near
@@ -2030,7 +2117,10 @@ impl ContextManager {
             utilization > self.restore_pause_at_utilization
         });
         if over_capacity {
-            return;
+            self.sched_counters.drain_over_capacity_returns += 1;
+            if work_in_flight {
+                return;
+            }
         }
 
         let num_drivers = self.gpu_stores.len();
@@ -2065,7 +2155,17 @@ impl ContextManager {
             }
 
             // Admission check: enough free pages for this context?
-            if !self.can_restore(ctx_id) {
+            //
+            // When nothing is in flight, a rejection here is terminal rather
+            // than temporary — no unpin will arrive to free the pages this
+            // context is short of, so re-enqueueing it just spins. Fall back
+            // to eviction, which is exactly what the alloc path already does
+            // (`when_allocated`) and the restore path was missing. Recomputed
+            // per iteration on purpose: a successful restore pins the context,
+            // so the escape disarms itself as soon as real work is running.
+            if !self.can_restore(ctx_id)
+                && !(!self.has_work_in_flight() && self.evict_for_restore(ctx_id))
+            {
                 self.sched_counters.restore_rejections += 1;
                 re_enqueue.push(ctx_id);
                 rejections += 1;
@@ -2356,6 +2456,15 @@ pub(crate) enum Message {
     Unpin {
         id: ContextId,
     },
+    /// Print a scheduler snapshot to stderr. Sent on a timer when
+    /// `PIE_SCHED_DEBUG` is set — deliberately time-driven rather than
+    /// tick-driven, because a wedged engine fires no ticks and the old
+    /// tick-gated diagnostic would print nothing exactly when it is needed.
+    DumpSched,
+    /// Re-run `drain_queues` while work is queued. Sent on a timer so that a
+    /// stalled engine — one where no page-freeing event remains to trigger a
+    /// drain — still makes progress.
+    DrainKick,
     ReplayComplete {
         id: ContextId,
         scratch_driver: usize,
@@ -2426,6 +2535,71 @@ impl ServiceHandler for ContextManager {
     async fn handle(&mut self, msg: Message) {
         let _t = Instant::now();
         match msg {
+            Message::DrainKick => {
+                if !self.alloc_queue.is_empty() || !self.restore_queue.is_empty() {
+                    self.drain_queues();
+                }
+            }
+            Message::DumpSched => {
+                let (mut active, mut pinned, mut stashed, mut suspended) = (0, 0, 0, 0);
+                let mut pending_suspend = 0;
+                for ctx in self.contexts.values() {
+                    match ctx.state {
+                        State::Active => active += 1,
+                        State::Pinned => pinned += 1,
+                        State::Stashed => stashed += 1,
+                        State::Suspended => suspended += 1,
+                    }
+                    if ctx.pending_suspend {
+                        pending_suspend += 1;
+                    }
+                }
+                // What the head of the alloc queue is waiting for, versus what
+                // is free on its driver. When the engine wedges this pair says
+                // whether the demand is merely unmet (`need > free`) or stale.
+                let head = self
+                    .alloc_queue
+                    .front()
+                    .and_then(|id| self.contexts.get(id).and_then(|c| c.deferred_ops.first()))
+                    .map(|op| {
+                        format!(
+                            "need={}/free={}",
+                            op.num_pages,
+                            self.gpu_stores[op.driver].available()
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                let c = &self.sched_counters;
+                let pages: Vec<String> = self
+                    .gpu_stores
+                    .iter()
+                    .map(|s| format!("{}/{}", s.available(), s.total_pages()))
+                    .collect();
+                eprintln!(
+                    "[pie-sched] ctx active={active} pinned={pinned} \
+                     stashed={stashed} suspended={suspended} \
+                     pending_suspend={pending_suspend} | \
+                     alloc_q={} head={head} restore_q={} gpu_pages_free={} cpu_free={} | \
+                     evict_susp={} no_victim_susp={} prio_gate_susp={} \
+                     restores={} restore_rej={} evict_searches={} ticks={} | \
+                     drain_ret_alloc={} drain_ret_overcap={} restore_evict={} alloc_evict={}",
+                    self.alloc_queue.len(),
+                    self.restore_queue.len(),
+                    pages.join(","),
+                    self.cpu_stores.iter().map(|s| s.available()).sum::<usize>(),
+                    c.eviction_suspends,
+                    c.no_victim_suspends,
+                    c.priority_gate_suspends,
+                    c.restores,
+                    c.restore_rejections,
+                    c.eviction_searches,
+                    c.ticks,
+                    c.drain_alloc_priority_returns,
+                    c.drain_over_capacity_returns,
+                    c.restore_evictions,
+                    c.alloc_evictions,
+                );
+            }
             Message::Lookup {
                 username,
                 name,

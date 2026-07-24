@@ -1,0 +1,20 @@
+[package]
+name = "openhands-completion"
+version = "0.1.0"
+description = "Phase-1 inferlet for the OpenHands ↔ Pie integration. Consumes a prompt already rendered with the model's chat template and returns generated text with stop-reason and token counts."
+authors = ["Lin Startup"]
+repository = "https://github.com/pie-project/pie"
+readme = "README.md"
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt       = {type = "string", description = "Prompt already rendered via the model's chat template (PieLLM.render_prompt)."}
+max_tokens   = {type = "int",    optional = true, description = "Hard cap on generated tokens. Default 2048."}
+temperature  = {type = "float",  optional = true, description = "Sampling temperature. 0 = greedy. Default 0.0."}
+top_p        = {type = "float",  optional = true, description = "Nucleus sampling threshold. Default 0.95."}
+# `stop` is a string array; the manifest TOML type system only supports scalar types
+# (string|int|float|bool), so we declare it implicitly — the inferlet's Input struct
+# (Vec<String> via serde) accepts and validates it at runtime.
+model        = {type = "string", optional = true, description = "Model name (informational only — the runtime's first model is used)."}

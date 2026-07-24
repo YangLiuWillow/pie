@@ -118,6 +118,17 @@ static TEMPLATE: &str = r#"
 {%- endif %}
 "#;
 
+
+/// Tool-call wire format. Qwen3/Qwen2.5-Instruct emit a JSON object inside
+/// `<tool_call>` tags; Qwen3-Coder emits a nested `<function=…>/<parameter=…>`
+/// XML block inside `<tool_call>` tags (a different fine-tuned format).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolFormat {
+    /// `<tool_call>\n{"name": …, "arguments": {…}}\n</tool_call>`
+    Json,
+    /// `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n…\n</function>\n</tool_call>`
+    Coder,
+}
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
     pub has_thinking: bool,
@@ -125,6 +136,8 @@ pub struct ChatMLConfig {
     pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
+    /// Tool-call wire format (default [`ToolFormat::Json`]).
+    pub tool_format: ToolFormat,
 }
 
 // =============================================================================
@@ -138,6 +151,17 @@ pub struct QwenInstruct {
     system_prefix: Vec<u32>,
     user_prefix: Vec<u32>,
     assistant_prefix: Vec<u32>,
+    // "<|im_start|>user"/"<|im_start|>assistant" WITHOUT the trailing newline
+    // baked into `user_prefix`/`assistant_prefix`. Needed when replaying a
+    // tool-calling turn: the reference template's tool-call/tool-response
+    // branches never put an unconditional newline right after the role tag —
+    // the newline comes from whatever follows (content, or the first
+    // `<tool_call>`/`<tool_response>` chunk), so reusing the newline-inclusive
+    // prefix would double up newlines when merging multiple chunks into one
+    // turn. See `assistant_with_tool_calls`/`answer_batch`.
+    user_prefix_no_nl: Vec<u32>,
+    assistant_prefix_no_nl: Vec<u32>,
+    newline_ids: Vec<u32>,
     turn_suffix: Vec<u32>,
     generation_header: Vec<u32>,
     stop_ids: Vec<u32>,
@@ -147,6 +171,24 @@ pub struct QwenInstruct {
     // Tool delimiters
     tool_response_prefix_tokens: Vec<u32>,
     tool_response_suffix_tokens: Vec<u32>,
+    // Tool-call/tool-response fragments for replaying history
+    // (`assistant_with_tool_calls`/`answer_batch`). Pre-tokenized like every
+    // other literal fragment in this struct — dynamic content (name,
+    // arguments, value) is always encoded on its own and concatenated as
+    // token IDs, never interpolated into a literal string and encoded in one
+    // shot, since that isn't guaranteed to retokenize into the same pieces
+    // (verified the hard way: see git history of this file).
+    tool_call_open_tokens: Vec<u32>,      // "\n<tool_call>\n{\"name\": \""
+    tool_call_mid_tokens: Vec<u32>,       // "\", \"arguments\": "
+    tool_call_close_tokens: Vec<u32>,     // "}\n</tool_call>"
+    tool_response_open_tokens: Vec<u32>,  // "\n<tool_response>\n"
+    // Qwen3-Coder tool-call fragments (used when config.tool_format == Coder).
+    coder_tc_open_tokens: Vec<u32>,       // "\n<tool_call>\n<function="
+    coder_fn_close_tokens: Vec<u32>,      // ">\n"                (after function name)
+    coder_param_open_tokens: Vec<u32>,    // "<parameter="
+    coder_param_mid_tokens: Vec<u32>,     // ">\n"                (after parameter name)
+    coder_param_close_tokens: Vec<u32>,   // "\n</parameter>\n"
+    coder_tc_close_tokens: Vec<u32>,      // "</function>\n</tool_call>"
 }
 
 impl QwenInstruct {
@@ -173,6 +215,11 @@ impl QwenInstruct {
         let mut turn_suffix = im_end;
         turn_suffix.extend(&newline);
 
+        let mut user_prefix_no_nl = im_start.clone();
+        user_prefix_no_nl.extend(encode("user"));
+        let mut assistant_prefix_no_nl = im_start.clone();
+        assistant_prefix_no_nl.extend(encode("assistant"));
+
         let think_prefix = encode("<think>");
         let think_suffix = encode("</think>");
 
@@ -184,10 +231,26 @@ impl QwenInstruct {
         let mut generation_header = make_prefix("assistant");
         generation_header.extend(encode(config.generation_suffix));
 
+        let tool_call_open_tokens = encode("\n<tool_call>\n{\"name\": \"");
+        let tool_call_mid_tokens = encode("\", \"arguments\": ");
+        let tool_call_close_tokens = encode("}\n</tool_call>");
+        let mut tool_response_open_tokens = newline.clone();
+        tool_response_open_tokens.extend(&tool_resp_prefix);
+
+        let coder_tc_open_tokens = encode("\n<tool_call>\n<function=");
+        let coder_fn_close_tokens = encode(">\n");
+        let coder_param_open_tokens = encode("<parameter=");
+        let coder_param_mid_tokens = encode(">\n");
+        let coder_param_close_tokens = encode("\n</parameter>\n");
+        let coder_tc_close_tokens = encode("</function>\n</tool_call>");
+
         Self {
             system_prefix: make_prefix("system"),
             user_prefix: make_prefix("user"),
             assistant_prefix: make_prefix("assistant"),
+            user_prefix_no_nl,
+            assistant_prefix_no_nl,
+            newline_ids: newline.clone(),
             generation_header,
             turn_suffix,
             stop_ids,
@@ -195,6 +258,16 @@ impl QwenInstruct {
             think_suffix_ids: think_suffix,
             tool_response_prefix_tokens: tool_resp_prefix,
             tool_response_suffix_tokens: tool_resp_suffix,
+            tool_call_open_tokens,
+            tool_call_mid_tokens,
+            tool_call_close_tokens,
+            tool_response_open_tokens,
+            coder_tc_open_tokens,
+            coder_fn_close_tokens,
+            coder_param_open_tokens,
+            coder_param_mid_tokens,
+            coder_param_close_tokens,
+            coder_tc_close_tokens,
             tokenizer,
             config,
         }
@@ -224,18 +297,36 @@ impl QwenInstruct {
         }
     }
 
+    /// Dispatch to the tool system-prompt builder for this model's format.
+    fn tool_system_prompt(&self, tools: &[String]) -> String {
+        match self.config.tool_format {
+            ToolFormat::Json => Self::build_tool_system_prompt(tools),
+            ToolFormat::Coder => Self::build_coder_tool_system_prompt(tools),
+        }
+    }
+
     /// Build the tool system prompt matching the Qwen reference format.
     /// Both Qwen3 and Qwen2.5 use identical `<tools>` XML + `<tool_call>` format.
     fn build_tool_system_prompt(tools: &[String]) -> String {
+        // Must match the Jinja2 chat template's output exactly — the model
+        // was fine-tuned on that format and won't produce <tool_call> blocks
+        // if the preamble diverges.
         let mut prompt = String::from(
-            " # Tools\n\n\
+            "\n# Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>",
         );
         for tool in tools {
             prompt.push('\n');
-            prompt.push_str(tool);
+            // Wrap in {"type": "function", "function": ...} if not already
+            // wrapped — the Jinja template renders tools in this envelope and
+            // the model was fine-tuned on it.
+            if tool.contains("\"type\"") && tool.contains("\"function\"") {
+                prompt.push_str(tool);
+            } else {
+                prompt.push_str(&format!("{{\"type\": \"function\", \"function\": {tool}}}"));
+            }
         }
         prompt.push_str(
             "\n</tools>\n\n\
@@ -248,42 +339,272 @@ impl QwenInstruct {
         prompt
     }
 
+    /// Build the Qwen3-Coder tool system prompt, matching that model's
+    /// fine-tuned chat template (nested `<function>/<parameter>` schema XML
+    /// and the `<tool_call><function=…>` call format). Diverging from this
+    /// preamble makes the model fall back to bare-JSON calls that no parser
+    /// recognizes (the exact failure that motivated this format).
+    fn build_coder_tool_system_prompt(tools: &[String]) -> String {
+        use std::fmt::Write as _;
+
+        // Render a JSON value for an "extra key": objects/arrays as compact
+        // JSON, scalars as their string form (mirrors the template's
+        // render_extra_keys macro).
+        fn render_val(v: &serde_json::Value) -> String {
+            match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => v.to_string(),
+                other => other.to_string(),
+            }
+        }
+
+        let mut prompt = String::from(
+            "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>",
+        );
+
+        for tool in tools {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) else {
+                continue;
+            };
+            // Accept both {"type":"function","function":{…}} and a bare
+            // function object.
+            let func = parsed.get("function").unwrap_or(&parsed);
+            let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            prompt.push_str("\n<function>\n<name>");
+            prompt.push_str(name);
+            prompt.push_str("</name>");
+            if let Some(desc) = func.get("description").and_then(|d| d.as_str()) {
+                let _ = write!(prompt, "\n<description>{}</description>", desc.trim());
+            }
+            prompt.push_str("\n<parameters>");
+            let params = func.get("parameters");
+            if let Some(props) = params
+                .and_then(|p| p.get("properties"))
+                .and_then(|p| p.as_object())
+            {
+                for (pname, pfields) in props {
+                    prompt.push_str("\n<parameter>\n<name>");
+                    prompt.push_str(pname);
+                    prompt.push_str("</name>");
+                    if let Some(t) = pfields.get("type") {
+                        let _ = write!(prompt, "\n<type>{}</type>", render_val(t));
+                    }
+                    if let Some(d) = pfields.get("description").and_then(|d| d.as_str()) {
+                        let _ = write!(prompt, "\n<description>{}</description>", d.trim());
+                    }
+                    // Extra parameter-level keys (enum, items, default, …).
+                    if let Some(obj) = pfields.as_object() {
+                        for (k, v) in obj {
+                            if matches!(k.as_str(), "name" | "type" | "description") {
+                                continue;
+                            }
+                            let _ = write!(prompt, "\n<{k}>{}</{k}>", render_val(v));
+                        }
+                    }
+                    prompt.push_str("\n</parameter>");
+                }
+            }
+            // Extra parameters-level keys (required, additionalProperties, …).
+            if let Some(obj) = params.and_then(|p| p.as_object()) {
+                for (k, v) in obj {
+                    if matches!(k.as_str(), "type" | "properties") {
+                        continue;
+                    }
+                    let _ = write!(prompt, "\n<{k}>{}</{k}>", render_val(v));
+                }
+            }
+            prompt.push_str("\n</parameters>");
+            // Extra function-level keys.
+            if let Some(obj) = func.as_object() {
+                for (k, v) in obj {
+                    if matches!(k.as_str(), "type" | "name" | "description" | "parameters") {
+                        continue;
+                    }
+                    let _ = write!(prompt, "\n<{k}>{}</{k}>", render_val(v));
+                }
+            }
+            prompt.push_str("\n</function>");
+        }
+
+        prompt.push_str(
+            "\n</tools>\n\n\
+             If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+             <tool_call>\n\
+             <function=example_function_name>\n\
+             <parameter=example_parameter_1>\n\
+             value_1\n\
+             </parameter>\n\
+             <parameter=example_parameter_2>\n\
+             This is the value for the second parameter\n\
+             that can span\n\
+             multiple lines\n\
+             </parameter>\n\
+             </function>\n\
+             </tool_call>\n\n\
+             <IMPORTANT>\n\
+             Reminder:\n\
+             - Function calls MUST follow the specified format: an inner <function=...></function> \
+             block must be nested within <tool_call></tool_call> XML tags\n\
+             - Required parameters MUST be specified\n\
+             - You may provide optional reasoning for your function call in natural language BEFORE \
+             the function call, but NOT after\n\
+             - If there is no function call available, answer the question like normal with your \
+             current knowledge and do not tell the user about function calls\n\
+             </IMPORTANT>",
+        );
+        prompt
+    }
+
+    /// Append one Qwen3-Coder `<tool_call>` block for a replayed call.
+    /// `arguments_json` is a JSON object string; each key becomes a
+    /// `<parameter=…>` entry whose value is the raw string (for string
+    /// values) or compact JSON (for numbers/arrays/objects).
+    fn render_coder_call(&self, tokens: &mut Vec<u32>, name: &str, arguments_json: &str) {
+        tokens.extend(&self.coder_tc_open_tokens);
+        tokens.extend(self.tokenizer.encode(name));
+        tokens.extend(&self.coder_fn_close_tokens);
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(arguments_json)
+        {
+            for (key, value) in &map {
+                tokens.extend(&self.coder_param_open_tokens);
+                tokens.extend(self.tokenizer.encode(key));
+                tokens.extend(&self.coder_param_mid_tokens);
+                let value_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                tokens.extend(self.tokenizer.encode(&value_str));
+                tokens.extend(&self.coder_param_close_tokens);
+            }
+        }
+        tokens.extend(&self.coder_tc_close_tokens);
+    }
+
+    /// Escape a string for embedding in an EBNF string-literal token.
+    fn escape_ebnf_literal(s: &str) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
+    ///
+    /// The grammar enforces well-formed `<tool_call>` blocks with a valid
+    /// tool name (layer 1) and, when the tool declares a `parameters`
+    /// schema with properties, arguments constrained to that schema
+    /// (layer 2, via `json_schema_to_ebnf_named`). Tools without a usable
+    /// schema fall back to generic JSON arguments. Both paths permit the
+    /// model's natural JSON whitespace (e.g. a space after `:`); masking
+    /// out those high-probability tokens forces sampling into the logit
+    /// noise floor, where grammar-legal garbage wins per-tool.
     fn build_tool_call_grammar(tools: &[String]) -> Option<String> {
-        let mut names: Vec<String> = Vec::new();
+        use crate::inference::structured::json_schema::{
+            json_schema_to_ebnf_named, JsonSchemaOptions,
+        };
+
+        struct ToolSpec {
+            name: String,
+            parameters: Option<serde_json::Value>,
+        }
+
+        let mut specs: Vec<ToolSpec> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                let name = parsed
-                    .get("function")
+                let func = parsed.get("function");
+                let name = func
                     .and_then(|f| f.get("name"))
                     .or_else(|| parsed.get("name"))
                     .and_then(|n| n.as_str());
                 if let Some(n) = name {
-                    names.push(format!("\"{}\"", n));
+                    let parameters = func
+                        .and_then(|f| f.get("parameters"))
+                        .or_else(|| parsed.get("parameters"))
+                        .cloned();
+                    specs.push(ToolSpec { name: n.to_string(), parameters });
                 }
             }
         }
-        if names.is_empty() {
+        if specs.is_empty() {
             return None;
         }
 
-        let name_alt = names.join(" | ");
+        let mut tool_json_alts: Vec<String> = Vec::with_capacity(specs.len());
+        let mut extra_rules = String::new();
+
+        for (i, spec) in specs.iter().enumerate() {
+            let alt_name = format!("tool-json-{i}");
+            let escaped_name = Self::escape_ebnf_literal(&spec.name);
+            // Layer 2: constrain arguments to the tool's parameter schema
+            // when it declares properties; a schema that fails to convert
+            // (or declares none) falls back to generic JSON.
+            let schema_args = spec.parameters.as_ref().and_then(|params| {
+                let has_props = params
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .is_some_and(|o| !o.is_empty());
+                if !has_props {
+                    return None;
+                }
+                let args_root = format!("tool-args-{i}");
+                json_schema_to_ebnf_named(params, &args_root, &JsonSchemaOptions::default())
+                    .ok()
+                    .map(|ebnf| (args_root, ebnf))
+            });
+            let args_rule = match &schema_args {
+                Some((args_root, ebnf)) => {
+                    extra_rules.push_str(ebnf);
+                    if !ebnf.ends_with('\n') {
+                        extra_rules.push('\n');
+                    }
+                    args_root.as_str()
+                }
+                None => "json-object",
+            };
+            extra_rules.push_str(&format!(
+                "{alt_name} ::= \"{{\\\"name\\\": \\\"{escaped_name}\\\", \\\"arguments\\\": \" {args_rule} \"}}\"\n",
+            ));
+            tool_json_alts.push(alt_name);
+        }
+
+        let tool_json_alt = tool_json_alts.join(" | ");
+
+        // The grammar begins directly at "<tool_call>" — no free-text
+        // prefix. Callers must NOT constrain a whole assistant turn with it
+        // (that suppresses all reasoning text and collapses t=0 agent
+        // trajectories into action loops — traj job 18818735); a
+        // prefix-automaton variant that allowed free text was tried and
+        // abandoned: the parse ambiguity blew up per-token mask cost 3-18x
+        // and long constrained generations crashed the driver (traj jobs
+        // 18820715/18821389). The intended use is two-phase: generate the
+        // turn unconstrained, and only when no tool call was produced,
+        // re-run the tail of the turn under this grammar to force one
+        // well-formed call (see the openhands inferlets). Repetition is
+        // capped at 4 calls per turn (mc-* chain): the unbounded tail let
+        // a degenerate t=0 decode emit 15 identical calls in one response.
         let grammar = format!(
-            r#"root ::= tool-call ("\n" tool-call)*
+            r#"root ::= tool-call mc-1
+mc-1 ::= ("\n" tool-call mc-2)?
+mc-2 ::= ("\n" tool-call mc-3)?
+mc-3 ::= ("\n" tool-call)?
 tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
-tool-json ::= "{{"  "\"name\": \"" tool-name "\", \"arguments\": " json-object "}}"
-tool-name ::= {name_alt}
-json-object ::= "{{" json-members? "}}"
-json-members ::= json-pair ("," json-pair)*
-json-pair ::= json-string ":" json-value
+tool-json ::= {tool_json_alt}
+{extra_rules}json-object ::= "{{" json-ws (json-pair (json-ws "," json-ws json-pair)*)? json-ws "}}"
+json-pair ::= json-string json-ws ":" json-ws json-value
 json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
 json-string ::= "\"" json-chars "\""
 json-chars ::= json-char*
 json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
-json-array ::= "[" (json-value ("," json-value)*)? "]"
-"#,
-            name_alt = name_alt
+json-array ::= "[" json-ws (json-value (json-ws "," json-ws json-value)*)? json-ws "]"
+json-ws ::= [ \t\n\r]*
+"#
         );
         Some(grammar)
     }
@@ -322,8 +643,27 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools {
             return Vec::new();
         }
-        let prompt = Self::build_tool_system_prompt(tools);
+        let prompt = self.tool_system_prompt(tools);
         self.system(&prompt)
+    }
+
+    fn equip_after_system(&self, system_content: Option<&str>, tools: &[String]) -> Vec<u32> {
+        // Reference (qwen2.rs's embedded Jinja template, top-of-prompt
+        // preamble): when tools are present, the leading system message's
+        // content (if any) and the tools block are folded into ONE system
+        // turn ('content' + '\n\n' + tools-block), not two separate turns.
+        if !self.config.has_tools || tools.is_empty() {
+            return match system_content {
+                Some(c) => self.system(c),
+                None => Vec::new(),
+            };
+        }
+        let tools_block = self.tool_system_prompt(tools);
+        let merged = match system_content {
+            Some(c) if !c.is_empty() => format!("{c}\n\n{tools_block}"),
+            _ => tools_block,
+        };
+        self.system(&merged)
     }
 
     fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
@@ -336,6 +676,61 @@ impl Instruct for QwenInstruct {
         tokens.extend(&self.tool_response_prefix_tokens);
         tokens.extend(self.tokenizer.encode(value));
         tokens.extend(&self.tool_response_suffix_tokens);
+        tokens.extend(&self.turn_suffix);
+        tokens
+    }
+
+    fn assistant_with_tool_calls(&self, content: Option<&str>, calls: &[(String, String)]) -> Vec<u32> {
+        if !self.config.has_tools || calls.is_empty() {
+            return self.assistant(content.unwrap_or(""));
+        }
+        // Reference (qwen2.rs's embedded Jinja template, assistant branch):
+        // '<|im_start|>' + role, then '\n' + content only if content is
+        // truthy, then for each call '\n<tool_call>\n{"name": ..., "arguments":
+        // ...}\n</tool_call>', then '<|im_end|>\n'. Note there's no
+        // unconditional newline after the role tag — it comes from whichever
+        // of those two branches fires first.
+        let mut tokens = self.assistant_prefix_no_nl.clone();
+        if let Some(c) = content {
+            if !c.is_empty() {
+                tokens.extend(&self.newline_ids);
+                tokens.extend(self.tokenizer.encode(c));
+            }
+        }
+        for (name, arguments_json) in calls {
+            match self.config.tool_format {
+                ToolFormat::Json => {
+                    tokens.extend(&self.tool_call_open_tokens);
+                    tokens.extend(self.tokenizer.encode(name));
+                    tokens.extend(&self.tool_call_mid_tokens);
+                    tokens.extend(self.tokenizer.encode(arguments_json));
+                    tokens.extend(&self.tool_call_close_tokens);
+                }
+                ToolFormat::Coder => self.render_coder_call(&mut tokens, name, arguments_json),
+            }
+        }
+        tokens.extend(&self.turn_suffix);
+        tokens
+    }
+
+    fn answer_batch(&self, results: &[(String, String)]) -> Vec<u32> {
+        if !self.config.has_tools || results.is_empty() {
+            return Vec::new();
+        }
+        // Reference: consecutive tool-role messages share one
+        // '<|im_start|>user' ... '<|im_end|>\n' turn, but EVERY message still
+        // contributes its own leading '\n<tool_response>\n...\n</tool_response>'
+        // chunk (there's no unconditional newline baked into the opening tag
+        // either — same shape as assistant_with_tool_calls above). Merging
+        // two single-result `answer()` calls would double up the newline
+        // between chunks, which is why this needs its own implementation
+        // rather than just looping `answer()` (the trait default).
+        let mut tokens = self.user_prefix_no_nl.clone();
+        for (_name, value) in results {
+            tokens.extend(&self.tool_response_open_tokens);
+            tokens.extend(self.tokenizer.encode(value));
+            tokens.extend(&self.tool_response_suffix_tokens);
+        }
         tokens.extend(&self.turn_suffix);
         tokens
     }
@@ -359,16 +754,32 @@ impl Instruct for QwenInstruct {
     }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
-        Box::new(QwenToolDecoder {
-            tokenizer: self.tokenizer.clone(),
-            accumulated: String::new(),
-            inside: false,
-            has_tools: self.config.has_tools,
-        })
+        match self.config.tool_format {
+            ToolFormat::Json => Box::new(QwenToolDecoder {
+                tokenizer: self.tokenizer.clone(),
+                accumulated: String::new(),
+                inside: false,
+                has_tools: self.config.has_tools,
+            }),
+            ToolFormat::Coder => Box::new(Qwen3CoderToolDecoder {
+                tokenizer: self.tokenizer.clone(),
+                accumulated: String::new(),
+                inside: false,
+                has_tools: self.config.has_tools,
+            }),
+        }
     }
 
     fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
         if !self.config.has_tools || tools.is_empty() {
+            return None;
+        }
+        // Qwen3-Coder's `<function=…>/<parameter=…>` format has no
+        // constrained-grammar implementation yet; the model emits it
+        // natively when the preamble matches, so phase-1 decoding suffices
+        // and the two-phase forced fallback is skipped (native_matcher
+        // returns None). See openhands inferlets.
+        if self.config.tool_format == ToolFormat::Coder {
             return None;
         }
         let source = Self::build_tool_call_grammar(tools)?;
@@ -428,6 +839,89 @@ impl ToolDecoder for QwenToolDecoder {
     }
 }
 
+/// Streaming decoder for the Qwen3-Coder tool-call format:
+/// `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>…\n</function>\n</tool_call>`.
+/// Emits a `Call(name, args_json)` where `args_json` is a JSON object built
+/// from the parameters (values parsed as JSON when they parse, else kept as
+/// raw strings — mirroring how the reference parser coerces types).
+struct Qwen3CoderToolDecoder {
+    tokenizer: Arc<Tokenizer>,
+    accumulated: String,
+    inside: bool,
+    has_tools: bool,
+}
+
+impl Qwen3CoderToolDecoder {
+    /// Parse a `<function=…>…</function>` body into `(name, args_json)`.
+    fn parse_body(body: &str) -> Option<(String, String)> {
+        let fstart = body.find("<function=")?;
+        let after_fn = &body[fstart + "<function=".len()..];
+        let name_end = after_fn.find('>')?;
+        let name = after_fn[..name_end].trim().to_string();
+        let mut rest = &after_fn[name_end + 1..];
+
+        let mut args = serde_json::Map::new();
+        while let Some(pstart) = rest.find("<parameter=") {
+            let after_p = &rest[pstart + "<parameter=".len()..];
+            let Some(key_end) = after_p.find('>') else { break };
+            let key = after_p[..key_end].trim().to_string();
+            let val_and_rest = &after_p[key_end + 1..];
+            let Some(vend) = val_and_rest.find("</parameter>") else { break };
+            let raw = &val_and_rest[..vend];
+            // The template wraps the value as ">\n{value}\n</parameter>";
+            // strip exactly one leading and one trailing newline.
+            let val = raw
+                .strip_prefix('\n')
+                .unwrap_or(raw)
+                .strip_suffix('\n')
+                .unwrap_or_else(|| raw.strip_prefix('\n').unwrap_or(raw));
+            // Coerce to a typed JSON value when the text parses as non-string
+            // JSON (numbers, bools, arrays, objects); otherwise keep as string.
+            let value = match serde_json::from_str::<serde_json::Value>(val.trim()) {
+                Ok(v) if !v.is_string() => v,
+                _ => serde_json::Value::String(val.to_string()),
+            };
+            args.insert(key, value);
+            rest = &val_and_rest[vend + "</parameter>".len()..];
+        }
+
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, serde_json::Value::Object(args).to_string()))
+    }
+}
+
+impl ToolDecoder for Qwen3CoderToolDecoder {
+    fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
+        if !self.has_tools {
+            return ToolEvent::Start;
+        }
+        let text = self.tokenizer.decode(tokens, false);
+        self.accumulated.push_str(&text);
+
+        if !self.inside {
+            if let Some(pos) = self.accumulated.find("<tool_call>") {
+                self.inside = true;
+                self.accumulated = self.accumulated[pos + "<tool_call>".len()..].to_string();
+                return ToolEvent::Start;
+            }
+        } else if let Some(pos) = self.accumulated.find("</tool_call>") {
+            let body = self.accumulated[..pos].to_string();
+            self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
+            self.inside = false;
+            if let Some((name, args)) = Self::parse_body(&body) {
+                return ToolEvent::Call(name, args);
+            }
+        }
+        ToolEvent::Start
+    }
+
+    fn reset(&mut self) {
+        self.accumulated.clear();
+        self.inside = false;
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +962,7 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                tool_format: ToolFormat::Json,
             },
         )
     }
@@ -480,6 +975,7 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                tool_format: ToolFormat::Json,
             },
         )
     }
@@ -492,6 +988,7 @@ mod tests {
                 has_tools: false,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>"],
+                tool_format: ToolFormat::Json,
             },
         )
     }
@@ -574,6 +1071,149 @@ mod tests {
         assert!(inst.tool_call_grammar(&["{}".to_string()]).is_none());
     }
 
+    /// Whether `s` is a complete, legally-terminatable match for `tg`'s
+    /// grammar. `accept_string` walks raw bytes directly, so the tokenizer
+    /// passed to `GrammarMatcher` is irrelevant here (no token-boundary
+    /// concerns for this check).
+    fn matches_grammar(tg: &ToolGrammar, s: &str) -> bool {
+        let mut m = crate::inference::structured::matcher::GrammarMatcher::new(
+            tg.grammar.clone(), make_tok(), vec![], 10,
+        );
+        m.accept_string(s) && m.can_terminate()
+    }
+
+    #[test]
+    fn tool_call_grammar_constrains_arguments_by_schema() {
+        let inst = qwen3();
+        let tool = serde_json::json!({
+            "name": "calculator",
+            "description": "Evaluate an arithmetic expression.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"}
+                },
+                "required": ["expression"],
+                "additionalProperties": false
+            }
+        })
+        .to_string();
+
+        let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
+
+        let valid = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, valid), "well-typed arguments should match");
+
+        // The model's natural whitespace style must be legal — masking it
+        // out is what pushed sampling into the noise floor on GPU.
+        let spaced = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\": \"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, spaced), "space after ':' should be accepted");
+
+        // Schema-constrained: wrong value type is rejected.
+        let wrong_type = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, wrong_type), "wrong argument type must be rejected");
+
+        let extra_prop = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\",\"extra\":\"x\"}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, extra_prop), "extra properties must be rejected");
+
+        let empty_args = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, empty_args), "missing required property must be rejected");
+    }
+
+    #[test]
+    fn tool_call_grammar_multiple_tools_use_independent_names() {
+        let inst = qwen3();
+        let tools = vec![
+            serde_json::json!({
+                "name": "calculator",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expression": {"type": "string"}},
+                    "required": ["expression"]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            })
+            .to_string(),
+        ];
+        let tg = inst.tool_call_grammar(&tools).expect("grammar should build");
+
+        let calc_call = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, calc_call));
+
+        let weather_call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"NYC\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, weather_call));
+
+        // Tool name must match one of the declared tools.
+        let wrong_name = "<tool_call>\n{\"name\": \"unknown\", \"arguments\": {}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, wrong_name), "undeclared tool name must be rejected");
+    }
+
+    #[test]
+    fn tool_call_grammar_falls_back_to_generic_json_without_schema() {
+        // A tool with no "parameters" at all should still produce a usable
+        // grammar (falls back to the generic, unconstrained json-object).
+        let inst = qwen3();
+        let tool = serde_json::json!({"name": "no_args_tool"}).to_string();
+        let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
+
+        let call = "<tool_call>\n{\"name\": \"no_args_tool\", \"arguments\": {\"anything\":123}}\n</tool_call>";
+        assert!(matches_grammar(&tg, call));
+    }
+
+    #[test]
+    fn tool_call_grammar_forces_immediate_capped_calls() {
+        // This grammar is for the forced phase-2 tail of a turn (see
+        // build_tool_call_grammar's comment): it must start at
+        // "<tool_call>" immediately, enforce the schema inside, and cap
+        // repetition at 4 calls.
+        let inst = qwen3();
+        let tool = serde_json::json!({
+            "name": "calculator",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+                "additionalProperties": false
+            }
+        })
+        .to_string();
+        let tg = inst.tool_call_grammar(&[tool]).expect("grammar should build");
+
+        // No free text anywhere — not before, not instead of, a call.
+        assert!(!matches_grammar(&tg, "I'm done with the task."));
+        assert!(!matches_grammar(&tg, ""));
+        let call = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":\"1+1\"}}\n</tool_call>";
+        let reasoned = format!("Let me compute the sum first.\n\n{call}");
+        assert!(!matches_grammar(&tg, &reasoned));
+
+        // Bare tool calls work.
+        assert!(matches_grammar(&tg, call));
+
+        // Schema binds inside the call.
+        assert!(!matches_grammar(&tg, "<tool_call>\nnot json\n</tool_call>"));
+        let wrong_type = "<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\":1}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, wrong_type));
+
+        // Text after a completed tool call is not part of the template.
+        let trailing = format!("{call}\nand then some");
+        assert!(!matches_grammar(&tg, &trailing));
+
+        // Repetition is capped at 4 calls per turn — a degenerate t=0
+        // decode once emitted 15 identical calls in one response.
+        let four = std::iter::repeat(call).take(4).collect::<Vec<_>>().join("\n");
+        assert!(matches_grammar(&tg, &four));
+        let five = std::iter::repeat(call).take(5).collect::<Vec<_>>().join("\n");
+        assert!(!matches_grammar(&tg, &five));
+    }
+
     #[test]
     fn full_conversation() {
         let inst = qwen3();
@@ -639,6 +1279,7 @@ mod tests {
                 has_tools: true,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                tool_format: ToolFormat::Json,
             },
         );
         let mut dec = inst.tool_decoder();
@@ -653,5 +1294,384 @@ mod tests {
             }
             other => panic!("expected Call, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_falls_back_when_disabled() {
+        let inst = olmo3();
+        let with_calls = inst.assistant_with_tool_calls(Some("Hello"), &[("f".to_string(), "{}".to_string())]);
+        assert_eq!(with_calls, inst.assistant("Hello"));
+    }
+
+    /// Vocab for the tool-call-history tests below: the base `make_tok()` set
+    /// plus the three fixed literal fragments `assistant_with_tool_calls`
+    /// pre-tokenizes in `new()`, and the dynamic `name`/`arguments_json`
+    /// pieces those tests use ("f", "{}") as their own standalone entries —
+    /// `self.tokenizer.encode(name)` / `encode(arguments_json)` are called on
+    /// them in isolation, never interpolated into a bigger literal first (see
+    /// the comment on the struct's `tool_call_open_tokens` field for why).
+    fn make_tool_call_tok() -> Arc<Tokenizer> {
+        let mut v: Vec<String> = vec![
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "system", "\n", "user", "assistant", "Hello", " world",
+            "<think>", "</think>", "<tool_call>", "</tool_call>",
+            "<tool_response>", "</tool_response>", "<tools>", "</tools>",
+        ].into_iter().map(String::from).collect();
+        v.push("\n<tool_call>\n{\"name\": \"".to_string());
+        v.push("\", \"arguments\": ".to_string());
+        v.push("}\n</tool_call>".to_string());
+        v.push("f".to_string());
+        v.push("{}".to_string());
+        Arc::new(Tokenizer::from_vocab(&v))
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_matches_reference_with_content() {
+        let tok = make_tool_call_tok();
+        let inst = QwenInstruct::new(tok, ChatMLConfig {
+            has_thinking: false, has_tools: true,
+            generation_suffix: "",
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            tool_format: ToolFormat::Json,
+        });
+
+        let tokens = inst.assistant_with_tool_calls(Some("Hello"), &[("f".to_string(), "{}".to_string())]);
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>assistant\nHello\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_matches_reference_no_content() {
+        // Same as above but content=None: no unconditional newline after the
+        // role tag when there's no leading text — the reference template only
+        // ever emits one newline before the first `<tool_call>`, not two.
+        let tok = make_tool_call_tok();
+        let inst = QwenInstruct::new(tok, ChatMLConfig {
+            has_thinking: false, has_tools: true,
+            generation_suffix: "",
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            tool_format: ToolFormat::Json,
+        });
+
+        let tokens = inst.assistant_with_tool_calls(None, &[("f".to_string(), "{}".to_string())]);
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>assistant\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn answer_batch_noop_when_disabled() {
+        let inst = olmo3();
+        assert!(inst.answer_batch(&[("fn1".to_string(), "42".to_string())]).is_empty());
+    }
+
+    #[test]
+    fn answer_batch_single_matches_answer() {
+        let inst = qwen3();
+        assert_eq!(
+            inst.answer_batch(&[("fn1".to_string(), "Hello".to_string())]),
+            inst.answer("fn1", "Hello"),
+        );
+    }
+
+    #[test]
+    fn answer_batch_merges_consecutive_results() {
+        // The regression this exists to catch: calling `answer()` twice would
+        // produce two separate `<|im_start|>user...<|im_end|>` turns; the
+        // reference template merges consecutive tool results into ONE turn
+        // with multiple `<tool_response>` blocks inside it. Unlike the
+        // assistant-side tests above, `answer_batch`'s literal fragments are
+        // all built from pieces already in the base vocab (see
+        // `tool_response_open_tokens`'s construction — concatenated from
+        // already-tokenized pieces, not encoded as a combined literal), so
+        // only the dynamic values ("Hello", "world") need their own entries.
+        let mut v: Vec<String> = vec![
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "system", "\n", "user", "assistant", "Hello", " world",
+            "<think>", "</think>", "<tool_call>", "</tool_call>",
+            "<tool_response>", "</tool_response>", "<tools>", "</tools>",
+        ].into_iter().map(String::from).collect();
+        v.push("world".to_string());
+        let tok = Arc::new(Tokenizer::from_vocab(&v));
+        let inst = QwenInstruct::new(tok, ChatMLConfig {
+            has_thinking: false, has_tools: true,
+            generation_suffix: "",
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            tool_format: ToolFormat::Json,
+        });
+
+        let tokens = inst.answer_batch(&[
+            ("fn1".to_string(), "Hello".to_string()),
+            ("fn2".to_string(), "world".to_string()),
+        ]);
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>user\n<tool_response>\nHello\n</tool_response>\n<tool_response>\nworld\n</tool_response><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn tool_call_grammar_accepts_any_json_arguments() {
+        let inst = qwen3();
+        let file_editor = r#"{"name": "file_editor"}"#.to_string();
+        let tg = inst.tool_call_grammar(&[file_editor]).expect("grammar should build");
+
+        // Any valid JSON arguments should be accepted
+        let with_old_new = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\":\"str_replace\",\"path\":\"/tmp/test.py\",\"old_str\":\"x\",\"new_str\":\"y\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, with_old_new));
+
+        // Any property order is fine
+        let diff_order = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"old_str\":\"x\",\"command\":\"str_replace\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, diff_order));
+
+        // Empty arguments
+        let empty = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {}}\n</tool_call>";
+        assert!(matches_grammar(&tg, empty));
+
+        // Natural whitespace after ':' and ',' in the generic fallback too
+        let spaced = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, spaced));
+    }
+
+    /// Regression for the GPU degeneracy found via mask-debug job 18734943:
+    /// with the real file_editor schema (command is an enum), the exact
+    /// garbage the constrained run produced must be grammar-illegal, and
+    /// the model's natural spaced rendering must be legal.
+    #[test]
+    fn tool_call_grammar_rejects_observed_degenerate_output() {
+        let inst = qwen3();
+        // Real OpenHands file_editor shape: the FIRST declared property
+        // (summary) is optional — omitting it must not strand the grammar
+        // on a leading comma.
+        let file_editor = serde_json::json!({
+            "name": "file_editor",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+                    "path": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"}
+                },
+                "required": ["command", "path"]
+            }
+        })
+        .to_string();
+        let tg = inst.tool_call_grammar(&[file_editor]).expect("grammar should build");
+
+        let degenerate = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\":\"}}\n</tool_call> \n{\"}}\n</tool_call>";
+        assert!(
+            !matches_grammar(&tg, degenerate),
+            "observed degenerate output must be rejected by the schema layer"
+        );
+
+        let sane = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, sane), "omitting the leading optional property must be accepted");
+
+        let with_summary = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"summary\": \"look\", \"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, with_summary), "leading optional property present must be accepted");
+
+        let str_replace = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"str_replace\", \"path\": \"/tmp/x.py\", \"old_str\": \"a\", \"new_str\": \"b\"}}\n</tool_call>";
+        assert!(matches_grammar(&tg, str_replace), "optional tail properties must be accepted");
+
+        let leading_comma = "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {, \"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>";
+        assert!(!matches_grammar(&tg, leading_comma), "leading comma must be rejected");
+    }
+
+    /// Diagnostic (needs the real Qwen2.5 tokenizer on NFS): walk a realistic
+    /// tool call token-by-token and assert every expected token survives the
+    /// next-token bitmask. Reproduces the GPU-side degenerate-mask failure.
+    #[test]
+    #[ignore]
+    fn debug_mask_walk_real_tokenizer() {
+        let path = std::env::var("QWEN_TOKENIZER_JSON").expect("set QWEN_TOKENIZER_JSON");
+        let tok = Arc::new(Tokenizer::from_file(std::path::Path::new(&path)).unwrap());
+        let inst = QwenInstruct::new(
+            tok.clone(),
+            ChatMLConfig {
+                has_thinking: false,
+                has_tools: true,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+                tool_format: ToolFormat::Json,
+            },
+        );
+
+        // Accuracy-preservation invariant: for any well-formed,
+        // schema-conformant rendering the model would naturally produce
+        // (compact or spaced, optional properties omitted or present), the
+        // mask must allow every expected token at every step — i.e. the
+        // constraint never binds on correct output, so constrained
+        // greedy decoding equals unconstrained greedy decoding whenever
+        // the unconstrained output is well-formed.
+        let file_editor_schema = r#"{"type":"function","function":{"name":"file_editor","parameters":{"type":"object","properties":{"summary":{"type":"string"},"command":{"type":"string","enum":["view","create","str_replace","insert","undo_edit"]},"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"}},"required":["command","path"]}}}"#;
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "terminal",
+                r#"{"type":"function","function":{"name":"terminal","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"terminal\", \"arguments\": {\"command\":\"ls\"}}\n</tool_call>",
+            ),
+            (
+                "terminal-spaced",
+                r#"{"type":"function","function":{"name":"terminal","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"terminal\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>",
+            ),
+            (
+                "file_editor",
+                file_editor_schema.to_string(),
+                "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\":\"view\",\"path\":\"/tmp/x.py\"}}\n</tool_call>",
+            ),
+            (
+                "file_editor-spaced-no-summary",
+                file_editor_schema.to_string(),
+                "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"command\": \"view\", \"path\": \"/tmp/x.py\"}}\n</tool_call>",
+            ),
+            (
+                "file_editor-str-replace",
+                file_editor_schema.to_string(),
+                "<tool_call>\n{\"name\": \"file_editor\", \"arguments\": {\"summary\": \"fix bug\", \"command\": \"str_replace\", \"path\": \"/tmp/x.py\", \"old_str\": \"a = 1\", \"new_str\": \"a = 2\"}}\n</tool_call>",
+            ),
+            (
+                "think",
+                r#"{"type":"function","function":{"name":"think","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"think\", \"arguments\": {\"thought\":\"I should list the files.\"}}\n</tool_call>",
+            ),
+            (
+                "think-spaced",
+                r#"{"type":"function","function":{"name":"think","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}}"#.to_string(),
+                "<tool_call>\n{\"name\": \"think\", \"arguments\": {\"thought\": \"I should list the files first.\"}}\n</tool_call>",
+            ),
+        ];
+
+        for (name, schema, target) in cases {
+            let tg = inst.tool_call_grammar(&[schema]).expect("grammar builds");
+            let mut m = crate::inference::structured::matcher::GrammarMatcher::new(
+                tg.grammar.clone(),
+                tok.clone(),
+                vec![],
+                10,
+            );
+            let ids = tok.encode(target);
+            let words = (tok.vocab_size() + 31) / 32;
+            let mut mask = vec![0u32; words];
+            let mut failed = false;
+            let dump_dir = std::env::var("MASK_DUMP_DIR").ok();
+            for (i, &id) in ids.iter().enumerate() {
+                // Serving path: BRLE-encoded mask (what the driver actually sees).
+                let brle = m.fill_next_token_brle();
+                if let Some(dir) = &dump_dir {
+                    let mut popcount = 0usize;
+                    for (val, start, end) in brle.iter_runs() {
+                        if val {
+                            popcount += end.min(tok.vocab_size()) - start;
+                        }
+                    }
+                    let rec = serde_json::json!({
+                        "case": name,
+                        "step": i,
+                        "next_id": id,
+                        "popcount": popcount,
+                        "total_size": brle.total_size,
+                        "brle": brle.buffer,
+                    });
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/brle_dump.jsonl"))
+                        .unwrap();
+                    writeln!(f, "{rec}").unwrap();
+                }
+                let mut brle_bits = vec![false; tok.vocab_size()];
+                for (val, start, end) in brle.iter_runs() {
+                    for t in start..end.min(tok.vocab_size()) {
+                        brle_bits[t] = val;
+                    }
+                }
+                m.fill_next_token_bitmask(&mut mask);
+                for t in 0..tok.vocab_size() {
+                    let raw = (mask[t / 32] >> (t % 32)) & 1 == 1;
+                    if raw != brle_bits[t] {
+                        panic!(
+                            "[{name}] step {i}: BRLE/bitmask disagree at token {t} ({:?}): raw={raw} brle={}",
+                            tok.decode(&[t as u32], false),
+                            brle_bits[t]
+                        );
+                    }
+                }
+                let allowed = (mask[id as usize / 32] >> (id % 32)) & 1 == 1;
+                if !allowed {
+                    let mut sample = Vec::new();
+                    for t in 0..tok.vocab_size() {
+                        if (mask[t / 32] >> (t % 32)) & 1 == 1 {
+                            sample.push(format!("{:?}", tok.decode(&[t as u32], false)));
+                            if sample.len() >= 25 {
+                                break;
+                            }
+                        }
+                    }
+                    println!(
+                        "[{name}] step {i}: token {id} {:?} MASKED OUT\n  prefix: {:?}\n  allowed sample: {}",
+                        tok.decode(&[id], false),
+                        tok.decode(&ids[..i], false),
+                        sample.join(", ")
+                    );
+                    failed = true;
+                    break;
+                }
+                assert!(m.accept_token(id), "[{name}] accept_token failed at step {i}");
+            }
+            if !failed {
+                println!("[{name}] full walk OK ({} tokens)", ids.len());
+            }
+        }
+    }
+
+    // ── Qwen3-Coder tool format ────────────────────────────────────────────
+
+    #[test]
+    fn coder_parse_body_str_replace() {
+        // Multi-line old_str (raw newlines) is exactly what the JSON
+        // <tool_call> format could not carry; the Coder format handles it.
+        let body = "\n<function=file_editor>\n\
+                    <parameter=command>\nstr_replace\n</parameter>\n\
+                    <parameter=old_str>\ndef Y(self):\n    return self.data.year\n</parameter>\n\
+                    <parameter=view_range>\n[315, 318]\n</parameter>\n\
+                    </function>\n";
+        let (name, args) = Qwen3CoderToolDecoder::parse_body(body).expect("should parse");
+        assert_eq!(name, "file_editor");
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["command"], "str_replace");
+        assert_eq!(v["old_str"], "def Y(self):\n    return self.data.year");
+        // Bracketed value coerces to a JSON array, not a string.
+        assert_eq!(v["view_range"], serde_json::json!([315, 318]));
+    }
+
+    #[test]
+    fn coder_parse_body_requires_function_name() {
+        assert!(Qwen3CoderToolDecoder::parse_body("no function here").is_none());
+    }
+
+    #[test]
+    fn coder_system_prompt_matches_template_shape() {
+        let tools = vec![
+            r#"{"type":"function","function":{"name":"file_editor","description":"Edit files","parameters":{"type":"object","properties":{"command":{"type":"string","description":"cmd"},"old_str":{"type":"string"}},"required":["command"]}}}"#
+                .to_string(),
+        ];
+        let p = QwenInstruct::build_coder_tool_system_prompt(&tools);
+        assert!(p.contains("# Tools"));
+        assert!(p.contains("<tools>"));
+        assert!(p.contains("<function>\n<name>file_editor</name>"));
+        assert!(p.contains("<parameter>\n<name>command</name>"));
+        assert!(p.contains("<required>[\"command\"]</required>"));
+        assert!(p.contains("<function=example_function_name>"));
+        assert!(p.contains("ONLY reply in the following format"));
     }
 }

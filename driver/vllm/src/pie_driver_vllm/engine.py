@@ -9,6 +9,7 @@ imported directly from `pie_driver`.
 from __future__ import annotations
 
 import os
+import re
 import random
 import time
 import sys
@@ -32,6 +33,30 @@ class _DecodeLookaheadBuffer:
     tokens: list[int]
     sampler_key: tuple
     next_idx: int = 1
+
+
+def _normalize_arch_name(raw_arch: str) -> str:
+    """"Qwen2ForCausalLM" -> "qwen2".
+
+    Mirrors the heuristic in `server/src/embedded_driver.rs`'s
+    `read_hf_config_defaults` — pie's runtime matches `arch_name` against
+    short lowercase names (`instruct::create` in
+    `runtime/src/model/instruct.rs`) and silently falls back to a
+    no-tools/no-thinking generic config for anything that doesn't match, so
+    reporting the raw HF architecture string here would disable tool
+    support for every model this driver serves.
+    """
+    lowered = raw_arch.lower()
+    suffix = "forcausallm"
+    name = lowered[: -len(suffix)] if lowered.endswith(suffix) else lowered
+    # The Rust instruct::create() match arms use underscores before component
+    # words (e.g. "qwen3_moe", "gemma3_text") but the HF CamelCase architecture
+    # string collapses them (Qwen3MoeForCausalLM → "qwen3moe").  Re-insert
+    # the underscore so the Rust side picks the correct instruct config
+    # (has_tools / has_thinking) instead of falling through to the generic
+    # default.
+    name = re.sub(r"(?<=[a-z0-9])(moe|text)(?=$|_)", r"_\1", name)
+    return name
 
 
 class VllmEngine:
@@ -151,6 +176,14 @@ class VllmEngine:
         _debug_stage("maybe_wrap_full_cudagraph: done")
 
         _debug_stage("allocate_and_bind_kv_cache: begin")
+
+        # vLLM >=0.16 requires WorkspaceManager for MoE fused-expert kernels.
+        try:
+            from vllm.v1.worker.workspace import init_workspace_manager
+            device = torch.device(config.devices[config.rank])
+            init_workspace_manager(device)
+        except (ImportError, AttributeError):
+            pass
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         _debug_stage("allocate_and_bind_kv_cache: done")
         _debug_stage("allocate_host_pool: begin")
@@ -762,7 +795,7 @@ class VllmEngine:
             max_custom_mask_bytes=unconstrained,
             max_sampler_rows=unconstrained,
             max_logprob_labels=unconstrained,
-            arch_name=self.arch_type,
+            arch_name=_normalize_arch_name(self.arch_type),
             vocab_size=int(mc.get_vocab_size()),
             max_model_len=int(mc.max_model_len),
             activation_dtype=dtype_str,
