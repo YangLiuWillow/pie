@@ -1,0 +1,40 @@
+# Native CUDA driver config for Qwen3-Coder-30B-A3B (MoE) on a single
+# A100 SXM4 80GB (sm_80). Adapted from the RTX Pro 6000 Blackwell (96 GB, sm_120)
+# fixtures for the runpod fair-parity rerun.
+#
+# Requires a `pie` built with `--features driver-portable,driver-cuda` on THIS
+# box (sm_80). The CUDA driver auto-detects arch (DetectCudaArchitecture.cmake);
+# moe_dispatch.cu has __CUDA_ARCH__ >= 800 paths, so sm_80 is a supported target.
+# Do NOT copy an sm_120 binary here — rebuild on the A100. See 00_setup_a100.sh.
+#
+# NEW-SCHEMA config (auto-plans KV/batch from memory_profile + gpu_mem_utilization);
+# the old max_num_kv_pages / max_batch_tokens / max_batch_size knobs were removed.
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+# ~60 GB of bf16 weights on an 80 GB A100. 0.90 leaves the planner ~12 GB of the
+# budget for KV pages after weights (smaller than the 96 GB Blackwell box, so
+# expect a smaller auto-planned KV pool — fine for the serial A/B; watch it under
+# the concurrent/overcommit stretch).
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
+kv_page_size = 32
+weight_dtype = "bfloat16"
+# Host-backed KV offload tier ON. For the fair serial wall-clock A/B this is a
+# harmless backstop (KV fits). It becomes ESSENTIAL for the stretch overcommit
+# sweep (Pie swap vs vLLM evict-and-recompute) — the one regime the writeup says
+# structurally differs. ~8192 host pages ≈ ~25 GB pinned host RAM; runpod A100
+# SXM nodes usually have plenty. Set to 0 to reproduce the "swap off" baseline.
+swap_pool_size = 8192
