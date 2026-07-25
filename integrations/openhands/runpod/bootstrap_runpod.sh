@@ -45,6 +45,10 @@ MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 CPM_SOURCE_CACHE=${CPM_SOURCE_CACHE:-$WORK/.cpm-cache}
 PIP_CACHE_DIR=${PIP_CACHE_DIR:-$WORK/.pip-cache}
 UV_CACHE_DIR=${UV_CACHE_DIR:-$WORK/.uv-cache}
+# uv defaults to a 30s HTTP timeout, which the multi-hundred-MB wheels in the
+# vLLM/torch/CUDA dependency set routinely blow through on a runpod link.
+export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-300}
+export PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-300}
 VLLM_VERSION=${VLLM_VERSION:-}
 SKIP_MODEL=${SKIP_MODEL:-0}
 SKIP_APT=${SKIP_APT:-0}
@@ -229,6 +233,8 @@ export PIE_BIN=$PIE_SRC/target/release/pie
 export CPM_SOURCE_CACHE=$CPM_SOURCE_CACHE
 export PIP_CACHE_DIR=$PIP_CACHE_DIR
 export UV_CACHE_DIR=$UV_CACHE_DIR
+export UV_HTTP_TIMEOUT=$UV_HTTP_TIMEOUT
+export PIP_DEFAULT_TIMEOUT=$PIP_DEFAULT_TIMEOUT
 export CMAKE_CUDA_ARCHITECTURES=$ARCH
 export PIE_PORTABLE_CUDA_ARCH=$ARCH
 $([ -n "$PIE_NCCL_HOME" ] && echo "export PIE_NCCL_HOME=$PIE_NCCL_HOME")
@@ -250,12 +256,27 @@ mkvenv() {  # mkvenv <path>
 }
 pipinstall() {  # pipinstall <venv> <args...>
     local v=$1; shift
-    if command -v uv >/dev/null; then VIRTUAL_ENV=$v uv pip install "$@"
-    else "$v/bin/pip" install -q "$@"; fi
+    local attempt
+    # Retry: these are multi-GB downloads over a link that drops them. Both
+    # tools resume from cache ($UV_CACHE_DIR / $PIP_CACHE_DIR on $WORK), so a
+    # retry re-fetches only what actually failed.
+    for attempt in 1 2 3; do
+        if command -v uv >/dev/null; then VIRTUAL_ENV=$v uv pip install "$@" && return 0
+        else "$v/bin/pip" install -q "$@" && return 0; fi
+        warn "install attempt $attempt/3 failed ($*) — retrying in 10s"
+        sleep 10
+    done
+    die "install failed after 3 attempts: $*"
 }
 
-if [ ! -x "$PIE_VENV/bin/python" ]; then
-    echo "  creating vLLM venv at $PIE_VENV"
+# Gate on the PACKAGE importing, not on the venv directory existing. A venv is
+# created before its (multi-GB) installs finish, so a network failure mid-install
+# leaves a venv that exists but is empty — and a directory-existence guard would
+# then skip the retry on re-run and fail at the import check instead.
+has_pkg() { [ -x "$1/bin/python" ] && "$1/bin/python" -c "import $2" >/dev/null 2>&1; }
+
+if ! has_pkg "$PIE_VENV" vllm; then
+    echo "  provisioning vLLM venv at $PIE_VENV"
     mkvenv "$PIE_VENV"
     pipinstall "$PIE_VENV" --upgrade pip
     # Pin VLLM_VERSION for a reproducible baseline; unpinned takes latest.
@@ -265,8 +286,8 @@ if [ ! -x "$PIE_VENV/bin/python" ]; then
 fi
 "$PIE_VENV/bin/python" -c 'import vllm; print("  vLLM", vllm.__version__)'
 
-if [ ! -x "$HARNESS_VENV/bin/python" ]; then
-    echo "  creating harness venv at $HARNESS_VENV"
+if ! has_pkg "$HARNESS_VENV" pie_openhands; then
+    echo "  provisioning harness venv at $HARNESS_VENV"
     mkvenv "$HARNESS_VENV"
     pipinstall "$HARNESS_VENV" --upgrade pip
     pipinstall "$HARNESS_VENV" -e "$PIE_SRC/integrations/openhands"
