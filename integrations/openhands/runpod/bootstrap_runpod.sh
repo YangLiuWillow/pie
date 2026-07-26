@@ -47,8 +47,13 @@ PIP_CACHE_DIR=${PIP_CACHE_DIR:-$WORK/.pip-cache}
 UV_CACHE_DIR=${UV_CACHE_DIR:-$WORK/.uv-cache}
 # uv defaults to a 30s HTTP timeout, which the multi-hundred-MB wheels in the
 # vLLM/torch/CUDA dependency set routinely blow through on a runpod link.
-export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-300}
-export PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-300}
+export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-900}
+export PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-900}
+# uv fetches wheels in parallel by default. On a saturated link that starves
+# every stream until each trips its own timeout — observed on runpod as a 90 MB
+# wheel failing at a 300s timeout. Capping concurrency fixes this where raising
+# the timeout alone does not.
+export UV_CONCURRENT_DOWNLOADS=${UV_CONCURRENT_DOWNLOADS:-4}
 VLLM_VERSION=${VLLM_VERSION:-}
 SKIP_MODEL=${SKIP_MODEL:-0}
 SKIP_APT=${SKIP_APT:-0}
@@ -235,6 +240,7 @@ export PIP_CACHE_DIR=$PIP_CACHE_DIR
 export UV_CACHE_DIR=$UV_CACHE_DIR
 export UV_HTTP_TIMEOUT=$UV_HTTP_TIMEOUT
 export PIP_DEFAULT_TIMEOUT=$PIP_DEFAULT_TIMEOUT
+export UV_CONCURRENT_DOWNLOADS=$UV_CONCURRENT_DOWNLOADS
 export CMAKE_CUDA_ARCHITECTURES=$ARCH
 export PIE_PORTABLE_CUDA_ARCH=$ARCH
 $([ -n "$PIE_NCCL_HOME" ] && echo "export PIE_NCCL_HOME=$PIE_NCCL_HOME")
@@ -261,12 +267,24 @@ pipinstall() {  # pipinstall <venv> <args...>
     # tools resume from cache ($UV_CACHE_DIR / $PIP_CACHE_DIR on $WORK), so a
     # retry re-fetches only what actually failed.
     for attempt in 1 2 3; do
-        if command -v uv >/dev/null; then VIRTUAL_ENV=$v uv pip install "$@" && return 0
-        else "$v/bin/pip" install -q "$@" && return 0; fi
+        if command -v uv >/dev/null; then
+            # Halve concurrency each retry — a link that starved 4 parallel
+            # streams may still carry 2, then 1.
+            UV_CONCURRENT_DOWNLOADS=$(( UV_CONCURRENT_DOWNLOADS > 1 ? UV_CONCURRENT_DOWNLOADS / attempt : 1 )) \
+                VIRTUAL_ENV=$v uv pip install "$@" && return 0
+        else
+            "$v/bin/pip" install -q "$@" && return 0
+        fi
         warn "install attempt $attempt/3 failed ($*) — retrying in 10s"
         sleep 10
     done
-    die "install failed after 3 attempts: $*"
+    # Last resort: pip is serial and a different HTTP stack, so it sometimes
+    # completes a download set that uv cannot.
+    if [ -x "$v/bin/pip" ]; then
+        warn "falling back to pip (serial) for: $*"
+        "$v/bin/pip" install "$@" && return 0
+    fi
+    die "install failed after 3 uv attempts + pip fallback: $*"
 }
 
 # Gate on the PACKAGE importing, not on the venv directory existing. A venv is
