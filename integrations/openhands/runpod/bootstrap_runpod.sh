@@ -149,21 +149,28 @@ cargo --version
 # -----------------------------------------------------------------------------
 step 2 "python >= 3.12 (pie-openhands requires-python >=3.12)"
 # -----------------------------------------------------------------------------
-PY=""
-for cand in python3.13 python3.12; do
-    command -v "$cand" >/dev/null && { PY=$(command -v "$cand"); break; }
-done
-if [ -z "$PY" ] && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then
-    PY=$(command -v python3)
+# 3.12 SPECIFICALLY, not "newest >= 3.12". On 3.13 the vLLM dependency set
+# resolves and installs fine, then torch fails at IMPORT time: TorchScript's
+# overload parser (torch/_sources.py parse_def -> ast.parse) raises
+# IndentationError on torch/nn/modules/rnn.py. Resolution succeeding is not
+# evidence the stack works. 3.12 is what vLLM and torch are built against.
+# Override with PYTHON_VERSION= / PY= if you know better.
+PYTHON_VERSION=${PYTHON_VERSION:-3.12}
+PY=${PY:-}
+if [ -z "$PY" ] && command -v "python$PYTHON_VERSION" >/dev/null; then
+    PY=$(command -v "python$PYTHON_VERSION")
 fi
 if [ -z "$PY" ]; then
-    echo "  no python >= 3.12 found ($(python3 --version 2>&1)); provisioning one with uv"
+    echo "  python$PYTHON_VERSION not on PATH ($(python3 --version 2>&1) is the default); provisioning it with uv"
     command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    command -v uv >/dev/null || die "uv install failed — install python3.12 manually"
-    UV_CACHE_DIR=$UV_CACHE_DIR uv python install 3.12
-    PY=$(UV_CACHE_DIR=$UV_CACHE_DIR uv python find 3.12)
+    command -v uv >/dev/null || die "uv install failed — install python$PYTHON_VERSION manually"
+    uv python install "$PYTHON_VERSION"
+    PY=$(uv python find "$PYTHON_VERSION")
 fi
+[ -x "$PY" ] || die "no usable python$PYTHON_VERSION interpreter (got: '$PY')"
+"$PY" -c "import sys; sys.exit(0 if sys.version_info[:2] == tuple(int(x) for x in '$PYTHON_VERSION'.split('.')) else 1)" \
+    || warn "interpreter is $("$PY" --version), not $PYTHON_VERSION — torch may fail at import on 3.13"
 echo "  python: $PY ($("$PY" --version))"
 
 # -----------------------------------------------------------------------------
@@ -292,6 +299,19 @@ pipinstall() {  # pipinstall <venv> <args...>
 # leaves a venv that exists but is empty — and a directory-existence guard would
 # then skip the retry on re-run and fail at the import check instead.
 has_pkg() { [ -x "$1/bin/python" ] && "$1/bin/python" -c "import $2" >/dev/null 2>&1; }
+
+# A venv built on the wrong interpreter can never be repaired by reinstalling
+# into it — packages are version-keyed by path. Discard it so it is rebuilt.
+# (This is the recovery path for a venv created on 3.13 before the pin above.)
+drop_stale_venv() {
+    [ -x "$1/bin/python" ] || return 0
+    local got; got=$("$1/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo unknown)
+    [ "$got" = "$PYTHON_VERSION" ] && return 0
+    warn "$1 was built on python $got, need $PYTHON_VERSION — removing and rebuilding"
+    rm -rf "$1"
+}
+drop_stale_venv "$PIE_VENV"
+drop_stale_venv "$HARNESS_VENV"
 
 if ! has_pkg "$PIE_VENV" vllm; then
     echo "  provisioning vLLM venv at $PIE_VENV"
