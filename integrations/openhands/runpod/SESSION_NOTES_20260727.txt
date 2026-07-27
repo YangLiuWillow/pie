@@ -1,0 +1,394 @@
+================================================================================
+SESSION NOTES -- 2026-07-27, A100 fair-parity A/B (pie-openhands vs litellm)
+Plain text. Written because the terminal display was corrupted.
+Canonical live state is RUN_STATE.md; this file is the readable narrative.
+================================================================================
+
+
+================================================================================
+1. THE HEADLINE FINDING -- THE A100 PIE ARM IS NOT A VALID PIE MEASUREMENT
+================================================================================
+
+Pie's two fast attention paths are hard-gated to CUDA compute capability >= 9
+(Hopper and newer). The A100 is sm_80, major 8. Both were OFF for the entire
+Pie run, silently.
+
+    driver/cuda/src/entry.cpp:988-989
+        fwd_cfg.use_prefill_decode_plan =
+            (serving_prop.major >= 9 || force_prefill_decode_plan) && ...
+
+    driver/cuda/src/ops/attention_xqa.cu:274
+        return current_device_major() >= 9;    // xqa_decode_bf16_supported
+
+The driver printed this in its own startup banner and we read past it:
+
+    [pie-driver-cuda] ... prefill_decode_plan=off xqa_decode=off decode_plan_graph=on
+
+Device confirms the gates fail:
+    name=NVIDIA A100-SXM4-80GB  major=8  minor=0  SMs=108
+    serving_prop.major >= 9      -> False
+    current_device_major() >= 9  -> False
+
+PIE_CUDA_XQA_DECODE defaults to ON, so xqa is not disabled by choice -- the
+SUPPORT CHECK fails on Ampere. PIE_CUDA_PREFILL_DECODE_PLAN=1 can force the
+other path on, but that pushes a Hopper-gated kernel onto Ampere. Not a
+validated configuration. Do not use it for a headline number.
+
+
+1.1 FULL LIST OF ARCH GATES (all favor the original writeup's GPU)
+--------------------------------------------------------------------------------
+
+  gate                       source                          needs   A100  H200  RTX6000
+                                                                     (8.0) (9.0) (12.0)
+  use_prefill_decode_plan    entry.cpp:989                   >= 9    off   ON    ON
+  xqa_decode_bf16_supported  attention_xqa.cu:274            >= 9    off   ON    ON
+  wide_prefill_device        cuda_memory_planner.cpp:219     >= 12   narrow narrow WIDE
+  prefill_candidate_cap      cuda_memory_planner.cpp:250     >= 12   8192  8192  16384
+
+profile_prefill_target() also doubles sm_factor (32->64) and max_target
+(4096->8192) on major >= 12. The XQA kernel file is literally named
+attention_xqa_gqa8_sm90.cu.
+
+
+1.2 WHY THIS EXPLAINS THE WHOLE EXPERIMENT
+--------------------------------------------------------------------------------
+
+build_pie_cuda.sh:7 confirms the ORIGINAL writeup targeted
+RTX Pro 6000 Blackwell = sm_120 = major 12. Both >= 9 gates PASS there.
+On this A100 both FAIL.
+
+  - the original "+26% for Pie" was measured with Pie's fast paths ON
+  - this rerun measured Pie with them OFF
+
+The config-effort axis this rerun was built to test (--enforce-eager, tuned
+MoE kernel) is NOT what moved the number. We spent the day auditing the wrong
+variable.
+
+DO NOT PUBLISH "vLLM is ~10x faster than Pie" FROM THIS DATA.
+It measures Pie's fallback attention path. It is exactly as much a hardware
+artifact as the claim it was meant to correct, just pointing the other way.
+TEST_PLAN.md section 7 says audit for a confound before celebrating a Pie win.
+The rule has to be symmetric. This is the confound.
+
+
+================================================================================
+2. THE MEASUREMENT (what the numbers actually are)
+================================================================================
+
+                          Pie (A100)        vLLM 'fair' (A100)
+  s/iter                  10.8 - 24.2       1.2 - 1.7
+  median call latency     17.9 s            1.2 - 1.3 s
+  decode throughput       ~11.5 tok/s       ~100-160 tok/s
+  prefix reuse            95.34%            95.1%  (vLLM APC)
+
+
+2.1 ONE FINDING HERE IS REAL AND SURVIVES THE CONFOUND
+--------------------------------------------------------------------------------
+
+vLLM's automatic prefix caching hit 95.1%.
+Pie's explicit session reuse hit 95.34%.
+
+On this workload STOCK vLLM MATCHES PIE'S PREFILL REUSE. That result does not
+depend on the arch gates at all. It is the one thing from today worth putting
+in a blog post as-is, and it is arguably the more interesting claim: the reuse
+advantage needs a harder workload to demonstrate, if it exists at all.
+
+
+================================================================================
+3. PIE ARM -- COMPLETE (but see section 1: not a valid Pie datapoint)
+================================================================================
+
+File: predictions/ab_a100_pie_20260727_104638.jsonl   (13/13, 10:46-14:33 UTC)
+
+  wall 13594 s = 3.78 h      782 iterations      378 LLM calls
+  17.38 s/iter overall       median per-call latency 17.93 s
+  prompt tokens 9,537,424 (mean 733,725/instance)
+  completion tokens 93,499 (mean 7,192/instance)
+
+Per instance (sorted by wall):
+
+  instance                          iters  wall_s  s/iter  calls  med_lat  patchB
+  scikit-learn-10908                   90    2175   24.17     44     23.1    4513
+  django-13028                         64    1504   23.51     31     19.8    9166
+  scikit-learn-12973                   60    1405   23.42     29     21.0    6415
+  matplotlib-22719                     72    1319   18.33     35     17.1    8286
+  scikit-learn-13496                   66     945   14.32     32     18.4    3491
+  django-16485                         52     938   18.04     25     25.0    7220
+  xarray-4966                          64     925   14.45     31     13.1   10017
+  xarray-4075                          68     885   13.01     33     14.4    8370
+  sympy-19346                          46     803   17.45     22     21.8    2189
+  django-12276                         56     790   14.10     27     15.8    3181
+  django-13089                         38     761   20.04     18     19.6    5623
+  django-15569                         56     606   10.83     27     12.9     489
+  django-14373                         50     537   10.75     24     14.1    4646
+
+Prefill reuse: 95.34% aggregate (444,196 prefilled of 9,537,424 rendered),
+band 93.02-96.67%. Call modes: 365 extended, 13 rebuilt -- exactly one rebuild
+per instance (the opening call), no mid-run session rebuild anywhere.
+
+Cleanliness: 0 empty patches, 0 errors, 0 stuck retries, max 90 iterations
+(cap is 100). kv-verify errors: 0 -- the check aborts the call
+(inferlets/openhands-coder-session/src/lib.rs:739-745), so all 13 rows carrying
+error=null is what establishes it. Report it as a TOKEN-COUNT check, not
+numerical KV equivalence.
+
+Latency tail worth stating: median 17.93 s but mean 33.94 s, p90 77.13 s,
+p99 210.69 s, max 262.9 s. Sum of all 378 latencies is ~12,830 s = 94% of the
+13,594 s wall, so the agent is latency-bound and tool execution is nearly free.
+
+KNOWN GAP: generate_s and tool_s are 0.0 on every row -- that split was never
+wired up. per_step is empty and candidates is [] on all rows too. The 94% above
+is derived from response_latencies, not the intended field.
+
+
+================================================================================
+4. vLLM 'fair' ARM -- RUNNING
+================================================================================
+
+File: predictions/ab_a100_litellm_fair_20260727_175145.jsonl
+Launched 17:51 UTC detached, STRICT_FAIR=1, VLLM_TUNED_CONFIG_FOLDER set.
+
+At 5/13 instances: wall 477 s, 300 iterations, 145 calls,
+                   1.59 s/iter, median latency 1.25 s
+
+  django-12276      78it    94s   1.2s/it  med=1.2s     890B
+  django-13028      88it   148s   1.7s/it  med=1.3s   12030B
+  django-13089      54it   133s   2.5s/it  med=1.2s    5462B
+  django-14373      34it    59s   1.7s/it  med=3.2s    1427B
+  django-15569      46it    42s   0.9s/it  med=1.2s     489B
+
+Sanity: django-15569 produced a 489 B patch, same size as Pie's on that
+instance. Both arms are doing real work.
+
+TIER GATE BANNER (the auditable artifact -- quote verbatim in the writeup):
+
+    === FAIR baseline: litellm + vLLM (CUDA graphs ON, tuned MoE) ===
+    Declared tier: fair
+      [ ok ] CUDA graphs not disabled.
+      [ ok ] graph capture observed.
+      [ ok ] Tuned MoE config in use (no default-config warning).
+      [ ok ] Prefix caching not reported disabled.
+
+Backed by vLLM naming the file itself:
+
+    INFO 07-27 17:54:02 [fused_moe.py:1093] Using configuration from
+      /workspace/tuned_moe/E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json
+      for MoE layer.
+
+Engine: v0.25.1, bf16, tp=1, max_seq_len=32768, CUDA graphs 51 PIECEWISE +
+35 FULL (0.92 GiB), GPU KV cache 137,472 tokens, available KV 12.59 GiB.
+
+WATCH ITEM: max_seq_len=32768 while the Pie arm averaged ~27k prompt tokens per
+call. If a single call exceeds 32k, vLLM rejects it where Pie may not, which
+would show up as failed instances rather than slow ones. Not yet observed.
+
+
+================================================================================
+5. THE MoE CONFIG -- AUTOTUNE ABANDONED, CONFIG BORROWED AND VALIDATED
+================================================================================
+
+benchmark_moe.py --tune measured ~57 min for the FIRST of 18 batch-size sweeps
+(1920 configs each), later sweeps slower: 15-24 h+ projected. save_configs only
+fires after all 18 finish, so there is no partial artifact and a kill forfeits
+everything. Killed it at ~17:45.
+
+Replaced with SGLang's published A800-SXM4-80GB config, renamed to the A100
+device name:
+
+  source: github.com/sgl-project/sglang, branch main, fetched 2026-07-27
+  path:   python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/
+          triton_3_2_0/E=128,N=768,device_name=NVIDIA_A800-SXM4-80GB.json
+  installed at:
+          /workspace/tuned_moe/E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json
+
+A800 is the same GA100 silicon as A100: identical compute, 80 GB HBM2e,
+~2 TB/s memory bandwidth. The ONLY difference is NVLink, 600 -> 400 GB/s. We
+serve tp=1 on a single GPU, so NVLink is never touched by the fused MoE kernel.
+
+Corroboration in the file itself: it caps num_stages at 2-4, whereas the
+shipped H200 config uses num_stages=5 at bs=1. That is what sm_80 tuning looks
+like -- 164 KB shared memory per SM will not hold as deep a pipeline as
+Hopper's 228 KB.
+
+Format compatibility is by lineage, not luck: vLLM's get_moe_configs carries
+the comment "Adapted from: https://github.com/sgl-project/sglang/pull/2628",
+the JSON schema is identical, and vLLM pops triton_version and ignores it.
+
+
+5.1 VALIDATION ON THIS EXACT GPU (benchmark_moe.py with NO --tune)
+--------------------------------------------------------------------------------
+
+  batch   default us   A800 cfg us    delta
+      1        75.51         68.76    -8.9%
+      2       118.57        107.20    -9.6%
+      4       196.94        197.72    +0.4%   (noise)
+      8       305.36        304.86    -0.2%   (noise)
+     16       466.98        462.99    -0.9%
+     24       563.43        551.95    -2.0%
+     32       621.50        612.42    -1.5%
+     48       685.58        677.65    -1.2%
+     64       708.42        690.02    -2.6%
+     96       737.86        705.25    -4.4%
+    128       757.59        712.83    -5.9%
+    256       799.55        755.59    -5.5%
+    512       841.14        818.75    -2.7%
+   1024      1068.78        958.26   -10.3%
+   1536      1136.42       1070.30    -5.8%
+   2048      1501.36       1219.86   -18.7%
+   3072      2015.26       1649.02   -18.2%
+   4096      2505.40       2285.47    -8.8%
+
+  overall -8.3%        decode band (1-8) -2.6%        prefill band (>=1024) -12.7%
+
+Faster at 17 of 18 points. This validates BETTER THAN THE DEFAULT HEURISTIC on
+this silicon. It does NOT prove optimal -- a native autotune could still beat
+it. Single-shot per point; the two non-wins are inside run-to-run noise, the
+double-digit prefill wins are not.
+
+Full writeups: /workspace/tuned_moe/PROVENANCE.md and
+               /workspace/tuned_moe/VALIDATION.md
+Both MUST be cited if the fair tier appears in the blog post. The tier is no
+longer "we tuned it", it is "we used a third-party tuned config and measured
+that it beats the default".
+
+Also confirmed absent everywhere as of 2026-07-27: no A100 E=128,N=768 bf16
+config in vLLM (any version), SGLang, or community repos. H100 has no bf16
+config for this shape either. vLLM ships that bf16 shape only for
+H200 / B200 / H20 / MI308X; SGLang adds H100 and A800.
+
+
+================================================================================
+6. OPEN DECISIONS (yours)
+================================================================================
+
+6.1 WHICH GPU
+--------------------------------------------------------------------------------
+A valid Pie comparison needs sm_90 or newer. Two candidates:
+
+  H200 (sm_90, major 9)
+    + Pie's two attention fast paths turn ON
+    + vLLM SHIPS the tuned E=128,N=768 bf16 MoE config -- neither side needs
+      tuning from us, strongest possible methods sentence
+    + mainstream hardware, more representative for readers
+    - NOT identical to the original writeup's Pie config (misses the >= 12
+      wide-prefill settings)
+    - requires rebuilding pie for sm_90 (CMAKE_CUDA_ARCHITECTURES=90;
+      build_pie_cuda.sh:7 documents h200=90) and re-running the Pie arm
+
+  RTX Pro 6000 Blackwell (sm_120, major 12)
+    + EXACTLY reproduces the original writeup's Pie configuration, so it is the
+      only venue where a null result actually refutes the original claim
+    + build_pie_cuda.sh already defaults to sm_120
+    - no shipped vLLM MoE config for this shape -> autotune or borrow again
+
+  Choose by thesis:
+    "we re-examined our own +26% claim"          -> sm_120 (RTX Pro 6000)
+    "how Pie and vLLM compare on mainstream HW"  -> H200
+
+  DO NOT use B200: sm_100 is new enough that Pie's own kernels may be immature
+  there, which introduces a confound you cannot disentangle from architecture.
+  GB200 and RTX Pro 6000 also lack a bf16 E=128,N=768 vLLM config.
+
+  WATCH OUT if moving to H200/B200: the tuned MoE config SHIPS there, so
+  'graphs-only' and 'crippled' (both defined as DEFAULT MoE) would need the
+  shipped JSON physically moved aside. VLLM_TUNED_CONFIG_FOLDER only PREPENDS a
+  search path, it cannot suppress the package file. Recommend dropping the
+  'graphs-only' tier on those GPUs -- there, "what you get without the
+  autotuner" means "what you get if you delete a file vLLM ships", which is not
+  a configuration any real user is in.
+
+6.2 LET THE 'fair' ARM FINISH?
+--------------------------------------------------------------------------------
+Recommend YES. It is running far faster than projected (5/13 in ~13 min, so
+well under an hour total, not the ~4 h estimated). It gives a clean
+vLLM-on-A100 reference that stays valid regardless of the GPU decision.
+
+Recommend NOT starting 'graphs-only' or 'crippled' yet. Those quantify the
+config-effort axis, and that axis is no longer the story.
+
+6.3 CHEAP DECISIVE TEST BEFORE SPENDING MONEY ON A GPU SWITCH
+--------------------------------------------------------------------------------
+runpod/20_decode_microbench.py already exists. Once 'fair' finishes, run Pie's
+decode microbenchmark twice on this A100 -- once as-is, once with
+PIE_CUDA_PREFILL_DECODE_PLAN=1 forced -- to measure how much of the ~10x gap
+that single gate accounts for. Minutes, not hours. Not a publishable
+configuration, but it turns "the gates explain it" from inference into
+measurement.
+
+6.4 ACCURACY -- DEFERRED BY YOUR DECISION
+--------------------------------------------------------------------------------
+Nothing has been scored. This pod cannot score: no docker, no apptainer, no
+swebench package. The 13-instance set is the baseline's own prior wins so its
+ceiling is parity anyway. Only existing accuracy data is a partial Apptainer
+run on the neutral-50 pair: 29 of 50 scored, Pie 13, litellm 7, zero
+only-litellm wins -- but those files predate every fix from this session.
+See RUN_STATE.md section 3a.
+
+
+================================================================================
+7. PENDING ITEMS
+================================================================================
+
+7.1 GIT PUSH -- BLOCKED
+--------------------------------------------------------------------------------
+Three commits are queued locally on branch openhands-integration-updated:
+
+    3f1200a  Record the method change: borrowed A800 MoE config ...
+    ebe8168  Add Pie-arm results for the A100 fair-parity A/B (13/13 instances)
+    ccadbc4  Fix A/B harness telemetry, patch capture, condenser isolation, ...
+
+Push failed:
+    remote: Permission to YangLiuWillow/pie.git denied to YangLiuWillow.
+    fatal: ... error: 403
+
+GitHub resolved the token to the correct account, so the PAT is valid and not
+expired -- AUTHORIZATION failed, not authentication. For a fine-grained PAT,
+one of these two:
+    1. YangLiuWillow/pie is not in the token's selected repositories
+       (fine-grained tokens are repo-scoped and default to none)
+    2. the Contents permission is Read-only; push needs Read and write
+
+Fix under Settings -> Developer settings -> Personal access tokens ->
+Fine-grained tokens -> (token) -> Repository access, and
+Permissions -> Repository permissions -> Contents: Read and write.
+Editing the existing token works; regenerating is not required.
+
+/root/.git-credentials was deleted and credential.helper unset, so nothing is
+cached on the pod.
+
+7.2 ROTATE THE PAT
+--------------------------------------------------------------------------------
+The token was pasted in plaintext into the session transcript. Treat it as
+compromised and revoke it once the push is done:
+github.com/settings/personal-access-tokens
+
+7.3 UNCOMMITTED / UNTRACKED
+--------------------------------------------------------------------------------
+  - RUN_STATE.md section 0 (the arch-gate finding) is written but NOT yet
+    committed as of this file being written
+  - integrations/openhands/logs/ is gitignored (root .gitignore:216), so the
+    harness and serve logs exist only on the pod
+  - /workspace/tuned_moe/ (the config, PROVENANCE.md, VALIDATION.md) is outside
+    the repo entirely and is NOT version controlled. Consider committing it --
+    it is part of the experimental record and needed to reproduce the fair tier.
+  - 'target' is an untracked symlink to /root/pie-target. Do NOT commit it.
+
+
+================================================================================
+8. GOTCHAS HIT THIS SESSION (in addition to RUN_STATE.md section 6)
+================================================================================
+
+  - pkill/pgrep -f '<pattern>' kills your own shell when the pattern appears in
+    its command line. Hit exit 144 AGAIN this session while killing the
+    autotune. Kill by PID. The fair-arm watcher now uses kill -0 <pid> instead
+    of pattern matching.
+  - "it compiles" is not "it imports": py_compile does not execute imports, so
+    benchmark_moe.py passed preflight while missing ray.
+  - benchmark_moe.py --tp-size defaults to 2 and silently tunes E=64,N=384.
+    We serve tp=1 which needs E=128,N=768. Always pass --tp-size 1.
+  - The /Users/yangliu/... paths in the original handover are the local Mac.
+    On this pod the repo is /workspace/pie.
+
+================================================================================
+END
+================================================================================

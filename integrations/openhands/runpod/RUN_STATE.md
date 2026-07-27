@@ -257,6 +257,72 @@ for f in sorted(glob.glob('/workspace/pie/integrations/openhands/predictions/ab_
 
 ---
 
+## 0. STOP — the A100 Pie arm is NOT a valid Pie measurement (18:05 UTC)
+
+**Pie's two fast attention paths are hard-gated to compute capability >= 9
+(Hopper+). The A100 is sm_80, major 8. Both are OFF, silently.**
+
+```
+driver/cuda/src/entry.cpp:988-989
+    fwd_cfg.use_prefill_decode_plan =
+        (serving_prop.major >= 9 || force_prefill_decode_plan) && ...
+
+driver/cuda/src/ops/attention_xqa.cu:274
+    return current_device_major() >= 9;      // xqa_decode_bf16_supported
+```
+
+The running driver says so in its own banner, which we read past earlier:
+
+```
+[pie-driver-cuda] ... prefill_decode_plan=off xqa_decode=off decode_plan_graph=on
+```
+
+`PIE_CUDA_XQA_DECODE` defaults to ON, so xqa is not off by choice — the
+**support check** fails on sm_80. `PIE_CUDA_PREFILL_DECODE_PLAN=1` can force the
+other path on, but it would be forcing a Hopper-gated kernel onto Ampere; that is
+not a validated configuration and must not be used to produce a headline number.
+
+### Why this explains the whole experiment
+
+The original writeup ran on **RTX Pro 6000 Blackwell (sm_120, major 12)** —
+`build_pie_cuda.sh:7` confirms that was the target. Both gates **pass** there. On
+this A100 both **fail**. So:
+
+- the original "+26% for Pie" was measured with Pie's fast paths ON,
+- this rerun measured Pie with them OFF,
+
+and the config-effort axis (`--enforce-eager`, tuned MoE) that the rerun was
+designed to test is **not** what moved the number.
+
+### The measurement
+
+| | Pie (A100) | vLLM `fair` (A100) |
+|---|---|---|
+| s/iter | 10.8 - 24.2 | **1.2 - 1.7** |
+| median call latency | 17.9 s | **1.2 - 1.3 s** |
+| decode throughput | ~11.5 tok/s | **~100-160 tok/s** |
+| prefix reuse | 95.34% | **95.1%** (vLLM APC) |
+
+Do **not** publish "vLLM is ~10x faster than Pie" from this. It measures Pie's
+fallback attention path, and is as much a hardware artifact as the original
+claim it was meant to correct.
+
+### Note the second finding, which is real and hardware-independent
+
+vLLM's automatic prefix caching hit **95.1%** against Pie's **95.34%** explicit
+session reuse — on this workload the prefill-reuse advantage is **matched by
+stock vLLM**. That is a genuine result and does not depend on the arch gates.
+
+### Consequence
+
+A valid Pie-vs-vLLM comparison needs **sm_90 or newer**. That makes **H200 the
+indicated GPU on two independent grounds**: Pie's gates pass (major 9), and vLLM
+ships the tuned `E=128,N=768` bf16 MoE config for it, so neither side needs
+tuning from us. sm_120 (RTX Pro 6000) also passes Pie's gates but has no shipped
+vLLM MoE config.
+
+---
+
 ## 3b. METHOD CHANGE — autotune abandoned, config borrowed (human, 17:45 UTC)
 
 **The `fair` tier no longer comes from our own autotuner.** `benchmark_moe.py
