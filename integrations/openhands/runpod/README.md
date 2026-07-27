@@ -63,6 +63,7 @@ accuracy) don't depend on decode speed.
 
 | File | Role |
 |---|---|
+| `AGENT_HANDOVER.md` | **for an agent taking over a provisioned pod**: machine state, the storage rule, run order, version pins and why, what to record, what to decide vs escalate |
 | `bootstrap_runpod.sh` | **start here on a bare pod**: preflight, toolchain, python 3.12, clone, NCCL, one shared env file, venvs — then hands off to `00_setup_a100.sh`. Idempotent/resumable. |
 | `00_setup_a100.sh` | one-time: rebuild Pie for sm_80, build coder-session wasm, vLLM venv, harness venv, model download. **Read its LOGISTICS block first.** |
 | `10_vllm_serve_fair.sh` | launch vLLM at `VLLM_TIER`; asserts the banner matches the tier before serving |
