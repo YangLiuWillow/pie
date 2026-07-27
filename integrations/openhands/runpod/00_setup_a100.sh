@@ -15,9 +15,12 @@
 set -euo pipefail
 
 # ---- paths (edit for the runpod box) ----------------------------------------
-# Everything reusable lives on $WORK (the persistent /workspace volume) so it
-# survives pod stop/restart AND does not consume the ephemeral container disk.
-# See TEST_PLAN.md §10 for sizing (persistent 150 GB, container disk 40–60 GB).
+# $WORK (the persistent /workspace volume) holds the repo and the model weights.
+# It is a MooseFS NETWORK volume, so caches/venvs/build trees must NOT go here —
+# small-file work stalls on it. bootstrap_runpod.sh puts those on the local disk
+# and exports the paths; the defaults below are only a fallback.
+# See TEST_PLAN.md §10 for the split and sizing (persistent 100 GB, container
+# disk 100 GB).
 export WORK=${WORK:-/workspace}
 export PIE_SRC=${PIE_SRC:-$WORK/pie}                      # pie checkout
 export PIE_VENV=${PIE_VENV:-$WORK/venvs/pie-vllm}        # vLLM venv (on /workspace)
@@ -37,9 +40,11 @@ mkdir -p "$WORK/venvs" "$PIP_CACHE_DIR"
 #      git clone -b openhands-integration-updated https://github.com/YangLiuWillow/pie.git $PIE_SRC
 #    (Without the §4 fix, any coder-session prefill >512 tokens faults the driver
 #     — so do not check out an older ref.)
-# 2. DISK: see TEST_PLAN.md §10. Persistent /workspace 150 GB (200 GB if scoring
-#    SWE-bench here); container disk 40-60 GB. runpod defaults are far too small
-#    — resize BEFORE starting the pod (model alone is ~60 GB bf16).
+# 2. DISK: see TEST_PLAN.md §10. Persistent /workspace 100 GB (150-200 GB if
+#    scoring SWE-bench here) for the repo + weights; container disk 100 GB for
+#    the venvs + cargo target/ + caches. The runpod 60 GB container default is
+#    workable but leaves no headroom. Resize BEFORE starting the pod (the model
+#    alone is ~60 GB bf16).
 # 3. GPU: confirm it is actually an A100 SXM (sm_80), not a PCIe/40GB variant —
 #    the 80 GB config assumes 80 GB. `nvidia-smi --query-gpu=name,memory.total`.
 # =============================================================================

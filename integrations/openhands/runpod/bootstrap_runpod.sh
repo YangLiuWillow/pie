@@ -54,8 +54,9 @@ REPO_REF=${REPO_REF:-openhands-integration-updated}
 #   $WORK (persistent volume)    : the repo and the ~60 GB model weights —
 #                                  large sequential files, expensive to refetch.
 #
-# The container disk is finite (60 GB is the runpod default), so this trades
-# rebuild-on-restart for a setup that actually completes.
+# The container disk is finite (60 GB is the runpod default; 100 GB is the
+# recommendation in TEST_PLAN.md §10), so this trades rebuild-on-restart for a
+# setup that actually completes.
 FAST=${FAST:-/root}
 PIE_SRC=${PIE_SRC:-$WORK/pie}
 PIE_VENV=${PIE_VENV:-$FAST/venvs/pie-vllm}
@@ -139,7 +140,7 @@ echo "  free on $WORK: ${AVAIL:-?} GB"
 FAST_AVAIL=$(df -BG --output=avail "$FAST" 2>/dev/null | tail -1 | tr -dc '0-9')
 echo "  free on $FAST (local, holds venvs+build): ${FAST_AVAIL:-?} GB"
 [ "${FAST_AVAIL:-0}" -ge 55 ] || warn "$FAST has ${FAST_AVAIL:-?} GB. venvs (~18) + cargo target (~30) + CPM (~5) need ~55 GB; raise the pod's container disk or expect a build failure."
-[ "${AVAIL:-0}" -ge 150 ] || warn "TEST_PLAN.md §10 wants 150 GB on $WORK (200 GB if also scoring SWE-bench here)."
+[ "${AVAIL:-0}" -ge 100 ] || warn "TEST_PLAN.md §10 wants 100 GB on $WORK for the repo + weights (150-200 GB if also scoring SWE-bench here)."
 ROOT_AVAIL=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
 echo "  free on / (container disk): ${ROOT_AVAIL:-?} GB"
 

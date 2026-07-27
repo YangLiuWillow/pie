@@ -146,8 +146,10 @@ confirmed; big `/workspace` volume; Pie **rebuilt on the box for sm_80** (do not
 copy the sm_120 Blackwell binary); vLLM + harness venvs; model downloaded.
 
 ```bash
-# 0. one-time setup
-bash 00_setup_a100.sh
+# 0. one-time setup on a bare pod (provisions the box, clones this ref, then
+#    runs 00_setup_a100.sh itself). Run under tmux — the CUDA build is 30-60 min.
+bash bootstrap_runpod.sh
+source /workspace/pie-bench-env.sh     # every later shell needs this
 
 # 1. generate the tuned MoE config once (needed only for the `fair` tier)
 bash 11_autotune_moe.sh          # relaunch check: assert_vllm_fair.sh ... fair must pass clean
@@ -171,6 +173,15 @@ python summarize_ab.py \
 python 20_decode_microbench.py --base-url http://localhost:18000/v1 \
        --model Qwen/Qwen3-Coder-30B-A3B-Instruct --label vllm-fair
 ```
+
+**Pinned versions — record these once, alongside the banners.** A tier
+comparison is only meaningful against a known software set:
+
+| | pinned to | why |
+|---|---|---|
+| vLLM | `VLLM_VERSION=0.25.1` | unpinned takes whatever PyPI serves that day |
+| Python (both venvs) | 3.12 | on 3.13 the vLLM set *resolves*, then torch dies at import (TorchScript overload parser). A successful resolve is not evidence the stack runs. |
+| harness deps | `uv --exclude-newer 2026-05-15` | `openhands-sdk 1.21.1` (2026-05-08) declares 14 open-ended floors; at today's newest, litellm 1.93.0 fails to import its own `MessagesInterceptor` and fastmcp 3.x moved `Client`. Pin time, not packages. |
 
 **What to record for the writeup, per arm:**
 1. The `assert_vllm_fair.sh` banner block (proves the tier — the auditable,
@@ -246,26 +257,52 @@ Pie's structural advantage pays off.
 ## 10. Storage sizing (runpod)
 
 runpod separates **container disk** (ephemeral — wiped when the pod stops) from
-the **persistent volume** mounted at `/workspace` (survives stop/restart). Put
-everything reusable on `/workspace`; keep the container disk for the base image
-and transient caches only.
+the **persistent volume** mounted at `/workspace` (survives stop/restart).
 
-**Persistent volume (`/workspace`): 150 GB** (200 GB if also scoring SWE-bench here).
+**Do not put everything on `/workspace`.** An earlier version of this section
+said to, and it is wrong. `/workspace` is a **MooseFS network volume**
+(`df -h /workspace` shows `mfs#...runpod.net:9421`), so every file operation is
+a network round-trip. Small-file-heavy work does not merely run slow there — it
+**stalls**. Measured on the A100 pod: `uv pip install` of 67 small wheels parked
+43 parallel downloads at ~15 KiB each and never progressed, while `curl` to the
+same CDN ran at 125 MB/s. Note that `uv` streams downloads into `UV_CACHE_DIR`
+*before* linking them into the venv, so a cache on `/workspace` stalls the
+install no matter where the venv itself lives.
 
-| Item | Size |
-|---|---|
-| Model weights + HF cache (`Qwen3-Coder-30B-A3B`, bf16) | ~60–65 GB |
-| Pie build — `target/` (release, CUDA) + CPM source cache (cutlass/flashinfer) | ~40–50 GB |
-| vLLM venv (torch + vllm + kernels) | ~12–15 GB |
-| Harness venv (openhands sdk + deps) | ~2–3 GB |
-| coder-session wasm, predictions, logs | <1 GB |
-| headroom | ~15–20 GB |
+Split by **access pattern**, not by what you wish would persist:
 
-**Container disk: 40–60 GB.** Holds the base PyTorch/CUDA image (~20 GB) plus
-apt/pip/`/tmp` transients. To keep it small **and** survive pod restarts, put the
-venvs on `/workspace` (the setup script now defaults `PIE_VENV` under `$WORK` and
-sets `PIP_CACHE_DIR`/`HF_HOME` there); if you instead leave venvs in `$HOME`,
-size the container disk to ~100 GB.
+| Goes on | What | Why |
+|---|---|---|
+| **container disk** (`$FAST`, default `/root`) | uv/pip/CPM caches, both venvs, cargo `target/` | small files, hot, cheap to rebuild |
+| **`/workspace`** | the repo, the ~60 GB model weights | large sequential files — what MooseFS is actually good at — and expensive to refetch |
+
+`bootstrap_runpod.sh` does this split, and symlinks `target/` and
+`integrations/openhands/.venv` back into the repo because
+`run_pie_backend.sh` hardcodes the latter and `CARGO_TARGET_DIR` is global
+(setting it would also redirect the wasm inferlet build).
+
+The cost is that venvs and the build tree are lost on pod **stop**; re-running
+`bootstrap_runpod.sh` rebuilds them. The weights — the only genuinely expensive
+artifact — persist.
+
+**Container disk: 100 GB.** The runpod default of 60 GB is workable but tight:
+venvs (~18) + cargo `target/` (~30–40) + CPM cache (~5) ≈ 55–60 GB with nothing
+to spare. **Persistent volume (`/workspace`): 100 GB** (150–200 GB if also
+scoring SWE-bench here) — it now holds only the repo and the weights.
+
+| Item | Size | Lives on |
+|---|---|---|
+| Model weights + HF cache (`Qwen3-Coder-30B-A3B`, bf16) | ~60–65 GB | `/workspace` |
+| pie checkout | <1 GB | `/workspace` |
+| Pie build — `target/` (release, CUDA) + CPM source cache (cutlass/flashinfer) | ~40–50 GB | `$FAST` |
+| vLLM venv (torch + vllm + kernels) | ~12–15 GB | `$FAST` |
+| Harness venv (openhands sdk + deps) | ~2–3 GB | `$FAST` |
+| uv/pip caches | ~8–10 GB | `$FAST` |
+| coder-session wasm, predictions, logs | <1 GB | `/workspace` |
+
+Note the base PyTorch/CUDA image (~20 GB) also sits on the container disk, which
+is why 60 GB total leaves so little room once the build tree lands there.
+Reclaim ~8–10 GB after setup with `uv cache clean` if it gets tight.
 
 **SWE-bench scoring is the wildcard.** Building/pulling per-instance test images
 is large and file-count heavy (a prior run hit an inode quota at ~15M files, each
