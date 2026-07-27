@@ -242,9 +242,36 @@ def _run(cmd: list[str]) -> None:
 
 
 def capture_patch(workspace: Path) -> str:
-    """Return ``git diff HEAD`` — the patch the agent produced."""
+    """Return the patch the agent produced, matching the official protocol.
+
+    The upstream harness (OpenHands/benchmarks ``benchmarks/swebench/run_infer.py``)
+    stages, commits, then diffs base_commit..HEAD::
+
+        git add -A
+        git commit --no-verify -m patch
+        git --no-pager diff --no-color <base_commit> HEAD
+
+    A plain ``git diff HEAD`` — what this used to do — silently drops every
+    file the agent *created*, since untracked files appear in no diff. We
+    stage instead of committing and diff ``--cached`` against HEAD, which
+    yields the identical patch (we never commit, so HEAD is still
+    base_commit) without needing a committer identity configured in the
+    throwaway clone. This is upstream's own ``get_staged_git_patch``.
+
+    Note the consequence, which is upstream's too: a reproduction script the
+    agent wrote under Phase 4 is a new file, so it now lands in the patch.
+    """
+    add = subprocess.run(
+        ["git", "-C", str(workspace), "add", "-A"],
+        capture_output=True, text=True,
+    )
+    if add.returncode != 0:
+        # Non-fatal, exactly as upstream treats it: fall through and report
+        # whatever the tracked-file diff shows rather than losing the run.
+        logger.warning("git add -A failed in %s: %s", workspace, add.stderr.strip())
     res = subprocess.run(
-        ["git", "-C", str(workspace), "diff", "HEAD"],
+        ["git", "--no-pager", "-C", str(workspace),
+         "diff", "--no-color", "--cached", "HEAD"],
         capture_output=True, text=True, check=True,
     )
     return res.stdout
@@ -375,8 +402,24 @@ def build_agent(llm, *, enable_condenser: bool = True):
     if enable_condenser:
         try:
             from openhands.sdk.context.condenser import LLMSummarizingCondenser
+            # Upstream builds a *separate* LLM for the condenser
+            # (``build_eval_llm(..., usage_id="condenser")`` in
+            # benchmarks/swebench/run_infer.py), so summarization is accounted
+            # for — and, on the Pie arm, cached — independently of the agent
+            # loop. Sharing one object would interleave condenser calls into
+            # the agent's own KV session, which is precisely the thing the
+            # prefill-reuse number is supposed to measure. PieLLM.model_copy
+            # clears the session id, so the copy gets its own namespace.
+            condenser_llm = llm.model_copy(update={"usage_id": "condenser"})
+            # model_copy shallow-copies private attrs, so the copy would share
+            # the agent's Metrics object. LLMRegistry.add calls
+            # _ensure_independent_metrics for exactly this reason — but only
+            # for LLMs it registers, which never includes a PieLLM (see
+            # _iter_llms). Do it ourselves so both arms account identically.
+            if hasattr(condenser_llm, "reset_metrics"):
+                condenser_llm.reset_metrics()
             condenser = LLMSummarizingCondenser(
-                llm=llm,
+                llm=condenser_llm,
                 max_size=240,
                 keep_first=2,
             )
@@ -574,7 +617,7 @@ def solve_one(
             )
 
             patch = capture_patch(ws)
-            metrics = _extract_metrics(conv)
+            metrics = _extract_metrics(conv, agent, llm)
             session_stats = _pie_session_stats(llm)
             if session_stats:
                 logger.info(
@@ -659,10 +702,70 @@ def _count_iterations(conv) -> int:
         return 0
 
 
-def _extract_metrics(conv) -> dict[str, Any]:
-    """Pull token counts and per-call latencies from a finished conversation."""
+def _iter_llms(obj, _seen: set[int] | None = None) -> Iterator[Any]:
+    """Yield every LLM reachable from ``obj`` — **subclasses included**.
+
+    The SDK's own ``AgentBase.get_all_llms`` yields only objects whose type is
+    *exactly* ``LLM`` (``openhands/sdk/agent/base.py``: "Only yields objects
+    whose type is exactly `LLM` (no subclasses)"). ``LocalConversation`` feeds
+    that generator straight into ``llm_registry.add``, and the registry is what
+    subscribes ``ConversationStats.register_llm``. So a ``PieLLM`` — being a
+    subclass — is never registered, ``stats.usage_to_metrics`` stays empty, and
+    ``get_combined_metrics()`` returns a fresh zeroed ``Metrics``.
+
+    The telemetry itself is fine: ``LLM.completion`` calls
+    ``telemetry.on_response`` around our ``_transport_call`` override, which
+    records latency unconditionally into ``llm.metrics``. Only the *hand-off*
+    to the conversation is lost. Walking the agent ourselves recovers it, which
+    is what gives the pie arm the same median-per-call-latency and token numbers
+    the litellm arm has always had.
+    """
+    from openhands.sdk import LLM
+    from pydantic import BaseModel
+
+    seen = _seen if _seen is not None else set()
+    if id(obj) in seen:
+        return
+    seen.add(id(obj))
+
+    if isinstance(obj, LLM):
+        yield obj
+    if isinstance(obj, BaseModel):
+        for name in type(obj).model_fields:
+            try:
+                val = getattr(obj, name)
+            except Exception:
+                continue
+            yield from _iter_llms(val, seen)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_llms(k, seen)
+            yield from _iter_llms(v, seen)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for item in obj:
+            yield from _iter_llms(item, seen)
+
+
+def _extract_metrics(conv, *roots: Any) -> dict[str, Any]:
+    """Pull token counts and per-call latencies from a finished conversation.
+
+    ``roots`` are extra objects (the agent, the LLM) walked for metrics the
+    conversation's own stats never saw — see ``_iter_llms``.
+    """
     try:
         m = conv.state.stats.get_combined_metrics()
+        # Merge in any LLM the registry skipped. Registered LLMs store the very
+        # same Metrics object in usage_to_metrics, so dedupe by identity to
+        # avoid double-counting a call.
+        merged = {id(x) for x in conv.state.stats.usage_to_metrics.values()}
+        for root in roots:
+            if root is None:
+                continue
+            for sub in _iter_llms(root):
+                sm = getattr(sub, "metrics", None)
+                if sm is not None and id(sm) not in merged:
+                    merged.add(id(sm))
+                    m.merge(sm)
         usage = m.accumulated_token_usage
         pt = usage.prompt_tokens if usage else 0
         ct = usage.completion_tokens if usage else 0

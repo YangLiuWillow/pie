@@ -42,7 +42,13 @@ if graphs_off; then
 else
     echo "  [ ok ] CUDA graphs not disabled."
     grep -qiE "Capturing cudagraph|graph captur" "$LOG" && echo "  [ ok ] graph capture observed."
-    [ "$TIER" = "crippled" ] && echo "  [warn] tier 'crippled' but graphs are ON — not reproducing the original baseline."
+    if [ "$TIER" = "crippled" ]; then
+        # Over-delivery is as corrupting as under-delivery: a 'crippled' run with
+        # graphs ON understates what --enforce-eager cost, which is the whole
+        # point of the crippled->graphs-only gap. Fail, don't warn.
+        echo "  [FAIL] tier 'crippled' but CUDA graphs are ON — not reproducing the original baseline."
+        fail=1
+    fi
 fi
 
 # --- MoE kernel ---
@@ -50,7 +56,9 @@ if moe_default; then
     case "$TIER" in
         fair)
             echo "  [FAIL] Untuned/default MoE config but tier 'fair' requires a tuned one."
-            echo "         -> run 11_autotune_moe.sh once, then relaunch."
+            echo "         -> autotune once (benchmark_moe.py --tune --tp-size 1"
+            echo "            --save-dir \$TUNED_DIR), then relaunch with"
+            echo "            VLLM_TUNED_CONFIG_FOLDER=\$TUNED_DIR exported."
             fail=1 ;;
         graphs-only)
             echo "  [info] Default MoE config — EXPECTED for the 'graphs-only' (no-autotuner) tier." ;;
@@ -59,7 +67,29 @@ if moe_default; then
     esac
 else
     echo "  [ ok ] Tuned MoE config in use (no default-config warning)."
-    [ "$TIER" = "graphs-only" ] && echo "  [warn] tier 'graphs-only' but a tuned MoE config was found — the 'no-autotuner' point is contaminated; move/rename the tuned json to isolate it."
+    if [ "$TIER" = "crippled" ]; then
+        # Symmetric to the graphs-only check below. 'crippled' is defined as
+        # "--enforce-eager + DEFAULT MoE" (see header): it reproduces the
+        # original writeup's baseline, which had no tuned kernel. Harmless while
+        # the autotune ran last, but the arms can be collected in any order --
+        # run 'crippled' after the autotune and the tuned json silently gives it
+        # the good kernel, understating what --enforce-eager cost. That is the
+        # crippled->graphs-only gap, so it must be a hard fail, not a warning.
+        echo "  [FAIL] tier 'crippled' but a tuned MoE config is in use — this is"
+        echo "         not the original baseline (autotune already run?)."
+        echo "         -> unset VLLM_TUNED_CONFIG_FOLDER and relaunch."
+        fail=1
+    fi
+    if [ "$TIER" = "graphs-only" ]; then
+        # The failure mode this exists to catch: a graphs-only run performed
+        # with the tuned config live silently becomes a second 'fair' run. That
+        # collapses the graphs-only->fair gap to ~0 and makes "the autotuner
+        # isn't worth running" look proven when it was never tested.
+        echo "  [FAIL] tier 'graphs-only' but a tuned MoE config is in use — the"
+        echo "         'no-autotuner' point is contaminated (autotune already run?)."
+        echo "         -> unset VLLM_TUNED_CONFIG_FOLDER and relaunch."
+        fail=1
+    fi
 fi
 
 # --- prefix caching (required in every non-crippled tier) ---

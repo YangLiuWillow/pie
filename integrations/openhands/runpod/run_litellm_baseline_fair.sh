@@ -27,8 +27,11 @@ PRED_DIR=$HARNESS_DIR/predictions
 VLLM_PORT=${VLLM_PORT:-18000}
 HARNESS=${HARNESS:-benchmarks.run_swe_bench}
 MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
-LABEL=${LABEL:-litellm-fair+$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]')}
 VLLM_TIER=${VLLM_TIER:-fair}   # crippled | graphs-only | fair (see README)
+# Derive the label from the ACTUAL tier. Hardcoding "fair" here mislabels a
+# crippled/graphs-only run as fair whenever this script is invoked directly
+# rather than through 30_ab_run.sh (which sets LABEL/OUTPUT itself).
+LABEL=${LABEL:-litellm-${VLLM_TIER}+$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]')}
 STRICT_FAIR=${STRICT_FAIR:-1}
 EAGER_FLAG=""; [ "$VLLM_TIER" = "crippled" ] && EAGER_FLAG="--enforce-eager"
 
@@ -41,8 +44,10 @@ esac
 mkdir -p "$LOG_DIR" "$PRED_DIR"
 EXTRA_ARGS=("$@"); [ ${#EXTRA_ARGS[@]} -eq 0 ] && EXTRA_ARGS=(--subset-size 50)
 TS=$(date +%Y%m%d_%H%M%S)
-OUTPUT=${OUTPUT:-"$PRED_DIR/litellm_fair_${TS}.jsonl"}
-VLLM_LOG="$LOG_DIR/vllm_serve_fair_${TS}.log"
+# summarize_ab.py selects arms by FILENAME glob, so a tier-agnostic name here
+# would silently file a crippled run under the fair arm.
+OUTPUT=${OUTPUT:-"$PRED_DIR/litellm_${VLLM_TIER}_${TS}.jsonl"}
+VLLM_LOG="$LOG_DIR/vllm_serve_${VLLM_TIER}_${TS}.log"
 
 echo "=== FAIR baseline: litellm + vLLM (CUDA graphs ON, tuned MoE) ==="
 echo "  Model: $MODEL   Output: $OUTPUT   vLLM log: $VLLM_LOG"

@@ -1,5 +1,10 @@
 # Agent handover — running the fair-parity A/B on the provisioned A100 pod
 
+> **If a run is in progress, read `RUN_STATE.md` immediately after this file.**
+> It carries the live session state: which arm is running, uncommitted harness
+> fixes and why they exist, the verified preflight, and where to pick up. This
+> file stays the standing handover; that one is what changes hour to hour.
+
 You are taking over an experiment that is **already provisioned and part-way
 through**. Read this file, `TEST_PLAN.md` (the experimental design), and
 `README.md` (file index) before touching anything.

@@ -271,7 +271,7 @@ def solve_one(
             fixed_solution = (ws / SOLUTION_FILENAME).read_text()
             passed, detail = score_fix(problem, fixed_solution, timeout_s=score_timeout_s)
             from benchmarks.swe_bench import _extract_metrics
-            metrics = _extract_metrics(conv)
+            metrics = _extract_metrics(conv, agent, llm)
             return Result(
                 task_id=problem.task_id,
                 model_name_or_path=label,
