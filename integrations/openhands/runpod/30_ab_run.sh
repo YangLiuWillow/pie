@@ -41,7 +41,7 @@ if [ "$ARM" = "litellm" ]; then
     # Optimization-effort tier for the vLLM baseline: crippled | graphs-only | fair.
     # Run all three for the effort-axis curve; each writes a distinct output.
     export VLLM_TIER=${VLLM_TIER:-fair}
-    export OUTPUT=predictions/ab_a100_litellm_${VLLM_TIER}_${TS}.jsonl
+    export OUTPUT=${OUTPUT:-predictions/ab_h200_litellm_${VLLM_TIER}_${TS}.jsonl}
     export LABEL=litellm-${VLLM_TIER}+qwen3-coder-30b-a3b-t0
     bash "$RUNPOD_DIR/run_litellm_baseline_fair.sh" \
         "${INSTANCES[@]}" --temperature 0 --max-iterations 100
@@ -52,9 +52,9 @@ elif [ "$ARM" = "pie" ]; then
     export PIE_PORT=${PIE_PORT:-18097}
     export BACKEND=pie-session
     export KV_VERIFY=1
-    export CFG=$RUNPOD_DIR/pie_cuda_native_config_30b_moe_a100.toml
-    export LABEL=pie-cuda-native-a100+qwen3-coder-30b-t0
-    export OUTPUT=predictions/ab_a100_pie_${TS}.jsonl
+    export CFG=${CFG:-$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml}
+    export LABEL=${LABEL:-pie-cuda-native-h200+qwen3-coder-30b-t0}
+    export OUTPUT=${OUTPUT:-predictions/ab_h200_pie_${TS}.jsonl}
     export REQUEST_TIMEOUT_S=900
     bash "$HARNESS_DIR/run_pie_backend.sh" \
         "${INSTANCES[@]}" --python-tool-parser --temperature 0 --max-iterations 100
