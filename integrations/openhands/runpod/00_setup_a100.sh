@@ -20,7 +20,7 @@ set -euo pipefail
 # small-file work stalls on it. bootstrap_runpod.sh puts those on the local disk
 # and exports the paths; the defaults below are only a fallback.
 # See TEST_PLAN.md §10 for the split and sizing (persistent 100 GB, container
-# disk 100 GB).
+# disk 60 GB — the runpod default).
 export WORK=${WORK:-/workspace}
 export PIE_SRC=${PIE_SRC:-$WORK/pie}                      # pie checkout
 export PIE_VENV=${PIE_VENV:-$WORK/venvs/pie-vllm}        # vLLM venv (on /workspace)
@@ -41,10 +41,10 @@ mkdir -p "$WORK/venvs" "$PIP_CACHE_DIR"
 #    (Without the §4 fix, any coder-session prefill >512 tokens faults the driver
 #     — so do not check out an older ref.)
 # 2. DISK: see TEST_PLAN.md §10. Persistent /workspace 100 GB (150-200 GB if
-#    scoring SWE-bench here) for the repo + weights; container disk 60 GB (the runpod default is fine) for
-#    the venvs + cargo target/ + caches. The runpod 60 GB container default is
-#    workable but leaves no headroom. Resize BEFORE starting the pod (the model
-#    alone is ~60 GB bf16).
+#    scoring SWE-bench here) for the repo + weights — resize BEFORE starting the
+#    pod, the model alone is ~60 GB bf16. The container disk holds the venvs +
+#    cargo target/ + caches; measured usage there is ~17 GB, so the runpod
+#    default of 60 GB needs no change.
 # 3. GPU: confirm it is actually an A100 SXM (sm_80), not a PCIe/40GB variant —
 #    the 80 GB config assumes 80 GB. `nvidia-smi --query-gpu=name,memory.total`.
 # =============================================================================
