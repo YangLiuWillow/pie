@@ -408,6 +408,26 @@ echo "  pie:  $PIE_SRC/target/release/pie"
 echo "  wasm: $WASM"
 "$PIE_SRC/target/release/pie" driver list || warn "'pie driver list' failed — check the CUDA build"
 
+# `driver list` proves cuda_native was COMPILED IN; it says nothing about which
+# GPU arch the kernels were compiled FOR. That is the exact failure the TEST_PLAN
+# prereq warns about ("do not copy the sm_120 Blackwell binary"), and it would
+# otherwise surface as a runtime fault well into an arm. Check the fatbin.
+if command -v cuobjdump >/dev/null; then
+    ELF_ARCHS=$(cuobjdump --list-elf "$PIE_SRC/target/release/pie" 2>/dev/null \
+                | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')
+    if [ -n "$ELF_ARCHS" ]; then
+        echo "  embedded GPU code: $ELF_ARCHS(this GPU: sm_$ARCH)"
+        case " $ELF_ARCHS" in
+            *" sm_$ARCH "*) ;;
+            *) warn "binary carries [$ELF_ARCHS] but this GPU is sm_$ARCH — it will fault at runtime. Rebuild with CMAKE_CUDA_ARCHITECTURES=$ARCH." ;;
+        esac
+    else
+        echo "  (cuobjdump found no embedded ELF — kernels may be JIT/PTX-only)"
+    fi
+else
+    echo "  (cuobjdump not on PATH — skipping arch verification)"
+fi
+
 # -----------------------------------------------------------------------------
 step 8 "done"
 # -----------------------------------------------------------------------------

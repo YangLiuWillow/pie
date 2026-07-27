@@ -97,10 +97,12 @@ VLLM_TIER=fair        ARM=litellm bash 30_ab_run.sh
 
 # 4. the effort-axis table (s/iter + median latency, shared-instance head-to-head)
 python summarize_ab.py \
-  pie=predictions/ab_a100_pie_*.jsonl \
-  litellm-crippled=predictions/ab_a100_litellm_crippled_*.jsonl \
-  litellm-graphs-only=predictions/ab_a100_litellm_graphs-only_*.jsonl \
-  litellm-fair=predictions/ab_a100_litellm_fair_*.jsonl
+  pie=../predictions/ab_a100_pie_*.jsonl \
+  litellm-crippled=../predictions/ab_a100_litellm_crippled_*.jsonl \
+  litellm-graphs-only=../predictions/ab_a100_litellm_graphs-only_*.jsonl \
+  litellm-fair=../predictions/ab_a100_litellm_fair_*.jsonl
+# NB ../predictions — 30_ab_run.sh cd's to integrations/openhands before
+# writing, so the jsonl lands one level above this runpod/ directory.
 
 # (optional) clean decode microbench, both engines measured identically
 python 20_decode_microbench.py --base-url http://localhost:18000/v1 \
