@@ -160,6 +160,39 @@ disagree.
 
 ---
 
+## 4a. Context cap — `MAX_MODEL_LEN=131072` (decided, 2026-07-27)
+
+`00_setup_h200.sh` writes this into the env file. Both serve scripts already read
+it (`run_litellm_baseline_fair.sh:62`, `10_vllm_serve_fair.sh:87`), so no edit.
+
+**Why it changed from the A100's 32768.** That was a memory necessity, not a
+choice: the A100's 12.59 GiB of KV held 137,472 tokens, so 131072 would have left
+room for ~1.05 sequences. H200 has ~72 GB of KV — about 762,000 tokens at
+**96 KiB/token** (48 layers × 4 KV heads × 128 dim × 2 × 2 bytes bf16) — so
+131072 costs ~12.6 GB and still leaves ~5.8× concurrency. §0 of the setup script
+computes this and hard-fails if the value does not fit.
+
+**Why it matters.** The serving cap is the **only** context limit in this stack:
+
+- litellm has **no entry for a self-hosted model** — that is the benign
+  `Cost calculation failed: This model isn't mapped yet` line, once per call — so
+  nothing truncates client-side.
+- the condenser bounds history by **message count (240), not tokens**.
+- **Pie has no fixed cap at all.** Its ceiling is memory-planned (~762k tokens
+  here). So a cap that is too low fails vLLM on inputs Pie serves fine, which
+  surfaces as a *failed instance in one arm only* and reads as an accuracy
+  difference when it is a configuration artifact.
+
+131072 is the OpenHands SWE-bench norm (128k). The model is native **262144**
+with `rope_scaling: None`; do not exceed that without YaRN, which would change
+model behaviour rather than just the ceiling.
+
+**Nothing came near the old cap** — the A100 `fair` arm logged zero length
+rejections at 32768. This is insurance against trajectory divergence (§9), not a
+fix for an observed failure.
+
+---
+
 ## 5. Run order
 
 ```bash
@@ -283,6 +316,23 @@ Per arm:
 4. **Pie arm only**: prefill-reuse % and the kv-verify error count (**must be 0**).
 5. **The version set** from §6, once, alongside the banners.
 6. **The compute capability** and which gates it enables (§1 table).
+7. **`max_prompt_tokens` across all rows, against `MAX_MODEL_LEN`.** Rows now
+   carry `_metadata.max_prompt_tokens` and `_metadata.prompt_tokens_per_call`,
+   so the writeup can state *"no request exceeded N tokens, against a cap of
+   131072"* rather than assuming it. Check it per arm:
+
+   ```bash
+   python3 -c "
+   import json,glob
+   for f in sorted(glob.glob('/workspace/pie/integrations/openhands/predictions/ab_h200_*.jsonl')):
+       rows=[json.loads(l) for l in open(f) if l.strip()]
+       mx=max((r['_metadata'].get('max_prompt_tokens',0) for r in rows), default=0)
+       print(f'{f.split(\"/\")[-1]:50} max_prompt_tokens={mx:,}')
+   "
+   ```
+
+   If any arm's max approaches the cap, say so explicitly — it means the cap was
+   nearly binding and the arms were not on equal footing.
 
 Report **s/iter and median per-call latency, never raw wall time** — the two
 agents walk different trajectories, so raw wall conflates path length with
@@ -311,8 +361,11 @@ serving speed (`TEST_PLAN.md` §5, §8).
 JSON aside for `crippled` and restoring it.
 
 **Ask the human first:** changing any version pin, changing the instance set,
-switching vLLM versions, changing `--max-model-len` or other harness flags,
-removing the `graphs-only` tier, or anything that would invalidate a collected arm.
+switching vLLM versions, changing harness flags, removing the `graphs-only`
+tier, or anything that would invalidate a collected arm.
+
+`MAX_MODEL_LEN` is **already decided** (§4a) — 131072. Do not change it without
+asking, but do not treat setting it as a change; it is the configured default.
 
 **Never:** collect a Pie arm when the driver banner reads
 `prefill_decode_plan=off`, or `git checkout` during a running arm.
@@ -335,11 +388,10 @@ removing the `graphs-only` tier, or anything that would invalidate a collected a
 - **Trajectories diverge run-to-run even at temperature 0.** The same instance
   went 66 iters / 1008 s and 56 iters / 790 s. This is exactly why `TEST_PLAN.md`
   §5/§8 normalizes by iteration — **never compare raw wall time**.
-- **`max_seq_len=32768`** is vLLM's default for this model and the A100 arms used
-  it, while instances averaged ~27k prompt tokens per call. If a call exceeds it
-  vLLM rejects where Pie may not, which surfaces as *failed* instances, not slow
-  ones. H200 has room to raise it — but that is a harness-flag change, so escalate
-  rather than doing it silently.
+- **The context cap is the only limit in the stack, and the arms are asymmetric.**
+  Resolved for H200 by setting `MAX_MODEL_LEN=131072` (§4a). Do not lower it back
+  toward the A100's 32768 without reading that section — instances averaged ~27k
+  prompt tokens per call there, so the margin was thinner than it looked.
 - **Paths in the older docs are stale.** `AGENT_HANDOVER.md` says the model is at
   `/workspace/hf-cache`; it is actually at `/workspace/.cache/huggingface/`.
   Any `/Users/yangliu/...` path in a doc refers to the human's Mac, not the pod.

@@ -770,12 +770,28 @@ def _extract_metrics(conv, *roots: Any) -> dict[str, Any]:
         pt = usage.prompt_tokens if usage else 0
         ct = usage.completion_tokens if usage else 0
         latencies = [r.latency for r in m.response_latencies]
+        # Per-call prompt sizes. `Metrics.token_usages` is a list[TokenUsage]
+        # with one entry per completion, so this is a read of data already
+        # collected, not new instrumentation.
+        #
+        # Why it is recorded: the serving cap (`--max-model-len`) is the ONLY
+        # context limit in this stack. litellm has no entry for a self-hosted
+        # model -- that is the benign "This model isn't mapped yet" line -- so
+        # nothing truncates client-side, and the condenser bounds history by
+        # MESSAGE COUNT (240), not tokens. If one call exceeds the cap, vLLM
+        # errors while Pie (whose ceiling is memory-planned, not fixed) does
+        # not, which surfaces as a failed instance in one arm only and looks
+        # like an accuracy difference. Recording the max lets the writeup state
+        # "no request exceeded N tokens" instead of assuming it.
+        per_call_prompt = [u.prompt_tokens for u in m.token_usages]
         return {
             "prompt_tokens": pt,
             "completion_tokens": ct,
             "total_tokens": pt + ct,
             "num_llm_calls": len(m.token_usages),
             "response_latencies": latencies,
+            "max_prompt_tokens": max(per_call_prompt) if per_call_prompt else 0,
+            "prompt_tokens_per_call": per_call_prompt,
         }
     except Exception:
         return {}

@@ -48,6 +48,9 @@ export ENV_FILE=${ENV_FILE:-$WORK/pie-bench-env.sh}
 PY=${PY:-python3.12}
 VLLM_VERSION=${VLLM_VERSION:-0.25.1}
 HARNESS_EXCLUDE_NEWER=${HARNESS_EXCLUDE_NEWER:-2026-05-15}
+# vLLM context cap. See the note in the generated env file (§3) for why this is
+# 131072 here and was 32768 on the A100.
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 
 mkdir -p "$FAST/venvs" "$CPM_SOURCE_CACHE" "$UV_CACHE_DIR" "$BUILD_TREE" "$PIP_CACHE_DIR"
 
@@ -73,6 +76,24 @@ echo "  compute cap $CC (sm_$ARCH, major $MAJOR) — Pie's >= 9 gates will PASS.
 
 GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 [ "$GPU_MEM" -ge 130000 ] || warn "GPU has ${GPU_MEM} MiB — the H200 toml assumes ~141 GB."
+
+# Does MAX_MODEL_LEN fit? KV is 96 KiB/token for this model (48 layers x 4 KV
+# heads x 128 dim x 2 (K,V) x 2 bytes bf16). Weights are ~58 GB.
+python3 - <<EOF
+gpu_mib   = $GPU_MEM
+mml       = $MAX_MODEL_LEN
+kv_kib    = 96
+weights   = 58_500          # MiB, measured
+budget    = gpu_mib * 0.90 - weights
+tokens    = int(budget * 1024 / kv_kib)
+conc      = tokens / mml if mml else 0
+print(f"  KV budget ~{budget/1024:.0f} GiB -> ~{tokens:,} tokens")
+print(f"  MAX_MODEL_LEN={mml:,} -> ~{conc:.1f}x concurrency")
+if conc < 1:
+    raise SystemExit("FATAL: MAX_MODEL_LEN does not fit in the KV budget — lower it.")
+if conc < 2:
+    print("  WARN: under 2x concurrency. Fine for a serial A/B, tight for anything else.")
+EOF
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 echo "  device name: $GPU_NAME"
@@ -143,6 +164,23 @@ export PIP_DEFAULT_TIMEOUT=900
 export UV_CONCURRENT_DOWNLOADS=4
 export CMAKE_CUDA_ARCHITECTURES=$ARCH
 export PIE_PORTABLE_CUDA_ARCH=$ARCH
+
+# Context cap for the vLLM arms. 131072 = the OpenHands SWE-bench norm (128k).
+#
+# The A100 used 32768 out of necessity, not choice: its 12.59 GiB of KV held
+# only 137,472 tokens, so 131072 would have left room for ~1.05 sequences.
+# H200 has ~72 GB of KV (~786k tokens at 96 KB/token: 48 layers x 4 KV heads
+# x 128 dim x 2 x 2 bytes), so 131072 costs ~12.6 GB and still leaves ~6x.
+#
+# This matters because the serving cap is the ONLY context limit in the stack:
+# litellm has no entry for a self-hosted model (the benign "isn't mapped yet"
+# line), so nothing truncates client-side, and the condenser bounds history by
+# MESSAGE COUNT (240), not tokens. Pie has no fixed cap at all -- its ceiling is
+# memory-planned -- so too low a value here fails vLLM on inputs Pie serves
+# fine, which looks like an accuracy difference and is not.
+# The model is native 262144 (no RoPE scaling below that); do not exceed it
+# without YaRN.
+export MAX_MODEL_LEN=$MAX_MODEL_LEN
 
 # H200 ships its own tuned MoE config — do NOT export VLLM_TUNED_CONFIG_FOLDER.
 # See AGENT_HANDOVER_H200.md §4.
