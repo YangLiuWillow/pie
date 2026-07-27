@@ -65,9 +65,13 @@ if [ ! -d "$PIE_SRC/.git" ]; then
 fi
 
 echo "=== [3] build Pie native CUDA driver for sm_80 (A100) ==="
-# Arch is auto-detected from nvidia-smi; pin it explicitly to be safe.
-export CMAKE_CUDA_ARCHITECTURES=80
-export PIE_PORTABLE_CUDA_ARCH=80
+# Arch is auto-detected from nvidia-smi; pin it explicitly to be safe. Defaults
+# to 80 (A100) but honours a value already exported — bootstrap_runpod.sh sets
+# it from the GPU's real compute cap, so a non-A100 pod does not spend an hour
+# compiling for the wrong architecture.
+export CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES:-80}
+export PIE_PORTABLE_CUDA_ARCH=${PIE_PORTABLE_CUDA_ARCH:-80}
+echo "  building for sm_$CMAKE_CUDA_ARCHITECTURES"
 ( cd "$PIE_SRC" && cargo build -p pie-server --release --features driver-portable,driver-cuda )
 echo "  built: $PIE_SRC/target/release/pie"
 

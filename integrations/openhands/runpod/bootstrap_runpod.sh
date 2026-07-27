@@ -38,13 +38,39 @@ set -euo pipefail
 WORK=${WORK:-/workspace}
 REPO_URL=${REPO_URL:-https://github.com/YangLiuWillow/pie.git}
 REPO_REF=${REPO_REF:-openhands-integration-updated}
+# STORAGE SPLIT — the single most important thing in this script.
+#
+# On runpod $WORK is typically a MooseFS network volume (check: `df -h $WORK`
+# shows mfs#...runpod.net). It has effectively unlimited space and survives pod
+# restarts, but every file operation is a network round-trip. Small-file-heavy
+# workloads do not merely run slow on it — they stall. Observed: `uv pip
+# install` of 67 small wheels parked 43 parallel downloads at ~15 KiB each and
+# never progressed, while curl to the same CDN ran at 125 MB/s. uv streams
+# downloads into UV_CACHE_DIR before linking them into the venv, so a cache on
+# MooseFS stalls the install no matter where the venv itself lives.
+#
+#   $FAST (local container disk) : caches, venvs, cargo target/ — small files,
+#                                  hot, cheap to rebuild. Lost on pod stop.
+#   $WORK (persistent volume)    : the repo and the ~60 GB model weights —
+#                                  large sequential files, expensive to refetch.
+#
+# The container disk is finite (60 GB is the runpod default), so this trades
+# rebuild-on-restart for a setup that actually completes.
+FAST=${FAST:-/root}
 PIE_SRC=${PIE_SRC:-$WORK/pie}
-PIE_VENV=${PIE_VENV:-$WORK/venvs/pie-vllm}
-HF_HOME=${HF_HOME:-$WORK/hf-cache}
+PIE_VENV=${PIE_VENV:-$FAST/venvs/pie-vllm}
+HF_HOME=${HF_HOME:-$WORK/hf-cache}          # weights: big, sequential, persist
 MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
-CPM_SOURCE_CACHE=${CPM_SOURCE_CACHE:-$WORK/.cpm-cache}
-PIP_CACHE_DIR=${PIP_CACHE_DIR:-$WORK/.pip-cache}
-UV_CACHE_DIR=${UV_CACHE_DIR:-$WORK/.uv-cache}
+CARGO_TARGET=${CARGO_TARGET:-$FAST/pie-target}
+CPM_SOURCE_CACHE=${CPM_SOURCE_CACHE:-$FAST/.cpm-cache}
+PIP_CACHE_DIR=${PIP_CACHE_DIR:-$FAST/.pip-cache}
+UV_CACHE_DIR=${UV_CACHE_DIR:-$FAST/.uv-cache}
+# Resolve the harness dependency graph as of when openhands-sdk 1.21.1 shipped
+# (2026-05-08). It declares 14 open-ended floors (fastmcp>=3.0.0,
+# litellm>=1.83.7, pydantic>=2.12.5, ...); resolving those at today's newest
+# gives a set the SDK was never tested against — litellm 1.93.0 fails to import
+# its own MessagesInterceptor, fastmcp 3.x moved Client. Pin time, not packages.
+HARNESS_EXCLUDE_NEWER=${HARNESS_EXCLUDE_NEWER:-2026-05-15}
 # uv defaults to a 30s HTTP timeout, which the multi-hundred-MB wheels in the
 # vLLM/torch/CUDA dependency set routinely blow through on a runpod link.
 export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-900}
@@ -58,15 +84,17 @@ VLLM_VERSION=${VLLM_VERSION:-}
 SKIP_MODEL=${SKIP_MODEL:-0}
 SKIP_APT=${SKIP_APT:-0}
 ENV_FILE=$WORK/pie-bench-env.sh
-# run_pie_backend.sh hardcodes VENV=$SCRIPT_DIR/.venv, so the harness venv has
-# to live exactly here — it is not overridable downstream.
-HARNESS_VENV=$PIE_SRC/integrations/openhands/.venv
+# The real venv is on $FAST; run_pie_backend.sh hardcodes VENV=$SCRIPT_DIR/.venv
+# and is not overridable, so $HARNESS_VENV_LINK is symlinked at it.
+HARNESS_VENV=${HARNESS_VENV:-$FAST/venvs/harness}
+HARNESS_VENV_LINK=$PIE_SRC/integrations/openhands/.venv
 
 step() { printf '\n\033[1;36m=== [%s] %s\033[0m\n' "$1" "$2"; }
 warn() { printf '\033[1;33mWARN: %s\033[0m\n' "$1"; }
 die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$1" >&2; exit 1; }
 
-mkdir -p "$WORK" "$WORK/logs" "$WORK/venvs" "$PIP_CACHE_DIR" "$CPM_SOURCE_CACHE" "$HF_HOME"
+mkdir -p "$WORK" "$WORK/logs" "$FAST/venvs" "$PIP_CACHE_DIR" "$CPM_SOURCE_CACHE" \
+         "$UV_CACHE_DIR" "$CARGO_TARGET" "$HF_HOME"
 LOG=$WORK/logs/bootstrap_$(date +%Y%m%d_%H%M%S).log
 exec > >(tee -a "$LOG") 2>&1
 echo "bootstrap log: $LOG"
@@ -99,8 +127,18 @@ if command -v mountpoint >/dev/null && ! mountpoint -q "$WORK"; then
     warn "$WORK is not a separate mount — it may be ephemeral container disk."
     warn "On runpod the persistent volume must be mounted at $WORK (see TEST_PLAN.md §10)."
 fi
+WORK_FS=$(df -h "$WORK" 2>/dev/null | tail -1 | awk '{print $1}')
+echo "  $WORK filesystem: ${WORK_FS:-unknown}"
+case "$WORK_FS" in
+    mfs*|*:/*|*nfs*)
+        echo "  -> network filesystem detected: caches/venvs/build go on \$FAST ($FAST)."
+        echo "     Only the repo and the model weights stay on $WORK." ;;
+esac
 AVAIL=$(df -BG --output=avail "$WORK" 2>/dev/null | tail -1 | tr -dc '0-9')
 echo "  free on $WORK: ${AVAIL:-?} GB"
+FAST_AVAIL=$(df -BG --output=avail "$FAST" 2>/dev/null | tail -1 | tr -dc '0-9')
+echo "  free on $FAST (local, holds venvs+build): ${FAST_AVAIL:-?} GB"
+[ "${FAST_AVAIL:-0}" -ge 55 ] || warn "$FAST has ${FAST_AVAIL:-?} GB. venvs (~18) + cargo target (~30) + CPM (~5) need ~55 GB; raise the pod's container disk or expect a build failure."
 [ "${AVAIL:-0}" -ge 150 ] || warn "TEST_PLAN.md §10 wants 150 GB on $WORK (200 GB if also scoring SWE-bench here)."
 ROOT_AVAIL=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
 echo "  free on / (container disk): ${ROOT_AVAIL:-?} GB"
@@ -234,6 +272,7 @@ cat > "$ENV_FILE" <<EOF
 # generated by bootstrap_runpod.sh — source before every run:
 #   source $ENV_FILE
 export WORK=$WORK
+export FAST=$FAST
 export PIE_SRC=$PIE_SRC
 export RUNPOD_DIR=$PIE_SRC/integrations/openhands/runpod
 export HARNESS_DIR=$PIE_SRC/integrations/openhands
@@ -325,13 +364,32 @@ fi
 "$PIE_VENV/bin/python" -c 'import vllm; print("  vLLM", vllm.__version__)'
 
 if ! has_pkg "$HARNESS_VENV" pie_openhands; then
-    echo "  provisioning harness venv at $HARNESS_VENV"
+    echo "  provisioning harness venv at $HARNESS_VENV (resolved as of $HARNESS_EXCLUDE_NEWER)"
     mkvenv "$HARNESS_VENV"
     pipinstall "$HARNESS_VENV" --upgrade pip
-    pipinstall "$HARNESS_VENV" -e "$PIE_SRC/integrations/openhands"
-    pipinstall "$HARNESS_VENV" litellm
+    # litellm is a direct import in pie_openhands/llm.py but is not declared in
+    # its pyproject, so name it explicitly — bounded by --exclude-newer rather
+    # than pinned, which is what keeps it consistent with openhands-sdk.
+    pipinstall "$HARNESS_VENV" --exclude-newer "$HARNESS_EXCLUDE_NEWER" \
+        -e "$PIE_SRC/integrations/openhands" litellm
 fi
 "$HARNESS_VENV/bin/python" -c 'import pie_openhands, openhands.sdk; print("  harness ok")'
+
+# run_pie_backend.sh looks for integrations/openhands/.venv unconditionally.
+if [ ! -e "$HARNESS_VENV_LINK" ] || [ "$(readlink -f "$HARNESS_VENV_LINK")" != "$(readlink -f "$HARNESS_VENV")" ]; then
+    rm -rf "$HARNESS_VENV_LINK"
+    ln -sfn "$HARNESS_VENV" "$HARNESS_VENV_LINK"
+    echo "  linked $HARNESS_VENV_LINK -> $HARNESS_VENV"
+fi
+
+# Same trick for the Rust build tree: CARGO_TARGET_DIR is global and would also
+# redirect the wasm inferlet build, breaking the path run_pie_backend.sh expects.
+# A symlink keeps target/ where every script looks while the bytes land on $FAST.
+if [ ! -L "$PIE_SRC/target" ]; then
+    [ -d "$PIE_SRC/target" ] && rm -rf "$PIE_SRC/target"
+    ln -sfn "$CARGO_TARGET" "$PIE_SRC/target"
+    echo "  linked $PIE_SRC/target -> $CARGO_TARGET"
+fi
 
 # -----------------------------------------------------------------------------
 step 7 "hand off to 00_setup_a100.sh (pie sm_$ARCH build, wasm inferlet, model)"
