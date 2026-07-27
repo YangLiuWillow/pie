@@ -9,6 +9,11 @@ description = "OpenHands ↔ Pie integration (PieLLM, PieConversation, supportin
 requires-python = ">=3.12"
 dependencies = [
   "openhands-sdk==1.21.1",
+  # benchmarks/swe_bench.py builds the stock agent via
+  # `openhands.tools.preset.default.get_default_tools`, so this is a hard
+  # runtime dependency of the harness, not an extra. Released in lockstep with
+  # the sdk — keep the two versions identical.
+  "openhands-tools==1.21.1",
   # `pie_openhands.llm` imports PieClient directly, so this is a hard runtime
   # dependency, not an optional extra. Published on PyPI; installing the
   # Pie repo's `client/python` in editable mode also satisfies it.

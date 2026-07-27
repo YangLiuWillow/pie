@@ -374,7 +374,14 @@ if ! has_pkg "$HARNESS_VENV" pie_openhands; then
     pipinstall "$HARNESS_VENV" --exclude-newer "$HARNESS_EXCLUDE_NEWER" \
         -e "$PIE_SRC/integrations/openhands" litellm
 fi
-"$HARNESS_VENV/bin/python" -c 'import pie_openhands, openhands.sdk; print("  harness ok")'
+# Import what the benchmark actually imports. `import pie_openhands` alone
+# passed while openhands.tools was missing, so every SWE-bench instance failed
+# 2 s in with ModuleNotFoundError at swe_bench.py:370 — a whole arm burned.
+"$HARNESS_VENV/bin/python" - <<'PY'
+import pie_openhands, openhands.sdk                      # noqa: F401
+from openhands.tools.preset.default import get_default_tools  # noqa: F401
+print("  harness ok")
+PY
 
 # run_pie_backend.sh looks for integrations/openhands/.venv unconditionally.
 if [ ! -e "$HARNESS_VENV_LINK" ] || [ "$(readlink -f "$HARNESS_VENV_LINK")" != "$(readlink -f "$HARNESS_VENV")" ]; then
