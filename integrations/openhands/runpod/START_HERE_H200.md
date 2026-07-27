@@ -61,6 +61,31 @@ get you there and stop you making the one mistake that already cost a full run.
 
 ---
 
+## Push to the fork only
+
+`YangLiuWillow/pie` is a **fork of `pie-project/pie`**. This experiment's commits
+belong on the fork. Nothing here should ever land upstream without a deliberate,
+separate decision by the human.
+
+Two guards, both reinstalled by `00_setup_h200.sh` because neither survives a
+fresh clone (`.git/hooks` is not versioned):
+
+- `remote.pushDefault = origin` — a bare `git push` targets the fork regardless
+  of branch tracking.
+- `.git/hooks/pre-push` (tracked copy at `git-hooks/pre-push`) — **refuses any
+  push whose target URL is not `YangLiuWillow/pie`**, in HTTPS or SSH form.
+  Verified against `pie-project/pie`, `git@github.com:pie-project/pie.git` and a
+  third-party URL; all blocked.
+
+If you deliberately want to publish upstream, that is `--no-verify` plus a
+conversation with the human first — it is on the escalate list.
+
+Note that **opening a pull request is not a push**. The fork's default PR target
+is upstream, so if you use `gh pr create`, pass `--repo YangLiuWillow/pie`
+explicitly or you will propose the branch to `pie-project/pie`.
+
+---
+
 ## Why this brief is short
 
 `AGENT_HANDOVER_H200.md` is ~17 KB and carries the storage rule, the version

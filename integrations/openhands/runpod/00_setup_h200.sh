@@ -114,6 +114,20 @@ say "[1] what survived the pod move"
              https://github.com/YangLiuWillow/pie.git $PIE_SRC"
 echo "  repo:  $PIE_SRC ($(git -C "$PIE_SRC" rev-parse --abbrev-ref HEAD) @ $(git -C "$PIE_SRC" rev-parse --short HEAD))"
 
+# Fork-only push guard. YangLiuWillow/pie is a FORK of pie-project/pie; this
+# experiment's commits belong on the fork. `.git/hooks` is not versioned, so a
+# fresh clone arrives without it — reinstall from the tracked copy every time.
+if [ -f "$RUNPOD_DIR/git-hooks/pre-push" ]; then
+    install -m 0755 "$RUNPOD_DIR/git-hooks/pre-push" "$PIE_SRC/.git/hooks/pre-push"
+    git -C "$PIE_SRC" config remote.pushDefault origin
+    echo "  push guard: pre-push hook installed; bare 'git push' pinned to origin (the fork)"
+fi
+PUSH_URL=$(git -C "$PIE_SRC" remote get-url --push origin 2>/dev/null || echo "?")
+case "$PUSH_URL" in
+    *YangLiuWillow/pie*) echo "  push target: $PUSH_URL (fork — correct)" ;;
+    *) warn "origin pushes to $PUSH_URL, which is NOT the fork. Check before pushing." ;;
+esac
+
 MODEL_DIR="$HF_HOME/hub/models--Qwen--Qwen3-Coder-30B-A3B-Instruct"
 if [ -d "$MODEL_DIR" ]; then
     echo "  model: present ($(du -sh "$HF_HOME" 2>/dev/null | cut -f1)) — no re-download"

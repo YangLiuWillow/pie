@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Refuse to push anywhere except the fork. YangLiuWillow/pie is a fork of
+# pie-project/pie; this experiment's commits belong on the fork only.
+# Installed by integrations/openhands/runpod/00_setup_h200.sh (and by hand).
+ALLOWED_RE='github\.com[:/]YangLiuWillow/pie(\.git)?$'
+url="$2"
+if [[ ! "$url" =~ $ALLOWED_RE ]]; then
+    echo "pre-push: BLOCKED — '$url' is not the fork (YangLiuWillow/pie)." >&2
+    echo "pre-push: this repo pushes to the fork only. Override with --no-verify" >&2
+    echo "pre-push: only if you genuinely intend to publish upstream." >&2
+    exit 1
+fi
+exit 0
