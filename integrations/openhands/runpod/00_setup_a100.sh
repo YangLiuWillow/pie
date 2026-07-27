@@ -41,7 +41,7 @@ mkdir -p "$WORK/venvs" "$PIP_CACHE_DIR"
 #    (Without the §4 fix, any coder-session prefill >512 tokens faults the driver
 #     — so do not check out an older ref.)
 # 2. DISK: see TEST_PLAN.md §10. Persistent /workspace 100 GB (150-200 GB if
-#    scoring SWE-bench here) for the repo + weights; container disk 100 GB for
+#    scoring SWE-bench here) for the repo + weights; container disk 60 GB (the runpod default is fine) for
 #    the venvs + cargo target/ + caches. The runpod 60 GB container default is
 #    workable but leaves no headroom. Resize BEFORE starting the pod (the model
 #    alone is ~60 GB bf16).

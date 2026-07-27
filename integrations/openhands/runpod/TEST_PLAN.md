@@ -287,24 +287,29 @@ The cost is that venvs and the build tree are lost on pod **stop**; re-running
 `bootstrap_runpod.sh` rebuilds them. The weights — the only genuinely expensive
 artifact — persist.
 
-**Container disk: 100 GB.** The runpod default of 60 GB is workable but tight:
-venvs (~18) + cargo `target/` (~30–40) + CPM cache (~5) ≈ 55–60 GB with nothing
-to spare. **Persistent volume (`/workspace`): 100 GB** (150–200 GB if also
-scoring SWE-bench here) — it now holds only the repo and the weights.
+**Container disk: 60 GB — the runpod default is fine.** Measured usage with
+everything (base image, both venvs, build tree, caches) is ~17 GB. **Persistent
+volume (`/workspace`): 100 GB** (150–200 GB if also scoring SWE-bench here) —
+it holds only the repo and the weights.
+
+Sizes below are **measured** on the A100 pod (2026-07-27), not estimated — an
+earlier revision of this table guessed 40–50 GB for the Rust build tree, which
+is wrong by more than an order of magnitude and drove a needlessly large
+container-disk recommendation.
 
 | Item | Size | Lives on |
 |---|---|---|
-| Model weights + HF cache (`Qwen3-Coder-30B-A3B`, bf16) | ~60–65 GB | `/workspace` |
+| Model weights + HF cache (`Qwen3-Coder-30B-A3B`, bf16) | ~60 GB | `/workspace` |
 | pie checkout | <1 GB | `/workspace` |
-| Pie build — `target/` (release, CUDA) + CPM source cache (cutlass/flashinfer) | ~40–50 GB | `$FAST` |
-| vLLM venv (torch + vllm + kernels) | ~12–15 GB | `$FAST` |
-| Harness venv (openhands sdk + deps) | ~2–3 GB | `$FAST` |
-| uv/pip caches | ~8–10 GB | `$FAST` |
+| Pie build — `target/` (release, CUDA) | **2.4 GB** | `$FAST` |
+| CPM source cache (cutlass/flashinfer) | ~1–3 GB | `$FAST` |
+| vLLM venv (torch + vllm + kernels) | ~9 GB | `$FAST` |
+| Harness venv (openhands sdk + tools + deps) | ~0.7 GB | `$FAST` |
+| uv/pip caches | ~5 GB | `$FAST` |
 | coder-session wasm, predictions, logs | <1 GB | `/workspace` |
 
-Note the base PyTorch/CUDA image (~20 GB) also sits on the container disk, which
-is why 60 GB total leaves so little room once the build tree lands there.
-Reclaim ~8–10 GB after setup with `uv cache clean` if it gets tight.
+With the base image, that is ~17 GB of a 60 GB container disk in practice.
+Reclaim the caches with `uv cache clean` if it ever gets tight.
 
 **SWE-bench scoring is the wildcard.** Building/pulling per-instance test images
 is large and file-count heavy (a prior run hit an inode quota at ~15M files, each
