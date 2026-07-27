@@ -71,9 +71,10 @@ get you there and stop you making the one mistake that already cost a full run.
 > and tell me — do not work around it.
 >
 > Then run the arms in the order in §5, one at a time, verifying each before
-> starting the next. **You have standing authorization for the whole sequence —
-> do not ask between arms.** §8 is the escalate list; §5 flags one required edit
-> to `30_ab_run.sh` that is pre-authorized.
+> starting the next. **Current scope is TWO ARMS ONLY — `pie` and vLLM `fair`.**
+> Do not run `crippled` or `graphs-only`; see the scope note at the top of §5.
+> **You have standing authorization for that sequence — do not ask between
+> arms.** §8 is the escalate list.
 >
 > Report per §7: **s/iter and median per-call latency, never raw wall time**; the
 > `assert_vllm_fair.sh` banner verbatim for each vLLM tier; the Pie driver

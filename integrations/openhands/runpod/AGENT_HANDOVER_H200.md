@@ -269,6 +269,12 @@ fix for an observed failure.
 
 ## 5. Run order
 
+> **CURRENT SCOPE (decided by the human, 2026-07-27): TWO ARMS ONLY — `pie` and
+> vLLM `fair`.** Skip step 3 (`crippled`) and do not run `graphs-only`. That
+> means no shipped-MoE-JSON shuffling (§4) is needed at all, and step 4's
+> summarize call should drop the `litellm-crippled=` argument. Adding a tier back
+> is an escalate-first change (§8) — it is a scope change, not a fix.
+
 ```bash
 source /workspace/pie-bench-env.sh
 cd /workspace/pie/integrations/openhands/runpod
@@ -436,8 +442,15 @@ serving speed (`TEST_PLAN.md` §5, §8).
 JSON aside for `crippled` and restoring it.
 
 **Ask the human first:** changing any version pin, changing the instance set,
-switching vLLM versions, changing harness flags, removing the `graphs-only`
-tier, or anything that would invalidate a collected arm.
+switching vLLM versions, changing harness flags, adding or removing a tier, or
+anything that would invalidate a collected arm.
+
+> On the vLLM pin specifically, the human's standing preference is **run the
+> newest vLLM that will run at all, and change the hardware rather than the
+> pin**. When the environment cannot support the pinned version, propose a pod
+> that can before you propose a downgrade. Faced with exactly this on 2026-07-27
+> (r570 driver vs vLLM 0.25.1's CUDA 13 requirement), they chose to migrate pods
+> rather than fall back to vLLM 0.19.0.
 
 `MAX_MODEL_LEN` is **already decided** (§4a) — 131072. Do not change it without
 asking, but do not treat setting it as a change; it is the configured default.
