@@ -1,0 +1,52 @@
+# Native CUDA driver config for Qwen3-Coder-30B-A3B (MoE) on a single
+# H200 SXM 141GB (sm_90). Ported from pie_cuda_native_config_30b_moe_a100.toml.
+#
+# WHY H200 AND NOT A100 — read RUN_STATE.md §0 before changing this.
+# Pie's two fast attention paths are gated to compute capability >= 9:
+#     driver/cuda/src/entry.cpp:988-989      use_prefill_decode_plan
+#     driver/cuda/src/ops/attention_xqa.cu:274  xqa_decode_bf16_supported
+# The A100 is sm_80 (major 8) and FAILED both, silently, which is why the A100
+# Pie arm is not a valid Pie measurement. H200 is sm_90 (major 9) and passes
+# both. Confirm this at runtime — see §5 of 00_setup_h200.sh; the driver prints
+# `prefill_decode_plan=on xqa_decode=on`. If it prints `off`, STOP: the whole
+# reason for moving to this GPU has not been met.
+#
+# Note H200 does NOT pass the two `major >= 12` gates
+# (cuda_memory_planner.cpp:219 and :250) — those need sm_120 (RTX Pro 6000).
+# So this is Pie-with-fast-attention, not the exact configuration the original
+# writeup ran. State that in the writeup.
+#
+# Requires a `pie` built with `--features driver-portable,driver-cuda` on THIS
+# box (sm_90). Do NOT copy the sm_80 binary from the A100 pod — rebuild.
+#
+# NEW-SCHEMA config (auto-plans KV/batch from memory_profile + gpu_mem_utilization).
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+# ~58 GB of bf16 weights on a 141 GB H200. At 0.90 the planner gets roughly
+# 72 GB for KV pages, against 13.5 GB on the 80 GB A100 — about 5x the KV pool.
+# That headroom accrues mostly to the BASELINE (vLLM's APC has more room to
+# hit), so it makes the comparison more conservative for Pie, not less.
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
+kv_page_size = 32
+weight_dtype = "bfloat16"
+# Host-backed KV offload tier. On the A100's 13.5 GB KV pool this was a
+# meaningful backstop; with ~72 GB here it should never engage for the serial
+# A/B. Kept ON for symmetry with the A100 runs and because it remains ESSENTIAL
+# for the stretch overcommit sweep (Pie swap vs vLLM evict-and-recompute), the
+# one regime the writeup says structurally differs.
+# ~8192 host pages ~= 25 GB pinned host RAM. Set to 0 to reproduce "swap off".
+swap_pool_size = 8192
