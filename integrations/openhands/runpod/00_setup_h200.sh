@@ -77,6 +77,30 @@ echo "  compute cap $CC (sm_$ARCH, major $MAJOR) — Pie's >= 9 gates will PASS.
 GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 [ "$GPU_MEM" -ge 130000 ] || warn "GPU has ${GPU_MEM} MiB — the H200 toml assumes ~141 GB."
 
+# Driver vs CUDA runtime. Compute capability is NOT the only pod-selection
+# criterion — the DRIVER matters independently, and it bit us once:
+#   vllm >= 0.20.0 pins torch==2.11.0, which is a CUDA 13 build (nvidia-nccl-cu13)
+#   and whose kernels link libcudart.so.13. CUDA 13 requires an r580+ driver.
+#   On an r570 pod (CUDA 12.8) the ENTIRE stack resolves, downloads and installs
+#   without a single error, then dies at the first torch.cuda call with
+#   "The NVIDIA driver on your system is too old (found version 12080)".
+# A clean `uv pip install` is not evidence the stack can reach the GPU — same
+# lesson as "it compiles is not it imports" (AGENT_HANDOVER_H200.md §9).
+DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d ' ')
+DRV_MAJOR=${DRV%%.*}
+DRV_CUDA=$(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9][0-9.]*\).*/\1/p' | head -1)
+echo "  driver $DRV (supports CUDA up to ${DRV_CUDA:-unknown})"
+if [ "${DRV_MAJOR:-0}" -lt 580 ] && [ "${ALLOW_OLD_DRIVER:-0}" != "1" ]; then
+    die "driver $DRV supports CUDA ${DRV_CUDA:-<12.x>}, but vllm==$VLLM_VERSION needs
+       CUDA 13 (torch 2.11.0, libcudart.so.13) and therefore an r580+ driver.
+       Nothing will fail until the first CUDA init, hours in. Options:
+         - get a pod whose nvidia-smi reports CUDA Version 13.x  (preferred)
+         - VLLM_VERSION=0.19.0 (torch 2.10.0 / CUDA 12.8) — this is a PIN CHANGE
+           and is on the escalate list; ask the human first.
+       The Pie arm is unaffected: pie builds against the system CUDA toolkit.
+       Set ALLOW_OLD_DRIVER=1 to run Pie-only bring-up on this pod anyway."
+fi
+
 # Does MAX_MODEL_LEN fit? KV is 96 KiB/token for this model (48 layers x 4 KV
 # heads x 128 dim x 2 (K,V) x 2 bytes bf16). Weights are ~58 GB.
 python3 - <<EOF
@@ -179,6 +203,23 @@ export UV_CONCURRENT_DOWNLOADS=4
 export CMAKE_CUDA_ARCHITECTURES=$ARCH
 export PIE_PORTABLE_CUDA_ARCH=$ARCH
 
+# REQUIRED for xqa_decode. Do not drop this and do not assume the toml covers it.
+#
+# sm_90 satisfies the ARCH gate in xqa_decode_bf16_supported(), but that function
+# has SEVEN conditions and \`major >= 9\` is only the last one. One of the others is
+# the KV page size: the gqa8 XQA kernel is compiled with TOKENS_PER_PAGE=32
+# (attention_xqa_gqa8.cu:21), and the page_size==16 escape hatch applies only to
+# GQA ratio 2 with PIE_CUDA_XQA_GQA2_P16 set. This model is ratio 8 (32 q / 4 kv),
+# so it does not qualify.
+#
+# The memory planner's \`auto\` page-size selection picks 16 on this box and
+# SILENTLY OVERRIDES kv_page_size=32 in the toml, which turns xqa_decode off while
+# prefill_decode_plan stays on. Observed banner without this variable:
+#     page_size=16 (auto) ... prefill_decode_plan=on xqa_decode=off
+# With it:
+#     page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on
+export PIE_CUDA_KV_PAGE_SIZE=32
+
 # Context cap for the vLLM arms. 131072 = the OpenHands SWE-bench norm (128k).
 #
 # The A100 used 32768 out of necessity, not choice: its 12.59 GiB of KV held
@@ -219,6 +260,13 @@ else
     echo "  vLLM venv exists"
 fi
 "$PIE_VENV/bin/python" -c "import vllm,torch;print(f'  vLLM {vllm.__version__}, torch {torch.__version__}')"
+# A successful install is not evidence torch can reach the GPU. Force a real CUDA
+# init here rather than discovering it in section [6] or, worse, mid-arm.
+"$PIE_VENV/bin/python" - <<'PY' || die "torch cannot initialize CUDA on this pod — see section [0]'s driver check."
+import torch
+torch.cuda.init()
+print(f"  CUDA init OK: {torch.cuda.get_device_name(0)}, torch built for cuda {torch.version.cuda}")
+PY
 
 if [ ! -x "$HARNESS_VENV/bin/python" ]; then
     echo "  creating harness venv ($PY, deps pinned --exclude-newer $HARNESS_EXCLUDE_NEWER)"
@@ -318,11 +366,14 @@ say "[8] THE CRITICAL CHECK — are Pie's fast paths actually ON?"
 # means STOP — do not collect a Pie arm.
 CFG="$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml"
 [ -f "$CFG" ] || die "missing $CFG"
-PROBE_LOG=$WORK/pie/integrations/openhands/logs/pie_gatecheck_$(date +%Y%m%d_%H%M%S).log
+PROBE_LOG=$HARNESS_DIR/logs/pie_gatecheck_$(date +%Y%m%d_%H%M%S).log
 mkdir -p "$(dirname "$PROBE_LOG")"
 echo "  starting pie briefly to read its banner -> $PROBE_LOG"
 echo "  (loads ~58 GB of weights; several minutes of silence is normal)"
 set +e
+# See section [3]: without this the planner picks page_size=16 and xqa_decode is
+# off even though the arch gate passes.
+export PIE_CUDA_KV_PAGE_SIZE=${PIE_CUDA_KV_PAGE_SIZE:-32}
 timeout 900 "$PIE_SRC/target/release/pie" serve --config "$CFG" > "$PROBE_LOG" 2>&1 &
 PROBE_PID=$!
 for _ in $(seq 1 180); do
@@ -334,6 +385,8 @@ BANNER=$(grep -oE 'prefill_decode_plan=[a-z]+ xqa_decode=[a-z]+[^ ]*' "$PROBE_LO
 kill "$PROBE_PID" 2>/dev/null; wait "$PROBE_PID" 2>/dev/null
 set -e
 
+PLANNED_PAGE=$(grep -oaE 'page_size=[0-9]+' "$PROBE_LOG" 2>/dev/null | head -1)
+echo "  planner: ${PLANNED_PAGE:-<not found>}  (must be page_size=32 for xqa)"
 echo "  banner: ${BANNER:-<not found>}"
 case "$BANNER" in
     *prefill_decode_plan=on*xqa_decode=on*)

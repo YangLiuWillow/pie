@@ -41,6 +41,12 @@ device = ["cuda:0"]
 # hit), so it makes the comparison more conservative for Pie, not less.
 gpu_mem_utilization = 0.90
 memory_profile = "auto"
+# WARNING: this key is NOT sufficient on its own. Under memory_profile = "auto"
+# the planner derives its own page size and silently ignores this value — it
+# picked 16 on the H200, which turns xqa_decode OFF (the gqa8 XQA kernel is built
+# with TOKENS_PER_PAGE=32). You must ALSO export PIE_CUDA_KV_PAGE_SIZE=32, which
+# 00_setup_h200.sh writes into the env file. Verify with the driver's own line:
+#   page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on
 kv_page_size = 32
 weight_dtype = "bfloat16"
 # Host-backed KV offload tier. On the A100's 13.5 GB KV pool this was a
