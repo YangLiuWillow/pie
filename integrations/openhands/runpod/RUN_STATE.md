@@ -257,6 +257,36 @@ for f in sorted(glob.glob('/workspace/pie/integrations/openhands/predictions/ab_
 
 ---
 
+## 3b. METHOD CHANGE — autotune abandoned, config borrowed (human, 17:45 UTC)
+
+**The `fair` tier no longer comes from our own autotuner.** `benchmark_moe.py
+--tune` was killed at ~17:45 after 1 of 18 batch-size sweeps in 57 min
+(15-24 h+ projected, nothing written until all 18 finish).
+
+Replaced by **SGLang's published A800-SXM4-80GB config**, renamed to the A100
+device name and installed at
+`/workspace/tuned_moe/E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json`.
+A800 is the same GA100 silicon as A100 — identical compute, 80 GB HBM2e,
+~2 TB/s — differing only in NVLink bandwidth, which a tp=1 single-GPU fused MoE
+kernel never touches.
+
+Full justification in `/workspace/tuned_moe/PROVENANCE.md`; the measured
+before/after on this exact GPU is in `/workspace/tuned_moe/VALIDATION.md`
+(**-8.3% overall**, -8.9% at bs=1, -18.7% at bs=2048; faster at 17 of 18 batch
+sizes). **Both files must be cited in the writeup** — the tier is no longer
+"we tuned it", it is "we used a third-party tuned config and measured that it
+beats the default".
+
+No published A100 config exists for this shape in vLLM (any version), SGLang, or
+the community repos — checked 2026-07-27. H100 has no bf16 `E=128,N=768` either;
+vLLM ships that bf16 shape only for H200 / B200 / H20 / MI308X, and SGLang adds
+H100 and A800.
+
+Optional follow-up, costs nothing already collected: run the full autotune later
+and report how close SGLang's config came.
+
+---
+
 ## 3a. Accuracy — deliberately deferred (human, 2026-07-27 ~17:00 UTC)
 
 **This writeup is a timing result. Do not put an accuracy number in it.**
