@@ -18,7 +18,7 @@ The A100 rerun was going to test whether a **properly configured vLLM** closes
 the ~26% gap the original writeup claimed for Pie. It measured something else
 entirely.
 
-**Pie's two fast attention paths are hard-gated to compute capability ≥ 9:**
+**Pie's two fast attention paths both require compute capability ≥ 9:**
 
 ```
 driver/cuda/src/entry.cpp:988-989
@@ -28,6 +28,12 @@ driver/cuda/src/entry.cpp:988-989
 driver/cuda/src/ops/attention_xqa.cu:274
     return current_device_major() >= 9;      // xqa_decode_bf16_supported
 ```
+
+> **CORRECTION (2026-07-27, found on the first H200 pod).** An earlier revision of
+> this section presented that second line as *the* xqa gate. It is not — it is the
+> **last of seven conditions** in `xqa_decode_bf16_supported()`, and the arch check
+> is the one most likely to pass. Reaching sm_90 is necessary and **not sufficient**.
+> See §1a: on a stock H200 this gate is **off** until you fix the KV page size.
 
 The A100 is sm_80, **major 8**. Both were **off for the entire run**, silently.
 The driver said so in its own banner and it was read past:
@@ -45,9 +51,10 @@ was measured with Pie's fast paths **on**, and the A100 rerun measured Pie with
 them **off**. The config-effort axis the rerun was built around
 (`--enforce-eager`, tuned MoE) is not what moved the number.
 
-**H200 is sm_90, major 9 — both gates pass.** That is the entire reason for this
-pod. `00_setup_h200.sh` §8 verifies it at runtime and refuses to continue if the
-banner reads `off`.
+**H200 is sm_90, major 9 — both arch gates pass.** That is the entire reason for
+this pod. `00_setup_h200.sh` §8 verifies it at runtime and refuses to continue if
+the banner reads `off`. But read §1a first: the arch gate passing is not the same
+as the feature being on.
 
 ### What H200 does NOT restore
 
@@ -56,7 +63,7 @@ Two further gates need **major ≥ 12** and stay off here:
 | gate | source | needs | A100 (8) | **H200 (9)** | RTX 6000 (12) |
 |---|---|---|---|---|---|
 | `use_prefill_decode_plan` | `entry.cpp:989` | ≥ 9 | ✗ | **✓** | ✓ |
-| `xqa_decode_bf16_supported` | `attention_xqa.cu:274` | ≥ 9 | ✗ | **✓** | ✓ |
+| `xqa_decode_bf16_supported` | `attention_xqa.cu:274` | ≥ 9 **+ page_size 32** | ✗ | **✓ only with `PIE_CUDA_KV_PAGE_SIZE=32`** (§1a) | ✓ |
 | `wide_prefill_device` | `cuda_memory_planner.cpp:219` | ≥ 12 | ✗ | **✗** | ✓ |
 | `prefill_candidate_cap` 16384 | `cuda_memory_planner.cpp:250` | ≥ 12 | ✗ | **✗** | ✓ |
 
@@ -64,6 +71,73 @@ So this is **Pie-with-fast-attention, not the exact configuration the original
 writeup ran**. A null result here does not strictly refute the original claim —
 only sm_120 would. **State this in the writeup.** H200 was chosen because vLLM
 ships a tuned MoE config for it (§4), so neither side needs tuning from us.
+
+---
+
+## 1a. xqa is OFF on a stock H200 — the KV page size, not the arch
+
+Found on the first H200 pod, 2026-07-27. The arch gate passed and xqa was still
+off:
+
+```
+page_size=16 (auto) ... prefill_decode_plan=on xqa_decode=off     # stock toml
+page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on      # with the fix
+```
+
+`xqa_decode_bf16_supported()` (`attention_xqa.cu:257-275`) checks **seven** things.
+In order: kv-head divisibility, GQA ratio ∈ {2,4,5,8}, **KV page size**, head dim,
+sliding window, non-default `sm_scale`, and *then* `current_device_major() >= 9`.
+
+The one that fails here is the page size:
+
+- the gqa8 XQA kernel is compiled with `TOKENS_PER_PAGE=32`
+  (`attention_xqa_gqa8.cu:21`), so `page_size` must be exactly **32**
+- the `page_size == 16` escape hatch applies **only** to GQA ratio 2 with
+  `PIE_CUDA_XQA_GQA2_P16` set. Qwen3-Coder-30B-A3B is ratio **8** (32 q / 4 kv),
+  so it does not qualify
+- `memory_profile = "auto"` makes the planner derive its own page size, and it
+  **silently overrides `kv_page_size = 32` in the toml**. It picked 16.
+
+**The fix is `PIE_CUDA_KV_PAGE_SIZE=32`** (`cuda_memory_planner.cpp:159`).
+`00_setup_h200.sh` now writes it into the generated env file and exports it for
+the §8 probe, and the gate check prints the planner's page size next to the
+banner. **Verify both lines, not just the banner** — the banner alone told the
+A100 run what was wrong and got read past; this one is subtler, because
+`prefill_decode_plan=on` makes it look half-right.
+
+The general lesson, which is the same one §1 teaches: **an arch gate passing is
+not the feature being on.** Read the driver's own output, every line of it.
+
+## 1b. The driver is a pod-selection criterion, independent of compute capability
+
+Also found 2026-07-27, on a pod that had the right GPU and the wrong driver.
+
+`vllm >= 0.20.0` pins `torch==2.11.0`, which is a **CUDA 13** build
+(`nvidia-nccl-cu13`) whose kernels link `libcudart.so.13`. CUDA 13 requires an
+**r580+** driver. On an r570 pod (CUDA 12.8) the entire stack — vLLM, torch, every
+nvidia wheel — resolves, downloads and installs **without a single error**, and
+then dies at the first `torch.cuda` call:
+
+```
+RuntimeError: The NVIDIA driver on your system is too old (found version 12080)
+```
+
+Changing the *container image* cannot fix this. `libcudart` (runtime) ships in the
+image and the wheels; `libcuda` (driver API) is bind-mounted in from the host by
+the NVIDIA container runtime. A CUDA 13 image on an r570 host gives you a second
+copy of the part you already have and none of the part you need.
+
+So a pod needs **both**, and they are independent:
+
+| requirement | makes valid | check |
+|---|---|---|
+| compute cap **9.0** | the **Pie** arm | `nvidia-smi --query-gpu=compute_cap --format=csv` |
+| driver **≥ 580** | the **vLLM** arm | `nvidia-smi --query-gpu=driver_version --format=csv` |
+
+`00_setup_h200.sh` §0 now hard-fails on driver major < 580
+(`ALLOW_OLD_DRIVER=1` permits a Pie-only bring-up, since Pie builds against the
+system CUDA toolkit and is unaffected), and §4 forces a real `torch.cuda.init()`
+immediately after the venv is built rather than letting it surface in §6.
 
 ---
 
@@ -289,6 +363,7 @@ for f in sorted(glob.glob('/workspace/pie/integrations/openhands/predictions/ab_
 
 | pin | why |
 |---|---|
+| **driver r580+** (the host, not a package) | `vllm >= 0.20.0` → `torch==2.11.0` → CUDA 13 → `libcudart.so.13`. On r570 everything installs cleanly and dies at the first CUDA call. Not fixable from inside the container. See §1b. |
 | **Python 3.12** (both venvs) | On 3.13 the vLLM set *resolves and installs*, then torch dies at import in the TorchScript overload parser (`torch/_sources.py parse_def` → `IndentationError`). A successful resolve is not evidence the stack runs. |
 | **vLLM 0.25.1** | A tier comparison needs one engine version, and the A100 `fair` arm used it. 0.26.0 exists — do not switch mid-experiment. |
 | **harness deps `--exclude-newer 2026-05-15`** | `openhands-sdk 1.21.1` declares 14 open-ended floors. At today's newest, litellm 1.93.0 fails to import its own `MessagesInterceptor` and fastmcp 3.x moved `Client`. Pin time, not packages. |
@@ -392,6 +467,17 @@ asking, but do not treat setting it as a change; it is the configured default.
   Resolved for H200 by setting `MAX_MODEL_LEN=131072` (§4a). Do not lower it back
   toward the A100's 32768 without reading that section — instances averaged ~27k
   prompt tokens per call there, so the margin was thinner than it looked.
+- **"It installs" is not "it can reach the GPU."** The whole CUDA 13 vLLM stack
+  installs without error on an r570 driver and dies at the first `torch.cuda`
+  call (§1b). This is the same shape as the `py_compile` lesson above: a clean
+  resolve proves resolution, nothing more. §4 now forces `torch.cuda.init()`.
+- **The memory planner silently overrides `kv_page_size` from the toml** under
+  `memory_profile = "auto"`, and picking 16 turns `xqa_decode` off while leaving
+  `prefill_decode_plan` on — which reads as half-working rather than broken
+  (§1a). Always check the planner's `page_size=` next to the feature banner.
+- **A config knob that appears in the toml is not necessarily in effect.**
+  `kv_page_size = 32` was in the H200 toml from the start and was ignored. Trust
+  what the driver prints at load time over what the config file says.
 - **Paths in the older docs are stale.** `AGENT_HANDOVER.md` says the model is at
   `/workspace/hf-cache`; it is actually at `/workspace/.cache/huggingface/`.
   Any `/Users/yangliu/...` path in a doc refers to the human's Mac, not the pod.

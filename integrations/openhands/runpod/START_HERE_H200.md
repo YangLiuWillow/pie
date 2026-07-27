@@ -9,6 +9,22 @@ get you there and stop you making the one mistake that already cost a full run.
 
 ## Before the agent starts (human, once per pod)
 
+0. **Check the pod before you pay for it.** Two independent requirements, and a
+   pod that satisfies one and not the other looks fine until it wastes an hour:
+
+   ```bash
+   nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv
+   ```
+
+   | need | makes valid | wrong value costs you |
+   |---|---|---|
+   | compute cap **9.0** | the **Pie** arm | the A100 failure — an invalid Pie arm |
+   | driver **≥ 580** | the **vLLM** arm | vLLM installs cleanly, then cannot start |
+
+   Driver r570 caps you at CUDA 12.8; `vllm >= 0.20` needs CUDA 13. Changing the
+   container image does **not** fix this — see `AGENT_HANDOVER_H200.md` §1b. On
+   RunPod, set the CUDA-version filter to 13.0+ *before* picking the GPU.
+
 1. **Attach the same network volume** if `us-md-1` has H200 capacity — you keep
    the ~57 GB model and the repo. `/root` (venvs, cargo build tree, caches) is
    lost regardless; `00_setup_h200.sh` rebuilds it. If the volume cannot follow,
@@ -34,16 +50,25 @@ get you there and stop you making the one mistake that already cost a full run.
 > `SESSION_NOTES_20260727.txt` for what the previous run found.
 >
 > The short version of why you're on this GPU: the previous run was on an A100
-> and produced an **invalid Pie arm**. Pie's fast attention paths are hard-gated
-> to CUDA compute capability >= 9 (`driver/cuda/src/entry.cpp:989`,
+> and produced an **invalid Pie arm**. Pie's fast attention paths require CUDA
+> compute capability >= 9 (`driver/cuda/src/entry.cpp:989`,
 > `driver/cuda/src/ops/attention_xqa.cu:274`) and the A100 is major 8, so both
 > were silently off for the whole run. The driver said so in its own startup
 > banner and it was read past. Do not repeat that.
 >
+> **But sm_90 alone is not enough, and the handover used to claim it was.**
+> `xqa_decode_bf16_supported()` has **seven** conditions and the arch check is
+> only the last. On a stock H200 the KV page size fails: the memory planner's
+> `auto` mode picks `page_size=16` and silently overrides `kv_page_size = 32` in
+> the toml, while the gqa8 XQA kernel needs `TOKENS_PER_PAGE=32`. The fix is
+> `PIE_CUDA_KV_PAGE_SIZE=32`, which the setup script now exports. Read
+> `AGENT_HANDOVER_H200.md` §1a — this is the trap that is *still* live.
+>
 > **Start with `bash integrations/openhands/runpod/00_setup_h200.sh`.** It is
 > idempotent and refuses to continue unless the Pie driver banner reads
-> `prefill_decode_plan=on xqa_decode=on`. If it does not print PASS, stop and
-> tell me — do not work around it.
+> `prefill_decode_plan=on xqa_decode=on`. Check the planner line it prints
+> alongside — you need **`page_size=32`** too. If it does not print PASS, stop
+> and tell me — do not work around it.
 >
 > Then run the arms in the order in §5, one at a time, verifying each before
 > starting the next. **You have standing authorization for the whole sequence —
@@ -103,8 +128,9 @@ will see `prefill_decode_plan=off`, decide it looks unimportant, and continue.
 
 | | |
 |---|---|
+| **Check first** | driver **≥ 580** *and* compute cap **9.0** — different arms depend on each |
 | **Do first** | `bash integrations/openhands/runpod/00_setup_h200.sh` |
-| **Must see** | `prefill_decode_plan=on xqa_decode=on` — otherwise STOP |
+| **Must see** | `prefill_decode_plan=on xqa_decode=on` **and** `page_size=32` — otherwise STOP |
 | **Never** | collect a Pie arm when that banner reads `off` |
 | **Don't set** | `VLLM_TUNED_CONFIG_FOLDER` — H200 ships its own MoE config |
 | **Report** | s/iter and median per-call latency, **never** raw wall time |
