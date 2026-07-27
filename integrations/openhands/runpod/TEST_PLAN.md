@@ -110,8 +110,15 @@ overcommit — not raw batch-1 decode."*
 **Controls / guards:**
 - `assert_vllm_fair.sh` gates every vLLM launch on the engine banner matching its
   declared tier — a silently-mis-tiered baseline cannot enter the numbers.
-- `KV_VERIFY=1` on the Pie arm asserts every reused KV block is numerically
-  identical to a from-scratch render (0 kv-verify errors is a pass condition).
+- `KV_VERIFY=1` on the Pie arm asserts, on every call, that the session
+  context's accumulated token count equals the from-scratch prompt render
+  (`inferlets/openhands-coder-session/src/lib.rs:739`); the inferlet errors out
+  instead of proceeding on mismatch. 0 kv-verify errors is a pass condition.
+  **State it as what it is** — a length/identity check on the token sequence,
+  which is the failure mode incorrect prefix reuse produces. It is *not* a
+  numerical comparison of KV tensors against a fresh render, and the writeup
+  must not claim that. Its cost is one integer comparison per call, so it does
+  not perturb the timings.
 - Fresh server per arm (60 GB of weights per engine won't co-reside on 80 GB
   anyway) — no cross-engine contention.
 
