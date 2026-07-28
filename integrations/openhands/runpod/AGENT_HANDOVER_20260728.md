@@ -213,18 +213,40 @@ Cross-check, and it is a tight one: 389 × 100 = 38,900 forwards for 100,708
 generated tokens = **2.59 tokens/forward**, against a mean R of 2.63 from the
 sample. The sampling is sound and the batching is real.
 
-So at concurrency 8 Pie issues **2.8× fewer forwards** but each takes **1.85×
-longer** (711 s / 38,900 = 18.3 ms, vs 1070 s / 108,000 = 9.9 ms at c1). Net:
-1.42×. Two distinct losses, do not conflate them:
+**Corrected derivation.** The 1.85×-per-forward figure below came from makespan,
+which is contaminated by tool time and by litellm's 303 s stall. The clean route
+uses only `pie_timings` decode totals: each decoded token waits exactly one
+forward, so `t_forward = decode_total_s / tokens`. That gives **7.36 ms at R=1**
+(783.8 s / 106,449) and **18.48 ms at R=2.63** (1860.9 s / 100,708) — 2.51× the
+time for 2.63× the work, i.e. **4.8% amortization**. Near zero, which is exactly
+what a `cublasGemmBatchedEx` M=1 fallback predicts: each route is an independent
+GEMV, so cost is linear in routes by construction (§6a-bis).
+
+vLLM's own log reports mean **5.77** concurrent requests at c8 (22 time-samples,
+mostly 4–8) against Pie's 2.63. Normalizing to marginal cost per added request:
+
+| | mean batch | per-stream slowdown | marginal request costs |
+|---|---|---|---|
+| pie | 2.63 | 2.25× | **0.78** of a solo request |
+| litellm | 5.77 | 2.63× | **0.34** of a solo request |
+
+So vLLM amortizes ~2.3× better per added request. Note the trap: raw per-stream
+*retention* is 0.44 for Pie against 0.38 for vLLM, which reads as Pie scaling
+better and is meaningless — the two run at different batch sizes, and retention
+does not normalize for that.
+
+So at concurrency 8 Pie issues **2.8× fewer forwards** but each takes longer.
+Net: 1.42×. Two distinct losses, do not conflate them:
 
 1. **Mean batch is 2.6, not 8.** Agents spend real time in tool execution, so
    the eight conversations are rarely all decoding in the same window.
-2. **A batch of 2.6 costs 1.85× a batch of 1.** The marginal token is ~71% the
-   price of a solo token. For a weight-bandwidth-bound decode, batching should
-   amortize far better than that. A plausible cause is MoE routing — 8 tokens
-   routing to disjoint experts grows the read set nearly linearly — but that is
-   a **hypothesis, not a measurement**, and vLLM's 7.00× on the same model says
-   whatever it is, it is not a hard property of the architecture.
+2. **The marginal request costs 0.78 of a solo one** (vLLM: 0.34). This is now
+   explained rather than hypothesized: at `routes ≈ 21` the MoE decode is still
+   below the aligned path's gate, so it runs batched GEMVs whose cost is linear
+   in routes. Raising the gate does not fix it — `aligned8` measured 9.5%
+   *slower* at batch 1 (§6a-bis). The aligned path wins only where its gate
+   already puts it, so closing this needs a kernel that amortizes at low route
+   counts, not a threshold change.
 
 **The `7.47× at N=8` figure in the pre-2026-07-28 notes does not transfer, and
 should not be quoted again.** `logs/probe_conc.log` shows what it measured: eight
@@ -263,6 +285,70 @@ scheduler"* — one forward pass carries both). So for this workload the lever i
 likely **unified/chunked-prefill scheduling**, not a second stream.
 
 </details>
+
+### 6a-bis. Decode: the MoE kernel-selection lever is CLOSED (measured)
+
+`qwen3_5_moe_forward.cpp` picks a decode path off `routes = batch * top_k`
+(top_k=8 here). At batch 1 `routes=8`; at the concurrency these arms reach
+(mean R=2.63) `routes~21`. Both are far below the aligned path's `min_routes=64`
+gate, and the WMMA path is off by default — so **every decode in this study ran
+the `cublasGemmBatchedEx` M=1 fallback**, cuBLAS's worst shape.
+
+That looked like free performance. It is not. `41_moe_decode_sweep.sh`,
+one instance, temperature 0, all rc=0 with no errors:
+
+| variant | decode tok/s | max prompt | vs base |
+|---|---|---|---|
+| base (cuBLAS M=1) | **147.5** | 25,520 | — |
+| p16 (page_size 16) | 147.3 | 28,152 | ~0 (10% longer ctx, same rate) |
+| wmma | **87.2** | 33,416 | **-41%** |
+| aligned8 (`min_routes=8`) | **133.5** | 28,073 | **-9.5%** |
+
+**Both gated-off kernels are worse at batch 1, so the defaults are right and the
+gates are correctly tuned.** Trajectories diverged (contexts differ up to 31%),
+but the context curve in §2 costs only ~9% per 50% more context, so neither the
+41% nor the 9.5% deficit is a context artifact. Page size 16 vs 32 is a wash,
+independently confirming §3's "page size buys nothing here".
+
+**The decode gap is not reachable by configuration.** Everything env-tunable has
+now been tried. What remains is kernel work.
+
+### 6a-ter. Where decode time actually goes — and why the profiler misleads
+
+`PIE_QWEN35_MOE_PROFILE=1` puts `full_attn` at 47% of decode kernel time and MoE
+GEMMs at 32% (390 forwards, median KV 21,001). **Do not plan off those shares.**
+The profiler syncs every stage, which suppresses overlap and blocks graph
+capture; its leaves sum to 8.93 ms against ~6.8 ms unprofiled, and it inflates
+attention hardest. It also depresses throughput enough to trip a websocket
+timeout — that run died after 11 calls, `rc=0`, `iters=0`, with a decode rate
+that looked perfectly legitimate. Never read a rate off a profiled run.
+
+The profiler-free decomposition is the **slope of decode cost against context**,
+which needs no instrumentation at all. From §2's post-fix sweep:
+
+| ctx | tok/s | ms/token |
+|---|---|---|
+| 298 | 166 | 6.02 |
+| 4,558 | 160 | 6.25 |
+| 18,218 | 137 | 7.30 |
+| 27,318 | 125 | 8.00 |
+
+Slope 4,558 → 27,318: 1.75 ms for 22,760 KV tokens = 2.24 GB, i.e. **~1.28 TB/s
+effective KV read** — about 27% of an H200's ~4.8 TB/s. Intercept: **~6.0 ms of
+context-independent cost**, which at ~6.6 GB of active weights is **~1.1 TB/s**,
+also ~23% of peak.
+
+So at 25k context the split is roughly **72% fixed / 28% attention** — the
+reverse of what the profiler reported, and it means the dominant decode cost is
+the weight/MoE/router/launch path, not attention. Both components run at about a
+quarter of the machine's bandwidth.
+
+**Next measurement, before any kernel work:** re-run that context sweep in-tree
+so the slope is ours rather than inherited from a previous session's notes, and
+run the identical sweep against vLLM. The fixed-vs-slope split tells you which
+of the two to attack; the vLLM comparison tells you how much of each is
+recoverable. Guessing between them is what produced the two wrong hypotheses
+above.
 
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 

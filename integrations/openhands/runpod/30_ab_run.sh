@@ -20,6 +20,20 @@ ARM=${ARM:?set ARM=litellm or ARM=pie}
 export MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 export HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
 export PIE_VENV=${PIE_VENV:-$HOME/.venvs/pie-vllm}
+
+# This script does NOT source /workspace/pie-bench-env.sh — callers are expected
+# to have done it (40_concurrency_sweep.sh and 41_moe_decode_sweep.sh do). Forget
+# it and HF_HOME falls back to $HOME/.cache/huggingface, which on a fresh pod is
+# empty, and the failure is a 57 GB re-download announced as
+#   "hf: … not in local cache; downloading runtime artifacts only"
+# several minutes after launch, from a log you are not tailing. Fail here instead.
+_snap_root="$HF_HOME/hub/models--${MODEL//\//--}/snapshots"
+if [ ! -d "$_snap_root" ] || [ -z "$(ls -A "$_snap_root" 2>/dev/null)" ]; then
+    echo "FATAL: $MODEL is not in HF_HOME=$HF_HOME" >&2
+    echo "       Run 'source /workspace/pie-bench-env.sh' first (it sets HF_HOME" >&2
+    echo "       to the /workspace copy). Refusing to trigger a 57 GB download." >&2
+    exit 2
+fi
 TS=$(date +%Y%m%d_%H%M%S)
 
 # The 13-instance set from the writeup (baseline's own prior wins — ceiling is
