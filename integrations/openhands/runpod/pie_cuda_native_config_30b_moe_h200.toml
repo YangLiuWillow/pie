@@ -1,5 +1,12 @@
-# Native CUDA driver config for Qwen3-Coder-30B-A3B (MoE) on a single
-# H200 SXM 141GB (sm_90). Ported from pie_cuda_native_config_30b_moe_a100.toml.
+# CONFIG A — "auto + forced page 32". The shape the 2026-07-27 H200 arm ran.
+#
+# Native CUDA driver, Qwen3-Coder-30B-A3B (MoE), single H200 SXM 141GB (sm_90).
+# One of THREE Pie configs for the 2026-07-28 rerun; see the table in
+# AGENT_HANDOVER_H200.md §5a. This file is also what 00_setup_h200.sh §8 probes,
+# so its banner must read `page_size=32 ... xqa_decode=on`.
+#
+# REQUIRES `PIE_CUDA_KV_PAGE_SIZE=32` in the environment. The env file written
+# by 00_setup_h200.sh exports it. Without it this config becomes CONFIG C.
 #
 # WHY H200 AND NOT A100 — read RUN_STATE.md §0 before changing this.
 # Pie's two fast attention paths are gated to compute capability >= 9:
@@ -7,9 +14,8 @@
 #     driver/cuda/src/ops/attention_xqa.cu:274  xqa_decode_bf16_supported
 # The A100 is sm_80 (major 8) and FAILED both, silently, which is why the A100
 # Pie arm is not a valid Pie measurement. H200 is sm_90 (major 9) and passes
-# both. Confirm this at runtime — see §5 of 00_setup_h200.sh; the driver prints
-# `prefill_decode_plan=on xqa_decode=on`. If it prints `off`, STOP: the whole
-# reason for moving to this GPU has not been met.
+# both. Confirm at runtime — the driver prints `prefill_decode_plan=on
+# xqa_decode=on`. If it prints `off`, STOP.
 #
 # Note H200 does NOT pass the two `major >= 12` gates
 # (cuda_memory_planner.cpp:219 and :250) — those need sm_120 (RTX Pro 6000).
@@ -33,6 +39,11 @@ hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 [model.driver]
 type = "cuda_native"
 device = ["cuda:0"]
+# Both were previously omitted and left at their defaults. Stated explicitly so
+# the config matches the reference at pie-project.org/docs/reference/drivers/cuda
+# and so a reader does not have to know the defaults to know what ran.
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
 
 [model.driver.options]
 # ~58 GB of bf16 weights on a 141 GB H200. At 0.90 the planner gets roughly
@@ -41,18 +52,34 @@ device = ["cuda:0"]
 # hit), so it makes the comparison more conservative for Pie, not less.
 gpu_mem_utilization = 0.90
 memory_profile = "auto"
-# WARNING: this key is NOT sufficient on its own. Under memory_profile = "auto"
-# the planner derives its own page size and silently ignores this value — it
-# picked 16 on the H200, which turns xqa_decode OFF (the gqa8 XQA kernel is built
-# with TOKENS_PER_PAGE=32). You must ALSO export PIE_CUDA_KV_PAGE_SIZE=32, which
-# 00_setup_h200.sh writes into the env file. Verify with the driver's own line:
+# WARNING: this key is INERT on the memory-planner path. The planner never reads
+# `cfg.batching.kv_page_size` — it builds its own candidate list in
+# derive_kv_page_size_candidates() (cuda_memory_planner.cpp:155) and scores it.
+# The value is parsed and range-checked (config.hpp:151), then ignored.
+#
+# Worse, the scorer PREFERS 16 over 32 at tp=1 in every profile branch
+# (:707-730), so no choice of memory_profile will produce 32 either. The ONLY
+# control is the env var PIE_CUDA_KV_PAGE_SIZE, which short-circuits the
+# candidate list to a single value (:157-162).
+#
+# That matters because the gqa8 XQA kernel is compiled with TOKENS_PER_PAGE=32
+# (attention_xqa_gqa8.cu:21) and the page_size==16 escape hatch applies only to
+# GQA ratio 2; Qwen3-Coder-30B-A3B is ratio 8 (32 q / 4 kv). So page 32 is a
+# hard requirement for xqa, and we are overriding a planner preference to get it
+# — which is exactly what CONFIG C exists to measure the cost of.
+#
+# Kept here at 32 for documentation value only. Verify what actually took effect
+# from the driver's own line, never from this file:
 #   page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on
 kv_page_size = 32
 weight_dtype = "bfloat16"
-# Host-backed KV offload tier. On the A100's 13.5 GB KV pool this was a
-# meaningful backstop; with ~72 GB here it should never engage for the serial
-# A/B. Kept ON for symmetry with the A100 runs and because it remains ESSENTIAL
-# for the stretch overcommit sweep (Pie swap vs vLLM evict-and-recompute), the
-# one regime the writeup says structurally differs.
-# ~8192 host pages ~= 25 GB pinned host RAM. Set to 0 to reproduce "swap off".
-swap_pool_size = 8192
+# Host-backed KV offload tier. Documented default is 0 (disabled); the A100 runs
+# used 8192 (~25 GB pinned host RAM) and the first H200 arm inherited it.
+#
+# Set to 0 for the rerun. With a ~69 GB KV budget and 632k KV tokens against a
+# single serial session of ~34k tokens, the swap tier can never engage, so it
+# was measuring nothing while remaining the one Pie-only non-default in the
+# stack — vLLM has no equivalent enabled. Restore 8192 for the stretch
+# overcommit sweep (Pie swap vs vLLM evict-and-recompute), the one regime where
+# it is the thing under test.
+swap_pool_size = 0

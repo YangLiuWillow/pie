@@ -1,0 +1,51 @@
+# CONFIG B — "latency plan + forced page 32".
+#
+# Same hardware, weights, page size and attention paths as CONFIG A
+# (pie_cuda_native_config_30b_moe_h200.toml). The ONLY difference is
+# memory_profile. Read A's comments first; they are not repeated here.
+#
+# REQUIRES `PIE_CUDA_KV_PAGE_SIZE=32`, same as A. Expected banner is identical:
+#   page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on
+#
+# WHAT THIS TESTS. Under `auto`, the planner resolved to `balanced` and sized
+# the plan for 512 concurrent decode rows and an 8192-token prefill target
+# (observed 2026-07-27: `resolved_profile=balanced selector=rule
+# decode_target=512 prefill_target=8192`). The A/B workload is the opposite of
+# that: ONE session, strictly serial, ~190 completion tokens per call against a
+# ~30k-token prompt that is 94-96% prefix-reused.
+#
+# `latency` changes two planner inputs (cuda_memory_planner.cpp):
+#   :198  decode sm_factor 6 -> 4   (132 SMs: 792 -> 528, both clamp to 512, so
+#                                    this one is expected to be a no-op here)
+#   :226  prefill target halved     (the real change)
+# It also flips the page-size preference harder toward 16 (:721, 16 -> +0.20,
+# 32 -> -0.20), which the env var overrides — so B fights the planner slightly
+# MORE than A does, not less. That is deliberate: it isolates plan shape from
+# page size, since both configs are pinned to 32.
+#
+# Do not read a B-beats-A result as "latency is the right profile" without
+# checking the planner banner — if decode_target and prefill_target come out
+# identical to A's, the two configs are the same plan and any delta is noise.
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+# THE VARIABLE UNDER TEST. Everything else matches CONFIG A byte for byte.
+memory_profile = "latency"
+kv_page_size = 32          # inert — see CONFIG A. The env var is the control.
+weight_dtype = "bfloat16"
+swap_pool_size = 0

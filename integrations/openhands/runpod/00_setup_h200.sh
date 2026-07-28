@@ -172,10 +172,21 @@ fi
 rustup target add wasm32-wasip2 >/dev/null 2>&1 || true
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-command -v "$PY" >/dev/null || die "$PY not found. Python 3.12 is REQUIRED: on
-       3.13 the vLLM set resolves and installs, then torch dies at import in the
-       TorchScript overload parser. A successful resolve is not evidence the
-       stack runs."
+# Python 3.12 is REQUIRED: on 3.13 the vLLM set resolves and installs, then
+# torch dies at import in the TorchScript overload parser. A successful resolve
+# is not evidence the stack runs.
+#
+# Do not assume the image ships it. The first H200 pod had python3.12 on PATH;
+# the 2026-07-28 image is conda-based with 3.11 as `python3` and no 3.12 at all,
+# which killed this script ~40 s in. uv can provision the exact version, so
+# fetch it rather than dying on an image difference that is not a pin change.
+if ! command -v "$PY" >/dev/null; then
+    echo "  $PY not on PATH — provisioning it with uv (this is not a pin change)"
+    uv python install 3.12 || die "uv could not install Python 3.12"
+    PY=$(uv python find 3.12) \
+        || die "uv installed Python 3.12 but 'uv python find 3.12' failed"
+    [ -x "$PY" ] || die "resolved interpreter '$PY' is not executable"
+fi
 echo "  $($PY --version), cargo $(cargo --version | cut -d' ' -f2), uv $(uv --version 2>/dev/null | cut -d' ' -f2)"
 
 # =============================================================================
@@ -251,10 +262,21 @@ say "[4] venvs on LOCAL disk"
 # uv streams downloads into its cache BEFORE linking into the venv, so a cache
 # on MooseFS stalls the install no matter where the venv lives. UV_CACHE_DIR is
 # already pointed at $FAST above. This cost the human several hours once.
+# `$PY -m venv` fails on a uv-provisioned interpreter: ensurepip exits non-zero
+# (observed 2026-07-28, "returned non-zero exit status 1" creating pie-vllm).
+# `uv venv --seed` builds the same layout, works with both system and
+# uv-managed interpreters, and seeds pip so `<venv>/bin/pip` still exists for
+# anything that shells out to it.
+make_venv() {
+    local dest="$1"
+    rm -rf "$dest"
+    uv venv --seed --python "$PY" "$dest" \
+        || die "could not create venv at $dest with $PY"
+}
+
 if [ ! -x "$PIE_VENV/bin/python" ]; then
     echo "  creating vLLM venv ($PY, vllm==$VLLM_VERSION)"
-    "$PY" -m venv "$PIE_VENV"
-    VIRTUAL_ENV="$PIE_VENV" uv pip install -U pip
+    make_venv "$PIE_VENV"
     VIRTUAL_ENV="$PIE_VENV" uv pip install "vllm==$VLLM_VERSION"
 else
     echo "  vLLM venv exists"
@@ -270,8 +292,7 @@ PY
 
 if [ ! -x "$HARNESS_VENV/bin/python" ]; then
     echo "  creating harness venv ($PY, deps pinned --exclude-newer $HARNESS_EXCLUDE_NEWER)"
-    "$PY" -m venv "$HARNESS_VENV"
-    VIRTUAL_ENV="$HARNESS_VENV" uv pip install -U pip
+    make_venv "$HARNESS_VENV"
     ( cd "$HARNESS_DIR" && VIRTUAL_ENV="$HARNESS_VENV" \
         uv pip install --exclude-newer "$HARNESS_EXCLUDE_NEWER" -e . )
 else
@@ -364,6 +385,24 @@ say "[8] THE CRITICAL CHECK — are Pie's fast paths actually ON?"
 # feature flags at model-load time. Anything other than
 #     prefill_decode_plan=on xqa_decode=on
 # means STOP — do not collect a Pie arm.
+# --- preflight: does this binary even have the driver? -----------------------
+# `pie driver cuda-native doctor` is the driver's own self-check (driver/cuda/
+# README.md). It answers "is cuda_native compiled into THIS binary and can it
+# see the GPU" in under a second, against the ~3 minutes the banner probe below
+# spends loading 58 GB of weights before it can fail. A binary built without
+# --features driver-cuda, or a pod whose GPU has gone away, dies here instead.
+echo "  driver self-check: pie driver cuda-native doctor"
+if ! DOCTOR=$("$PIE_SRC/target/release/pie" driver cuda-native doctor 2>&1); then
+    echo "$DOCTOR" | sed 's/^/    /'
+    die "cuda-native doctor failed — the built binary cannot use this GPU."
+fi
+echo "$DOCTOR" | sed 's/^/    /'
+case "$DOCTOR" in
+    *"compiled in"*) ;;
+    *) die "cuda-native is NOT compiled into $PIE_SRC/target/release/pie.
+       Rebuild with --features driver-portable,driver-cuda." ;;
+esac
+
 CFG="$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml"
 [ -f "$CFG" ] || die "missing $CFG"
 PROBE_LOG=$HARNESS_DIR/logs/pie_gatecheck_$(date +%Y%m%d_%H%M%S).log

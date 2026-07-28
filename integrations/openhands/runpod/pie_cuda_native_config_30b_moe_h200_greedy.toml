@@ -1,0 +1,69 @@
+# DECODE PROBE CONFIG — identical to CONFIG A except the batch policy.
+#
+# Requires `PIE_CUDA_KV_PAGE_SIZE=32`, same as A. Expected driver banner is
+# identical: page_size=32 ... prefill_decode_plan=on xqa_decode=on
+#
+# WHY THIS EXISTS. With the per-call transport cost eliminated (daemon mode,
+# 2026-07-28), decode is 98.3% of Pie's per-call latency: 317.5 s of 323.1 s
+# across 25 calls, at 15.4 tok/s against vLLM's 185 tok/s on the same instance
+# and the same GPU. That gap is now the whole story, and nothing measured so far
+# explains it — the arch gates are on and transport overhead is 0.02%.
+#
+# Pie does ITERATION-LEVEL batching: every in-flight context re-submits a
+# forward-pass request after each token, and a scheduling policy decides when to
+# fire the accumulated batch (runtime/src/inference/adaptive_policy.rs:17-20).
+# The default policy is `adaptive` (server/src/config.rs:399).
+#
+# `adaptive` fires on, in order: the structural cap `B >= max_forward_requests`;
+# a cold start; `B >= fired_high_water`; or the `last_latency` deadlock
+# watchdog. Otherwise it WAITS. Our workload is a single serial conversation, so
+# B is 1 on every decode step while the planner sized `max_forward_requests` at
+# 512 — the structural cap is unreachable by three orders of magnitude. If
+# `fired_high_water` is ever ratcheted above 1 (a prefill cohort, a fork, the
+# condenser), every subsequent decode step falls through to the watchdog and
+# waits `last_latency` — roughly one fire — before firing a batch of one.
+# That would about double per-token latency, which is the right order for the
+# 44 ms/token observed.
+#
+# `greedy` fires immediately with zero waiting (adaptive_policy.rs:6). It is the
+# wrong policy for a throughput server and exactly the right one for a
+# single-stream latency measurement.
+#
+# HOW TO READ THE RESULT. This config is a DIAGNOSTIC, not a proposed default:
+#
+#   greedy >> adaptive  -> the gap is scheduler wait, not kernels. Pie is
+#                          fast and was queueing behind a batch that never
+#                          arrived. Fix belongs in the policy, not the config.
+#   greedy ~= adaptive  -> the time is inside the forward pass. Look at the
+#                          MoE kernels next (vLLM ships a tuned E=128,N=768
+#                          H200 config; Pie's CUDA driver has its own), and
+#                          check GPU utilization during decode.
+#
+# Sampled GPU utilization during a decode-heavy call separates the two
+# regardless: pegged = kernel-bound, idle = waiting.
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.scheduler]
+# THE VARIABLE UNDER TEST. Everything below matches CONFIG A byte for byte.
+batch_policy = "greedy"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
+kv_page_size = 32          # inert — see CONFIG A. The env var is the control.
+weight_dtype = "bfloat16"
+swap_pool_size = 0
