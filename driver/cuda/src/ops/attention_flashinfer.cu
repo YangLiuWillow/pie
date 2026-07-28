@@ -123,6 +123,68 @@ bool force_split_kv_small_enabled() {
     return enabled;
 }
 
+// Legacy small-batch non-split decode override. OFF by default since
+// 2026-07-28; set PIE_CUDA_SMALL_BATCH_NONSPLIT_DECODE=1 to restore it.
+//
+// It used to be on unconditionally for `batch_size <= 512` on sm_80+, and it
+// discarded FlashInfer's own split-kv decision. That is backwards with respect
+// to its own rationale. Without a KV split, decode parallelism is roughly
+// `batch_size * num_kv_heads` CTAs, so on a 132-SM H200 serving a 4-KV-head
+// model:
+//
+//     batch    CTAs   fills device?   non-split appropriate?
+//         1       4   no (~3%)        no — catastrophic
+//        66     264   yes (~2 waves)  yes
+//       512    2048   yes             yes
+//
+// So the old condition applied the non-split schedule across exactly the range
+// where it hurts: low batch is precisely when the split is most needed, and
+// "the TP1 latency shapes we care about" ARE low batch. And because the memory
+// planner caps max_forward_requests at 512 (observed `R=512` in the driver's
+// own planner banner), `batch_size <= 512` is always true here — FlashInfer's
+// decision was never actually deferred to, at any batch size.
+//
+// This is not a new diagnosis. benches/MULTIMODAL_BENCH.md:92 already recorded
+// it — "makes long-KV batch-1 decode read the KV serially -> linear-with-
+// context ... a real perf bug for ALL long-context decode, not just
+// multimodal" — and benches/pie_mm_bench.py:168 works around it by baking
+// PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL=1 for that one benchmark. Nothing else
+// in the tree sets it, so every other caller kept the bug. This change makes
+// the fix the default instead of a per-benchmark opt-in.
+//
+// Measured on H200 / Qwen3-Coder-30B-A3B (32 q / 4 kv heads, 48 full-attention
+// layers), batch 1, page_size 32 — override ON vs OFF:
+//
+//     ctx tokens      ON      OFF
+//            298     157      166 tok/s
+//          1,138     112      172
+//          4,558      48      160
+//         18,218      14      137
+//         27,318      10      125        <- 12.8x
+//
+// End to end on SWE-bench django__django-14373, identical 52-iteration
+// trajectory: 402 s -> 57 s wall (7.72 -> 1.09 s/iter), decode 15.2 -> 144.6
+// tok/s. A concurrency sweep at 27k context confirmed the mechanism directly:
+// per-stream latency stayed flat out to 8 streams while aggregate throughput
+// scaled 7.47x, i.e. the non-split schedule left ~87% of the device idle.
+//
+// Kept reachable rather than deleted because it changes decode scheduling for
+// every sm_80+ shape, and the above is one model on one GPU. If you have a
+// shape where non-split wins at low batch, this restores it — please record
+// the measurement next to this comment.
+//
+// PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL still wins if set: it was the pre-existing
+// escape hatch for exactly this problem, so a script that sets it must keep
+// getting split-kv.
+bool legacy_small_batch_nonsplit_enabled() {
+    static const bool enabled = [] {
+        if (force_split_kv_small_enabled()) return false;
+        const char* v = std::getenv("PIE_CUDA_SMALL_BATCH_NONSPLIT_DECODE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool static_nonsplit_decode_plan_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_CUDA_STATIC_DECODE_PLAN");
@@ -173,7 +235,11 @@ struct DecodeWorkEstimator {
             }
             max_num_pages_per_batch = std::max(max_num_pages_per_batch, max_pages_per_req);
         }
-        if (!force_split_kv_small_enabled() &&
+        // Default: leave FlashInfer's `split_kv` decision alone. Its work
+        // estimator already compares the achievable grid against the device's
+        // SM count, which is exactly the question "is there enough parallelism
+        // without splitting the KV?" — see legacy_small_batch_nonsplit_enabled.
+        if (legacy_small_batch_nonsplit_enabled() &&
             current_device_major() >= 8 && batch_size <= 512) {
             split_kv = false;
             new_batch_size = batch_size;
@@ -352,15 +418,19 @@ cudaError_t plan_decode_for_head_dim(
 }
 
 bool can_use_static_nonsplit_decode_plan(uint32_t num_requests) {
-    // DecodeWorkEstimator above already overrides FlashInfer's split-kv choice
-    // to false for the TP1 latency shapes we care about. In that case the
-    // schedule is independent of KV lengths, so avoid rerunning the full
-    // FlashInfer planner for every decode batch.
+    // This is NOT an independent optimization — it is only correct when
+    // DecodeWorkEstimator has forced split-kv off, because only then is the
+    // schedule independent of KV lengths and safe to reuse across decode
+    // batches without rerunning the planner. So it must track that override
+    // exactly; gating it on anything looser silently pins a KV-length-blind
+    // schedule onto batches that FlashInfer wanted to split, which is the
+    // long-context decode collapse documented on
+    // legacy_small_batch_nonsplit_enabled.
     return static_nonsplit_decode_plan_enabled() &&
+           legacy_small_batch_nonsplit_enabled() &&
            current_device_major() >= 8 &&
            num_requests > 0 &&
-           num_requests <= 512 &&
-           !force_split_kv_small_enabled();
+           num_requests <= 512;
 }
 
 void refresh_static_nonsplit_decode_vectors(
