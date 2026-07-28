@@ -105,8 +105,14 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     const bool supported_head_dim =
         hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
         hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
+    // The decode fast-path is instantiated for one head_dim the prefill list
+    // above does not cover (96 — see plan_decode_for_head_dim's dispatch), so
+    // a 96-dim model would otherwise take the `base` early-return with its
+    // decode term never modelled at all.
+    const bool decode_supported_head_dim =
+        supported_head_dim || hf.head_dim_kernel == 96;
     if (hf.num_attention_heads <= 0 || hf.num_key_value_heads <= 0 ||
-        !supported_head_dim || prop.multiProcessorCount <= 0) {
+        !decode_supported_head_dim || prop.multiProcessorCount <= 0) {
         return base;
     }
 
