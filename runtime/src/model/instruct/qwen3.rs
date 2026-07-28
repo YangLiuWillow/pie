@@ -665,6 +665,49 @@ mod tests {
         assert_eq!(inst.seal(), inst.stop_ids);
     }
 
+    /// `stop_ids` preserves the order of `ChatMLConfig::stop_tokens`, so index 0
+    /// is the turn terminator and any extras (`<|endoftext|>`) follow.
+    ///
+    /// Callers that need to CLOSE A TURN want only that first id — plus a
+    /// newline, i.e. `turn_suffix` — not all of `seal()`. `seal()` returns every
+    /// stop id, so for Qwen it emits `<|im_end|><|endoftext|>`, and
+    /// `<|endoftext|>` is a document separator: injected mid-conversation it
+    /// tells the model unrelated text follows. `self-correct-rollout` relies on
+    /// this ordering to close turn 1 correctly; pin it.
+    #[test]
+    fn stop_ids_lead_with_the_turn_terminator() {
+        let tok = make_tok();
+        let im_end = tok.token_to_id("<|im_end|>").expect("<|im_end|> in vocab");
+        let eot = tok.token_to_id("<|endoftext|>").expect("<|endoftext|> in vocab");
+
+        for inst in [qwen3(), qwen2()] {
+            assert_eq!(inst.stop_ids.first().copied(), Some(im_end));
+            assert!(inst.stop_ids.contains(&eot));
+            // seal() is NOT the way to close a turn: it carries the separator too.
+            assert_ne!(inst.seal(), inst.turn_suffix);
+            assert!(inst.seal().contains(&eot));
+        }
+        // Single-stop-token configs are unaffected either way.
+        let olmo = olmo3();
+        assert_eq!(olmo.stop_ids.first().copied(), Some(im_end));
+        assert!(!olmo.seal().contains(&eot));
+    }
+
+    /// `turn_suffix` is what the template's own message builders emit to close a
+    /// turn: the terminator followed by a newline.
+    #[test]
+    fn turn_suffix_is_terminator_plus_newline() {
+        let tok = make_tok();
+        let im_end = tok.token_to_id("<|im_end|>").expect("<|im_end|> in vocab");
+        let inst = qwen3();
+        assert_eq!(inst.turn_suffix.first().copied(), Some(im_end));
+        assert_eq!(inst.turn_suffix, {
+            let mut v = vec![im_end];
+            v.extend(tok.encode("\n"));
+            v
+        });
+    }
+
     #[test]
     fn generation_header_matches_cue() {
         let inst = qwen3();
