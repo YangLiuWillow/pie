@@ -50,16 +50,36 @@ if [ -n "${AB_INSTANCES:-}" ]; then
     echo "=== instance set overridden: $((${#INSTANCES[@]} / 2)) instance(s) — ${AB_INSTANCES} ==="
 fi
 
+# How many instances to solve in parallel against ONE server. 1 = the serial
+# behaviour every arm before 2026-07-28 used; >1 is the throughput lever.
+#
+# The harness already implements this (`swe_bench.py:942`, a ThreadPoolExecutor
+# whose workers each call `build_llm`, so every conversation gets its own PieLLM
+# — and, in daemon mode, its own inferlet process and websocket). Nothing here
+# had a way to reach it, which is the only reason the concurrency question was
+# still open.
+#
+# The metric this exists to produce is instances/GPU-hour, NOT s/iter: at N>1
+# the per-iteration number is contended by construction and stops meaning what
+# it means at N=1. Compare a concurrent arm against the SAME arm at N=1.
+CONCURRENCY=${CONCURRENCY:-1}
+if [ "$CONCURRENCY" -lt 1 ] 2>/dev/null; then
+    echo "CONCURRENCY must be a positive integer" >&2; exit 2
+fi
+
+echo "=== concurrency: $CONCURRENCY instance(s) in parallel against one server ==="
+
 cd "$HARNESS_DIR"
 
 if [ "$ARM" = "litellm" ]; then
     # Optimization-effort tier for the vLLM baseline: crippled | graphs-only | fair.
     # Run all three for the effort-axis curve; each writes a distinct output.
     export VLLM_TIER=${VLLM_TIER:-fair}
-    export OUTPUT=${OUTPUT:-predictions/ab_h200_litellm_${VLLM_TIER}_${TS}.jsonl}
-    export LABEL=litellm-${VLLM_TIER}+qwen3-coder-30b-a3b-t0
+    export OUTPUT=${OUTPUT:-predictions/ab_h200_litellm_${VLLM_TIER}_c${CONCURRENCY}_${TS}.jsonl}
+    export LABEL=litellm-${VLLM_TIER}+qwen3-coder-30b-a3b-t0-c${CONCURRENCY}
     bash "$RUNPOD_DIR/run_litellm_baseline_fair.sh" \
-        "${INSTANCES[@]}" --temperature 0 --max-iterations 100
+        "${INSTANCES[@]}" --temperature 0 --max-iterations 100 \
+        --concurrency "$CONCURRENCY"
 
 elif [ "$ARM" = "pie" ]; then
     # Uses the existing run_pie_backend.sh, pointed at the A100 native config.
@@ -97,16 +117,17 @@ elif [ "$ARM" = "pie" ]; then
             exit 2 ;;
     esac
     export CFG=${CFG:-$RUNPOD_DIR/$_cfg}
-    export LABEL=${LABEL:-pie-cuda-native-h200-${PIE_CFG_VARIANT}+qwen3-coder-30b-t0}
+    export LABEL=${LABEL:-pie-cuda-native-h200-${PIE_CFG_VARIANT}+qwen3-coder-30b-t0-c${CONCURRENCY}}
     # The variant is in the FILENAME because summarize_ab.py selects arms by
     # glob. Summarize these with explicit per-variant globs — a bare
     # `*_pie_*.jsonl` would merge all three into one meaningless average.
-    export OUTPUT=${OUTPUT:-predictions/ab_h200_pie_${PIE_CFG_VARIANT}_${TS}.jsonl}
+    export OUTPUT=${OUTPUT:-predictions/ab_h200_pie_${PIE_CFG_VARIANT}_c${CONCURRENCY}_${TS}.jsonl}
     echo "=== pie config variant: $PIE_CFG_VARIANT ($_cfg)"
     echo "===   PIE_CUDA_KV_PAGE_SIZE=${PIE_CUDA_KV_PAGE_SIZE:-<unset — planner picks, expect 16>}"
     export REQUEST_TIMEOUT_S=900
     bash "$HARNESS_DIR/run_pie_backend.sh" \
-        "${INSTANCES[@]}" --python-tool-parser --temperature 0 --max-iterations 100
+        "${INSTANCES[@]}" --python-tool-parser --temperature 0 --max-iterations 100 \
+        --concurrency "$CONCURRENCY"
 else
     echo "ARM must be litellm or pie"; exit 2
 fi
