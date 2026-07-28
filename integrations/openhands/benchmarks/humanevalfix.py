@@ -120,6 +120,13 @@ class Result:
     total_tokens: int = 0
     num_llm_calls: int = 0
     response_latencies: list[float] = field(default_factory=list)
+    # Same two fields, same reason, as Prediction in swe_bench.py:135. This
+    # file calls the SAME `_extract_metrics` (line 274) and splats it with
+    # `Result(**metrics)`, so it inherited the identical latent TypeError —
+    # every task would have been recorded as a failure the moment anyone ran
+    # this harness again.
+    max_prompt_tokens: int = 0
+    prompt_tokens_per_call: list[int] = field(default_factory=list)
 
     def to_jsonl(self) -> str:
         return json.dumps({
@@ -138,6 +145,8 @@ class Result:
                 "total_tokens": self.total_tokens,
                 "num_llm_calls": self.num_llm_calls,
                 "response_latencies": [round(l, 4) for l in self.response_latencies],
+                "max_prompt_tokens": self.max_prompt_tokens,
+                "prompt_tokens_per_call": self.prompt_tokens_per_call,
             },
         })
 

@@ -124,12 +124,28 @@ class Prediction:
     total_tokens: int = 0
     num_llm_calls: int = 0
     response_latencies: list[float] = field(default_factory=list)
+    # Prompt size per call, and the largest one. AGENT_HANDOVER_H200.md §7
+    # requires reporting the max against MAX_MODEL_LEN so the writeup can say
+    # "no request exceeded N tokens, against a cap of 131072" instead of
+    # assuming it. `_extract_metrics` has returned both since 2026-07-27, but
+    # the dataclass that consumes it never gained the fields in THIS tree —
+    # the matching version lived on the previous pod's local disk and went
+    # with it. Without them `Prediction(**metrics)` raises TypeError and every
+    # instance is recorded as a 0-iteration failure.
+    max_prompt_tokens: int = 0
+    prompt_tokens_per_call: list[int] = field(default_factory=list)
     # Per-step breakdown (populated by Pattern A agent inferlet).
     generate_s: float = 0.0
     tool_s: float = 0.0
     per_step: list[dict[str, Any]] = field(default_factory=list)
     # KV-session telemetry (populated by the pie backend with --pie-session).
     pie_session: dict[str, Any] = field(default_factory=dict)
+    # Per-call latency attribution (populated by ANY pie backend, no flag).
+    # Splits each call into inferlet phases (render/prefill/decode/save) and
+    # transport phases (connect/auth/launch/first_event/wait/close), so the
+    # share of Pie's per-call latency that is serving work can be separated
+    # from the share that is this integration's launch-per-call transport.
+    pie_timings: dict[str, Any] = field(default_factory=dict)
     # Fork test-time scaling: K candidate patches (one per forked branch). The
     # top-level model_patch is branch 0; best-of-K is computed downstream by
     # bestofk_split.py + scoring each candidate file.
@@ -150,10 +166,13 @@ class Prediction:
                 "total_tokens": self.total_tokens,
                 "num_llm_calls": self.num_llm_calls,
                 "response_latencies": [round(l, 4) for l in self.response_latencies],
+                "max_prompt_tokens": self.max_prompt_tokens,
+                "prompt_tokens_per_call": self.prompt_tokens_per_call,
                 "generate_s": round(self.generate_s, 3),
                 "tool_s": round(self.tool_s, 3),
                 "per_step": self.per_step,
                 "pie_session": self.pie_session,
+                "pie_timings": self.pie_timings,
                 "candidates": self.candidates,
             },
         })
@@ -636,6 +655,7 @@ def solve_one(
                 agent_iterations=_count_iterations(conv),
                 stuck_retries=nudges,
                 pie_session=session_stats,
+                pie_timings=_pie_timing_stats(conv, agent, llm),
                 **metrics,
             )
     except Exception as e:
@@ -648,6 +668,9 @@ def solve_one(
             agent_iterations=0,
             error=f"{type(e).__name__}: {e}",
             pie_session=_pie_session_stats(llm),
+            # Only `llm` is guaranteed bound here — `agent`/`conv` may not
+            # exist if the failure happened before they were built.
+            pie_timings=_pie_timing_stats(llm),
         )
     finally:
         # A leaked session pins its KV snapshot server-side; deletion is
@@ -664,6 +687,41 @@ def _pie_session_stats(llm) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _pie_timing_stats(*roots) -> dict[str, Any]:
+    """Per-call latency attribution, merged across every PieLLM in the agent.
+
+    Merged rather than read off the agent's own LLM because the condenser is a
+    separate `model_copy` with its own timing list (see `PieLLM.model_copy`),
+    and its calls pay the same per-call transport cost. `response_latencies` in
+    `_extract_metrics` already aggregates both, so anything narrower here would
+    not line up against it.
+
+    Unlike `_pie_session_stats` this needs no flag: timings are recorded on
+    every Pie call. Returns {} on the litellm arm, where no PieLLM exists.
+    """
+    calls: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for root in roots:
+        if root is None:
+            continue
+        try:
+            for obj in _iter_llms(root):
+                recs = getattr(obj, "_pie_call_timings", None)
+                if recs and id(recs) not in seen:
+                    seen.add(id(recs))
+                    calls.extend(recs)
+        except Exception:
+            continue
+    if not calls:
+        return {}
+    try:
+        from pie_openhands.llm import summarize_pie_call_timings
+
+        return summarize_pie_call_timings(calls)
+    except Exception:
+        return {}
 
 
 def _format_user_prompt(

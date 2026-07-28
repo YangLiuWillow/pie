@@ -48,7 +48,9 @@
 //! earlier boundary and a delegated sub-agent that shares a task prefix hits
 //! the parent's boundary with no explicit fork protocol.
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, tools};
+use inferlet::{
+    Context, FutureStringExt, Result, chat, model::Model, runtime, sample::Sampler, session, tools,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -248,8 +250,16 @@ struct SessionOut {
 
 // ─── Entry point ───────────────────────────────────────────────────────────
 
-#[inferlet::main]
-async fn main(mut input: Input) -> Result<Output> {
+/// Serve one request.
+///
+/// Called once per process in one-shot mode, or once per received message in
+/// daemon mode (see `main`). The body is unchanged from when this WAS `main` —
+/// including `Model::load`, which stays per-request deliberately: it binds to a
+/// model the runtime already has resident, so it is a handle lookup rather than
+/// a weight load, and `timings.setup_ms` measures it either way. Hoisting it
+/// would have forced `&model` -> `&&Model` churn through 20 call sites for a
+/// cost the telemetry can now simply show us.
+async fn handle_request(mut input: Input) -> Result<Output> {
     let t_call = Instant::now();
     let mut timings = Timings::default();
 
@@ -606,6 +616,123 @@ async fn main(mut input: Input) -> Result<Output> {
 /// without a language tag) whose body is an object with a string `name`
 /// and an object `arguments`. Returns `(fence_byte_offset, name,
 /// arguments_json)` per match, in order.
+// ─── Process entry point: one-shot or daemon ───────────────────────────────
+
+/// Raw-JSON entry point.
+///
+/// The `#[inferlet::main]` macro passes `String` in and out untouched (it only
+/// serializes *typed* parameters — inferlet-macros/src/lib.rs:113-142), so the
+/// one-shot path below is byte-identical to what callers saw when `main` took
+/// `Input` and returned `Output`.
+///
+/// TWO MODES, selected by a `daemon` flag in the launch payload:
+///
+/// - **one-shot** (default, unchanged): the launch payload IS the request.
+///   Serve it, return the `Output`, exit. Every existing caller keeps working.
+///
+/// - **daemon**: launch once, then serve requests off `session::receive()`
+///   until the host says stop. This is what makes a fair comparison against a
+///   persistent vLLM server possible.
+///
+/// WHY THE DAEMON MODE EXISTS. In one-shot mode the host pays, on EVERY LLM
+/// call, a websocket connect, an authenticate, a process launch, admission
+/// queueing, and a teardown — none of which vLLM's already-running HTTP server
+/// charges per request. Measuring Pie that way benchmarks
+/// `PieLLM._call_pie`'s call pattern, not Pie's serving. The per-request design
+/// was a deliberate, documented choice (docs/OPENHANDS_CODER_SESSION_DESIGN.md
+/// line 56, which also names `launch_daemon` as the alternative "if a long-lived
+/// server inferlet is ever preferred"). It is now preferred.
+///
+/// WHAT DAEMON MODE DOES *NOT* CHANGE: the KV path. Each request still renders
+/// the full history, still resolves reuse through content-addressed snapshots,
+/// still saves. That keeps `--kv-verify` and the prefill-reuse percentage
+/// directly comparable against the one-shot arms, so the only variable moving
+/// is process lifetime. Holding a `Context` live in this loop across requests
+/// would be a further (larger) win and a separate experiment — it would also
+/// take Pie past what vLLM does, which is a different claim than the one this
+/// change is meant to support.
+///
+/// WIRE PROTOCOL (all frames are single-line JSON):
+///   inferlet -> host   {"ready":true}                      once, after launch
+///   host -> inferlet   {<Input fields>}                    a request
+///   host -> inferlet   {"daemon_action":"shutdown"}        stop serving
+///   inferlet -> host   {"ok":true,"result":{<Output>}}     a served request
+///   inferlet -> host   {"ok":false,"error":"..."}          a failed request
+///
+/// Errors are reported IN-BAND rather than by returning `Err`, because
+/// returning would kill the process and take the host's next N calls with it.
+/// A malformed request must cost one call, not the conversation.
+#[inferlet::main]
+async fn main(raw: String) -> Result<String> {
+    let launch: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid launch payload: {e}"))?;
+
+    let daemon = launch
+        .get("daemon")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if !daemon {
+        let input: Input = serde_json::from_value(launch)
+            .map_err(|e| format!("invalid request payload: {e}"))?;
+        let out = handle_request(input).await?;
+        return serde_json::to_string(&out)
+            .map_err(|e| format!("failed to serialize output: {e}"));
+    }
+
+    session::send(r#"{"ready":true}"#);
+
+    let mut served: u64 = 0;
+    loop {
+        // `None` means the host closed the connection without saying goodbye
+        // (harness crash, SSH drop). Exit rather than spin.
+        let Some(msg) = session::receive().wait_async().await else {
+            break;
+        };
+
+        let parsed: serde_json::Value = match serde_json::from_str(&msg) {
+            Ok(v) => v,
+            Err(e) => {
+                session::send(&error_frame(&format!("invalid request JSON: {e}")));
+                continue;
+            }
+        };
+
+        if parsed.get("daemon_action").and_then(serde_json::Value::as_str)
+            == Some("shutdown")
+        {
+            break;
+        }
+
+        let frame = match serde_json::from_value::<Input>(parsed) {
+            Ok(input) => match handle_request(input).await {
+                Ok(out) => serde_json::to_string(&serde_json::json!({
+                    "ok": true,
+                    "result": out,
+                }))
+                .unwrap_or_else(|e| error_frame(&format!("serialize failed: {e}"))),
+                Err(e) => error_frame(&e),
+            },
+            Err(e) => error_frame(&format!("invalid request fields: {e}")),
+        };
+        session::send(&frame);
+        served += 1;
+    }
+
+    Ok(format!("{{\"served\":{served}}}"))
+}
+
+/// An in-band error frame. Built by hand so that constructing it can never
+/// itself fail and leave the host waiting forever for a reply.
+fn error_frame(msg: &str) -> String {
+    let escaped = msg
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
+        .replace('\r', " ");
+    format!(r#"{{"ok":false,"error":"{escaped}"}}"#)
+}
+
 fn parse_fenced_tool_calls(text: &str) -> Vec<(usize, String, String)> {
     let mut out = Vec::new();
     let mut pos = 0;

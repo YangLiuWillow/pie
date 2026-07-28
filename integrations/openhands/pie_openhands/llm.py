@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 from typing import Any
@@ -34,6 +35,95 @@ from openhands.sdk.llm import LLM
 from openhands.sdk.llm.streaming import TokenCallbackType
 from pydantic import Field, PrivateAttr
 from pie_client import Event, PieClient
+
+# Phase names in the inferlet's own `Timings` struct
+# (inferlets/openhands-coder-session/src/lib.rs:207). `total_ms` is the whole
+# inferlet body, entry to exit — it does NOT include anything before entry.
+INFERLET_PHASES = ("setup_ms", "render_ms", "hash_ms", "open_ms",
+                   "prefill_ms", "save_ms", "fork_ms", "decode_ms", "total_ms")
+
+# Phase names in `_call_pie`'s `_transport` block. These cover exactly the part
+# the inferlet cannot see: opening the websocket, authenticating, launching the
+# wasm process, waiting for admission, and tearing the connection down.
+# `connect`/`auth`/`launch`/`close` appear only in one-shot mode — in daemon
+# mode they are paid once at boot, not per call, and their absence from a run's
+# telemetry is the headline result of the daemon change. `signal_ms` is the
+# daemon-only cost of handing the request to an already-running process.
+TRANSPORT_PHASES = ("connect_ms", "auth_ms", "launch_ms", "signal_ms",
+                    "first_event_ms", "wait_ms", "close_ms")
+
+
+def _as_text(value: Any) -> str:
+    """Decode a websocket frame that may arrive as bytes or str."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    return value if isinstance(value, str) else str(value)
+
+
+def summarize_pie_call_timings(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-call latency attribution across one or more PieLLMs.
+
+    Returns ``{}`` when nothing was recorded (e.g. a mocked transport in tests
+    or a non-Pie arm), so callers can treat a non-empty result as "this arm ran
+    on Pie and the attribution is trustworthy".
+    """
+    if not calls:
+        return {}
+
+    def agg(key: str) -> dict[str, float] | None:
+        xs = [c[key] for c in calls if key in c]
+        if not xs:
+            return None
+        xs_sorted = sorted(xs)
+        return {
+            "total_s": round(sum(xs) / 1000.0, 3),
+            "median_ms": round(xs_sorted[len(xs_sorted) // 2], 2),
+            "p90_ms": round(
+                xs_sorted[min(len(xs_sorted) - 1, int(0.9 * len(xs_sorted)))], 2),
+            "max_ms": round(max(xs), 2),
+        }
+
+    phases: dict[str, Any] = {}
+    for key in ("host_ms", *INFERLET_PHASES, *TRANSPORT_PHASES, "unaccounted_ms"):
+        a = agg(key)
+        if a is not None:
+            phases[key.removesuffix("_ms")] = a
+
+    tokens = sum(c.get("tokens_generated", 0) for c in calls)
+    decode_s = sum(c.get("decode_ms", 0.0) for c in calls) / 1000.0
+    host_s = sum(c["host_ms"] for c in calls) / 1000.0
+    modes: dict[str, int] = {}
+    for c in calls:
+        m = str(c.get("transport_mode") or "oneshot")
+        modes[m] = modes.get(m, 0) + 1
+    return {
+        "num_calls": len(calls),
+        "tokens_generated": tokens,
+        # Which transport served these calls. A run showing {"daemon": N} paid
+        # connect/auth/launch ONCE; {"oneshot": N} paid them N times.
+        "transport_modes": modes,
+        "daemon_boot_ms": round(
+            sum(c.get("daemon_boot_ms", 0.0) for c in calls), 2),
+        "phases": phases,
+        # The two throughput numbers that matter, and the gap between them is
+        # the finding. `decode_tok_s` is what Pie's kernels actually sustain
+        # once the request is in flight; `effective_tok_s` is what the agent
+        # experiences. vLLM's per-call latency has no equivalent of the gap,
+        # because its server is already running when the request arrives.
+        "decode_tok_s": round(tokens / decode_s, 2) if decode_s > 0 else 0.0,
+        "effective_tok_s": round(tokens / host_s, 2) if host_s > 0 else 0.0,
+        "overhead_fraction": (
+            round(sum(c.get("unaccounted_ms", 0.0) for c in calls)
+                  / (host_s * 1000.0), 4) if host_s > 0 else 0.0
+        ),
+        # Per-call rows, so the distribution (the p90/max outliers an aggregate
+        # hides — Pie's H200 calls ranged 4 s to 109 s) survives into the
+        # predictions file instead of being averaged away.
+        "per_call": [
+            {k: (round(v, 2) if isinstance(v, float) else v) for k, v in c.items()}
+            for c in calls
+        ],
+    }
 
 
 class PieLLM(LLM):
@@ -102,6 +192,24 @@ class PieLLM(LLM):
                     "post-generation and host-side.",
     )
 
+    pie_daemon: bool = Field(
+        default=True,
+        description="Keep ONE inferlet process and websocket alive for the "
+                    "whole conversation and feed it requests, instead of "
+                    "launching a fresh process per LLM call. This is what "
+                    "gives Pie the same process lifetime vLLM's HTTP server "
+                    "has; without it a Pie-vs-vLLM latency comparison is "
+                    "measuring this integration's call pattern rather than "
+                    "either serving stack. Set False to reproduce the "
+                    "pre-2026-07-28 launch-per-call transport.",
+    )
+    pie_daemon_boot_timeout_s: float = Field(
+        default=900.0,
+        description="Seconds to wait for the daemon inferlet to report ready. "
+                    "Generous because a cold pie server is still loading ~58 GB "
+                    "of weights when the first conversation starts.",
+    )
+
     # Session bookkeeping. `session_id` is the only thing that goes on the
     # wire: the inferlet's prefix cache self-keys from the token content it
     # renders, so the host never tells it where the previous turn ended. The
@@ -111,6 +219,28 @@ class PieLLM(LLM):
     _pie_session_len: int = PrivateAttr(default=0)
     _pie_session_hash: str | None = PrivateAttr(default=None)
     _pie_session_stats: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+
+    # Per-call latency attribution, recorded UNCONDITIONALLY on every Pie call.
+    #
+    # This used to exist only behind `PIE_DEBUG_LOG` (see `_maybe_debug_dump`),
+    # which meant the 2026-07-27 H200 arms — the ones that produced the headline
+    # 16x gap against vLLM — recorded no attribution at all. The single most
+    # important question about those numbers (how much of Pie's ~11 s median
+    # call is GPU work vs the per-call connect/auth/launch/teardown that
+    # `_call_pie` pays and a persistent HTTP server does not) was therefore
+    # unanswerable from the collected data.
+    #
+    # It is cheap: six `time.monotonic()` reads already taken by `_call_pie`,
+    # plus a dict append per call. There is no reason for it to be opt-in.
+    _pie_call_timings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+
+    # Daemon-transport handles. All None until the first call boots them.
+    _pie_loop: Any = PrivateAttr(default=None)
+    _pie_thread: Any = PrivateAttr(default=None)
+    _pie_client_cm: Any = PrivateAttr(default=None)
+    _pie_client: Any = PrivateAttr(default=None)
+    _pie_proc: Any = PrivateAttr(default=None)
+    _pie_daemon_boot_ms: float = PrivateAttr(default=0.0)
 
     # `_wrap_as_model_response` now populates real `tool_calls` from the
     # inferlet's structured output (see `assistant_with_tool_calls`/
@@ -171,9 +301,10 @@ class PieLLM(LLM):
         # which job 19245724 left as the open question: the inferlet accounted
         # for 4.35 s of a call while the instance wallclock implied far more.
         _t0 = time.monotonic()
-        raw = asyncio.run(self._call_pie(wire_messages, tools, gen_params))
+        raw = self._invoke_pie(wire_messages, tools, gen_params)
         _host_ms = (time.monotonic() - _t0) * 1000.0
         _maybe_debug_dump(raw, _host_ms)
+        self._record_call_timing(raw, _host_ms)
         if self.pie_session:
             self._record_session_response(raw)
         if self.pie_python_tool_parser:
@@ -223,8 +354,22 @@ class PieLLM(LLM):
         no-op.
         """
         child = super().model_copy(update=update, deep=deep)
-        # Shallow copy aliases the parent's telemetry list — give a fresh one.
+        # Shallow copy aliases the parent's telemetry lists — give fresh ones.
         child._pie_session_stats = []
+        child._pie_call_timings = []
+        # The child must NOT inherit the parent's daemon handles. Pydantic
+        # copies private attrs verbatim, so without this the condenser would
+        # share the agent's inferlet process and websocket: two conversations
+        # interleaved on one context, and whichever finished first would tear
+        # the transport out from under the other. Clearing them makes the child
+        # boot its own daemon on first use, mirroring how it gets its own
+        # session id above.
+        child._pie_loop = None
+        child._pie_thread = None
+        child._pie_client_cm = None
+        child._pie_client = None
+        child._pie_proc = None
+        child._pie_daemon_boot_ms = 0.0
         # The child must not share the parent's session identity.
         child._pie_session_id = None
         child._pie_session_len = 0
@@ -249,18 +394,29 @@ class PieLLM(LLM):
         Call when the conversation ends — a leaked session would pin its KV
         snapshot until an external sweep removes it.
         """
-        if not self.pie_session or self._pie_session_id is None:
-            return
         try:
-            asyncio.run(self._call_pie(
-                [], [],
-                {"session_id": self._pie_session_id, "session_action": "delete"},
-            ))
+            if self.pie_session and self._pie_session_id is not None:
+                # Route the delete over whatever transport is live. Going
+                # straight to `_call_pie` here would launch a fresh one-shot
+                # process even in daemon mode — harmless but it would put a
+                # spurious launch in the telemetry of every conversation's
+                # last moments.
+                self._invoke_pie(
+                    [], [],
+                    {"session_id": self._pie_session_id,
+                     "session_action": "delete"},
+                )
         except Exception:
             pass
-        self._pie_session_id = None
-        self._pie_session_len = 0
-        self._pie_session_hash = None
+        finally:
+            self._pie_session_id = None
+            self._pie_session_len = 0
+            self._pie_session_hash = None
+            # The daemon outlives individual calls by design, so it has to be
+            # closed explicitly and AFTER the session delete above — shutting
+            # it first would leave the KV snapshots pinned for the lifetime of
+            # the pie server.
+            self.close_pie_daemon()
 
     def pie_session_summary(self) -> dict[str, Any]:
         """Aggregate per-call session telemetry for benchmark metadata."""
@@ -277,6 +433,68 @@ class PieLLM(LLM):
         }
 
     # ------------------------------------------------------------------
+    # Per-call latency attribution
+    # ------------------------------------------------------------------
+    # The inferlet's own clock (`timings`) starts at its entry point, so it
+    # cannot see connection setup, authentication, process launch, admission
+    # queueing, or teardown. `host_ms` brackets the whole round trip, and the
+    # difference between them is what THIS INTEGRATION pays per call while
+    # vLLM's persistent HTTP server does not.
+    #
+    # Be precise about whose cost that is. It is not a property of Pie: the
+    # platform supports a long-lived inferlet that is launched once and fed
+    # many requests (`session::receive` / `session::send`,
+    # runtime/wit/core/wit/session.wit:9, driven from the client by
+    # `Process.signal`, client/python/src/pie_client/client.py:40 — see
+    # inferlets/text-completion-bench/src/lib.rs:130 for an inferlet that does
+    # exactly this). It is a property of `_call_pie` below, which opens a
+    # websocket, authenticates, launches a fresh wasm process and tears it all
+    # down inside every single `_transport_call`.
+    #
+    # So this measurement attributes OUR design, not Pie's kernels, and must be
+    # subtracted before any "vLLM is Nx faster than Pie" claim is made.
+    def _record_call_timing(self, raw: Any, host_ms: float) -> None:
+        """Record one call's timing breakdown. Never raises — telemetry must
+        not be able to fail a benchmark run."""
+        try:
+            timings = raw.get("timings") if isinstance(raw, dict) else None
+            transport = raw.get("_transport") if isinstance(raw, dict) else None
+            timings = timings if isinstance(timings, dict) else {}
+            transport = transport if isinstance(transport, dict) else {}
+            rec: dict[str, Any] = {"host_ms": float(host_ms)}
+            for k in INFERLET_PHASES:
+                if k in timings:
+                    rec[k] = float(timings[k] or 0.0)
+            for k in TRANSPORT_PHASES:
+                if k in transport:
+                    rec[k] = float(transport[k] or 0.0)
+            if "open_attempts" in timings:
+                rec["open_attempts"] = int(timings["open_attempts"] or 0)
+            if isinstance(raw, dict):
+                rec["tokens_generated"] = int(raw.get("tokens_generated") or 0)
+                rec["transport_mode"] = raw.get("_transport_mode") or "oneshot"
+            # One-time daemon boot, attributed to the call that paid for it
+            # rather than folded into its latency.
+            if self._pie_daemon_boot_ms and not self._pie_call_timings:
+                rec["daemon_boot_ms"] = self._pie_daemon_boot_ms
+            # host_ms minus the inferlet's own total. Positive by construction;
+            # a negative value would mean the two clocks disagree and is worth
+            # seeing rather than clamping.
+            if "total_ms" in rec:
+                rec["unaccounted_ms"] = rec["host_ms"] - rec["total_ms"]
+            self._pie_call_timings.append(rec)
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+    def pie_timing_summary(self) -> dict[str, Any]:
+        """This LLM's own per-call latency attribution.
+
+        Use :func:`summarize_pie_call_timings` directly to merge several LLMs
+        (agent + condenser), which is what the benchmark harness does.
+        """
+        return summarize_pie_call_timings(self._pie_call_timings)
+
+    # ------------------------------------------------------------------
     # Parameter extraction from kwargs
     # ------------------------------------------------------------------
     def _extract_gen_params(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -291,7 +509,196 @@ class PieLLM(LLM):
         }
 
     # ------------------------------------------------------------------
-    # The Pie round-trip
+    # Transport selection: persistent daemon (default) or launch-per-call
+    # ------------------------------------------------------------------
+    def _invoke_pie(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        gen_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run one request over whichever transport is configured."""
+        if not self.pie_daemon:
+            return asyncio.run(self._call_pie(messages, tools, gen_params))
+        payload = {"messages": messages, "tools": tools, **gen_params}
+        return self._daemon_call(payload)
+
+    # ------------------------------------------------------------------
+    # Persistent-daemon transport
+    # ------------------------------------------------------------------
+    # WHY A BACKGROUND THREAD. `_transport_call` is synchronous — that is the
+    # SDK's contract, not our choice — so the one-shot path reaches async code
+    # through `asyncio.run(...)`, which builds an event loop, runs one
+    # coroutine, and destroys the loop. A websocket cannot outlive that, which
+    # is the mechanical reason the old transport had to reconnect, re-auth and
+    # relaunch the inferlet on every single call. Owning one long-lived loop on
+    # a daemon thread, and submitting work to it with
+    # `run_coroutine_threadsafe`, is what lets the connection AND the wasm
+    # process survive between calls — the same lifetime vLLM's server has.
+    def _ensure_daemon(self) -> None:
+        """Start the loop thread and the inferlet process. Idempotent."""
+        if self._pie_proc is not None:
+            return
+        if self._pie_loop is None:
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever,
+                name=f"pie-daemon-{id(self):x}",
+                daemon=True,
+            )
+            thread.start()
+            self._pie_loop = loop
+            self._pie_thread = thread
+        t0 = time.monotonic()
+        self._run_on_loop(
+            self._daemon_connect(), timeout=self.pie_daemon_boot_timeout_s
+        )
+        # One-time cost, recorded once rather than amortized silently into the
+        # first call — otherwise call 1 looks pathological and the mean lies.
+        self._pie_daemon_boot_ms = (time.monotonic() - t0) * 1000.0
+
+    def _run_on_loop(self, coro: Any, timeout: float) -> Any:
+        if self._pie_loop is None:  # pragma: no cover — guarded by callers
+            raise RuntimeError("pie daemon loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coro, self._pie_loop)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            future.cancel()
+            raise
+
+    async def _daemon_connect(self) -> None:
+        cm = PieClient(self.pie_uri)
+        client = await cm.__aenter__()
+        try:
+            await client.authenticate(self.pie_username)
+            proc = await client.launch_process(
+                self.pie_inferlet, input={"daemon": True}
+            )
+            # The inferlet announces itself once it is serving. Waiting for it
+            # here means the first real request does not silently absorb
+            # process startup and model binding.
+            while True:
+                event, value = await asyncio.wait_for(
+                    proc.recv(), timeout=self.pie_daemon_boot_timeout_s
+                )
+                if event == Event.Message:
+                    if json.loads(_as_text(value)).get("ready"):
+                        break
+                elif event == Event.Error:
+                    raise RuntimeError(f"pie daemon failed to start: {value!r}")
+                elif event == Event.Return:
+                    raise RuntimeError(
+                        f"pie daemon exited before serving: {value!r}. Is the "
+                        "installed inferlet new enough for daemon mode?"
+                    )
+        except BaseException:
+            await cm.__aexit__(None, None, None)
+            raise
+        self._pie_client_cm = cm
+        self._pie_client = client
+        self._pie_proc = proc
+
+    def _daemon_call(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_daemon()
+        return self._run_on_loop(
+            self._daemon_request(payload),
+            timeout=self.pie_request_timeout_s + 60,
+        )
+
+    async def _daemon_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        t: dict[str, float] = {}
+        clock = time.monotonic
+        proc = self._pie_proc
+        if proc is None:  # pragma: no cover — _ensure_daemon guarantees this
+            raise RuntimeError("pie daemon process is not running")
+
+        t0 = clock()
+        await proc.signal(json.dumps(payload))
+        t["signal_ms"] = (clock() - t0) * 1000.0
+
+        t0 = clock()
+        stdout_chunks: list[str] = []
+        first_seen = False
+        while True:
+            event, value = await asyncio.wait_for(
+                proc.recv(), timeout=self.pie_request_timeout_s
+            )
+            if not first_seen:
+                t["first_event_ms"] = (clock() - t0) * 1000.0
+                first_seen = True
+            if event == Event.Message:
+                t["wait_ms"] = (clock() - t0) * 1000.0
+                frame = json.loads(_as_text(value))
+                if not frame.get("ok"):
+                    raise RuntimeError(f"Pie inferlet error: {frame.get('error')!r}")
+                out = frame.get("result")
+                if not isinstance(out, dict):
+                    raise RuntimeError(f"Pie daemon returned a non-object: {out!r}")
+                if stdout_chunks:
+                    out.setdefault("_stdout", "".join(stdout_chunks))
+                # Same key the one-shot path uses, so the timing telemetry and
+                # every downstream consumer stay transport-agnostic. `connect`,
+                # `auth` and `launch` are absent here by construction — that
+                # absence IS the change being measured.
+                out["_transport"] = t
+                out["_transport_mode"] = "daemon"
+                return out
+            if event == Event.Stdout:
+                stdout_chunks.append(_as_text(value))
+            elif event == Event.Error:
+                raise RuntimeError(f"Pie inferlet error: {value!r}")
+            elif event == Event.Return:
+                raise RuntimeError(f"pie daemon exited mid-request: {value!r}")
+
+    def close_pie_daemon(self) -> None:
+        """Shut the daemon down. Idempotent, never raises.
+
+        A leaked daemon holds its KV pages and a wasm process for the lifetime
+        of the pie server, so this must run on the error path too.
+        """
+        if self._pie_proc is None and self._pie_loop is None:
+            return
+        try:
+            if self._pie_proc is not None:
+                self._run_on_loop(self._daemon_shutdown(), timeout=60)
+        except Exception:
+            pass
+        finally:
+            self._pie_proc = None
+            self._pie_client = None
+            self._pie_client_cm = None
+            loop = self._pie_loop
+            self._pie_loop = None
+            self._pie_thread = None
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except Exception:
+                    pass
+
+    async def _daemon_shutdown(self) -> None:
+        proc, cm = self._pie_proc, self._pie_client_cm
+        try:
+            if proc is not None:
+                await proc.signal(json.dumps({"daemon_action": "shutdown"}))
+                # Give the loop a moment to exit cleanly, then terminate.
+                # Either way we stop waiting — shutdown must not hang a
+                # benchmark that has already produced its result.
+                try:
+                    await asyncio.wait_for(proc.recv(), timeout=10)
+                except Exception:
+                    pass
+                try:
+                    await proc.terminate()
+                except Exception:
+                    pass
+        finally:
+            if cm is not None:
+                await cm.__aexit__(None, None, None)
+
+    # ------------------------------------------------------------------
+    # The Pie round-trip (one-shot: launch a fresh process per call)
     # ------------------------------------------------------------------
     async def _call_pie(
         self,

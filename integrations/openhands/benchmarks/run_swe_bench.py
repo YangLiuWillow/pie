@@ -77,6 +77,14 @@ def main(argv: list[str] | None = None) -> int:
                         "model emits its native ChatML tool-call format and "
                         "the inferlet decoder parses it unconstrained — "
                         "parity with an unconstrained vLLM baseline.")
+    p.add_argument("--pie-oneshot", action="store_true",
+                   help="Launch a fresh inferlet process per LLM call instead "
+                        "of keeping one alive for the conversation. This is "
+                        "the pre-2026-07-28 transport, kept ONLY so the cost "
+                        "of the old design can be measured — it charges a "
+                        "websocket connect, an authenticate, a process launch "
+                        "and a teardown on every call, none of which vLLM's "
+                        "persistent server pays.")
     p.add_argument("--python-tool-parser", action="store_true",
                    help="Parse tool calls host-side with a verbatim port of "
                         "vLLM's qwen3_coder parser (the parser the litellm "
@@ -171,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
             backend_kwargs["pie_use_grammar"] = False
         if args.python_tool_parser:
             backend_kwargs["pie_python_tool_parser"] = True
+        if args.pie_oneshot:
+            backend_kwargs["pie_daemon"] = False
         if args.model:
             backend_kwargs["model"] = args.model
 
