@@ -2,15 +2,16 @@
 //!
 //! A proper multi-turn chat, so an instruct model answers focused and stops on
 //! `<|im_end|>` instead of rambling past the token cap:
-//!   system + user(question) + cue          → the PROMPT
+//!   system + user(question) + cue            → the PROMPT
 //!   turn 1  (assistant answer)               → trainable, env_mask 1
-//!   inject: seal + user(reflect) + cue       → masked,   env_mask 0
+//!   inject: <|im_end|>\n + user(reflect) + cue → masked, env_mask 0
 //!   turn 2  (assistant final answer)         → trainable, env_mask 1
+//!   turn 2's <|im_end|>, if it stopped on its own → trainable, env_mask 1
 //!
 //! Emits one flat training row per rollout:
 //!   prompt_ids     = system ++ user(question) ++ cue
-//!   completion_ids = t1 ++ inject ++ t2
-//!   env_mask       = 1*|t1| ++ 0*|inject| ++ 1*|t2|
+//!   completion_ids = t1 ++ inject ++ t2 [++ <|im_end|>]
+//!   env_mask       = 1*|t1| ++ 0*|inject| ++ 1*|t2| [++ 1]
 //!   logprobs       = zeros  (TRL's GRPO loss on our path — num_iterations=1,
 //!                    use_vllm=False — ignores the sampling logprobs: ratio is 1
 //!                    and the KL is to the ref model. So we skip teacher-force scoring.)
@@ -83,13 +84,26 @@ async fn main(input: Input) -> Result<String> {
         return Err("empty prompt".into());
     }
 
+    let stops = chat::stop_tokens(&model);
+
+    // Close the assistant turn. NOT `chat::seal()`: that returns every stop id
+    // (`runtime/src/model/instruct/qwen3.rs:410` → `stop_ids`), which for Qwen3 is
+    // BOTH `<|im_end|>` and `<|endoftext|>` (`runtime/src/model/instruct.rs:178`).
+    // `<|endoftext|>` is a document separator — injecting it between turn 1 and the
+    // reflect prompt tells the model an unrelated document follows, right before we
+    // ask it to review its own answer. The template's own message builders close a
+    // turn with `turn_suffix` = `<|im_end|>` ++ newline (`qwen3.rs:197-198`); use
+    // that. First stop id is the turn terminator for every ChatML config in the
+    // runtime (the `<|endoftext|>` entries come second).
+    let turn_end = *stops.first().ok_or("model exposes no stop tokens")?;
+    let mut turn_close = vec![turn_end];
+    turn_close.extend(tokenizer.encode("\n"));
+
     // Injected turn = close assistant + user(reflect) + cue (all masked).
     let mut inject = Vec::new();
-    inject.extend(chat::seal(&model));
+    inject.extend_from_slice(&turn_close);
     inject.extend(chat::user(&model, &input.reflect_prompt));
     inject.extend(chat::cue(&model));
-
-    let stops = chat::stop_tokens(&model);
 
     let adapter = match &input.adapter_path {
         Some(path) => {
@@ -142,8 +156,37 @@ async fn main(input: Input) -> Result<String> {
             g.collect_tokens().await?
         };
 
-        // Linearize: completion = t1 ++ inject ++ t2 ; mask the injected turn out.
-        let mut completion_ids = Vec::with_capacity(t1.len() + inject.len() + t2.len());
+        // Did turn 2 end because the model emitted a stop token, or because it hit
+        // the cap? Nothing else ends generation early, so length decides it.
+        let t2_terminated = t2.len() < input.max_tokens;
+
+        // Linearize: completion = t1 ++ inject ++ t2 [++ turn_end] ; mask the
+        // injected turn out.
+        //
+        // The generator truncates AT the stop token (`generation.rs:645-647`), so a
+        // naturally-ended turn 2 arrives without its `<|im_end|>`. Re-append it,
+        // TRAINABLE, for two reasons:
+        //   * termination becomes a decision the model gets gradient on. Without it
+        //     nothing in the objective says "stop here" — length control rests
+        //     entirely on the cap plus the accident that the reward's last-number
+        //     rule punishes rambling.
+        //   * TRL calls a completion truncated when `ids[-1]` is not eos/pad
+        //     (`grpo_trainer.py:2419`). Ending on a normal token made EVERY rollout
+        //     read as clipped: `completions/clipped_ratio` pinned at 1.0 and the
+        //     terminated-length metrics permanently empty (`:2238-2246`) — and with
+        //     `mask_truncated_completions=True` the whole batch's loss mask would be
+        //     zeroed (`:2419-2424`), training on nothing, silently.
+        //
+        // Only when it really terminated. A rollout that hit the cap IS truncated
+        // and must stay unterminated, or the accounting starts lying the other way.
+        //
+        // Turn 1's terminator is deliberately left masked: `inject` is appended
+        // unconditionally, so marking it trainable would teach the model to emit a
+        // stop it may never have chosen (a capped turn 1 gets closed regardless).
+        // Training it would need the same length test applied to t1 — worth doing,
+        // but it is a separate change with its own effect on what gets learned.
+        let mut completion_ids =
+            Vec::with_capacity(t1.len() + inject.len() + t2.len() + 1);
         completion_ids.extend_from_slice(&t1);
         completion_ids.extend_from_slice(&inject);
         completion_ids.extend_from_slice(&t2);
@@ -152,6 +195,10 @@ async fn main(input: Input) -> Result<String> {
         env_mask.extend(std::iter::repeat(1u32).take(t1.len()));
         env_mask.extend(std::iter::repeat(0u32).take(inject.len()));
         env_mask.extend(std::iter::repeat(1u32).take(t2.len()));
+        if t2_terminated {
+            completion_ids.push(turn_end);
+            env_mask.push(1);
+        }
 
         let logprobs = vec![0.0f32; completion_ids.len()]; // unused by TRL on our path
         let final_answer = tokenizer.decode(&t2).unwrap_or_default();
