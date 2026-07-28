@@ -343,12 +343,69 @@ reverse of what the profiler reported, and it means the dominant decode cost is
 the weight/MoE/router/launch path, not attention. Both components run at about a
 quarter of the machine's bandwidth.
 
-**Next measurement, before any kernel work:** re-run that context sweep in-tree
-so the slope is ours rather than inherited from a previous session's notes, and
-run the identical sweep against vLLM. The fixed-vs-slope split tells you which
-of the two to attack; the vLLM comparison tells you how much of each is
-recoverable. Guessing between them is what produced the two wrong hypotheses
-above.
+### 6a-quater. The decomposition, measured on both arms
+
+`42_context_sweep.sh` + `context_sweep_client.py`, 6 contexts × 3 reps, both
+arms, same prompts, same pod (`logs/ctxsweep_20260728_234433/`).
+
+**Method.** Same prompt generated short (8 tokens) and long (136), subtracted:
+`(lat_long - lat_short) / (tok_long - tok_short)`. Prefill, render, transport and
+process launch are generation-independent, so they cancel — which is what makes
+two entirely different client stacks comparable. A warmup call per context leaves
+both measured calls equally prefix-cached, otherwise the subtraction would
+quietly return decode *minus* prefill. **Validated:** Pie's differenced number
+tracks its own `timings.decode_ms` within 1.5% at every one of six contexts.
+
+| prompt tokens | pie ms/tok | vllm ms/tok |
+|---|---|---|
+| 1,036 | 5.45 | 4.18 |
+| 3,988 | 5.88 | 4.28 |
+| 8,020 | 5.93 | 4.40 |
+| 16,012 | 6.24 | 4.61 |
+| 24,004 | 7.06 | 4.81 |
+| 31,996 | 7.20 | 5.01 |
+
+| | pie | vllm | ratio |
+|---|---|---|---|
+| intercept (fixed per-token) | 5.494 ms | 4.173 ms | **1.32×** |
+| slope (per 1k KV tokens) | 0.0563 ms | 0.0265 ms | **2.12×** |
+| implied KV read | **1,747 GB/s** (36% of peak) | **3,708 GB/s** (77% of peak) | 2.12× |
+| R² | 0.952 | 0.998 | — |
+
+Gap decomposition, modelled from the fits:
+
+| ctx | pie | vllm | ratio | gap = fixed + attention |
+|---|---|---|---|---|
+| 16k | 6.39 ms (156 tok/s) | 4.60 ms (218) | 1.39× | 1.80 = **1.32 (74%)** + 0.48 (26%) |
+| 25k | 6.90 ms (145 tok/s) | 4.84 ms (207) | 1.43× | 2.07 = **1.32 (64%)** + 0.74 (36%) |
+| 32k | 7.29 ms (137 tok/s) | 5.02 ms (199) | 1.45× | 2.27 = **1.32 (58%)** + 0.95 (42%) |
+
+The modelled 1.43× at 25k sits under the A/B's measured 1.59× (§6a), as it
+should — the sweep isolates decode, the A/B carries per-call overhead too.
+
+**What this says to do.**
+
+1. **Attention is the recoverable half.** Pie reads KV at 1,747 GB/s; vLLM hits
+   3,708 GB/s *on the same GPU, same model, same contexts*, so ~77% of peak is
+   demonstrably achievable here and Pie is leaving 2.12× on the table. This is
+   the only part of the decode gap with a proven target.
+2. **The fixed 1.32× is the larger term but the harder one.** It is weights +
+   MoE + router + launch, and §6a-bis already showed kernel *selection* cannot
+   move it — all three MoE decode paths were tried and the default won.
+3. Attention's share grows with context (26% → 42% from 16k to 32k), so it gets
+   more valuable as agent histories lengthen, which is the direction this
+   workload goes.
+
+**And a third correction to the profiler.** It reported `full_attn` at 47% of
+decode. The slope says attention is 1.41 ms of 6.90 ms at 25k — **20%**. The
+profiler overstated it by ~2.4×. Three hypotheses in this study have now been
+wrong (MoE weights at 82%, attention at 47%, batching better than vLLM's), and
+each was corrected by a measurement that cost minutes. Measure first.
+
+Pie's fit is visibly noisier than vLLM's (R² 0.952 vs 0.998; residuals to
+±0.22 ms, with 24k sitting high). Worth one look before micro-optimizing against
+the slope — it may be a page-boundary or split-KV threshold effect rather than
+noise.
 
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 
