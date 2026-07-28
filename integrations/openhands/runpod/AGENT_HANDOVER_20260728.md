@@ -1,0 +1,370 @@
+# Agent handover — 2026-07-28
+
+> Supersedes `AGENT_HANDOVER_H200.md` and `RUN_STATE.md` for **findings**. Their
+> machine-state and storage rules still apply. `RUN_STATE.md` §0 and
+> `AGENT_HANDOVER_H200.md` §1 are now **partly wrong** — see §3 below before you
+> act on anything either says about xqa or the A100 arm.
+
+## 1. The thirty-second version
+
+The experiment set out to explain why `litellm+vLLM` beat `pie-openhands` by
+~10-16×. **It was one inverted conditional in the CUDA driver**, which disabled
+flash-decoding for exactly the batch sizes that need it most. Fixed in
+`d9aaf9f1`.
+
+| | before | after |
+|---|---|---|
+| Pie s/iter (SWE-bench, 1 instance) | 7.72 | **1.07** |
+| Pie decode | 15.2 tok/s | **154.7 tok/s** |
+| gap to vLLM `fair` | ~12× | **1.34×** (1 instance; §4b puts it at 1.73× over 13) |
+
+Everything is committed and pushed to `origin/openhands-integration-updated`
+(`YangLiuWillow/pie`). Nothing went near upstream.
+
+## 2. The fix
+
+`driver/cuda/src/ops/attention_flashinfer.cu` overrode FlashInfer's own
+`split_kv` decision whenever `batch_size <= 512` on sm_80+. The memory planner
+caps `max_forward_requests` at 512, so **the override fired on every decode this
+driver has ever run** and FlashInfer's decision was never used at any batch size.
+
+The condition is backwards relative to its own rationale. Without a KV split,
+decode parallelism is roughly `batch_size * num_kv_heads` CTAs:
+
+| batch | CTAs on a 132-SM H200, 4 KV heads | non-split appropriate? |
+|---|---|---|
+| 1 | 4 (~3% of device) | **no — catastrophic** |
+| 66 | 264 (~2 waves) | yes |
+| 512 | 2048 | yes |
+
+Low batch is precisely when the split is needed, and "the TP1 latency shapes we
+care about" *are* low batch.
+
+Decode rate vs context (H200, Qwen3-Coder-30B-A3B, batch 1, page_size 32):
+
+| ctx tokens | before | after |
+|---|---|---|
+| 298 | 157 tok/s | 166 |
+| 4,558 | 48 | 160 |
+| 18,218 | 14 | 137 |
+| 27,318 | **10** | **125** |
+
+Old behaviour is still reachable with `PIE_CUDA_SMALL_BATCH_NONSPLIT_DECODE=1`,
+because this changes decode scheduling for every sm_80+ shape and the evidence
+is one model on one GPU. If you find a shape where non-split wins, record the
+measurement next to `legacy_small_batch_nonsplit_enabled()`.
+
+**This was not a new diagnosis.** `benches/MULTIMODAL_BENCH.md:92` recorded it in
+June as *"a real perf bug for ALL long-context decode, not just multimodal"* and
+worked around it by baking `PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL=1` into
+`benches/pie_mm_bench.py:168`. Nothing else in the tree set it. Their controlled
+test topped out at **~900 KV tokens**, where the fix is worth ~8% — which likely
+explains why it stayed a per-benchmark opt-in for two months. At 27k it is 12.8×.
+
+**Still to do:** file this upstream (`pie-project/pie` appears to have no issue
+for it; `gh` is not installed on the pod so this was not confirmed), and drop
+the now-redundant env var from `benches/pie_mm_bench.py:168`.
+
+## 3. What is now VOID — read before trusting the older handovers
+
+**xqa is worth nothing for this model, and the H200 migration's premise was
+wrong.**
+
+- A context sweep with `xqa_decode=on` vs `off` is **identical at every length**
+  (27,318 tokens: 101.6 vs 103.4 ms/token).
+- Reason: `model_type = "qwen3_moe"` routes through the **qwen3_5** code
+  (`entry.cpp:488-490`), and `qwen3_5_forward.cpp` / `qwen3_5_moe_forward.cpp` /
+  `qwen3_5_moe_model.cpp` contain **zero** references to xqa (`llama_like.cpp`
+  has 18). The `xqa_decode=on` banner prints the *llama_like* forward config,
+  which this model never uses.
+- Therefore `PIE_CUDA_KV_PAGE_SIZE=32` buys nothing here, and **the A100 Pie arm
+  was voided over a banner describing a code path Qwen3-Coder-30B-A3B does not
+  take on either GPU.** The real limiter (split-KV) was present on both.
+
+That does not retroactively validate the A100 numbers — it means the stated
+reason for discarding them was wrong. The A100 also lacks the split fix's
+benefit only in the sense that it was never applied there; re-measuring on A100
+is now a legitimate question rather than a settled one.
+
+**Also void:** `AGENT_HANDOVER_H200.md` §5's "REQUIRED first edit" is done, and
+its three-tier scope note is superseded — see §6.
+
+## 4. Current measured state
+
+> **The single-instance table below is superseded — read §4b.** The 13-instance
+> run puts the median-latency ratio at 1.73×, not 1.15×/1.34×.
+
+Head-to-head, `django__django-14373`, temperature 0, same pod, same harness,
+both arms fresh (2026-07-28 20:30):
+
+| | Pie (cuda_native) | vLLM (fair) | ratio |
+|---|---|---|---|
+| s/iter | **1.07** | **0.80** | 1.34× |
+| median call latency | 1.38 s | 1.20 s | 1.15× |
+| effective tok/s | 135.6 | 187.3 | 1.38× |
+| iterations | 40 | 38 | — |
+| wall | 43 s | 30 s | — |
+| max prompt tokens | 20,465 | 22,628 | cap 131,072 |
+| errors | none | none | — |
+
+Pie's own attribution (`_metadata.pie_timings`, now in every row):
+
+| phase | share | median |
+|---|---|---|
+| decode | **87.7%** | 1016 ms |
+| prefill | **11.7%** | 162 ms |
+| render + hash + open + save + setup | 0.4% | — |
+| transport | 0.2% | 1.4 ms |
+
+KV reuse **92.79%** (20,462 prefilled of 283,618 rendered), vs vLLM APC's ~95.1%
+on the A100 arm. Comparable — Pie's prefix cache is working.
+
+**One instance with divergent trajectories (40 vs 38 iterations) cannot support
+a 1.34× claim.** Treat it as indicative. Accuracy is still unmeasured and cannot
+be measured on a GPU pod (no docker/apptainer/swebench).
+
+### 4b. Superseded by the 13-instance run — the ratio is 1.73×, not 1.34×
+
+`40_concurrency_sweep.sh` ran four arms back-to-back (21:09–22:07). All 13
+instances in all four arms: **rc=0, zero errors, zero empty patches, zero
+0-iteration failures, zero stuck-retries.** Predictions in
+`predictions/ab_h200_{pie_auto_p32,litellm_fair}_c{1,8}_20260728_*.jsonl`,
+logs in `logs/sweep_20260728_210923/`.
+
+| arm | s/iter | med lat | p90 | p99 | max | inst/GPU-hr | agg tok/s |
+|---|---|---|---|---|---|---|---|
+| pie c1 | 1.265 | 1.21 | 4.59 | 9.70 | 14.1 | 42.9 | 99.5 |
+| litellm c1 | 1.566 | **0.70** | 2.94 | 7.47 | **303.6** | 33.7 | 75.8 |
+| pie c8 | 4.098 | 3.00 | 10.74 | 26.9 | 53.1 | 64.1 | 141.6 |
+| litellm c8 | 1.765 | **1.76** | 7.26 | 15.4 | 19.2 | **161.4** | **530.4** |
+
+**On serving latency vLLM wins at every percentile through p99** — 1.73× on the
+median at c1, not the 1.34× §4 reported from one instance. §4's number came from
+`django__django-14373`, which happens to be one of Pie's better instances.
+
+**Do not read Pie's better `s/iter` and `inst/GPU-hr` at c1 as a win.** Both come
+from wall clock, and litellm-c1 has two instances (`django__django-13089`,
+`django__django-16485`) whose walls are ~340-360 s against a ~50 s cohort. That
+is not tool time — `sum(response_latencies)` is 331 s and 348 s, i.e. essentially
+all of it, and **one single call took 303.55 s**. One anomalous vLLM stall is the
+entire margin. Excluding those two instances litellm-c1 is faster than pie-c1 on
+every instance. The stall is unexplained and worth one look before anyone cites
+either arm's wall clock; `s/iter` is only trajectory-robust against *iteration
+count*, not against a five-minute outlier call.
+
+## 5. Where the remaining gap lives (single-stream)
+
+> Written against the 1.34× single-instance figure; §4b revises the ratio to
+> 1.73× and §6a shows it becomes 2.52× at concurrency 8. The two causes below
+> still hold and the second one now matters more, not less — the *shares* are
+> what is stale, not the mechanisms.
+
+Two causes, both measured:
+
+1. **Decode is ~17% slower per token (~83% of the gap).** Pie's *decode-only*
+   rate (154.7 tok/s) is below vLLM's *end-to-end* rate (187.3). Closing decode
+   alone would take 1.34× → ~1.05×. `MULTIMODAL_BENCH.md` independently measured
+   this on **different hardware and a different model** (L40, Qwen3-VL) and
+   concluded decode is *"weight-bandwidth-bound, not slow… ~15% behind vLLM at
+   most; near the HBM floor."* Two unrelated benchmarks landing on ~15-17% is
+   strong evidence this is a real property, not a bug. Do not expect a one-liner.
+
+2. **Small prefills under-occupy (~17% of the gap).** ~1,077 genuinely-new
+   tokens per turn run at ~5,250 tok/s, against ~20,400 tok/s when the prefill
+   is large (27,318 tokens in 1.338 s). Same occupancy story as the decode bug,
+   one phase over.
+
+Both trace to one root property: **Pie issues one fire at a time on one stream**,
+so any phase that does not individually fill the GPU runs at a fraction of peak.
+
+**Amended by §6a:** "one fire at a time" is right about the *stream*, wrong if
+read as "one request per forward" — with concurrent traffic Pie does merge
+requests (mean R=2.63 at c8, R up to 7). The problem is not that batching is
+absent; it is that it forms small batches and amortizes them poorly.
+
+## 6. What to do next
+
+### 6a. The concurrency question — ANSWERED, and the answer is bad
+
+**Concurrency widens the gap. It does not close it.** Scaling c1 → c8:
+
+| | c1 | c8 | scaling |
+|---|---|---|---|
+| pie inst/GPU-hr | 42.9 | 64.1 | **1.49×** |
+| litellm inst/GPU-hr | 33.7 | 161.4 | **4.79×** |
+| pie agg tok/s | 99.5 | 141.6 | 1.42× |
+| litellm agg tok/s | 75.8 | 530.4 | 7.00× |
+
+At c8 vLLM delivers **2.52× Pie's throughput** on the same 13 instances. The
+single-stream 1.73× becomes 2.52× under load.
+
+**The mechanism, measured — Pie batches, but the batches are small and the
+amortization is weak.** The driver logs `req_id=… R=…` on a 1-in-100 sample of
+forwards (`executor.cpp:3183`, `handled % 100`), which is enough for a
+distribution:
+
+| | c1 | c8 |
+|---|---|---|
+| logged forwards | 1080 | 389 |
+| R distribution | **100% R=1** | R=1 168, R=2 44, R=3 88, R=4 22, R=5 13, R=6 27, R=7 27 |
+| mean R | 1.00 | **2.63** |
+
+Cross-check, and it is a tight one: 389 × 100 = 38,900 forwards for 100,708
+generated tokens = **2.59 tokens/forward**, against a mean R of 2.63 from the
+sample. The sampling is sound and the batching is real.
+
+So at concurrency 8 Pie issues **2.8× fewer forwards** but each takes **1.85×
+longer** (711 s / 38,900 = 18.3 ms, vs 1070 s / 108,000 = 9.9 ms at c1). Net:
+1.42×. Two distinct losses, do not conflate them:
+
+1. **Mean batch is 2.6, not 8.** Agents spend real time in tool execution, so
+   the eight conversations are rarely all decoding in the same window.
+2. **A batch of 2.6 costs 1.85× a batch of 1.** The marginal token is ~71% the
+   price of a solo token. For a weight-bandwidth-bound decode, batching should
+   amortize far better than that. A plausible cause is MoE routing — 8 tokens
+   routing to disjoint experts grows the read set nearly linearly — but that is
+   a **hypothesis, not a measurement**, and vLLM's 7.00× on the same model says
+   whatever it is, it is not a hard property of the architecture.
+
+**The `7.47× at N=8` figure in the pre-2026-07-28 notes does not transfer, and
+should not be quoted again.** `logs/probe_conc.log` shows what it measured: eight
+streams held in lockstep steady-state decode, producing genuine `R=8 N=8
+sampled=8` forwards. Real agent traffic never holds that shape. This is the §8
+lesson in a new costume — a microbenchmark reporting a scaling factor is not that
+scaling factor being available to the workload.
+
+Next lever, if this is pursued: find out why mean R is 2.6 and whether the
+scheduler can hold requests briefly to build larger batches, and separately why
+R=2.6 buys only 1.4×. The second is the bigger prize — fixing batch *formation*
+alone caps out at ~8/2.63 = 3× more work per forward, which at the current
+amortization curve is worth far less than 3×.
+
+<details><summary>Original §6a text, now superseded — kept for the reasoning</summary>
+
+The overlap lever is a **throughput** lever, not a single-stream one. In the
+current A/B there is exactly one conversation, and turn N's prefill must precede
+turn N's decode — that 11.7% is serial by construction and no scheduling change
+removes it from a single-agent latency measurement.
+
+Where it matters is concurrency, and the headroom is already measured: a
+concurrency sweep at 27k context showed **7.47× aggregate scaling at N=8 with
+per-stream latency flat** (109 → 113 ms/token).
+
+**Run the SWE-bench A/B at concurrency 4-8, both arms, and report
+instances/GPU-hour** (`TEST_PLAN.md` already names that as the throughput
+metric). Single-stream we are at 1.34×; concurrent is where Pie's scheduling
+either closes or widens the gap, and nobody knows which.
+
+Note a refinement to `MULTIMODAL_BENCH.md`'s proposal: it scopes a **second CUDA
+stream** because vision encoding cannot merge into an LLM forward pass. Prefill
+and decode *can* merge — that is exactly what vLLM does (`v1/core/sched/
+scheduler.py:398-407`: *"There's no 'decoding phase' nor 'prefill phase' in the
+scheduler"* — one forward pass carries both). So for this workload the lever is
+likely **unified/chunked-prefill scheduling**, not a second stream.
+
+</details>
+
+### 6b. `Context::suspend()` during tool execution — the Pie-only angle
+
+SWE-bench agents spend seconds to minutes per iteration running pytest with KV
+resident and the GPU idle. `RUN_STATE.md` §4 flagged `suspend()` as a throughput
+win; it has never been tested. vLLM has no equivalent — it must keep blocks or
+evict-and-recompute. This is a **capability** claim rather than a speed claim.
+
+### 6c. Deferred, with reasons
+
+- ~~**Full 13-instance A/B**~~ — **done**, see §4b. It moved the headline from
+  1.34× to 1.73×, which is exactly why this gate existed. Keep the gate for the
+  next ratio anyone wants to publish.
+- **Stage 2 (delta rendering / live `Context`).** Its targets — render, hash,
+  open, save — measure **0.4% combined**. Worth building as a programmability
+  demonstration (the human's stated reason), **not** as a performance fix. Do
+  not let the 11.7% prefill number pull you into justifying it: that is real
+  compute on new tokens, and delta rendering does not remove it.
+- **Profiling the 17% decode gap.** Needs `ncu`, which is **blocked on this pod**
+  (`ERR_NVGPUCTRPERM`; `RmProfilingAdminOnly: 1`, and the kernel module cannot be
+  reloaded from a container). Needs a pod created with `--cap-add=SYS_ADMIN`.
+
+## 7. Machine state and how to resume
+
+```bash
+source /workspace/pie-bench-env.sh
+cd /workspace/pie/integrations/openhands/runpod
+```
+
+- `/workspace` (MooseFS network volume) persists: repo, model (~57 GB),
+  predictions. `/root` is **wiped when the pod is replaced** — venvs, cargo tree,
+  git credentials.
+- The storage rule from `AGENT_HANDOVER_H200.md` §3 still holds absolutely:
+  small-file work on `/workspace` **stalls indefinitely with no error**.
+- `00_setup_h200.sh` is idempotent and now self-heals two things the 2026-07-28
+  image broke: it provisions Python 3.12 via `uv` (the image is conda-based with
+  3.11 and no 3.12) and builds venvs with `uv venv --seed` (`$PY -m venv` fails
+  on a uv-provisioned interpreter — ensurepip exits non-zero).
+- §8 now runs `pie driver cuda-native doctor` first — answers "is cuda_native in
+  this binary and can it see the GPU" in under a second, versus the ~3 minutes
+  the banner probe spends loading 58 GB before failing the same way.
+- **git identity is not set on a fresh pod.** Set it locally to match history:
+  `git config user.name yangliuwillow; git config user.email liu.yang.ly337@yale.edu`.
+- **No `gh`, no credentials.** Pushing needs a PAT. Do not paste one into the
+  session transcript — export it in your own shell, or use a deploy key.
+
+### Running an arm
+
+```bash
+# one instance, pie (split-KV is now the default — no env var needed)
+AB_INSTANCES=django__django-14373 PIE_CFG_VARIANT=auto_p32 ARM=pie bash 30_ab_run.sh
+# vLLM fair
+AB_INSTANCES=django__django-14373 VLLM_TIER=fair ARM=litellm bash 30_ab_run.sh
+```
+
+`AB_INSTANCES` narrows the set without editing the 13-instance array.
+`PIE_CFG_VARIANT` ∈ `auto_p32 | latency_p32 | auto_p16` selects the toml **and**
+the `PIE_CUDA_KV_PAGE_SIZE` that variant needs — the toml key is inert on the
+planner path, so the env var is the only real control.
+
+The Pie arm runs on a **persistent daemon** by default now (one inferlet process
+and websocket per conversation, not per call). `--pie-oneshot` restores the old
+launch-per-call transport so its cost stays measurable.
+
+## 8. Cautions
+
+- **`nvidia-smi utilization.gpu` is not SM occupancy.** It reports the fraction
+  of time at least one kernel was resident. A single-CTA kernel grinding through
+  2.7 GB reads 97%. This misled the investigation for a while.
+- **A banner reporting a feature is not that feature being on.** The
+  `xqa_decode=on` line describes a config struct this model never uses (§3). The
+  repo's existing lesson — *"trust what the driver prints over what the config
+  says"* — needs a corollary: *check the driver is printing about the code path
+  you are actually running.*
+- **`pgrep -f` / `pkill -f` match your own shell.** Cost time again this session.
+  Kill by PID; verify with `ss -ltnp` and `nvidia-smi`, not `pgrep`.
+- **Four separate env toggles produced null results** before the real cause was
+  found (`PIE_CUDA_PREFILL_DECODE_MIN_KV_PAGES`, `..._NOGRAPHS`, page size, an
+  added decode-graph flag). All four configured the **llama_like** path, which
+  `qwen3_moe` does not take. If a toggle changes nothing, suspect it is not
+  reaching the executed code before concluding the mechanism is innocent.
+- **Read-then-assert is the failure mode of this session.** Three code-reading
+  claims were wrong and each was caught by the human, not by me: that
+  `qwen3_moe` used `prepare_llama_like_decode_plan`; that `full_attn_min_R`
+  routed decode to a recompute path; and that Pie's prefix hits are "restored
+  from a named snapshot" (they are handle operations on GPU-resident pages —
+  `open`/`save` medians are 0.3 ms, which cannot move 2 GB). **The measurements
+  held; the narration around them did not.** Prefer a number over a reading.
+
+## 9. Commits
+
+Pushed to `origin/openhands-integration-updated` (`YangLiuWillow/pie`):
+
+| commit | what |
+|---|---|
+| `d9aaf9f1` | **the fix** — default to flash-decoding instead of force-disabling split-KV |
+| `9d77878e` | persistent daemon transport, always-on `pie_timings`, `Prediction`/`Result` field fix |
+| `da0cc551` | H200 bring-up repairs for the new image, `doctor` preflight, config variants, runner params |
+
+`9d77878e` also fixed a latent bug worth knowing about: `_extract_metrics` has
+returned `max_prompt_tokens` / `prompt_tokens_per_call` since 2026-07-27, but
+neither `Prediction` (`swe_bench.py`) nor `Result` (`humanevalfix.py`) had the
+fields in this tree, so `Prediction(**metrics)` raised `TypeError` and **every
+instance was recorded as a 0-iteration failure with an empty patch.** The
+matching version lived on the previous pod's local disk and went with it.
