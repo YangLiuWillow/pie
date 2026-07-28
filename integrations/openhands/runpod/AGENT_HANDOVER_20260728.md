@@ -407,6 +407,58 @@ Pie's fit is visibly noisier than vLLM's (R² 0.952 vs 0.998; residuals to
 the slope — it may be a page-boundary or split-KV threshold effect rather than
 noise.
 
+### 6a-quinquies. What vLLM's decode attention does differently
+
+The 2.12× KV-bandwidth gap is not two tunings of one kernel. **The two engines
+run different kernel families, and vLLM explicitly declined the one Pie uses.**
+
+From `logs/ctxsweep_20260728_234433/vllm_server.log`:
+
+```
+Using FLASH_ATTN attention backend out of potential backends:
+  ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION']
+Using FlashAttention version 3
+```
+
+FlashInfer was available and vLLM picked **FlashAttention 3** over it. FA3 is the
+Hopper-native implementation — TMA-driven KV loads and warp-specialized
+producer/consumer pipelines, written for sm90.
+
+Pie's side, all verified in-tree rather than assumed:
+
+| | finding | evidence |
+|---|---|---|
+| decode kernel | `flashinfer::BatchDecodeWithPagedKVCacheDispatched` — the **CUDA-core** decode kernel | `attention_flashinfer.cu:784` |
+| is it ever bypassed? | **no** — `if (decode_plan)` has no alternative branch | `qwen3_5_forward.cpp:1074-1077` |
+| Hopper decode path | **none exists** | tree-wide grep for any sm90/hopper decode symbol returns nothing (xqa excluded — §3) |
+| Hopper prefill path | **exists** | `attention_flashinfer_hopper.hpp` exposes only `hopper_prefill_supported`, `plan_…_prefill_sm90_bf16`, `dispatch_…_prefill_sm90_bf16` |
+| tensor-core decode | **no such option** — `use_tensor_cores` appears nowhere in the driver | tree-wide grep |
+
+So Pie has a Hopper specialization for prefill and **none for decode**, and
+decode runs an architecture-agnostic CUDA-core kernel against vLLM's
+Hopper-native tensor-core one. 36% vs 77% of peak is what that looks like.
+
+**Do not be misled by `full_attn_min_R=256` in the banner.** It looks like a
+mechanism that routes decode to the full-attention kernel above a batch
+threshold. It is consumed only at `llama_like.cpp:193`, a path `qwen3_moe` never
+executes (§3), so it is inert here. §8 already records one agent misreading this
+same symbol.
+
+**The experiment.** For GQA, FlashInfer's own recommendation at group size ≥ 4 is
+the *tensor-core* decode path, which it implements by calling the paged
+**prefill** kernel at `qo_len=1`. This model is group size 8 (32 Q heads /
+4 KV heads), squarely in that regime — and `BatchPrefillWithPagedKVCacheDispatched`
+is **already compiled into the binary and already used for prefill**
+(`attention_flashinfer.cu:918`). So the test is a plan/dispatch change behind an
+env flag, not new CUDA: build a decode plan that targets the paged-prefill kernel
+with `qo_indptr = [0,1,…,R]` and `causal=false`, then re-run
+`42_context_sweep.sh`. **The metric is the slope, not the rate** — the intercept
+is a different problem (§6a-quater).
+
+Confidence: the structural difference is established. That it accounts for the
+*whole* 2.12× is a hypothesis, and the sweep is a ~12-minute test of it. Given
+this study's record (§6a-ter), run it before believing it.
+
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 
 SWE-bench agents spend seconds to minutes per iteration running pytest with KV
