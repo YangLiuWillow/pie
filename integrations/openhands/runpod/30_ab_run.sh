@@ -36,6 +36,20 @@ if [ ! -d "$_snap_root" ] || [ -z "$(ls -A "$_snap_root" 2>/dev/null)" ]; then
 fi
 TS=$(date +%Y%m%d_%H%M%S)
 
+# Which GPU this arm ran on, as a filename tag. Every predictions file and LABEL
+# used to hardcode `h200`, which was correct only for as long as the pod was one.
+# `summarize_ab.py` selects arms by filename GLOB, so a hardcoded tag on a
+# different box silently invites merging two hardwares into one average — the
+# same class of mislabeling trap as RUN_STATE.md §2.5, and a worse one, because
+# nothing downstream can detect it.
+#
+# Derived from the device, so it cannot disagree with the machine. Override only
+# to reproduce an old filename.
+GPU_TAG=${GPU_TAG:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 \
+    | sed -e 's/NVIDIA //' -e 's/ .*//' -e 's/-.*//' | tr 'A-Z' 'a-z')}
+GPU_TAG=${GPU_TAG:-unknowngpu}
+echo "=== gpu tag: $GPU_TAG (predictions and LABEL are tagged with this) ==="
+
 # The 13-instance set from the writeup (baseline's own prior wins — ceiling is
 # parity for accuracy, but the timing/per-iteration signal is clean). Swap in
 # the neutral-50 ids for a set whose accuracy can move both ways.
@@ -89,7 +103,7 @@ if [ "$ARM" = "litellm" ]; then
     # Optimization-effort tier for the vLLM baseline: crippled | graphs-only | fair.
     # Run all three for the effort-axis curve; each writes a distinct output.
     export VLLM_TIER=${VLLM_TIER:-fair}
-    export OUTPUT=${OUTPUT:-predictions/ab_h200_litellm_${VLLM_TIER}_c${CONCURRENCY}_${TS}.jsonl}
+    export OUTPUT=${OUTPUT:-predictions/ab_${GPU_TAG}_litellm_${VLLM_TIER}_c${CONCURRENCY}_${TS}.jsonl}
     export LABEL=litellm-${VLLM_TIER}+qwen3-coder-30b-a3b-t0-c${CONCURRENCY}
     bash "$RUNPOD_DIR/run_litellm_baseline_fair.sh" \
         "${INSTANCES[@]}" --temperature 0 --max-iterations 100 \
@@ -118,24 +132,40 @@ elif [ "$ARM" = "pie" ]; then
     PIE_CFG_VARIANT=${PIE_CFG_VARIANT:-auto_p32}
     case "$PIE_CFG_VARIANT" in
         auto_p32)
-            _cfg=pie_cuda_native_config_30b_moe_h200.toml
+            _sfx=""
             export PIE_CUDA_KV_PAGE_SIZE=32 ;;
         latency_p32)
-            _cfg=pie_cuda_native_config_30b_moe_h200_latency.toml
+            _sfx="_latency"
             export PIE_CUDA_KV_PAGE_SIZE=32 ;;
         auto_p16)
-            _cfg=pie_cuda_native_config_30b_moe_h200_auto_p16.toml
+            _sfx="_auto_p16"
             unset PIE_CUDA_KV_PAGE_SIZE ;;
         *)
             echo "PIE_CFG_VARIANT must be auto_p32 | latency_p32 | auto_p16" >&2
             exit 2 ;;
     esac
+    # Prefer a toml written for THIS GPU, fall back to the h200 one. The configs
+    # are `memory_profile = "auto"`, so their *values* are hardware-independent
+    # and the h200 file does plan correctly on another sm_90 board — but its
+    # comments quote an H200 KV budget (~72 GB), and a config whose header
+    # describes a different machine is how a writeup ends up quoting the wrong
+    # KV pool. Prefer the accurate one; say so out loud when falling back.
+    _cfg=pie_cuda_native_config_30b_moe_${GPU_TAG}${_sfx}.toml
+    if [ ! -f "$RUNPOD_DIR/$_cfg" ]; then
+        _fallback=pie_cuda_native_config_30b_moe_h200${_sfx}.toml
+        [ -f "$RUNPOD_DIR/$_fallback" ] || {
+            echo "no config for variant '$PIE_CFG_VARIANT' on $GPU_TAG: tried $_cfg and $_fallback" >&2
+            exit 2; }
+        echo "=== note: no $_cfg — falling back to $_fallback (auto profile, plans for this box;"
+        echo "===       its header comments describe an H200, not a $GPU_TAG)"
+        _cfg=$_fallback
+    fi
     export CFG=${CFG:-$RUNPOD_DIR/$_cfg}
-    export LABEL=${LABEL:-pie-cuda-native-h200-${PIE_CFG_VARIANT}+qwen3-coder-30b-t0-c${CONCURRENCY}}
+    export LABEL=${LABEL:-pie-cuda-native-${GPU_TAG}-${PIE_CFG_VARIANT}+qwen3-coder-30b-t0-c${CONCURRENCY}}
     # The variant is in the FILENAME because summarize_ab.py selects arms by
     # glob. Summarize these with explicit per-variant globs — a bare
     # `*_pie_*.jsonl` would merge all three into one meaningless average.
-    export OUTPUT=${OUTPUT:-predictions/ab_h200_pie_${PIE_CFG_VARIANT}_c${CONCURRENCY}_${TS}.jsonl}
+    export OUTPUT=${OUTPUT:-predictions/ab_${GPU_TAG}_pie_${PIE_CFG_VARIANT}_c${CONCURRENCY}_${TS}.jsonl}
     echo "=== pie config variant: $PIE_CFG_VARIANT ($_cfg)"
     echo "===   PIE_CUDA_KV_PAGE_SIZE=${PIE_CUDA_KV_PAGE_SIZE:-<unset — planner picks, expect 16>}"
     export REQUEST_TIMEOUT_S=900

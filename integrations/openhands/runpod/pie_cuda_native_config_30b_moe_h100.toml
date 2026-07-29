@@ -1,0 +1,135 @@
+# CONFIG A for H100 — "auto + forced page 32". Same shape as the H200 arms ran.
+#
+# Native CUDA driver, Qwen3-Coder-30B-A3B (MoE), single H100 SXM 80GB (sm_90).
+# Selected by `PIE_CFG_VARIANT=auto_p32` in 30_ab_run.sh, which picks the toml
+# matching the detected GPU. Values are IDENTICAL to
+# pie_cuda_native_config_30b_moe_h200.toml — `memory_profile = "auto"` means the
+# planner sizes everything from the device — so this file exists for its header,
+# not its settings: the H200 file's comments quote a ~72 GB KV budget that is
+# wrong here by nearly 5x, and a config whose header describes a different
+# machine is how a writeup ends up quoting the wrong KV pool.
+#
+# REQUIRES `PIE_CUDA_KV_PAGE_SIZE=32` in the environment. 30_ab_run.sh exports it
+# for this variant; the env file written by 00_setup_h200.sh does too. Without it
+# the planner picks 16 and xqa_decode turns OFF while prefill_decode_plan stays
+# on — see below.
+#
+# ARCH GATES — the reason the A100 arm was void (RUN_STATE.md §0).
+# Pie's two fast attention paths are gated to compute capability >= 9:
+#     driver/cuda/src/entry.cpp:988-989         use_prefill_decode_plan
+#     driver/cuda/src/ops/attention_xqa.cu:274  xqa_decode_bf16_supported
+# H100 is sm_90 (major 9) and passes both, exactly as H200 does. Confirm at
+# RUNTIME from the driver's own banner — `prefill_decode_plan=on xqa_decode=on`.
+# If it prints `off`, STOP; do not collect a Pie arm.
+#
+# Like H200, H100 does NOT pass the two `major >= 12` gates
+# (cuda_memory_planner.cpp:219 and :250) — those need sm_120 (RTX Pro 6000).
+# So this is Pie-with-fast-attention, not the exact configuration the original
+# writeup ran. State that in the writeup.
+#
+# Requires a `pie` built with `--features driver-portable,driver-cuda` on THIS
+# box (sm_90).
+#
+# NEW-SCHEMA config (auto-plans KV/batch from memory_profile + gpu_mem_utilization).
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+# Both were previously omitted and left at their defaults. Stated explicitly so
+# the config matches the reference at pie-project.org/docs/reference/drivers/cuda
+# and so a reader does not have to know the defaults to know what ran.
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+# THE NUMBER THAT DIFFERS FROM H200, AND IT IS NOT SMALL.
+#
+# MEASURED on this box from the planner's own banner (2026-07-29 gate check),
+# not estimated:
+#
+#   memory planner: profile=auto resolved_profile=latency selector=rule util=0.9
+#   total=81079 MiB sm=132 tp=1 decode_target=512 prefill_target=8192
+#   page_size=32 (auto) used_after_weights=59732 MiB safety=810 MiB
+#   budget=12427 MiB N=512 R=512 page_refs=262144 arena=798 MiB
+#   kv_pages=3876 kv_tokens=124032 state_slots=0
+#
+# **kv_tokens = 124,032** against the H200 sweep arms' **622,112** — 5.0x
+# smaller, not the ~4x a naive "15 GiB / 96 KiB" estimate gives. The gap is
+# wider than raw memory implies because arena, safety and page_refs are charged
+# before KV.
+#
+# Consequences that must travel with any H100 number:
+#   - The arms are NOT capacity-matched at the same util=0.90, and PIE IS THE ONE
+#     WITH MORE ROOM. Measured on this board, each from its own startup output:
+#         Pie   12.14 GiB -> kv_tokens=124,032        (102.6 KiB/token effective)
+#         vLLM  10.77 GiB -> GPU KV cache size: 117,599 tokens  (96.0 KiB/token)
+#     Pie has **12.7% more KV memory but only 5.5% more KV tokens**, because at
+#     page_size=32 its effective cost is 102.6 KiB/token against the model's
+#     nominal 96 — page rounding. Quote the TOKEN figures: tokens are what a
+#     request consumes, and the memory comparison overstates Pie's advantage by
+#     more than 2x.
+#     An earlier revision of this comment asserted the REVERSE (~159k for vLLM,
+#     "roughly 28% larger") from an estimate that ignored vLLM's activation and
+#     CUDA-graph reservations. Both engines came in under the naive
+#     "15 GiB / 96 KiB" figure. Never estimate this; read both startup banners.
+#   - vLLM could not start at MAX_MODEL_LEN=131072 here: 12.0 GiB is needed for
+#     one max-length request against 10.77 GiB available. The cap was lowered to
+#     113664 for this board (see /workspace/pie-bench-env.sh). It is not binding
+#     — the largest prompt in the H100 pie c1 arm was 46,870 tokens — but it is a
+#     protocol deviation from the H200 arms and must be stated as one.
+#   - At MAX_MODEL_LEN=131072 this is ~1.2x concurrency, so a concurrent arm
+#     (c8/c16) runs under KV pressure the H200 arms never saw. Both arms are
+#     squeezed, but they do not degrade the same way: vLLM preempts and
+#     recomputes, Pie has its own planner. Record vLLM's preemption counts.
+#   - The H200 config's claim that spare KV "accrues mostly to the BASELINE
+#     (vLLM's APC has more room to hit), so it makes the comparison more
+#     conservative for Pie" is FALSE here. There is no spare KV, and what little
+#     asymmetry exists favours vLLM. Do not carry that sentence over.
+#   - H100 is the same GH100 die as H200 (132 SMs, 50 MB L2) but HBM3 at
+#     ~3.35 TB/s against H200's HBM3e ~4.8 TB/s. Decode is bandwidth-bound, so
+#     absolute tok/s on both arms will be well below the H200 figures. Ratios
+#     are the only thing worth comparing across the two pods, and even those
+#     only with the KV-pressure caveat above.
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
+# WARNING: this key is INERT on the memory-planner path. The planner never reads
+# `cfg.batching.kv_page_size` — it builds its own candidate list in
+# derive_kv_page_size_candidates() (cuda_memory_planner.cpp:155) and scores it.
+# The value is parsed and range-checked (config.hpp:151), then ignored.
+#
+# Worse, the scorer PREFERS 16 over 32 at tp=1 in every profile branch
+# (:707-730), so no choice of memory_profile will produce 32 either. The ONLY
+# control is the env var PIE_CUDA_KV_PAGE_SIZE, which short-circuits the
+# candidate list to a single value (:157-162).
+#
+# That matters because the gqa8 XQA kernel is compiled with TOKENS_PER_PAGE=32
+# (attention_xqa_gqa8.cu:21) and the page_size==16 escape hatch applies only to
+# GQA ratio 2; Qwen3-Coder-30B-A3B is ratio 8 (32 q / 4 kv). So page 32 is a
+# hard requirement for xqa.
+#
+# Kept here at 32 for documentation value only. Verify what actually took effect
+# from the driver's own line, never from this file:
+#   page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on
+kv_page_size = 32
+weight_dtype = "bfloat16"
+# Host-backed KV offload tier. Documented default is 0 (disabled). Held at 0 for
+# the same reason as the H200 rerun: it is the one Pie-only non-default in the
+# stack and vLLM has no equivalent enabled.
+#
+# NOTE the H200 justification was "with a ~69 GB KV budget the swap tier can
+# never engage, so it was measuring nothing". That argument does NOT hold on
+# H100 — at ~15 GiB of KV a concurrent arm can plausibly reach the point where
+# swap would engage. Keeping it at 0 is therefore a real choice here, not a
+# no-op: it keeps the two arms comparable rather than handing Pie a mechanism
+# vLLM lacks. Enabling it is the stretch overcommit sweep (Pie swap vs vLLM
+# evict-and-recompute), which is a SEPARATE experiment and must be labeled one.
+swap_pool_size = 0

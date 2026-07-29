@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Bring-up on a FRESH RunPod H200 SXM box.
+# Bring-up on a FRESH RunPod box with compute capability >= 9.
 #
-# Replaces 00_setup_a100.sh. Read AGENT_HANDOVER_H200.md first — it explains
-# WHY this pod is an H200 and what the A100 run established.
+# Named for the H200 it was written on; it has since brought up an H100 and is
+# board-agnostic where it matters. Read AGENT_HANDOVER_H200.md first — it
+# explains what the A100 run established.
 #
-# The one-line reason: Pie's fast attention paths are gated to compute
-# capability >= 9. The A100 is sm_80 and failed both gates silently, so the
-# A100 Pie arm measured Pie's fallback path. H200 is sm_90 and passes. Section
-# [8] below VERIFIES that at runtime and is the most important step here.
+# The one-line reason for the >= 9 requirement: Pie's fast attention paths are
+# gated to compute capability >= 9. The A100 is sm_80 and failed both gates
+# silently, so the A100 Pie arm measured Pie's fallback path. Section [8] below
+# VERIFIES the gates at runtime and is the most important step here.
 #
-# Bonus: vLLM SHIPS a tuned bf16 MoE config for this exact shape on H200
-# (E=128,N=768,device_name=NVIDIA_H200.json), so there is NO autotune to run
-# and no VLLM_TUNED_CONFIG_FOLDER to export. Section [6] verifies it exists.
+# TWO THINGS THAT ARE PER-BOARD, NOT PER-ARCHITECTURE — sm_90 does not imply
+# either, and assuming the H200 answer has cost time already:
+#   - THE TUNED MoE CONFIG. vLLM 0.25.1 ships E=128,N=768 bf16 for H200 / B200 /
+#     H20 / MI308X and NOT for A100 or H100. Section [6] resolves this against
+#     the installed package and appends the right export to the env file.
+#   - THE KV BUDGET. H200's 141 GB leaves ~72 GB of KV; H100's 80 GB leaves
+#     ~15 GiB, ~4x less, which changes what a concurrent arm is measuring.
+#     Section [0] computes it for this board and writes it into the env file.
 #
 # Idempotent: safe to re-run. Skips anything already done.
 # =============================================================================
@@ -55,7 +61,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 mkdir -p "$FAST/venvs" "$CPM_SOURCE_CACHE" "$UV_CACHE_DIR" "$BUILD_TREE" "$PIP_CACHE_DIR"
 
 # =============================================================================
-say "[0] preflight — is this actually an H200?"
+say "[0] preflight — is this board usable for BOTH arms?"
 # =============================================================================
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found — is this a GPU pod?"
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv
@@ -72,10 +78,14 @@ if [ "$MAJOR" -lt 9 ]; then
 fi
 echo "  compute cap $CC (sm_$ARCH, major $MAJOR) — Pie's >= 9 gates will PASS."
 [ "$MAJOR" -ge 12 ] || echo "  note: major < 12, so the wide-prefill gates
-  (cuda_memory_planner.cpp:219,:250) stay OFF. Expected on H200. State it."
+  (cuda_memory_planner.cpp:219,:250) stay OFF. Expected on any sm_90. State it."
 
 GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-[ "$GPU_MEM" -ge 130000 ] || warn "GPU has ${GPU_MEM} MiB — the H200 toml assumes ~141 GB."
+# Not a failure — smaller boards work, they just have a much smaller KV pool,
+# which the block below quantifies and the env file records.
+[ "$GPU_MEM" -ge 130000 ] || warn "GPU has ${GPU_MEM} MiB, under the 141 GB an H200 has.
+  The Pie tomls are memory_profile=auto so they plan correctly regardless, but the
+  KV pool is proportionally smaller — see the budget computed next."
 
 # Driver vs CUDA runtime. Compute capability is NOT the only pod-selection
 # criterion — the DRIVER matters independently, and it bit us once:
@@ -103,24 +113,66 @@ fi
 
 # Does MAX_MODEL_LEN fit? KV is 96 KiB/token for this model (48 layers x 4 KV
 # heads x 128 dim x 2 (K,V) x 2 bytes bf16). Weights are ~58 GB.
-python3 - <<EOF
+#
+# Captured into shell variables as well as printed, because section [3] writes
+# them into the env file. A KV figure quoted from the wrong board is how a
+# writeup ends up claiming H200 headroom on an 80 GB card.
+KV_FACTS=$(python3 - <<EOF
 gpu_mib   = $GPU_MEM
 mml       = $MAX_MODEL_LEN
 kv_kib    = 96
 weights   = 58_500          # MiB, measured
-budget    = gpu_mib * 0.90 - weights
+# ENGINE OVERHEAD, and leaving it out is why this check used to be optimistic.
+# Neither engine gets util*total - weights for KV. Measured on the H100:
+#   vLLM  weights 56.93 GiB + CUDA graphs 0.64 GiB -> KV 10.77 GiB
+#   Pie   safety 810 MiB + arena 798 MiB + page_refs -> KV 12.14 GiB
+# against a naive estimate of ~15 GiB. vLLM's activation peak and non-torch
+# reservations account for most of the difference. 4200 MiB is calibrated from
+# that measurement and is deliberately the LARGER (vLLM) overhead, so this check
+# predicts the binding engine rather than the roomier one.
+overhead  = 4_200
+budget    = gpu_mib * 0.90 - weights - overhead
 tokens    = int(budget * 1024 / kv_kib)
-conc      = tokens / mml if mml else 0
-print(f"  KV budget ~{budget/1024:.0f} GiB -> ~{tokens:,} tokens")
-print(f"  MAX_MODEL_LEN={mml:,} -> ~{conc:.1f}x concurrency")
-if conc < 1:
-    raise SystemExit("FATAL: MAX_MODEL_LEN does not fit in the KV budget — lower it.")
-if conc < 2:
-    print("  WARN: under 2x concurrency. Fine for a serial A/B, tight for anything else.")
+if tokens <= 0:
+    raise SystemExit("no KV budget at all on this GPU")
+# Clamp rather than fail: a board that cannot hold the requested context can
+# still run the experiment at a smaller one, and the cap is not binding on this
+# workload anyway (largest observed SWE-bench prompt: 46,870 tokens). Failing
+# here would have stopped the H100 re-baseline for a limit nothing reaches.
+if mml > tokens:
+    mml = (tokens // 1024) * 1024
+conc = tokens / mml if mml else 0
+print(f"{budget/1024:.0f}|{tokens}|{conc:.1f}|{mml}")
 EOF
+) || die "could not compute a KV budget for this GPU."
+KV_GIB=${KV_FACTS%%|*}
+KV_TOKENS=$(printf '%s' "$KV_FACTS" | cut -d'|' -f2)
+KV_CONC=$(printf '%s' "$KV_FACTS" | cut -d'|' -f3)
+_MML_FIT=$(printf '%s' "$KV_FACTS" | cut -d'|' -f4)
+printf "  KV budget ~%s GiB -> ~%s tokens (after ~4.2 GiB engine overhead)\n" "$KV_GIB" "$KV_TOKENS"
+if [ "$_MML_FIT" != "$MAX_MODEL_LEN" ]; then
+    warn "MAX_MODEL_LEN=$MAX_MODEL_LEN does not fit this board — clamped to $_MML_FIT.
+  vLLM refuses to start when one max-length request exceeds its KV pool, and this
+  is what that looks like BEFORE spending 5 minutes loading weights to find out.
+  Not binding on this workload (largest observed SWE-bench prompt: 46,870), but
+  it IS a protocol deviation from any board that ran the larger value — say so."
+    MAX_MODEL_LEN=$_MML_FIT
+fi
+printf "  MAX_MODEL_LEN=%s -> ~%sx concurrency\n" "$MAX_MODEL_LEN" "$KV_CONC"
+if awk -v c="$KV_CONC" 'BEGIN{exit !(c < 2)}'; then
+    warn "under 2x concurrency at this MAX_MODEL_LEN. Fine for a serial A/B, but a
+  c8/c16 arm will run under KV pressure — a REAL DIFFERENCE from the H200 arms
+  (622,112 KV tokens) that must be stated next to any concurrent number from
+  this box. It hits BOTH arms, but they do not degrade the same way."
+fi
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-echo "  device name: $GPU_NAME"
+# Short tag used to pick per-board files: the Pie toml (30_ab_run.sh) and the
+# borrowed-MoE folder ([6]). Derived from the device so it cannot disagree with
+# the machine. "NVIDIA H100 80GB HBM3" -> h100, "NVIDIA A100-SXM4-80GB" -> a100.
+GPU_TAG=$(printf '%s' "$GPU_NAME" | sed -e 's/NVIDIA //' -e 's/ .*//' -e 's/-.*//' | tr 'A-Z' 'a-z')
+export GPU_TAG
+echo "  device name: $GPU_NAME  (tag: $GPU_TAG)"
 
 if command -v mountpoint >/dev/null && ! mountpoint -q "$WORK"; then
     warn "$WORK is not a separate mount — it may be ephemeral container disk."
@@ -233,10 +285,18 @@ export PIE_CUDA_KV_PAGE_SIZE=32
 
 # Context cap for the vLLM arms. 131072 = the OpenHands SWE-bench norm (128k).
 #
-# The A100 used 32768 out of necessity, not choice: its 12.59 GiB of KV held
-# only 137,472 tokens, so 131072 would have left room for ~1.05 sequences.
-# H200 has ~72 GB of KV (~786k tokens at 96 KB/token: 48 layers x 4 KV heads
-# x 128 dim x 2 x 2 bytes), so 131072 costs ~12.6 GB and still leaves ~6x.
+# MEASURED ON THIS BOX AT BRING-UP — do not carry another board's figure here:
+#   device:     $GPU_NAME ($GPU_MEM MiB)
+#   KV budget:  ~$KV_GIB GiB -> ~$KV_TOKENS tokens at 96 KiB/token
+#               (48 layers x 4 KV heads x 128 dim x 2 (K,V) x 2 bytes bf16)
+#   headroom:   ~${KV_CONC}x MAX_MODEL_LEN
+#
+# For scale, the reference points this experiment has actually run:
+#   A100 80GB  12.59 GiB KV = 137,472 tokens -> 32768 was forced, not chosen
+#   H200 141GB ~72 GB KV, and the sweep arms planned 622,112 KV tokens
+#   H100 80GB  ~15 GiB KV = ~159k tokens -> ~1.2x at 131072
+# If the headroom above is under ~2x, a concurrent (c8/c16) arm runs under KV
+# pressure and that fact belongs beside the number, on both arms.
 #
 # This matters because the serving cap is the ONLY context limit in the stack:
 # litellm has no entry for a self-hosted model (the benign "isn't mapped yet"
@@ -248,8 +308,11 @@ export PIE_CUDA_KV_PAGE_SIZE=32
 # without YaRN.
 export MAX_MODEL_LEN=$MAX_MODEL_LEN
 
-# H200 ships its own tuned MoE config — do NOT export VLLM_TUNED_CONFIG_FOLDER.
-# See AGENT_HANDOVER_H200.md §4.
+# TUNED MoE CONFIG — decided in section [6], which APPENDS the export below this
+# line if this board needs one. Whether it does is per-board and the H200 answer
+# does not generalise: vLLM 0.25.1 ships E=128,N=768 bf16 for H200/B200/H20/
+# MI308X and NOT for A100 or H100. Section [6] resolves it against the installed
+# package rather than against this comment.
 
 export PATH="\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH"
 [ -f "\$HOME/.cargo/env" ] && . "\$HOME/.cargo/env"
@@ -338,31 +401,77 @@ fi
 ls -la "$PIE_SRC/$WASM"
 
 # =============================================================================
-say "[6] confirm vLLM ships the tuned MoE config for THIS device"
+say "[6] resolve the tuned MoE config for THIS device"
 # =============================================================================
-# This is why H200 needs no autotune. If it is missing, the fair tier is not
-# available and assert_vllm_fair.sh will hard-fail it.
-"$PIE_VENV/bin/python" - <<'PY'
-import os, torch
-from vllm.model_executor.layers.fused_moe.fused_moe import get_config_file_name
+# The 'fair' tier is "CUDA graphs ON + a TUNED MoE kernel". Whether vLLM supplies
+# one is PER-BOARD, and assuming the H200 answer is the trap this section exists
+# to close:
+#   H200 / B200 / H20 / MI308X : vLLM 0.25.1 ships E=128,N=768 bf16. Nothing to do.
+#   A100 / H100                : it does NOT. The tier needs a borrowed config in
+#                                VLLM_TUNED_CONFIG_FOLDER, or it is not fair and
+#                                assert_vllm_fair.sh will hard-fail it.
+#
+# Resolution order matches vLLM's own (fused_moe.py:1075-1089): the env folder
+# first, then the package dir. Whatever wins is APPENDED to the env file, so the
+# arms inherit the same decision instead of depending on an exported shell var.
+TUNED_DEFAULT=${TUNED_MOE_DIR:-$WORK/tuned_moe_${GPU_TAG}}
+MOE_EXPORT=$("$PIE_VENV/bin/python" - "$TUNED_DEFAULT" <<'PY'
+import json, os, sys, torch
 import vllm.model_executor.layers.fused_moe.fused_moe as fm
+from vllm.model_executor.layers.fused_moe.fused_moe import get_config_file_name
+
 name = get_config_file_name(128, 768, None, None)
-cfgdir = os.path.join(os.path.dirname(fm.__file__), "configs")
-path = os.path.join(cfgdir, name)
-print(f"  device      : {torch.cuda.get_device_properties(0).name}")
-print(f"  vLLM expects: {name}")
-if os.path.exists(path):
-    import json
+pkg = os.path.join(os.path.dirname(fm.__file__), "configs", name)
+env_folder = os.environ.get("VLLM_TUNED_CONFIG_FOLDER") or ""
+default_folder = sys.argv[1]
+
+def describe(path):
     d = json.load(open(path)); d.pop("triton_version", None)
-    print(f"  SHIPPED     : {len(d)} batch-size keys — no autotune needed.")
-else:
-    print(f"  *** NOT SHIPPED at {path}")
-    print("  *** The 'fair' tier needs a tuned config. See AGENT_HANDOVER_H200.md §4.")
-    raise SystemExit(1)
+    return f"{len(d)} batch-size keys"
+
+print(f"  device      : {torch.cuda.get_device_properties(0).name}", file=sys.stderr)
+print(f"  vLLM expects: {name}", file=sys.stderr)
+
+for folder, why in ((env_folder, "VLLM_TUNED_CONFIG_FOLDER"),
+                    (default_folder, "conventional location")):
+    if folder and os.path.exists(os.path.join(folder, name)):
+        p = os.path.join(folder, name)
+        print(f"  BORROWED    : {describe(p)} via {why}", file=sys.stderr)
+        print(f"                {p}", file=sys.stderr)
+        print(f"  NOTE        : borrowed, not autotuned here. {folder}/PROVENANCE.md",
+              file=sys.stderr)
+        print(f"                and VALIDATION.md must be cited with any fair-tier number.",
+              file=sys.stderr)
+        print(folder)   # stdout = the folder to export
+        sys.exit(0)
+
+if os.path.exists(pkg):
+    print(f"  SHIPPED     : {describe(pkg)} — no autotune, no export needed.", file=sys.stderr)
+    print("")           # stdout empty = export nothing
+    sys.exit(0)
+
+print(f"  *** NO TUNED CONFIG for this device.", file=sys.stderr)
+print(f"  *** not packaged : {pkg}", file=sys.stderr)
+print(f"  *** not borrowed : {default_folder}/{name}", file=sys.stderr)
+print(f"  *** The 'fair' tier is NOT AVAILABLE until one exists. Options:", file=sys.stderr)
+print(f"  ***   - drop a published config for this exact device name into", file=sys.stderr)
+print(f"  ***     {default_folder}/ and document it (see runpod/tuned_moe/ for the", file=sys.stderr)
+print(f"  ***     A100 precedent: PROVENANCE.md + a measured VALIDATION.md), or", file=sys.stderr)
+print(f"  ***   - autotune, which was abandoned once at a 15-24 h projection with", file=sys.stderr)
+print(f"  ***     no partial-progress artifact (RUN_STATE.md 3b).", file=sys.stderr)
+sys.exit(1)
 PY
-if [ -n "${VLLM_TUNED_CONFIG_FOLDER:-}" ]; then
-    warn "VLLM_TUNED_CONFIG_FOLDER is set (=$VLLM_TUNED_CONFIG_FOLDER)."
-    warn "On H200 it is not needed and can only cause confusion. Unset it."
+) || die "no tuned MoE config for this device — the 'fair' tier cannot be run. See above."
+
+if [ -n "$MOE_EXPORT" ]; then
+    printf 'export VLLM_TUNED_CONFIG_FOLDER=%s\n' "$MOE_EXPORT" >> "$ENV_FILE"
+    echo "  appended to $ENV_FILE: export VLLM_TUNED_CONFIG_FOLDER=$MOE_EXPORT"
+    echo "  (correct for the 'fair' tier ONLY — 'crippled' and 'graphs-only' are"
+    echo "   defined as DEFAULT MoE and assert_vllm_fair.sh hard-fails both if a"
+    echo "   tuned config is live. Run those with 'env -u VLLM_TUNED_CONFIG_FOLDER'.)"
+elif [ -n "${VLLM_TUNED_CONFIG_FOLDER:-}" ]; then
+    warn "VLLM_TUNED_CONFIG_FOLDER is set (=$VLLM_TUNED_CONFIG_FOLDER) but this board
+  ships its own config. It is not needed and can only cause confusion. Unset it."
 fi
 
 # =============================================================================
@@ -403,8 +512,19 @@ case "$DOCTOR" in
        Rebuild with --features driver-portable,driver-cuda." ;;
 esac
 
-CFG="$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml"
+# Probe the CONFIG A toml for THIS board, matching 30_ab_run.sh's selection.
+# Hardcoding the h200 file made the gate check probe a config whose header
+# documents a different KV budget — the values are identical (memory_profile =
+# "auto"), so it still passed, which is exactly what makes it easy to miss.
+CFG="$RUNPOD_DIR/pie_cuda_native_config_30b_moe_${GPU_TAG}.toml"
+if [ ! -f "$CFG" ]; then
+    CFG="$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml"
+    warn "no pie_cuda_native_config_30b_moe_${GPU_TAG}.toml — probing the h200 one.
+  Its values plan correctly here (auto profile) but its header describes an H200.
+  Add a ${GPU_TAG} variant before quoting KV numbers from it."
+fi
 [ -f "$CFG" ] || die "missing $CFG"
+echo "  probing config: $CFG"
 PROBE_LOG=$HARNESS_DIR/logs/pie_gatecheck_$(date +%Y%m%d_%H%M%S).log
 mkdir -p "$(dirname "$PROBE_LOG")"
 echo "  starting pie briefly to read its banner -> $PROBE_LOG"
@@ -446,23 +566,28 @@ Source the env in every shell:
     source $ENV_FILE
     cd $RUNPOD_DIR
 
+This board: $GPU_NAME (tag $GPU_TAG, sm_$ARCH)
+  KV budget ~$KV_GIB GiB / ~$KV_TOKENS tokens, ~${KV_CONC}x at MAX_MODEL_LEN=$MAX_MODEL_LEN
+  MoE config: ${MOE_EXPORT:-shipped by vLLM (nothing exported)}
+
 Run order (one arm at a time, verify before the next):
 
-  1. Pie arm — uses the H200 toml, KV_VERIFY=1, no vLLM involved
-       CFG=$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml \\
+  1. Pie arm — KV_VERIFY=1, no vLLM involved. 30_ab_run.sh picks the toml for
+     this board automatically (PIE_CFG_VARIANT=auto_p32 by default).
        ARM=pie bash 30_ab_run.sh
 
-  2. vLLM fair — the shipped MoE config makes this the DEFAULT here.
-       Do NOT export VLLM_TUNED_CONFIG_FOLDER.
+  2. vLLM fair
        VLLM_TIER=fair ARM=litellm bash 30_ab_run.sh
 
-  3. vLLM crippled — reproduces the original writeup's --enforce-eager baseline.
-       Requires MOVING THE SHIPPED CONFIG ASIDE first; see
-       AGENT_HANDOVER_H200.md §4. Read it, this differs from the A100 flow.
+  3. vLLM crippled / graphs-only — both are defined as DEFAULT MoE, so on a board
+     where [6] exported a borrowed config they must be run with it suppressed:
+       env -u VLLM_TUNED_CONFIG_FOLDER VLLM_TIER=crippled ARM=litellm bash 30_ab_run.sh
+     assert_vllm_fair.sh hard-fails either tier if a tuned config is live, so
+     this is verified rather than assumed.
 
-  4. summarize
-       python summarize_ab.py pie=../predictions/*_pie_*.jsonl \\
-           litellm-fair=../predictions/*_litellm_fair_*.jsonl
+  4. summarize — glob by GPU tag, or arms from different boards merge silently
+       python summarize_ab.py pie=../predictions/ab_${GPU_TAG}_pie_*.jsonl \\
+           litellm-fair=../predictions/ab_${GPU_TAG}_litellm_fair_*.jsonl
 
 Read AGENT_HANDOVER_H200.md before step 1.
 EOF

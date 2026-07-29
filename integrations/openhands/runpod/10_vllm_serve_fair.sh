@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# FAIR vLLM baseline launch — Qwen3-Coder-30B-A3B on a single A100 SXM (sm_80).
+# FAIR vLLM baseline launch — Qwen3-Coder-30B-A3B on a single GPU.
+#
+# Originally written for an A100 SXM (sm_80); has since run on H200 and H100
+# (both sm_90). Nothing here is board-specific EXCEPT the tuned-MoE question,
+# which is board-specific in a way that is easy to get wrong — see the note
+# above the flag set.
 #
 # This is the direct replacement for the crippled `run_litellm_baseline.sh`
 # launch that the current writeup (docs/pie-vs-litellm-writeup.md, "Fairness"
@@ -33,7 +38,14 @@ PIE_VENV=${PIE_VENV:-$HOME/.venvs/pie-vllm}          # venv with vllm installed
 HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
 LOG_DIR=${LOG_DIR:-$SCRIPT_DIR/logs}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}               # matches the prior baseline
+# Stated, never defaulted — see the long note in run_litellm_baseline_fair.sh.
+# 32768 was the A100's forced value; every sm_90 arm runs 131072. A silent
+# fallback gives vLLM a smaller context than Pie (which has no fixed cap) and
+# reads as an accuracy difference rather than a config mistake.
+if [ -z "${MAX_MODEL_LEN:-}" ]; then
+    echo "FATAL: MAX_MODEL_LEN is not set — run 'source /workspace/pie-bench-env.sh' first." >&2
+    exit 2
+fi
 TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen3_coder}
 # Optimization-effort tier — the axis the rerun measures. See runpod/README.md.
 #   crippled    : --enforce-eager + default MoE (reproduce the original writeup)
@@ -57,7 +69,7 @@ mkdir -p "$LOG_DIR"
 TS=$(date +%Y%m%d_%H%M%S)
 VLLM_LOG="$LOG_DIR/vllm_serve_fair_${TS}.log"
 
-echo "=== vLLM baseline (A100 SXM) — tier: $VLLM_TIER ==="
+echo "=== vLLM baseline ($(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)) — tier: $VLLM_TIER ==="
 echo "  Model:     $MODEL"
 echo "  Port:      $VLLM_PORT"
 echo "  GPU mem:   $GPU_MEM_UTIL   max_model_len: $MAX_MODEL_LEN"
@@ -73,10 +85,20 @@ echo ""
 #   --generation-config vllm  use vLLM's own sampling defaults (unchanged).
 #   Chunked prefill / V1 are default-on in current vLLM; not forced so we get
 #   vLLM's own recommended defaults rather than second-guessing them.
-# A tuned fused-MoE config is NOT a flag — vLLM auto-loads it from its config
-# dir IF a file matching this GPU + expert shape exists. On A100-SXM one often
-# ships; if the banner still says "Using default MoE config", run
-# 11_autotune_moe.sh (vLLM's own benchmark_moe.py) once, then relaunch.
+# A tuned fused-MoE config is NOT a flag — vLLM auto-loads it from
+# VLLM_TUNED_CONFIG_FOLDER first, then its own packaged config dir, IF a file
+# matching this GPU + expert shape exists (fused_moe.py:1075-1109).
+#
+# WHETHER ONE SHIPS IS PER-BOARD, and this is the trap. For E=128,N=768 bf16,
+# vLLM 0.25.1 ships H200 / B200 / H20 / MI308X and **not A100, not H100**
+# (verified against the v0.25.1 tree, 2026-07-29). So:
+#   H200 - nothing to do; do NOT set VLLM_TUNED_CONFIG_FOLDER.
+#   H100 - the 'fair' tier REQUIRES VLLM_TUNED_CONFIG_FOLDER=/workspace/tuned_moe_h100
+#          (borrowed config; see that folder's PROVENANCE.md + VALIDATION.md).
+#   A100 - same situation; /workspace/tuned_moe, see runpod/tuned_moe/.
+# If the banner says "Using default MoE config" on a board with no shipped
+# config, exporting the folder is the fix — NOT 11_autotune_moe.sh, which was
+# abandoned at a 15-24 h projection with no partial-progress artifact.
 # -----------------------------------------------------------------------------
 PYTHONPATH="" HF_HOME="$HF_HOME" \
   "$PIE_VENV/bin/python" -m vllm.entrypoints.openai.api_server \

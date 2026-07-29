@@ -1,0 +1,64 @@
+# CONFIG C for H100 — "the planner's own choice". page_size 16, xqa_decode OFF.
+#
+# Same file as CONFIG A (pie_cuda_native_config_30b_moe_h100.toml) in every key.
+# The difference is not in this file at all: C must run with
+# **PIE_CUDA_KV_PAGE_SIZE UNSET**. `30_ab_run.sh` unsets it when
+# PIE_CFG_VARIANT=auto_p16.
+#
+# EXPECTED BANNER — and this is the one config where `off` is the correct result:
+#   page_size=16 (auto) ... prefill_decode_plan=on xqa_decode=off
+#
+# Do NOT treat that `off` as the A100 failure repeating. On the A100 it was off
+# because the hardware could not do better and nobody noticed. Here it is off
+# because we are deliberately measuring what it costs. The 00_setup_h200.sh [8]
+# gate still probes CONFIG A and still hard-fails on `off`, so the guardrail that
+# matters is unchanged.
+#
+# WHAT THIS TESTS — xqa's contribution, isolated on one machine.
+# The move off the A100 was premised on Pie's fast attention paths being the
+# reason Pie looked slow, but the GPU changed at the same time, so the two
+# effects were confounded. C vs A isolates it: same pod, same binary, same
+# weights, same instance, same harness. The only difference is page 16 + xqa off
+# vs page 32 + xqa on.
+#
+#   C ~= A   -> xqa is not the bottleneck on this shape.
+#   C <  A   -> xqa is real and worth the forced page size; A stays the config.
+#   C >  A   -> the planner was right and forcing page 32 costs more than xqa
+#               returns, which would make every sm_90 Pie number so far the
+#               wrong configuration.
+#
+# ONE H100-SPECIFIC REASON THIS ARM MATTERS MORE HERE THAN IT DID ON H200.
+# Page size is not only an xqa gate, it is a KV-fragmentation knob, and this box
+# has ~15 GiB of KV against H200's ~72 GB (see CONFIG A). Forcing 32 against the
+# planner's preference for 16 costs more when the pool is small — larger pages
+# waste more on partially-filled tails, and there are ~4x fewer pages to waste.
+# So the C > A outcome, which stayed hypothetical on H200, is a live possibility
+# here, and it is a different question from "is xqa fast": it is "does xqa pay
+# for the page size it demands, at this KV budget".
+#
+# Run this arm on H100 before quoting any A-config number as Pie's best.
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
+# Left at 32 to prove the point: this key does NOT keep the planner at 32. With
+# PIE_CUDA_KV_PAGE_SIZE unset the planner will pick 16 and print
+# `page_size=16 (auto)` while this line still reads 32.
+kv_page_size = 32
+weight_dtype = "bfloat16"
+swap_pool_size = 0

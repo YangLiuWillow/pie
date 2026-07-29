@@ -41,6 +41,67 @@ case "$MODEL" in
     *)             TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-hermes} ;;
 esac
 
+# --- the serving context cap must be stated, never defaulted -------------------
+# This used to be `${MAX_MODEL_LEN:-32768}` inline at the serve call. 32768 was
+# the A100's value, forced by that box's 12.59 GiB of KV; every sm_90 arm has run
+# 131072. The fallback is silent, and it is asymmetric in the one direction that
+# corrupts the comparison: MAX_MODEL_LEN is the ONLY context limit in the vLLM
+# arm (litellm has no registry entry for a self-hosted model, so nothing
+# truncates client-side, and the condenser bounds history by MESSAGE COUNT, not
+# tokens), while **Pie has no fixed cap at all** — its ceiling is memory-planned.
+# So an unsourced env file silently gives vLLM a 4x smaller context than Pie and
+# fails it on inputs Pie serves fine, which reads as an accuracy difference and
+# is not one.
+#
+# Refuse to guess. `source /workspace/pie-bench-env.sh` sets it per GPU.
+if [ -z "${MAX_MODEL_LEN:-}" ]; then
+    echo "FATAL: MAX_MODEL_LEN is not set." >&2
+    echo "       Run 'source /workspace/pie-bench-env.sh' first — it sets the value" >&2
+    echo "       this GPU's KV budget was checked against (00_setup_h200.sh [0])." >&2
+    echo "       Refusing to fall back to a hardcoded default: the vLLM arm's" >&2
+    echo "       context cap is the one knob Pie has no equivalent of, so a wrong" >&2
+    echo "       value silently biases the comparison instead of failing." >&2
+    exit 2
+fi
+
+# --- the tuned MoE config must exist BEFORE we spend 3 minutes booting ---------
+# The fairness gate (assert_vllm_fair.sh) already catches an untuned 'fair' run,
+# but only from the banner, i.e. after a full model load. Whether a config will
+# resolve is knowable in two seconds, so know it in two seconds.
+#
+# This is NOT the same on every sm_90 board, which is the trap:
+#   H200 - vLLM 0.25.1 SHIPS E=128,N=768,device_name=NVIDIA_H200.json.
+#          Nothing to export. START_HERE_H200.md says "don't set
+#          VLLM_TUNED_CONFIG_FOLDER" and is right *for that box*.
+#   H100 - vLLM ships NO bf16 E=128,N=768 config (verified 2026-07-29 against the
+#          v0.25.1 tree). The 'fair' tier REQUIRES
+#          VLLM_TUNED_CONFIG_FOLDER=/workspace/tuned_moe_h100 — see that folder's
+#          PROVENANCE.md and VALIDATION.md, both of which must be cited with any
+#          H100 fair-tier number.
+if [ "$VLLM_TIER" = "fair" ]; then
+    "$PIE_VENV/bin/python" - <<'PY' || exit 2
+import os, sys, torch
+import vllm.model_executor.layers.fused_moe.fused_moe as fm
+from vllm.model_executor.layers.fused_moe.fused_moe import get_config_file_name
+name = get_config_file_name(128, 768, None, None)
+folder = os.environ.get("VLLM_TUNED_CONFIG_FOLDER")
+cands = ([os.path.join(folder, name)] if folder else []) + \
+        [os.path.join(os.path.dirname(fm.__file__), "configs", name)]
+for p in cands:
+    if os.path.exists(p):
+        print(f"  [ ok ] tier 'fair': MoE config resolves -> {p}")
+        sys.exit(0)
+print(f"FATAL: tier 'fair' but no tuned MoE config for {torch.cuda.get_device_properties(0).name}.", file=sys.stderr)
+print(f"       vLLM looks for: {name}", file=sys.stderr)
+for p in cands:
+    print(f"       tried: {p}", file=sys.stderr)
+if not folder:
+    print("       VLLM_TUNED_CONFIG_FOLDER is unset. On a board where vLLM ships no", file=sys.stderr)
+    print("       config for this shape (e.g. H100) the fair tier needs one exported.", file=sys.stderr)
+sys.exit(1)
+PY
+fi
+
 mkdir -p "$LOG_DIR" "$PRED_DIR"
 EXTRA_ARGS=("$@"); [ ${#EXTRA_ARGS[@]} -eq 0 ] && EXTRA_ARGS=(--subset-size 50)
 TS=$(date +%Y%m%d_%H%M%S)
@@ -59,7 +120,7 @@ PYTHONPATH="" HF_HOME=$HF_HOME \
     --port "$VLLM_PORT" \
     --enable-prefix-caching \
     --gpu-memory-utilization "${GPU_MEM_UTIL:-0.90}" \
-    --max-model-len "${MAX_MODEL_LEN:-32768}" \
+    --max-model-len "$MAX_MODEL_LEN" \
     --generation-config vllm \
     --enable-auto-tool-choice \
     --tool-call-parser "$TOOL_CALL_PARSER" \

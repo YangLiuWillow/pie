@@ -1,0 +1,86 @@
+# CONFIG B for H100 — "latency plan + forced page 32".
+#
+# Same hardware, weights, page size and attention paths as CONFIG A
+# (pie_cuda_native_config_30b_moe_h100.toml). The ONLY difference is
+# memory_profile. Read A's comments first — in particular A's note on the ~15 GiB
+# H100 KV budget, which is ~4x smaller than the H200 arms ran with and is not
+# repeated here.
+#
+# REQUIRES `PIE_CUDA_KV_PAGE_SIZE=32`, same as A. Expected banner is identical:
+#   page_size=32 (auto) ... prefill_decode_plan=on xqa_decode=on
+#
+# *** READ THIS BEFORE RUNNING THIS ARM ON H100: IT IS PROBABLY A DUPLICATE OF A.
+#
+# On H200, `auto` resolved to `balanced`, so CONFIG B (explicit `latency`) was a
+# genuinely different plan. On THIS box it does not. The 2026-07-29 gate check,
+# running CONFIG A (memory_profile = "auto"), printed:
+#
+#   memory planner: profile=auto resolved_profile=latency selector=rule ...
+#   decode_target=512 prefill_target=8192 page_size=32 (auto)
+#
+# `auto` already RESOLVES TO `latency` here — the smaller memory total moves the
+# rule selector. So CONFIG A and CONFIG B are expected to produce the same plan
+# on H100, and B's decode_target/prefill_target should come out identical to A's
+# (512 / 8192).
+#
+# That makes this file's own warning (bottom of this header) load-bearing rather
+# than theoretical: CHECK THE PLANNER BANNER FIRST. If B's targets match A's,
+# the two arms are the same configuration and any measured delta is run-to-run
+# noise — do not report it as a profile effect, and consider skipping the arm.
+#
+# The arm is still worth keeping for the case where it does NOT duplicate A:
+# `latency` is set explicitly here, so if a future planner change makes `auto`
+# resolve to `balanced` on this board, this file keeps the comparison available.
+#
+# WHAT THIS WOULD TEST, where the profiles do differ. Under `balanced` the
+# planner sizes for concurrent decode rows and a large prefill target. The serial
+# A/B workload is the opposite of that: ONE session, strictly serial, ~190
+# completion tokens per call against a ~30k-token prompt that is 94-96%
+# prefix-reused.
+#
+# `latency` changes two planner inputs (cuda_memory_planner.cpp):
+#   :198  decode sm_factor 6 -> 4
+#   :226  prefill target halved     (the real change)
+# It also flips the page-size preference harder toward 16 (:721, 16 -> +0.20,
+# 32 -> -0.20), which the env var overrides — so B fights the planner slightly
+# MORE than A does, not less. That is deliberate: it isolates plan shape from
+# page size, since both configs are pinned to 32.
+#
+# THE sm_factor ARITHMETIC IS UNCHANGED FROM H200 AND THAT IS NOT AN OVERSIGHT:
+# H100 SXM and H200 SXM are the same GH100 die with the same **132 SMs**
+# (confirmed on this pod via torch's multi_processor_count). So the H200 note
+# still holds exactly — 132 SMs gives 792 -> 528, both of which clamp to 512,
+# making that half of the profile change a no-op here too.
+#
+# What DOES differ from H200 is the prefill target's practical effect: with only
+# ~15 GiB of KV, halving the prefill target frees proportionally much more of the
+# pool than it did on a 141 GB board. If B ever beats A on H100 by more than it
+# did on H200, that is the likely mechanism — check the planner banner's
+# decode_target/prefill_target before attributing it to anything else.
+#
+# Do not read a B-beats-A result as "latency is the right profile" without
+# checking the planner banner — if decode_target and prefill_target come out
+# identical to A's, the two configs are the same plan and any delta is noise.
+[auth]
+enabled = false
+
+[server]
+verbose = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+# THE VARIABLE UNDER TEST. Everything else matches CONFIG A byte for byte.
+memory_profile = "latency"
+kv_page_size = 32          # inert — see CONFIG A. The env var is the control.
+weight_dtype = "bfloat16"
+swap_pool_size = 0
