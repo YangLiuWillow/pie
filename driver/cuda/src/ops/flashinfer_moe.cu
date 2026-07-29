@@ -353,4 +353,86 @@ bool flashinfer_cutlass_moe_bf16_relu2(
     return true;
 }
 
+// Probe helper for the doctor entry point below. Takes the activation as a plain
+// int so the diagnostic code needs none of this file's internal type aliases.
+// ActivationType: Gelu=0 Relu=1 Silu=2 Swiglu=3 Geglu=4 SwigluBias=5 Relu2=6.
+std::size_t moe_probe_workspace_bytes(
+    int act_raw, int num_rows, int hidden, int inter, int experts, int topk) {
+    Runner& runner = get_runner();
+    return runner.getWorkspaceSize(
+        num_rows, hidden, inter, experts, topk,
+        static_cast<ck::ActivationType>(act_raw),
+        parallelism_config(/*tp_size=*/1, /*tp_rank=*/0),
+        false, false, false, false, false);
+}
+
 }  // namespace pie_cuda_driver::ops
+
+// -----------------------------------------------------------------------------
+// Diagnostic probe, reachable from `pie driver cuda-native doctor`.
+//
+// WHY THIS EXISTS. Reading `case ActivationType::Swiglu:` in the activation
+// dispatch switch is NOT evidence that the runner can serve a given MoE shape:
+// the workspace calculation separately requires that at least one TMA
+// warp-specialized GEMM config be valid for (hidden, inter, experts, gated?),
+// and if none is, getWorkspaceSize throws "Could not find valid config".
+// That is exactly how the 2026-07-29 Qwen3-MoE attempt failed, after a code
+// reading said it should work.
+//
+// This answers the question in under a second with NO MODEL LOAD, so the
+// activation-vs-shape distinction can be settled before writing integration
+// code. Fills `out` with a human-readable report; never throws.
+extern "C" void pie_driver_cuda_moe_probe(char* out, int out_len) {
+    if (out == nullptr || out_len <= 0) return;
+    std::string r;
+    // ActivationType enum values (common.h): Swiglu=3, Relu2=6.
+    constexpr int kSwiglu = 3;
+    constexpr int kRelu2 = 6;
+
+    struct Shape { const char* name; int hidden; int inter; int experts; int topk; };
+    // Qwen3-Coder-30B-A3B is the first row. The rest vary ONE dimension at a
+    // time so a failure can be attributed rather than guessed at.
+    const Shape shapes[] = {
+        {"qwen3-30b-a3b   ", 2048, 768,  128, 8},
+        {"  inter 768->1536", 2048, 1536, 128, 8},
+        {"  inter 768->2048", 2048, 2048, 128, 8},
+        {"  experts 128->64", 2048, 768,  64,  8},
+        {"  hidden 2048->4096", 4096, 768, 128, 8},
+    };
+    const struct { const char* name; int act; } acts[] = {
+        {"swiglu(gated)", kSwiglu},
+        {"relu2 (plain)", kRelu2},
+    };
+
+    r += "  moe-probe (CutlassMoeFCRunner<bf16,bf16>, num_rows=512, tp=1)\n";
+    for (const auto& s : shapes) {
+        for (const auto& a : acts) {
+            r += "    ";
+            r += s.name;
+            r += "  ";
+            r += a.name;
+            r += " : ";
+            try {
+                const std::size_t bytes =
+                    pie_cuda_driver::ops::moe_probe_workspace_bytes(
+                        a.act, 512, s.hidden, s.inter, s.experts, s.topk);
+                if (bytes == 0) {
+                    r += "0 bytes (runner declined without error)";
+                } else {
+                    r += "OK, workspace ";
+                    r += std::to_string(bytes >> 20);
+                    r += " MiB";
+                }
+            } catch (const std::exception& e) {
+                std::string msg(e.what());
+                // Keep only the first line; TllmException carries a stack trace.
+                const auto nl = msg.find('\n');
+                if (nl != std::string::npos) msg = msg.substr(0, nl);
+                if (msg.size() > 110) msg = msg.substr(0, 110) + "...";
+                r += "FAIL: " + msg;
+            }
+            r += "\n";
+        }
+    }
+    std::snprintf(out, static_cast<std::size_t>(out_len), "%s", r.c_str());
+}

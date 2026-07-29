@@ -526,6 +526,16 @@ fn doctor_embedded(name: &str) -> Result<()> {
             }
             Err(e) => println!("  nvidia-smi: skipped ({e})"),
         }
+
+        // Which MoE shapes can the CUTLASS fused-MoE runner actually serve?
+        // Cheap (no model load) and worth having in `doctor` because the answer
+        // is not readable from the source: the activation dispatch switch lists
+        // Swiglu, but the workspace calculation separately needs a valid TMA
+        // warp-specialized GEMM config for the shape, and can find none.
+        #[cfg(feature = "driver-cuda")]
+        if compiled {
+            print!("{}", crate::driver_ffi::cuda_moe_probe());
+        }
     }
     Ok(())
 }

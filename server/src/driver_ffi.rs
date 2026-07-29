@@ -43,6 +43,28 @@ unsafe extern "C" {
         vtable: pie::driver::InProcVTable,
     ) -> c_int;
     fn pie_driver_cuda_request_stop();
+
+    /// Fills `out` with a report of which (MoE shape x activation) combinations
+    /// the CUTLASS fused-MoE runner can serve. Costs a runner construction and
+    /// some config enumeration -- NO model load -- so `doctor` can answer
+    /// "is this kernel usable for my model" in about a second.
+    ///
+    /// Exists because reading the activation dispatch switch is not evidence:
+    /// the workspace calculation independently requires a valid TMA
+    /// warp-specialized GEMM config for the shape, and Qwen3-MoE's
+    /// (hidden=2048, inter=768, E=128) found none.
+    fn pie_driver_cuda_moe_probe(out: *mut c_char, out_len: c_int);
+}
+
+/// Safe wrapper over [`pie_driver_cuda_moe_probe`].
+#[cfg(feature = "driver-cuda")]
+pub fn cuda_moe_probe() -> String {
+    let mut buf = vec![0u8; 8192];
+    unsafe {
+        pie_driver_cuda_moe_probe(buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 // The dummy driver is a Rust crate (rlib) in this workspace. We call
