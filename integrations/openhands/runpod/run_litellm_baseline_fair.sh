@@ -83,6 +83,16 @@ if ! bash "$RUNPOD_DIR/assert_vllm_fair.sh" "$VLLM_LOG" "$VLLM_TIER"; then
 fi
 
 # --- run the harness (identical to upstream below the LLM boundary) ----------
+#
+# MAX_OUTPUT_TOKENS matches PieLLM's per-call cap (pie_openhands/llm.py: "or
+# 2048"). Without it the arms are not comparable and vLLM is the one that
+# suffers: openhands.sdk resolves max_output_tokens from litellm's model
+# registry, which has no entry for a self-hosted Qwen, so it stays None and
+# generation is bounded only by max_model_len. Measured 2026-07-29: one call
+# generated at ~200 tok/s for 15+ minutes and timed out the client twice,
+# stalling the whole arm. The 303 s call in AGENT_HANDOVER_20260728.md §4b is
+# the same bug, milder.
+MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS:-2048}
 PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 HF_HOME=$HF_HOME \
   "$VENV/bin/python" -m "$HARNESS" \
     --backend litellm \
@@ -91,6 +101,7 @@ PYTHONPATH="" OPENHANDS_SUPPRESS_BANNER=1 HF_HOME=$HF_HOME \
     --api-key dummy \
     --output "$OUTPUT" \
     --label "$LABEL" \
+    --max-output-tokens "$MAX_OUTPUT_TOKENS" \
     --verbose \
     "${EXTRA_ARGS[@]}"
 

@@ -139,6 +139,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--temperature", type=float, default=None,
                    help="LLM sampling temperature (0 = greedy). Passed to the "
                         "litellm/pie backend's LLM constructor.")
+    p.add_argument("--max-output-tokens", type=int, default=None,
+                   help="Cap on generated tokens per call. REQUIRED for an "
+                        "apples-to-apples litellm arm: PieLLM caps every call "
+                        "at 2048 (pie_openhands/llm.py), while openhands.sdk's "
+                        "LLM leaves max_output_tokens None and resolves it from "
+                        "litellm's model registry — which has no entry for a "
+                        "self-hosted model ('isn't mapped yet'), so it stays "
+                        "None and nothing bounds generation. A repetition loop "
+                        "then runs to the context cap: observed as ~200 tok/s "
+                        "for 11+ minutes per call, tripping the client timeout.")
 
 
     args = p.parse_args(argv)
@@ -151,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     backend_kwargs: dict = {}
     if args.temperature is not None:
         backend_kwargs["temperature"] = args.temperature
+    if args.max_output_tokens is not None:
+        backend_kwargs["max_output_tokens"] = args.max_output_tokens
     if args.native_tool_calling is not None:
         backend_kwargs["native_tool_calling"] = args.native_tool_calling
     if args.log_completions:

@@ -9,6 +9,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIE=${PIE_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/release/pie}
 BACKEND=${BACKEND:-pie}
+# Per-call generation cap. 2048 is what PieLLM has always used implicitly
+# (pie_openhands/llm.py: "or 2048"); passing it explicitly keeps this arm and
+# the litellm arm auditably matched — see the note in
+# runpod/run_litellm_baseline_fair.sh for what an unmatched cap did.
+MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS:-2048}
 CFG=${CFG:-$SCRIPT_DIR/tests/fixtures/pie_cuda_vllm_config.toml}
 MODEL=${MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}
 LABEL=${LABEL:-pie+qwen2.5-coder-7b}
@@ -175,6 +180,7 @@ while true; do
         --pie-request-timeout-s "$REQUEST_TIMEOUT_S" \
         --output "$OUTPUT" \
         --label "$LABEL" \
+        --max-output-tokens "$MAX_OUTPUT_TOKENS" \
         --verbose \
         --resume \
         "${EXTRA_ARGS[@]}"
