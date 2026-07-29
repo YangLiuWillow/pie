@@ -1182,7 +1182,9 @@ int run_impl(int argc,
             weights_qwen3_5, hf_q,
             qwen3_5_la_ws, qwen3_5_state_cache, qwen3_5_plan_state,
             kv_cache, q35_tp_size, q35_tp_comm,
-            /*force_prefill_path=*/!pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q),
+            /*force_prefill_path=*/
+                pie_cuda_driver::model::qwen35_tensor_core_decode_enabled() ||
+                !pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q),
             /*small_prefill_naive_attention_max_tokens=*/pie_cuda_driver::model::qwen35_small_spec_graph_tokens(),
             /*graph_safe=*/kv_cache.format().is_native_bf16() &&
                 !pie_cuda_driver::model::qwen35_forward_profile_enabled(),
@@ -1203,12 +1205,31 @@ int run_impl(int argc,
         const auto& hf_q = engine.hf_config();
         const int gqa_q_moe = hf_q.num_attention_heads /
                               std::max(1, hf_q.num_key_value_heads);
+        // Print the decision from the config this model ACTUALLY uses. The
+        // model_type banner below reports llama_like's fwd_cfg, which qwen3_moe
+        // never executes — reading a feature off that line is how `xqa_decode=on`
+        // misled this investigation for a day.
+        {
+            const bool tc = pie_cuda_driver::model::qwen35_tensor_core_decode_enabled();
+            const bool in_set =
+                pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q_moe);
+            std::cerr << "[pie-driver-cuda] qwen3.5-moe attention: gqa=" << gqa_q_moe
+                      << " flashinfer_decode_supports_gqa=" << (in_set ? 1 : 0)
+                      << " tensor_core_decode="
+                      << (tc ? "on (PIE_QWEN35_TENSOR_CORE_DECODE)" : "off")
+                      << " -> decode kernel="
+                      << ((tc || !in_set) ? "paged-prefill (tensor core)"
+                                          : "BatchDecodeWithPagedKVCache (cuda core)")
+                      << "\n";
+        }
         qwen3_5_moe_model = std::make_unique<pie_cuda_driver::model::Qwen35MoeModel>(
             weights_qwen3_5_moe, hf_q,
             qwen3_5_la_ws, qwen3_5_moe_ws,
             qwen3_5_state_cache, qwen3_5_plan_state,
             kv_cache, q35moe_tp_size, q35moe_tp_comm,
-            /*force_prefill_path=*/!pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q_moe),
+            /*force_prefill_path=*/
+                pie_cuda_driver::model::qwen35_tensor_core_decode_enabled() ||
+                !pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q_moe),
             /*small_prefill_naive_attention_max_tokens=*/pie_cuda_driver::model::qwen35_small_spec_graph_tokens(),
             /*graph_safe=*/[]{
                 const char* env = std::getenv("PIE_QWEN35_MOE_PROFILE");

@@ -5,6 +5,14 @@
 
 namespace pie_cuda_driver::model {
 
+bool qwen35_tensor_core_decode_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_TENSOR_CORE_DECODE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 int qwen35_small_spec_graph_tokens() {
     static const int tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_SPEC_VERIFY_GRAPH_N");

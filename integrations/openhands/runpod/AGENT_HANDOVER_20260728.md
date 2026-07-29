@@ -455,9 +455,66 @@ with `qo_indptr = [0,1,…,R]` and `causal=false`, then re-run
 `42_context_sweep.sh`. **The metric is the slope, not the rate** — the intercept
 is a different problem (§6a-quater).
 
-Confidence: the structural difference is established. That it accounts for the
-*whole* 2.12× is a hypothesis, and the sweep is a ~12-minute test of it. Given
-this study's record (§6a-ter), run it before believing it.
+### 6a-sexies. RESULT — tensor-core decode closes the attention gap and passes it
+
+`PIE_QWEN35_TENSOR_CORE_DECODE=1` (new, `qwen3_5_config.cpp`) forces
+`force_prefill_path`, routing pure-decode batches through the paged-prefill
+kernel. The plumbing already existed — it was only ever reached as a *fallback*
+for GQA ratios outside FlashInfer's decode set `{1,2,3,4,8}`. This model is
+ratio 8, i.e. in the set, so it never took it.
+
+Same sweep, same pod, same binary, flag off then on:
+
+| prompt tokens | off (ms/tok) | on (ms/tok) | speedup |
+|---|---|---|---|
+| 1,036 | 5.449 | 5.053 | 1.08× |
+| 8,020 | 5.924 | 5.230 | 1.13× |
+| 16,012 | 6.234 | 5.419 | 1.15× |
+| 24,004 | 7.079 | 5.626 | 1.26× |
+| 31,996 | 7.191 | 5.791 | **1.24×** |
+
+| | off | **on** | vllm |
+|---|---|---|---|
+| slope per 1k KV | 0.0562 ms | **0.0242 ms** | 0.0265 ms |
+| implied KV read | 1,748 GB/s (36%) | **4,068 GB/s (85%)** | 3,708 GB/s (77%) |
+| intercept | 5.496 ms | **5.030 ms** | 4.173 ms |
+
+**Pie's KV read now beats vLLM's — 4,068 vs 3,708 GB/s, 85% of the H200's peak
+against vLLM's 77%.** The 2.12× attention deficit is not merely closed, it is
+reversed to a 1.10× lead. The intercept also improved 8.5% (the prefill plan
+avoids some per-call decode-plan work), though at 5.030 vs 4.173 ms the fixed
+term is still 1.21× behind and remains the open problem.
+
+Decode gap against vLLM at 25k context: **1.43× → 1.16×**.
+
+End-to-end on the real agent workload (`django__django-14373`, same instance,
+comparable context 25,520 vs 25,911, valid patch, no errors):
+
+| | decode tok/s | effective tok/s | iters |
+|---|---|---|---|
+| base | 147.5 | 129.3 | 48 |
+| tensor-core decode | **178.2** | **152.2** | 46 |
+
+**+20.8% decode throughput from a three-line dispatch change.**
+
+The control is solid: re-running the flag-off sweep on the new binary reproduced
+the original fit to within 0.1% (slope 0.05625 vs 0.05626, KV 1747.6 vs 1747.2),
+so the delta is the flag and not drift. The driver prints which kernel it chose
+(`qwen3.5-moe attention: … -> decode kernel=…`) — deliberately at the
+qwen3_5_moe construction site, using the config this model actually executes,
+because the `model_type=` banner reports llama_like's `fwd_cfg` and reading a
+feature off that line is what made `xqa_decode=on` mislead this study for a day.
+
+**Why it is still env-gated, and what to test before flipping the default.**
+On the prefill path `enable_graph` requires `total_tokens <=
+qwen35_small_spec_graph_tokens()` (default **17**,
+`qwen3_5_forward.cpp:1149-1151`). On decode `total_tokens == R`, so **above 17
+concurrent requests this silently drops CUDA graphs** and could regress hard.
+Everything above is batch 1; the concurrency arms reach mean R=2.63, max ~7, so
+the measured regime is safe — but R can legitimately reach 512. Before making
+this the default: run `40_concurrency_sweep.sh` with the flag at c8 **and** a
+high-R probe past 17, or raise the graph threshold for the decode-as-prefill
+case. Do not ship it on the strength of batch-1 numbers alone.
 
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 
