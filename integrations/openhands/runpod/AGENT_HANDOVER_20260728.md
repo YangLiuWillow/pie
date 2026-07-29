@@ -4,6 +4,10 @@
 > machine-state and storage rules still apply. `RUN_STATE.md` §0 and
 > `AGENT_HANDOVER_H200.md` §1 are now **partly wrong** — see §3 below before you
 > act on anything either says about xqa or the A100 arm.
+>
+> **§4b and §6a are superseded by §10 (2026-07-29).** Every ratio they quote was
+> measured against a vLLM arm whose generation was unbounded, and against a Pie
+> arm predating the decode work. Do not quote 1.73× or 2.52×.
 
 ## 1. The thirty-second version
 
@@ -786,3 +790,163 @@ neither `Prediction` (`swe_bench.py`) nor `Result` (`humanevalfix.py`) had the
 fields in this tree, so `Prediction(**metrics)` raised `TypeError` and **every
 instance was recorded as a 0-iteration failure with an empty patch.** The
 matching version lived on the previous pod's local disk and went with it.
+
+## 10. 2026-07-29 — the concurrency question, re-measured fairly
+
+Supersedes §4b and §6a. Two things changed since those were written: the decode
+work of §6a-sexies … §6a-nonies landed (`4b7855c4` and back), and **the vLLM arm
+turned out to have been measured with generation unbounded**. Both arms were
+re-run at c1 / c8 / c16 on the same 13 instances.
+
+### 10a. The fairness bug — vLLM was under-measured, not Pie over-measured
+
+`PieLLM` has always capped every call at 2048 tokens (`pie_openhands/llm.py`:
+`or 2048`). `openhands.sdk`'s `LLM` leaves `max_output_tokens` at `None` and
+resolves it from litellm's model registry — which has **no entry for a
+self-hosted model** (the benign-looking *"isn't mapped yet"* warning that this
+tree has been printing for days). So it stayed `None`, and **nothing bounded
+vLLM's generation** except `max_model_len`.
+
+What that does when the model falls into a repetition loop, observed directly in
+`logs/sweep_20260729_041212/litellm_c1.log`:
+
+```
+04:55:37 ERROR litellm.Timeout: APITimeoutError - Request timed out. Attempt #1
+05:10:47 ERROR litellm.Timeout: APITimeoutError - Request timed out. Attempt #2
+```
+
+One call, two 300 s client timeouts fifteen minutes apart, generating at ~200
+tok/s the whole time. **That arm produced a 0-byte predictions file** —
+`predictions/ab_h200_litellm_fair_c1_20260729_043858.jsonl` is still there as
+evidence. §4b's unexplained **303.55 s single call** is the same bug, milder, and
+§4b already noted that one stall *"is the entire margin"* on litellm-c1's wall
+clock. It was.
+
+Fixed by giving the harness `--max-output-tokens` and passing 2048 from **both**
+runner scripts, so the cap is auditable in the command line rather than implicit
+in one backend:
+
+| file | change |
+|---|---|
+| `benchmarks/run_swe_bench.py` | `--max-output-tokens` → `backend_kwargs` |
+| `run_pie_backend.sh` | `MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS:-2048}`, passed |
+| `runpod/run_litellm_baseline_fair.sh` | same, with the reasoning inline |
+
+Passing it on the Pie side changes nothing numerically — it restates the cap
+`PieLLM` already applied. It is there so the two command lines match on
+inspection.
+
+**This cuts against Pie.** Every published ratio in §4b/§6a compared Pie to a
+vLLM arm that was intermittently stalling. The corrected numbers below are worse
+for Pie on latency than §4b's and better on throughput than §6a's, and the
+throughput improvement is the decode work, not the cap.
+
+### 10b. The arms
+
+All eight arms: 13/13 instances, `rc=0`, **zero errors**. `tc` = the
+`PIE_QWEN35_TENSOR_CORE_DECODE` state the driver actually printed (§6a-sexies);
+`inst/hr` is instances per GPU-hour from the arm makespan in
+`logs/sweep_20260729_*/SWEEP_SUMMARY.tsv`.
+
+> `predictions/` and `logs/` are **gitignored and pod-local**. The full per-arm
+> numbers, with the predictions file and server log each row came from, are
+> committed in `runpod/results_20260729_concurrency.tsv` so they survive the pod.
+
+| arm | span s | inst/hr | agg tok/s | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| pie c1 `tc=on` | 804 | 58.2 | 114.9 | 0.92 | 2.85 | 6.46 | 10.7 |
+| litellm c1 fair | 840 | 55.7 | 124.1 | **0.70** | 2.92 | 8.29 | 10.3 |
+| pie c8 `tc=on` | 383 | 122.2 | 269.5 | 3.08 | 10.97 | 21.18 | 41.2 |
+| pie c8 `tc=off` | 482 | 97.1 | 213.6 | 4.39 | 15.93 | 37.15 | 68.8 |
+| litellm c8 fair | 275 | **170.2** | **333.5** | **1.69** | 7.04 | 15.32 | 17.2 |
+| litellm c8 *pre-cap* | 419 | 111.7 | 252.4 | 1.77 | 8.61 | 15.16 | 18.0 |
+| pie c16 `tc=on` | 339 | 138.1 | 291.1 | 5.08 | 17.12 | 37.22 | 72.5 |
+| litellm c16 fair | 281 | 166.5 | 354.2 | 2.62 | 10.95 | 22.07 | 43.1 |
+
+**The 303 s tail is gone.** Worst single call across every capped arm is 43.1 s
+(litellm c16), against 303.6 s in §4b. Latency comparisons are now meaningful.
+
+### 10c. Tensor-core decode is worth ~26% on the real workload under load
+
+§6a-sexies measured the flag on microbenchmarks and one single-stream agent run.
+The c8 pair above is the first **concurrent, end-to-end** measurement, same
+binary, same 13 instances, identical planner banner (`kv_tokens=622112` in both):
+
+| | `tc=off` | `tc=on` | gain |
+|---|---|---|---|
+| inst/GPU-hr | 97.1 | **122.2** | **+25.9%** |
+| aggregate tok/s | 213.6 | **269.5** | **+26.2%** |
+| median call latency | 4.39 s | **3.08 s** | **1.43×** |
+| p99 | 37.15 s | 21.18 s | 1.75× |
+| max | 68.8 s | 41.2 s | 1.67× |
+
+The tail improves more than the median, which is what §6a-septies' batch sweep
+predicted: the margin grows with R, so the forwards that carry the most requests
+gain the most. **Nothing here contradicts the recommendation in §6a-septies to
+make it the default** — it is now validated on the workload, not just the
+microbenchmark.
+
+### 10d. Where the gap against vLLM actually stands
+
+| concurrency | pie inst/hr | vllm inst/hr | ratio | was (2026-07-28) |
+|---|---|---|---|---|
+| 1 | 58.2 | 55.7 | **0.96×** (see caveat) | 0.79× |
+| 8 | 122.2 | 170.2 | **1.39×** | 2.52× |
+| 16 | 138.1 | 166.5 | **1.21×** | not measured |
+
+Median call latency at c1: **0.92 s vs 0.70 s = 1.32×**, down from §4b's 1.73×.
+
+**The headline: 2.52× → 1.39× at c8.** That is the decode work, measured against
+a vLLM arm that is now faster than the one it was originally compared to.
+
+**vLLM saturates at c8; Pie does not.** 170.2 → 166.5 inst/GPU-hr from c8 to c16
+(flat, marginally down) against Pie's 122.2 → 138.1 (+13%), so the gap closes
+from 1.39× to 1.21× purely by adding load. That is the first evidence in this
+study of Pie's scheduling *gaining* on vLLM anywhere, and it is the opposite of
+§6a's conclusion that "concurrency widens the gap."
+
+**Two caveats, both of which must travel with these numbers.**
+
+1. **c16 is not a 16-way measurement.** There are only 13 instances, so `c16`
+   means "all 13 at once, decaying as they finish." Both arms are equally
+   affected, so the *ratio* holds, but neither arm's c16 figure is a steady-state
+   throughput number. Measuring past c8 properly needs more instances.
+2. **Do not read c1 as a Pie win.** `scikit-learn__scikit-learn-12973` in the pie
+   c1 arm degenerated — the agent replied without tool calls ten times, hit the
+   fake-response cap, and stopped after **7.4 s with a 0-byte patch and 10
+   stuck-retries** (`sweep_20260729_041212/pie_c1.log:1009`). A normal instance in
+   that arm takes ~55 s. Add it back and pie c1 is ~854 s ≈ 54.8 inst/hr, i.e.
+   **a tie with litellm's 55.7, not a 0.96× lead**. This is §4b's own lesson
+   arriving in Pie's favour this time: one anomalous instance is the entire
+   margin. It is an agent-behaviour failure, not a serving one — but it is in the
+   wall clock either way.
+
+### 10e. One thing measured and deliberately not claimed
+
+litellm c8 pre-cap (419 s) vs post-cap (275 s) is a 52% swing, and the obvious
+story is that the cap fixed it. **That story does not survive checking.** The
+pre-cap arm's worst call was 18.0 s — no stall — and it generated only 15% more
+tokens (105,735 vs 91,719). 15% more work does not make 52% more wall clock, and
+the timeout/retry counts in the two logs are identical. So the cap is *not*
+demonstrated to be the cause here, and the swing is unexplained run-to-run
+variance in the vLLM arm.
+
+That matters for how much confidence §10d's c8 row deserves: **there is at least
+one unexplained ~50% swing in a vLLM c8 arm, and only one sample per arm.** The
+1.39× is a point estimate on a noisy measurement. Repeat both c8 arms two or
+three times before anyone publishes it. The `tc=on`/`tc=off` pair in §10c is on
+firmer ground — same engine, same harness, and the direction agrees with three
+independent prior measurements.
+
+### 10f. Next
+
+1. **Repeat c8 both arms ×3.** Cheapest way to turn §10d's headline into a
+   quotable number, and §10e says it is currently not one.
+2. **More instances.** 13 caps the concurrency axis at ~13 and makes every
+   makespan hostage to one degenerate trajectory (§10d caveat 2). The 500-instance
+   SWE-bench-verified subset would fix both.
+3. **The intercept is still the open decode problem** — 4.533 ms vs vLLM's 4.173
+   (§6a-nonies' Cumulative). Unchanged by anything here.
+4. Accuracy is **still unmeasured** and still cannot be measured on this pod
+   (no docker/apptainer/swebench). Every number in this document is serving
+   speed only.

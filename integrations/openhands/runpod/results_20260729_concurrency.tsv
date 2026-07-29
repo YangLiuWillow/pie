@@ -1,0 +1,9 @@
+arm	concurrency	tensor_core_decode	max_output_tokens	instances	errors	empty_patches	makespan_s	inst_per_gpu_hr	agg_tok_s	iters	s_per_iter	lat_p50	lat_p90	lat_p99	lat_max	prompt_tok	completion_tok	predictions_file	server_log
+pie	1	on	2048	13	0	1	804	58.2	114.9	835	0.939	0.92	2.85	6.46	10.7	10219773	92381	ab_h200_pie_auto_p32_c1_20260729_042534.jsonl	pie_serve_20260729_042534.log
+litellm	1	-	2048	13	0	0	840	55.7	124.1	848	0.861	0.70	2.92	8.29	10.3	11014380	104258	ab_h200_litellm_fair_c1_20260729_052351.jsonl	vllm_serve_fair_20260729_052351.log
+pie	8	on	2048	13	0	0	383	122.2	269.5	846	2.793	3.08	10.97	21.18	41.2	10476688	103232	ab_h200_pie_auto_p32_c8_20260729_041212.jsonl	pie_serve_20260729_041212.log
+pie	8	off	2048	13	0	0	482	97.1	213.6	812	4.050	4.39	15.93	37.15	68.8	10294475	102954	ab_h200_pie_auto_p32_c8_20260729_054811.jsonl	pie_serve_20260729_054811.log
+litellm	8	-	2048	13	0	0	275	170.2	333.5	816	1.707	1.69	7.04	15.32	17.2	10227098	91719	ab_h200_litellm_fair_c8_20260729_055635.jsonl	vllm_serve_fair_20260729_055635.log
+litellm	8	-	none	13	0	0	419	111.7	252.4	894	1.891	1.77	8.61	15.16	18.0	11859284	105735	ab_h200_litellm_fair_c8_20260729_041835.jsonl	vllm_serve_fair_20260729_041835.log
+pie	16	on	2048	13	0	0	339	138.1	291.1	824	4.174	5.08	17.12	37.22	72.5	10278993	98698	ab_h200_pie_auto_p32_c16_20260729_053751.jsonl	pie_serve_20260729_053751.log
+litellm	16	-	2048	13	0	0	281	166.5	354.2	832	2.530	2.62	10.95	22.07	43.1	10750462	99544	ab_h200_litellm_fair_c16_20260729_054330.jsonl	vllm_serve_fair_20260729_054330.log
