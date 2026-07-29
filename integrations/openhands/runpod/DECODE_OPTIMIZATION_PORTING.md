@@ -296,7 +296,42 @@ changing, something else changed too.
 
 ---
 
-## 7. What this does NOT fix
+## 7. Third change: parallel router top-K (all MoE archs)
+
+`kernels/topk_softmax.cu`, `topk_softmax_bf16_kernel`. The K-argmax ran entirely
+on thread 0 — K passes over `num_experts`, so **1024 serial comparisons** at
+E=128, K=8, with the other 63 threads idle. The header's "sequential top-K ...
+fine for E ≤ 64" was accurate when written; Qwen3-30B-A3B is E=128, K=8.
+
+Replace the `if (tid == 0) { ... }` block with a block-parallel version:
+normalize strided across threads, then K rounds of {per-thread best over a
+strided slice → tree reduction}. Keep strict `>` in the per-thread scan (j
+ascends, so the lowest index already wins ties) and in the reduction take the
+other slot on `ov > cv || (ov == cv && oi < ci)`.
+
+**Effect: intercept 4.628 → 4.533 ms, ~2%.** Small, and that is the useful
+signal — the router's cost is the GEMV plus the launch, not the top-K.
+
+**Dead end, do not repeat:** fusing the router GEMV and top-K into one
+block-per-token kernel. Router weights are 512 KB/layer; a block-per-token
+kernel puts that whole read on one SM at batch 1, where cuBLAS spreads it across
+the device. Saving a launch is not worth serialising the read.
+
+### Validating this one
+
+The trajectory test does **not** work here — the agent harness is not
+run-to-run deterministic. The same binary twice gave 48 vs 52 iterations,
+max prompt 31,931 vs 28,316, different patches. `decode_tok_s` over those two
+runs was 194.26 vs 194.52 (0.13%), so compare rates, never trajectories.
+
+Verify the selection logic directly instead: simulate both algorithms over
+random **and heavy-tie / all-equal** inputs across several E and K. Ties are the
+only place the two can diverge. 4,000 cases, 0 mismatches. The reduction only
+compares and never accumulates, so there is no float reassociation.
+
+---
+
+## 8. What this does NOT fix
 
 The intercept is now 4.628 ms against vLLM's 4.173, about **1.11×**, and still
 ~9× off its ~0.51 ms roofline — so it remains kernel-granularity bound, roughly

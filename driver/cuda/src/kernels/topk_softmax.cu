@@ -61,25 +61,70 @@ __global__ void topk_softmax_bf16_kernel(
     const float inv_Z = 1.f / buf[0];
     __syncthreads();
 
-    if (tid == 0) {
-        // Normalize in shared mem, then K-argmax with exclusion.
-        for (int j = 0; j < num_experts; ++j) probs[j] *= inv_Z;
+    // Normalize, then K-argmax with exclusion — both block-parallel.
+    //
+    // This used to run entirely on thread 0: K passes over num_experts, i.e.
+    // 1024 serial comparisons at E=128, K=8, with the other BLOCK-1 threads
+    // idle. The header's "sequential top-K ... fine for E <= 64" was true when
+    // written; Qwen3-30B-A3B ships E=128 with K=8, twice that design point, and
+    // the router then costs about as much as the gate_up GEMM it feeds.
+    //
+    // Selection and tie-breaking are unchanged: strictly-greater wins, ties go
+    // to the lower expert index, so the emitted routing is bit-identical.
+    for (int j = tid; j < num_experts; j += BLOCK) probs[j] *= inv_Z;
+    __syncthreads();
 
-        std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
-        float*        out_w   = topk_w   + static_cast<long long>(n) * K;
-        float w_sum = 0.f;
-        for (int k = 0; k < K; ++k) {
-            int   best_i = -1;
-            float best_v = -1.f;
-            for (int j = 0; j < num_experts; ++j) {
-                if (probs[j] > best_v) { best_v = probs[j]; best_i = j; }
-            }
-            out_idx[k] = best_i;
-            out_w[k]   = best_v;
-            w_sum += best_v;
-            probs[best_i] = -1.f;  // exclude on next pass
+    __shared__ float best_v_s[BLOCK];
+    __shared__ int   best_i_s[BLOCK];
+    __shared__ float w_sum_s;
+    if (tid == 0) w_sum_s = 0.f;
+    __syncthreads();
+
+    std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+    float*        out_w   = topk_w   + static_cast<long long>(n) * K;
+
+    for (int k = 0; k < K; ++k) {
+        // Per-thread best over a strided slice. `j` ascends, so strict `>`
+        // already leaves the lowest index holding a tie.
+        float lv = -1.f;
+        int   li = -1;
+        for (int j = tid; j < num_experts; j += BLOCK) {
+            if (probs[j] > lv) { lv = probs[j]; li = j; }
         }
-        const float inv_w = 1.f / w_sum;
+        best_v_s[tid] = lv;
+        best_i_s[tid] = li;
+        __syncthreads();
+
+        for (int off = BLOCK / 2; off > 0; off >>= 1) {
+            if (tid < off) {
+                const float ov = best_v_s[tid + off];
+                const int   oi = best_i_s[tid + off];
+                const float cv = best_v_s[tid];
+                const int   ci = best_i_s[tid];
+                // Take the other slot on a strictly larger value, or on an
+                // exact tie with a lower index — matching the old ascending
+                // scan. `oi < 0` means that slot found nothing.
+                if (oi >= 0 && (ov > cv || (ov == cv && (ci < 0 || oi < ci)))) {
+                    best_v_s[tid] = ov;
+                    best_i_s[tid] = oi;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const int   bi = best_i_s[0];
+            const float bv = best_v_s[0];
+            out_idx[k] = bi;
+            out_w[k]   = bv;
+            w_sum_s   += bv;
+            if (bi >= 0) probs[bi] = -1.f;  // exclude on next pass
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const float inv_w = 1.f / w_sum_s;
         for (int k = 0; k < K; ++k) out_w[k] *= inv_w;
     }
 }

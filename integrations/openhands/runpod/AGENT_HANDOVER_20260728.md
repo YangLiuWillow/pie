@@ -630,6 +630,58 @@ The next candidates, in order of expected value:
   though it is a legitimate product win.
 - Deeper per-layer fusion (norm+projection, router+topk).
 
+### 6a-nonies. The router — parallel top-K, and a dead end worth recording
+
+`launch_topk_softmax_bf16` ran its K-argmax **entirely on thread 0**: K passes
+over `num_experts` = **1024 serial comparisons** at E=128, K=8, with the other 63
+threads idle. Its own header says "sequential top-K which is fine for E ≤ 64" —
+true when written, and Qwen3-30B-A3B ships E=128 with K=8, twice that design
+point. Replaced with a block-parallel argmax (per-thread strided best, then a
+tree reduction), keeping strictly-greater-wins and ties-to-lower-index so the
+routing is unchanged.
+
+| | + fused QKV | **+ parallel top-K** | vllm |
+|---|---|---|---|
+| intercept | 4.628 ms | **4.533 ms** | 4.173 ms |
+| slope per 1k KV | 0.0237 ms | 0.0241 ms | 0.0265 ms |
+| intercept vs vllm | 1.11× | **1.086×** | — |
+
+**0.095 ms, ~2% of the intercept — real but much smaller than the QKV fusion's
+0.40 ms.** That is itself the finding: the router's cost is the GEMV and the
+launch, not the top-K arithmetic.
+
+**Do not try to fuse the router GEMV and top-K into one kernel.** The obvious
+next step is a single block-per-token kernel computing all 128 dot products then
+selecting. It would be *slower*: the router weights are 512 KB per layer, and a
+block-per-token kernel puts that entire read on **one SM** at batch 1, where
+cuBLAS currently spreads it across the device. Removing a launch is not worth
+serialising the read.
+
+**Equivalence evidence.** The end-to-end trajectory changed — and that means
+nothing here, because **the agent harness is not run-to-run deterministic**: the
+*same binary* run twice gave 48 vs 52 iterations, max prompt 31,931 vs 28,316,
+and different patches. Every per-instance trajectory comparison in this document
+(including §4's 40-vs-38) sits on that noise floor. `decode_tok_s` across those
+two runs was 194.26 vs 194.52 — 0.13% apart, which is why rates and not
+trajectories are the metric.
+
+The selection logic was instead verified directly: 4,000 simulated cases across
+E ∈ {8,64,128,129,256} and K ∈ {1,2,8}, including all-ties and heavy-tie
+adversarial inputs, **0 mismatches** against the old algorithm. The reduction
+only ever compares — it never accumulates — so there is no float reassociation,
+and `w_sum` still sums the K weights in the same order on one thread.
+
+### Cumulative
+
+| | decode tok/s (agent) | intercept | slope | vs vllm decode @25k |
+|---|---|---|---|---|
+| base | 147.5 | 5.496 | 0.0562 | 1.43× |
+| + tensor-core decode | 178.2 | 5.030 | 0.0242 | 1.16× |
+| + fused QKV | 191.2 | 4.628 | 0.0237 | 1.08× |
+| + parallel top-K | **194.4** | **4.533** | 0.0241 | **1.06×** |
+
+**+31.8% decode end-to-end; the decode gap against vLLM is 1.43× → 1.06×.**
+
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 
 SWE-bench agents spend seconds to minutes per iteration running pytest with KV
