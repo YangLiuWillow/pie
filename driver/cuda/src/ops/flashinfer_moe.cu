@@ -356,6 +356,53 @@ bool flashinfer_cutlass_moe_bf16_relu2(
 // Probe helper for the doctor entry point below. Takes the activation as a plain
 // int so the diagnostic code needs none of this file's internal type aliases.
 // ActivationType: Gelu=0 Relu=1 Silu=2 Swiglu=3 Geglu=4 SwigluBias=5 Relu2=6.
+// Probe the LOWER-LEVEL grouped-GEMM runner, the one that takes each MoE GEMM
+// separately and so can express SwiGLU as non-gated fc1 -> elementwise -> fc2.
+// Appends its findings to `r`.
+void moe_probe_gemm_runner(std::string& r) {
+    using GemmRunner =
+        ck::MoeGemmRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
+    GemmRunner runner;
+    const bool tma = runner.supportsTmaWarpSpecialized();
+    r += "    supportsTmaWarpSpecialized : ";
+    r += tma ? "yes\n" : "NO (would fall back to Ampere configs)\n";
+
+    const auto cfgs_plain = runner.getConfigs(/*supports_finalize_fusion=*/false);
+    const auto cfgs_fin   = runner.getConfigs(/*supports_finalize_fusion=*/true);
+    r += "    configs (no finalize fusion) : " +
+         std::to_string(cfgs_plain.size()) + "\n";
+    r += "    configs (finalize fusion)    : " +
+         std::to_string(cfgs_fin.size()) + "\n";
+
+    // getMaxWorkspaceSize(num_experts) forwards to calcMaxWorkspaceSize, which
+    // takes NO shape and iterates configs for a shape-independent worst case.
+    // Calling it cold from here throws, but CutlassMoeFCRunner reaches the same
+    // function successfully for Relu2 -- so this is very likely a call-ORDER
+    // problem in this probe, not a capability limit. Reported as inconclusive
+    // rather than FAIL so nobody reads it as "the split route is dead".
+    r += "    getMaxWorkspaceSize(E=128)   : ";
+    try {
+        const std::size_t gemm_ws = runner.getMaxWorkspaceSize(/*num_experts=*/128);
+        r += std::to_string(gemm_ws >> 20) + " MiB\n";
+    } catch (const std::exception& e) {
+        std::string msg(e.what());
+        const auto nl = msg.find('\n');
+        if (nl != std::string::npos) msg = msg.substr(0, nl);
+        if (msg.size() > 80) msg = msg.substr(0, 80) + "...";
+        r += "INCONCLUSIVE (" + msg + ")\n";
+        r += "      ^ probably called out of order here; CutlassMoeFCRunner does\n";
+        r += "        setup before this and reaches the same fn fine for Relu2.\n";
+    }
+
+    const std::size_t tma_ws = ck::TmaWarpSpecializedGroupedGemmInput::workspaceSize(
+        /*num_experts=*/128,
+        ck::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE);
+    r += "    TmaWS input workspaceSize    : " +
+         std::to_string(tma_ws) + " bytes (problem shapes, strides, ptr arrays)\n";
+    r += "    -> still to write: per-expert problem-shape/stride/pointer fill,\n";
+    r += "       expert-sorted permutation + cumulative counts. Numerics unproven.\n";
+}
+
 std::size_t moe_probe_workspace_bytes(
     int act_raw, int num_rows, int hidden, int inter, int experts, int topk) {
     Runner& runner = get_runner();
@@ -434,5 +481,27 @@ extern "C" void pie_driver_cuda_moe_probe(char* out, int out_len) {
             r += "\n";
         }
     }
+    // ---- standalone grouped-GEMM runner -------------------------------------
+    // The high-level CutlassMoeFCRunner refuses gated activations at
+    // inter_size=768 (rows above). The lower-level MoeGemmRunner takes each GEMM
+    // separately, so SwiGLU can be split into: non-gated fc1 (n=2*I) -> our own
+    // elementwise swiglu -> non-gated fc2 (n=H, k=I). Both of those shapes are
+    // already known good from the rows above (relu2 @ I=1536 covers n=1536;
+    // relu2 @ I=768 covers n=2048,k=768).
+    //
+    // What this reports is whether the runner is DRIVABLE standalone: does it
+    // advertise TMA warp-specialized support, does it return configs, and how
+    // much scratch does it want. It does NOT prove numerics -- that needs the
+    // per-expert problem-shape/stride/pointer fill plus parity_harness.
+    r += "  moe-gemm-runner (standalone, for the split-SwiGLU route)\n";
+    try {
+        pie_cuda_driver::ops::moe_probe_gemm_runner(r);
+    } catch (const std::exception& e) {
+        std::string msg(e.what());
+        const auto nl = msg.find('\n');
+        if (nl != std::string::npos) msg = msg.substr(0, nl);
+        r += "    FAIL: " + msg + "\n";
+    }
+
     std::snprintf(out, static_cast<std::size_t>(out_len), "%s", r.c_str());
 }
