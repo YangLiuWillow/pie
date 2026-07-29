@@ -130,11 +130,69 @@ int qwen35_moe_aligned_decode_min_routes() {
     return min_routes;
 }
 
+// Token count below which the MoE block takes the on-device batched path
+// instead of the host-orchestrated per-expert loop.
+//
+// THE CEILING USED TO BE 128 AND THAT WAS THE BINDING CONSTRAINT ON PREFILL.
+// Measured on H100 (2026-07-29), Qwen3-Coder-30B-A3B, agent workload:
+//
+//   Pie prefill = 102 ms fixed per forward + 0.1908 ms/token
+//                 -> 5,241 tok/s marginal, ~35 TFLOP/s, ~5% of H100 bf16
+//   vLLM prefill = 44,855 tok/s   (8.6x faster)
+//
+// The fixed term is the host path: per LAYER it does one D2H copy of the
+// routing table, one FULL cudaStreamSynchronize, then a 128-iteration expert
+// loop each with 2 H2D copies, 3 kernels and 2 cuBLAS GEMMs of M~=N*K/E. Over
+// 48 layers that is ~43,000 GPU operations and 48 pipeline stalls per forward,
+// independent of how many tokens the forward carries. The on-device path below
+// (`use_decode_fast_path`) has none of that: it builds the route/pointer arrays
+// on device and issues two cublasGemmBatchedEx calls per layer.
+//
+// The old 128 ceiling meant no real prefill could ever reach it -- agent chunks
+// median ~1,000 tokens. It was also unnecessary: the aligned scratch is sized
+// from `maxR = max_workspace_tokens * top_k` at allocation, and a forward can
+// never carry more than `max_workspace_tokens` tokens (512 on this box), so the
+// buffers already cover every N the engine can produce. The tail kernels
+// (`launch_token_batched_weighted_sum{,_add}_bf16`, the aligned gather/reorder)
+// are all parameterised by (N, K, H) and were already N-general.
+//
+// MEASURED RESULT of routing prefill through the on-device path, H100,
+// Qwen3-Coder-30B-A3B, 2026-07-29. Same binary, same server config, the only
+// difference is this value:
+//
+//   prefill sweep (5 sizes, 8.3k-12.0k tokens per forward, base cached):
+//       host (64)        5,183 tok/s
+//       on-device (512) 12,058 tok/s          2.61x - 2.74x at every point
+//   real agent instances (SWE-bench, chunks ~1k):
+//       django-12276     2,917 -> 8,364 tok/s   (2.87x)
+//       django-14373     3,088 -> 9,260 tok/s   (3.00x)
+//
+//   DECODE CONTROL (must not move -- `is_pure_decode` already selected this
+//   path regardless of this variable, so any movement would mean the variable
+//   is doing something other than what it says):
+//       intercept 5.113 -> 5.184 ms (+1.4%), slope 0.03427 -> 0.03418 (-0.3%)
+//       agent decode 159.4 -> 158.0 and 170.4 -> 165.8 tok/s
+//
+//   CORRECTNESS: both instances produced the canonical upstream fix
+//   (use_required_attribute moved to FileInput; "%04d" % year), zero errors,
+//   zero stuck retries, zero non-ascii bytes in the patches.
+//
+// DEFAULT IS NOW "always on-device". That is safe for every N the engine can
+// produce: the aligned scratch is allocated from `maxR = max_workspace_tokens *
+// top_k`, and a forward can never carry more than `max_workspace_tokens`
+// tokens, so the capacity guard in moe_block() cannot fire.
+//
+// Set PIE_QWEN35_MOE_DECODE_FAST_N=64 to restore the host-orchestrated path
+// (one D2H copy + one full cudaStreamSynchronize per layer, then a 128-iteration
+// expert loop). Kept reachable because this changes MoE scheduling for every
+// qwen3_5-family prefill and the evidence is one model on one GPU. If you find
+// a shape where the host path wins, record the measurement next to this comment.
 int qwen35_moe_decode_fast_max_tokens() {
     static const int max_tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_DECODE_FAST_N");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::clamp(std::atoi(v), 0, 128);
+        if (v == nullptr || v[0] == '\0') return 8192;
+        // Upper bound is a sanity rail, not a capability limit.
+        return std::clamp(std::atoi(v), 0, 8192);
     }();
     return max_tokens;
 }
