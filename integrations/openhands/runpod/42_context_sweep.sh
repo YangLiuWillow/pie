@@ -36,7 +36,16 @@ REPS=${SWEEP_REPS:-3}
 # It exists to find the R>17 CUDA-graph cliff on the decode-as-prefill path
 # (qwen3_5_forward.cpp:1149 gates enable_graph on total_tokens, which for decode
 # is the request count). pie arm only.
-MODE=${SWEEP_MODE:-context}
+# One or more modes, run back-to-back against the SAME server boot. Loading 58 GB
+# of weights takes ~5-8 minutes per engine, so running `context` and `prefill` as
+# two separate invocations would pay that four times instead of twice.
+# Accepts "context", "prefill context", or a comma-separated list.
+MODES=$(echo "${SWEEP_MODE:-context}" | tr ',' ' ')
+# Prefill mode (SWEEP_MODE=prefill): base is the shared cached prefix, suffixes
+# are the NEW tokens whose cost is being measured. Defaults bracket the agent
+# workload -- the H100 c1 pie arm prefilled ~1,008 new tokens per call on average.
+PREFILL_BASE=${SWEEP_PREFILL_BASE:-8000}
+PREFILL_SUFFIXES=${SWEEP_PREFILL_SUFFIXES:-256,512,1024,2048,4096}
 CONCURRENCIES=${SWEEP_CONCURRENCIES:-1,4,8,16,20,24,32,48}
 BATCH_CONTEXT=${SWEEP_BATCH_CONTEXT:-16000}
 ARMS=${SWEEP_ARMS:-"pie vllm"}
@@ -46,7 +55,18 @@ MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 # pie_client lives in the harness venv; the pie-vllm venv does not have it.
 CLIENT_PY=${CLIENT_PY:-/root/venvs/harness/bin/python}
 PIE_BIN=${PIE_BIN:-$REPO_ROOT/target/release/pie}
-CFG=${CFG:-$RUNPOD_DIR/pie_cuda_native_config_30b_moe_h200.toml}
+# Pick the toml written for THIS GPU, matching 30_ab_run.sh's selection. This was
+# hardcoded to the h200 file, which on another board silently sweeps a config
+# whose header documents the wrong KV budget — and the KV budget is precisely
+# what a CONTEXT sweep is probing (H100 has ~15 GiB against H200's ~72 GB).
+_gpu_tag=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 \
+    | sed -e 's/NVIDIA //' -e 's/ .*//' -e 's/-.*//' | tr 'A-Z' 'a-z')
+CFG=${CFG:-$RUNPOD_DIR/pie_cuda_native_config_30b_moe_${_gpu_tag:-h200}.toml}
+[ -f "$CFG" ] || {
+    echo "FATAL: no Pie config at $CFG (gpu tag '${_gpu_tag:-?}')." >&2
+    echo "       Add pie_cuda_native_config_30b_moe_${_gpu_tag}.toml or pass CFG=." >&2
+    exit 2; }
+echo "    cfg=$CFG"
 
 echo "=== context sweep $TS"
 echo "    arms=$ARMS contexts=$CONTEXTS reps=$REPS"
@@ -87,12 +107,17 @@ for arm in $ARMS; do
         SRV_PID=$!
         wait_for_line "$srv_log" "pie-server serving on" "pie serve" "$SRV_PID" || {
             kill "$SRV_PID" 2>/dev/null; continue; }
-        "$CLIENT_PY" "$RUNPOD_DIR/context_sweep_client.py" \
-            --arm pie --uri "ws://127.0.0.1:$PIE_PORT" --repo "$REPO_ROOT" \
-            --model "$MODEL" --contexts "$CONTEXTS" --reps "$REPS" \
-            --mode "$MODE" --concurrencies "$CONCURRENCIES" \
-            --batch-context "$BATCH_CONTEXT" \
-            --out "$out_json" 2>&1 | tee "$OUT_DIR/${arm}_client.log"
+        for m in $MODES; do
+            echo "    --- [$(date +%H:%M:%S)] arm=pie mode=$m"
+            "$CLIENT_PY" "$RUNPOD_DIR/context_sweep_client.py" \
+                --arm pie --uri "ws://127.0.0.1:$PIE_PORT" --repo "$REPO_ROOT" \
+                --model "$MODEL" --contexts "$CONTEXTS" --reps "$REPS" \
+                --mode "$m" --concurrencies "$CONCURRENCIES" \
+                --batch-context "$BATCH_CONTEXT" \
+                --prefill-base "$PREFILL_BASE" --prefill-suffixes "$PREFILL_SUFFIXES" \
+                --out "$OUT_DIR/${arm}_${m}.json" 2>&1 \
+                | tee "$OUT_DIR/${arm}_${m}_client.log"
+        done
     else
         PYTHONPATH="" HF_HOME=$HF_HOME \
           "$PIE_VENV/bin/python" -m vllm.entrypoints.openai.api_server \
@@ -100,16 +125,25 @@ for arm in $ARMS; do
             --port "$VLLM_PORT" \
             --enable-prefix-caching \
             --gpu-memory-utilization "${GPU_MEM_UTIL:-0.90}" \
-            --max-model-len "${MAX_MODEL_LEN:-131072}" \
+            --max-model-len "${MAX_MODEL_LEN:?set MAX_MODEL_LEN (source /workspace/pie-bench-env.sh) — see run_litellm_baseline_fair.sh for why this must not be defaulted}" \
             --generation-config vllm \
             > "$srv_log" 2>&1 &
         SRV_PID=$!
         wait_for_line "$srv_log" "Application startup complete" "vllm" "$SRV_PID" || {
             kill "$SRV_PID" 2>/dev/null; continue; }
-        "$CLIENT_PY" "$RUNPOD_DIR/context_sweep_client.py" \
-            --arm vllm --base-url "http://127.0.0.1:$VLLM_PORT/v1" \
-            --model "$MODEL" --contexts "$CONTEXTS" --reps "$REPS" \
-            --out "$out_json" 2>&1 | tee "$OUT_DIR/${arm}_client.log"
+        for m in $MODES; do
+            # `batch` drives the pie inferlet directly and has no vLLM
+            # implementation; skipping keeps a mixed mode list usable.
+            [ "$m" = "batch" ] && { echo "    --- skipping mode=batch on vllm (pie-only)"; continue; }
+            echo "    --- [$(date +%H:%M:%S)] arm=vllm mode=$m"
+            "$CLIENT_PY" "$RUNPOD_DIR/context_sweep_client.py" \
+                --arm vllm --base-url "http://127.0.0.1:$VLLM_PORT/v1" \
+                --model "$MODEL" --contexts "$CONTEXTS" --reps "$REPS" \
+                --mode "$m" \
+                --prefill-base "$PREFILL_BASE" --prefill-suffixes "$PREFILL_SUFFIXES" \
+                --out "$OUT_DIR/${arm}_${m}.json" 2>&1 \
+                | tee "$OUT_DIR/${arm}_${m}_client.log"
+        done
     fi
 
     echo "    stopping $arm server (PID $SRV_PID)"
@@ -122,11 +156,14 @@ echo "=== sweep done — $OUT_DIR"
 "$CLIENT_PY" - "$OUT_DIR" <<'PY'
 import glob, json, os, sys
 d = sys.argv[1]
-fits = {}
+# Keyed by (mode, arm): one boot can now produce several modes per arm, and
+# keying on arm alone silently kept only the last one.
+res = {}
 for p in sorted(glob.glob(os.path.join(d, "*.json"))):
     o = json.load(open(p))
-    fits[o["arm"]] = o
-    print(f"\n=== {o['arm']}")
+    mode = o.get("mode") or "context"
+    res[(mode, o["arm"])] = o
+    print(f"\n=== {o['arm']}  mode={mode}")
     if o["rows"] and "concurrency" in o["rows"][0]:
         print(f"  {'R':>4} {'t_forward_ms':>13} {'aggregate_tok_s':>16}")
         for r in o["rows"]:
@@ -134,17 +171,29 @@ for p in sorted(glob.glob(os.path.join(d, "*.json"))):
             print(f"  {r['concurrency']:>4} {'' if t is None else round(t,3):>13} "
                   f"{'' if a is None else round(a,1):>16}")
         continue
-    print(f"  {'prompt_tok':>10} {'ms/token':>9} {'self':>8}")
-    for r in o["rows"]:
-        s = r.get("self_reported_decode_ms_per_token")
-        print(f"  {str(r['prompt_tokens']):>10} "
-              f"{'' if r['decode_ms_per_token'] is None else round(r['decode_ms_per_token'],3):>9} "
-              f"{'' if s is None else round(s,3):>8}")
+    if mode == "prefill":
+        print(f"  {'new_tok':>8} {'latency_ms':>11} {'self_prefill':>13}")
+        for r in o["rows"]:
+            s = r.get("self_reported_prefill_ms")
+            print(f"  {str(r['new_tokens']):>8} "
+                  f"{'' if r['latency_ms'] is None else round(r['latency_ms'],1):>11} "
+                  f"{'' if s is None else round(s,1):>13}")
+    else:
+        print(f"  {'prompt_tok':>10} {'ms/token':>9} {'self':>8}")
+        for r in o["rows"]:
+            s = r.get("self_reported_decode_ms_per_token")
+            print(f"  {str(r['prompt_tokens']):>10} "
+                  f"{'' if r['decode_ms_per_token'] is None else round(r['decode_ms_per_token'],3):>9} "
+                  f"{'' if s is None else round(s,3):>8}")
     print(f"  fit: {json.dumps(o['fit'])}")
-if len(fits) == 2 and all(f.get("fit") for f in fits.values()):
-    p, v = fits.get("pie", {}).get("fit"), fits.get("vllm", {}).get("fit")
-    if p and v:
-        print("\n=== pie / vllm")
+
+for mode in ("context", "prefill"):
+    p = (res.get((mode, "pie")) or {}).get("fit")
+    v = (res.get((mode, "vllm")) or {}).get("fit")
+    if not (p and v):
+        continue
+    print(f"\n=== pie / vllm — {mode}")
+    if mode == "context":
         print(f"  intercept (fixed per-token):  {p['intercept_ms']:.3f} vs "
               f"{v['intercept_ms']:.3f} ms   ratio {p['intercept_ms']/v['intercept_ms']:.2f}x")
         print(f"  slope (per 1k KV tokens):     {p['slope_ms_per_ktoken']:.4f} vs "
@@ -153,4 +202,14 @@ if len(fits) == 2 and all(f.get("fit") for f in fits.values()):
         if p.get("kv_read_GB_per_s") and v.get("kv_read_GB_per_s"):
             print(f"  implied KV read bandwidth:    {p['kv_read_GB_per_s']:.0f} vs "
                   f"{v['kv_read_GB_per_s']:.0f} GB/s")
+    else:
+        print(f"  prefill per new token:        {p['prefill_ms_per_token']:.4f} vs "
+              f"{v['prefill_ms_per_token']:.4f} ms  ratio "
+              f"{p['prefill_ms_per_token']/v['prefill_ms_per_token']:.2f}x")
+        print(f"  prefill throughput:           {p['prefill_tokens_per_s']:.0f} vs "
+              f"{v['prefill_tokens_per_s']:.0f} tok/s")
+        print(f"  fixed per-call cost:          {p['fixed_per_call_ms']:.1f} vs "
+              f"{v['fixed_per_call_ms']:.1f} ms  ratio "
+              f"{p['fixed_per_call_ms']/v['fixed_per_call_ms']:.2f}x")
+        print(f"  fit quality (R2):             {p.get('r2')} vs {v.get('r2')}")
 PY

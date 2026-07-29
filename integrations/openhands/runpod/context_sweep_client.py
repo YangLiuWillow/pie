@@ -82,6 +82,73 @@ def messages_for(filler: str) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Prefill mode — the same differencing idea, turned 90 degrees.
+#
+# WHY IT IS NEEDED. `context` mode deliberately CANCELS prefill: it holds the
+# prompt fixed and varies generation, so everything generation-independent drops
+# out. That made decode comparable across two unrelated client stacks, and it is
+# why prefill has never been compared between the arms at all. With decode now at
+# ~1.06x of vLLM (AGENT_HANDOVER_20260728.md 6a-nonies), prefill is the largest
+# remaining stage: it is 21.7% of Pie's per-call time on the H100 c1 arm.
+#
+# THE MEASUREMENT. Hold GENERATION fixed and vary the number of NEW prompt tokens:
+#
+#     prefill_ms_per_token = (latency(S_long) - latency(S_short))
+#                            / (S_long - S_short)
+#
+# Per-call fixed cost, transport, render, launch and the cached-prefix lookup are
+# all independent of S, so they cancel exactly as prefill did in `context` mode.
+#
+# CONTROLLING CACHE STATE IS THE WHOLE GAME. If the shared prefix is not already
+# resident, the "new tokens" count is wrong and this silently measures cold
+# prefill on one arm and warm on the other. So every size gets its own session /
+# prefix warm on the SAME base prompt first, and only the appended suffix is new.
+# That also matches how the agent workload actually behaves -- an append-only
+# conversation that grows -- rather than inventing a pattern neither engine sees.
+#
+# WHAT SURVIVES THE SUBTRACTION BUT SHOULDN'T. Decode at the longer context costs
+# marginally more (the ctx-mode slope, ~0.024 ms per 1k KV tokens). Over a 4k
+# suffix and 8 generated tokens that is ~0.8 ms against hundreds of ms of
+# prefill, i.e. well under 1%. Reported so the reader can check rather than
+# assume, but not corrected for.
+# --------------------------------------------------------------------------
+def build_prefill_case(tok, base_tokens: int, suffix_tokens: int, uid: str):
+    """Base prompt (shared, cacheable) + a unique suffix of ~suffix_tokens.
+
+    The uid marker sits at the START of the suffix so the prefix cache matches
+    exactly the base and nothing after it -- the suffix is genuinely new work on
+    both engines. Returns (warm_messages, measured_messages, actual_new_tokens).
+    """
+    base, _ = build_prompt(tok, base_tokens)
+    tail = "\n\nSummarize what the function above does, in detail."
+
+    warm_content = base + tail
+    if suffix_tokens <= 0:
+        return messages_for(base), messages_for(base), 0
+
+    marker = f"\n# variant {uid}\n"
+    suffix, _ = build_prompt(tok, suffix_tokens)
+    measured_content = base + marker + suffix + tail
+
+    warm_msgs = [{"role": "system", "content": SYSTEM},
+                 {"role": "user", "content": warm_content}]
+    meas_msgs = [{"role": "system", "content": SYSTEM},
+                 {"role": "user", "content": measured_content}]
+
+    # The warm call is  system + base + tail;  the measured call is
+    # system + base + marker + suffix + tail. Their longest common prefix is
+    # system + base, because the two diverge at the first character after `base`.
+    # So the cache covers `base` and the new work is marker + suffix + tail.
+    #
+    # Counted with the tokenizer rather than assumed: BPE does not guarantee that
+    # asking for N tokens of filler yields exactly N, and the exact figure is the
+    # denominator of the whole measurement.
+    n_base = len(tok(base, add_special_tokens=False)["input_ids"])
+    n_meas = len(tok(measured_content, add_special_tokens=False)["input_ids"])
+    return warm_msgs, meas_msgs, n_meas - n_base
+
+
+# --------------------------------------------------------------------------
 # Pie arm
 # --------------------------------------------------------------------------
 async def run_pie(args, tok, contexts):
@@ -215,6 +282,153 @@ async def run_pie_batch(args, tok, concurrencies):
 
 
 # --------------------------------------------------------------------------
+# Prefill sweep — Pie arm.
+#
+# Each suffix size gets a FRESH session id. Within that session the warm call
+# establishes the base prompt and the measured call extends it, so Pie takes its
+# `extended` path (the one the agent workload uses) rather than `rebuilt`. Using
+# one session across different suffixes would diverge the context and force a
+# rebuild, which prefills EVERYTHING and would silently report the wrong number
+# -- larger, and in a way that looks like a real result.
+# --------------------------------------------------------------------------
+async def run_pie_prefill(args, tok, suffixes):
+    from pie_client import Event, PieClient  # noqa: E402
+
+    inferlet_dir = os.path.join(args.repo, "inferlets", "openhands-coder-session")
+    wasm = os.path.join(inferlet_dir, "target", "wasm32-wasip2", "release",
+                        "openhands_coder_session.wasm")
+    manifest = os.path.join(inferlet_dir, "Pie.toml")
+
+    async def one(client, msgs, session_id):
+        payload = {"messages": msgs, "max_tokens": args.short_tokens,
+                   "temperature": 0.0, "session_id": session_id}
+        t0 = time.perf_counter()
+        proc = await client.launch_process(args.inferlet, input=payload)
+        while True:
+            event, value = await asyncio.wait_for(proc.recv(), timeout=args.timeout)
+            if event == Event.Return:
+                if isinstance(value, (bytes, bytearray)):
+                    value = value.decode()
+                out = json.loads(value) if isinstance(value, str) else value
+                break
+            if event == Event.Error:
+                raise RuntimeError(f"inferlet error: {value!r}")
+        lat = (time.perf_counter() - t0) * 1000.0
+        return lat, (out.get("timings") or {}), (out.get("session") or {})
+
+    rows = []
+    async with PieClient(args.uri) as client:
+        await client.authenticate("local-dev")
+        await client.install_program(wasm, manifest, force_overwrite=True)
+        for s in suffixes:
+            lats, self_pref, news = [], [], []
+            for rep in range(args.reps):
+                uid = f"{s}_{rep}"
+                sid = f"prefillsweep_{args.prefill_base}_{uid}"
+                warm, meas, n_new = build_prefill_case(
+                    tok, args.prefill_base, s, uid)
+                await one(client, warm, sid)              # cache the base
+                lat, tim, sess = await one(client, meas, sid)
+                lats.append(lat)
+                news.append(n_new)
+                # Pie's own attribution, as an independent check on the
+                # differencing -- exactly as `context` mode does for decode.
+                self_pref.append(float(tim.get("prefill_ms") or 0.0))
+                if sess.get("mode") == "rebuilt":
+                    print(f"    WARN suffix={s} rep={rep}: pie reported "
+                          f"mode=rebuilt, not extended -- this sample prefilled "
+                          f"the whole prompt and must not be trusted", flush=True)
+            rows.append(prefill_row(s, news, lats, self_pref))
+            report_prefill(rows[-1])
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Prefill sweep — vLLM arm. Same procedure; APC supplies the prefix reuse that
+# Pie gets from the session id, so the warm call is what makes the two
+# comparable rather than any engine-specific flag.
+# --------------------------------------------------------------------------
+def run_vllm_prefill(args, tok, suffixes):
+    import urllib.request
+
+    def one(msgs):
+        body = json.dumps({
+            "model": args.model, "messages": msgs,
+            "max_tokens": args.short_tokens, "temperature": 0.0, "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{args.base_url}/chat/completions", data=body,
+            headers={"Content-Type": "application/json"})
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=args.timeout) as r:
+            out = json.loads(r.read().decode())
+        return (time.perf_counter() - t0) * 1000.0, (out.get("usage") or {})
+
+    rows = []
+    for s in suffixes:
+        lats, news = [], []
+        for rep in range(args.reps):
+            uid = f"{s}_{rep}"
+            warm, meas, n_new = build_prefill_case(tok, args.prefill_base, s, uid)
+            one(warm)                                     # cache the base
+            lat, _ = one(meas)
+            lats.append(lat)
+            news.append(n_new)
+        rows.append(prefill_row(s, news, lats, []))
+        report_prefill(rows[-1])
+    return rows
+
+
+def prefill_row(suffix, news, lats, self_prefill_ms):
+    return {
+        "suffix_requested": suffix,
+        "new_tokens": int(st.median(news)) if news else None,
+        "samples": len(lats),
+        "latency_ms": st.median(lats) if lats else None,
+        "latency_ms_spread": (max(lats) - min(lats)) if len(lats) > 1 else None,
+        # Pie only; vLLM exposes no per-phase attribution, so it stays null.
+        "self_reported_prefill_ms":
+            st.median(self_prefill_ms) if self_prefill_ms else None,
+    }
+
+
+def report_prefill(r):
+    s = r["self_reported_prefill_ms"]
+    print(f"  suffix~{r['suffix_requested']:>6} new_tokens={str(r['new_tokens']):>7} "
+          f"latency={r['latency_ms'] if r['latency_ms'] is None else round(r['latency_ms'], 1)} ms"
+          + (f"  (self-reported prefill {round(s, 1)} ms)" if s else ""), flush=True)
+
+
+def fit_prefill(rows):
+    """Least-squares line through (new_tokens, latency_ms).
+
+    slope     = ms per NEW prompt token  -> 1000/slope = prefill tok/s
+    intercept = per-call cost that does not depend on how much is prefilled
+                (transport, render, scheduling, and the fixed generation)
+    """
+    pts = [(r["new_tokens"], r["latency_ms"]) for r in rows
+           if r["new_tokens"] and r["latency_ms"]]
+    if len(pts) < 2:
+        return None
+    n = len(pts)
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    denom = sum((p[0] - mx) ** 2 for p in pts)
+    if denom == 0:
+        return None
+    slope = sum((p[0] - mx) * (p[1] - my) for p in pts) / denom
+    intercept = my - slope * mx
+    ss_tot = sum((p[1] - my) ** 2 for p in pts)
+    ss_res = sum((p[1] - (intercept + slope * p[0])) ** 2 for p in pts)
+    return {
+        "prefill_ms_per_token": slope,
+        "prefill_tokens_per_s": (1000.0 / slope) if slope > 0 else None,
+        "fixed_per_call_ms": intercept,
+        "r2": (1 - ss_res / ss_tot) if ss_tot else None,
+    }
+
+
+# --------------------------------------------------------------------------
 # vLLM arm
 # --------------------------------------------------------------------------
 def run_vllm(args, tok, contexts):
@@ -318,9 +532,15 @@ def main():
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--out", default=None)
-    p.add_argument("--mode", choices=["context", "batch"], default="context")
+    p.add_argument("--mode", choices=["context", "batch", "prefill"],
+                   default="context")
     p.add_argument("--concurrencies", default="1,4,8,16,20,24,32,48")
     p.add_argument("--batch-context", type=int, default=16000)
+    # Prefill mode. The base is the cached shared prefix; the suffixes are the
+    # NEW tokens whose cost we are measuring. Defaults bracket the agent
+    # workload: the H100 c1 arm prefilled ~1,008 new tokens per call on average.
+    p.add_argument("--prefill-base", type=int, default=8000)
+    p.add_argument("--prefill-suffixes", default="256,512,1024,2048,4096")
     args = p.parse_args()
 
     from transformers import AutoTokenizer
@@ -336,6 +556,16 @@ def main():
             raise SystemExit(2)
         rows = asyncio.run(run_pie_batch(args, tok, conc))
         f = None
+    elif args.mode == "prefill":
+        suffixes = [int(s) for s in args.prefill_suffixes.split(",") if s.strip()]
+        print(f"=== prefill sweep: arm={args.arm} base={args.prefill_base} "
+              f"suffixes={suffixes} gen={args.short_tokens} reps={args.reps}")
+        if args.arm == "pie":
+            rows = asyncio.run(run_pie_prefill(args, tok, suffixes))
+        else:
+            rows = run_vllm_prefill(args, tok, suffixes)
+        f = fit_prefill(rows)
+        print(f"\n=== {args.arm} prefill fit: {json.dumps(f)}")
     else:
         print(f"=== context sweep: arm={args.arm} contexts={contexts} "
               f"short={args.short_tokens} long={args.long_tokens} reps={args.reps}")
@@ -347,7 +577,8 @@ def main():
         print(f"\n=== {args.arm} fit: {json.dumps(f)}")
     if args.out:
         with open(args.out, "w") as fh:
-            json.dump({"arm": args.arm, "rows": rows, "fit": f}, fh, indent=2)
+            json.dump({"arm": args.arm, "mode": args.mode,
+                       "rows": rows, "fit": f}, fh, indent=2)
         print(f"wrote {args.out}")
 
 
