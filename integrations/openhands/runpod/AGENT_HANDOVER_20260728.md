@@ -566,6 +566,70 @@ whatever graph capture is lost, the tensor-core kernel's win dominates it by a
 wide and growing margin. The gate has served its purpose; the remaining reason
 to keep the env var is as an escape hatch, not as a warning.
 
+### 6a-octies. The intercept — fused QKV projection
+
+With attention fixed, the remaining gap was the intercept: 5.030 ms against
+vLLM's 4.173, ~1.21×. Two profiler-free facts framed it.
+
+1. **It is not bandwidth.** The batch sweep separates per-forward from
+   per-request cost: `t_forward = 6.023 ms + 0.4751 ms × R` at 16k. The 6.02 ms
+   is shared by the whole batch and covers ~2.5 GB of non-per-request weights —
+   0.51 ms at peak. **11.8× off roofline**, so it is kernel granularity, not
+   bytes.
+2. **It is not lost CUDA graphs.** Both the old and new decode paths capture
+   51 decode graphs. Ruled out before chasing it.
+
+At batch 1 every projection is a GEMV far too small to fill 132 SMs, so cost is
+dominated by per-kernel ramp. That makes kernel *count* the lever — and
+`qwen3_5_moe_forward.cpp` was issuing **three** QKV GEMVs per layer where
+`qwen3_5_forward.cpp` has long issued **one**. The file's own header comment
+admits it is a "near-clone… while the schemas may still drift"; this is the
+drift. `Qwen3_5MoeLayerWeights` did not even have the `fa_qgkv_proj_fused`
+field, and `bind_qwen3_5_moe` never built it — while `ws.qkv_fused` scratch was
+already allocated and `concat_axis0_bf16` already existed in the same file.
+
+Fix: concatenate q/k/v at bind time (plain unquantized bf16 only), add the fused
+branch to `full_attn_body`, keep the three-GEMV path as fallback. 96 fewer
+kernels per forward.
+
+| | tensor-core only | **+ fused QKV** | vllm |
+|---|---|---|---|
+| intercept | 5.030 ms | **4.628 ms** | 4.173 ms |
+| slope per 1k KV | 0.0242 ms | 0.0237 ms | 0.0265 ms |
+| intercept vs vllm | 1.21× | **1.11×** | — |
+
+The slope is unchanged, as it must be — this touches no KV read. Decode
+ms/token at 32k: 5.791 → **5.388**.
+
+**Cumulative, on the real agent workload** (`django__django-14373`, valid patch
+every time; the last run even ran a longer context, 28,826 vs 25,520):
+
+| | decode tok/s | vs base |
+|---|---|---|
+| base (cuda-core decode, 3 QKV GEMVs) | 147.5 | — |
+| + tensor-core decode | 178.2 | +20.8% |
+| + fused QKV | **191.2** | **+29.6%** |
+
+Modelled total decode at 25k: **5.22 ms (192 tok/s) vs vLLM's 4.84 (207)** —
+a **1.08×** gap, from 1.43× when this started.
+
+The driver prints `qwen3.5-moe qkv projection: fused on 48/48 full-attention
+layers (1 GEMM/layer)`, so a silent fallback to the unfused path is visible
+rather than inferred.
+
+**What is left in the intercept.** 4.628 ms against a ~0.51 ms roofline is still
+9× off, and the same argument still applies: ~800 small kernels per forward.
+The next candidates, in order of expected value:
+- **The router** — one `[1,2048]×[2048,128]` GEMV plus a top-k per layer, 96
+  kernels moving 25 MB total. Pure launch cost; fusing the router into the
+  preceding norm, or across layers, is the analogous win.
+- **fp8/mxfp4 expert weights.** `model.mxfp4_moe = auto` is printed at load but
+  the checkpoint is bf16, so it is inert. This is the only lever that changes
+  the *bytes* rather than the kernel count — but it changes numerics, and vLLM
+  is running bf16, so quantizing only Pie would make the comparison unfair even
+  though it is a legitimate product win.
+- Deeper per-layer fusion (norm+projection, router+topk).
+
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 
 SWE-bench agents spend seconds to minutes per iteration running pytest with KV

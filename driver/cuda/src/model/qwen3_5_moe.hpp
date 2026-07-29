@@ -62,6 +62,13 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* fa_q_proj = nullptr;
     const DeviceTensor* fa_k_proj = nullptr;
     const DeviceTensor* fa_v_proj = nullptr;
+    // [Hq(+Hq if attn_output_gate) + 2*Hk, H] bf16 — q/k/v concatenated at
+    // bind time so decode issues ONE projection GEMM per layer instead of
+    // three. `qwen3_5_forward.cpp` has had this since forever; this file is a
+    // near-clone that never got it, so Qwen3-30B-A3B was paying 3 launches and
+    // three separately-ramped GEMVs per layer. Null when any of q/k/v is
+    // quantized or non-bf16 (the concat only handles plain bf16).
+    const DeviceTensor* fa_qgkv_proj_fused = nullptr;
     const DeviceTensor* fa_o_proj = nullptr;
     const DeviceTensor* fa_q_norm = nullptr;
     const DeviceTensor* fa_k_norm = nullptr;

@@ -1224,6 +1224,22 @@ int run_impl(int argc,
                       << ((tc || !in_set) ? "paged-prefill (tensor core)"
                                           : "BatchDecodeWithPagedKVCache (cuda core)")
                       << "\n";
+            int fused_qkv_layers = 0, full_attn_layers = 0;
+            for (const auto& Lw : weights_qwen3_5_moe.layers) {
+                if (Lw.kind !=
+                    pie_cuda_driver::model::Qwen3_5MoeLayerWeights::Kind::FullAttn) {
+                    continue;
+                }
+                ++full_attn_layers;
+                if (Lw.fa_qgkv_proj_fused != nullptr) ++fused_qkv_layers;
+            }
+            std::cerr << "[pie-driver-cuda] qwen3.5-moe qkv projection: fused on "
+                      << fused_qkv_layers << "/" << full_attn_layers
+                      << " full-attention layers ("
+                      << (fused_qkv_layers == full_attn_layers && full_attn_layers > 0
+                              ? "1 GEMM/layer"
+                              : "3 GEMMs/layer where unfused")
+                      << ")\n";
         }
         qwen3_5_moe_model = std::make_unique<pie_cuda_driver::model::Qwen35MoeModel>(
             weights_qwen3_5_moe, hf_q,

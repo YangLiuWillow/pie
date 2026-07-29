@@ -325,6 +325,24 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
             Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
             Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
             Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
+            // Fuse q/k/v into one [.., H] tensor so decode issues one
+            // projection GEMM per layer instead of three. At batch 1 each of
+            // these is a GEMV far too small to fill the device, so the cost is
+            // dominated by per-kernel ramp rather than the bytes moved, and
+            // three of them cost appreciably more than one that reads the same
+            // weights. Only plain unquantized bf16 — the concat helper cannot
+            // interleave quant scales.
+            if (!Lw.fa_q_proj_quant.has_value() &&
+                !Lw.fa_k_proj_quant.has_value() &&
+                !Lw.fa_v_proj_quant.has_value() &&
+                Lw.fa_q_proj->dtype() == DType::BF16 &&
+                Lw.fa_k_proj->dtype() == DType::BF16 &&
+                Lw.fa_v_proj->dtype() == DType::BF16) {
+                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                    *Lw.fa_q_proj, *Lw.fa_k_proj, *Lw.fa_v_proj,
+                    "qwen3_5_moe: fuse self_attn.qkv_proj"));
+                Lw.fa_qgkv_proj_fused = &w.owned_bf16_buffers.back();
+            }
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(

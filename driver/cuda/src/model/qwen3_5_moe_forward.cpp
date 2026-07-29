@@ -23,6 +23,7 @@
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
+#include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "kernels/topk_softmax.hpp"
 #include "ops/attention_flashinfer.hpp"
@@ -1022,25 +1023,56 @@ void full_attn_body(
     // q_proj as a [2*Hq, H] tensor — rows [0,Hq) are q, rows [Hq,2*Hq)
     // are the gate logits. Qwen3-MoE (Qwen3-30B-A3B) ships plain q_proj
     // [Hq, H] with no output gate, so the GEMM goes straight into ws.q.
-    if (cfg.attn_output_gate) {
+    // One fused q/k/v GEMM when the bind step could concatenate the weights,
+    // else the original three. `ws.qkv_fused` is sized [max_tokens, Hq + 2*Hk],
+    // which is exactly right when there is no output gate and too small when
+    // there is — the numel() guard makes that case fall back rather than
+    // overrun.
+    const int q_width = cfg.attn_output_gate ? 2 * Hq : Hq;
+    const int qkv_dim = q_width + 2 * Hk;
+    const bool use_fused_qkv =
+        Lw.fa_qgkv_proj_fused != nullptr &&
+        !ws.qkv_fused.empty() &&
+        ws.qkv_fused.numel() >= static_cast<std::size_t>(N) * qkv_dim;
+
+    if (use_fused_qkv) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), ops::WeightView(*Lw.fa_qgkv_proj_fused),
+            ws.qkv_fused.data(), N, qkv_dim, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            cfg.attn_output_gate ? la.fa_qg_packed.data() : ws.q.data(),
+            ws.k.data(), ws.v.data(),
+            N, q_width, Hk, stream);
+        if (cfg.attn_output_gate) {
+            kernels::launch_split_q_gate_bf16(
+                la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
+                N, num_q_heads_local, d, stream);
+        }
+    } else if (cfg.attn_output_gate) {
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             la.fa_qg_packed.data(), N, 2 * Hq, H);
         kernels::launch_split_q_gate_bf16(
             la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
             N, num_q_heads_local, d, stream);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
+            ws.v.data(), N, Hk, H);
     } else {
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
+            ws.v.data(), N, Hk, H);
     }
-
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
-        ws.k.data(), N, Hk, H);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
-        ws.v.data(), N, Hk, H);
 
     rmsnorm_bf16_dispatch(cfg,
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),

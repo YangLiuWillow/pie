@@ -236,10 +236,74 @@ End-to-end on `django__django-14373` (SWE-bench, temperature 0): decode
 
 ---
 
-## 6. What this does NOT fix
+## 6. Second change: fused QKV projection (Qwen3.5-MoE only)
 
-The intercept — the context-independent 5.030 ms/token against vLLM's 4.173,
-about **1.21×** — is untouched. That is the weights / MoE / router / launch path.
+Independent of the above, and stacks with it. `qwen3_5_moe_forward.cpp` is a
+near-clone of `qwen3_5_forward.cpp` that never picked up the fused QKV
+projection, so Qwen3-30B-A3B issued **three** projection GEMVs per layer where
+the non-MoE arch issues **one**. At batch 1 each is a GEMV far too small to fill
+the device, so cost is per-kernel ramp, not bytes — 96 extra kernels per forward.
+
+Three edits:
+
+1. **`model/qwen3_5_moe.hpp`** — add to `Qwen3_5MoeLayerWeights`:
+   ```cpp
+   const DeviceTensor* fa_qgkv_proj_fused = nullptr;
+   ```
+2. **`model/qwen3_5_moe.cpp`**, in `bind_qwen3_5_moe` right after the
+   `fa_*_proj_quant` binds, guarded on all three being plain bf16:
+   ```cpp
+   w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+       *Lw.fa_q_proj, *Lw.fa_k_proj, *Lw.fa_v_proj,
+       "qwen3_5_moe: fuse self_attn.qkv_proj"));
+   Lw.fa_qgkv_proj_fused = &w.owned_bf16_buffers.back();
+   ```
+   `concat_axis0_bf16` already exists in this file, and `owned_bf16_buffers` is
+   already `reserve`d to `L*8` — which matters, because the code stores
+   `&back()`, and without the reserve a reallocation would dangle every earlier
+   pointer.
+3. **`model/qwen3_5_moe_forward.cpp`** — `#include "kernels/split_packed.hpp"`
+   (not previously included here) and add a fused branch to `full_attn_body`:
+   one `gemm_act_x_w` into `ws.qkv_fused` then `launch_split_qkv_bf16`. Keep the
+   three-GEMV path as the `else`.
+
+   `ws.qkv_fused` is already allocated unconditionally, sized
+   `[max_tokens, Hq + 2*Hk]` — exactly right when `attn_output_gate` is false
+   (Qwen3-30B-A3B) and too small when it is true (Qwen3.5/3.6-MoE, where q is
+   `2*Hq` wide). Guard with
+   `ws.qkv_fused.numel() >= (size_t)N * qkv_dim` so the gated case falls back
+   instead of overrunning.
+
+Banner it, same reasoning as before:
+
+```
+[pie-driver-cuda] qwen3.5-moe qkv projection: fused on 48/48 full-attention layers (1 GEMM/layer)
+```
+
+**Effect** (stacks on top of tensor-core decode):
+
+| | tensor-core only | + fused QKV | vllm |
+|---|---|---|---|
+| intercept | 5.030 ms | **4.628 ms** | 4.173 ms |
+| slope per 1k KV | 0.0242 ms | 0.0237 ms | 0.0265 ms |
+
+Slope must not move — this touches no KV read. If a port shows the slope
+changing, something else changed too.
+
+**Cumulative end-to-end** on `django__django-14373`: decode **147.5 → 178.2 →
+191.2 tok/s (+29.6%)**, valid patch at every step. Modelled total decode at 25k:
+5.22 ms (192 tok/s) against vLLM's 4.84 (207) — a **1.08×** gap, down from 1.43×.
+
+---
+
+## 7. What this does NOT fix
+
+The intercept is now 4.628 ms against vLLM's 4.173, about **1.11×**, and still
+~9× off its ~0.51 ms roofline — so it remains kernel-granularity bound, roughly
+800 small kernels per forward. Remaining candidates: the router (one tiny GEMV
+plus a top-k per layer, 96 kernels moving 25 MB total — pure launch cost), fp8 /
+mxfp4 expert weights (the only lever that changes bytes rather than kernel
+count, but it moves numerics and vLLM runs bf16), and deeper per-layer fusion.
 Kernel *selection* there has already been ruled out by measurement: of Pie's
 three MoE decode paths, the `cublasGemmBatchedEx` M=1 default beat both
 alternatives at batch 1 (WMMA −41%, aligned-gate-lowered −9.5%), and KV page size
