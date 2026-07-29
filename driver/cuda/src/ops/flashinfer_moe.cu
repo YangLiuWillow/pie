@@ -406,9 +406,18 @@ void moe_probe_gemm_runner(std::string& r) {
 std::size_t moe_probe_workspace_bytes(
     int act_raw, int num_rows, int hidden, int inter, int experts, int topk) {
     Runner& runner = get_runner();
+    // THE THIRD PARAMETER IS fc1_output_size, NOT inter_size. They differ for
+    // gated activations: moe_gemm_template_dispatch.h:830 states
+    //   fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size
+    // and runMoe() takes inter_size in the corresponding slot, so the two calls
+    // want DIFFERENT values. Passing inter_size to both looks right, works for
+    // Relu2, and makes every gated shape fail with "Could not find valid config"
+    // -- which reads like a kernel limitation and is not one.
+    const auto act = static_cast<ck::ActivationType>(act_raw);
+    const int64_t fc1_output_size = ck::isGatedActivation(act) ? 2LL * inter : inter;
     return runner.getWorkspaceSize(
-        num_rows, hidden, inter, experts, topk,
-        static_cast<ck::ActivationType>(act_raw),
+        num_rows, hidden, fc1_output_size, experts, topk,
+        act,
         parallelism_config(/*tp_size=*/1, /*tp_rank=*/0),
         false, false, false, false, false);
 }
@@ -445,6 +454,11 @@ extern "C" void pie_driver_cuda_moe_probe(char* out, int out_len) {
         {"  inter 768->2048", 2048, 2048, 128, 8},
         {"  experts 128->64", 2048, 768,  64,  8},
         {"  hidden 2048->4096", 4096, 768, 128, 8},
+        // Repeat of row 1. If this SUCCEEDS where row 1 failed, the runner
+        // carries order-dependent state (getMaxWorkspaceSize caches on
+        // num_experts_) and a "no valid config" on a cold first call says
+        // nothing about whether the shape is supported.
+        {"qwen3-30b-a3b AGAIN", 2048, 768,  128, 8},
     };
     const struct { const char* name; int act; } acts[] = {
         {"swiglu(gated)", kSwiglu},
