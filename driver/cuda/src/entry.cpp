@@ -1183,7 +1183,7 @@ int run_impl(int argc,
             qwen3_5_la_ws, qwen3_5_state_cache, qwen3_5_plan_state,
             kv_cache, q35_tp_size, q35_tp_comm,
             /*force_prefill_path=*/
-                pie_cuda_driver::model::qwen35_tensor_core_decode_enabled() ||
+                pie_cuda_driver::model::qwen35_tensor_core_decode_enabled(gqa_q) ||
                 !pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q),
             /*small_prefill_naive_attention_max_tokens=*/pie_cuda_driver::model::qwen35_small_spec_graph_tokens(),
             /*graph_safe=*/kv_cache.format().is_native_bf16() &&
@@ -1210,13 +1210,16 @@ int run_impl(int argc,
         // never executes — reading a feature off that line is how `xqa_decode=on`
         // misled this investigation for a day.
         {
-            const bool tc = pie_cuda_driver::model::qwen35_tensor_core_decode_enabled();
+            const bool tc = pie_cuda_driver::model::qwen35_tensor_core_decode_enabled(gqa_q_moe);
             const bool in_set =
                 pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q_moe);
             std::cerr << "[pie-driver-cuda] qwen3.5-moe attention: gqa=" << gqa_q_moe
                       << " flashinfer_decode_supports_gqa=" << (in_set ? 1 : 0)
-                      << " tensor_core_decode="
-                      << (tc ? "on (PIE_QWEN35_TENSOR_CORE_DECODE)" : "off")
+                      << " tensor_core_decode=" << (tc ? "on" : "off") << "("
+                      << (std::getenv("PIE_QWEN35_TENSOR_CORE_DECODE")
+                              ? "PIE_QWEN35_TENSOR_CORE_DECODE"
+                              : "default: gqa>=4")
+                      << ")"
                       << " -> decode kernel="
                       << ((tc || !in_set) ? "paged-prefill (tensor core)"
                                           : "BatchDecodeWithPagedKVCache (cuda core)")
@@ -1228,7 +1231,7 @@ int run_impl(int argc,
             qwen3_5_state_cache, qwen3_5_plan_state,
             kv_cache, q35moe_tp_size, q35moe_tp_comm,
             /*force_prefill_path=*/
-                pie_cuda_driver::model::qwen35_tensor_core_decode_enabled() ||
+                pie_cuda_driver::model::qwen35_tensor_core_decode_enabled(gqa_q_moe) ||
                 !pie_cuda_driver::flashinfer_decode_supports_gqa(gqa_q_moe),
             /*small_prefill_naive_attention_max_tokens=*/pie_cuda_driver::model::qwen35_small_spec_graph_tokens(),
             /*graph_safe=*/[]{

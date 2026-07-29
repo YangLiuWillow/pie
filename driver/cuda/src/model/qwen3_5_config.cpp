@@ -5,12 +5,15 @@
 
 namespace pie_cuda_driver::model {
 
-bool qwen35_tensor_core_decode_enabled() {
-    static const bool enabled = [] {
+bool qwen35_tensor_core_decode_enabled(int gqa_group) {
+    // -1 = unset, decide from the ratio; 0/1 = explicit override.
+    static const int forced = [] {
         const char* v = std::getenv("PIE_QWEN35_TENSOR_CORE_DECODE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (v == nullptr || v[0] == '\0') return -1;
+        return v[0] != '0' ? 1 : 0;
     }();
-    return enabled;
+    if (forced >= 0) return forced == 1;
+    return gqa_group >= 4;
 }
 
 int qwen35_small_spec_graph_tokens() {
