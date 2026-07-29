@@ -505,16 +505,66 @@ qwen3_5_moe construction site, using the config this model actually executes,
 because the `model_type=` banner reports llama_like's `fwd_cfg` and reading a
 feature off that line is what made `xqa_decode=on` mislead this study for a day.
 
-**Why it is still env-gated, and what to test before flipping the default.**
+### 6a-septies. Concurrency validation — the R>17 cliff does not exist
+
+The graph-drop concern below was theoretical. It was tested and **it is not
+real**. `42_context_sweep.sh` gained a `SWEEP_MODE=batch` mode that sweeps
+concurrency at fixed context (same differencing, one level up: N streams short
+then N streams long, subtracted; shared prompt text with distinct session ids so
+per-stream lengths match and R stays flat across the measured window).
+
+**16k context** (aggregate decode tok/s):
+
+| R | off | on | speedup |
+|---|---|---|---|
+| 1 | 159.9 | 184.6 | 1.15× |
+| 4 | 379.0 | 545.0 | 1.44× |
+| 8 | 451.0 | 764.3 | 1.69× |
+| 16 | 538.6 | 1014.3 | 1.88× |
+| 20 | 596.6 | 1160.8 | 1.95× |
+| 24 | 657.6 | 1338.6 | 2.04× |
+| 32 | 679.9 | **1592.2** | **2.34×** |
+
+**4k context**, pushing R far past the threshold:
+
+| R | off | on | speedup |
+|---|---|---|---|
+| 16 | 945.9 | 1168.5 | 1.24× |
+| 32 | 1390.5 | 1998.6 | 1.44× |
+| 48 | 1712.6 | 2818.0 | 1.65× |
+| 64 | 2105.9 | 3946.4 | 1.87× |
+| 96 | **1915.0** | **4356.3** | **2.28×** |
+
+**The flag wins at every R from 1 to 96, and the margin grows monotonically.**
+There is no discontinuity at 17 in either series. Beyond that, the *off* path
+degrades at high R (2105.9 → 1915.0 from R=64 to 96) while the on path keeps
+scaling (3946 → 4356) — so the tensor-core path is not merely faster, it is the
+one that still scales where the CUDA-core path has stopped.
+
+It also fixes batch amortization. Marginal cost of an added request at 16k,
+R=1→32: **0.211 off → 0.087 on**, a 2.4× improvement. That is the §6a
+concurrency finding's root cause, in the same place as the latency one.
+
+**One measurement invalidated, and why it is not a finding.** At 16k both arms
+collapse at R=48 (off 680→380, on 1592→999). That is the KV pool, not the
+kernel: 48 × 16,012 = 768,576 tokens against a 632,352 capacity
+(`kv_tokens=632352` in the planner banner), so both thrash. The 4k sweep, where
+R=48 needs only 192k and fits, shows R=48 scaling cleanly in both arms. Test
+design, not behaviour — recorded so nobody re-derives it as a regression.
+
+**Recommendation: make it the default** for qwen3_5 / qwen3_5_moe at GQA ratio in
+FlashInfer's decode set. Validated across R=1..96 and contexts 1k..32k, always
+faster, never a regression, with the end-to-end agent run producing a valid patch.
+
+**Why it was env-gated, and what that check found.**
 On the prefill path `enable_graph` requires `total_tokens <=
 qwen35_small_spec_graph_tokens()` (default **17**,
 `qwen3_5_forward.cpp:1149-1151`). On decode `total_tokens == R`, so **above 17
-concurrent requests this silently drops CUDA graphs** and could regress hard.
-Everything above is batch 1; the concurrency arms reach mean R=2.63, max ~7, so
-the measured regime is safe — but R can legitimately reach 512. Before making
-this the default: run `40_concurrency_sweep.sh` with the flag at c8 **and** a
-high-R probe past 17, or raise the graph threshold for the decode-as-prefill
-case. Do not ship it on the strength of batch-1 numbers alone.
+concurrent requests this drops CUDA graphs**, which looked like it could regress
+hard. §6a-septies tested exactly that and found **no cliff at any R up to 96** —
+whatever graph capture is lost, the tensor-core kernel's win dominates it by a
+wide and growing margin. The gate has served its purpose; the remaining reason
+to keep the env var is as an escape hatch, not as a warning.
 
 ### 6b. `Context::suspend()` during tool execution — the Pie-only angle
 

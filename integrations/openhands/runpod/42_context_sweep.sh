@@ -32,6 +32,13 @@ mkdir -p "$OUT_DIR"
 
 CONTEXTS=${SWEEP_CONTEXTS:-1000,4000,8000,16000,24000,32000}
 REPS=${SWEEP_REPS:-3}
+# mode=batch sweeps CONCURRENCY at fixed context instead of context at batch 1.
+# It exists to find the R>17 CUDA-graph cliff on the decode-as-prefill path
+# (qwen3_5_forward.cpp:1149 gates enable_graph on total_tokens, which for decode
+# is the request count). pie arm only.
+MODE=${SWEEP_MODE:-context}
+CONCURRENCIES=${SWEEP_CONCURRENCIES:-1,4,8,16,20,24,32,48}
+BATCH_CONTEXT=${SWEEP_BATCH_CONTEXT:-16000}
 ARMS=${SWEEP_ARMS:-"pie vllm"}
 PIE_PORT=${PIE_PORT:-18097}
 VLLM_PORT=${VLLM_PORT:-18000}
@@ -83,6 +90,8 @@ for arm in $ARMS; do
         "$CLIENT_PY" "$RUNPOD_DIR/context_sweep_client.py" \
             --arm pie --uri "ws://127.0.0.1:$PIE_PORT" --repo "$REPO_ROOT" \
             --model "$MODEL" --contexts "$CONTEXTS" --reps "$REPS" \
+            --mode "$MODE" --concurrencies "$CONCURRENCIES" \
+            --batch-context "$BATCH_CONTEXT" \
             --out "$out_json" 2>&1 | tee "$OUT_DIR/${arm}_client.log"
     else
         PYTHONPATH="" HF_HOME=$HF_HOME \
@@ -118,6 +127,13 @@ for p in sorted(glob.glob(os.path.join(d, "*.json"))):
     o = json.load(open(p))
     fits[o["arm"]] = o
     print(f"\n=== {o['arm']}")
+    if o["rows"] and "concurrency" in o["rows"][0]:
+        print(f"  {'R':>4} {'t_forward_ms':>13} {'aggregate_tok_s':>16}")
+        for r in o["rows"]:
+            t, a = r["t_forward_ms"], r["aggregate_tok_s"]
+            print(f"  {r['concurrency']:>4} {'' if t is None else round(t,3):>13} "
+                  f"{'' if a is None else round(a,1):>16}")
+        continue
     print(f"  {'prompt_tok':>10} {'ms/token':>9} {'self':>8}")
     for r in o["rows"]:
         s = r.get("self_reported_decode_ms_per_token")
