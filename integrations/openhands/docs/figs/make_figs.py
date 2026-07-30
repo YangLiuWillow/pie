@@ -65,14 +65,15 @@ fig.tight_layout(); fig.savefig(f"{OUT}/fig3_concurrency.png", dpi=160); plt.clo
 
 # Fig 4 — c8 overcommit completion (placeholder: armA/armB fill in)
 fig, ax = plt.subplots(figsize=(7.2, 3.6))
-arms = ["no swap,\nsnapshots\n(2026-07-29)", "swap only\n(Arm A)", "swap + live ctx\n+ bid (Arm B)"]
-vals = [0, None, None]   # PENDING: fill from arm results
-b = ax.bar(arms[:1], [0], width=0.5, color=PIE)
-ax.bar(arms[1:], [0, 0], width=0.5, color=PIE, alpha=0.25, hatch="//")
-ax.annotate("0/8", (0, 0.2), ha="center", color=INK)
-ax.annotate("pending", (1, 0.2), ha="center", color=MUT)
-ax.annotate("pending", (2, 0.2), ha="center", color=MUT)
-ax.set_ylim(0, 13); ax.set_ylabel("instances completed (of 13)")
-ax.set_title("Memory overcommit at c8 on 80 GB: policy, not speed  [PENDING]")
+arms = ["no swap,\nsnapshots\n(07-29)", "swap only\n(control)", "live ctx + bids\n(after 5 fixes)", "vLLM fair\n(same load)"]
+vals = [0, 0, 6, 8]
+attempted = [8, 8, 6, 8]
+cols = [PIE, PIE, PIE, VLLM]
+b = ax.bar(arms, vals, width=0.55, color=cols)
+for i, (v, a) in enumerate(zip(vals, attempted)):
+    ax.annotate(f"{v}/{a}", (i, v + 0.2), ha="center", color=INK)
+ax.annotate("stopped early for\nthe comparator", (2, 6.9), ha="center", fontsize=8, color=MUT)
+ax.set_ylim(0, 13); ax.set_ylabel("instances served / attempted")
+ax.set_title("Memory overcommit at c8 on 80 GB: policy, not speed")
 fig.tight_layout(); fig.savefig(f"{OUT}/fig4_overcommit.png", dpi=160); plt.close(fig)
 print("wrote 4 figs to", OUT)

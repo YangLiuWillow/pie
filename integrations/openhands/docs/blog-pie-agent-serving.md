@@ -149,10 +149,45 @@ token context is ~4.4 GB of KV — ~90 ms to restore over PCIe versus ~1 s to
 recompute even at vLLM's prefill speed. Whether that wins under a real
 overcommitted agent workload is exactly what the next arms measure:
 
-`[PENDING: c8 overcommit arms — A: swap-on/snapshot-mode (attribution control),
-B: swap-on/live-context. Yesterday's baseline: 0/8 completions.]`
+It took one day and five bug fixes to get there — each found by a
+minutes-scale repro, each individually measured (the full chain lives in
+`runpod/DEFECTS_OVERCOMMIT.md`): a stale-counter under-reservation in the
+SDK, equal-bid eviction churn in the market scheduler, a zero-bid fresh
+context that could never evict its way back in, a context-per-turn leak in
+daemon mode, and a double-delete trap in `Context::destroy`. The arms tell
+the story in three acts:
+
+| c8 arm (80 GB board, ~2× KV overcommit) | outcome |
+|---|---|
+| snapshots, no swap (2026-07-29) | **0/8** — starved at 900 s timeouts |
+| snapshots + swap pool (control) | **0/8** — mechanism without policy objects |
+| live contexts + bids, after fixes | **all attempted instances served** (one empty patch); stopped early for the comparator |
+| vLLM 0.25 fair, same instances | 8/8 |
 
 ![c8 overcommit completion rates — baseline vs swap-only vs live contexts](figs/fig4_overcommit.png)
+
+And the head-to-head, matched instances under identical 8-way pressure,
+Pie still on its stock 512-token chunk (the prefill lever above unplayed):
+
+| instance | Pie s/iter | vLLM s/iter | ratio |
+|---|---|---|---|
+| django-12276 | 4.26 | 4.09 | 1.04× |
+| django-13089 | 4.68 | 4.68 | **1.00×** |
+| django-15569 | 4.45 | 4.14 | 1.08× |
+| matplotlib-22719 | 5.88 | 3.90 | 1.51× |
+| django-14373* | 11.89 | 5.27 | 2.26× |
+
+*\*heavily divergent trajectories (62 vs 44 iterations) and a partial
+wall-clock window — the weakest row; the matplotlib row also diverged
+(vLLM's patch is 7× larger — different solutions).*
+
+On cleanly-matched instances: **parity** (1.00–1.08×). Both engines
+inflate ~4× from their c1 baselines — the cost is the 8-way rotation
+itself, which the two architectures reach by different roads: vLLM's
+admission queue caps the running set at ~4 and rotates; Pie's bid market
+evicts parked conversations to host RAM and restores them at PCIe speed.
+Convergent behavior, kind-different mechanisms — and the mechanism
+difference is programmable on exactly one side.
 
 These arms are labeled a **capability experiment**, not the fair A/B — vLLM
 0.25's V1 engine dropped swap-based preemption entirely, so there is no

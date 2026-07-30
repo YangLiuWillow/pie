@@ -102,3 +102,12 @@ in `/workspace/.env`).
   writeup quotes 24,120 tok/s as the recommended config.
 - Stretch: chat-apc HTTP surface (in `/workspace/pie-vllm-test`) as the
   transport for multi-harness (Codex) arms.
+
+## RESOLVED (2026-07-30 ~23:55) — see DEFECTS_OVERCOMMIT.md §RESOLUTION
+
+Repro 12/12 rounds; c1 smoke 1.28 s/iter (~6% over fair c1); c8 live arm
+served every attempted instance (5 healthy + 1 empty-patch; stopped early
+for the comparator); vLLM fair c8 on the same 8 instances: 8/8, and on
+cleanly-matched instances Pie s/iter is 1.00-1.08x of vLLM — parity at
+~2x overcommit with the STOCK 512 chunk. Next: the lever arm
+(PIE_CUDA_PREFILL_TOKENS=2048 + blk64) and the CUTLASS grouped-GEMM probe.
