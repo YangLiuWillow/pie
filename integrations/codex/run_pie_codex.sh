@@ -24,7 +24,12 @@ VENV="$HERE/.venv"
 [[ -f "$WASM" ]] || { echo "wasm not found at $WASM (cargo build --target wasm32-wasip2 --release)"; exit 1; }
 
 echo "[1/3] pie serve on :$CONTROL_PORT (log: $PIE_LOG)"
-PYTHONPATH="" "$PIE" serve --config "$CFG" --port "$CONTROL_PORT" --no-auth >"$PIE_LOG" 2>&1 &
+# PIE_SHMEM_TIMEOUT_S: the shmem RPC hard timeout defaults to 60s; a
+# 1024-token CPU prefill chunk takes ~90-110s, so every such forward would
+# silently return an empty output (the driver keeps grinding). Generous on
+# CPU; harmless on GPU where forwards take milliseconds.
+PYTHONPATH="" PIE_SHMEM_TIMEOUT_S="${PIE_SHMEM_TIMEOUT_S:-600}" \
+    "$PIE" serve --config "$CFG" --port "$CONTROL_PORT" --no-auth >"$PIE_LOG" 2>&1 &
 PIE_PID=$!
 trap 'kill "$PIE_PID" 2>/dev/null || true' EXIT
 

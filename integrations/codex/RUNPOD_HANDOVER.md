@@ -38,6 +38,17 @@ traps were hit and fixed on the branch (keep them in mind if configs change):
   request then starves. Config now sets 600s, and the inferlet prefills in
   1024-token chunks with an SSE keepalive per chunk (Codex kills streams
   silent > 5 min).
+- **The real per-forward ceiling is `PIE_SHMEM_TIMEOUT_S` (default 60s)** —
+  the shmem RPC hard timeout in `runtime/src/shmem_ipc.rs`. Any forward
+  slower than it errors client-side while the driver keeps computing, and
+  `runtime/src/inference/scheduler.rs::execute_batch` **converts that error
+  into an empty `ForwardPassOutput`** — the inferlet sees a successful
+  zero-token step, not an error. `run_pie_codex.sh` exports 600s now.
+  Engine bug worth fixing properly: fire_batch failures should propagate as
+  errors to the inferlet, and `FP_NONE_FOR_DECODE` / `fire_batch failed`
+  log lines are the signature to grep for. On GPU (ms-scale forwards) the
+  default never fires — but a cold-start JIT or a wedged driver produces
+  exactly this silent-empty pattern, so know it.
 - `pie serve` caches installed programs; after rebuilding the wasm, restart
   the server — reinstalling over a live server does not take effect.
 
