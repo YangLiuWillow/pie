@@ -642,6 +642,15 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
 
         // Truncate at stop / max_tokens, accumulate counters, seed buffer.
         let mut tokens = accepted_tokens;
+
+        // If the driver returned no token despite having a sampler attached,
+        // the forward pass failed (plan error, shmem timeout, etc.). Mark
+        // done so the generation loop exits rather than spinning indefinitely
+        // with an empty buffer.
+        if tokens.is_empty() && !user_cleared_sampler {
+            parent.done = true;
+        }
+
         if let Some(pos) = tokens.iter().position(|t| parent.stop.contains(t)) {
             tokens.truncate(pos);
             parent.done = true;

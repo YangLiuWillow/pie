@@ -123,6 +123,9 @@ pub fn native_grammar(model: &Model, tool_schemas: &[String]) -> Option<Grammar>
 /// [`GrammarConstraint::new`](crate::GrammarConstraint::new) for
 /// constrained generation.
 pub fn native_matcher(model: &Model, tool_schemas: &[String]) -> Option<Matcher> {
+    // `create_matcher` traps if the model has no tool grammar; check via
+    // `format` first (which returns Option) before calling it.
+    tool_use::format(model, tool_schemas)?;
     Some(tool_use::create_matcher(model, tool_schemas))
 }
 

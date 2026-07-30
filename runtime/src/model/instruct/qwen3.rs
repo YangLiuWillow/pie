@@ -530,6 +530,14 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools || tools.is_empty() {
             return None;
         }
+        // Thinking models emit <think>...</think> before <tool_call>, so the
+        // grammar (which requires <tool_call> at position 0) would block all
+        // thinking tokens → empty logit mask → infinite zero-token decode loop.
+        // Skip constrained generation for thinking models; the ToolDecoder
+        // handles detection correctly without it.
+        if self.config.has_thinking {
+            return None;
+        }
         let source = Self::build_tool_call_grammar(tools)?;
         let grammar = Grammar::from_ebnf(&source, "root").ok()?;
         Some(ToolGrammar { source, grammar: Arc::new(grammar) })
