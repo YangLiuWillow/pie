@@ -113,6 +113,24 @@ struct Input {
 
     #[serde(default = "default_true")]
     use_grammar: bool,
+
+    // ── Live-context session mode (capability experiment) ─────────────
+    //
+    // When true, the daemon holds a LIVE `Context` per session across
+    // requests instead of the snapshot save/open cycle. KV pressure is then
+    // handled by the runtime's market scheduler (bid-ordered eviction to the
+    // swap pool, bid-ordered restore) instead of not at all — snapshot refs
+    // are invisible to that scheduler, which is why the 2026-07-29 c8 arm
+    // starved. NOT comparable to snapshot-mode arms: `pie_session.mode`
+    // strings are prefixed "live-" so an arm's rows self-identify.
+    #[serde(default)]
+    live_context: bool,
+
+    /// With live_context: explicitly suspend() the parked parent after each
+    /// response instead of leaving it resident at an idle bid. Aggressive —
+    /// frees pages proactively, pays a restore on every turn.
+    #[serde(default)]
+    live_idle_suspend: bool,
 }
 
 fn default_max_tokens() -> usize { 2048 }
@@ -289,6 +307,9 @@ async fn handle_request(mut input: Input) -> Result<Output> {
         // conversation: on a hard-allocated cache (cuda_native,
         // swap_pool_size=0) a few back-to-back conversations exhaust the
         // budget and later ones block forever waiting for pages.
+        // Live-mode state first: dropping the parent Context releases its
+        // page refs regardless of which mode the session actually ran in.
+        LIVE_SESSIONS.with(|m| m.borrow_mut().remove(sid));
         let _ = Context::delete(&model, &session_name(sid));
         let _ = Context::delete(&model, &prefix_cache::namespace(sid, CACHE_COMPAT));
         return Ok(Output {
@@ -348,6 +369,27 @@ async fn handle_request(mut input: Input) -> Result<Output> {
         &mut timings,
     )
     .await?;
+
+    // Live mode: park the parent at the prompt boundary and generate on a
+    // fork. The fork shares the prefix pages by refcount; the parent then
+    // advertises an idle bid (or suspends outright) so the market scheduler
+    // treats it as the preferred eviction victim under pressure.
+    if input.live_context {
+        if let Some(sid) = input.session_id.as_deref() {
+            let child = ctx.fork()?;
+            let parent = std::mem::replace(&mut ctx, child);
+            parent.set_bid(LIVE_IDLE_BID);
+            if input.live_idle_suspend {
+                let _ = parent.suspend();
+            }
+            LIVE_SESSIONS.with(|m| {
+                m.borrow_mut().insert(
+                    sid.to_string(),
+                    LiveSession { ctx: parent, tokens: full_tokens.clone() },
+                )
+            });
+        }
+    }
 
     ctx.cue();
 
@@ -783,6 +825,10 @@ async fn build_context(
         return Ok((ctx, None));
     };
 
+    if input.live_context {
+        return build_context_live(model, sid, input, full_tokens, full_hash, timings).await;
+    }
+
     // Content-addressed reuse, self-keyed from token content alone. Every call
     // saves its *full* host-message render under `hash(full_tokens)`. Because
     // OpenHands history is append-only, a previous turn's full render is a
@@ -895,6 +941,102 @@ async fn build_context(
 
 fn session_name(session_id: &str) -> String {
     format!("oh-session-{session_id}")
+}
+
+// ─── Live-context session mode ──────────────────────────────────────────────
+//
+// The persistent state is a LIVE `Context` parked at the prompt-render
+// boundary, not a snapshot. Pressure handling belongs to the runtime's market
+// scheduler: the parked parent advertises an idle bid (or is explicitly
+// suspended), so under KV pressure the engine evicts it to the swap pool and
+// restores it — bid-ordered — when it is touched again. Ops on a suspended
+// context are deferred, not failed, so the extend path below needs no
+// explicit restore handling.
+//
+// Generation never runs on the parent: committed pages cannot be truncated,
+// so a generated suffix would poison the reusable prefix. handle_request
+// forks a child for the turn and drops it after the response.
+
+/// Bid advertised by a parked parent context. Deliberately far below any
+/// plausible truthful bid (compute_bid amortizes a wallet over a horizon):
+/// idle sessions must be the first eviction victims, never a generating one.
+const LIVE_IDLE_BID: f64 = 1e-12;
+
+struct LiveSession {
+    ctx: Context,
+    /// Exact tokens materialized in `ctx` — the next render must extend
+    /// these or the context is rebuilt (condenser rewrote history).
+    tokens: Vec<u32>,
+}
+
+thread_local! {
+    static LIVE_SESSIONS: std::cell::RefCell<
+        std::collections::HashMap<String, LiveSession>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+async fn build_context_live(
+    model: &Model,
+    sid: &str,
+    input: &Input,
+    full_tokens: &[u32],
+    full_hash: u64,
+    timings: &mut Timings,
+) -> Result<(Context, Option<SessionOut>)> {
+    let prior = LIVE_SESSIONS.with(|m| m.borrow_mut().remove(sid));
+
+    let t_prefill = Instant::now();
+    let (mut ctx, mode, prefill) = match prior {
+        Some(s)
+            if full_tokens.len() >= s.tokens.len()
+                && full_tokens[..s.tokens.len()] == s.tokens[..] =>
+        {
+            let mut c = s.ctx;
+            // Back to default (truthful) bidding: this also sets the
+            // restore priority if the engine suspended the parent while
+            // it was parked.
+            c.set_bid(0.0);
+            c.append(&full_tokens[s.tokens.len()..]);
+            let n = full_tokens.len() - s.tokens.len();
+            (c, "live-extended", n)
+        }
+        Some(s) => {
+            // History no longer extends what the context holds (condenser
+            // rewrite/truncation). Same cost profile as snapshot-mode
+            // "rebuilt": drop and re-prefill.
+            drop(s);
+            let mut c = Context::new(model)?;
+            c.append(full_tokens);
+            (c, "live-rebuilt", full_tokens.len())
+        }
+        None => {
+            let mut c = Context::new(model)?;
+            c.append(full_tokens);
+            (c, "live-fresh", full_tokens.len())
+        }
+    };
+
+    // May wait on the market scheduler (deferred alloc + restore) if the
+    // parent was evicted while parked — that wait IS the pressure policy.
+    ctx.flush().await?;
+    timings.prefill_ms = ms(t_prefill);
+
+    if input.kv_verify && ctx.seq_len() as usize != full_tokens.len() {
+        return Err(format!(
+            "kv-verify: live context holds {} tokens after prefill, render has {}",
+            ctx.seq_len(),
+            full_tokens.len()
+        ));
+    }
+
+    let session = SessionOut {
+        id: sid.to_string(),
+        mode: mode.to_string(),
+        len: full_tokens.len(),
+        hash: format!("{full_hash:x}"),
+        prefill_tokens: prefill,
+    };
+    Ok((ctx, Some(session)))
 }
 
 /// FNV-1a 64-bit over the little-endian bytes of the token IDs.

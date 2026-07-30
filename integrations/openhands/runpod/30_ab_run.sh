@@ -140,8 +140,14 @@ elif [ "$ARM" = "pie" ]; then
         auto_p16)
             _sfx="_auto_p16"
             unset PIE_CUDA_KV_PAGE_SIZE ;;
+        overcommit_p32)
+            # Swap tier ENABLED (swap_pool_size=4096). This is the capability
+            # experiment, NOT the fair A/B — see the toml header. Do not
+            # compare arms using this variant against vLLM fair arms.
+            _sfx="_overcommit"
+            export PIE_CUDA_KV_PAGE_SIZE=32 ;;
         *)
-            echo "PIE_CFG_VARIANT must be auto_p32 | latency_p32 | auto_p16" >&2
+            echo "PIE_CFG_VARIANT must be auto_p32 | latency_p32 | auto_p16 | overcommit_p32" >&2
             exit 2 ;;
     esac
     # Prefer a toml written for THIS GPU, fall back to the h200 one. The configs

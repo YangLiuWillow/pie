@@ -330,6 +330,16 @@ class PieLLM(LLM):
         fields: dict[str, Any] = {"session_id": self._pie_session_id}
         if self.pie_kv_verify:
             fields["kv_verify"] = True
+        # Live-context capability experiment (env-gated, off by default): the
+        # inferlet holds a live Context across calls and lets the runtime's
+        # market scheduler (bid-ordered swap/restore) handle KV pressure,
+        # instead of the snapshot save/open cycle. Arms run this way are NOT
+        # comparable to snapshot-mode arms — the pie_session.mode strings in
+        # the predictions rows carry a "live-" prefix so rows self-identify.
+        if os.environ.get("PIE_LIVE_CONTEXT", "") not in ("", "0"):
+            fields["live_context"] = True
+            if os.environ.get("PIE_LIVE_IDLE_SUSPEND", "") not in ("", "0"):
+                fields["live_idle_suspend"] = True
         return fields
 
     def model_copy(self, *, update: Any = None, deep: bool = False) -> "PieLLM":
