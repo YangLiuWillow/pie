@@ -1,0 +1,28 @@
+# Pie config for the Codex integration — Qwen3-0.6B on the portable (ggml)
+# driver. First run downloads ~1.2 GB of safetensors from HuggingFace.
+
+[server]
+verbose = true    # run_pie_codex.sh greps the log for readiness
+
+[auth]
+enabled = false
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "portable"
+device = ["cpu"]              # try ["metal"] if compiled with -DGGML_METAL=ON
+activation_dtype = "bfloat16"
+
+[model.scheduler]
+# CPU prefill of a 1k-token chunk runs ~100s; the default 120s forward
+# timeout abandons responses while the driver keeps grinding, wedging the
+# whole queue. Generous headroom costs nothing.
+request_timeout_secs = 600
+
+[model.driver.options]
+max_batch_tokens = 4096
+max_batch_size = 16
+max_num_kv_pages = 1024       # KV snapshots pin pages across turns; leave headroom
