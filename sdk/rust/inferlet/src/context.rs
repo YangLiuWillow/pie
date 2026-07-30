@@ -392,6 +392,23 @@ impl Context {
         self.inner.truncate_working_page_tokens(removable);
         // Re-sync from the host: truncation can release pages, and the
         // safe thing is to read the authoritative counts back.
+        self.resync_page_counts();
+    }
+
+    /// Re-read the authoritative page/token counts from the host.
+    ///
+    /// The cached counters exist for speed, but the host can reshuffle a
+    /// context's pages beneath them: under KV pressure a deferred
+    /// `reserve_working_pages` can SELF-SUSPEND the requesting context
+    /// (sched.rs, no-victim path) and later restore it via replay, after
+    /// which the host's committed/working split no longer matches the cache.
+    /// Reservation arithmetic computed from the stale cache then
+    /// under-reserves by one page at an exact page boundary and the next
+    /// forward dies with KV_INVARIANT_VIOLATION (DEFECTS_OVERCOMMIT.md,
+    /// defect 2 — reproduced deterministically by 50_overcommit_repro.py).
+    /// Callers that are about to size a reservation must resync first.
+    /// Cost: three in-process host getters, ~µs against a ~5 ms decode step.
+    pub(crate) fn resync_page_counts(&mut self) {
         self.committed_pages = self.inner.committed_page_count();
         self.working_pages = self.inner.working_page_count();
         self.working_tokens = self.inner.working_page_token_count();
@@ -414,6 +431,10 @@ impl Context {
         let num_tokens = tokens.len() as u32;
 
         // Reserve additional pages if we need more than currently allocated.
+        // Resync first: the host may have reshuffled pages (suspend/restore
+        // under pressure) since the cache was last written — see
+        // resync_page_counts.
+        self.resync_page_counts();
         let total_tokens_after = self.working_tokens + num_tokens;
         let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
         let additional = pages_needed.saturating_sub(self.working_pages);

@@ -318,6 +318,10 @@ impl<'ctx> Forward<'ctx> {
         // commit on the way out). Explicit inputs are scoring-only — the
         // caller manages their pages.
         if n_auto > 0 {
+            // Resync from the host before sizing the reservation — the cache
+            // can be stale after a pressure-driven suspend/restore (see
+            // Context::resync_page_counts).
+            ctx.resync_page_counts();
             let total_after = ctx.working_tokens + n_auto;
             let pages_needed = (total_after + ctx.page_size - 1) / ctx.page_size;
             let additional = pages_needed.saturating_sub(ctx.working_pages);

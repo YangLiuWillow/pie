@@ -370,24 +370,24 @@ async fn handle_request(mut input: Input) -> Result<Output> {
     )
     .await?;
 
-    // Live mode: park the parent at the prompt boundary and generate on a
-    // fork. The fork shares the prefix pages by refcount; the parent then
-    // advertises an idle bid (or suspends outright) so the market scheduler
-    // treats it as the preferred eviction victim under pressure.
+    // Live mode: generate on a fork; the parent is the persistent session
+    // state, parked at the prompt boundary. CRITICAL ORDER (defect 2,
+    // DEFECTS_OVERCOMMIT.md): the parent must NOT be parked (idle bid /
+    // suspend) while the child generates. The child's page set includes the
+    // parent's partial tail WORKING page (prompts are not page-aligned, and
+    // partial pages cannot commit), and suspend() FREES working pages
+    // without refcounting — evicting a parked parent mid-generation steals
+    // the child's tail page and the next decode step dies with
+    // KV_INVARIANT_VIOLATION. So: hold the parent at active priority here,
+    // park it only after generation completes (end of handle_request). On an
+    // error path the parent drops and the next turn rebuilds — safe, just
+    // slower.
+    let mut live_parent: Option<(String, Context)> = None;
     if input.live_context {
         if let Some(sid) = input.session_id.as_deref() {
             let child = ctx.fork()?;
             let parent = std::mem::replace(&mut ctx, child);
-            parent.set_bid(LIVE_IDLE_BID);
-            if input.live_idle_suspend {
-                let _ = parent.suspend();
-            }
-            LIVE_SESSIONS.with(|m| {
-                m.borrow_mut().insert(
-                    sid.to_string(),
-                    LiveSession { ctx: parent, tokens: full_tokens.clone() },
-                )
-            });
+            live_parent = Some((sid.to_string(), parent));
         }
     }
 
@@ -636,6 +636,21 @@ async fn handle_request(mut input: Input) -> Result<Output> {
     // render is a literal token-prefix of the next call's render and is
     // re-discovered there by the boundary search — byte-identical name, no
     // re-serialization drift.
+    // Live mode: generation is done and the child (`ctx`) is about to drop —
+    // NOW it is safe to park the parent as the preferred eviction victim.
+    if let Some((sid, parent)) = live_parent.take() {
+        parent.set_bid(LIVE_IDLE_BID);
+        if input.live_idle_suspend {
+            let _ = parent.suspend();
+        }
+        LIVE_SESSIONS.with(|m| {
+            m.borrow_mut().insert(
+                sid,
+                LiveSession { ctx: parent, tokens: full_tokens.clone() },
+            )
+        });
+    }
+
     let debug_phase1_marker = full_text.contains("<tool_call>");
     Ok(Output {
         text,
@@ -962,6 +977,18 @@ fn session_name(session_id: &str) -> String {
 /// idle sessions must be the first eviction victims, never a generating one.
 const LIVE_IDLE_BID: f64 = 1e-12;
 
+/// Bid set when a parked parent is touched by a new request. This must be an
+/// EXPLICIT high value, not 0.0: 0.0 means "default truthful bidding", and the
+/// truthful bid is computed by the Generator during generation steps — a
+/// context waiting in the restore queue is not generating, so with 0.0 its
+/// effective bid stays at the parked LIVE_IDLE_BID and it sits at the BOTTOM
+/// of the bid-ordered restore queue while active conversations hold every
+/// page. Measured on the first c8 live arm (2026-07-30): every conversation
+/// progressed 6-9 calls and then starved terminally at its first
+/// post-eviction wake, tripping the 900 s per-call timeout. Wake high, let
+/// generation's auto-bid take over for the turn, park low again after.
+const LIVE_WAKE_BID: f64 = 1.0;
+
 struct LiveSession {
     ctx: Context,
     /// Exact tokens materialized in `ctx` — the next render must extend
@@ -992,10 +1019,10 @@ async fn build_context_live(
                 && full_tokens[..s.tokens.len()] == s.tokens[..] =>
         {
             let mut c = s.ctx;
-            // Back to default (truthful) bidding: this also sets the
-            // restore priority if the engine suspended the parent while
-            // it was parked.
-            c.set_bid(0.0);
+            // Explicit high wake bid — restore priority if the engine
+            // suspended the parent while it was parked. See LIVE_WAKE_BID
+            // for why 0.0 ("truthful") starves here.
+            c.set_bid(LIVE_WAKE_BID);
             c.append(&full_tokens[s.tokens.len()..]);
             let n = full_tokens.len() - s.tokens.len();
             (c, "live-extended", n)

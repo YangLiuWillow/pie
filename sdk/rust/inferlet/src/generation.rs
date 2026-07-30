@@ -585,6 +585,12 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // the last cached KV position without growing the working tail.
         let n_total_input = n_pending + n_drafted;
         if n_total_input > 0 {
+            // Resync from the host before sizing the reservation: under KV
+            // pressure a prior deferred reserve can have suspend/restored
+            // this context, invalidating the cached counters (defect 2,
+            // DEFECTS_OVERCOMMIT.md — KV_INVARIANT_VIOLATION at exact page
+            // boundaries).
+            parent.ctx.resync_page_counts();
             let total_after = parent
                 .ctx
                 .working_tokens
