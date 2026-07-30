@@ -907,9 +907,20 @@ impl ContextManager {
                 continue;
             }
 
-            // Non-defaulted contexts must have bid ≤ requester's bid.
+            // Non-defaulted contexts must bid STRICTLY below the requester.
             // Defaulted contexts are always evictable (they owe rent).
-            if !ctx.defaulted && ctx.bid > requester_bid {
+            //
+            // Ties were evictable here once, and the 50_overcommit_repro.py
+            // measurement shows why they must not be: with N equal-bid
+            // contexts over capacity, every waiter may evict every resident
+            // and the engine churns whole-context evict/replay cycles per
+            // decode step (~1,800 evictions in 10 min, throughput collapse)
+            // instead of running turns to completion. Strict inequality makes
+            // mid-turn peers inviolable to each other; a session that wants
+            // eviction rights over idle peers must bid above their parked
+            // bid (see the live-context inferlet: park 0.0, wake 1.0), which
+            // yields turn-slot round-robin under overcommit.
+            if !ctx.defaulted && ctx.bid >= requester_bid {
                 continue;
             }
 

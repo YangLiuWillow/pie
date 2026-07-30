@@ -33,3 +33,26 @@ c8, H100 80GB, overcommit toml: Arm A (snapshots+swap) 8/8 timeouts;
 Arm B (live+wake-bid 1.0) 8/8 after 6–9 healthy calls each; Arm C
 (live+idle-suspend) same. All ~900 s ConversationRunError. c1 smoke of
 live mode: clean (93.8% reuse, 0 errors).
+
+## RESOLUTION (2026-07-30, ~23:25) — repro passes 12/12 rounds at ~1.9x overcommit
+
+Five fixes, each forced by a repro measurement:
+1. SDK counter resync before reservation sizing (defect 2) — b7b872a4.
+2. Eviction requires victims bidding STRICTLY below the requester
+   (sched.rs): equal-bid eviction produced whole-context evict/replay churn
+   per decode step; strict inequality makes mid-turn peers inviolable and
+   yields turn-slot round-robin.
+3. Live-mode wake bid (1.0) set on ALL requester paths incl. fresh/rebuilt:
+   a bid-0.0 fresh fill evicted under pressure could never evict back in.
+4. Live mode destroys the per-turn child fork explicitly: plain drop only
+   collects at instance exit, which a daemon never reaches (leaked ~1
+   context/turn; wedged when the pool no longer fit the rotation).
+5. SDK Context::destroy() forgets the raw handle after the WIT destroy:
+   the handle's own resource-drop double-deleted host-side and TRAPPED the
+   instance (the old phase-2 comment was right).
+
+ENGINE DEBTS still open: suspend() frees working pages without refcounting
+(a fork sharing the parent's tail working page loses it — masked now by
+park-after-generation ordering, not fixed); the restore reject-loop spins
+hot instead of backing off; equal-bid zero-bid legacy flows now cannot
+evict each other at all (acceptable: they couldn't before either).

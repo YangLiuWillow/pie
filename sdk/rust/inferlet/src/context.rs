@@ -177,8 +177,17 @@ impl Context {
     }
 
     /// Force-destroy the context immediately, consuming it.
+    ///
+    /// The WIT `destroy` deletes the host-side resource; letting the handle
+    /// then run its own resource-drop double-deletes it and TRAPS the
+    /// instance mid-request (measured: 50_overcommit_repro.py, wasm
+    /// backtrace in handle_request; also the old phase-2 fork comment).
+    /// Destructure and forget the raw handle — every other field still
+    /// drops normally, so no wasm-side memory leaks.
     pub fn destroy(self) {
-        self.inner.destroy()
+        let Self { inner, .. } = self;
+        inner.destroy();
+        std::mem::forget(inner);
     }
 
     // ── Market operations ────────────────────────────────────────────

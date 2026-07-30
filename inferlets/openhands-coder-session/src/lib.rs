@@ -636,8 +636,12 @@ async fn handle_request(mut input: Input) -> Result<Output> {
     // render is a literal token-prefix of the next call's render and is
     // re-discovered there by the boundary search — byte-identical name, no
     // re-serialization drift.
-    // Live mode: generation is done and the child (`ctx`) is about to drop —
-    // NOW it is safe to park the parent as the preferred eviction victim.
+    // Live mode: generation is done — park the parent as the preferred
+    // eviction victim and DESTROY the child explicitly. A plain drop only
+    // collects at instance exit, which a daemon never reaches: at c8 that
+    // leaked one child per turn (44 contexts by round 6 in the repro) until
+    // the pool could no longer fit the rotation. See DEFECTS_OVERCOMMIT.md.
+    let live_mode_child = live_parent.is_some();
     if let Some((sid, parent)) = live_parent.take() {
         parent.set_bid(LIVE_IDLE_BID);
         if input.live_idle_suspend {
@@ -649,6 +653,12 @@ async fn handle_request(mut input: Input) -> Result<Output> {
                 LiveSession { ctx: parent, tokens: full_tokens.clone() },
             )
         });
+    }
+
+    if live_mode_child {
+        // `g` still borrows ctx; end the borrow before consuming it.
+        drop(g);
+        ctx.destroy();
     }
 
     let debug_phase1_marker = full_text.contains("<tool_call>");
@@ -975,7 +985,13 @@ fn session_name(session_id: &str) -> String {
 /// Bid advertised by a parked parent context. Deliberately far below any
 /// plausible truthful bid (compute_bid amortizes a wallet over a horizon):
 /// idle sessions must be the first eviction victims, never a generating one.
-const LIVE_IDLE_BID: f64 = 1e-12;
+// 0.0, NOT an epsilon: fresh contexts that never call set_bid carry bid
+// 0.0, and eviction victims must bid <= the requester (ties allowed,
+// sched.rs find_eviction_victim). A parked parent at 1e-12 OUTBIDS a fresh
+// fill, so an evicted first-fill can never evict its way back in — the
+// terminal restore_rej loop of DEFECTS_OVERCOMMIT.md defect 1. At 0.0
+// parked parents tie with fresh fills: evictable both ways, FCFS tiebreak.
+const LIVE_IDLE_BID: f64 = 0.0;
 
 /// Bid set when a parked parent is touched by a new request. This must be an
 /// EXPLICIT high value, not 0.0: 0.0 means "default truthful bidding", and the
@@ -1033,11 +1049,18 @@ async fn build_context_live(
             // "rebuilt": drop and re-prefill.
             drop(s);
             let mut c = Context::new(model)?;
+            // Wake bid on EVERY requester path, not just extend: a fresh
+            // context defaults to bid 0.0, which ties with parked parents —
+            // and eviction requires strictly lower bids, so a 0.0-bid fill
+            // evicted under pressure could never claim pages back
+            // (defect 1, DEFECTS_OVERCOMMIT.md).
+            c.set_bid(LIVE_WAKE_BID);
             c.append(full_tokens);
             (c, "live-rebuilt", full_tokens.len())
         }
         None => {
             let mut c = Context::new(model)?;
+            c.set_bid(LIVE_WAKE_BID);
             c.append(full_tokens);
             (c, "live-fresh", full_tokens.len())
         }

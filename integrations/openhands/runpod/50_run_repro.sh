@@ -23,7 +23,9 @@ grep -m1 "swap_pool=" "$SRV"
 RC=$?
 echo "REPRO-EXIT $RC (server log: $SRV)"
 if [ $RC -eq 2 ]; then
-    echo "=== server log tail at wedge ==="; tail -30 "$SRV"
+    echo "=== server log tail at wedge (sched lines only) ==="
+    grep "pie-sched" "$SRV" | tail -6
 fi
+echo "REPRO-VERDICT exit=$RC"
 kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
 exit $RC
