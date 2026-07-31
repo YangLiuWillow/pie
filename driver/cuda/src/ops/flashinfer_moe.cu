@@ -285,6 +285,103 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         false);
 }
 
+// SwiGLU twins of the two functions above, for the Qwen3-MoE prefill path.
+// THE API TRAP, honored here (see moe_probe_workspace_bytes below):
+// getWorkspaceSize takes fc1_output_size = 2*inter for a gated activation,
+// while runMoe takes inter_size itself in the corresponding slot. Requires
+// the Hopper TMA-WS launchers (COMPILE_HOPPER_TMA_GROUPED_GEMMS + the
+// vendored sm90 TUs) — without them the gated dispatch aborts the driver.
+std::size_t flashinfer_cutlass_moe_swiglu_workspace_bytes(
+    int num_rows,
+    int hidden_size,
+    int inter_size,
+    int num_experts,
+    int experts_per_token,
+    int tp_size,
+    int tp_rank) {
+    if (num_rows <= 0 || hidden_size <= 0 || inter_size <= 0 ||
+        num_experts <= 0 || experts_per_token <= 0) {
+        return 0;
+    }
+    Runner& runner = get_runner();
+    return runner.getWorkspaceSize(
+        num_rows,
+        hidden_size,
+        /*fc1_output_size=*/2LL * inter_size,
+        num_experts,
+        experts_per_token,
+        ck::ActivationType::Swiglu,
+        parallelism_config(tp_size, tp_rank),
+        false, false, false, false, false);
+}
+
+bool flashinfer_cutlass_moe_bf16_swiglu(
+    const std::uint16_t* input,
+    const std::int32_t* token_selected_experts,
+    const float* token_final_scales,
+    const std::uint16_t* fc1_expert_weights,
+    const std::uint16_t* fc2_expert_weights,
+    std::uint16_t* output,
+    std::uint8_t* workspace,
+    std::size_t workspace_bytes,
+    std::int32_t* unpermuted_row_to_permuted_row,
+    int num_rows,
+    int hidden_size,
+    int inter_size,
+    int num_experts,
+    int experts_per_token,
+    int tp_size,
+    int tp_rank,
+    cudaStream_t stream) {
+    if (input == nullptr || token_selected_experts == nullptr ||
+        token_final_scales == nullptr || fc1_expert_weights == nullptr ||
+        fc2_expert_weights == nullptr || output == nullptr ||
+        workspace == nullptr || unpermuted_row_to_permuted_row == nullptr) {
+        return false;
+    }
+    const std::size_t needed = flashinfer_cutlass_moe_swiglu_workspace_bytes(
+        num_rows, hidden_size, inter_size, num_experts, experts_per_token,
+        tp_size, tp_rank);
+    if (needed == 0 || workspace_bytes < needed) return false;
+
+    Runner& runner = get_runner();
+    ck::QuantParams quant_params{};
+    tk::LoraParams lora_params{};
+    ck::MoeMinLatencyParams min_latency_params{};
+    runner.runMoe(
+        input,
+        nullptr,
+        false,
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        nullptr,
+        ck::ActivationParams(ck::ActivationType::Swiglu),
+        fc2_expert_weights,
+        nullptr,
+        quant_params,
+        num_rows,
+        hidden_size,
+        hidden_size,
+        /*inter_size=*/inter_size,
+        num_experts,
+        experts_per_token,
+        reinterpret_cast<char*>(workspace),
+        output,
+        unpermuted_row_to_permuted_row,
+        parallelism_config(tp_size, tp_rank),
+        false,
+        false,
+        lora_params,
+        false,
+        false,
+        false,
+        min_latency_params,
+        false,
+        stream);
+    return true;
+}
+
 bool flashinfer_cutlass_moe_bf16_relu2(
     const std::uint16_t* input,
     const std::int32_t* token_selected_experts,

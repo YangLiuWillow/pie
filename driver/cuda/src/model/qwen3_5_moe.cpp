@@ -10,6 +10,19 @@
 
 #include "cuda_check.hpp"
 #include "kernels/gated_delta_net.hpp"  // launch_bf16_to_fp32
+#include <cstdlib>
+#include "kernels/swiglu.hpp"
+
+namespace {
+// The fused CUTLASS MoE path (PIE_QWEN35_MOE_CUTLASS_FUSED=1) consumes the
+// packed gate_up weights in TRT-LLM's [linear; gate] order — the mirror of
+// the checkpoint's [gate; up]. Swap the halves once at bind time; every
+// Pie-side consumer then reads them via chunked_swiglu's gate_second mode.
+bool cutlass_fused_layout_enabled() {
+    const char* v = std::getenv("PIE_QWEN35_MOE_CUTLASS_FUSED");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+}  // namespace
 
 namespace pie_cuda_driver::model {
 
@@ -361,6 +374,14 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         // combined routed+shared partial sum.
         Lw.moe_router       = &must(engine, lp + "mlp.gate.weight");
         Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
+        if (cutlass_fused_layout_enabled()) {
+            pie_cuda_driver::kernels::launch_swap_gate_up_halves_bf16(
+                const_cast<void*>(Lw.moe_gate_up_proj->data()),
+                cfg.num_experts,
+                static_cast<long long>(cfg.moe_intermediate_size) *
+                    cfg.hidden_size,
+                /*stream=*/0);
+        }
         Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
@@ -425,6 +446,14 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
         Lw.moe_router = &must(engine, lp + "mlp.gate.weight");
         Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
+        if (cutlass_fused_layout_enabled()) {
+            pie_cuda_driver::kernels::launch_swap_gate_up_halves_bf16(
+                const_cast<void*>(Lw.moe_gate_up_proj->data()),
+                cfg.num_experts,
+                static_cast<long long>(cfg.moe_intermediate_size) *
+                    cfg.hidden_size,
+                /*stream=*/0);
+        }
         Lw.moe_down_proj = &must(engine, lp + "mlp.experts.down_proj");
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");

@@ -68,6 +68,11 @@ struct Qwen3_5MoeMlpWorkspace {
     // int64 cumulative padded rows per expert — the CUTLASS grouped GEMM's
     // total_tokens_including_expert (written by launch_moe_align_decode).
     DeviceBuffer<long long> aligned_expert_offsets;
+    // Fused CutlassMoeFCRunner (TMA-WS SwiGLU) scratch: opaque workspace +
+    // the permutation map runMoe writes. Sized for max_workspace_tokens at
+    // allocation; empty unless PIE_QWEN35_MOE_CUTLASS_FUSED=1.
+    DeviceBuffer<std::uint8_t> cutlass_fused_workspace;
+    DeviceBuffer<std::int32_t> cutlass_fused_row_map;
     DeviceBuffer<std::uint16_t> aligned_gate_up;     // [aligned_rows, 2*I_moe]
     DeviceBuffer<std::uint16_t> aligned_act;         // [aligned_rows, I_moe]
     DeviceBuffer<std::uint16_t> aligned_out;         // [aligned_rows, H]

@@ -177,6 +177,7 @@ void launch_sigmoid_gate_inplace_bf16(
 
 namespace {
 
+template <bool GATE_SECOND>
 __global__ void chunked_swiglu_bf16_kernel(
     const __nv_bfloat16* __restrict__ packed,
     __nv_bfloat16*       __restrict__ y,
@@ -188,12 +189,31 @@ __global__ void chunked_swiglu_bf16_kernel(
 
     const long long row = static_cast<long long>(n) * I;
     const long long packed_row = row * 2;
-    const float g = __bfloat162float(packed[packed_row + i]);
-    const float u = __bfloat162float(packed[packed_row + I + i]);
+    const float g = __bfloat162float(packed[packed_row + (GATE_SECOND ? I + i : i)]);
+    const float u = __bfloat162float(packed[packed_row + (GATE_SECOND ? i : I + i)]);
     const float silu = g / (1.f + __expf(-g));
     y[row + i] = __float2bfloat16(silu * u);
 }
 
+// Swap the [gate; up] halves of a packed per-expert weight tensor in place:
+// element j of expert e's first half exchanges with element j of its second
+// half. One-time load pass for the fused CUTLASS path, whose gated kernel
+// reads [linear; gate] — the exact mirror of Pie's [gate; up]. In-place safe:
+// each thread owns one disjoint pair.
+__global__ void swap_gate_up_halves_bf16_kernel(
+    __nv_bfloat16* __restrict__ w, long long half_elems, int experts)
+{
+    const long long j =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int e = blockIdx.y;
+    if (e >= experts || j >= half_elems) return;
+    __nv_bfloat16* base = w + static_cast<long long>(e) * 2 * half_elems;
+    const __nv_bfloat16 a = base[j];
+    base[j] = base[half_elems + j];
+    base[half_elems + j] = a;
+}
+
+template <bool GATE_SECOND>
 __global__ void chunked_swiglu_bf16_vec2_kernel(
     const __nv_bfloat16* __restrict__ packed,
     __nv_bfloat16*       __restrict__ y,
@@ -207,9 +227,9 @@ __global__ void chunked_swiglu_bf16_vec2_kernel(
     const long long packed_row = row * 2;
     if (((I & 1) == 0) && i + 1 < I) {
         const auto gate2 = *reinterpret_cast<const __nv_bfloat162*>(
-            packed + packed_row + i);
+            packed + packed_row + (GATE_SECOND ? I + i : i));
         const auto up2 = *reinterpret_cast<const __nv_bfloat162*>(
-            packed + packed_row + I + i);
+            packed + packed_row + (GATE_SECOND ? i : I + i));
         const float2 g = __bfloat1622float2(gate2);
         const float2 u = __bfloat1622float2(up2);
         const float y0 = (g.x / (1.f + __expf(-g.x))) * u.x;
@@ -219,8 +239,8 @@ __global__ void chunked_swiglu_bf16_vec2_kernel(
         return;
     }
 
-    const float g = __bfloat162float(packed[packed_row + i]);
-    const float u = __bfloat162float(packed[packed_row + I + i]);
+    const float g = __bfloat162float(packed[packed_row + (GATE_SECOND ? I + i : i)]);
+    const float u = __bfloat162float(packed[packed_row + (GATE_SECOND ? i : I + i)]);
     const float silu = g / (1.f + __expf(-g));
     y[row + i] = __float2bfloat16(silu * u);
 }
@@ -276,23 +296,44 @@ __global__ void chunked_swiglu_bf16_strided_kernel(
 }  // namespace
 
 void launch_chunked_swiglu_bf16(
-    const void* packed, void* y, int N, int I, cudaStream_t stream)
+    const void* packed, void* y, int N, int I, cudaStream_t stream,
+    bool gate_second)
 {
     if (N <= 0 || I <= 0) return;
     constexpr int BLOCK = 128;
     if (I > 10000) {
         dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-        chunked_swiglu_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(packed),
-            static_cast<__nv_bfloat16*>(y),
-            N, I);
+        if (gate_second) {
+            chunked_swiglu_bf16_kernel<true><<<grid, BLOCK, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(packed),
+                static_cast<__nv_bfloat16*>(y), N, I);
+        } else {
+            chunked_swiglu_bf16_kernel<false><<<grid, BLOCK, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(packed),
+                static_cast<__nv_bfloat16*>(y), N, I);
+        }
         return;
     }
     dim3 grid(N, ((I + 1) / 2 + BLOCK - 1) / BLOCK);
-    chunked_swiglu_bf16_vec2_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(packed),
-        static_cast<__nv_bfloat16*>(y),
-        N, I);
+    if (gate_second) {
+        chunked_swiglu_bf16_vec2_kernel<true><<<grid, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(packed),
+            static_cast<__nv_bfloat16*>(y), N, I);
+    } else {
+        chunked_swiglu_bf16_vec2_kernel<false><<<grid, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(packed),
+            static_cast<__nv_bfloat16*>(y), N, I);
+    }
+}
+
+void launch_swap_gate_up_halves_bf16(
+    void* w, int experts, long long half_elems, cudaStream_t stream)
+{
+    if (w == nullptr || experts <= 0 || half_elems <= 0) return;
+    constexpr int BLOCK = 256;
+    dim3 grid((half_elems + BLOCK - 1) / BLOCK, experts);
+    swap_gate_up_halves_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(w), half_elems, experts);
 }
 
 void launch_chunked_swiglu_strided_bf16(

@@ -79,11 +79,22 @@ void launch_sigmoid_gate_inplace_bf16(
 // deinterleave that an unfused path would need.
 //
 //     y[n, i] = silu(packed[n, i]) * packed[n, I + i]
+// gate_second: read the gate from the SECOND half of the packed pair
+// ([linear; gate], the TRT-LLM fused-MoE layout) instead of Pie's native
+// [gate; up]. Set when the gate_up weights were swapped at load for the
+// fused CUTLASS path. NOTE the *strided* variant below stays gate-first —
+// the host/debug MoE path is incompatible with the swapped layout.
 void launch_chunked_swiglu_bf16(
-    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
+    const void* packed,  // [N, 2*I] bf16
     void*       y,       // [N, I]   bf16
     int N, int I,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool gate_second = false);
+
+// One-time in-place swap of the two halves of a packed per-expert
+// [E, 2*half, ...] weight tensor (gate<->up), for the fused CUTLASS layout.
+void launch_swap_gate_up_halves_bf16(
+    void* w, int experts, long long half_elems, cudaStream_t stream);
 
 void launch_chunked_swiglu_strided_bf16(
     const void* packed,  // [N, row_stride] bf16 (gate first, up second)

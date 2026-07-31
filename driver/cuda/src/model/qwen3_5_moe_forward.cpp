@@ -205,6 +205,18 @@ int qwen35_moe_decode_fast_max_tokens() {
 // the prefill sweep + decode control validate it; enable with
 // PIE_QWEN35_MOE_CUTLASS_PREFILL=1. Applies only to !is_pure_decode
 // forwards so the decode path (and its measured parity) cannot move.
+// Fused CutlassMoeFCRunner path for prefill: one runMoe call does
+// permutation, both GEMMs, gated SwiGLU and finalize. Requires the Hopper
+// TMA-WS build (doctor: "hopper TMA-WS launchers: COMPILED"); without it a
+// gated dispatch ABORTS the driver, which is why this defaults OFF.
+bool qwen35_moe_cutlass_fused_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_CUTLASS_FUSED");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool qwen35_moe_cutlass_prefill_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_CUTLASS_PREFILL");
@@ -588,6 +600,18 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
             DeviceBuffer<std::int32_t>::alloc(max_blocks);
         ws.aligned_expert_offsets =
             DeviceBuffer<long long>::alloc(num_experts);
+        if (qwen35_moe_cutlass_fused_prefill_enabled()) {
+            const std::size_t fused_bytes =
+                ops::flashinfer_cutlass_moe_swiglu_workspace_bytes(
+                    max_tokens, hidden, moe_intermediate, num_experts, top_k,
+                    /*tp_size=*/1, /*tp_rank=*/0);
+            if (fused_bytes > 0) {
+                ws.cutlass_fused_workspace =
+                    DeviceBuffer<std::uint8_t>::alloc(fused_bytes);
+                ws.cutlass_fused_row_map =
+                    DeviceBuffer<std::int32_t>::alloc(maxR);
+            }
+        }
         ws.aligned_expert_in =
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * H);
         ws.aligned_gate_up =
@@ -1303,6 +1327,47 @@ bool moe_block(
     const std::size_t expert_stride_dn =
         static_cast<std::size_t>(H) * Im;       // bf16 elements per expert in down_proj
 
+    // Fused TMA-WS SwiGLU path (prefill only): one runMoe call replaces the
+    // whole aligned pipeline — its own permutation, both grouped GEMMs, the
+    // gated activation, and the finalize (scale-and-sum over top-k). Output
+    // is the COMBINED routed-expert result [N, H], written (not accumulated)
+    // — so it must land in norm_y and the residual add happens explicitly
+    // below. The add_to_residual trap (a kernel that overwrites ws.y erases
+    // the attention output) is thereby sidestepped rather than finessed.
+    const bool use_fused_cutlass =
+        !is_pure_decode && (T == 1) &&
+        // The fused branch returns before the shared-expert section below;
+        // only safe when the model has no shared expert (Qwen3-Coder: none).
+        (Is == 0) &&
+        qwen35_moe_cutlass_fused_prefill_enabled() &&
+        !moe_ws.cutlass_fused_workspace.empty();
+    if (use_fused_cutlass) {
+        bool ok = false;
+        profile_cuda_stage(profile, profile ? &profile->moe_routed_ms : nullptr,
+            stream, [&] {
+                ok = ops::flashinfer_cutlass_moe_bf16_swiglu(
+                    static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                    moe_ws.topk_idx.data(),
+                    moe_ws.topk_weights.data(),
+                    static_cast<const std::uint16_t*>(
+                        Lw.moe_gate_up_proj->data()),
+                    static_cast<const std::uint16_t*>(
+                        Lw.moe_down_proj->data()),
+                    static_cast<std::uint16_t*>(ws.norm_y.data()),
+                    moe_ws.cutlass_fused_workspace.data(),
+                    moe_ws.cutlass_fused_workspace.size(),
+                    moe_ws.cutlass_fused_row_map.data(),
+                    N, H, Im, E, K,
+                    /*tp_size=*/1, /*tp_rank=*/0, stream);
+            });
+        if (ok) {
+            // Fused output sits in norm_y; returning false makes the CALLER
+            // run the residual add (the same contract the TP>1 path uses).
+            return false;
+        }
+        // Fall through to the standard path if the wrapper declined.
+    }
+
     if (use_decode_fast_path) {
         // Decode fast-path. Fully on-device pipeline (graph-capturable):
         //   1. Build gate_up/down cuBLAS pointer arrays for every
@@ -1403,7 +1468,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.aligned_gate_up.data(),
                                 moe_ws.aligned_act.data(),
-                                aligned_rows, Im, stream);
+                                aligned_rows, Im, stream,
+                                qwen35_moe_cutlass_fused_prefill_enabled());
                         });
 
                     // Aligned down_proj: M=block_size, N=H, K=Im.
@@ -1467,7 +1533,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.expert_gate_up.data(),
                                 moe_ws.expert_act.data(),
-                                routes, Im, stream);
+                                routes, Im, stream,
+                                qwen35_moe_cutlass_fused_prefill_enabled());
                         });
 
                     profile_cuda_detail_stage(
@@ -1540,7 +1607,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.expert_gate_up.data(),
                                 moe_ws.expert_act.data(),
-                                routes, Im, stream);
+                                routes, Im, stream,
+                                qwen35_moe_cutlass_fused_prefill_enabled());
                         });
 
                     // down_proj batched GEMM: M=1, N=H, K=Im, batch=N*top_k.
@@ -1613,7 +1681,8 @@ bool moe_block(
                     kernels::launch_chunked_swiglu_bf16(
                         moe_ws.expert_gate_up.data(),
                         moe_ws.expert_act.data(),
-                        Ne, Im, stream);
+                        Ne, Im, stream,
+                        qwen35_moe_cutlass_fused_prefill_enabled());
 
                     const auto* down_w = static_cast<const std::uint16_t*>(
                                              Lw.moe_down_proj->data())
