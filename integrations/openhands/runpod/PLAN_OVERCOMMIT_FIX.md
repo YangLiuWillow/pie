@@ -111,3 +111,34 @@ for the comparator); vLLM fair c8 on the same 8 instances: 8/8, and on
 cleanly-matched instances Pie s/iter is 1.00-1.08x of vLLM — parity at
 ~2x overcommit with the STOCK 512 chunk. Next: the lever arm
 (PIE_CUDA_PREFILL_TOKENS=2048 + blk64) and the CUTLASS grouped-GEMM probe.
+
+## NEXT: CUTLASS grouped-GEMM dispatch probe (task #6, designed 2026-07-31 ~00:00)
+
+Vendored tree: /root/.cpm-cache/flashinfer/b239/csrc/nv_internal/tensorrt_llm/
+kernels/cutlass_kernels/ — MoeGemmRunner<bf16,bf16,bf16,bf16> explicitly
+instantiated in moe_gemm/moe_gemm_kernels_bf16_bf16.cu.
+
+API (include/moe_gemm_kernels.h): GroupedGemmInput{A, B, C,
+total_tokens_including_expert (DEVICE int64 cumulative rows/expert ==
+variable-M), n, k, num_experts, activation_type, gemm_config, stream};
+runner.moeGemm(inputs, TmaWarpSpecializedGroupedGemmInput{});
+runner.getConfigs(false) lists configs; runner.isTmaWarpSpecialized(cfg)
+filters to the sm80-style configs that ARE compiled (the TMA-WS ones are
+not — the known build gate).
+
+Probe (extend pie_driver_cuda_moe_probe in driver/cuda/src/ops/
+flashinfer_moe.cu): allocate A 512x2048 bf16, B 128x2048x1536 (up, as
+NON-gated n=2I with elementwise SwiGLU after) and 128x768x2048 (down),
+C, offsets = 512 rows spread over 128 experts; for each non-TMA config:
+set gemm_config, moeGemm, cudaDeviceSynchronize, catch — report which
+configs RUN (dispatch-level truth; getWorkspaceSize lies). Shapes to
+probe: (n=1536,k=2048) up non-gated, (n=2048,k=768) down,
+activation_type=Identity/InvalidType per non-gated convention (check
+moeGemm's act handling — moeGemmBiasAct is the act-fused variant; plain
+moeGemm should be act-free).
+
+If configs run: integrate as the prefill MoE path (route/gather already
+exist from the aligned path; replace the two cublasGemmBatchedEx with two
+moeGemm calls + launch_chunked_swiglu between; remember add_to_residual
+must ACCUMULATE and decode control must stay flat). Rebuild driver, run
+42_context_sweep prefill mode vs the 24.1k baseline. Then the c8 lever arm.
