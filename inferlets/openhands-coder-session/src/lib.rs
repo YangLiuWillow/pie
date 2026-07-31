@@ -126,6 +126,26 @@ struct Input {
     #[serde(default)]
     live_context: bool,
 
+    /// Share prefix snapshots ACROSS sessions: the cache key drops the
+    /// session id, so any conversation whose render shares a token prefix
+    /// with a previously saved boundary (the common system-prompt + tool
+    /// schema head, ~3-4k tokens) reuses it — the cross-conversation
+    /// sharing vLLM's global APC gets for free. EXPERIMENT flag: shared
+    /// snapshots are not covered by session teardown (they would need a
+    /// refcount/TTL lifecycle before this could be a default).
+    #[serde(default)]
+    global_prefix_cache: bool,
+
+    /// Snapshot retention horizon (0 = unlimited, the legacy behavior):
+    /// keep at most this many boundary snapshots per session, deleting the
+    /// oldest beyond it. Ported from chat-apc's SnapshotRecords/enforce
+    /// pass, simplified: our boundary scan probes at most MAX_OPEN_ATTEMPTS
+    /// (8) boundaries back, so snapshots older than the horizon are
+    /// unreachable by lookup and only pin KV. A deep truncate/retry past
+    /// the horizon falls back to a clean rebuild — semantically safe.
+    #[serde(default)]
+    snapshot_retention: usize,
+
     /// With live_context: explicitly suspend() the parked parent after each
     /// response instead of leaving it resident at an idle bid. Aggressive —
     /// frees pages proactively, pays a restore on every turn.
@@ -310,6 +330,7 @@ async fn handle_request(mut input: Input) -> Result<Output> {
         // Live-mode state first: dropping the parent Context releases its
         // page refs regardless of which mode the session actually ran in.
         LIVE_SESSIONS.with(|m| m.borrow_mut().remove(sid));
+        SNAPSHOT_RECORDS.with(|m| m.borrow_mut().remove(sid));
         let _ = Context::delete(&model, &session_name(sid));
         let _ = Context::delete(&model, &prefix_cache::namespace(sid, CACHE_COMPAT));
         return Ok(Output {
@@ -854,6 +875,11 @@ async fn build_context(
         return build_context_live(model, sid, input, full_tokens, full_hash, timings).await;
     }
 
+    // Cross-session sharing experiment: one shared namespace instead of the
+    // per-session one. The underlying KV trie is content-addressed either
+    // way; only the snapshot NAME changes.
+    let cache_key: &str = if input.global_prefix_cache { "shared" } else { sid };
+
     // Content-addressed reuse, self-keyed from token content alone. Every call
     // saves its *full* host-message render under `hash(full_tokens)`. Because
     // OpenHands history is append-only, a previous turn's full render is a
@@ -891,7 +917,7 @@ async fn build_context(
         }
         attempts += 1;
         let t_h = Instant::now();
-        let name = prefix_cache::snapshot_name(sid, CACHE_COMPAT, model_id, &full_tokens[..len]);
+        let name = prefix_cache::snapshot_name(cache_key, CACHE_COMPAT, model_id, &full_tokens[..len]);
         timings.hash_ms += ms(t_h);
         let t_o = Instant::now();
         let open_result = Context::open(model, &name);
@@ -916,11 +942,47 @@ async fn build_context(
         Some((mut c, len)) => {
             let suffix = &full_tokens[len..];
             c.append(suffix);
-            (c, "extended", suffix.len())
+            // Distinguish a cross-conversation shared-head hit (opened at
+            // the FIRST boundary — the [system+tools] head another session
+            // saved) from ordinary same-session extension, so the mode
+            // counts can prove the sharing actually fired.
+            let mode = if input.global_prefix_cache
+                && boundaries.first().is_some_and(|&b| b == len)
+            {
+                "shared-hit"
+            } else {
+                "extended"
+            };
+            (c, mode, suffix.len())
         }
         None => {
             let mut c = Context::new(model)?;
-            c.append(full_tokens);
+            // Head snapshot (global_prefix_cache only): saves happen at
+            // FULL-render points, so the shared [system+tools] head is never
+            // a save-point and cross-conversation lookups can never hit it —
+            // measured 2026-07-31: two-instance arm, second instance's first
+            // call still "rebuilt". Fix: on a cold build, pause the fill at
+            // the first render boundary and save that prefix under the
+            // shared namespace. One extra save per cold start; total
+            // prefilled tokens unchanged; later conversations' boundary
+            // scans then genuinely hit the shared head.
+            let mut head_saved = false;
+            if input.global_prefix_cache {
+                if let Some(&head) =
+                    boundaries.iter().find(|&&b| b > 0 && b < full_len)
+                {
+                    c.append(&full_tokens[..head]);
+                    c.flush().await?;
+                    let head_name = prefix_cache::snapshot_name(
+                        cache_key, CACHE_COMPAT, model_id, &full_tokens[..head]);
+                    let _ = c.save(&head_name);
+                    c.append(&full_tokens[head..]);
+                    head_saved = true;
+                }
+            }
+            if !head_saved {
+                c.append(full_tokens);
+            }
             // "fresh" when there was no interior boundary to reuse (first turn /
             // single render unit); "rebuilt" when candidates existed but all
             // missed (snapshot lost, or the condenser rewrote history).
@@ -948,11 +1010,12 @@ async fn build_context(
     // error rather than delete+resave, so distinct boundaries coexist (that is
     // what makes retry / branch / truncate re-hit their earlier boundary).
     let t_h = Instant::now();
-    let full_name = prefix_cache::snapshot_name(sid, CACHE_COMPAT, model_id, full_tokens);
+    let full_name = prefix_cache::snapshot_name(cache_key, CACHE_COMPAT, model_id, full_tokens);
     timings.hash_ms += ms(t_h);
     let t_save = Instant::now();
     let _ = ctx.save(&full_name);
     timings.save_ms = ms(t_save);
+    record_and_enforce(model, sid, &full_name, input.snapshot_retention);
 
     let session = SessionOut {
         id: sid.to_string(),
@@ -1016,6 +1079,32 @@ thread_local! {
     static LIVE_SESSIONS: std::cell::RefCell<
         std::collections::HashMap<String, LiveSession>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Per-session saved-snapshot names in save order (chat-apc's
+    /// SnapshotRecords, reduced to what our reachability rule needs).
+    static SNAPSHOT_RECORDS: std::cell::RefCell<
+        std::collections::HashMap<String, std::collections::VecDeque<String>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record a successful save and enforce the retention horizon: delete the
+/// oldest snapshots beyond `keep`. Shared-head names (global_prefix_cache)
+/// are recorded under the shared key and never enforced here — they are the
+/// cross-session asset the experiment exists to keep.
+fn record_and_enforce(model: &Model, sid: &str, name: &str, keep: usize) {
+    SNAPSHOT_RECORDS.with(|m| {
+        let mut m = m.borrow_mut();
+        let q = m.entry(sid.to_string()).or_default();
+        if q.back().map(String::as_str) != Some(name) {
+            q.push_back(name.to_string());
+        }
+        if keep > 0 {
+            while q.len() > keep {
+                if let Some(old) = q.pop_front() {
+                    let _ = Context::delete(model, &old);
+                }
+            }
+        }
+    });
 }
 
 async fn build_context_live(

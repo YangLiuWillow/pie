@@ -336,6 +336,11 @@ class PieLLM(LLM):
         # instead of the snapshot save/open cycle. Arms run this way are NOT
         # comparable to snapshot-mode arms — the pie_session.mode strings in
         # the predictions rows carry a "live-" prefix so rows self-identify.
+        ret = os.environ.get("PIE_SNAPSHOT_RETENTION", "")
+        if ret.isdigit() and int(ret) > 0:
+            fields["snapshot_retention"] = int(ret)
+        if os.environ.get("PIE_GLOBAL_PREFIX_CACHE", "") not in ("", "0"):
+            fields["global_prefix_cache"] = True
         if os.environ.get("PIE_LIVE_CONTEXT", "") not in ("", "0"):
             fields["live_context"] = True
             if os.environ.get("PIE_LIVE_IDLE_SUSPEND", "") not in ("", "0"):
