@@ -474,8 +474,9 @@ std::string moe_dispatch_probe_run(int64_t n, int64_t k, int experts, int64_t ro
         const auto configs = runner.getConfigs(false);
         int tried = 0, ran = 0;
         std::string first_ok, first_err;
+        const bool probe_tma = std::getenv("PIE_MOE_PROBE_TMA") != nullptr;
         for (const auto& cfg : configs) {
-            if (runner.isTmaWarpSpecialized(cfg)) continue;
+            if (runner.isTmaWarpSpecialized(cfg) != probe_tma) continue;
             ++tried;
             ck::GroupedGemmInput<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16,
                                  __nv_bfloat16> in;
@@ -510,7 +511,7 @@ std::string moe_dispatch_probe_run(int64_t n, int64_t k, int experts, int64_t ro
         }
         cleanup();
         line = std::to_string(ran) + "/" + std::to_string(tried) +
-               " non-TMA configs RAN";
+               (probe_tma ? " TMA configs RAN" : " non-TMA configs RAN");
         if (ran > 0) {
             std::string c = first_ok;
             if (c.size() > 70) c = c.substr(0, 70) + "...";

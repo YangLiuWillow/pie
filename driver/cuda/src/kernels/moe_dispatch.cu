@@ -675,24 +675,6 @@ __global__ void moe_bucket_exact_kernel(
     }
     __syncthreads();
 
-    // Optional: publish the cumulative padded-row count per expert as int64.
-    // This is exactly the `total_tokens_including_expert` array the CUTLASS
-    // variable-M grouped GEMM consumes (rows for expert e occupy
-    // [offsets[e], offsets[e+1]) in the aligned layout).
-    if (expert_offsets_out != nullptr) {
-        for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-            expert_offsets_out[e] = static_cast<long long>(offsets[e + 1]);
-        }
-        // The consumer passes num_rows = max_blocks * block_size (the
-        // worst-case aligned capacity), which can exceed offsets[E]. Pin the
-        // last expert's cumulative count to that capacity so the two agree:
-        // the slack rows are ordinary padding — computed, never read back.
-        if (threadIdx.x == 0) {
-            expert_offsets_out[num_experts - 1] =
-                static_cast<long long>(max_blocks) * block_size;
-        }
-    }
-    __syncthreads();
 
     for (int r = threadIdx.x; r < num_routes; r += blockDim.x) {
         const int e = topk_idx[r];

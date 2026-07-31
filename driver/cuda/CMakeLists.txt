@@ -376,7 +376,14 @@ target_include_directories(pie_driver_cuda_lib
 set(PIE_FLASHINFER_MOE_GEN_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_generated")
 file(GLOB PIE_FLASHINFER_MOE_GENERATED_SOURCES CONFIGURE_DEPENDS
-  "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/80/*.generated.cu")
+  "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/80/*.generated.cu"
+  # SM90 TMA warp-specialized launchers (non-mixed set): generated with
+  # generate_gemm_operations(out, "90-real"), same generator as the 80 set.
+  # These are what COMPILE_HOPPER_TMA_GROUPED_GEMMS below promises exist —
+  # without them the define fails at link with hundreds of undefined
+  # tma_warp_specialized_generic_moe_gemm_kernelLauncher<Sm90,...> symbols
+  # (the 2026-07-29 finding, results_20260729_h100.md §6).
+  "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/90/*.generated.cu")
 list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
 message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
 
@@ -418,7 +425,8 @@ target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
 target_compile_definitions(pie_flashinfer_cutlass_moe PRIVATE
   ENABLE_BF16=1
   ENABLE_FP8=1
-  USING_OSS_CUTLASS_MOE_GEMM=1)
+  USING_OSS_CUTLASS_MOE_GEMM=1
+  COMPILE_HOPPER_TMA_GROUPED_GEMMS=1)
 target_compile_options(pie_flashinfer_cutlass_moe PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
     --extended-lambda
