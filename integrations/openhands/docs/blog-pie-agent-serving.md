@@ -10,6 +10,7 @@ agent on Pie at the end.*
 in `integrations/openhands/`; hardware named next to each number.*
 
 ---
+I bumped into Dr. Sebastian Raschka's article titled [Using Local Coding Agents](https://magazine.sebastianraschka.com/p/using-local-coding-agents) in June and greatly enjoyed it! So I am writing a little tutorial on how to run a local coding agent, and make it *faster*! 
 
 If you've played with local coding agents, you've probably had this experience:
 you point your agent at a local model server, it works, and then you wonder —
