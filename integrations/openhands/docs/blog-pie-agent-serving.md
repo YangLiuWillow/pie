@@ -117,7 +117,12 @@ another +45%: **24,120 tok/s.**
 ![Prefill throughput progression: bug fix, chunk size, tile size, vs vLLM](figs/fig1_prefill.png)
 
 Net: prefill went from 8.6× behind to **1.86× behind, with zero kernels
-written** — a bug fix and two environment variables. The remaining 1.86× is
+written** — a bug fix and two environment variables. (Full-agent honesty
+check: re-running the complete 13-instance benchmark with the levers moved
+in-call throughput just ~2% — 144 → 147 tok/s, gap 1.11× → 1.09× — because
+after the sync-bug fix, live conversations are decode-bound; the levers'
+2× pays on cache-miss rebuilds, restores, and long fresh prefills, not on
+warm incremental turns. Every optimization has a regime.) The remaining 1.86× is
 kernel-generation shape: we built and measured the obvious CUTLASS fix (proper
 variable-size grouped GEMM), and it *lost* to the simple approach by 6% —
 because the compiled CUTLASS kernels are Ampere-era and can't use the H100's
