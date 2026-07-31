@@ -173,3 +173,15 @@ single-sample rank (1.6% band). Batched cuBLAS baseline: 24,120. The
 Ampere-family kernels are config-insensitive here and lose to cuBLAS.
 Default stays cuBLAS; flag kept as infrastructure. Remaining prefill path:
 generate the Hopper TMA-WS TU instantiations (build project).
+
+## LEVER-AT-C8 FINDING (2026-07-31 ~01:25): capacity beats speed under overcommit
+
+The c8 lever arm (chunk 2048 + blk64 + live mode) crawled: sched dumps at
+pressure show pinned=2 stashed=6 gpu_pages_free=29/3255 restore_rej climbing
+— TWO generating 40k-ctx conversations hold the whole 105k-token pool, six
+queue behind whole generations (~2.5 effective slots). Rotation correct, no
+deadlock; back-of-queue exceeds the 900 s cap. The 40k/max_tokens=2048
+repro variant reproduces the dynamics (large-restore-only variant PASSED —
+big restores per se are fine). Guidance: lever at c1, stock chunk at c8;
+the parity table (stock chunk) stands as the c8 number. Repro gained
+--max-tokens for generation-length stress.

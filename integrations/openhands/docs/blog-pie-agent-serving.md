@@ -196,6 +196,22 @@ evicts parked conversations to host RAM and restores them at PCIe speed.
 Convergent behavior, kind-different mechanisms — and the mechanism
 difference is programmable on exactly one side.
 
+One more measured lesson closes the loop between the prefill and
+overcommit threads: **the prefill chunk lever inverts at c8.** Forcing
+2048-token forwards doubles prefill speed but costs 15% of the KV pool —
+and under overcommit, pool size sets the number of conversations that can
+be resident at once, which dominates everything else. At the stock chunk
+both engines run ~4 concurrent slots (124k vs 117k token pools) and reach
+the parity table above; with the lever, Pie's pool drops to ~105k tokens
+and a 40k-token conversation mid-generation holds ~1,300 pages, leaving
+**~2.5 effective slots** — the rotation stays correct (scheduler dumps
+show clean stash/restore cycling, zero deadlock) but eight conversations
+queue six deep behind whole generations, and the back of the queue times
+out. Not a bug: capacity arithmetic. The operating guidance is per-regime
+configs — chunk 2048 + 64-row tiles at low concurrency where speed rules,
+stock 512 under overcommit where every KV page is a seat at the table —
+a policy split Pie's planner could automate per workload.
+
 These arms are labeled a **capability experiment**, not the fair A/B — vLLM
 0.25's V1 engine dropped swap-based preemption entirely, so there is no
 equivalent configuration to compare against. That's the point: it's the one

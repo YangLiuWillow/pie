@@ -55,7 +55,8 @@ def as_text(v) -> str:
 
 
 class Session:
-    def __init__(self, idx: int, target_tokens: int, idle_suspend: bool):
+    def __init__(self, idx: int, target_tokens: int, idle_suspend: bool, max_tokens: int = 32):
+        self.max_tokens = max_tokens
         self.idx = idx
         self.sid = f"repro-{idx}"
         self.idle_suspend = idle_suspend
@@ -87,7 +88,7 @@ class Session:
         )
         payload = {
             "messages": self.messages,
-            "max_tokens": 32,
+            "max_tokens": self.max_tokens,
             "temperature": 0.0,
             "use_grammar": False,
             "session_id": self.sid,
@@ -123,13 +124,14 @@ async def main() -> int:
     ap.add_argument("--sessions", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=12)
     ap.add_argument("--target-tokens", type=int, default=28000)
+    ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--call-timeout", type=float, default=120.0)
     ap.add_argument("--idle-suspend", action="store_true")
     ap.add_argument("--boot-timeout", type=float, default=180.0)
     args = ap.parse_args()
 
     sessions = [
-        Session(i, args.target_tokens, args.idle_suspend) for i in range(args.sessions)
+        Session(i, args.target_tokens, args.idle_suspend, args.max_tokens) for i in range(args.sessions)
     ]
     print(f"connecting {args.sessions} daemons …", flush=True)
     await asyncio.gather(*(s.connect(args.uri, args.boot_timeout) for s in sessions))
