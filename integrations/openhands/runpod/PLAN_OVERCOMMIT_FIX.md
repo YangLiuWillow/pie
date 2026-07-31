@@ -162,3 +162,14 @@ PIE_QWEN35_MOE_CUTLASS_PREFILL=1 for A/B):
   autotune later.
 - Correctness gate: parity vs the cuBLAS path on one forward (compare
   outputs), then prefill sweep vs the 24.1k baseline, decode control flat.
+
+## CUTLASS ROUTE MEASURED (2026-07-31 ~00:50): viable but NOT faster
+
+Integration (PIE_QWEN35_MOE_CUTLASS_PREFILL=1, default OFF): correct
+(clean generations, r2=0.991 fit), decode control flat (5.197 / 0.0333 —
+also clears yesterday's borderline blk64 slope as noise). Performance:
+22,614 tok/s at config 0; all 9 non-TMA configs within 608-618 ms on the
+single-sample rank (1.6% band). Batched cuBLAS baseline: 24,120. The
+Ampere-family kernels are config-insensitive here and lose to cuBLAS.
+Default stays cuBLAS; flag kept as infrastructure. Remaining prefill path:
+generate the Hopper TMA-WS TU instantiations (build project).

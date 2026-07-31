@@ -375,6 +375,59 @@ std::size_t moe_probe_workspace_bytes(
         false, false, false, false, false);
 }
 
+// Variable-M grouped GEMM for the prefill MoE path (the non-gated CUTLASS
+// route, confirmed by the dispatch probe below: 9/9 non-TMA configs run at
+// these shapes). A is expert-sorted rows (the aligned-MoE gather layout,
+// which is expert-contiguous with per-expert padding), B is Pie's weight
+// tensor as stored: [E, n, k] row-major == the column-major [k, n] the
+// Ampere grouped GEMM's TN layout expects — no transpose, no copy.
+// expert_offsets is the DEVICE int64 cumulative padded-row count per expert
+// (moe_dispatch.cu writes it during alignment).
+//
+// The config is chosen once (first non-TMA config that the probe order
+// yields), overridable with PIE_QWEN35_MOE_CUTLASS_CONFIG=<index into the
+// non-TMA config list>. Autotuning is a follow-up; the win over fixed-M=16
+// batched cuBLAS is the variable-M shape itself.
+void cutlass_moe_grouped_gemm_bf16(const void* A, const void* B, void* C,
+                                   const long long* expert_offsets,
+                                   int64_t rows, int64_t n, int64_t k,
+                                   int num_experts, cudaStream_t stream) {
+    using GemmRunner =
+        ck::MoeGemmRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
+    static std::once_flag once;
+    static std::unique_ptr<GemmRunner> runner;
+    static std::vector<ce::CutlassGemmConfig> cfgs;
+    static int cfg_idx = 0;
+    std::call_once(once, [] {
+        runner = std::make_unique<GemmRunner>();
+        for (const auto& c : runner->getConfigs(false)) {
+            if (!runner->isTmaWarpSpecialized(c)) cfgs.push_back(c);
+        }
+        if (const char* v = std::getenv("PIE_QWEN35_MOE_CUTLASS_CONFIG")) {
+            if (v[0] != '\0') cfg_idx = std::atoi(v);
+        }
+        if (cfg_idx < 0 || cfg_idx >= static_cast<int>(cfgs.size())) cfg_idx = 0;
+    });
+    if (cfgs.empty()) {
+        throw std::runtime_error(
+            "cutlass_moe_grouped_gemm_bf16: no non-TMA configs available");
+    }
+    ck::GroupedGemmInput<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16,
+                         __nv_bfloat16> in;
+    in.A = static_cast<__nv_bfloat16 const*>(A);
+    in.B = static_cast<__nv_bfloat16 const*>(B);
+    in.C = static_cast<__nv_bfloat16*>(C);
+    in.total_tokens_including_expert =
+        reinterpret_cast<int64_t const*>(expert_offsets);
+    in.num_rows = rows;
+    in.n = n;
+    in.k = k;
+    in.num_experts = num_experts;
+    in.stream = stream;
+    in.gemm_config = cfgs[static_cast<std::size_t>(cfg_idx)];
+    runner->moeGemm(in, {});
+}
+
 // Dispatch-level probe: actually RUN the lower-level variable-M grouped GEMM
 // (MoeGemmRunner::moeGemm, EpilogueOpDefault = no activation) at a given
 // (n, k, experts) shape, for every config the runner offers that is NOT

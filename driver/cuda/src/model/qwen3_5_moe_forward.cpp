@@ -27,6 +27,7 @@
 #include "kernels/swiglu.hpp"
 #include "kernels/topk_softmax.hpp"
 #include "ops/attention_flashinfer.hpp"
+#include "ops/flashinfer_moe.hpp"
 #include "ops/attention_naive.hpp"
 #include "ops/attention_naive_paged.hpp"
 #include "ops/gemm.hpp"
@@ -195,6 +196,21 @@ int qwen35_moe_decode_fast_max_tokens() {
         return std::clamp(std::atoi(v), 0, 8192);
     }();
     return max_tokens;
+}
+
+// CUTLASS variable-M grouped GEMM for the aligned PREFILL path (the
+// non-gated route: plain up-GEMM, elementwise SwiGLU, down-GEMM). Confirmed
+// dispatchable by `pie driver cuda-native doctor`'s moe-dispatch-probe
+// (9/9 non-TMA configs ran at these shapes, 2026-07-31). Default OFF until
+// the prefill sweep + decode control validate it; enable with
+// PIE_QWEN35_MOE_CUTLASS_PREFILL=1. Applies only to !is_pure_decode
+// forwards so the decode path (and its measured parity) cannot move.
+bool qwen35_moe_cutlass_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_CUTLASS_PREFILL");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
 }
 
 bool qwen35_moe_wmma_decode_enabled() {
@@ -570,6 +586,8 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
             DeviceBuffer<std::int32_t>::alloc(ws.aligned_rows_capacity);
         ws.aligned_expert_ids =
             DeviceBuffer<std::int32_t>::alloc(max_blocks);
+        ws.aligned_expert_offsets =
+            DeviceBuffer<long long>::alloc(num_experts);
         ws.aligned_expert_in =
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * H);
         ws.aligned_gate_up =
@@ -1325,6 +1343,7 @@ bool moe_block(
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_ids.data(),
                                 /*route_to_aligned_row=*/nullptr,
+                                moe_ws.aligned_expert_offsets.data(),
                                 routes, E, block, max_blocks, stream);
                             kernels::launch_gather_moe_aligned_inputs_bf16(
                                 ws.norm_x.data(), moe_ws.aligned_route_ids.data(),
@@ -1347,10 +1366,28 @@ bool moe_block(
                                 max_blocks, block, H, Im, stream);
                         });
 
+                    // The CUTLASS route replaces BOTH batched GEMMs with
+                    // variable-M grouped GEMMs over the same expert-sorted
+                    // aligned buffers (weights consumed as stored — Pie's
+                    // [E, n, k] row-major is the grouped GEMM's column-major
+                    // [k, n]). Restricted to !is_pure_decode: the decode
+                    // path's measured parity must not move.
+                    const bool use_cutlass_grouped =
+                        !is_pure_decode && qwen35_moe_cutlass_prefill_enabled();
+
                     // Aligned gate_up: M=block_size, N=2*Im, K=H.
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_gate_up_ms : nullptr,
                         stream, [&] {
+                            if (use_cutlass_grouped) {
+                                ops::cutlass_moe_grouped_gemm_bf16(
+                                    moe_ws.aligned_expert_in.data(),
+                                    Lw.moe_gate_up_proj->data(),
+                                    moe_ws.aligned_gate_up.data(),
+                                    moe_ws.aligned_expert_offsets.data(),
+                                    aligned_rows, 2 * Im, H, E, stream);
+                                return;
+                            }
                             ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
                                 reinterpret_cast<const void* const*>(
                                     moe_ws.b_gu_ptrs.data()),
@@ -1373,6 +1410,15 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_down_ms : nullptr,
                         stream, [&] {
+                            if (use_cutlass_grouped) {
+                                ops::cutlass_moe_grouped_gemm_bf16(
+                                    moe_ws.aligned_act.data(),
+                                    Lw.moe_down_proj->data(),
+                                    moe_ws.aligned_out.data(),
+                                    moe_ws.aligned_expert_offsets.data(),
+                                    aligned_rows, H, Im, E, stream);
+                                return;
+                            }
                             ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
                                 reinterpret_cast<const void* const*>(
                                     moe_ws.b_dn_ptrs.data()),

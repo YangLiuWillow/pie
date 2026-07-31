@@ -108,7 +108,14 @@ work: **24,120 tok/s (+45% more)**.
 Net: **prefill doubled with two environment variables**, no kernel written. Gap
 to vLLM's 44.9k tok/s prefill: 8.6× → 3.6× → **1.86×**. The remainder is kernel
 shape — Pie's batched fixed-M GEMMs against vLLM's variable-M grouped Triton
-kernels — with a CUTLASS grouped-GEMM route scoped. `[PENDING: CUTLASS arm]`
+kernels. We built the CUTLASS variable-M grouped-GEMM route (the compiled,
+non-TMA kernel family — confirmed dispatchable, numerically correct, decode
+control flat) and measured it: **22.6k tok/s, config-insensitive across all
+nine tactics (1.6% spread)** — slightly *below* the batched-cuBLAS path it
+would replace. The Ampere-generation kernels can't use Hopper's TMA
+hardware; closing the last 1.86× requires generating the TMA
+warp-specialized instantiations (upstream's `--arch 90-real` build), now
+the one scoped open item on the prefill axis.
 
 ### Concurrency: Pie gains as load rises (H200 series)
 

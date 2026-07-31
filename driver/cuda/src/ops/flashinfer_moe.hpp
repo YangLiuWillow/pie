@@ -37,4 +37,15 @@ bool flashinfer_cutlass_moe_bf16_relu2(
     int tp_rank,
     cudaStream_t stream);
 
+// Variable-M grouped GEMM over expert-sorted rows (the non-gated CUTLASS
+// prefill route). A: [rows, k] bf16, expert-contiguous with padding; B: the
+// weight tensor as Pie stores it, [E, n, k] row-major; C: [rows, n];
+// expert_offsets: DEVICE int64 cumulative padded rows per expert (length E).
+// Throws on setup failure; asynchronous on `stream`.
+void cutlass_moe_grouped_gemm_bf16(const void* A, const void* B, void* C,
+                                   const long long* expert_offsets,
+                                   std::int64_t rows, std::int64_t n,
+                                   std::int64_t k, int num_experts,
+                                   cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::ops

@@ -549,6 +549,7 @@ __global__ void moe_align_decode_kernel(
     std::int32_t* __restrict__ sorted_route_ids,
     std::int32_t* __restrict__ expert_ids,
     std::int32_t* __restrict__ route_to_aligned_row,
+    long long* __restrict__ expert_offsets_out,
     int num_routes,
     int num_experts,
     int block_size,
@@ -588,6 +589,25 @@ __global__ void moe_align_decode_kernel(
             running += ((c + block_size - 1) / block_size) * block_size;
         }
         offsets[num_experts] = running;
+    }
+    __syncthreads();
+
+    // Optional: publish the cumulative padded-row count per expert as int64.
+    // This is exactly the `total_tokens_including_expert` array the CUTLASS
+    // variable-M grouped GEMM consumes (rows for expert e occupy
+    // [offsets[e], offsets[e+1]) in the aligned layout).
+    if (expert_offsets_out != nullptr) {
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+            expert_offsets_out[e] = static_cast<long long>(offsets[e + 1]);
+        }
+        // The consumer passes num_rows = max_blocks * block_size (the
+        // worst-case aligned capacity), which can exceed offsets[E]. Pin the
+        // last expert's cumulative count to that capacity so the two agree:
+        // the slack rows are ordinary padding — computed, never read back.
+        if (threadIdx.x == 0) {
+            expert_offsets_out[num_experts - 1] =
+                static_cast<long long>(max_blocks) * block_size;
+        }
     }
     __syncthreads();
 
@@ -652,6 +672,25 @@ __global__ void moe_bucket_exact_kernel(
             running += c;
         }
         offsets[num_experts] = running;
+    }
+    __syncthreads();
+
+    // Optional: publish the cumulative padded-row count per expert as int64.
+    // This is exactly the `total_tokens_including_expert` array the CUTLASS
+    // variable-M grouped GEMM consumes (rows for expert e occupy
+    // [offsets[e], offsets[e+1]) in the aligned layout).
+    if (expert_offsets_out != nullptr) {
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+            expert_offsets_out[e] = static_cast<long long>(offsets[e + 1]);
+        }
+        // The consumer passes num_rows = max_blocks * block_size (the
+        // worst-case aligned capacity), which can exceed offsets[E]. Pin the
+        // last expert's cumulative count to that capacity so the two agree:
+        // the slack rows are ordinary padding — computed, never read back.
+        if (threadIdx.x == 0) {
+            expert_offsets_out[num_experts - 1] =
+                static_cast<long long>(max_blocks) * block_size;
+        }
     }
     __syncthreads();
 
@@ -747,6 +786,7 @@ void launch_moe_align_decode(
     std::int32_t* sorted_route_ids,
     std::int32_t* expert_ids,
     std::int32_t* route_to_aligned_row,
+    long long* expert_offsets_out,
     int num_routes,
     int num_experts,
     int block_size,
@@ -762,7 +802,7 @@ void launch_moe_align_decode(
         static_cast<std::size_t>(3 * num_experts + 1) * sizeof(std::int32_t);
     moe_align_decode_kernel<<<1, BS, smem, stream>>>(
         topk_idx, sorted_route_ids, expert_ids, route_to_aligned_row,
-        num_routes, num_experts, block_size, max_blocks);
+        expert_offsets_out, num_routes, num_experts, block_size, max_blocks);
 }
 
 void launch_moe_bucket_exact(

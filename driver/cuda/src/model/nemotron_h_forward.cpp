@@ -943,6 +943,7 @@ void moe_layer(
                 kernels::launch_moe_align_decode(
                     nem_ws.topk_idx.data(), sorted_route_ids, expert_ids,
                     route_to_aligned_row,
+                    /*expert_offsets_out=*/nullptr,
                     routes, E, block_size, max_blocks, stream);
                 kernels::launch_gather_moe_aligned_inputs_bf16(
                     ws.norm_x.data(), sorted_route_ids,

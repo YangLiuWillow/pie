@@ -210,6 +210,10 @@ void launch_moe_align_decode(
     // padded sorted-row position. Pass nullptr if the caller does not need
     // this inverse map. Used by the fused `_aligned_bf16` combine kernel.
     std::int32_t* route_to_aligned_row,
+    // Optional output (nullptr to skip): DEVICE int64 cumulative padded-row
+    // count per expert, length num_experts — the CUTLASS grouped GEMM's
+    // `total_tokens_including_expert`.
+    long long* expert_offsets_out,
     int num_routes,
     int num_experts,
     int block_size,

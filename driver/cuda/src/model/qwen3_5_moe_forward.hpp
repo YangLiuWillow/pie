@@ -65,6 +65,9 @@ struct Qwen3_5MoeMlpWorkspace {
     DeviceBuffer<std::int32_t>  aligned_route_ids;   // [aligned_rows]
     DeviceBuffer<std::int32_t>  aligned_expert_ids;  // [aligned_rows / block]
     DeviceBuffer<std::uint16_t> aligned_expert_in;   // [aligned_rows, H]
+    // int64 cumulative padded rows per expert — the CUTLASS grouped GEMM's
+    // total_tokens_including_expert (written by launch_moe_align_decode).
+    DeviceBuffer<long long> aligned_expert_offsets;
     DeviceBuffer<std::uint16_t> aligned_gate_up;     // [aligned_rows, 2*I_moe]
     DeviceBuffer<std::uint16_t> aligned_act;         // [aligned_rows, I_moe]
     DeviceBuffer<std::uint16_t> aligned_out;         // [aligned_rows, H]
