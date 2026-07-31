@@ -375,6 +375,107 @@ std::size_t moe_probe_workspace_bytes(
         false, false, false, false, false);
 }
 
+// Dispatch-level probe: actually RUN the lower-level variable-M grouped GEMM
+// (MoeGemmRunner::moeGemm, EpilogueOpDefault = no activation) at a given
+// (n, k, experts) shape, for every config the runner offers that is NOT
+// TMA warp-specialized (those launchers are not compiled — see the banner in
+// the workspace probe below). getWorkspaceSize lies at dispatch time; this
+// does not. Returns a one-line summary; never throws.
+//
+// This is the probe for the non-gated CUTLASS route to the prefill MoE:
+// up-projection as a PLAIN n=2*inter GEMM, elementwise SwiGLU between,
+// down-projection n=hidden — sidestepping the gated-epilogue minimum that
+// requires the uncompiled TMA-WS kernels.
+std::string moe_dispatch_probe_run(int64_t n, int64_t k, int experts, int64_t rows) {
+    using GemmRunner =
+        ck::MoeGemmRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;
+    std::string line;
+    void* A = nullptr; void* B = nullptr; void* C = nullptr;
+    int64_t* offsets_d = nullptr;
+    auto cleanup = [&] {
+        if (A) cudaFree(A);
+        if (B) cudaFree(B);
+        if (C) cudaFree(C);
+        if (offsets_d) cudaFree(offsets_d);
+        cudaGetLastError();  // clear any sticky error for later probes
+    };
+    try {
+        GemmRunner runner;
+        if (cudaMalloc(&A, rows * k * 2) != cudaSuccess ||
+            cudaMalloc(&B, static_cast<int64_t>(experts) * k * n * 2) != cudaSuccess ||
+            cudaMalloc(&C, rows * n * 2) != cudaSuccess ||
+            cudaMalloc(&offsets_d, experts * sizeof(int64_t)) != cudaSuccess) {
+            cleanup();
+            return "alloc failed (GPU busy?)";
+        }
+        cudaMemset(A, 0, rows * k * 2);
+        cudaMemset(B, 0, static_cast<int64_t>(experts) * k * n * 2);
+        // Rows spread evenly: cumulative inclusive per expert.
+        std::vector<int64_t> offsets_h(experts);
+        for (int e = 0; e < experts; ++e) {
+            offsets_h[e] = rows * (e + 1) / experts;
+        }
+        cudaMemcpy(offsets_d, offsets_h.data(), experts * sizeof(int64_t),
+                   cudaMemcpyHostToDevice);
+
+        const auto configs = runner.getConfigs(false);
+        int tried = 0, ran = 0;
+        std::string first_ok, first_err;
+        for (const auto& cfg : configs) {
+            if (runner.isTmaWarpSpecialized(cfg)) continue;
+            ++tried;
+            ck::GroupedGemmInput<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16,
+                                 __nv_bfloat16> in;
+            in.A = static_cast<__nv_bfloat16 const*>(A);
+            in.B = static_cast<__nv_bfloat16 const*>(B);
+            in.C = static_cast<__nv_bfloat16*>(C);
+            in.total_tokens_including_expert = offsets_d;
+            in.num_rows = rows;
+            in.n = n;
+            in.k = k;
+            in.num_experts = experts;
+            in.stream = nullptr;
+            in.gemm_config = cfg;
+            try {
+                runner.moeGemm(in, {});
+                cudaError_t sync = cudaDeviceSynchronize();
+                if (sync == cudaSuccess) {
+                    ++ran;
+                    if (first_ok.empty()) first_ok = cfg.toString();
+                } else if (first_err.empty()) {
+                    first_err = cudaGetErrorString(sync);
+                    cudaGetLastError();
+                }
+            } catch (const std::exception& e) {
+                if (first_err.empty()) {
+                    first_err = e.what();
+                    const auto nl = first_err.find('\n');
+                    if (nl != std::string::npos) first_err = first_err.substr(0, nl);
+                }
+                cudaGetLastError();
+            }
+        }
+        cleanup();
+        line = std::to_string(ran) + "/" + std::to_string(tried) +
+               " non-TMA configs RAN";
+        if (ran > 0) {
+            std::string c = first_ok;
+            if (c.size() > 70) c = c.substr(0, 70) + "...";
+            line += " (first: " + c + ")";
+        } else if (!first_err.empty()) {
+            if (first_err.size() > 90) first_err = first_err.substr(0, 90) + "...";
+            line += " — first error: " + first_err;
+        }
+        return line;
+    } catch (const std::exception& e) {
+        cleanup();
+        std::string msg(e.what());
+        const auto nl = msg.find('\n');
+        if (nl != std::string::npos) msg = msg.substr(0, nl);
+        return std::string("probe setup failed: ") + msg;
+    }
+}
+
 }  // namespace pie_cuda_driver::ops
 
 // -----------------------------------------------------------------------------
@@ -464,6 +565,28 @@ extern "C" void pie_driver_cuda_moe_probe(char* out, int out_len) {
             }
             r += "\n";
         }
+    }
+
+    // DISPATCH-LEVEL probe: run the lower-level variable-M grouped GEMM
+    // (no activation epilogue) at the shapes the non-gated prefill route
+    // needs. Unlike the section above, a line here saying configs RAN is
+    // ground truth — the kernel executed and synchronized.
+    r += "  moe-dispatch-probe (MoeGemmRunner<bf16> moeGemm, rows=512, "
+         "non-TMA configs only)\n";
+    struct DShape { const char* name; int64_t n; int64_t k; int experts; };
+    const DShape dshapes[] = {
+        // The two GEMMs of the non-gated Qwen3-Coder-30B-A3B prefill route.
+        {"up   n=1536 k=2048 E=128 (gate_up as plain 2I)", 1536, 2048, 128},
+        {"down n=2048 k=768  E=128", 2048, 768, 128},
+        // One control at a shape the workspace probe calls OK for Relu2.
+        {"ctl  n=768  k=2048 E=128 (inter as-is)", 768, 2048, 128},
+    };
+    for (const auto& d : dshapes) {
+        r += "    ";
+        r += d.name;
+        r += " : ";
+        r += pie_cuda_driver::ops::moe_dispatch_probe_run(d.n, d.k, d.experts, 512);
+        r += "\n";
     }
     std::snprintf(out, static_cast<std::size_t>(out_len), "%s", r.c_str());
 }

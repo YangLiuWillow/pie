@@ -142,3 +142,23 @@ exist from the aligned path; replace the two cublasGemmBatchedEx with two
 moeGemm calls + launch_chunked_swiglu between; remember add_to_residual
 must ACCUMULATE and decode control must stay flat). Rebuild driver, run
 42_context_sweep prefill mode vs the 24.1k baseline. Then the c8 lever arm.
+
+## PROBE RESULT (2026-07-31 ~00:20): non-gated CUTLASS route CONFIRMED
+
+moe-dispatch-probe: 9/9 non-TMA configs RAN (executed + synchronized) at
+up n=1536 k=2048 E=128, down n=2048 k=768 E=128, and the control shape.
+The variable-M grouped GEMM route needs NO TMA-WS build.
+
+Integration design (moe_block prefill path, env-gated
+PIE_QWEN35_MOE_CUTLASS_PREFILL=1 for A/B):
+- Reuse the aligned gather (block=16, ~3% padding at N=2048): rows are
+  already expert-sorted-contiguous in aligned_expert_in; padding rows waste
+  3% FLOPs and are ignored by the existing reorder.
+- New tiny kernel (or extend launch_moe_align_decode): int64 CUMULATIVE
+  padded-rows-per-expert on device = total_tokens_including_expert.
+- Replace the two cublasGemmBatchedEx with MoeGemmRunner<bf16>::moeGemm
+  (up n=2*Im, then launch_chunked_swiglu, then down n=H). Config: first
+  running non-TMA config (tile shape ID 4, stages 2), env override index;
+  autotune later.
+- Correctness gate: parity vs the cuBLAS path on one forward (compare
+  outputs), then prefill sweep vs the 24.1k baseline, decode control flat.
