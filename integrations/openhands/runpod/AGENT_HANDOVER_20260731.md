@@ -44,6 +44,27 @@ with a codex agent — /workspace/GPU_LOCK_PROTOCOL.md, honor it.
    the TMA build closes the 1.86x or the aligned path stays champion.
 2. **System-prompt diff** (two minutes, no GPU): dump messages[0] for two
    instances; settles why shared-hit never fired.
+   — DONE 2026-07-31 04:1x: messages[0] (system) is byte-identical across
+   instances; the per-instance bytes are in the TOOLS. OpenHands'
+   `file_editor` tool description ends with "Your current working
+   directory is: …/sweb-<instance_id>/repo" (FileEditorTool embeds the
+   workspace path; terminal/task_tracker are clean). The first render
+   unit is [system + tool schemas] folded into one turn
+   (openhands-coder-session lib.rs render_prompt), so the head hash
+   differs per instance and cross-instance shared-hit can NEVER fire —
+   not a bug in the head-snapshot fix. Note the cwd is redundant:
+   `_format_user_prompt` already states the checkout path.
+   FIX IMPLEMENTED same day: pie_openhands/tool_desc_invariance.py strips
+   the suffix; installed unconditionally in build_llm so BOTH arms see
+   identical schemas. Gotcha it had to work around: the SDK tool registry
+   snapshots the bound create() at import-time registration, so patching
+   the class alone is invisible — install() re-registers after wrapping.
+   Verified: msg0+tools byte-identical across instances; executor
+   survives model_copy (view smoke-passes). Head sharing is now possible
+   — the next global-APC arm should finally show "shared-hit".
+   Repro: runpod/diag_msg0_diff.py (test-backend
+   Conversation, spy on llm.completion, diff msg0+tools; run with
+   /root/venvs/harness/bin/python from a scratch dir).
 3. **c8 snapshot-mode arm with PIE_SNAPSHOT_RETENTION=10**: retention's
    real prize — bounded snapshot pinning was the original starvation
    ingredient.

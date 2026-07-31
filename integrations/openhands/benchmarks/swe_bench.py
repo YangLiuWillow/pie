@@ -311,6 +311,10 @@ def build_llm(backend: str, **kwargs):
     # module docstring for why this isn't Pie-specific.
     from pie_openhands.editor_repair import install as _install_editor_repair
     _install_editor_repair()
+    # Both arms must see identical tool schemas, so this too installs
+    # unconditionally — see tool_desc_invariance's module docstring.
+    from pie_openhands.tool_desc_invariance import install as _install_desc_strip
+    _install_desc_strip()
 
     if backend == "pie":
         from pie_openhands import PieLLM
