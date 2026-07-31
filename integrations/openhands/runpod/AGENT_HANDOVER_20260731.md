@@ -42,6 +42,52 @@ with a codex agent — /workspace/GPU_LOCK_PROTOCOL.md, honor it.
 1. **Fused-path tactic sweep** (PIE_NEMOTRON_FLASHINFER_MOE_SELECT=raw +
    GEMM{1,2}_INDEX; lite pattern like the config sweep). Decides whether
    the TMA build closes the 1.86x or the aligned path stays champion.
+   — RUN 2026-07-31 04:35-05:2x, STOPPED MID-REFINE (pod closed). All
+   measured GEMM1 points (fused path + levers, GEMM2_INDEX=0, 2-suffix
+   1-rep fit via 42_context_sweep.sh; script banked as
+   43_fused_tactic_sweep.sh; per-point ctxsweep dirs 20260731_0434xx+
+   hold server logs with tactic descriptors):
+
+   | raw idx | tile MxNxK | swap | cluster | tok/s |
+   |---|---|---|---|---|
+   | 0 (default) | 128x16x128 | n | 1x1 | 13,588 |
+   | 4 | 128x64x128 | n | 1x1 | 19,210 |
+   | 5 | 128x64 fam | n | ? | 18,248 |
+   | 6 | 128x64/128 fam | n | ? | 20,676 |
+   | 7 | (see srv log) | n | ? | 18,701 |
+   | 8 | 128x128x128 | n | 1x2 | **23,576** |
+   | 9 | 128x128 fam | n | ? | 21,575 |
+   | 10 | 128x128 fam | n | ? | 21,304 |
+   | 12 | 128x256x128 | n | 1x2 | 21,133 |
+   | 16 | 256x128x128 | n | 1x2 | 22,222 |
+   | 20 | 128x32x128 | y | 1x1 | 17,385 |
+   | 24 | 128x128x128 | y | 1x1 | 20,371 |
+   | 28 | 128x256x128 | y | 1x1 | 20,471 |
+   | 32 | 256x128x128 | y | 1x1 | 20,329 |
+
+   Findings so far: 36 TMA configs exist (doctor probe; getConfigs
+   orders TMA first, so "default" = raw 0 = a 128x16 tile — that alone
+   explains the 14.5k). Best = raw 8 (128x128x128, no swap, cluster
+   1x2) at 23.6k, within 2.3% of the 24.1k champion, GEMM2 still
+   untuned. Cluster 1x2-vs-1x1 alone is +16% on that tile (idx 8 vs
+   24); swap_ab never wins; N=128 is the tile sweet spot (16→64→128
+   climbs, 256 falls).
+   STILL TO RUN: (a) GEMM1 indices 11, 17, 18, 19 (untested cluster
+   variants of the strong 128x128 / 256x128 families — vLLM's tuned
+   Triton large-M pick is a 128x256 tile, so 13/14/15 clusters may
+   also be worth a look); (b) GEMM2 sweep at the best GEMM1 (same raw
+   pattern; GEMM2 list includes FINALIZE-fusion variants —
+   PIE_NEMOTRON_FLASHINFER_MOE_GEMM2=finalize with SELECT=supported
+   is the other axis); (c) full 5-suffix 3-rep confirmation of the
+   winner for the apples-to-apples number vs 24,120. Resume: bash
+   43_fused_tactic_sweep.sh after editing its index list.
+   DECISION (human agreed 2026-07-31): if the fused path tops out well
+   short of ~30k, the next prefill lever is a Triton-AOT port of vLLM's
+   fused-MoE kernel (compile the tuned H100 configs — see
+   /workspace/tuned_moe_h100 — to cubins, cuModuleLoad from the driver,
+   port routing/align host logic). Scope it as its own project; it pays
+   in the prefill-heavy regime (rebuilds, restores, sweep-scale
+   prefills), not warm turns.
 2. **System-prompt diff** (two minutes, no GPU): dump messages[0] for two
    instances; settles why shared-hit never fired.
    — DONE 2026-07-31 04:1x: messages[0] (system) is byte-identical across
