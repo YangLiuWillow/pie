@@ -1,0 +1,17 @@
+[package]
+name = "rl-completions"
+version = "0.1.0"
+edition = "2024"
+description = "RL rollout completions server: pre-tokenized /v1/completions for rllm's cumulative token mode"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wstd = "0.5.6"
+inferlet = { path = "../../sdk/rust/inferlet" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true

@@ -1,0 +1,12 @@
+[package]
+name = "rl-completions"
+version = "0.1.0"
+description = "RL rollout completions server (rllm gateway cumulative-token-mode worker)"
+authors = ["Yang Liu <liu@liszt.ai>"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+# HTTP server inferlet — input arrives via HTTP requests.
+[parameters]
