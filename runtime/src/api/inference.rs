@@ -335,6 +335,19 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let speculative_positions = take(&mut pass.speculative_positions);
         let output_speculative_tokens = pass.output_speculative_tokens;
         let masks = take(&mut pass.mask);
+
+        // An empty forward (no input tokens and no speculative tokens) can
+        // never be planned: the portable driver rejects it per-plan and the
+        // retry path turns that into a silent client hang. Fail fast at the
+        // API boundary with a diagnosable error instead. (Regression test:
+        // inferlets/empty-forward-test.)
+        if tokens.is_empty() && speculative_tokens.is_empty() {
+            return Ok(Err(
+                "ForwardPass::execute: empty input — must supply at least one input or speculative token"
+                    .to_string(),
+            ));
+        }
+
         // Track whether the user actually supplied masks; the kernel-dispatch
         // hint downstream needs to distinguish user masks from the runtime's
         // synthesized causal default.
