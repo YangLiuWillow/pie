@@ -17,7 +17,9 @@ path = "src/lib.rs"
 # the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
 # behavior. Build every embedded driver into the Python engine so
 # `pie.server.Server` can host the same local flavors as `pie serve`.
-pie-server = { path = "../../server", default-features = false, features = ["driver-cuda", "driver-portable", "driver-dummy"] }
+# driver-cuda is Linux-only; dropped for macOS dev on this branch (portable
+# + Metal covers local CPU/GPU inference; restore behind a target gate before merge).
+pie-server = { path = "../../server", default-features = false, features = ["driver-portable", "driver-dummy"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1.38", features = ["rt-multi-thread"] }
 toml = "0.9"
