@@ -55,6 +55,10 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--cpu-mem-gb", type=int, default=0,
                         help="Pinned host KV pool size in GiB. 0 = swap disabled. "
                              "Native and sglang both honor this; vllm doesn't yet.")
+    parser.add_argument("--request-timeout-secs", type=int, default=None,
+                        help="Scheduler per-request timeout override. The engine default (120s) "
+                             "silently abandons any forward that outlives it — deep-context "
+                             "forwards on slow (CPU) drivers need more.")
     parser.add_argument("--spec-ngram", action="store_true",
                         help="Enable driver-supplied NGRAM speculative-decoding drafts "
                              "(sglang and vllm drivers).")
@@ -181,7 +185,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.server import Server
     from pie.config import (
         Config, ModelConfig, ServerConfig, AuthConfig, TelemetryConfig,
-        DriverConfig,
+        DriverConfig, SchedulerConfig,
     )
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
@@ -223,6 +227,11 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
                     type=args.driver,
                     device=device,
                     options=driver_subsection,
+                ),
+                scheduler=(
+                    SchedulerConfig(request_timeout_secs=args.request_timeout_secs)
+                    if args.request_timeout_secs is not None
+                    else None
                 ),
             ),
         ],
