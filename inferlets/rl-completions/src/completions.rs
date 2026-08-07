@@ -38,10 +38,12 @@ use wstd::io::AsyncWrite;
 
 const DEFAULT_MAX_TOKENS: usize = 4096;
 
-/// Max tokens per prefill forward pass — a single multi-thousand-token
-/// forward outlives the engine's per-forward timeout on CPU drivers
-/// (codex-responses lesson).
-const PREFILL_CHUNK: usize = 1024;
+/// Max tokens per prefill forward pass. The scheduler abandons any request
+/// exceeding `request_timeout_secs` (default 120s) and returns an EMPTY
+/// output as if successful — so a chunk must stay comfortably under that
+/// ceiling even at worst-case CPU prefill speed (~8 tok/s on a 1.7B):
+/// 256 tokens ≈ 32s. Bigger chunks silently produce contexts with holes.
+const PREFILL_CHUNK: usize = 256;
 
 /// Stamped on every response. Weight updates don't exist yet (gap G1);
 /// when they do, this becomes the served checkpoint's version.
