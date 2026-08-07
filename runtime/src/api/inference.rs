@@ -61,11 +61,17 @@ impl Pollable for FutureOutput {
                     self.done = true;
                 }
                 Err(_) => {
-                    self.result = Some(pie::core::inference::Output {
-                        slots: Vec::new(),
-                        spec_tokens: Vec::new(),
-                        spec_positions: Vec::new(),
-                    });
+                    // The scheduler dropped the response channel — the forward
+                    // failed (driver error, transport timeout, ...). Leave
+                    // `result` as None so the SDK's `get()` surfaces an error
+                    // instead of a fabricated empty output: an empty "success"
+                    // poisons the caller's token accounting and produces
+                    // starvation errors far from the real cause.
+                    eprintln!(
+                        "[inference] forward pass failed: scheduler dropped the \
+                         response channel (see server log for the driver error)"
+                    );
+                    self.result = None;
                     self.done = true;
                 }
             }

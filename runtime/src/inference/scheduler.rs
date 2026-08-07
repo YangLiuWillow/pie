@@ -60,7 +60,8 @@ fn build_slot_output(samplers: &[Sampler], resp: ForwardPassResponse) -> Forward
         && resp.entropies.is_empty();
 
     if is_spec_walk {
-        let slots = resp.tokens.into_iter().map(SlotOutput::Token).collect();
+        let slots: Vec<SlotOutput> =
+            resp.tokens.into_iter().map(SlotOutput::Token).collect();
         return ForwardPassOutput { slots, spec_tokens, spec_positions };
     }
 
@@ -481,15 +482,31 @@ impl BatchScheduler {
                         }
                         req.response_tx.send(output).ok();
                     } else {
-                        tracing::warn!(device = device_id, "Fewer results than requests — sending None");
-                        req.response_tx.send(ForwardPassOutput::default()).ok();
+                        // Drop the sender WITHOUT sending: the API layer maps a
+                        // dropped channel to a visible error. Sending an empty
+                        // default here would masquerade as success and poison
+                        // the caller's token accounting.
+                        eprintln!(
+                            "[inference] batch response missing result for ctx={} \
+                             on device {device_id} — failing the request",
+                            req.request.context_id,
+                        );
+                        drop(req.response_tx);
                     }
                 }
             }
             Err(e) => {
+                // Loud on stderr (tracing may have no subscriber in embedded
+                // contexts) and fail every request by dropping its sender —
+                // never fabricate empty-success outputs.
+                eprintln!(
+                    "[inference] fire_batch FAILED for device {device_id}: {e:?} — \
+                     failing {} request(s)",
+                    requests.len(),
+                );
                 tracing::error!("fire_batch failed for device {}: {:?}", device_id, e);
                 for req in requests {
-                    req.response_tx.send(ForwardPassOutput::default()).ok();
+                    drop(req.response_tx);
                 }
             }
         }

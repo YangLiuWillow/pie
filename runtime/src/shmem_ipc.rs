@@ -450,7 +450,11 @@ fn windows_mapping_name(name: &str) -> Result<CString> {
 /// 60s so a healthy driver's first fire_batch — which can spend tens of
 /// seconds JIT-compiling triton / flashinfer kernels — doesn't trip it.
 static HARD_TIMEOUT: LazyLock<std::time::Duration> = LazyLock::new(|| {
-    const DEFAULT_SECS: f64 = 60.0;
+    // 600s, not 60: CPU-backend forwards (portable driver) legitimately run
+    // minutes-long, and an expiry here used to surface as a silent empty
+    // output several layers up (now it errors loudly — see scheduler.rs
+    // fire_batch handling). Override with PIE_SHMEM_TIMEOUT_S.
+    const DEFAULT_SECS: f64 = 600.0;
     let secs = std::env::var("PIE_SHMEM_TIMEOUT_S")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
