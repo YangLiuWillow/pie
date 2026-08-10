@@ -1,0 +1,20 @@
+# Portable (ggml) driver config for the qwen-code integration —
+# Qwen3-0.6B on Metal (fall back to ["cpu"] if the build lacks GGML_METAL).
+# Field names track the current portable-driver options schema.
+
+[auth]
+enabled = false
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "portable"
+device = ["metal"]
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+max_forward_tokens = 4096
+max_forward_requests = 16
+total_pages = 512

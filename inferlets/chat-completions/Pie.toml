@@ -1,0 +1,12 @@
+[package]
+name = "chat-completions"
+version = "0.1.0"
+description = "OpenAI-compatible chat-completions server (qwen-code-facing)"
+authors = ["Liu Yang <liu@liszt.ai>"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+# No CLI parameters — this is an HTTP daemon; input arrives via HTTP requests.
+[parameters]
