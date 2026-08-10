@@ -28,6 +28,7 @@
 //! cargo build --target wasm32-wasip2 --release
 //! ```
 
+mod chat;
 mod completions;
 
 use wstd::http::body::IncomingBody;
@@ -47,6 +48,14 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                 return completions::error_response(res, 400, "Failed to read request body").await;
             }
             completions::handle(body_bytes, res).await
+        }
+
+        (Method::POST, "/v1/chat/completions") | (Method::POST, "/chat/completions") => {
+            let mut body_bytes = Vec::new();
+            if read_body(req.body_mut(), &mut body_bytes).await.is_err() {
+                return completions::error_response(res, 400, "Failed to read request body").await;
+            }
+            chat::handle(body_bytes, res).await
         }
 
         (Method::POST, "/debug/reuse") => {

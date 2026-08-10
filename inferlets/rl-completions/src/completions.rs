@@ -411,7 +411,7 @@ async fn generate(
     Ok(GenOutcome { token_ids, finish_reason })
 }
 
-fn strip_trailing_stop<'a>(ids: &'a [u32], stop_ids: &[u32]) -> &'a [u32] {
+pub fn strip_trailing_stop<'a>(ids: &'a [u32], stop_ids: &[u32]) -> &'a [u32] {
     match ids.last() {
         Some(last) if stop_ids.contains(last) => &ids[..ids.len() - 1],
         _ => ids,
