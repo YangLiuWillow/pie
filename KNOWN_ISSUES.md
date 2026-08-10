@@ -75,3 +75,21 @@ macOS (Darwin 25.4).
 - Scheduler `request_timeout_secs` was not exposed to the test harness
   (added `--request-timeout-secs` to `tests/inferlets/conftest.py` on this
   branch).
+
+## 8. `messaging::pull` never becomes ready across daemon instances
+
+A message `push`ed by one daemon request-instance is never observable by a
+later instance's `pull` — the pull future's pollable stays unready through
+bounded waits and reactor-registered awaits (topics are username-namespaced
+and daemon instances share a username, so it is not a namespacing issue).
+Found while building the rl-completions prefix cache; worked around by using
+the snapshot store for cross-request state instead. Repro: push in one
+`/v1/completions` request, pull in the next.
+
+## 9. `Context::destroy()` on an OPENED context traps the instance
+
+`Context::open(name)` works (correct seq_len), but calling `destroy()` on the
+opened fork kills the WASM instance with no surfaced trap message (connection
+drops mid-request). One-call repro: rl-completions' `POST /debug/reuse`
+`{"step": "oracle"}` (destroys) vs `{"step": "open-forget"}` (leaks — works).
+Workaround: leak opened forks; per-request instance teardown reclaims them.

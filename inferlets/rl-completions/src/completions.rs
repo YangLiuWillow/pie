@@ -160,6 +160,122 @@ pub async fn handle(body_bytes: Vec<u8>, responder: Responder) -> Finished {
     }
 }
 
+// ─── KV snapshot reuse (cumulative-prefix cache) ───────────────────────────
+//
+// Turn k+1's prompt starts with exactly the tokens of turn k's prompt +
+// completion (the gateway renderer's append-only invariant, verified
+// token-exact by the Phase 1a fixtures). So after serving a turn we save the
+// context under a content hash of the tokens it holds, and advertise
+// `(len, hash)` through a one-slot messaging mailbox. The next request
+// verifies the hash over its own prompt's prefix before opening — a stale or
+// foreign pointer just misses and pays full prefill. Misses are safe;
+// hits skip re-prefilling the entire shared prefix, which is the point of
+// the whole integration (rollouts are ~97% prompt re-reads).
+
+const LATEST_SNAP: &str = "rlc-latest";
+
+fn fnv1a64(ids: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &t in ids {
+        for b in t.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+fn snap_name(hash: u64) -> String {
+    format!("rlc-{hash:016x}")
+}
+
+/// Try to resume from a saved prefix of `prompt_ids`, using only the
+/// snapshot store (messaging pull never becomes ready across daemon
+/// instances — see KNOWN_ISSUES):
+///
+/// 1. Open the fixed-name `rlc-latest` snapshot purely as a LENGTH ORACLE
+///    (its `seq_len` says how many tokens the last turn banked), then
+///    destroy the fork.
+/// 2. Recompute the content hash over `prompt_ids[..len]` and open
+///    `rlc-<hash>`. Existence of that exact name IS the verification: the
+///    name was derived from the tokens the snapshot holds, so a hit means
+///    our prefix matches token-for-token (modulo a 64-bit hash collision).
+async fn try_resume(
+    model: &Model,
+    prompt_ids: &[u32],
+    note: &mut String,
+) -> Option<(Context, usize)> {
+    let len = match Context::open(model, LATEST_SNAP) {
+        Ok(oracle) => {
+            let l = oracle.seq_len() as usize;
+            // destroy() on an OPENED context traps the instance (engine bug,
+            // KNOWN_ISSUES #9 — one-call repro via /debug/reuse). Leak the
+            // fork instead; per-request instance teardown reclaims it.
+            std::mem::forget(oracle);
+            l
+        }
+        Err(_) => {
+            note.push_str("no-latest");
+            return None;
+        }
+    };
+    if len == 0 || len >= prompt_ids.len() {
+        note.push_str(&format!("len-out-of-range[{len}]"));
+        return None;
+    }
+    let hash = fnv1a64(&prompt_ids[..len]);
+    match Context::open(model, &snap_name(hash)) {
+        Ok(ctx) => {
+            note.push_str(&format!("hit[{len}]"));
+            Some((ctx, len))
+        }
+        Err(e) => {
+            note.push_str(&format!("content-miss[{len},{e}]"));
+            None
+        }
+    }
+}
+
+/// After a turn: commit pending tokens, save the context under its content
+/// hash, advertise the pointer, and delete the snapshot we resumed from.
+async fn save_and_advertise(
+    ctx: &mut Context,
+    model: &Model,
+    prompt_ids: &[u32],
+    completion_ids: &[u32],
+    resumed_from: Option<u64>,
+) -> String {
+    if let Err(e) = ctx.flush().await {
+        return format!("flush-failed[{e}]");
+    }
+    let seq = ctx.seq_len() as usize;
+    let total = prompt_ids.len() + completion_ids.len();
+    if seq == 0 || seq > total {
+        return format!("bad-seq[{seq}/{total}]");
+    }
+    let mut all: Vec<u32> = Vec::with_capacity(seq);
+    all.extend_from_slice(&prompt_ids[..seq.min(prompt_ids.len())]);
+    if seq > prompt_ids.len() {
+        all.extend_from_slice(&completion_ids[..seq - prompt_ids.len()]);
+    }
+    let hash = fnv1a64(&all);
+    match ctx.save(&snap_name(hash)) {
+        Ok(()) => {
+            // Refresh the fixed-name length oracle (delete-then-save; save
+            // does not overwrite).
+            let _ = Context::delete(model, LATEST_SNAP);
+            let _ = ctx.save(LATEST_SNAP);
+            if let Some(old) = resumed_from {
+                if old != hash {
+                    let _ = Context::delete(model, &snap_name(old));
+                }
+            }
+            format!("saved[{seq}]")
+        }
+        Err(e) => format!("save-failed[{e}]"),
+    }
+}
+
 /// Prefill the raw prompt ids. NO `cue()` — a cumulative prompt already ends
 /// with the generation header the renderer put there; adding another would
 /// corrupt the token accounting.
@@ -210,11 +326,16 @@ struct GenOutcome {
 // ─── Non-streaming ─────────────────────────────────────────────────────────
 
 async fn handle_non_streaming(model: Model, turn: Turn, responder: Responder) -> Finished {
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => return error_response(responder, 500, &e.to_string()).await,
+    let mut reuse_note = String::new();
+    let (mut ctx, resumed) = match try_resume(&model, &turn.prompt_ids, &mut reuse_note).await {
+        Some(v) => v,
+        None => match Context::new(&model) {
+            Ok(c) => (c, 0),
+            Err(e) => return error_response(responder, 500, &e.to_string()).await,
+        },
     };
-    if let Err(e) = prefill(&mut ctx, &turn.prompt_ids).await {
+    let resumed_hash = (resumed > 0).then(|| fnv1a64(&turn.prompt_ids[..resumed]));
+    if let Err(e) = prefill(&mut ctx, &turn.prompt_ids[resumed..]).await {
         return error_response(responder, 500, &e).await;
     }
 
@@ -228,6 +349,10 @@ async fn handle_non_streaming(model: Model, turn: Turn, responder: Responder) ->
     let text_ids = strip_trailing_stop(&outcome.token_ids, &stop_ids);
     let text = model.tokenizer().decode(text_ids).unwrap_or_default();
 
+    let save_note =
+        save_and_advertise(&mut ctx, &model, &turn.prompt_ids, &outcome.token_ids, resumed_hash)
+            .await;
+
     let response = serde_json::json!({
         "id": format!("cmpl-{}", uniq_fragment()),
         "object": "text_completion",
@@ -235,6 +360,7 @@ async fn handle_non_streaming(model: Model, turn: Turn, responder: Responder) ->
         "model": turn.model_name,
         "prompt_token_ids": turn.prompt_ids,
         "weight_version": WEIGHT_VERSION,
+        "pie_reuse": { "resumed_tokens": resumed, "resume": reuse_note, "save": save_note },
         "choices": [{
             "index": 0,
             "text": text,
@@ -330,10 +456,15 @@ async fn handle_streaming(model: Model, turn: Turn, responder: Responder) -> Fin
         }};
     }
 
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => fail!(e.to_string()),
+    let mut reuse_note = String::new();
+    let (mut ctx, resumed) = match try_resume(&model, &turn.prompt_ids, &mut reuse_note).await {
+        Some(v) => v,
+        None => match Context::new(&model) {
+            Ok(c) => (c, 0),
+            Err(e) => fail!(e.to_string()),
+        },
     };
+    let resumed_hash = (resumed > 0).then(|| fnv1a64(&turn.prompt_ids[..resumed]));
 
     // First chunk before the (potentially slow, CPU) prefill: carries the
     // prompt-id echo and doubles as the client's liveness signal.
@@ -342,14 +473,17 @@ async fn handle_streaming(model: Model, turn: Turn, responder: Responder) -> Fin
         "model": turn.model_name,
         "prompt_token_ids": turn.prompt_ids,
         "weight_version": WEIGHT_VERSION,
+        "pie_reuse": { "resumed_tokens": resumed },
         "choices": [{"index": 0, "text": "", "token_ids": [], "finish_reason": null}],
     });
     emit!(head.to_string());
 
-    // Chunked prefill with an SSE comment per chunk as a keepalive. The final
-    // chunk stays buffered for the generator's first step (see `prefill`).
+    // Chunked prefill (of the non-resumed remainder) with an SSE comment per
+    // chunk as a keepalive. The final chunk stays buffered for the
+    // generator's first step (see `prefill`).
     {
-        let chunks: Vec<&[u32]> = turn.prompt_ids.chunks(PREFILL_CHUNK).collect();
+        let todo = &turn.prompt_ids[resumed..];
+        let chunks: Vec<&[u32]> = todo.chunks(PREFILL_CHUNK).collect();
         let (last, head) = chunks.split_last().expect("prompt verified non-empty");
         for chunk in head {
             ctx.append(chunk);
@@ -413,6 +547,9 @@ async fn handle_streaming(model: Model, turn: Turn, responder: Responder) -> Fin
         }
     }
 
+    drop(g); // release the generator's borrow of ctx before snapshotting
+    let _ = save_and_advertise(&mut ctx, &model, &turn.prompt_ids, &all_ids, resumed_hash).await;
+
     let tail = serde_json::json!({
         "id": id, "object": "text_completion", "created": created,
         "model": turn.model_name,
@@ -438,6 +575,81 @@ pub async fn error_response(responder: Responder, status: u16, message: &str) ->
         .status(status)
         .header("Content-Type", "application/json")
         .body(error.to_string().into_body())
+        .unwrap();
+    responder.respond(response).await
+}
+
+
+// ─── Debug: bisect the resume path one host call at a time ─────────────────
+// POST /debug/reuse {"step": "oracle" | "content" | "extend", "prompt": [...]}
+// A wasm trap kills the connection — whichever step does that is the culprit.
+pub async fn debug_reuse(body_bytes: Vec<u8>, responder: Responder) -> Finished {
+    let v: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return error_response(responder, 400, &e.to_string()).await,
+    };
+    let step = v["step"].as_str().unwrap_or("oracle");
+    let prompt: Vec<u32> = v["prompt"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
+        .unwrap_or_default();
+
+    let models = runtime::models();
+    let model = match models.first().ok_or("no models".to_string()).and_then(|n| Model::load(n).map_err(|e| e.to_string())) {
+        Ok(m) => m,
+        Err(e) => return error_response(responder, 500, &e).await,
+    };
+
+    let mut out = Vec::new();
+    if step == "open-forget" {
+        match Context::open(&model, LATEST_SNAP) {
+            Ok(o) => {
+                let l = o.seq_len();
+                std::mem::forget(o); // deliberately leak: bisecting open vs destroy
+                out.push(format!("open-forget-ok[{l}]"));
+            }
+            Err(e) => out.push(format!("open-forget-err[{e}]")),
+        }
+        let response = Response::builder()
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"steps": out}).to_string().into_body())
+            .unwrap();
+        return responder.respond(response).await;
+    }
+    let oracle_len = match Context::open(&model, LATEST_SNAP) {
+        Ok(o) => {
+            let l = o.seq_len() as usize;
+            out.push(format!("oracle-open-ok[{l}]"));
+            o.destroy();
+            out.push("oracle-destroy-ok".into());
+            l
+        }
+        Err(e) => {
+            out.push(format!("oracle-open-err[{e}]"));
+            0
+        }
+    };
+    if step != "oracle" && oracle_len > 0 && oracle_len < prompt.len() {
+        let hash = fnv1a64(&prompt[..oracle_len]);
+        match Context::open(&model, &snap_name(hash)) {
+            Ok(mut c) => {
+                out.push(format!("content-open-ok[{}]", c.seq_len()));
+                if step == "extend" {
+                    c.append(&prompt[oracle_len..]);
+                    match c.flush().await {
+                        Ok(()) => out.push("extend-flush-ok".into()),
+                        Err(e) => out.push(format!("extend-flush-err[{e}]")),
+                    }
+                }
+                c.destroy();
+                out.push("content-destroy-ok".into());
+            }
+            Err(e) => out.push(format!("content-open-err[{e}]")),
+        }
+    }
+    let response = Response::builder()
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({"steps": out}).to_string().into_body())
         .unwrap();
     responder.respond(response).await
 }
