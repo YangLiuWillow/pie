@@ -83,6 +83,7 @@ async fn spawn_pair(rs_slots: usize, restore_pause_at_utilization: f64) -> usize
         None,
         32.0,
         restore_pause_at_utilization,
+        0,
     );
     let inf_idx = pie::inference::spawn(&[0], 4, 30, "greedy".to_string(), 0).await;
     assert_eq!(ctx_idx, inf_idx);

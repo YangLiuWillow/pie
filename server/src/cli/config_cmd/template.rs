@@ -70,6 +70,10 @@ request_timeout_secs = 120
 default_endowment_pages = 64
 admission_oversubscription_factor = 4.0
 restore_pause_at_utilization = 0.85
+# Cap on saved named snapshots per namespace prefix (per user); the
+# oldest under a prefix are evicted at save time. Bounds the KV pages
+# abandoned content-addressed sessions can pin. 0 = unlimited.
+# max_snapshots_per_prefix = 64
 # Per-context depth of pass-level speculative execution. `0`
 # disables speculation entirely (every submit goes through the
 # cold path — useful for A/B benchmarking). `1` is piggyback

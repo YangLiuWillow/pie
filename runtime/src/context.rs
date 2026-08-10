@@ -283,6 +283,7 @@ pub fn spawn(
     default_token_limit: Option<usize>,
     admission_oversubscription_factor: f64,
     restore_pause_at_utilization: f64,
+    max_snapshots_per_prefix: usize,
 ) -> usize {
     let model_idx = SERVICES.len();
     PAGE_SIZES.push(page_size);
@@ -301,6 +302,7 @@ pub fn spawn(
                 default_token_limit,
                 admission_oversubscription_factor,
                 restore_pause_at_utilization,
+                max_snapshots_per_prefix,
             )
         })
         .expect("Failed to spawn context manager");
@@ -1287,6 +1289,12 @@ pub(crate) struct ContextManager {
     /// contexts when any driver's page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade.
     pub(crate) restore_pause_at_utilization: f64,
+    /// Cap on saved named snapshots per namespace prefix (name up to and
+    /// including its last `/`), per user. `0` = unlimited. Enforced at
+    /// save time by evicting the oldest snapshots under the same prefix —
+    /// snapshots have no owner and otherwise outlive their creating
+    /// process forever (the abandoned-conversation leak).
+    pub(crate) max_snapshots_per_prefix: usize,
     /// Total driver-reported forward request slots across this model's
     /// registered drivers. Admission uses this as the largest useful launch
     /// wave and as the upper bound on page-rounding slack.
@@ -1318,6 +1326,7 @@ impl ContextManager {
         default_token_limit: Option<usize>,
         admission_oversubscription_factor: f64,
         restore_pause_at_utilization: f64,
+        max_snapshots_per_prefix: usize,
     ) -> Self {
         let gpu_stores: Vec<_> = num_gpu_pages
             .iter()
@@ -1346,6 +1355,7 @@ impl ContextManager {
             default_token_limit,
             admission_oversubscription_factor,
             restore_pause_at_utilization,
+            max_snapshots_per_prefix,
             admission_wave_requests: max_forward_requests.max(1),
             admission_drain_barrier: false,
             sched_counters: SchedCounters::default(),

@@ -330,6 +330,14 @@ pub struct SchedulerConfig {
     pub admission_oversubscription_factor: f64,
     #[serde(default = "default_restore_pause_at_utilization")]
     pub restore_pause_at_utilization: f64,
+    /// Cap on saved named snapshots per namespace prefix (the name up to and
+    /// including its last `/`), per user. On save, the oldest snapshots under
+    /// the same prefix are evicted to stay under the cap. `0` disables the
+    /// cap (default). Bounds the KV pages that abandoned content-addressed
+    /// sessions (e.g. `qwenchat/…`, `codex/{sid}/…`) can pin: without it,
+    /// snapshots have no owner and outlive their creating process forever.
+    #[serde(default)]
+    pub max_snapshots_per_prefix: usize,
     /// Per-context depth of pass-level speculative execution.
     /// `0` disables speculation entirely (every submit goes
     /// through the cold path). `1` is the piggyback path —
@@ -355,6 +363,7 @@ impl Default for SchedulerConfig {
             default_endowment_pages: default_endowment_pages(),
             admission_oversubscription_factor: default_oversubscription_factor(),
             restore_pause_at_utilization: default_restore_pause_at_utilization(),
+            max_snapshots_per_prefix: 0,
             speculation_depth: default_speculation_depth(),
         }
     }

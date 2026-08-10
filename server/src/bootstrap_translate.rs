@@ -154,6 +154,7 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
             default_endowment_pages: m.scheduler.default_endowment_pages,
             admission_oversubscription_factor: m.scheduler.admission_oversubscription_factor,
             restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
+            max_snapshots_per_prefix: m.scheduler.max_snapshots_per_prefix,
             speculation_depth: m.scheduler.speculation_depth,
         },
     }

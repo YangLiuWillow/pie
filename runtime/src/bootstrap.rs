@@ -145,6 +145,9 @@ pub struct SchedulerConfig {
     /// contexts when any driver's GPU page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
     pub restore_pause_at_utilization: f64,
+    /// Cap on saved named snapshots per namespace prefix, per user.
+    /// `0` disables. See `server::config::SchedulerConfig`.
+    pub max_snapshots_per_prefix: usize,
     /// Per-context depth of pass-level speculative execution.
     /// `0` disables speculation entirely; every submit goes
     /// through the cold path. `1` is piggyback (one staged pass
@@ -272,6 +275,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             cfg.scheduler.default_token_limit,
             cfg.scheduler.admission_oversubscription_factor,
             cfg.scheduler.restore_pause_at_utilization,
+            cfg.scheduler.max_snapshots_per_prefix,
         );
         inference::spawn(
             &drivers,

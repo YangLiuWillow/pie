@@ -18,3 +18,11 @@ activation_dtype = "bfloat16"
 max_forward_tokens = 4096
 max_forward_requests = 16
 total_pages = 512
+
+[model.scheduler]
+# Slow-driver headroom (see codex RUNPOD_HANDOVER: the 120 s default
+# abandons long prefills while the driver keeps grinding).
+request_timeout_secs = 600
+# Bound the qwenchat/ snapshot namespace: abandoned conversations
+# otherwise pin their KV pages forever (snapshots have no owner).
+max_snapshots_per_prefix = 64

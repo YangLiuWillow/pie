@@ -247,6 +247,38 @@ impl ContextManager {
             anyhow::bail!("Snapshot name already exists: {}", name);
         }
 
+        // Per-prefix retention: evict the oldest snapshots under this name's
+        // namespace prefix so that, with the one being saved, at most
+        // `max_snapshots_per_prefix` remain. Runs BEFORE the working-page
+        // copy below so the freed pages are available to it. Only namespaced
+        // names (containing `/`) participate — snapshots have no owner and
+        // survive their creating process, so content-addressed namespaces
+        // (`qwenchat/…`, `codex/{sid}/…`) otherwise grow without bound.
+        // Save-order comes for free: snapshot ContextIds are monotonic.
+        if self.max_snapshots_per_prefix > 0 && !auto_generated {
+            if let Some(cut) = name.rfind('/') {
+                let prefix = &name[..=cut];
+                let mut peers: Vec<(ContextId, (String, String))> = self
+                    .snapshots
+                    .iter()
+                    .filter(|((u, n), _)| *u == username && n.starts_with(prefix))
+                    .map(|(k, &sid)| (sid, k.clone()))
+                    .collect();
+                if peers.len() + 1 > self.max_snapshots_per_prefix {
+                    peers.sort_by_key(|(sid, _)| *sid);
+                    let excess = peers.len() + 1 - self.max_snapshots_per_prefix;
+                    for (sid, key) in peers.into_iter().take(excess) {
+                        eprintln!(
+                            "SNAPSHOT_RETENTION_EVICT prefix={prefix} name={} (cap {})",
+                            key.1, self.max_snapshots_per_prefix
+                        );
+                        self.snapshots.remove(&key);
+                        self.release_snapshot(sid);
+                    }
+                }
+            }
+        }
+
         let ctx = self
             .contexts
             .get(&id)
