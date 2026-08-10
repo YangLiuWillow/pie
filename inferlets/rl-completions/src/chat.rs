@@ -17,18 +17,6 @@
 //! History replay for assistant/tool turns is deliberately NOT here: the
 //! spec gates it behind the renderer-parity harness (Risk R1), and the
 //! cumulative path never needs it.
-//!
-//! STATUS (2026-08-10): routed and compiling, but turn-0 traps the wasm
-//! instance at runtime (HTTP 000, ~0.2s, before any forward — so in
-//! parsing or template rendering, NOT generation). Not yet localized:
-//! wasm `eprintln!` does not surface in the daemon log, so stage markers
-//! printed nothing. Resume via the response-embedded bisect technique used
-//! for the reuse feature — thread a `debug: Vec<String>` through the
-//! handler and return it in an error/JSON body — to find which of
-//! chat::system / equip_prefix / chat::user / chat::cue / native_matcher
-//! (empty schemas) traps. The /v1/completions path shares the generate
-//! loop and works, so the suspect is the template-rendering calls unique
-//! to this endpoint.
 
 use crate::completions::{error_response, strip_trailing_stop};
 use inferlet::model::Model;
@@ -63,6 +51,7 @@ struct ChatBody {
     #[allow(dead_code)]
     logprobs: Option<serde_json::Value>,
 }
+
 
 #[derive(Deserialize)]
 struct Msg {
@@ -178,8 +167,12 @@ pub async fn handle(body_bytes: Vec<u8>, responder: Responder) -> Finished {
     // ── Generate, decoding text and tool calls in parallel ──
     let stop_ids = chat::stop_tokens(&model);
     let mut g = ctx.generate(sampler).max_tokens(max_tokens).stop(&stop_ids);
-    if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
-        g = g.constrain(GrammarConstraint::new(matcher));
+    // Only constrain when tools are present: native_matcher traps the
+    // instance when handed an empty schema set.
+    if !tool_schemas.is_empty() {
+        if let Some(matcher) = tools::native_matcher(&model, &tool_schemas) {
+            g = g.constrain(GrammarConstraint::new(matcher));
+        }
     }
     let mut tool_decoder = (!tool_schemas.is_empty()).then(|| tools::Decoder::new(&model));
     let mut token_ids: Vec<u32> = Vec::new();

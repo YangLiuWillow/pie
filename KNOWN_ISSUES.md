@@ -93,3 +93,17 @@ opened fork kills the WASM instance with no surfaced trap message (connection
 drops mid-request). One-call repro: rl-completions' `POST /debug/reuse`
 `{"step": "oracle"}` (destroys) vs `{"step": "open-forget"}` (leaks — works).
 Workaround: leak opened forks; per-request instance teardown reclaims them.
+
+## 10. `tools::native_matcher` with an empty schema set traps the instance
+
+Calling `tools::native_matcher(&model, &[])` (empty tool schemas) kills the
+WASM instance with a silent trap (HTTP 000, no surfaced message). Guard the
+call site: only build a grammar matcher when at least one tool schema is
+present. Found building the chat endpoint; the /v1/completions path already
+guards this incidentally.
+
+Also worth noting for debuggers: **wasm `eprintln!`/`println!` output does
+not surface in the embedded daemon's server log**, so stage markers via
+stderr print nothing. Bisect wasm traps by threading progress into the HTTP
+*response* body (return-early markers) instead — a hard trap shows as
+HTTP 000, a clean return shows the marker.
