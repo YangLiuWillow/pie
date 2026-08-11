@@ -6,6 +6,7 @@ members = [
     "beam-search",
     "cacheback-speculative-decoding",
     "chat-completion",
+    "chat-completions",
     "consensus-decoding",
     "constrained-speculative-decoding",
     "contrastive-decoding",

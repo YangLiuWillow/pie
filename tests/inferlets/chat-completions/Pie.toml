@@ -1,0 +1,12 @@
+[package]
+name = "chat-completions"
+version = "0.1.0"
+description = "OpenAI chat-completions daemon: long-lived session loop serving qwen-code via the shim"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+# No launch parameters: every request arrives over the session channel as a
+# JSON envelope {"req_id", "body", "now"}; the launch input is ignored.
+[parameters]
