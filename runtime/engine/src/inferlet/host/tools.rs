@@ -35,6 +35,35 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         Ok(crate::model::model().instruct().answer(&name, &value))
     }
 
+    async fn equip_after_system(
+        &mut self,
+        system_content: Option<String>,
+        tools: Vec<String>,
+    ) -> Result<Result<Vec<u32>, pie::inferlet::types::Error>> {
+        let tokens = crate::model::model()
+            .instruct()
+            .equip_after_system(system_content.as_deref(), &tools);
+        Ok(Ok(tokens))
+    }
+
+    async fn assistant_with_tool_calls(
+        &mut self,
+        content: Option<String>,
+        calls: Vec<pie::inferlet::tools::ToolCall>,
+    ) -> Result<Vec<u32>> {
+        let calls: Vec<(String, String)> = calls
+            .into_iter()
+            .map(|c| (c.name, c.arguments_json))
+            .collect();
+        Ok(crate::model::model()
+            .instruct()
+            .assistant_with_tool_calls(content.as_deref(), &calls))
+    }
+
+    async fn answer_batch(&mut self, results: Vec<(String, String)>) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().answer_batch(&results))
+    }
+
 
     async fn format(
         &mut self,

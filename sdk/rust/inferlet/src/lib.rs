@@ -155,6 +155,15 @@ pub mod session {
     pub use crate::pie::inferlet::session::*;
 }
 
+/// Native tool calling (the WIT `tools` interface): `equip`/`equip_after_system`
+/// render tool schemas into the system prefix, `answer`/`answer_batch` render
+/// tool results, `assistant_with_tool_calls` replays a past tool-calling
+/// assistant turn, and [`Decoder`](tools::Decoder) detects tool calls in
+/// generated tokens — all in the bound model's own template dialect.
+pub mod tools {
+    pub use crate::pie::inferlet::tools::*;
+}
+
 /// Grammar compilation + incremental matching (the WIT `grammar` interface).
 /// [`Grammar`](grammar::Grammar) compiles a JSON Schema / regex / EBNF source
 /// once for the bound model's vocabulary; [`Matcher`](grammar::Matcher) walks

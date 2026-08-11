@@ -40,6 +40,17 @@ pub struct QwenInstruct {
     system_prefix: Vec<u32>,
     user_prefix: Vec<u32>,
     assistant_prefix: Vec<u32>,
+    // "<|im_start|>user"/"<|im_start|>assistant" WITHOUT the trailing newline
+    // baked into `user_prefix`/`assistant_prefix`. Needed when replaying a
+    // tool-calling turn: the reference template's tool-call/tool-response
+    // branches never put an unconditional newline right after the role tag —
+    // the newline comes from whatever follows (content, or the first
+    // `<tool_call>`/`<tool_response>` chunk), so reusing the newline-inclusive
+    // prefix would double up newlines when merging multiple chunks into one
+    // turn. See `assistant_with_tool_calls`/`answer_batch`.
+    user_prefix_no_nl: Vec<u32>,
+    assistant_prefix_no_nl: Vec<u32>,
+    newline_ids: Vec<u32>,
     turn_suffix: Vec<u32>,
     generation_header: Vec<u32>,
     stop_ids: Vec<u32>,
@@ -49,6 +60,16 @@ pub struct QwenInstruct {
     // Tool delimiters
     tool_response_prefix_tokens: Vec<u32>,
     tool_response_suffix_tokens: Vec<u32>,
+    // Tool-call/tool-response fragments for replaying history
+    // (`assistant_with_tool_calls`/`answer_batch`). Pre-tokenized like every
+    // other literal fragment in this struct — dynamic content (name,
+    // arguments, value) is always encoded on its own and concatenated as
+    // token IDs, never interpolated into a literal string and encoded in one
+    // shot, since that isn't guaranteed to retokenize into the same pieces.
+    tool_call_open_tokens: Vec<u32>, // "\n<tool_call>\n{\"name\": \""
+    tool_call_mid_tokens: Vec<u32>,  // "\", \"arguments\": "
+    tool_call_close_tokens: Vec<u32>, // "}\n</tool_call>"
+    tool_response_open_tokens: Vec<u32>, // "\n<tool_response>\n"
 }
 
 impl QwenInstruct {
@@ -75,6 +96,11 @@ impl QwenInstruct {
         let mut turn_suffix = im_end;
         turn_suffix.extend(&newline);
 
+        let mut user_prefix_no_nl = im_start.clone();
+        user_prefix_no_nl.extend(encode("user"));
+        let mut assistant_prefix_no_nl = im_start.clone();
+        assistant_prefix_no_nl.extend(encode("assistant"));
+
         let think_prefix = encode("<think>");
         let think_suffix = encode("</think>");
 
@@ -83,6 +109,12 @@ impl QwenInstruct {
         let mut tool_resp_suffix = newline.clone();
         tool_resp_suffix.extend(encode("</tool_response>"));
 
+        let tool_call_open_tokens = encode("\n<tool_call>\n{\"name\": \"");
+        let tool_call_mid_tokens = encode("\", \"arguments\": ");
+        let tool_call_close_tokens = encode("}\n</tool_call>");
+        let mut tool_response_open_tokens = newline.clone();
+        tool_response_open_tokens.extend(&tool_resp_prefix);
+
         let mut generation_header = make_prefix("assistant");
         generation_header.extend(encode(config.generation_suffix));
 
@@ -90,6 +122,9 @@ impl QwenInstruct {
             system_prefix: make_prefix("system"),
             user_prefix: make_prefix("user"),
             assistant_prefix: make_prefix("assistant"),
+            user_prefix_no_nl,
+            assistant_prefix_no_nl,
+            newline_ids: newline.clone(),
             generation_header,
             turn_suffix,
             stop_ids,
@@ -97,6 +132,10 @@ impl QwenInstruct {
             think_suffix_ids: think_suffix,
             tool_response_prefix_tokens: tool_resp_prefix,
             tool_response_suffix_tokens: tool_resp_suffix,
+            tool_call_open_tokens,
+            tool_call_mid_tokens,
+            tool_call_close_tokens,
+            tool_response_open_tokens,
             tokenizer,
             config,
         }
@@ -129,15 +168,26 @@ impl QwenInstruct {
     /// Build the tool system prompt matching the Qwen reference format.
     /// Both Qwen3 and Qwen2.5 use identical `<tools>` XML + `<tool_call>` format.
     fn build_tool_system_prompt(tools: &[String]) -> String {
+        // Must match the Jinja2 chat template's output exactly — the model
+        // was fine-tuned on that format and won't produce <tool_call> blocks
+        // if the preamble diverges. (This is the form the qwen-code e2e work
+        // validated; the parity harness adjudicates against HF per model.)
         let mut prompt = String::from(
-            " # Tools\n\n\
+            "\n# Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>",
         );
         for tool in tools {
             prompt.push('\n');
-            prompt.push_str(tool);
+            // Wrap in {"type": "function", "function": ...} if not already
+            // wrapped — the Jinja template renders tools in this envelope and
+            // the model was fine-tuned on it.
+            if tool.contains("\"type\"") && tool.contains("\"function\"") {
+                prompt.push_str(tool);
+            } else {
+                prompt.push_str(&format!("{{\"type\": \"function\", \"function\": {tool}}}"));
+            }
         }
         prompt.push_str(
             "\n</tools>\n\n\
@@ -238,6 +288,75 @@ impl Instruct for QwenInstruct {
         tokens.extend(&self.tool_response_prefix_tokens);
         tokens.extend(self.tokenizer.encode(value));
         tokens.extend(&self.tool_response_suffix_tokens);
+        tokens.extend(&self.turn_suffix);
+        tokens
+    }
+
+    fn equip_after_system(&self, system_content: Option<&str>, tools: &[String]) -> Vec<u32> {
+        // Reference (the Qwen Jinja template's top-of-prompt preamble): when
+        // tools are present, the leading system message's content (if any)
+        // and the tools block are folded into ONE system turn
+        // ('content' + '\n\n' + tools-block), not two separate turns.
+        if !self.config.has_tools || tools.is_empty() {
+            return match system_content {
+                Some(c) => self.system(c),
+                None => Vec::new(),
+            };
+        }
+        let tools_block = Self::build_tool_system_prompt(tools);
+        let merged = match system_content {
+            Some(c) if !c.is_empty() => format!("{c}\n\n{tools_block}"),
+            _ => tools_block,
+        };
+        self.system(&merged)
+    }
+
+    fn assistant_with_tool_calls(&self, content: Option<&str>, calls: &[(String, String)]) -> Vec<u32> {
+        if !self.config.has_tools || calls.is_empty() {
+            return self.assistant(content.unwrap_or(""));
+        }
+        // Reference (the Qwen Jinja template's assistant branch):
+        // '<|im_start|>' + role, then '\n' + content only if content is
+        // truthy, then for each call '\n<tool_call>\n{"name": ..., "arguments":
+        // ...}\n</tool_call>', then '<|im_end|>\n'. Note there's no
+        // unconditional newline after the role tag — it comes from whichever
+        // of those two branches fires first.
+        let mut tokens = self.assistant_prefix_no_nl.clone();
+        if let Some(c) = content {
+            if !c.is_empty() {
+                tokens.extend(&self.newline_ids);
+                tokens.extend(self.tokenizer.encode(c));
+            }
+        }
+        for (name, arguments_json) in calls {
+            tokens.extend(&self.tool_call_open_tokens);
+            tokens.extend(self.tokenizer.encode(name));
+            tokens.extend(&self.tool_call_mid_tokens);
+            tokens.extend(self.tokenizer.encode(arguments_json));
+            tokens.extend(&self.tool_call_close_tokens);
+        }
+        tokens.extend(&self.turn_suffix);
+        tokens
+    }
+
+    fn answer_batch(&self, results: &[(String, String)]) -> Vec<u32> {
+        if !self.config.has_tools || results.is_empty() {
+            return Vec::new();
+        }
+        // Reference: consecutive tool-role messages share one
+        // '<|im_start|>user' ... '<|im_end|>\n' turn, but EVERY message still
+        // contributes its own leading '\n<tool_response>\n...\n</tool_response>'
+        // chunk (there's no unconditional newline baked into the opening tag
+        // either — same shape as assistant_with_tool_calls above). Merging
+        // two single-result `answer()` calls would double up the newline
+        // between chunks, which is why this needs its own implementation
+        // rather than just looping `answer()` (the trait default).
+        let mut tokens = self.user_prefix_no_nl.clone();
+        for (_name, value) in results {
+            tokens.extend(&self.tool_response_open_tokens);
+            tokens.extend(self.tokenizer.encode(value));
+            tokens.extend(&self.tool_response_suffix_tokens);
+        }
         tokens.extend(&self.turn_suffix);
         tokens
     }
@@ -499,6 +618,194 @@ mod tests {
         assert_eq!(
             text,
             "<|im_start|>user\n<tool_response>\nHello\n</tool_response><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn equip_after_system_merges_into_one_turn() {
+        // The fold-into-one-turn property: content + '\n\n' + tools-block,
+        // rendered as a SINGLE system() turn — not a system turn followed by
+        // equip()'s own turn (the trait default). Asserted at the token level
+        // against the equivalent single system() call so the toy vocab's
+        // lossy encoding of the tools block can't skew the comparison.
+        let inst = qwen3();
+        let tools = vec!["{}".to_string()];
+        let expected = inst.system(&format!(
+            "Hello\n\n{}",
+            QwenInstruct::build_tool_system_prompt(&tools)
+        ));
+        assert_eq!(inst.equip_after_system(Some("Hello"), &tools), expected);
+        let text = inst.tokenizer.decode(&expected, false);
+        assert_eq!(text.matches("<|im_start|>system").count(), 1);
+        assert_eq!(text.matches("<|im_end|>").count(), 1);
+    }
+
+    #[test]
+    fn equip_after_system_without_tools_is_plain_system() {
+        let inst = qwen3();
+        assert_eq!(
+            inst.equip_after_system(Some("Hello"), &[]),
+            inst.system("Hello")
+        );
+        assert!(inst.equip_after_system(None, &[]).is_empty());
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_falls_back_when_disabled() {
+        let inst = olmo3();
+        let with_calls =
+            inst.assistant_with_tool_calls(Some("Hello"), &[("f".to_string(), "{}".to_string())]);
+        assert_eq!(with_calls, inst.assistant("Hello"));
+    }
+
+    /// Vocab for the tool-call-history tests below: the base `make_tok()` set
+    /// plus the three fixed literal fragments `assistant_with_tool_calls`
+    /// pre-tokenizes in `new()`, and the dynamic `name`/`arguments_json`
+    /// pieces those tests use ("f", "{}") as their own standalone entries —
+    /// `self.tokenizer.encode(name)` / `encode(arguments_json)` are called on
+    /// them in isolation, never interpolated into a bigger literal first (see
+    /// the comment on the struct's `tool_call_open_tokens` field for why).
+    fn make_tool_call_tok() -> Arc<Tokenizer> {
+        let mut v: Vec<String> = vec![
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "system",
+            "\n",
+            "user",
+            "assistant",
+            "Hello",
+            " world",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<tools>",
+            "</tools>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        v.push("\n<tool_call>\n{\"name\": \"".to_string());
+        v.push("\", \"arguments\": ".to_string());
+        v.push("}\n</tool_call>".to_string());
+        v.push("f".to_string());
+        v.push("{}".to_string());
+        Arc::new(Tokenizer::from_vocab(&v))
+    }
+
+    fn qwen3_tool_call() -> QwenInstruct {
+        QwenInstruct::new(
+            make_tool_call_tok(),
+            ChatMLConfig {
+                has_thinking: false,
+                has_tools: true,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        )
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_matches_reference_with_content() {
+        let inst = qwen3_tool_call();
+        let tokens =
+            inst.assistant_with_tool_calls(Some("Hello"), &[("f".to_string(), "{}".to_string())]);
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>assistant\nHello\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_matches_reference_no_content() {
+        // Same as above but content=None: no unconditional newline after the
+        // role tag when there's no leading text — the reference template only
+        // ever emits one newline before the first `<tool_call>`, not two.
+        let inst = qwen3_tool_call();
+        let tokens =
+            inst.assistant_with_tool_calls(None, &[("f".to_string(), "{}".to_string())]);
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>assistant\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn answer_batch_noop_when_disabled() {
+        let inst = olmo3();
+        assert!(
+            inst.answer_batch(&[("fn1".to_string(), "42".to_string())])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn answer_batch_single_matches_answer() {
+        let inst = qwen3();
+        assert_eq!(
+            inst.answer_batch(&[("fn1".to_string(), "Hello".to_string())]),
+            inst.answer("fn1", "Hello"),
+        );
+    }
+
+    #[test]
+    fn answer_batch_merges_consecutive_results() {
+        // The regression this exists to catch: calling `answer()` twice would
+        // produce two separate `<|im_start|>user...<|im_end|>` turns; the
+        // reference template merges consecutive tool results into ONE turn
+        // with multiple `<tool_response>` blocks inside it. Unlike the
+        // assistant-side tests above, `answer_batch`'s literal fragments are
+        // all built from pieces already in the base vocab (see
+        // `tool_response_open_tokens`'s construction — concatenated from
+        // already-tokenized pieces, not encoded as a combined literal), so
+        // only the dynamic values ("Hello", "world") need their own entries.
+        let mut v: Vec<String> = vec![
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "system",
+            "\n",
+            "user",
+            "assistant",
+            "Hello",
+            " world",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<tools>",
+            "</tools>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        v.push("world".to_string());
+        let tok = Arc::new(Tokenizer::from_vocab(&v));
+        let inst = QwenInstruct::new(
+            tok,
+            ChatMLConfig {
+                has_thinking: false,
+                has_tools: true,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        );
+
+        let tokens = inst.answer_batch(&[
+            ("fn1".to_string(), "Hello".to_string()),
+            ("fn2".to_string(), "world".to_string()),
+        ]);
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>user\n<tool_response>\nHello\n</tool_response>\n<tool_response>\nworld\n</tool_response><|im_end|>\n"
         );
     }
 
