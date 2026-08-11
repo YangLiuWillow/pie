@@ -1,0 +1,14 @@
+[package]
+name = "pie-openai-serving"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Pure-logic OpenAI chat-completions serving library: wire types, SSE chunk framing, content-addressed session canon, and engine-free render planning. Shared by the chat-completions and opencode-session inferlets; no wasm/WIT dependencies, so it tests natively in the host workspace."
+
+[lib]
+name = "pie_openai_serving"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

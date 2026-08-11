@@ -10,7 +10,7 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 |---|---|---|
 | P0.1 | Tool-history replay primitives (Instruct + WIT + host + SDK) | **done** |
 | P0.2 | opencode wire audit + fixture capture | **done** |
-| P0.3 | Shared `openai-serving` crate | pending |
+| P0.3 | Shared `openai-serving` crate | **done** |
 | P0.4 | Renderer parity harness | pending |
 | PA.1 | `chat-completions` inferlet on dev | pending |
 | PA.2 | Gateway OpenAI ingress | pending |
@@ -20,9 +20,51 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-11 — P0.3 done: shared `pie-openai-serving` crate
+
+Pure-logic host crate at `inferlets/openai-serving/` (new workspace member in
+the root `Cargo.toml`; serde/serde_json only, zero wasm/WIT deps). Tests:
+28/28 native, incl. all 5 opencode wire captures as fixtures; `cargo check
+-p pie-engine` still clean.
+
+- `src/types.rs` — ported near-verbatim from
+  `openhands-integration-updated:inferlets/chat-completions/src/types.rs`;
+  added `ChatMessage::text_opt()` (opencode's assistant `content:""` → None)
+  and made `tool_schema_envelopes` **name-sort** the `{name,description,
+  parameters}` envelopes (opencode sorts on the wire anyway; makes the
+  snapshot address order-independent). `$schema` + `maximum: 2^53−1` schema
+  noise round-trips losslessly through `serde_json::Value`.
+- `src/streaming.rs` — ported chunk framing, refactored to return
+  `serde_json::Value` (framing split into `sse_frame`/`sse_done`/`sse_ping`
+  per the plan's "inferlet emits chunk JSON, gateway frames" decision);
+  added `completion_response` (non-streaming body from the old handler) and
+  the `: ping` comment helper (opencode keepalive). Golden tests pin exact
+  chunk shapes (atomic tool-call delta with id+name on first delta).
+- `src/session.rs` — canon/FNV-1a-64×2/split ported verbatim minus engine
+  calls; `snapshot_name` → `snapshot_address` returning bare 32-hex (caller
+  prefixes its namespace — old code hardcoded `qwenchat/`). Response/save
+  unification invariant documented at module level.
+- `src/render.rs` — reworked engine-free: `RenderOp` enum + `plan_render`.
+  Deviations from old render.rs: no `System` op (leading system/developer
+  folds into `EquipAfterSystem` even with zero tools — the no-tools title
+  call renders as a plain system turn; mid-list system → `MisplacedSystem`
+  error, old code rendered it inline); `AnswerBatch` pairs now carry the
+  real tool name recovered via `tool_call_id→name` from preceding assistant
+  turns (old code passed `""`); `/no_think` decoration + special-token
+  `sanitize_messages` deliberately left to the inferlet (tokenizer-touching).
+- `src/error.rs` — extracted from handler.rs: OpenAI `{"error":{message,
+  type,param:null,code:null}}` body, `invalid_request_error`/`server_error`
+  constants, `parse_request` (only 400 rule: bad JSON / empty messages).
+  Handler itself not ported (PA.1).
+- Surprise from the old code: old `AnswerBatch` genuinely never used tool
+  names (Qwen template folds results namelessly), so the name recovery is
+  new capability, not a port — harmless for Qwen, needed if a template
+  renders names. Also `rl_completions` fixtures don't exist on this branch
+  (they live on the old one); the fixture test sweeps them only if present.
+
 ### 2026-08-11 — P0.1 done: tool-history replay primitives restored on dev
 
-All changes on `liu/opencode-integration` (uncommitted). Tests: 24/24
+Tests: 24/24
 `pie-model-qwen-3 --features chat`, `pie-model` 7/7, `pie-engine` +
 `inferlet` (wasm32-wasip2) compile clean.
 
