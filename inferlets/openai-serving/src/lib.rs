@@ -17,7 +17,12 @@
 //! - [`session`] — content-addressed canon: canonical items, FNV-1a-64
 //!   two-seed address, resume-point splitting;
 //! - [`render`] — engine-free render plan ([`render::RenderOp`]) mapping
-//!   1:1 onto the WIT template surface.
+//!   1:1 onto the WIT template surface;
+//! - [`filter`] — streaming visible-text filter (think/tool-call markup
+//!   suppression with chunk-straddling holdback) + special-token message
+//!   sanitization;
+//! - [`salvage`] — fallback parsers for tool calls the native token-level
+//!   decoder missed (fenced-JSON, unclosed hermes blocks).
 //!
 //! Provenance: ported from the validated qwen-code implementation at
 //! `openhands-integration-updated:inferlets/chat-completions/` (33/33
@@ -25,12 +30,16 @@
 //! hazards catalogued in `tests/inferlets/fixtures/opencode/AUDIT.md`.
 
 pub mod error;
+pub mod filter;
 pub mod render;
+pub mod salvage;
 pub mod session;
 pub mod streaming;
 pub mod types;
 
+pub use filter::{VisibleFilter, sanitize_messages};
 pub use render::{RenderError, RenderOp, plan_render, plan_render_messages};
+pub use salvage::{parse_fenced_tool_calls, parse_hermes_tool_calls};
 pub use session::{CanonItem, canon_messages, snapshot_address, split_resume_point};
 pub use streaming::{ChunkMeta, sse_done, sse_frame, sse_ping, usage_object};
 pub use types::{ChatCompletionRequest, ChatMessage, MessageContent, tool_schema_envelopes};

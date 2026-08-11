@@ -12,13 +12,83 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 | P0.2 | opencode wire audit + fixture capture | **done** |
 | P0.3 | Shared `openai-serving` crate | **done** |
 | P0.4 | Renderer parity harness | **done** |
-| PA.1 | `chat-completions` inferlet on dev | pending |
-| PA.2 | Gateway OpenAI ingress | pending |
+| PA.1 | `chat-completions` inferlet on dev | **milestone 1 done** (sessions/grammar/coder-dialect pending) |
+| PA.2 | Gateway OpenAI ingress | **done** |
 | PA.3 | Acceptance suite + stock-opencode e2e | pending |
 | PB.1 | `opencode-session` inferlet + AI SDK provider package | pending |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-11 — PA.1 milestone 1 done: `chat-completions` serving inferlet (parse → render → generate → stream → finish + usage)
+
+New guest crate `inferlets/chat-completions/` (wasm32-wasip2, own workspace
+root via empty `[workspace]` table — same exclusion policy as
+`tests/inferlets/*`; path-deps `inferlet` SDK + `pie-openai-serving`).
+Serves one OpenAI chat-completions request per process launch on the PA.2
+gateway⇄inferlet envelope (`{"status":u16}` first, then verbatim chunk JSON
+per message / one unary body). Build (verified):
+`cd inferlets/chat-completions && CARGO_TARGET_DIR=…/Lin_startup/pie/target
+cargo build --target wasm32-wasip2 --release`.
+
+- **`src/engine.rs`** — generation core ported from
+  `tests/inferlets/chat-completion/src/lib.rs` (PTIR prefill + in-graph
+  top-p/Gumbel sampling + device-carried decode loop under `run_ahead`),
+  two deltas: prefill is CHUNKED via `prefill_chunks` (naive-baseline
+  shape — serving prompts exceed `max_embed_length`), and per-token policy
+  is a caller-supplied callback. Engine failures never become wire errors:
+  `generate` returns the first error and the turn degrades to
+  `finish_reason:"length"` (KV overflow mid-decode = "generate what fits").
+- **`src/turn.rs`** — orchestration ported from the OLD validated handler
+  (`openhands-integration-updated:…/handler.rs`, logic only, not its engine
+  API): per token = tool-decoder feed → atomic tool-call delta on `Call`
+  (dedup + `call_{instance-id-fragment}_{n}` ids, unique per process) →
+  stop-set check (chat stops + `<|im_start|>` anti-loop stop) → chat-decoder
+  delta through `VisibleFilter` (partial `<tool_call>`/`<think>` never leaks
+  into content) → client stop-strings on the visible tail. ≥1 call ⇒
+  `finish_reason:"tool_calls"`; generation runs until the model's own stop
+  (old-handler behavior — no cut after the call block). Salvage after the
+  loop: fenced-JSON on visible text, unclosed-hermes on raw text.
+  `final_content` fallback (raw-minus-think, then `"…"`) guarantees a
+  non-empty text turn.
+- **`src/lib.rs`** — envelope + 400-vs-500 discipline: bad JSON / empty
+  `messages` / misplaced system / unknown role → `{"status":400}` + OpenAI
+  error body (never a process error; opencode retries 5xx forever); render
+  planned via `plan_render`, mapped 1:1 to WIT (`tools.equip-after-system`,
+  `chat.user`, `tools.assistant-with-tool-calls`, `tools.answer-batch`,
+  `chat.cue-no-think` — **D1 decided: always no-think this milestone**,
+  matching the token-exact parity verdict). Streaming: status → role-first
+  chunk → content/tool-call deltas → finish chunk → usage chunk
+  (`prompt_tokens_details.cached_tokens: 0` for now) when `include_usage`;
+  non-stream: status + one `completion_response` body. Sampling defaults
+  from the reference inferlet (t=0.6, top_p=0.95) when the request omits
+  them; `max_tokens` via `effective_max_tokens(4096)`.
+- **Ported INTO `pie-openai-serving`** (pure logic, native tests):
+  `filter.rs` — `VisibleFilter` verbatim from the old branch's `filter.rs`
+  + `sanitize_messages` (pure half of old `render::sanitize_messages`;
+  caller supplies decoded `model::special_tokens()` strings); `salvage.rs`
+  — `parse_fenced_tool_calls` + `parse_hermes_tool_calls` from the old
+  handler, with its unit tests adapted. Crate suite **43/43** (was 28; +10
+  filter/sanitize, +5 salvage). SDK: `chat::cue_no_think` added to the
+  `sdk/rust/inferlet` re-export list (binding existed since PA.2).
+- **Deliberately dropped/changed vs the old handler**: coder-XML salvage
+  (`parse_coder_xml_calls`) — out of scope with the Coder dialect, seam
+  marked in `turn::salvage`; grammar-forced phase-2 call — already absent
+  in the old code (traps guests on drivers without grammar support), seam
+  in lib.rs module docs; the wstd HTTP daemon shell — replaced by the
+  envelope (gateway owns HTTP/SSE/keepalives now); pre-status degrade macro
+  — render faults now answer a clean `{"status":500}` *before* the stream
+  commits (the old code had already sent SSE headers by then); degraded
+  turns emit `final_content` (`"…"` floor) instead of the old literal
+  `" "`; fixed rng seeds from the reference inferlet (deterministic per
+  request — revisit if per-request variety matters).
+- **Open seams** (marked in-code): KV snapshot sessions
+  (`split_resume_point`/`snapshot_address` already tested in
+  `pie-openai-serving::session`; attach at `build_prompt` + pre-finish save,
+  then report `cached_tokens`); grammar-constrained tool calls (behind a
+  capability probe via `tools::format`/`create-matcher`); Qwen3-Coder XML
+  dialect (decoder/template model-side + salvage slot).
+- Not yet exercised on a live worker — that is PA.3's acceptance suite.
 
 ### 2026-08-11 — PA.2 done: gateway OpenAI ingress; parity now TOKEN-EXACT (D1+D4 fixed)
 

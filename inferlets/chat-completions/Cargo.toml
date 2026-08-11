@@ -1,0 +1,32 @@
+# Guest wasm crate — NOT a member of the root host workspace (same policy as
+# `tests/inferlets/*` and `sdk/rust/*`: wasm-target crates keep their own
+# lockfiles so wasm-only deps never enter the host build graph). The empty
+# [workspace] table below makes this crate its own workspace root, so cargo
+# never walks up into the host manifest.
+#
+# Build:
+#   cd inferlets/chat-completions && \
+#   CARGO_TARGET_DIR=…/Lin_startup/pie/target \
+#   cargo build --target wasm32-wasip2 --release
+
+[package]
+name = "chat-completions"
+version = "0.1.0"
+edition = "2024"
+description = "OpenAI-compatible /v1/chat/completions serving inferlet (opencode-facing): one request per process launch, envelope-framed over session::send"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+# Pure-logic serving library (wire types, chunk builders, render plan,
+# visible-text filter, salvage parsers) — tested natively in the host
+# workspace, consumed here for all wire JSON.
+pie-openai-serving = { path = "../openai-serving" }
+serde_json = "1.0"
+
+[workspace]
+
+[profile.release]
+lto = true

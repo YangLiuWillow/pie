@@ -1,0 +1,13 @@
+[package]
+name = "chat-completions"
+version = "0.1.0"
+description = "OpenAI-compatible chat-completions serving inferlet (opencode-facing)"
+authors = ["Liu Yang <liu@liszt.ai>"]
+
+[runtime]
+core = "^0.2.0"
+
+# No CLI parameters — the raw OpenAI request JSON arrives as the launch
+# input (`LaunchProcess.input`, see gateway/src/ingress/openai.rs), and the
+# response travels back over session::send on the gateway⇄inferlet envelope.
+[parameters]
