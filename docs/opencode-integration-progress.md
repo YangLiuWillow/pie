@@ -14,13 +14,77 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 | P0.4 | Renderer parity harness | **done** |
 | PA.1 | `chat-completions` inferlet on dev | **milestone 1 done** (sessions/grammar/coder-dialect pending) |
 | PA.2 | Gateway OpenAI ingress | **done** |
-| PA.3 | Acceptance suite + stock-opencode e2e | pending |
+| PA.3 | Acceptance suite + stock-opencode e2e | suite + scaffolding **authored**; live run pending (RAM blocker) |
 | PB.1 | `opencode-session` inferlet + AI SDK provider package | pending |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
 
-### 2026-08-11 — PA.1 milestone 1 done: `chat-completions` serving inferlet (parse → render → generate → stream → finish + usage)
+### 2026-08-11 — PA.3 first half: acceptance suite + launch scaffolding AUTHORED (not yet run live)
+
+**Blocker for the live half:** machine RAM vs the Metal admission margin —
+`pie serve` needs ~3.2 GiB reclaimable for the Metal heap and the machine had
+~1.9, so the driver refuses admission. Mitigations documented in the script:
+free RAM and/or `PIE_METAL_ROW_BUDGET_MB` (activation-row reservation, driver
+default 1024 MB, `driver/metal/src/context.cpp row_budget_bytes()`; don't go
+low enough to refuse the ~7.5k-token opencode prompt — over-long prompts are
+refused, not chunked).
+
+New in `integrations/opencode/`:
+
+- **`test_acceptance.py`** — **25 tests**, stdlib-only raw HTTP (incl. SSE
+  parsing with keepalive-comment/junk-line separation), one test per hard
+  requirement from `tests/inferlets/fixtures/opencode/AUDIT.md` + the
+  PA.2 ingress contract: health/models; 401-without-Bearer with
+  `authentication_error` shape; 400 (never 5xx) on bad JSON / non-object /
+  empty messages with OpenAI error bodies; `$schema` + `maximum:2^53−1` +
+  unknown-top-level tolerance; streaming (content-type, role-first delta,
+  content accumulation, finish stop|length, usage chunk incl.
+  `prompt_tokens_details.cached_tokens ≤ prompt_tokens`, `[DONE]`, chunk-id
+  consistency, no `{"status":…}` envelope leakage, no stdout leakage);
+  non-streaming single-body shape; req-004 verbatim replay (10 real tools)
+  + a synthetic forced-tool turn; req-005 tool-history replay; cross-process
+  tool-call-id uniqueness over two sequential requests; `max_tokens:1` ⇒
+  `length`; keepalive/long-prefill completion (timing soft-logged);
+  global never-`error_finish` + no in-stream `error` events sweep.
+  Policy: wire-SHAPE assertions hard; 0.6B model-BEHAVIOR assertions soft
+  (`[WARN]`, e.g. "did the model actually call the tool") — but whenever
+  calls DO appear, the atomic-first-delta `index`+`id`+`function.name` /
+  valid-JSON-arguments / `finish_reason:"tool_calls"` shape is hard.
+  Fixture bodies replay verbatim except `max_tokens` clamped 32000→1024
+  (`PIE_TEST_MAX_TOKENS`) to bound live runtime. Run:
+  `PIE_BASE_URL=http://127.0.0.1:8080 python3 integrations/opencode/test_acceptance.py`
+  (`--collect-only` / `--only <substr>`; exit 2 = server unreachable).
+- **`run_pie_opencode.sh`** — `$PIE_BIN` (default
+  `../pie/target/release/pie`, the shared-target-dir release build) `-c
+  <config> serve` → wait `/health` (180 s, model load) → suite → clean
+  kill; `--serve-only` keeps it up for the stock-opencode e2e. Config = arg
+  or a generated trimmed copy of the known-good `~/.pie/config.toml`
+  (metal, `Qwen--Qwen3-0.6B-optimized`) with ONE change: `max_model_len`
+  4096→16384 (= 512 pages × 32), since req-005 renders at 7473 tokens.
+  Also refreshes `$PIE_HOME/programs/chat-completions/0.1.0.{wasm,toml}`
+  from the shared target dir when newer, and runs `pie doctor` preflight.
+- **`opencode.json`** + **`README.md`** — stock-opencode e2e profile
+  (provider `pie`, `@ai-sdk/openai-compatible`, baseURL
+  `http://127.0.0.1:8080/v1`, model `pie/qwen3-0.6b`, `limit.output:4096`
+  to bound `max_tokens`); README covers acceptance, the
+  `opencode run -m pie/qwen3-0.6b …` e2e, blockers, and what green means.
+
+Serverless self-checks (all that can run without the server): `--collect-only`
+lists 25/25; helpers unit-probed (fixture load + clamp, SSE parse incl. junk
+detection); unreachable-server preflight exits 2; `bash -n` clean; `pie doctor`
+on the generated profile: ready (metal compiled, weights artifact found,
+config parses).
+
+**Finding while wiring the launch path — predicted first-run failure:**
+`gateway/src/ingress/openai.rs` launches `CHAT_INFERLET = "chat-completions"`
+(bare), but `ProgramName::parse` (runtime/engine/src/inferlet/program.rs:154)
+requires `name@major.minor.patch` — the engine will reject the launch and
+every chat request will 500 with `Invalid program identifier
+'chat-completions'`. PA.2's 6/6 integration tests missed it because the stub
+worker never parses the name. Fix belongs to the live half: constant →
+`chat-completions@0.1.0` (or bare-name resolution in `handle_launch_process`)
++ rebuild; the suite will show it as universal 500s until then.
 
 New guest crate `inferlets/chat-completions/` (wasm32-wasip2, own workspace
 root via empty `[workspace]` table — same exclusion policy as

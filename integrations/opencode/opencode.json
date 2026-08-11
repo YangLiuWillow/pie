@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "pie": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Pie",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "pie-local"
+      },
+      "models": {
+        "qwen3-0.6b": {
+          "name": "Qwen3 0.6B (pie)",
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "pie/qwen3-0.6b"
+}

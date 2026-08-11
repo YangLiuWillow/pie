@@ -183,8 +183,11 @@ pub async fn chat_completions(
 
 /// The serving inferlet this surface launches. Fixed for now (gateway `Config`
 /// is `deny_unknown_fields`; making this configurable is a config-schema
-/// change to take deliberately, not smuggle in).
-const CHAT_INFERLET: &str = "chat-completions";
+/// change to take deliberately, not smuggle in). MUST be the full
+/// `name@major.minor.patch` form — the engine's `ProgramName::parse` rejects
+/// bare names, which turns every chat request into a 500 (found by the PA.3
+/// acceptance-suite dry review; the ingress tests now pin the format).
+const CHAT_INFERLET: &str = "chat-completions@0.1.0";
 
 /// One inferlet message event, decoded from the turn's token stream.
 enum Msg {

@@ -86,9 +86,21 @@ impl WorkerControl for EnvelopeWorker {
     async fn dispatch(self, _: tarpc::context::Context, req: Request) -> Accepted {
         let gateway = self.gateway.clone();
         let req_id = req.req_id;
-        let ClientMessage::LaunchProcess { input, .. } = req.message else {
+        let ClientMessage::LaunchProcess { input, inferlet, .. } = req.message else {
             panic!("openai ingress must dispatch LaunchProcess turns");
         };
+        // The engine's ProgramName::parse requires `name@major.minor.patch`;
+        // a bare name nacks every launch (universal 500s). Mirror that
+        // contract here so the ingress can't regress it unnoticed again.
+        let (name, version) = inferlet
+            .split_once('@')
+            .expect("inferlet id must be name@version — the engine rejects bare names");
+        assert!(!name.is_empty());
+        assert_eq!(
+            version.split('.').count(),
+            3,
+            "inferlet version must be full semver, got {version:?}"
+        );
         let body: Value = serde_json::from_str(&input).expect("ingress forwards valid JSON");
 
         tokio::spawn(async move {
