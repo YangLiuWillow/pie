@@ -177,8 +177,15 @@ impl Context {
     }
 
     /// Force-destroy the context immediately, consuming it.
+    ///
+    /// The host's `destroy` deletes the resource-table entry, so the
+    /// handle must not go through the normal wit-bindgen resource drop
+    /// afterwards — the host `drop` handler would fail on the missing
+    /// entry and trap the instance. Forget the handle instead.
     pub fn destroy(self) {
-        self.inner.destroy()
+        let Context { inner, .. } = self;
+        inner.destroy();
+        std::mem::forget(inner);
     }
 
     // ── Market operations ────────────────────────────────────────────
