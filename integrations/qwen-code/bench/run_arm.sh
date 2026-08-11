@@ -62,7 +62,7 @@ EOF
         --yolo --bare --safe-mode --auth-type openai \
         --max-session-turns "$MAX_TURNS" --max-wall-time "$WALL_LIMIT" \
         --max-tool-calls 40 --chat-recording false --openai-logging \
-        -p "$prompt" > "$tdir/stdout.log" 2>&1)
+        -p "$prompt" < /dev/null > "$tdir/stdout.log" 2>&1)
     rc=$?
     set -e
     end=$(python3 -c 'import time; print(time.time())')
@@ -81,12 +81,12 @@ EOF
 }
 
 echo "arm=$ARM base=$BASE_URL model=$MODEL out=$OUT_DIR"
-while IFS= read -r line; do
+while IFS= read -r line <&3; do
     [ -z "$line" ] && continue
     id=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
     prompt=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["prompt"])')
     setup=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["setup"])')
     check=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["check"])')
     run_one "$id" "$prompt" "$setup" "$check"
-done < "$TASKS"
+done 3< "$TASKS"
 echo "done -> $OUT_DIR"
