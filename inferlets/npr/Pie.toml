@@ -1,0 +1,18 @@
+[package]
+name = "npr"
+version = "0.1.0"
+description = "Native Parallel Reasoner (arXiv 2512.07461): guideline/plan fork, parallel step decoding over a shared prefix, takeaway join"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = { type = "string", optional = true, description = "The problem to solve (default: a sample math question)" }
+max_new_tokens = { type = "int", optional = true, description = "Global generation budget; branch tokens are charged x parallel degree (default: 30000)" }
+max_plans = { type = "int", optional = true, description = "Max plans per <guideline>; more falls back to sequential decoding (default: 5)" }
+max_depth = { type = "int", optional = true, description = "Max nesting depth of parallel blocks (default: 5)" }
+min_fork_budget = { type = "int", optional = true, description = "Minimum remaining budget required to fork (default: 1024)" }
+temperature = { type = "float", optional = true, description = "Sampling temperature (default: 1.0)" }
+top_p = { type = "float", optional = true, description = "Nucleus sampling p (default: 0.7)" }
