@@ -37,7 +37,8 @@ run_one() {
   "model": {
     "skipStartupContext": true,
     "maxToolCallsPerTurn": 0,
-    "generationConfig": { "contextWindowSize": 100000000, "temperature": 0 }
+    "generationConfig": { "contextWindowSize": 100000000,
+                          "samplingParams": { "temperature": 0, "top_p": 1 } }
   },
   "context": { "clearContextOnIdle": {
     "toolResultsThresholdMinutes": -1, "toolResultsTotalCharsThreshold": -1 } },

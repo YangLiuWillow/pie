@@ -467,6 +467,15 @@ async fn handle_streaming(mut setup: TurnSetup, responder: Responder) -> Finishe
                 }
             }
         }
+        // Coder-XML salvage: `<function=…>` blocks that arrived without the
+        // `<tool_call>` wrapper (native decoder never armed).
+        if calls.is_empty() && has_tools && visible_text.contains("<function=") {
+            for (name, args) in parse_coder_xml_calls(&visible_text, &setup.tool_schemas) {
+                let call_id = format!("call_{uniq}_{}", calls.len());
+                emit!(meta.tool_call_delta(calls.len(), &call_id, &name, &args));
+                calls.push(ToolCallOut { id: call_id, name, arguments: args });
+            }
+        }
 
         // NOTE — no phase-2 forced tool call here, deliberately. The
         // openhands-completion pattern (replay the prose on a fork and force
@@ -632,6 +641,16 @@ async fn handle_non_streaming(mut setup: TurnSetup, responder: Responder) -> Fin
     visible_text.push_str(&filter.finish());
     let visible_text = visible_text.trim_end().to_string();
 
+    if calls.is_empty() && has_tools && visible_text.contains("<function=") {
+        for (name, args) in parse_coder_xml_calls(&visible_text, &setup.tool_schemas) {
+            calls.push(ToolCallOut {
+                id: format!("call_{uniq}_{}", calls.len()),
+                name,
+                arguments: args,
+            });
+        }
+    }
+
     let outcome = TurnOutcome {
         hit_max: generated.len() >= setup.max_tokens,
         n_generated: generated.len(),
@@ -704,6 +723,85 @@ async fn handle_non_streaming(mut setup: TurnSetup, responder: Responder) -> Fin
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
+/// Salvage parser for Qwen3-Coder's XML tool dialect when the model omits
+/// the `<tool_call>` wrapper (observed on 30B with `general`-style prompt
+/// examples: `<function=name>` blocks arrive bare, the native decoder never
+/// arms, and the call leaks into content as text). Parses
+/// `<function=NAME><parameter=key>value</parameter>…</function>` into
+/// `(name, arguments_json)` pairs, typing values via the tool schemas the
+/// same way vLLM's Qwen3CoderToolParser does (parity reference:
+/// integrations/openhands/pie_openhands/qwen3coder_parser.py).
+fn parse_coder_xml_calls(text: &str, tool_schemas: &[String]) -> Vec<(String, String)> {
+    // name -> {param -> type} from the schema envelopes.
+    let mut param_types: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    for schema in tool_schemas {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(schema) else { continue };
+        let Some(name) = v.get("name").and_then(|n| n.as_str()) else { continue };
+        let mut types = std::collections::HashMap::new();
+        if let Some(props) = v.pointer("/parameters/properties").and_then(|p| p.as_object()) {
+            for (k, spec) in props {
+                if let Some(t) = spec.get("type").and_then(|t| t.as_str()) {
+                    types.insert(k.clone(), t.to_string());
+                }
+            }
+        }
+        param_types.insert(name.to_string(), types);
+    }
+
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find("<function=") {
+        let fn_at = pos + rel;
+        let after = &text[fn_at + "<function=".len()..];
+        let Some(name_end) = after.find('>') else { break };
+        let name = after[..name_end].trim().to_string();
+        let body_start = fn_at + "<function=".len() + name_end + 1;
+        let Some(body_len) = text[body_start..].find("</function>") else { break };
+        let body = &text[body_start..body_start + body_len];
+        pos = body_start + body_len + "</function>".len();
+
+        let types = param_types.get(&name);
+        let mut args = serde_json::Map::new();
+        let mut bpos = 0;
+        while let Some(prel) = body[bpos..].find("<parameter=") {
+            let p_at = bpos + prel;
+            let pafter = &body[p_at + "<parameter=".len()..];
+            let Some(key_end) = pafter.find('>') else { break };
+            let key = pafter[..key_end].trim().to_string();
+            let val_start = p_at + "<parameter=".len() + key_end + 1;
+            let Some(val_len) = body[val_start..].find("</parameter>") else { break };
+            // The template frames values with newlines; strip exactly one
+            // leading and one trailing newline (vLLM parser behavior).
+            let raw = &body[val_start..val_start + val_len];
+            let val = raw.strip_prefix('\n').unwrap_or(raw);
+            let val = val.strip_suffix('\n').unwrap_or(val);
+            bpos = val_start + val_len + "</parameter>".len();
+
+            let typed: serde_json::Value = match types.and_then(|t| t.get(&key)).map(String::as_str) {
+                Some("integer") => val.trim().parse::<i64>().map(Into::into)
+                    .unwrap_or_else(|_| serde_json::Value::String(val.to_string())),
+                Some("number") => val.trim().parse::<f64>().ok()
+                    .and_then(|f| serde_json::Number::from_f64(f).map(serde_json::Value::Number))
+                    .unwrap_or_else(|| serde_json::Value::String(val.to_string())),
+                Some("boolean") => match val.trim() {
+                    "true" => serde_json::Value::Bool(true),
+                    "false" => serde_json::Value::Bool(false),
+                    _ => serde_json::Value::String(val.to_string()),
+                },
+                Some("object") | Some("array") => serde_json::from_str(val.trim())
+                    .unwrap_or_else(|_| serde_json::Value::String(val.to_string())),
+                _ => serde_json::Value::String(val.to_string()),
+            };
+            args.insert(key, typed);
+        }
+        if !name.is_empty() {
+            out.push((name, serde_json::Value::Object(args).to_string()));
+        }
+    }
+    out
+}
+
 /// Extract tool calls written as fenced JSON blocks: a ``` fence (with or
 /// without a language tag) whose body is an object with a string `name` and
 /// an object `arguments`. Returns `(fence_byte_offset, name,
@@ -769,5 +867,33 @@ mod tests {
     fn non_tool_fences_are_ignored() {
         let text = "```python\nprint('hi')\n```\n```json\n{\"foo\": 1}\n```";
         assert!(parse_fenced_tool_calls(text).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod coder_xml_tests {
+    use super::parse_coder_xml_calls;
+
+    #[test]
+    fn bare_function_block_is_salvaged_and_typed() {
+        let schemas = vec![serde_json::json!({
+            "name": "run_shell_command",
+            "description": "d",
+            "parameters": {"type": "object", "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"}}}
+        }).to_string()];
+        let text = "I'll create it.\n\n<function=run_shell_command>\n<parameter=command>\necho 'x' > /tmp/a.txt\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_coder_xml_calls(text, &schemas);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "run_shell_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(args["command"], "echo 'x' > /tmp/a.txt");
+        assert_eq!(args["timeout"], 30);
+    }
+
+    #[test]
+    fn no_function_block_yields_nothing() {
+        assert!(parse_coder_xml_calls("plain text </tool_call>", &[]).is_empty());
     }
 }
