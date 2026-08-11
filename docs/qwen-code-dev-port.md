@@ -1,0 +1,195 @@
+# qwen-code ↔ Pie: port to the rewritten engine (`dev`)
+
+**Date:** 2026-08-11. Successor to `qwen-code-integration-plan.md`, whose Option-A build
+(commits `a2b0e2243`..`f380e9904` on `openhands-integration-updated`) ran against the
+pre-rewrite engine. The rewrite (`dev`, now branched as `liu/qwen-code-dev`) removes both
+hosts that build stood on: the in-guest HTTP daemon (`runtime/src/daemon.rs`,
+`#[wstd::http_server]`) and the named-Context snapshot API. This doc maps every old
+component to its new home. The wire contract (audit §1), the fixtures, and the acceptance
+suite carry over unchanged — the OpenAI-facing surface is identical by design.
+
+## 1. Shape: external shim + long-lived session inferlet
+
+The new WIT world (`interface/inferlet/world.wit`) imports only `wasi:http/client`
+(outbound); the incoming-server side was deliberately excluded. Client interaction is a
+gateway WebSocket (`/v1/ws`, msgpack frames) carrying process events, and an inferlet is
+one `run(input) -> result<string>` call that may loop forever on
+`session::receive().await`.
+
+So the integration becomes two pieces:
+
+```
+qwen-code ──HTTP/SSE──> shim.py (owns /v1/chat/completions)
+                          │  one WS session, x-pie-identity header
+                          ▼
+                    pie gateway (pie serve)
+                          │  signal_process / ProcessEvent::Message
+                          ▼
+              chat-completions inferlet (run = receive/send loop)
+```
+
+- **`integrations/qwen-code/shim.py`** — asyncio HTTP server + `pie_client.PieClient`.
+  On boot: connect (identity header), authenticate, `install_program`,
+  `launch_process("chat-completions", …)`, hold the `Process`. Per HTTP request:
+  `proc.signal(json{req_id, body})`; drain `proc.recv()` events, demux on `req_id`,
+  wrap each payload as one SSE `data:` line. The shim owns SSE keepalives (`: ping`)
+  and HTTP error mapping (400 with OpenAI error JSON; never 500 for client faults —
+  audit §1 rows 6/9). It is pure transport: all OpenAI semantics stay in the inferlet.
+- **`tests/inferlets/chat-completions/`** — the ported inferlet. `run` loops:
+  `receive()` → parse request → render → resume-or-prefill → decode loop → stream
+  chunk JSONs (tagged `req_id`) via `session::send` → publish KV index → next request.
+  One request at a time; the shim serializes (qwen-code is sequential anyway).
+
+Lifecycle traps (from the gateway map): the client's event queue is deleted on
+`return`/`error`, so if `run` ever returns the shim must **relaunch**, not reattach;
+`launch_process` is the one long-lived gateway turn and each `signal` is a short
+side-turn, all sticky to one worker.
+
+## 2. Old inferlet → new SDK, file by file
+
+Old sources: `git show f380e9904:inferlets/chat-completions/src/…` (2,060 lines).
+
+| Old | Fate |
+|---|---|
+| `types.rs` (wire types, unknown-field tolerant) | port unchanged |
+| `filter.rs` (hermes + bare Coder-XML salvage parsers) | port unchanged (pure text; the engine's `tools::Decoder` is hermes-only, Coder-XML still has no engine decoder) |
+| `render.rs` | port with the same *strings*, new APIs (see §3) |
+| `session.rs` (canon items, FNV-1a-64 ×2 addressing, resume-point strip) | port hashing + strip logic; storage moves to `WorkingSet::{update_index, from_index, remove_index}` (see §4) |
+| `streaming.rs` (SSE writer) | rewrite: chunk JSON assembly stays, transport becomes `session::send` |
+| `handler.rs` (HTTP orchestration) | rewrite around the receive loop; generation moves to PTIR (see §5) |
+| `lib.rs` (`#[wstd::http_server]` routing) | gone; replaced by `#[inferlet::main]` + loop |
+
+## 3. Rendering (the parity-critical part)
+
+The chat template is now engine-side Rust (`model/qwen_3/src/chat.rs`, ChatML for all
+Qwen variants; no Jinja, no `apply_chat_template`). Three engine helpers diverge from
+the HF template and must NOT be used for history replay:
+
+1. **`tools::equip()` makes its own system turn.** HF folds tools into the same
+   `<|im_start|>system` turn as the user's system prompt. Render the merged turn by
+   hand: `chat::system(system_text + tool_prompt)` (the engine's tool prompt begins
+   with a leading space — that is the concatenation seam).
+2. **No `assistant_with_tool_calls` renderer.** Hand-emit
+   `chat::assistant(content + "\n<tool_call>\n{json}\n</tool_call>" …)` — byte-identical
+   between generation replay and history replay, or index keys self-invalidate
+   (finding 1 of §5a in the old plan; it still binds).
+3. **`tools::answer()` renders one user turn per call.** HF batches consecutive tool
+   results into one turn. Batch by hand into a single `chat::user`-shaped turn with
+   N `<tool_response>` blocks.
+
+Also carried over: the `/no_think` soft switch (there is still no
+`enable_thinking` control anywhere in the new ABI); reasoning stripped from replay
+(engine's `assistant()` already strips `<think>…</think>`); `chat::stop_tokens()` for
+the stop set (`seal()` is a duplicate of it, not a single-token close);
+`chat::cue()` for the generation header. `tools::Decoder` events: `Start` fires on
+every non-call feed — only `Call` is meaningful.
+
+## 4. KV reuse: named snapshots → indexed working sets
+
+The prefix trie does not do automatic cross-process matching (that path is
+`#[cfg(test)]`-gated and unwired). The discipline is the old one, promoted into the
+engine — reference implementation:
+`runtime/engine/tests/inferlets/prefix-cache-e2e/src/lib.rs`.
+
+- Keep the old canon/hash scheme; the key (≤256 bytes) is the old
+  `qwenchat/{hash32}` string.
+- **Save:** after a turn, `slice` the working set to the full-page prefix
+  (`page_len` must equal `mapped_len` — no unmapped tail) and `update_index(key)`.
+  Insert-or-replace is atomic; replacing frees the old entry (this reproduces the old
+  take-on-hit ≤1-snapshot-per-branch bound if we also `remove_index` the parent key
+  on extension, as old `session.rs` did via open+delete).
+- **Resume:** strip trailing tool/user suffix → hash → `from_index(key)`. Hit: fresh
+  working set already holding the prefix; `reserve` only the shortfall; build the
+  forward pass over **suffix rows only** with `writable_pages: (cached_pages)..`
+  (declaring the whole range would CoW-copy the entire cached prefix). Miss: full
+  rebuild, always safe. Sub-page remainder always recomputes — reuse granularity is
+  one KV page.
+- **`cached_tokens`** = `ws.page_len() * model::kv_page_size()` at resume.
+- **Retention:** there is no LRU — index entries survive until the first KV-pool
+  pressure event, then *all* non-open entries are dropped wholesale. Same
+  "rebuild-on-miss is correct, just slower" posture as before; note in README.
+- Hybrid models (qwen3_5 GDN): `rs-working-set` has **no index surface** — no
+  cross-request KV reuse at all. Gate: if `model::pass_kind() != attention`, run
+  reuse-off (rebuild every turn) rather than erroring.
+
+## 5. Generation: PTIR decode loop
+
+Template: `tests/inferlets/chat-completion/src/lib.rs` (same-tree, 294 lines).
+`ptir::attention::prelude`, `run_ahead` driving a 1-wide decode pass whose epilogue
+samples (`reduce_argmax` at t=0, `nucleus_sample` otherwise) and re-feeds geometry
+channels; chunked prefill via `prefill_chunks(n, None)` respecting
+`model::max_embed_length()`; `chat::Decoder` for incremental detok;
+`reasoning::Decoder` for the `<think>` channel if it ever appears. Grammar-constrained
+tool calls stay **off** (old finding 2: the portable-driver trap; unverified on the
+new engine — re-evaluate behind a flag later).
+
+## 6. Scaffolding + config deltas
+
+`integrations/qwen-code/` (recreate; old copy recoverable from `f380e9904`):
+
+- `shim.py` (new), `run_pie_qwen.sh` (update: new `pie serve` + shim instead of
+  `launch_daemon.py`), `test_acceptance.py` (port, near-unchanged — it speaks raw
+  HTTP), `README.md`, `pie_config.toml` (rewrite: `[model]` singular,
+  `type = "metal"`, `device = ["metal:0"]`).
+- **Metal is 4-bit-only now** — every matvec binds `.weight/.scales/.biases`. Local
+  model becomes `mlx-community/Qwen3-0.6B-4bit`; a bf16 repo imports fine and then
+  fails at bind time.
+- Server: `cargo build --release -p pie-bin --features driver-metal`; `pie serve`
+  boots embedded controller+gateway+worker; clients need the `x-pie-identity` header
+  or the WS upgrade 401s before the socket opens (python client defaults it).
+
+## 7. Execution order
+
+- **A. Inferlet skeleton** — crate in `tests/inferlets/chat-completions/` building for
+  `wasm32-wasip2`; `types.rs`/`filter.rs` ported; C1 unit tests green against the
+  wire fixtures (`tests/inferlets/fixtures/`, to be committed on this branch).
+- **B. Render + generation** — §3 rendering + §5 decode loop; single-request
+  end-to-end via a throwaway driver script against `pie serve`.
+- **C. Shim + acceptance** — `shim.py`; port `test_acceptance.py`; target the same
+  33-row bar as §5a of the old plan.
+- **D. KV sessions** — §4 resume/save; two-turn echo-back with `cached_tokens > 0`;
+  then e2e with stock qwen-code v0.21.6 on M2 / Qwen3-0.6B-4bit.
+- **E. Docs + results** — README, results appended here; memory updated.
+
+Risks, front-loaded: (1) renderer parity — same C3 gap as before, now with three
+known engine-template divergences to hand-render around; (2) PTIR is a full rewrite
+of the generation core — the old integration reused `openhands-completion` idioms
+that no longer exist; (3) 4-bit Metal weights change the local model artifact; (4)
+first run of the new engine on this M2 is itself unproven (build in progress).
+
+## 8. Results (2026-08-11, first bring-up on the rewritten engine)
+
+Phases A–D executed same-day. Inferlet: 21/21 native unit tests; wasm32-wasip2
+builds clean. One design change vs §4: KV sessions are retained **in-process**
+(`HashMap<key, WorkingSet>`, fork-on-hit CoW, LRU 8) instead of the engine index —
+`update_index` requires a full-page mapped slice and sealed chat turns essentially
+never land on page boundaries; the daemon is long-lived so in-process retention
+preserves exact-token resume, and a restart degrades to a clean rebuild miss.
+Addressing (`qwenchat/{hash32}`) unchanged, so moving to the engine index later is
+storage-only.
+
+**Dummy driver (M2):** stack boots, WS client path green, acceptance 25/27 — the
+two failures are the tool-call rows, which need a real model.
+
+**RTX 3090 (RunPod, sm_86, CUDA 12.9 toolkit):** acceptance **33/33** — full
+parity with the old integration's bar, including native tool calls with unique
+ids and `finish_reason:"tool_calls"`, and turn-2 KV resume with
+`cached_tokens > 0`. E2E with stock qwen-code v0.21.6 (audited §6 profile):
+native `run_shell_command` decoded and executed, file created, clean exit, zero
+retries. Session log shows resume hits at **cached 8,841–8,968 tokens** on the
+follow-up agent turns (the full system+tools+history prefix) — same reuse
+behavior as the old engine's 99.7% result.
+
+Bring-up potholes for the next pod: the CUDA driver needs toolkit **≥ 12.9**
+(`cublasGemmGroupedBatchedEx` 12.5+, cublasLt `MATRIX_SCALE_BLK128x128/VEC128`
+12.9+) — RunPod's cuda-12.4 images fail at `gemm.cpp`; install
+`cuda-toolkit-12-9` and build with `CUDACXX=/usr/local/cuda-12.9/bin/nvcc
+CMAKE_CUDA_ARCHITECTURES=<sm>`. The dev-branch python client needed the
+"Already authenticated" sentinel fix (committed here). Metal on a shared 8 GB
+M2 is gated by the host-reclaimable guard (§6 of the README) — the GPU pod is
+the practical e2e environment.
+
+qwen-code behavior notes: `--safe-mode` blocks `write_file` in headless yolo
+mode (tool call round-trips correctly, execution refused) — drop it for e2e
+tasks or phrase tasks as shell commands; sub-page conversations (<32 tokens)
+report `cached_tokens: 0` by design (page-granular reuse).

@@ -1,0 +1,39 @@
+# Pie config for the qwen-code integration on Apple Silicon (Metal).
+# Schema: rewritten engine (`pie config init` template, driver-metal build).
+
+[server]
+host = "127.0.0.1"
+port = 18080
+registry = "https://registry.pie-project.org/"
+verbose = false
+telemetry = false
+
+[model]
+name = "default"
+# Metal's llama path is 4-bit-only (every matvec binds .weight/.scales/.biases);
+# a raw bf16 repo imports fine and then fails to bind at load.
+model = "mlx-community/Qwen3-0.6B-4bit"
+
+[driver]
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+kv_page_size = 32
+total_pages = 512
+# Fit the M2's ~5.3 GiB Metal budget. The dominant term is the M=1 KV ring,
+# sized fleet-wide from max_model_len (default = the driver's own ceiling,
+# ~14.6 GiB here); total_pages does not shrink it. 16K tokens ≈ 1.8 GiB ring
+# on Qwen3-0.6B.
+max_model_len = 16384
+max_forward_tokens = 4096
+max_forward_requests = 8
+
+[runtime]
+# Agent turns include multi-thousand-token prefills on a laptop GPU; the
+# default 120s can fire mid-turn.
+request_timeout = "600s"
+
+[sandbox]
+allow_fs = false
+allow_network = true
+network_allowed_hosts = ["*"]

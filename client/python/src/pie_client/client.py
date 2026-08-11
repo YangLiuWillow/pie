@@ -271,7 +271,9 @@ class PieClient:
         if not ok:
             raise Exception(f"Username '{username}' rejected by server: {result}")
 
-        if result == "Authenticated (Engine disabled authentication)":
+        # Engines with auth disabled short-circuit the handshake; the exact
+        # sentinel has drifted across engine versions, so accept both.
+        if result in ("Authenticated (Engine disabled authentication)", "Already authenticated"):
             return
 
         if private_key is None:

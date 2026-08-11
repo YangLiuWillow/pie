@@ -1,0 +1,33 @@
+# CUDA profile for the qwen-code integration (RunPod-class single GPU).
+# Build: CMAKE_CUDA_ARCHITECTURES=<sm> cargo build --release -p pie-bin --features driver-cuda
+# Needs CUDA toolkit >= 12.9: gemm.cpp uses cublasGemmGroupedBatchedEx (12.5+)
+# and the cublasLt block-scale modes CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128/
+# VEC128 (12.9+). On a 12.4 image: install cuda-toolkit-12-9 from the NVIDIA
+# apt repo and build with CUDACXX=/usr/local/cuda-12.9/bin/nvcc.
+
+[server]
+host = "127.0.0.1"
+port = 18080
+registry = "https://registry.pie-project.org/"
+verbose = false
+telemetry = false
+
+[model]
+name = "default"
+# CUDA path takes raw bf16 checkpoints directly.
+model = "Qwen/Qwen3-0.6B"
+
+[driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+gpu_mem_utilization = 0.90
+
+[runtime]
+request_timeout = "600s"
+
+[sandbox]
+allow_fs = false
+allow_network = true
+network_allowed_hosts = ["*"]

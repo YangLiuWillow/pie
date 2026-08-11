@@ -1,0 +1,29 @@
+# Dummy-driver profile: boots the full stack (gateway + engine + inferlet)
+# with fake forward passes — no GPU memory. For transport bring-up and the
+# acceptance rows that don't depend on real generation; swap to
+# pie_config.toml (Metal) for real runs.
+
+[server]
+host = "127.0.0.1"
+port = 18080
+registry = "https://registry.pie-project.org/"
+verbose = false
+telemetry = false
+
+[model]
+name = "default"
+model = "mlx-community/Qwen3-0.6B-4bit"
+
+[driver]
+type = "dummy"
+device = ["cpu"]
+vocab_size = 151936
+arch_name = "qwen3"
+
+[runtime]
+request_timeout = "600s"
+
+[sandbox]
+allow_fs = false
+allow_network = true
+network_allowed_hosts = ["*"]
