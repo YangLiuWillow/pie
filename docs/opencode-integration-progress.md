@@ -11,7 +11,7 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 | P0.1 | Tool-history replay primitives (Instruct + WIT + host + SDK) | **done** |
 | P0.2 | opencode wire audit + fixture capture | **done** |
 | P0.3 | Shared `openai-serving` crate | **done** |
-| P0.4 | Renderer parity harness | pending |
+| P0.4 | Renderer parity harness | **done** |
 | PA.1 | `chat-completions` inferlet on dev | pending |
 | PA.2 | Gateway OpenAI ingress | pending |
 | PA.3 | Acceptance suite + stock-opencode e2e | pending |
@@ -19,6 +19,75 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-11 — P0.4 follow-up: D2 + D3 fixed; D1 deferred; D4 discovered
+
+Applied the two mechanical template fixes the parity harness identified:
+
+- **D2 fixed** — `model/qwen_3/src/chat.rs build_tool_system_prompt` no longer
+  emits a leading `"\n"` before `# Tools` (the old validated branch carried
+  this bug; HF renders `content + "\n\n" + "# Tools"`).
+- **D3 fixed** — `inferlets/openai-serving/src/types.rs` now serializes tool
+  schema envelopes with Python `json.dumps` separators (`", "`/`": "`) via a
+  custom `python_json` formatter, matching HF Jinja `tojson`. This string
+  feeds the snapshot address too — render and address changed together.
+  (ensure_ascii escaping noted as an open caveat; fixtures are ASCII.)
+- Re-run verdict: **all 5 fixtures are now char-exact except D1** (the
+  `<think>\n\n</think>\n\n` no-think block after the cue — lands with PA.1's
+  channel decision).
+- **D4 (new)**: one token-boundary divergence inside the tool-call replay
+  region — same bytes, different segmentation (pie's pre-tokenized fragment
+  joins vs HF's whole-text encode, e.g. `…"arguments": ` + `{"…` splits where
+  HF merges `Ġ{"`). Char-parity holds; token-parity doesn't. Decision for
+  PA.1: encode each replayed turn's contiguous text in one pass (special
+  tokens as separate ids) instead of concatenating isolated fragment
+  encodings — deterministic either way, but only whole-text encoding matches
+  HF's tokenizer behavior. Tests 24/24 + 28/28 still green after D2/D3.
+
+### 2026-08-11 — P0.4 done: renderer parity harness — 3 divergences found
+
+Harness at `integrations/opencode/parity/`: `render-tokens/` (Rust bin, new
+root-workspace member; real serving path `plan_render` → `QwenInstruct` with
+the exact "qwen3" `ChatMLConfig` from `model/src/instruct.rs` →
+`pie-tokenizer`, fixture path in, token-id JSON array out) + `check_render.py`
+(HF `apply_chat_template(…, enable_thinking=False)` on Qwen/Qwen3-0.6B,
+tokenizer files only; token first-divergence report + complete grouped
+char-level diff) + `README.md`. No prior harness existed to port —
+`openhands-integration-updated:integrations/qwen-code/` has no `parity/` dir;
+written fresh. Run: all 5 opencode wire fixtures.
+
+**Verdict: no fixture token-exact; exactly 3 systematic divergences, nothing
+else across ~7.5k-token prompts.** Do-not-fix-in-harness list for P0.1/PA.1:
+
+1. **D1, all fixtures (incl. req-001/003 title calls, which are otherwise
+   token-exact)**: HF `enable_thinking=False` appends `<think>\n\n</think>\n\n`
+   (ids 151667,271,151668,271) after `<|im_start|>assistant\n`; pie `cue()`
+   doesn't. Deliberate so far (pie's no-think channel = `/no_think` decoration
+   at the inferlet, and opencode never sends `chat_template_kwargs`), but the
+   channel must be *chosen* at PA.1: empty-think-block cue vs `/no_think`.
+2. **D2, tools fixtures**: one extra `\n` — pie
+   `…</available_skills>\n\n\n# Tools`, HF `…\n\n# Tools`. Template bug in
+   `model/qwen_3/src/chat.rs`: `build_tool_system_prompt` starts `"\n# Tools"`
+   while `equip_after_system` merges `{c}\n\n{block}` (HF: `content + '\n\n'`
+   + `"# Tools…"`; no-system case `<|im_start|>system\n# Tools…` is also off
+   by the same `\n`). Faithful port of the old branch — the bug is inherited,
+   the qwen-code e2e validated tool-calling behavior, not byte parity here.
+3. **D3, tools fixtures, ×293 (= every JSON separator in the 10 schemas;
+   HF 480 spaced separators in `<tools>`, pie 187, Δ293)**: pie's
+   `tool_schema_envelopes` serializes compact
+   (`{"name":"bash","description":…}`), HF's `tojson` = `json.dumps` default
+   separators (`{"name": "bash", "description": …}`, wire key order,
+   ensure_ascii=False). Fix belongs in `openai-serving/types.rs` — and the
+   envelope string feeds the snapshot address too, so render + address must
+   change together (response/save unification).
+
+Confirmed exact: all role scaffolding, replayed
+`<tool_call>`/`<tool_response>` turns in req-005 (content:"" ≡ null ≡ absent
+under HF's template — probed), tool name-sort, no trailing newline after the
+final `<|im_end|>`. Harness notes: transformers 5.x `tokenize=True` return
+shape changed — driver tokenizes the rendered text with
+`add_special_tokens=False` instead; venv in scratchpad (transformers 5.15.0,
+no torch).
 
 ### 2026-08-11 — P0.3 done: shared `pie-openai-serving` crate
 

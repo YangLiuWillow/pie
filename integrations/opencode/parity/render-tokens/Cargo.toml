@@ -1,0 +1,19 @@
+[package]
+name = "render-tokens"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Renderer-parity harness bin: renders an OpenAI chat-completions request to token ids exactly the way the serving inferlet will (pie-openai-serving plan_render -> QwenInstruct -> pie-tokenizer), for diffing against HF apply_chat_template. See ../check_render.py."
+
+[[bin]]
+name = "render-tokens"
+path = "src/main.rs"
+
+[dependencies]
+pie-openai-serving = { path = "../../../../inferlets/openai-serving" }
+pie-model-qwen-3 = { path = "../../../../model/qwen_3", features = ["chat"] }
+pie-model-common = { path = "../../../../model/common", features = ["chat"] }
+pie-tokenizer = { path = "../../../../runtime/tokenizer" }
+serde_json = "1.0"
+anyhow = "1.0"

@@ -170,10 +170,12 @@ impl QwenInstruct {
     fn build_tool_system_prompt(tools: &[String]) -> String {
         // Must match the Jinja2 chat template's output exactly — the model
         // was fine-tuned on that format and won't produce <tool_call> blocks
-        // if the preamble diverges. (This is the form the qwen-code e2e work
-        // validated; the parity harness adjudicates against HF per model.)
+        // if the preamble diverges. No leading newline: the reference template
+        // emits `content + "\n\n"` (or just the system opener) directly before
+        // `# Tools` — the old branch's leading "\n" was parity divergence D2
+        // (integrations/opencode/parity, HF Qwen3-0.6B).
         let mut prompt = String::from(
-            "\n# Tools\n\n\
+            "# Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>",

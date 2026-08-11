@@ -224,14 +224,59 @@ pub fn tool_schema_envelopes(tools: &[ToolSpec]) -> Vec<String> {
     sorted
         .iter()
         .map(|t| {
-            serde_json::json!({
+            python_json(&serde_json::json!({
                 "name": t.function.name,
                 "description": t.function.description,
                 "parameters": t.function.parameters,
-            })
-            .to_string()
+            }))
         })
         .collect()
+}
+
+/// Serialize like Python's `json.dumps` defaults — `", "` and `": "`
+/// separators — because that is what HF's Jinja `tojson` filter emits inside
+/// `<tools>` blocks, and the rendered schema text must match the reference
+/// template byte-for-byte (parity harness divergence D3). serde_json's
+/// compact form (`,`/`:`) is NOT wire-compatible with the fine-tuned prompt.
+/// (Caveat: `json.dumps` also escapes non-ASCII by default; fixtures are
+/// ASCII-clean so this is unhandled until parity says otherwise.)
+///
+/// This string feeds both the rendered prompt AND the snapshot address
+/// (`session::snapshot_address`), which must always change together.
+pub fn python_json(value: &serde_json::Value) -> String {
+    struct PyFmt;
+    impl serde_json::ser::Formatter for PyFmt {
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+        ) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+    }
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, PyFmt);
+    serde::Serialize::serialize(value, &mut ser).expect("Value serialization is infallible");
+    String::from_utf8(out).expect("serde_json emits UTF-8")
 }
 
 #[cfg(test)]

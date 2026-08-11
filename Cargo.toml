@@ -112,6 +112,10 @@ members = [
     # here so its tests run natively; the wasm inferlets under
     # `tests/inferlets/` consume it as a path dependency.
     "inferlets/openai-serving",
+    # Renderer-parity harness (P0.4): renders wire-fixture requests to token
+    # ids via the real serving crates so check_render.py can diff them against
+    # HF apply_chat_template. A dev tool, not a shipped component.
+    "integrations/opencode/parity/render-tokens",
     # The engine's on-device end-to-end suite. No code of its own; it exists so
     # that `cargo test -p pie-bin` means the CLI's own tests rather than
     # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
