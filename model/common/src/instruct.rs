@@ -83,6 +83,16 @@ pub trait Instruct: Send + Sync {
     }
     fn assistant(&self, msg: &str) -> Vec<u32>;
     fn cue(&self) -> Vec<u32>;
+
+    /// The generation cue with the thinking channel explicitly closed — the
+    /// `enable_thinking=False` form of [`Instruct::cue`] (Qwen renders
+    /// `<|im_start|>assistant\n<think>\n\n</think>\n\n`; HF/vLLM emit the
+    /// same under that template kwarg). Default: identical to `cue()`,
+    /// correct for architectures without a thinking channel.
+    fn cue_no_think(&self) -> Vec<u32> {
+        self.cue()
+    }
+
     fn seal(&self) -> Vec<u32>;
     fn equip(&self, tools: &[String]) -> Vec<u32>;
     fn answer(&self, name: &str, value: &str) -> Vec<u32>;

@@ -20,6 +20,11 @@ interface chat {
     /// Cue the model to generate (fills generation header)
     cue: func() -> list<u32>;
 
+    /// The generation cue with the thinking channel explicitly closed
+    /// (the enable-thinking=false form; same as `cue` for models without
+    /// a thinking channel)
+    cue-no-think: func() -> list<u32>;
+
     /// Seal the current turn (insert stop token)
     seal: func() -> list<u32>;
 

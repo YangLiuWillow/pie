@@ -20,6 +20,40 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-11 — PA.2 done: gateway OpenAI ingress; parity now TOKEN-EXACT (D1+D4 fixed)
+
+**Renderer parity is fully green: all 5 opencode fixtures token-exact** vs HF
+`apply_chat_template(enable_thinking=False)`, Qwen3-0.6B — including the
+7473-token tool-history replay (req-005).
+
+- **D1 fixed** — new `cue_no_think()` through the full stack (Instruct trait
+  default → `chat.wit` `cue-no-think` (synced) → engine host → qwen_3
+  override appending `<think>\n\n</think>\n\n`). The parity bin and the
+  serving inferlet use it; plain `cue()` unchanged for thinking-mode callers.
+- **D4 fixed** — `assistant_with_tool_calls`/`answer_batch` (and `answer`,
+  now the single-element batch) build the turn's inner text as ONE string
+  and encode it in ONE pass, matching HF's whole-text BPE segmentation.
+  The pre-tokenized tool-call fragments are gone. Unit tests byte-test the
+  extracted `*_inner_text` builders (the toy vocab has no BPE merges, so
+  token-level fidelity is the parity harness's job — documented in-code).
+- **PA.2 done** — `gateway/src/ingress/openai.rs`: `POST /v1/chat/completions`
+  + `GET /v1/models` + `GET /health`; Bearer→Identity (blake3-keyed user,
+  trust-edge semantics preserved, `x-pie-identity` wins when present); the
+  gateway⇄inferlet envelope contract (module docs): first message
+  `{"status": u16}`, then verbatim chunk JSON per `data:` line / one unary
+  body; pre-stream rejection responds plain JSON, not SSE; launch acks and
+  stdout/stderr instrumentation filtered; `[DONE]` on clean Eos, SSE `error`
+  event on abort; axum keep-alive comments cover the prefill window.
+  6/6 integration tests (`gateway/tests/openai_ingress.rs`) drive the real
+  listener with a raw HTTP/1.1 client against an envelope-speaking stub
+  worker. Gateway suite overall 40+1+6 green.
+- Trap for posterity: `bind()` binds but does NOT serve the client edge —
+  call `into_handle()`/`serve()`; a raw client against a bound-only listener
+  hangs forever (cost ~40 min of hung background test runs to find).
+- Affinity: Ephemeral for Phase A (single worker). Multi-worker sticky
+  routing on opencode's `x-session-id` header needs a keyed-affinity variant
+  in `gateway/src/session.rs` — deliberately deferred, noted in openai.rs.
+
 ### 2026-08-11 — P0.4 follow-up: D2 + D3 fixed; D1 deferred; D4 discovered
 
 Applied the two mechanical template fixes the parity harness identified:

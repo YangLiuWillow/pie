@@ -46,6 +46,10 @@ impl pie::inferlet::chat::Host for ProcessCtx {
         Ok(crate::model::model().instruct().cue())
     }
 
+    async fn cue_no_think(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().cue_no_think())
+    }
+
     async fn seal(&mut self) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().seal())
     }

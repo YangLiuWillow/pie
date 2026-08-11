@@ -74,7 +74,9 @@ fn main() -> Result<()> {
                 instruct.assistant_with_tool_calls(content.as_deref(), calls)
             }
             RenderOp::AnswerBatch(results) => instruct.answer_batch(results),
-            RenderOp::Cue => instruct.cue(),
+            // The harness's HF side renders with enable_thinking=False, so
+            // the pie side takes the matching no-think cue (D1).
+            RenderOp::Cue => instruct.cue_no_think(),
         };
         ids.extend(toks);
     }
