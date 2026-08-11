@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "pie": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Pie",
+      "options": {
+        "baseURL": "http://127.0.0.1:8123/v1",
+        "apiKey": "test"
+      },
+      "models": {
+        "test-model": {
+          "name": "test",
+          "limit": { "context": 128000, "output": 32000 }
+        }
+      }
+    }
+  },
+  "model": "pie/test-model"
+}
