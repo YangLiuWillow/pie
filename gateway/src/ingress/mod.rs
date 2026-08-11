@@ -9,6 +9,7 @@
 
 pub mod http;
 pub mod identity;
+pub mod openai;
 pub mod ws;
 
 use axum::{
@@ -25,5 +26,8 @@ pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/v1/generate", post(http::generate)) // REST + SSE, one-shot
         .route("/v1/ws", get(ws::ws)) // WebSocket, multi-turn
+        .route("/v1/chat/completions", post(openai::chat_completions)) // OpenAI-compat
+        .route("/v1/models", get(openai::models))
+        .route("/health", get(openai::health))
         .with_state(state)
 }
