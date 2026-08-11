@@ -102,6 +102,28 @@ if(EXISTS "${flashinfer_SOURCE_DIR}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
   endif()
 endif()
 
+# The vendored SM90 TMA-WS MoE launchers (third_party/flashinfer_generated/
+# gemm_grouped/90/) need the fp8-alpha-gate applied to the CPM-cached .inl:
+# the vendored 3rdparty/cutlass predates LinearCombination's alpha_ptr_array,
+# so the per-expert alpha-scale epilogue constructs fail to compile for every
+# dtype unless gated to IsFP8. The patch script is idempotent; without it a
+# FRESH CPM cache fails with "const float ** cannot be used to initialize an
+# entity of type float" (first hit: 2026-08-10 H200 bring-up; the 2026-07-31
+# pod had the patch applied by hand and the cache never travels with the pod).
+if(EXISTS "${flashinfer_SOURCE_DIR}")
+  execute_process(
+    COMMAND python3
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_generated/patches/moe_gemm_tma_ws_launcher_fp8_alpha_gate.py"
+      "${flashinfer_SOURCE_DIR}"
+    RESULT_VARIABLE _FI_ALPHA_GATE_RC
+    OUTPUT_VARIABLE _FI_ALPHA_GATE_OUT
+    ERROR_VARIABLE _FI_ALPHA_GATE_OUT)
+  if(NOT _FI_ALPHA_GATE_RC EQUAL 0)
+    message(FATAL_ERROR "fp8-alpha-gate patch failed: ${_FI_ALPHA_GATE_OUT}")
+  endif()
+  message(STATUS "FlashInfer fp8-alpha-gate: ${_FI_ALPHA_GATE_OUT}")
+endif()
+
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
