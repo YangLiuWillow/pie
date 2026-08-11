@@ -7,12 +7,39 @@
 //! from these strings + `model::encode`; see `render.rs` for the token
 //! assembly. Keeping the strings pure keeps them natively testable.
 
+/// Serialize a JSON value the way transformers' chat templating does
+/// (`tojson`: `json.dumps(x, ensure_ascii=False)` — `", "`/`": "`
+/// separators, insertion-order keys, no sorting). Replayed tool schemas
+/// and tool-call arguments must round-trip through this form because that
+/// is byte-for-byte what a vLLM-served model saw (C3 parity finding,
+/// `docs/qwen-code-dev-port.md` §8). Requires serde_json/preserve_order.
+pub fn tojson(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            let inner: Vec<String> = m
+                .iter()
+                .map(|(k, val)| format!("{}: {}", serde_json::to_string(k).unwrap(), tojson(val)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Array(a) => {
+            let inner: Vec<String> = a.iter().map(tojson).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        leaf => serde_json::to_string(leaf).unwrap(),
+    }
+}
+
 /// Reference: the Qwen Jinja template's tool preamble. Must match exactly —
 /// the model was fine-tuned on this format and won't produce `<tool_call>`
-/// blocks if the preamble diverges.
+/// blocks if the preamble diverges. Starts directly at `# Tools` — the
+/// `\n\n` seam after a system message belongs to `merged_system_content`
+/// (the old engine's leading `\n` here produced a three-newline seam, a
+/// real divergence from the HF template caught by the C3 parity check).
 pub fn build_tool_system_prompt(tools: &[String]) -> String {
     let mut prompt = String::from(
-        "\n# Tools\n\n\
+        "# Tools\n\n\
          You may call one or more functions to assist with the user query.\n\n\
          You are provided with function signatures within <tools></tools> XML tags:\n\
          <tools>",
@@ -87,7 +114,7 @@ mod tests {
     fn tool_prompt_matches_reference_shape() {
         let schema = r#"{"name": "f", "description": "d", "parameters": {"type": "object"}}"#;
         let p = build_tool_system_prompt(&[schema.to_string()]);
-        assert!(p.starts_with("\n# Tools\n\n"));
+        assert!(p.starts_with("# Tools\n\n"));
         assert!(p.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"f\""));
         assert!(p.ends_with("</tool_call>"));
 
@@ -101,10 +128,23 @@ mod tests {
     fn merged_system_folds_into_one_turn() {
         let tools = vec!["{\"name\": \"f\"}".to_string()];
         let merged = merged_system_content(Some("You are Qwen Code."), &tools);
-        assert!(merged.starts_with("You are Qwen Code.\n\n\n# Tools"));
+        assert!(merged.starts_with("You are Qwen Code.\n\n# Tools"));
         let bare = merged_system_content(None, &tools);
-        assert!(bare.starts_with("\n# Tools"));
+        assert!(bare.starts_with("# Tools"));
         assert_eq!(merged_system_content(Some(""), &tools), bare);
+    }
+
+    #[test]
+    fn tojson_matches_python_json_dumps() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"command":"echo hi","nested":{"b":1,"a":[true,null,1.5]},"s":"café"}"#,
+        )
+        .unwrap();
+        // Spaced separators, insertion order (not sorted), raw non-ASCII.
+        assert_eq!(
+            tojson(&v),
+            r#"{"command": "echo hi", "nested": {"b": 1, "a": [true, null, 1.5]}, "s": "café"}"#
+        );
     }
 
     #[test]

@@ -32,6 +32,13 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream_options: StreamOptions,
 
+    /// Debug flag (C3 renderer parity, `docs/qwen-code-dev-port.md`):
+    /// render-only turn — return the full rendered token ids + decoded text
+    /// instead of generating. Always answered non-stream; never touches KV
+    /// sessions. Not part of the OpenAI surface.
+    #[serde(default)]
+    pub echo_tokens: bool,
+
     #[serde(default)]
     pub temperature: Option<f32>,
 
@@ -193,15 +200,17 @@ pub struct ToolSpecFunction {
 /// `{name, description, parameters}` shape `openhands-completion` verified
 /// against Qwen's template.
 pub fn tool_schema_envelopes(tools: &[ToolSpec]) -> Vec<String> {
+    // jinja-tojson serialization (spaced separators, insertion order): the
+    // HF template renders each tool with `| tojson`, and byte parity there
+    // decides whether the model recognizes its fine-tuning format (C3).
     tools
         .iter()
         .map(|t| {
-            serde_json::json!({
+            crate::render_text::tojson(&serde_json::json!({
                 "name": t.function.name,
                 "description": t.function.description,
                 "parameters": t.function.parameters,
-            })
-            .to_string()
+            }))
         })
         .collect()
 }

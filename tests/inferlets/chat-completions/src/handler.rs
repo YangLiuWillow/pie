@@ -186,6 +186,37 @@ impl Daemon {
             created: now,
         };
 
+        if request.echo_tokens {
+            // C3 parity debug: full clean render (no resume, no session
+            // interaction, no generation), answered as a non-stream response
+            // regardless of `stream`.
+            self.renderer.sanitize_messages(&mut setup.messages);
+            match self
+                .renderer
+                .render_full(&setup.messages, &setup.tool_schemas, setup.no_think)
+            {
+                Ok(mut t) => {
+                    t.extend_from_slice(self.renderer.cue());
+                    let text = model::decode(&t).unwrap_or_default();
+                    let resp = serde_json::json!({
+                        "object": "pie.debug.render",
+                        "model": meta.model,
+                        "prompt_tokens": t.len(),
+                        "rendered_ids": t,
+                        "rendered_text": text,
+                    });
+                    send(chunk::ev_response(req_id, &resp));
+                }
+                Err(e) => send(chunk::ev_error(
+                    req_id,
+                    500,
+                    "server_error",
+                    &format!("render failed: {e}"),
+                )),
+            }
+            return;
+        }
+
         // Role chunk first — announces the assistant turn and doubles as the
         // first keepalive before a potentially long prefill. From here every
         // streaming failure must be shaped as a well-formed turn

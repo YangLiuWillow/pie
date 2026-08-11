@@ -193,3 +193,43 @@ qwen-code behavior notes: `--safe-mode` blocks `write_file` in headless yolo
 mode (tool call round-trips correctly, execution refused) — drop it for e2e
 tasks or phrase tasks as shell commands; sub-page conversations (<32 tokens)
 report `cached_tokens: 0` by design (page-granular reuse).
+
+## 9. C3 renderer parity (2026-08-11) — 23/23 exact
+
+The load-bearing check both plans deferred is built and green:
+`echo_tokens: true` on a request makes the inferlet return its full rendered
+token stream (render-only, non-stream, session-free), and
+`integrations/qwen-code/parity/check_render.py` byte-compares that against
+`AutoTokenizer.apply_chat_template(...)` (transformers 5.8.1, Qwen/Qwen3-0.6B)
+for every checked-in wire capture. Runs entirely on the dummy-driver stack —
+rendering needs only the tokenizer.
+
+First run: 23/23 MISMATCH, from two real renderer bugs — both inherited from
+the old "verified" renderer, and both plausibly implicated in the old H200
+trajectory divergences (§5b of the old plan):
+
+1. **Tools seam.** Old `equip_after_system` produced `content\n\n\n# Tools`
+   (its tool block carried a leading `\n` *and* the merge added `\n\n`); the
+   HF template renders `content\n\n# Tools`. Fixed: the block starts at
+   `# Tools`, the seam belongs to the merge.
+2. **jinja `tojson` re-serialization.** The HF template runs both the
+   `<tools>` schemas and replayed `tool_calls[].function.arguments` through
+   transformers' `tojson` (spaced `", "`/`": "` separators, insertion-order
+   keys, raw non-ASCII) — a vLLM-served model saw that form, while we
+   replayed qwen-code's compact echo strings verbatim. Fixed with
+   `render_text::tojson` (+ serde_json `preserve_order`), applied to both
+   sites.
+
+After the fixes: **23 exact, 0 known-divergence, 0 mismatched** — including
+the generation cue. Caveat kept honest: no fixture sets
+`enable_thinking:false`, so the one *deliberate* divergence — our
+position-independent `/no_think` user-turn decoration vs HF's empty
+`<think>\n\n</think>` block after the cue — never fires in this corpus. It
+remains normalized-and-reported by the checker (`[KNOWN-DIV]`), not silently
+accepted. Acceptance stayed 25/27 on dummy (the 2 are real-model rows).
+
+Note for the record: generation-time turns save KV containing the model's own
+compact-JSON tool-call bytes, while a rebuild-from-history renders the
+tojson-spaced form; addresses hash canon strings (not bytes), and each path
+is self-consistent, so reuse is unaffected — but extend-vs-rebuild token
+streams for the same conversation differ in those bytes by design.

@@ -156,7 +156,14 @@ impl Renderer {
             tokens.extend(&self.tool_call_open);
             tokens.extend(model::encode(name));
             tokens.extend(&self.tool_call_mid);
-            tokens.extend(model::encode(arguments_json));
+            // The HF template runs arguments through `tojson`, so a vLLM-served
+            // model saw the re-serialized spaced form, not the compact string
+            // qwen-code echoes. Normalize likewise; pass unparseable args raw.
+            let args = match serde_json::from_str::<serde_json::Value>(arguments_json) {
+                Ok(v) => crate::render_text::tojson(&v),
+                Err(_) => arguments_json.clone(),
+            };
+            tokens.extend(model::encode(&args));
             tokens.extend(&self.tool_call_close);
         }
         tokens.extend(&self.turn_suffix);
