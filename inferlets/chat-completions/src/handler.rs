@@ -476,6 +476,19 @@ async fn handle_streaming(mut setup: TurnSetup, responder: Responder) -> Finishe
                 calls.push(ToolCallOut { id: call_id, name, arguments: args });
             }
         }
+        // Hermes salvage: `<tool_call>{json}` with the closing tag missing —
+        // the filter swallowed the visible text, so scan the RAW generation.
+        let raw_text = model.tokenizer().decode(&generated).unwrap_or_default();
+        if calls.is_empty() && has_tools && raw_text.contains("<tool_call>") {
+            for (name, args) in parse_hermes_tool_calls(&raw_text) {
+                let dup = calls.iter().any(|c| c.name == name && c.arguments == args);
+                if !dup {
+                    let call_id = format!("call_{uniq}_{}", calls.len());
+                    emit!(meta.tool_call_delta(calls.len(), &call_id, &name, &args));
+                    calls.push(ToolCallOut { id: call_id, name, arguments: args });
+                }
+            }
+        }
 
         // NOTE — no phase-2 forced tool call here, deliberately. The
         // openhands-completion pattern (replay the prose on a fork and force
@@ -490,7 +503,7 @@ async fn handle_streaming(mut setup: TurnSetup, responder: Responder) -> Finishe
         let n_generated = generated.len();
         TurnOutcome {
             hit_max: n_generated >= setup.max_tokens,
-            raw_text: model.tokenizer().decode(&generated).unwrap_or_default(),
+            raw_text,
             visible_text,
             calls,
             prompt_tokens,
@@ -650,11 +663,21 @@ async fn handle_non_streaming(mut setup: TurnSetup, responder: Responder) -> Fin
             });
         }
     }
+    let raw_text = model.tokenizer().decode(&generated).unwrap_or_default();
+    if calls.is_empty() && has_tools && raw_text.contains("<tool_call>") {
+        for (name, args) in parse_hermes_tool_calls(&raw_text) {
+            calls.push(ToolCallOut {
+                id: format!("call_{uniq}_{}", calls.len()),
+                name,
+                arguments: args,
+            });
+        }
+    }
 
     let outcome = TurnOutcome {
         hit_max: generated.len() >= setup.max_tokens,
         n_generated: generated.len(),
-        raw_text: model.tokenizer().decode(&generated).unwrap_or_default(),
+        raw_text,
         visible_text,
         calls,
         prompt_tokens,
@@ -802,6 +825,54 @@ fn parse_coder_xml_calls(text: &str, tool_schemas: &[String]) -> Vec<(String, St
     out
 }
 
+/// Salvage parser for hermes-style `<tool_call>\n{json}` blocks whose
+/// closing `</tool_call>` never arrived (observed on Qwen3.6-27B: the model
+/// stops at EOS right after the JSON, the native decoder never completes,
+/// and the block leaks into content). Closing tag optional — the same
+/// leniency qwen-code's own client-side recovery parser applies. Scans raw
+/// generated text, brace-balances the JSON object (string-aware), and
+/// accepts `{"name": …, "arguments": {…}}`.
+fn parse_hermes_tool_calls(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = text[pos..].find("<tool_call>") {
+        let start = pos + rel + "<tool_call>".len();
+        let rest = &text[start..];
+        let Some(obj_rel) = rest.find('{') else { break };
+        let obj = &rest[obj_rel..];
+        // Balance braces outside of strings.
+        let (mut depth, mut in_str, mut esc, mut end) = (0i32, false, false, None);
+        for (i, c) in obj.char_indices() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' if in_str => esc = true,
+                '"' => in_str = !in_str,
+                '{' if !in_str => depth += 1,
+                '}' if !in_str => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        pos = start + obj_rel + end;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&obj[..end]) {
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                out.push((name.to_string(), args.to_string()));
+            }
+        }
+    }
+    out
+}
+
 /// Extract tool calls written as fenced JSON blocks: a ``` fence (with or
 /// without a language tag) whose body is an object with a string `name` and
 /// an object `arguments`. Returns `(fence_byte_offset, name,
@@ -895,5 +966,33 @@ mod coder_xml_tests {
     #[test]
     fn no_function_block_yields_nothing() {
         assert!(parse_coder_xml_calls("plain text </tool_call>", &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hermes_tests {
+    use super::parse_hermes_tool_calls;
+
+    #[test]
+    fn unclosed_tool_call_block_is_salvaged() {
+        let text = "<tool_call>\n{\"name\": \"run_shell_command\", \"arguments\": {\"command\": \"echo \\\"a}b\\\" > x.txt\"}}";
+        let calls = parse_hermes_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "run_shell_command");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(args["command"], "echo \"a}b\" > x.txt");
+    }
+
+    #[test]
+    fn closed_block_and_multiple_calls() {
+        let text = "<tool_call>\n{\"name\":\"a\",\"arguments\":{}}\n</tool_call>\n<tool_call>\n{\"name\":\"b\",\"arguments\":{\"k\":1}}";
+        let calls = parse_hermes_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "b");
+    }
+
+    #[test]
+    fn garbage_json_is_skipped() {
+        assert!(parse_hermes_tool_calls("<tool_call>\n{not json}").is_empty());
     }
 }
