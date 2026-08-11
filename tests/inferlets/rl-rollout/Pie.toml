@@ -1,0 +1,18 @@
+[package]
+name = "rl-rollout"
+version = "0.1.0"
+description = "RL rollout: pre-tokenized prompt in, sampled token ids + exact per-token logprobs out. The pie-0.5 successor to the old rl-completions inferlet's generation core; the OpenAI wire envelope lives in the host-side bridge."
+authors = ["pie-project"]
+repository = "https://github.com/pie-project/pie"
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Debug path: plain text prompt, chat-templated"}
+max_tokens = {type = "int", optional = true, description = "Max generated tokens incl. stop token (default: 256)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature; <= 0 is greedy (default: 0)"}
+top_p = {type = "float", optional = true, description = "Top-p nucleus mass; >= 1 disables the mask (default: 1.0)"}
+seed = {type = "int", optional = true, description = "RNG seed for reproducible sampling (default: 0)"}
+ignore_eos = {type = "bool", optional = true, description = "Ignore stop tokens — generate exactly max_tokens (default: false)"}
+return_text = {type = "bool", optional = true, description = "Also decode the generated ids to text (default: false)"}

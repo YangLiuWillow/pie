@@ -19,6 +19,7 @@ members = [
     "naive-baseline",
     "prefix-tree-kv-cache",
     "quest-attention",
+    "rl-rollout",
     "tova-attention",
     "trackb-h2o",
     "trackb-snapkv",
