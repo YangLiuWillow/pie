@@ -312,8 +312,18 @@ macro_rules! define_generate {
                 let page_indptr =
                     Channel::from([0u32, (n + 1).div_ceil(page_t)]).named("page_indptr");
                 let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
+                // Ring sized a full frame of margin ABOVE the advertised
+                // capacity, not at it. `channel_capacity()` already bakes in a
+                // staging margin, but the engine's ticket check is more
+                // conservative still, and a continuation landing inside that
+                // margin is SILENTLY SKIPPED at reader-cell validation rather
+                // than refused. `text-completion-bench` measured the
+                // continuation lost on 12% of frames when sized at exactly
+                // `cap` — run-ahead collapsing with no error anywhere — and
+                // sizes at `cap + 7 * live_slots`. We inherited the exact-`cap`
+                // form from the `tests/inferlets/chat-completion` reference.
                 let out = Channel::new([1], dtype::i32)
-                    .capacity(channel_capacity() as u32)
+                    .capacity((channel_capacity() + 7 * live_slots()) as u32)
                     .named("out");
                 let rng = Channel::from([0x9e37_u32, 0]).named("rng");
                 let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
