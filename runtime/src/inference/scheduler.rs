@@ -406,6 +406,19 @@ impl BatchAccumulator {
         self.push_with(req, usage);
     }
 
+    /// Rows one request would need on its own — same rule as `projected_rows`
+    /// against an empty accumulator. Exposed so the chunker sizes chunks by
+    /// the identical accounting the admission check uses.
+    pub(super) fn rows_for_request(
+        limits: SchedulerLimits,
+        page_size: u32,
+        usage: &RequestCapacityUsage,
+    ) -> (usize, usize) {
+        let (logit_rows, prob_rows, _, _, _) =
+            BatchAccumulator::new(limits, page_size).projected_rows(Some(usage));
+        (logit_rows, prob_rows)
+    }
+
     fn push_with(&mut self, req: PendingRequest, mut usage: RequestCapacityUsage) {
         let (logit_rows, prob_rows, _, _, _) = self.projected_rows(Some(&usage));
         usage.logit_rows = logit_rows;
@@ -693,14 +706,29 @@ fn prepare_pending_with_usage(
         // Fall through to the slow path so the proper error message is
         // surfaced via `single_request_limit_error`.
     }
+    // Rejections below drop the request and hand the guest an error that
+    // currently surfaces as an empty *successful* forward (see
+    // `api::inference::FutureOutput::ready`), so without a log line here a
+    // dropped request leaves no trace anywhere and the guest reports only a
+    // confusing downstream "commit: need N tokens, have 0".
     let pending = match pending.maybe_start_chunking(batch.limits, batch.page_size) {
         Ok(pending) => pending,
         Err((pending, msg)) => {
+            tracing::warn!(
+                tokens = pending.request.token_ids.len(),
+                samplers = pending.request.n_samplers(),
+                "forward request rejected (not chunkable): {msg}"
+            );
             pending.send_error(msg);
             return None;
         }
     };
     if let Some(msg) = batch.single_request_limit_error(&pending) {
+        tracing::warn!(
+            tokens = pending.request.token_ids.len(),
+            samplers = pending.request.n_samplers(),
+            "forward request rejected (over driver limit): {msg}"
+        );
         pending.send_error(msg);
         return None;
     }
@@ -842,6 +870,62 @@ mod tests {
                 .single_request_limit_error(&with_sampler_rows(pending(1, 1), 4))
                 .is_some()
         );
+    }
+
+    /// A fill that fits `max_forward_tokens` but carries a top-p sampler
+    /// needs one logit row *per token* (the driver's compact-logits path is
+    /// off for top-k/top-p), so it must be chunked down to `max_logit_rows`
+    /// rather than rejected. Regression: NPR's textual join sent a
+    /// 2508-token fill under an 8192-token / 512-logit-row driver and the
+    /// request was dropped, surfacing to the guest as an empty success.
+    #[test]
+    fn oversized_logit_rows_are_chunked_not_rejected() {
+        let mut capped = limits(8, 8192, 100_000);
+        capped.max_logit_rows = 512;
+        capped.max_prob_rows = 512;
+        let batch = BatchAccumulator::new(capped, 16);
+
+        let mut req = with_samplers(
+            pending(2508, 1),
+            vec![2507],
+            vec![pie_driver_abi::Sampler::TopP {
+                temperature: 1.0,
+                p: 0.7,
+            }],
+        );
+        req.request.position_ids = (0..2508u32).collect();
+        req.physical_page_ids = (0..158).collect();
+        req.last_page_len = 16;
+        // Unchunked, this request is inadmissible...
+        assert!(batch.single_request_limit_error(&req).is_some());
+
+        // ...so chunking must engage even though 2508 <= max_forward_tokens,
+        // and every resulting chunk must be admissible.
+        let chunked = req
+            .maybe_start_chunking(capped, 16)
+            .unwrap_or_else(|(_, msg)| panic!("should chunk, got: {msg}"));
+        assert!(
+            matches!(chunked.completion, Completion::Chunk { .. }),
+            "request was not converted into chunks"
+        );
+        assert!(chunked.request.token_ids.len() <= 512);
+        assert!(batch.single_request_limit_error(&chunked).is_none());
+    }
+
+    /// A sampler-free fill of the same size projects zero logit rows, so it
+    /// must NOT be chunked by the row caps — that would needlessly split
+    /// every context flush.
+    #[test]
+    fn sampler_free_fill_is_not_chunked_by_row_limits() {
+        let mut capped = limits(8, 8192, 100_000);
+        capped.max_logit_rows = 512;
+        capped.max_prob_rows = 512;
+        let req = pending(2508, 1);
+        let out = req
+            .maybe_start_chunking(capped, 16)
+            .unwrap_or_else(|(_, msg)| panic!("unexpected rejection: {msg}"));
+        assert!(matches!(out.completion, Completion::Direct(_)));
+        assert_eq!(out.request.token_ids.len(), 2508);
     }
 
     #[test]

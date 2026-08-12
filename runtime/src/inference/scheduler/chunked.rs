@@ -56,15 +56,20 @@ impl PendingRequest {
         }
 
         let usage = request_capacity_usage(&self, page_size);
-        if usage.forward_tokens <= limits.max_forward_tokens {
+        // Chunking relieves three token-proportional capacities, not just
+        // forward tokens. A fill that carries a sampler and cannot use the
+        // driver's compact-logits path needs one logit row *per token in the
+        // request* (and, for top-k/top-p, one prob row per token), so a fill
+        // well under max_forward_tokens can still exceed max_logit_rows and
+        // would otherwise be rejected outright instead of split.
+        let chunk_size = chunk_size_for(limits, page_size, &usage);
+        if usage.forward_tokens <= chunk_size {
             return Ok(self);
         }
 
-        if let Err(msg) = validate_chunkable_request(&self.request, limits.max_forward_tokens) {
+        if let Err(msg) = validate_chunkable_request(&self.request, chunk_size) {
             return Err((self, msg));
         }
-
-        let chunk_size = limits.max_forward_tokens;
         let chunk_end = chunk_size.min(self.request.token_ids.len());
         let sampler_slots_by_chunk = chunk_sampler_slots_by_chunk(&self.request, chunk_size);
         if let Err(msg) = validate_chunk_capacity(
@@ -734,14 +739,48 @@ fn validate_chunk_capacity(
             page_size,
             sampler_slots,
         )?;
-        if let Some(msg) = chunk_limit_error(usage, limits) {
+        if let Some(msg) = chunk_limit_error(usage, limits, page_size) {
             return Err(msg);
         }
     }
     Ok(())
 }
 
-fn chunk_limit_error(usage: RequestCapacityUsage, limits: SchedulerLimits) -> Option<String> {
+/// Largest chunk that satisfies every token-proportional driver capacity.
+///
+/// `max_forward_tokens` always applies. The row caps only bind when the
+/// request actually materializes rows per token: a sampler-free fill (a
+/// context flush) projects zero logit rows at any length, and a request that
+/// qualifies for compact logits needs only one row per sampler slot.
+fn chunk_size_for(
+    limits: SchedulerLimits,
+    page_size: u32,
+    usage: &RequestCapacityUsage,
+) -> usize {
+    let mut size = limits.max_forward_tokens;
+    // A zero token limit is a misconfigured driver; leave it at zero so
+    // `validate_chunkable_request` reports that rather than a chunk error.
+    if size == 0 {
+        return 0;
+    }
+    let (logit_rows, prob_rows) =
+        super::BatchAccumulator::rows_for_request(limits, page_size, usage);
+    if usage.forward_tokens > 0 {
+        if logit_rows >= usage.forward_tokens {
+            size = size.min(limits.max_logit_rows);
+        }
+        if prob_rows >= usage.forward_tokens {
+            size = size.min(limits.max_prob_rows);
+        }
+    }
+    size.max(1)
+}
+
+fn chunk_limit_error(
+    usage: RequestCapacityUsage,
+    limits: SchedulerLimits,
+    page_size: u32,
+) -> Option<String> {
     if usage.forward_tokens > limits.max_forward_tokens {
         return Some(format!(
             "forward request chunk has {} forward tokens, exceeding driver limit {}",
@@ -760,6 +799,25 @@ fn chunk_limit_error(usage: RequestCapacityUsage, limits: SchedulerLimits) -> Op
         return Some(format!(
             "forward request chunk has {} sampler rows, exceeding driver limit {}",
             usage.sampler_rows, limits.max_sampler_rows
+        ));
+    }
+
+    // Mirrors the admission check in `single_request_limit_error`: a chunk
+    // that still needs more logit/prob rows than the driver published would
+    // be rejected downstream, so catch it here where the message names the
+    // chunk.
+    let (logit_rows, prob_rows) =
+        super::BatchAccumulator::rows_for_request(limits, page_size, &usage);
+    if logit_rows > limits.max_logit_rows {
+        return Some(format!(
+            "forward request chunk needs {logit_rows} logit rows, exceeding driver limit {}",
+            limits.max_logit_rows
+        ));
+    }
+    if prob_rows > limits.max_prob_rows {
+        return Some(format!(
+            "forward request chunk needs {prob_rows} probability rows, exceeding driver limit {}",
+            limits.max_prob_rows
         ));
     }
 
