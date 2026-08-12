@@ -405,6 +405,15 @@ pieces:
    pass-level speculation on every pass. The engine-side race deserves a real fix
    (drain staged entries before batch build).
 
+### Validation runs (portable driver, stock Qwen3-0.6B, CPU)
+
+- `selftest=true`: **pass** (all TVs 0.0000; control 0.2186).
+- Primer fork, budget 500, `max_step_tokens=60`: 2 branches decoded
+  concurrently, refill join (1 + 67 + 4 token passes at the logged
+  slot/position splits), then ~230 post-join takeaway tokens decoded through
+  `position_offset` — the full decoupled-position pipeline on a real model.
+- Dummy driver: structural run green (fork → join → return, 60 ms).
+
 ### Phase-2 leftovers
 
 - Nested (depth ≥ 2) refill joins — needs per-token position/visibility records

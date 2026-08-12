@@ -39,11 +39,17 @@ implementation notes with every engine bug found along the way.
 | NPR paper code (reference) | `github.com/bigai-nlco/Native-Parallel-Reasoner` — clone if you need to re-check the original engine; DESIGN.md §1 cites exact file:line |
 | NPR-4B checkpoint | `huggingface.co/bigai-NPR/NPR-4B` (fp32 — must convert, see §5) |
 
-**Lost in the device migration** (recreate if needed): the local
-`~/Desktop/Lin_startup/{pie,pie-npr,pie-rl,Native-Parallel-Reasoner}` checkouts,
-and the RunPod API key that lived in `pie-rl/.env` as `RUNPOD_API_KEY=...`.
-Nothing else was device-local — the design doc used to be in pie's *gitignored*
-`/docs/`, which is why it now lives in `inferlets/npr/DESIGN.md` instead.
+**On the old machine** the working tree lived at `~/Documents/Liszt_ai/`
+(previously `~/Desktop/Lin_startup/`): `pie/` (main clone, `liu/qwen-code-dev`
+checked out), `pie-npr/` (a **git worktree** of `pie/` holding the
+`npr-inferlet` branch), `pie-rl/` (whose `.env` carries `RUNPOD_API_KEY=...`),
+and `Native-Parallel-Reasoner/` (the paper's code release). Everything the
+project needs is now committed, so a fresh clone suffices — but if you move that
+tree to the new device, note that `pie-npr` is a worktree: it only works
+alongside its parent `pie/` clone, and `git worktree repair` fixes the recorded
+paths after a move. The RunPod key must be re-supplied on the new device. The
+design study used to sit in pie's *gitignored* `/docs/`, which is why it now
+lives in `inferlets/npr/DESIGN.md` instead of only on one machine.
 
 ## 3. Status: what works
 
