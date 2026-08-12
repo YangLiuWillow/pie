@@ -31,11 +31,17 @@
 //!
 //! ## Affinity
 //!
-//! Phase A targets the single-worker deployment, so turns go out
-//! [`Affinity::Ephemeral`]. Cross-request KV reuse relies on the engine's
-//! named snapshots, which live worker-side: once multi-worker matters, route
-//! on the client's `x-session-id` header (opencode sends it) instead —
-//! needs a keyed-affinity variant in §7, noted in the integration plan.
+//! Requests carrying a client-session signal route [`Affinity::Keyed`] —
+//! stable HRW on the derived key — so consecutive turns of one agent session
+//! land on the worker holding that session's KV snapshots. Key sources, in
+//! priority order (see [`extract_affinity_key`]): opencode's
+//! `x-session-affinity` / `x-session-id` headers, OpenClaw's (path-B)
+//! `session_id` header, then OpenClaw's `prompt_cache_key` body field
+//! (= `sessionId:boundaryCount`, sent when `compat.supportsPromptCacheKey`).
+//! Requests with no signal stay [`Affinity::Ephemeral`] (p2c load spread) —
+//! deliberately NOT a hash of identity+prompt, which would herd all traffic
+//! from one config onto one worker; revisit with multi-worker evidence.
+//! Single-worker deployments are unaffected either way.
 
 use std::convert::Infallible;
 
@@ -103,6 +109,30 @@ fn extract_identity(headers: &HeaderMap) -> Result<Identity, String> {
     identity::extract(&synth).map_err(|e| e.to_string())
 }
 
+/// Derive the client-session affinity key, if the request carries one.
+/// Priority: `x-session-affinity` (opencode's own sticky-routing header) →
+/// `x-session-id` (opencode) → `session_id` (OpenClaw path B with
+/// `compat.sendSessionAffinityHeaders`) → body `prompt_cache_key` (OpenClaw
+/// with `compat.supportsPromptCacheKey`; value `sessionId:boundaryCount`).
+/// The key is hashed to the router's `u64` HRW keyspace.
+fn extract_affinity_key(headers: &HeaderMap, body: &Value) -> Option<u64> {
+    let from_headers = ["x-session-affinity", "x-session-id", "session_id"]
+        .iter()
+        .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
+        .filter(|s| !s.is_empty());
+    let key = match from_headers {
+        Some(s) => s,
+        None => body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?,
+    };
+    let digest = blake3::hash(key.as_bytes());
+    Some(u64::from_le_bytes(
+        digest.as_bytes()[..8].try_into().expect("blake3 ≥ 8 bytes"),
+    ))
+}
+
 /// `GET /health` — liveness for OpenAI-client launch scripts and probes.
 pub async fn health() -> &'static str {
     "ok"
@@ -164,7 +194,11 @@ pub async fn chat_completions(
         priority: Priority::Normal,
     };
 
-    let (handle, rx) = match state.sessions.create(ident, turn, Affinity::Ephemeral).await {
+    let affinity = match extract_affinity_key(&headers, &parsed) {
+        Some(key) => Affinity::Keyed(key),
+        None => Affinity::Ephemeral,
+    };
+    let (handle, rx) = match state.sessions.create(ident, turn, affinity).await {
         Ok(pair) => pair,
         Err(e) => {
             return error_body(
@@ -463,6 +497,38 @@ mod tests {
         // First identity wins; later payloads don't rebind it.
         note_chunk_meta(&mut meta, r#"{"id":"other","model":"m2","created":9}"#);
         assert_eq!(meta.as_ref().unwrap().0, "chatcmpl-abc");
+    }
+
+    #[test]
+    fn affinity_key_priority_and_stability() {
+        let body_with_pck = json!({"prompt_cache_key": "sess-1:0", "stream": true});
+        let empty_body = json!({"stream": true});
+
+        // No signal anywhere → None (stays Ephemeral/p2c).
+        assert_eq!(extract_affinity_key(&HeaderMap::new(), &empty_body), None);
+
+        // Body prompt_cache_key alone keys affinity (OpenClaw compat path).
+        let k_body = extract_affinity_key(&HeaderMap::new(), &body_with_pck);
+        assert!(k_body.is_some());
+        // Same key → same hash (HRW stability across turns).
+        assert_eq!(k_body, extract_affinity_key(&HeaderMap::new(), &body_with_pck));
+        // Different key → different hash (overwhelmingly).
+        let other = json!({"prompt_cache_key": "sess-2:0"});
+        assert_ne!(k_body, extract_affinity_key(&HeaderMap::new(), &other));
+
+        // Headers beat the body field; x-session-affinity beats x-session-id.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "ses_b".parse().unwrap());
+        let k_sid = extract_affinity_key(&headers, &body_with_pck);
+        assert_ne!(k_sid, k_body);
+        headers.insert("x-session-affinity", "ses_a".parse().unwrap());
+        let k_aff = extract_affinity_key(&headers, &body_with_pck);
+        assert_ne!(k_aff, k_sid);
+
+        // Empty header values are ignored, not hashed.
+        let mut empty_h = HeaderMap::new();
+        empty_h.insert("x-session-id", "".parse().unwrap());
+        assert_eq!(extract_affinity_key(&empty_h, &empty_body), None);
     }
 
     #[test]

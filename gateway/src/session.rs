@@ -109,6 +109,14 @@ pub enum Affinity {
     /// Multi-turn session (WS): stick to the warm-KV worker across turns ⇒ stable
     /// HRW on the [`SessionId`], re-routed only if that worker is gone.
     Sticky,
+    /// One-shot that belongs to a CLIENT-side session (OpenAI ingress): stick
+    /// consecutive requests carrying the same external key to the same worker
+    /// ⇒ stable HRW on the key, so worker-side KV snapshots
+    /// (`working-set update-index/from-index`) get hit instead of being
+    /// scattered by p2c. Keys come from opencode's `x-session-affinity`/
+    /// `x-session-id` headers or OpenClaw's `prompt_cache_key` body field
+    /// (openclaw AUDIT §1e/§7).
+    Keyed(crate::route::AffinityKey),
 }
 
 /// Why a turn could not be started.
@@ -354,10 +362,12 @@ impl Sessions {
         }
         let session = SessionId(self.inner.next_session.fetch_add(1, Ordering::Relaxed));
         // Sticky multi-turn sessions key affinity on the stable session id; a
-        // fresh one-shot has no warm KV to prefer, so it routes load-aware (p2c).
+        // fresh one-shot has no warm KV to prefer, so it routes load-aware (p2c);
+        // a keyed one-shot sticks to the client session's HRW worker.
         let affinity_key = match affinity {
             Affinity::Ephemeral => None,
             Affinity::Sticky => Some(session.0),
+            Affinity::Keyed(key) => Some(key),
         };
         self.inner.live.fetch_add(1, Ordering::Relaxed);
         let (req_id, rx) = match self
@@ -812,6 +822,18 @@ mod tests {
             key,
             "turn reuses the session's affinity key"
         );
+
+        // Keyed one-shot → the EXTERNAL key verbatim, identical across two
+        // separate sessions carrying the same client-session key (that is the
+        // whole point: consecutive OpenAI requests of one agent session must
+        // HRW to the same warm-KV worker — openclaw AUDIT §7).
+        let r3 = MockRouter::new(Some(WorkerId(1)));
+        let s3 = Sessions::new(r3.clone());
+        let _ = s3.create(ident(), input(), Affinity::Keyed(0xC0FFEE)).await.unwrap();
+        let _ = s3.create(ident(), input(), Affinity::Keyed(0xC0FFEE)).await.unwrap();
+        let affs = r3.affinities.lock().unwrap();
+        assert_eq!(affs[0], Some(0xC0FFEE));
+        assert_eq!(affs[1], Some(0xC0FFEE), "same external key ⇒ same HRW key");
     }
 
     #[tokio::test]

@@ -13,7 +13,8 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-P0.1 | Source-derived OpenClaw wire audit → AUDIT.md | **done** |
 | oc-P0.2 | Real wire captures + fixture bank | **done** (gateway-only side-calls + image fixture pending, see README gaps) |
 | oc-P0.3 | Renderer parity on OpenClaw fixtures | **done — all 5 token-exact** |
-| oc-PA.1 | Keyed sticky affinity in gateway (shared w/ opencode track) | pending |
+| oc-PA.0 | Audit fixes: keepalive/overflow/fixture-sweep in serving stack | **done** |
+| oc-PA.1 | Keyed sticky affinity in gateway (shared w/ opencode track) | **done** |
 | oc-PA.2 | `extensions/pie/` bundled provider in OpenClaw | pending |
 | oc-PA.3 | Acceptance suite + e2e + A/B vs Ollama/llama.cpp | pending |
 | oc-PB.1 | Shared session dialect (design + crate) | pending |
@@ -23,6 +24,33 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-PB.5 | Optional depth (grammar calls, speculation, embeddings) | pending |
 
 ## Log
+
+### 2026-08-11 — oc-PA.0 + oc-PA.1 done: audit fixes + keyed affinity
+
+**PA.0** (`gateway/src/ingress/openai.rs`, `inferlets/openai-serving/`):
+- Keepalive rebuilt per D-1: axum's comment `KeepAlive` removed; the gateway
+  now injects an **empty-delta chunk** after 15 s of inferlet silence
+  (< OpenClaw's 60 s cron cap), mirroring the stream's chunk id/model from
+  the role chunk so opencode's chunk-id-consistency invariant holds. The one
+  documented envelope exception where the gateway authors chunk JSON.
+- `error::context_overflow_body(max, requested)` — the 400 body whose wording
+  OpenClaw classifies as `context_overflow` (triggers compaction, not
+  failure); veto-word test pins it. Wiring pre-generation is a seam until a
+  WIT context-capacity getter exists; until then the guard is catalog
+  `contextWindow` = engine `max_model_len` (PA.2 requirement).
+- `sse_ping` demoted to non-keepalive; streaming module docs corrected.
+- Serving crate now sweeps the openclaw fixtures: parse + plan_render on all
+  5, asserting the divergent shapes (D-3 null content, D-4
+  max_completion_tokens, S-2 strict:false). Crate tests 43→45.
+
+**PA.1** (`gateway/src/session.rs`, `openai.rs`): new `Affinity::Keyed(u64)`
+— stable HRW on an external client-session key. The OpenAI ingress derives
+it: `x-session-affinity` → `x-session-id` → `session_id` headers →
+`prompt_cache_key` body field (blake3→u64); no signal ⇒ Ephemeral/p2c as
+before (deliberately NOT hash-of-prompt — would herd multi-tenant load; note
+in module docs). Tests: extraction priority/stability unit test; session
+test pinning Keyed(k) → dispatch key verbatim across two sessions. Gateway
+suite 43+1+6 green.
 
 ### 2026-08-11 — oc-P0.3 done: renderer parity — ALL 5 OpenClaw fixtures token-exact
 
