@@ -113,6 +113,53 @@ mod fixture_tests {
         }
     }
 
+    fn openclaw_wire_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/inferlets/fixtures/openclaw/wire")
+    }
+
+    /// The openclaw captures (openclaw AUDIT §8): every banked fixture must
+    /// parse, render, and exercise the shapes that diverge from opencode —
+    /// assistant replay `content: null` (D-3), `max_completion_tokens`
+    /// without `max_tokens` (D-4), `strict: false` inside tool specs (S-2),
+    /// plain-string user content with the timestamp envelope (S-1).
+    #[test]
+    fn every_openclaw_fixture_parses_and_renders() {
+        let mut n = 0;
+        let mut saw_null_content_replay = false;
+        for f in std::fs::read_dir(openclaw_wire_dir()).unwrap().flatten() {
+            let name = f.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("req-") || !name.ends_with(".json") {
+                continue;
+            }
+            let capture: Value =
+                serde_json::from_str(&std::fs::read_to_string(f.path()).unwrap()).unwrap();
+            let mut req: ChatCompletionRequest =
+                serde_json::from_value(capture["body"].clone())
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!req.messages.is_empty(), "{name}: empty messages");
+            assert!(req.stream, "{name}: stream flag");
+            assert!(req.include_usage(), "{name}: include_usage");
+            // D-4: openclaw sends max_completion_tokens, never max_tokens.
+            assert!(req.max_tokens.is_none(), "{name}: unexpected max_tokens");
+            assert_eq!(req.effective_max_tokens(0), 32000, "{name}: max_completion_tokens");
+            for m in &req.messages {
+                if m.role == "assistant" && !m.calls().is_empty() {
+                    // D-3: content is null on replay; must normalize to None.
+                    assert!(m.text_opt().is_none(), "{name}: replay content not None");
+                    saw_null_content_replay = true;
+                }
+            }
+            // The full pipeline the inferlet runs (engine-free halves).
+            sanitize_messages(&mut req.messages, &[]);
+            let ops = plan_render(&req).unwrap_or_else(|e| panic!("{name}: render {e}"));
+            assert!(!ops.is_empty(), "{name}: empty render plan");
+            n += 1;
+        }
+        assert_eq!(n, 5, "expected the 5 banked openclaw captures");
+        assert!(saw_null_content_replay, "req-004 replay shape not exercised");
+    }
+
     #[test]
     fn req_005_round_trip_essentials() {
         // The history-replay capture: system, user, assistant+tool_calls

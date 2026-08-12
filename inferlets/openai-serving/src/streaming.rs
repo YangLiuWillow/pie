@@ -15,10 +15,15 @@
 //!   emits the whole call atomically (id + name + arguments in one delta),
 //!   which satisfies both clients — and a call without a unique `id` is
 //!   silently dropped by qwen-code's `cleanOrphanedToolCalls`.
-//! - Keepalives: opencode's `chunkTimeout` watchdog resets on raw bytes, so
-//!   SSE comments ([`sse_ping`]) are the preferred keepalive; qwen-code's
-//!   watchdog counts SDK-delivered chunks, so it needs empty-delta chunks
-//!   ([`ChunkMeta::keepalive`]) instead. Both are ignored by accumulation.
+//! - Keepalives: **empty-delta chunks ([`ChunkMeta::keepalive`]) are the
+//!   universal mechanism.** OpenClaw's SSE sanitizer drops comment-only
+//!   frames and its watchdogs reset only on parsed chunks (openclaw AUDIT
+//!   §2a / D-1); qwen-code's watchdog counts SDK-delivered chunks; opencode
+//!   resets on raw bytes, which a real chunk trivially satisfies. SSE
+//!   comments ([`sse_ping`]) satisfy opencode alone — do not use them as
+//!   the keepalive. The gateway injects keepalives during inferlet silence
+//!   (mirroring chunk identity); inferlets emitting their own use
+//!   [`ChunkMeta::keepalive`].
 //! - When `stream_options.include_usage` is set, a final `choices: []`
 //!   usage chunk precedes `[DONE]`; KV-session reuse is reported via
 //!   `usage.prompt_tokens_details.cached_tokens` (must be ≤ prompt_tokens
@@ -168,8 +173,10 @@ pub fn sse_done() -> String {
     "data: [DONE]\n\n".to_string()
 }
 
-/// SSE comment keepalive — capture-verified invisible to opencode's JSON
-/// layer while resetting its raw-byte `chunkTimeout` watchdog (AUDIT §2).
+/// SSE comment frame. NOT a keepalive: OpenClaw's sanitizer drops
+/// comment-only frames and its watchdogs never see them (openclaw AUDIT
+/// §2a) — use [`ChunkMeta::keepalive`] instead. Retained for tests and
+/// non-keepalive commentary.
 pub fn sse_ping() -> String {
     ": ping\n\n".to_string()
 }

@@ -9,7 +9,8 @@
 //!   2. launches the configured inferlet over the same `Sessions::create`
 //!      path as `http.rs`,
 //!   3. re-frames the inferlet's message events as SSE (streaming) or a JSON
-//!      body (non-streaming), with `: ping` keepalives on the SSE path.
+//!      body (non-streaming), injecting empty-delta keepalive chunks during
+//!      inferlet silence (see [`chunk_event_stream`]).
 //!
 //! ## Gateway ⇄ inferlet envelope
 //!
@@ -44,7 +45,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, Sse},
     },
 };
 use futures::Stream;
@@ -323,48 +324,152 @@ async fn stream_response(handle: SessionHandle, mut rx: TokenRx) -> Response {
         }
     }
 
-    // Keep-alive comments guard the long-prefill window; opencode's watchdog
-    // resets on raw bytes, so `:` comment frames are sufficient (audit §1).
-    Sse::new(chunk_event_stream(handle, rx))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    // No axum comment keepalive: OpenClaw's SSE sanitizer DROPS frames whose
+    // only content is a comment, and its idle watchdogs reset only on parsed
+    // chunks (openclaw AUDIT §2a / D-1). Empty-delta chunks are the one
+    // keepalive both audited clients accept (opencode's watchdog resets on
+    // raw bytes, so a real chunk trivially satisfies it too) — injected by
+    // `chunk_event_stream` during inferlet silence.
+    Sse::new(chunk_event_stream(handle, rx)).into_response()
+}
+
+/// Keepalive cadence during inferlet silence (long prefills). Must stay
+/// under the tightest client budget: OpenClaw caps the idle watchdog at 60 s
+/// for cron-triggered turns (`run/llm-idle-timeout.ts:28`).
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Empty-delta `chat.completion.chunk` keepalive. Invisible to chunk
+/// accumulation on both audited clients; resets OpenClaw's parsed-chunk idle
+/// watchdog, which SSE comments cannot (openclaw AUDIT §2a). Mirrors the
+/// id/model/created of the chunks the inferlet emits (opencode's acceptance
+/// suite pins chunk-id consistency across a stream) — the role chunk arrives
+/// before the prefill gap, so the mirror is populated before the first
+/// keepalive can fire; the placeholder covers only the sub-millisecond
+/// pre-role window.
+fn keepalive_chunk(meta: &Option<(String, String, i64)>) -> String {
+    let (id, model, created) = meta
+        .clone()
+        .unwrap_or_else(|| ("chatcmpl-keepalive".to_string(), "pie".to_string(), 0));
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "logprobs": null, "finish_reason": null}],
+    })
+    .to_string()
+}
+
+/// Remember the stream's chunk identity from the first payload that carries
+/// one (the role chunk), for keepalive mirroring.
+fn note_chunk_meta(meta: &mut Option<(String, String, i64)>, payload: &str) {
+    if meta.is_some() {
+        return;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(payload) {
+        if let (Some(id), Some(model)) = (v["id"].as_str(), v["model"].as_str()) {
+            *meta = Some((
+                id.to_string(),
+                model.to_string(),
+                v["created"].as_i64().unwrap_or(0),
+            ));
+        }
+    }
 }
 
 /// Forward each envelope payload as one `data:` line; `[DONE]` on clean Eos.
 /// Mirrors `http.rs::token_event_stream`, minus the ServerMessage re-encode:
-/// payloads are already the wire-ready chunk JSON.
+/// payloads are already the wire-ready chunk JSON. When the inferlet stays
+/// silent past [`KEEPALIVE_INTERVAL`] (prefill), an empty-delta keepalive
+/// chunk goes out instead — the one envelope exception where the gateway
+/// authors chunk JSON itself (documented at [`keepalive_chunk`]).
 fn chunk_event_stream(
     handle: SessionHandle,
     rx: TokenRx,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     enum St {
-        Streaming { rx: TokenRx, handle: SessionHandle },
+        Streaming {
+            rx: TokenRx,
+            handle: SessionHandle,
+            meta: Option<(String, String, i64)>,
+        },
         End,
     }
 
-    futures::stream::unfold(St::Streaming { rx, handle }, |st| async move {
-        match st {
-            St::Streaming { mut rx, handle } => match next_msg(&mut rx).await {
-                Msg::Payload(p) => {
-                    Some((Ok(Event::default().data(p)), St::Streaming { rx, handle }))
+    futures::stream::unfold(
+        St::Streaming { rx, handle, meta: None },
+        |st| async move {
+            match st {
+                St::Streaming { mut rx, handle, mut meta } => {
+                    match tokio::time::timeout(KEEPALIVE_INTERVAL, next_msg(&mut rx)).await {
+                        Err(_elapsed) => {
+                            let ka = keepalive_chunk(&meta);
+                            Some((
+                                Ok(Event::default().data(ka)),
+                                St::Streaming { rx, handle, meta },
+                            ))
+                        }
+                        Ok(Msg::Payload(p)) => {
+                            note_chunk_meta(&mut meta, &p);
+                            Some((
+                                Ok(Event::default().data(p)),
+                                St::Streaming { rx, handle, meta },
+                            ))
+                        }
+                        Ok(Msg::Eos) => {
+                            let _ = &handle; // dropped after End ⇒ session closes
+                            Some((Ok(Event::default().data("[DONE]")), St::End))
+                        }
+                        // Mid-stream fault/abort: the 200 is already on the
+                        // wire, so surface an SSE error event (clients treat a
+                        // broken stream as retryable; an explicit event beats a
+                        // silent hang).
+                        Ok(Msg::Fault(e)) => {
+                            Some((Ok(Event::default().event("error").data(e)), St::End))
+                        }
+                        Ok(Msg::Aborted) => Some((
+                            Ok(Event::default().event("error").data("stream aborted")),
+                            St::End,
+                        )),
+                    }
                 }
-                Msg::Eos => {
-                    let _ = &handle; // dropped after End ⇒ session closes
-                    Some((Ok(Event::default().data("[DONE]")), St::End))
-                }
-                // Mid-stream fault/abort: the 200 is already on the wire, so
-                // surface an SSE error event (clients treat a broken stream as
-                // retryable; an explicit event beats a silent hang).
-                Msg::Fault(e) => Some((
-                    Ok(Event::default().event("error").data(e)),
-                    St::End,
-                )),
-                Msg::Aborted => Some((
-                    Ok(Event::default().event("error").data("stream aborted")),
-                    St::End,
-                )),
-            },
-            St::End => None,
-        }
-    })
+                St::End => None,
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_mirrors_stream_chunk_identity() {
+        let mut meta = None;
+        // Role chunk (what the inferlet actually emits first).
+        note_chunk_meta(
+            &mut meta,
+            r#"{"id":"chatcmpl-abc","object":"chat.completion.chunk","created":42,"model":"qwen3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}"#,
+        );
+        let ka: Value = serde_json::from_str(&keepalive_chunk(&meta)).unwrap();
+        assert_eq!(ka["id"], "chatcmpl-abc");
+        assert_eq!(ka["model"], "qwen3");
+        assert_eq!(ka["created"], 42);
+        // Empty delta, null finish — invisible to accumulation, resets
+        // OpenClaw's parsed-chunk watchdog (openclaw AUDIT §2a).
+        assert_eq!(ka["choices"][0]["delta"], json!({}));
+        assert_eq!(ka["choices"][0]["finish_reason"], Value::Null);
+
+        // First identity wins; later payloads don't rebind it.
+        note_chunk_meta(&mut meta, r#"{"id":"other","model":"m2","created":9}"#);
+        assert_eq!(meta.as_ref().unwrap().0, "chatcmpl-abc");
+    }
+
+    #[test]
+    fn keepalive_placeholder_before_first_chunk() {
+        let ka: Value = serde_json::from_str(&keepalive_chunk(&None)).unwrap();
+        assert_eq!(ka["id"], "chatcmpl-keepalive");
+        assert_eq!(ka["object"], "chat.completion.chunk");
+        assert_eq!(ka["choices"][0]["delta"], json!({}));
+    }
 }
