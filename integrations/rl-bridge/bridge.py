@@ -101,6 +101,68 @@ class Bridge:
         return json.loads(last if isinstance(last, str) else last.decode())
 
 
+_QWEN3_TOOLS_HEADER = (
+    "\n\n# Tools\n\nYou may call one or more functions to assist with the user query."
+    "\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>"
+)
+_QWEN3_TOOLS_FOOTER = (
+    "\n</tools>\n\nFor each function call, return a json object with function name and "
+    "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+    '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>'
+)
+
+
+def render_tools_into_system(system: str, tools: list[dict]) -> str:
+    """Replicate the Qwen3 chat template's hermes-style tools block (the
+    rendering vLLM's template applies; chat.wit has no tools parameter, so the
+    block rides inside the system text)."""
+    lines = [_QWEN3_TOOLS_HEADER]
+    for t in tools:
+        fn = t.get("function", t)
+        lines.append("\n" + json.dumps(fn, separators=(", ", ": "), ensure_ascii=False))
+    lines.append(_QWEN3_TOOLS_FOOTER)
+    return system + "".join(lines)
+
+
+def parse_completion_text(text: str) -> tuple[str, str | None, list[dict]]:
+    """Split raw completion text into (content, reasoning_content, tool_calls)
+    — the vLLM reasoning-parser + hermes tool-parser shape qwen-code expects."""
+    reasoning = None
+    if "<think>" in text:
+        head, _, rest = text.partition("<think>")
+        thought, _, tail = rest.partition("</think>")
+        reasoning = thought.strip() or None
+        text = (head + tail).lstrip("\n")
+    calls: list[dict] = []
+    content_parts: list[str] = []
+    rest = text
+    while "<tool_call>" in rest:
+        before, _, after = rest.partition("<tool_call>")
+        content_parts.append(before)
+        block, closed, rest = after.partition("</tool_call>")
+        if not closed:
+            rest = ""
+            block = block.strip()
+        try:
+            obj = json.loads(block.strip())
+            name = obj.get("name")
+            args = obj.get("arguments", {})
+            if name:
+                calls.append({
+                    "id": f"call_{int(time.time() * 1000):x}_{len(calls)}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False)
+                        if not isinstance(args, str) else args,
+                    },
+                })
+        except json.JSONDecodeError:
+            content_parts.append(block)  # malformed call: surface as text
+    content_parts.append(rest)
+    return "".join(content_parts).strip(), reasoning, calls
+
+
 def _error(status: int, message: str, etype: str = "invalid_request_error") -> web.Response:
     return web.json_response(
         {"error": {"message": message, "type": etype, "param": None, "code": None}},
@@ -212,6 +274,131 @@ async def handle_completions(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+async def handle_chat(request: web.Request) -> web.StreamResponse:
+    """§3.2 turn-0 path: messages in, chat shape out — but still carrying root
+    prompt_token_ids and choices[0].token_ids for the training gateway."""
+    bridge: Bridge = request.app["bridge"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "request body is not valid JSON")
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return _error(400, "messages must be a non-empty list")
+
+    tools = body.get("tools") or []
+    if tools:
+        messages = [dict(m) for m in messages]
+        if messages and messages[0].get("role") == "system":
+            sys_text = messages[0].get("content") or ""
+            if isinstance(sys_text, list):
+                sys_text = "".join(p.get("text", "") for p in sys_text)
+            messages[0]["content"] = render_tools_into_system(sys_text, tools)
+        else:
+            messages.insert(0, {"role": "system",
+                                "content": render_tools_into_system("", tools)})
+
+    inp = {
+        "messages": messages,
+        "max_tokens": int(body.get("max_tokens", 256)),
+        "temperature": float(body.get("temperature", 1.0)),
+        "top_p": float(body.get("top_p", 1.0)),
+        "seed": int(body.get("seed", 0)),
+        "return_text": True,
+    }
+    try:
+        out = await bridge.rollout(inp)
+    except Exception as e:
+        return _error(500, f"rollout failed: {e}", "server_error")
+
+    prompt_ids = out.get("prompt_token_ids", [])
+    if prompt_ids:
+        bridge.hints.record(prompt_ids, out.get("saved_len", 0))
+
+    content, reasoning, tool_calls = parse_completion_text(out.get("text", ""))
+    finish_reason = "tool_calls" if tool_calls else out["finish_reason"]
+
+    logprobs_obj = None
+    if body.get("logprobs"):
+        # Chat logprob shape: the gateway reads logprobs.content[].logprob.
+        logprobs_obj = {
+            "content": [{"token": "", "logprob": lp} for lp in out["logprobs"]]
+        }
+    usage = {
+        "prompt_tokens": out["num_prompt_tokens"],
+        "completion_tokens": out["num_output_tokens"],
+        "total_tokens": out["num_prompt_tokens"] + out["num_output_tokens"],
+        "prompt_tokens_details": {"cached_tokens": out.get("cached_tokens", 0)},
+    }
+    base = {
+        "id": f"chatcmpl-{int(time.time() * 1000):x}",
+        "created": int(time.time()),
+        "model": body.get("model", "pie"),
+        "weight_version": bridge.weight_version,
+    }
+
+    message: dict = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    if not body.get("stream", False):
+        choice = {
+            "index": 0,
+            "message": message,
+            "token_ids": out["token_ids"],
+            "finish_reason": finish_reason,
+        }
+        if logprobs_obj is not None:
+            choice["logprobs"] = logprobs_obj
+        return web.json_response({
+            **base,
+            "object": "chat.completion",
+            "prompt_token_ids": prompt_ids,
+            "choices": [choice],
+            "usage": usage,
+        })
+
+    # SSE form (qwen-code always streams; a JSON body reads to it as a dead
+    # stream — "Model stream ended without a finish reason" and 4 retries).
+    # Buffered server-side: role chunk (carrying root prompt_token_ids for the
+    # gateway's turn-0 trace), one content delta with token_ids + logprobs, a
+    # finish chunk, usage, [DONE].
+    resp = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+    )
+    await resp.prepare(request)
+
+    async def emit(obj: dict) -> None:
+        await resp.write(f"data: {json.dumps(obj)}\n\n".encode())
+
+    chunk_base = {**base, "object": "chat.completion.chunk"}
+    await emit({**chunk_base, "prompt_token_ids": prompt_ids,
+                "choices": [{"index": 0, "delta": {"role": "assistant"},
+                             "finish_reason": None}]})
+    delta_body: dict = {"content": content}
+    if reasoning is not None:
+        delta_body["reasoning_content"] = reasoning
+    if tool_calls:
+        delta_body["tool_calls"] = [
+            {"index": i, **tc} for i, tc in enumerate(tool_calls)
+        ]
+    delta = {"index": 0, "delta": delta_body,
+             "token_ids": out["token_ids"], "finish_reason": None}
+    if logprobs_obj is not None:
+        delta["logprobs"] = logprobs_obj
+    await emit({**chunk_base, "choices": [delta]})
+    await emit({**chunk_base, "choices": [{"index": 0, "delta": {},
+                                           "finish_reason": finish_reason}]})
+    await emit({**chunk_base, "choices": [], "usage": usage})
+    await resp.write(b"data: [DONE]\n\n")
+    await resp.write_eof()
+    return resp
+
+
 async def handle_health(_: web.Request) -> web.Response:
     return web.Response(text="ok")
 
@@ -232,6 +419,8 @@ def main() -> None:
     app["bridge"] = bridge
     app.router.add_post("/v1/completions", handle_completions)
     app.router.add_post("/completions", handle_completions)
+    app.router.add_post("/v1/chat/completions", handle_chat)
+    app.router.add_post("/chat/completions", handle_chat)
     app.router.add_get("/health", handle_health)
 
     async def on_startup(_: web.Application) -> None:
