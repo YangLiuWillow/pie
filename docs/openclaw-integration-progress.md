@@ -15,8 +15,8 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-P0.3 | Renderer parity on OpenClaw fixtures | **done — all 5 token-exact** |
 | oc-PA.0 | Audit fixes: keepalive/overflow/fixture-sweep in serving stack | **done** |
 | oc-PA.1 | Keyed sticky affinity in gateway (shared w/ opencode track) | **done** |
-| oc-PA.2 | `extensions/pie/` bundled provider in OpenClaw | pending |
-| oc-PA.3 | Acceptance suite + e2e + A/B vs Ollama/llama.cpp | pending |
+| oc-PA.2 | `extensions/pie/` bundled provider in OpenClaw | **done** (compile/docs-check pending pnpm install) |
+| oc-PA.3 | Acceptance suite + e2e + A/B vs Ollama/llama.cpp | suite + launcher **authored** (29 tests); live run + A/B pending |
 | oc-PB.1 | Shared session dialect (design + crate) | pending |
 | oc-PB.2 | `openclaw-session` inferlet | pending |
 | oc-PB.3 | `createStreamFn` WS transport | pending |
@@ -24,6 +24,38 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-PB.5 | Optional depth (grammar calls, speculation, embeddings) | pending |
 
 ## Log
+
+### 2026-08-11 — oc-PA.2 done + oc-PA.3 authored
+
+**PA.2 — `extensions/pie/` in the OpenClaw repo** (branch `liu/pie-provider`
+@ `e35577861f4`, off `main`): vllm-pattern bundled provider via
+`defineSelfHostedOpenAICompatibleProvider` (id `pie`, default baseUrl
+`http://127.0.0.1:8080/v1`, env `PIE_API_KEY`), manifest with
+`openAICompletions.supportsStreamingUsage` (the only compat flag the
+manifest schema carries — the rest ship as documented config), core
+touch-ups (overlay-id allowlist, lean auto-enable set — both existing
+hardcoded lists with vllm/lmstudio precedent), `docs/providers/pie.md`
+(recommended compat block, `contextWindow` = engine `max_model_len` rule,
+`localService` profile), docs nav entry. Deliberately NOT in
+`PLUGIN_ART_SLUGS` (no pie.webp; gradient fallback covers it).
+**Verification gaps** (openclaw repo has no node_modules; per its AGENTS.md
+heavy proof is remote): extension compile, `pnpm docs:check-config-examples`
+on pie.md fences (`compat.sendSessionAffinityHeaders` verified present in
+`types.models.ts:46`), and the vitest suites — all pending a pnpm install or
+CI run when a PR is opened.
+
+**PA.3 — acceptance suite + launcher authored** (`integrations/openclaw/`):
+`test_acceptance.py` imports the opencode suite's plumbing + its 22 generic
+tests and swaps in 7 OpenClaw-specific ones (fixtures req-003/004/005
+replay incl. `content:null` history and lean surface;
+`max_completion_tokens`-only budget → `length`; content-part user messages;
+empty-delta keepalive chunks with mirrored chunk id; finish_reason ⊆
+{stop,length,tool_calls} sweep) — 29 collected. `run_pie_openclaw.sh` =
+opencode launcher with `max_model_len 32768` / `total_pages 1024` (parity
+measured ~24.2k-token full-surface prompts). `openclaw.json` e2e profile
+carries the audit compat block + lean mode. Live run pending the same
+Metal-admission RAM constraint as the opencode track (worse here: double
+the pages).
 
 ### 2026-08-11 — oc-PA.0 + oc-PA.1 done: audit fixes + keyed affinity
 

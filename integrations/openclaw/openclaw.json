@@ -1,0 +1,33 @@
+{
+  "agents": {
+    "defaults": {
+      "model": "pie/qwen3-0.6b",
+      "experimental": { "localModelLean": true }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "pie": {
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "apiKey": "pie-local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "qwen3-0.6b",
+            "name": "Qwen3 0.6B (Pie)",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 4096,
+            "compat": {
+              "supportsPromptCacheKey": true,
+              "sendSessionAffinityHeaders": true
+            }
+          }
+        ]
+      }
+    }
+  }
+}
