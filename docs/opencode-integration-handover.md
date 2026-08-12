@@ -74,14 +74,19 @@ as "done pending first contact."
 ## 3. Set up the new machine
 
 ```sh
-# 1. The repo. Upstream is pie-project/pie; the work lives on the fork.
-git clone https://github.com/YangLiuWillow/pie.git ~/Documents/Liszt_ai/pie
+# 1. The repo. Clone UPSTREAM as `origin`, add the fork as `fork` — that is the
+#    remote layout every doc, script and commit note here assumes
+#    (`git fetch origin dev` for upstream, `git push fork …` to publish).
+git clone https://github.com/pie-project/pie.git ~/Documents/Liszt_ai/pie
 cd ~/Documents/Liszt_ai/pie
-git remote add fork https://github.com/YangLiuWillow/pie.git   # if `origin` is upstream
+git remote add fork https://github.com/YangLiuWillow/pie.git
 git fetch fork liu/opencode-integration
 
-# 2. The convention here is one worktree per integration (pie-codex, pie-rl, …):
-git worktree add ../pie-opencode liu/opencode-integration
+# 2. One worktree per integration (pie-codex, pie-rl, …). `-b` is REQUIRED on a
+#    fresh clone: the fetch above created only the remote-tracking ref
+#    `fork/liu/opencode-integration`, and `worktree add` needs a LOCAL branch —
+#    without it you get `fatal: invalid reference: liu/opencode-integration`.
+git worktree add -b liu/opencode-integration ../pie-opencode fork/liu/opencode-integration
 cd ../pie-opencode
 ```
 
