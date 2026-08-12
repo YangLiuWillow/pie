@@ -18,7 +18,9 @@
 
 use inferlet::{chat, session, tools};
 use pie_openai_serving::streaming::ChunkMeta;
-use pie_openai_serving::{VisibleFilter, parse_fenced_tool_calls, parse_hermes_tool_calls};
+use pie_openai_serving::{
+    VisibleFilter, answer_after_reasoning, parse_fenced_tool_calls, parse_hermes_tool_calls,
+};
 use serde_json::Value;
 use std::ops::ControlFlow;
 
@@ -208,18 +210,21 @@ impl TurnState {
     ///
     /// A text turn that produced nothing visible still delivers non-empty
     /// content (qwen-code's NO_RESPONSE_TEXT retry loop; harmless for
-    /// opencode): fall back to the raw generation with think markup
-    /// stripped (the model's actual words when the budget died inside a
-    /// think block), then to a non-whitespace placeholder.
+    /// opencode): fall back to whatever the raw generation says AFTER its
+    /// reasoning, then to a non-whitespace placeholder.
+    ///
+    /// This used to strip `<think>`/`</think>` and keep everything else,
+    /// which served the model's private working-out as its answer in exactly
+    /// the case the filter was right to suppress it — fluent, on-topic, and
+    /// wrong in kind. `answer_after_reasoning` takes the text after the last
+    /// closer and treats an unterminated block as no answer at all; see its
+    /// docs for why that matters more the moment a cue opens the block.
     pub fn final_content(&self, raw_text: &str) -> String {
         if !self.visible_text.is_empty() || !self.calls.is_empty() {
             return self.visible_text.clone();
         }
-        let cleaned = raw_text
-            .replace("<think>", "")
-            .replace("</think>", "")
-            .trim()
-            .to_string();
-        if cleaned.is_empty() { "…".to_string() } else { cleaned }
+        answer_after_reasoning(raw_text)
+            .map(str::to_string)
+            .unwrap_or_else(|| "…".to_string())
     }
 }

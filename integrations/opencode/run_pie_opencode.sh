@@ -8,18 +8,26 @@
 #   ./run_pie_opencode.sh --serve-only       # boot + wait, skip the tests
 #                                            #   (for the stock-opencode e2e)
 #
+#   PIE_MODEL=qwen3.6-35b-a3b ./run_pie_opencode.sh          # the 35B run
+#
 # Environment:
+#   PIE_MODEL     which model to serve   (default: qwen3-0.6b). One of the
+#                                        profile keys below, or a raw artifact
+#                                        name from `pie model list` — a raw
+#                                        name gets the shared driver settings
+#                                        and whatever RAM it needs.
 #   PIE_BIN       pie binary            (default: <repo>/../pie/target/release/pie
 #                                        — the shared-target-dir release build,
 #                                        see the 2026-08-11 environment note in
 #                                        docs/opencode-integration-progress.md)
 #   PIE_HOME      pie home              (default: ~/.pie; must hold the model
-#                                        Qwen--Qwen3-0.6B-optimized and the
-#                                        chat-completions inferlet — this
-#                                        script refreshes the inferlet from the
-#                                        shared target dir when it is newer)
-#   PIE_PORT      gateway port          (default: 8080, matching [server].port)
-#   LOG           serve log file        (default: /tmp/pie_opencode_serve.log)
+#                                        artifact and the chat-completions
+#                                        inferlet — this script refreshes the
+#                                        inferlet from the shared target dir
+#                                        when it is newer)
+#   PIE_PORT      gateway port          (default: 8080, matching [server].port
+#                                        and the baseURL in ./opencode.json)
+#   LOG           serve file            (default: /tmp/pie_opencode_serve.log)
 #   PIE_METAL_ROW_BUDGET_MB
 #                 Metal activation-row reservation in MB (driver default
 #                 1024 = 1 GB, read in driver/metal/src/context.cpp
@@ -31,9 +39,14 @@
 #                 don't go so low that it gets refused. Pass-through only;
 #                 unset means the driver default.
 #
-# Known blocker (2026-08-11): this machine currently cannot admit the Metal
-# heap at all — pie serve needs ~3.2 GiB reclaimable and the machine had
-# ~1.9 GiB. Free RAM (or lower PIE_METAL_ROW_BUDGET_MB) before running.
+# Memory, on a shared machine (2026-08-12): run ONE `pie serve` at a time and
+# stop it with SIGTERM. The Metal driver's admission warning blames wired pages
+# on abandoned GPU contexts "cleared only by reboot", but the identical warning
+# appears when another `pie serve` simply holds its heap — that was the real
+# cause here, and a clean SIGTERM to it took wired from 24.17 GiB to 2.85 GiB
+# with no reboot. Check for a second `pie serve` before believing the leak
+# reading. The hard-kill hazard is real, but it comes from `kill -9` mid-fire,
+# not from running the thing.
 
 set -euo pipefail
 
@@ -67,12 +80,45 @@ done
     exit 1
 }
 
+# ── model profile ────────────────────────────────────────────────────────────
+# Friendly name → stored artifact. The keys match the model ids in
+# ./opencode.json, so `PIE_MODEL=x` and `opencode run -m pie/x` name the same
+# thing. A value that matches no key is passed through as a raw artifact name
+# (see `pie model list`).
+PIE_MODEL="${PIE_MODEL:-qwen3-0.6b}"
+case "$PIE_MODEL" in
+    qwen3-0.6b)       ARTIFACT="Qwen--Qwen3-0.6B-optimized" ;;
+    qwen3.6-35b-a3b)  ARTIFACT="mlx-community--Qwen3.6-35B-A3B-4bit" ;;
+    *)                ARTIFACT="$PIE_MODEL" ;;
+esac
+
 # ── config: argument, or a generated trimmed profile ─────────────────────────
-# The trimmed profile mirrors the known-good ~/.pie/config.toml (metal driver,
-# Qwen3-0.6B MLX-quantized checkpoint) with one deliberate change:
-# max_model_len 4096 → 16384, because opencode's build-agent prompt alone is
-# ~7.5k tokens (req-005 replays at 7473) and a longer-than-max prompt is
-# refused, not chunked. 16384 = total_pages(512) × kv_page_size(32).
+# One driver shape for every model here — these are the settings the 2026-08-12
+# results were produced under (`integrations/opencode/results-*.md`), for both
+# the 0.6B and the 35B, so a re-run reproduces them rather than approximating.
+#
+#   max_model_len 16384  opencode's build-agent prompt alone is ~7.5k tokens
+#                        (req-005 replays at 7473) and a longer-than-max prompt
+#                        is REFUSED by the Metal driver, not chunked. 16384 =
+#                        total_pages(512) × kv_page_size(32).
+#                        NOT a ceiling: 32768 (total_pages 1024) booted this
+#                        model fine on a quiet machine. Admission is
+#                        `want + min(transient,2GiB) + 2GiB > reclaimable`
+#                        (driver/metal/src/batch/forward.cpp:892), so it is a
+#                        function of what else is resident. Measured wants on
+#                        this 35B: 24.77 GiB at 32768/1024pages/32reqs,
+#                        22.55 GiB at 16384/512pages/8reqs. A client whose
+#                        prompts exceed 16k (OpenClaw's full surface replays
+#                        at ~24.2k) should raise both and check admission on a
+#                        quiet machine rather than assume the lower value.
+#   max_forward_*        1024/8 rather than the driver's roomier defaults: the
+#                        35B needs ~22.6 GiB resident at these numbers, and a
+#                        48 GB machine with anything else running cannot admit
+#                        more. The 0.6B could afford far more and does not care,
+#                        and holding both at one shape keeps the two runs
+#                        comparable.
+#   request_timeout      300s, not 120s: a 35B streaming turn with a large
+#                        max_tokens outruns two minutes on Metal.
 if [ -z "$CFG" ]; then
     CFG="$(mktemp -d -t pie_opencode)/config.toml"
     cat >"$CFG" <<EOF
@@ -82,7 +128,7 @@ port = $PIE_PORT
 
 [model]
 name = "default"
-model = "Qwen--Qwen3-0.6B-optimized"
+model = "$ARTIFACT"
 
 [driver]
 type = "metal"
@@ -90,19 +136,19 @@ device = ["metal:0"]
 activation_dtype = "bfloat16"
 kv_page_size = 32
 total_pages = 512
-max_forward_tokens = 2048
-max_forward_requests = 32
+max_forward_tokens = 1024
+max_forward_requests = 8
 max_model_len = 16384
 
 [runtime]
-request_timeout = "120s"
+request_timeout = "300s"
 
 [sandbox]
 allow_fs = false
 allow_network = true
 network_allowed_hosts = ["*"]
 EOF
-    echo "── generated config: $CFG"
+    echo "── generated config: $CFG (model $PIE_MODEL -> $ARTIFACT)"
 fi
 
 # ── refresh the chat-completions inferlet in \$PIE_HOME/programs ─────────────
@@ -124,9 +170,29 @@ PROG_DIR="$PIE_HOME/programs/chat-completions"
 if [ -f "$WASM_SRC" ]; then
     if [ ! -f "$PROG_DIR/0.1.0.wasm" ] || [ "$WASM_SRC" -nt "$PROG_DIR/0.1.0.wasm" ]; then
         mkdir -p "$PROG_DIR"
-        cp "$WASM_SRC" "$PROG_DIR/0.1.0.wasm"
+        # Copy to a temp name and rename. `cp` straight onto the destination
+        # is not atomic, and the source is a build output: a `cargo build` in
+        # another terminal can be mid-write when this fires, and the
+        # wasm32-wasip2 target's componentisation step leaves a LARGER
+        # intermediate on disk before the final artifact. Copying that
+        # intermediate installs a module the engine cannot run — and it does
+        # not fail cleanly. It HANGS: the launch never acks, nothing is
+        # logged, `/health` keeps answering 200, and every completion request
+        # blocks forever. Cost an hour here, twice, before the byte size gave
+        # it away (823132 installed vs 638350 for a real build).
+        TMP_WASM="$PROG_DIR/.0.1.0.wasm.$$"
+        cp "$WASM_SRC" "$TMP_WASM"
+        # Sanity-check the magic before it can wedge an engine: every
+        # wasm module/component starts "\0asm".
+        if [ "$(head -c 4 "$TMP_WASM" | od -An -c | tr -d ' \n')" != "\0asm" ]; then
+            rm -f "$TMP_WASM"
+            echo "── refusing to install $WASM_SRC: not a wasm module (build in progress?)" >&2
+            exit 1
+        fi
+        mv -f "$TMP_WASM" "$PROG_DIR/0.1.0.wasm"
         cp "$MANIFEST_SRC" "$PROG_DIR/0.1.0.toml"
-        echo "── refreshed $PROG_DIR/0.1.0.{wasm,toml} from $(dirname "$WASM_SRC")"
+        echo "── refreshed $PROG_DIR/0.1.0.{wasm,toml} from $(dirname "$WASM_SRC")" \
+             "($(wc -c <"$PROG_DIR/0.1.0.wasm" | tr -d ' ') bytes)"
     fi
 else
     echo "── warning: no built wasm at $WASM_SRC — using whatever is installed" >&2
@@ -178,12 +244,12 @@ if [ "$SERVE_ONLY" = 1 ]; then
 
 ── serve-only mode. Point stock opencode at it:
 
-     cd $HERE && opencode run -m pie/qwen3-0.6b "read the file $HERE/README.md and summarize it"
+     cd $HERE && opencode run -m pie/$PIE_MODEL "read the file $HERE/README.md and summarize it"
 
    (the ./opencode.json in this directory defines provider "pie" at
     $BASE_URL/v1; opencode picks it up from the cwd)
 
-   Acceptance, separately: python3 $HERE/test_acceptance.py
+   Acceptance, separately: PIE_BASE_URL=$BASE_URL python3 $HERE/test_acceptance.py
    Ctrl-C stops pie serve.
 EOF
     wait "$PIE_PID"

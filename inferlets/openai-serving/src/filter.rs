@@ -220,6 +220,42 @@ pub fn cut_leading_reasoning(text: &str) -> &str {
     text[close + CLOSE_THINK.len()..].trim_start()
 }
 
+/// The answer inside a raw generation, or `None` when the turn produced only
+/// reasoning.
+///
+/// This is the LAST-RESORT path: the filter emitted nothing visible, and the
+/// caller is deciding what a turn that streamed no content should say. The
+/// obvious implementation — strip `<think>`/`</think>` and keep what is left —
+/// is a **privacy and correctness bug**, because the thing left over is the
+/// model's private working-out. It serves reasoning as the answer in exactly
+/// the case the filter was right to suppress it, and the failure is invisible:
+/// the text is fluent, on-topic, and wrong only in kind.
+///
+/// It is not hypothetical. The qwen-code session's first live run under an
+/// open-block cue answered `"Here's a thinking"` with a correct cue and a
+/// correct filter, because its fallback did precisely this. Ours had the same
+/// shape. Under an open-block cue it becomes the COMMON case, since every turn
+/// truncated by `max_tokens` ends inside the block.
+///
+/// So: the answer is what follows the LAST closer, cut at any opener that
+/// starts a new block after it. An unterminated block means the turn died
+/// mid-reasoning and there is no answer to fall back to — `None`, and the
+/// caller substitutes its placeholder.
+pub fn answer_after_reasoning(raw: &str) -> Option<&str> {
+    let tail = match raw.rfind(CLOSE_THINK) {
+        Some(i) => &raw[i + CLOSE_THINK.len()..],
+        None => raw,
+    };
+    // A block opened after the last closer never finished: everything from
+    // there on is reasoning, whatever it looks like.
+    let tail = match tail.find("<think>") {
+        Some(i) => &tail[..i],
+        None => tail,
+    };
+    let tail = tail.trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
 /// Strip the tokenizer's special-token strings out of round-tripped message
 /// content, tool-call names, and tool-call arguments. `specials` is the
 /// decoded special-token table (the inferlet builds it from
@@ -432,5 +468,69 @@ mod stray_closer_tests {
     fn cut_leading_reasoning_leaves_a_matched_block_alone() {
         let s = "Write <think>x</think> to open a reasoning block.";
         assert_eq!(cut_leading_reasoning(s), s);
+    }
+}
+
+#[cfg(test)]
+mod answer_after_reasoning_tests {
+    use super::*;
+
+    /// The bug this function exists to prevent: a matched block's BODY must
+    /// never survive into content. Stripping the tags and keeping the rest
+    /// serves the model's private reasoning as its answer.
+    #[test]
+    fn a_matched_block_yields_only_what_follows_it() {
+        assert_eq!(
+            answer_after_reasoning("<think>The user wants a greeting.</think>Hello to you."),
+            Some("Hello to you.")
+        );
+    }
+
+    /// The stray-closer shape Qwen3.6 produces: reasoning, a closer it never
+    /// opened, then the answer.
+    #[test]
+    fn an_unmatched_closer_still_splits_reasoning_from_answer() {
+        assert_eq!(
+            answer_after_reasoning("I should read the file.\n\n</think>\nThe color is chartreuse."),
+            Some("The color is chartreuse.")
+        );
+    }
+
+    /// Truncated inside the block — `max_tokens` ran out mid-reasoning. There
+    /// is no answer here, only working-out, and the caller must say so rather
+    /// than serve it. Under an open-block cue this is the common case.
+    #[test]
+    fn an_unterminated_block_yields_no_answer() {
+        assert_eq!(answer_after_reasoning("<think>Okay, the user is asking about"), None);
+    }
+
+    /// …including a second block opened after a first one closed.
+    #[test]
+    fn a_reopened_unterminated_block_is_cut_at_the_opener() {
+        assert_eq!(
+            answer_after_reasoning("<think>a</think>Partial answer.<think>more reasoning"),
+            Some("Partial answer.")
+        );
+    }
+
+    /// A block that closed with nothing after it is also no answer.
+    #[test]
+    fn a_block_with_no_tail_yields_no_answer() {
+        assert_eq!(answer_after_reasoning("<think>all reasoning, no answer</think>\n\n"), None);
+    }
+
+    /// No markup at all: the whole generation is the answer. This is the
+    /// untagged-prose case, where nothing marker-based can help — returning it
+    /// is the best available, and it must not regress to None.
+    #[test]
+    fn untagged_text_passes_through_whole() {
+        assert_eq!(answer_after_reasoning("  Three colors: blue, red, green.  "),
+                   Some("Three colors: blue, red, green."));
+    }
+
+    #[test]
+    fn empty_input_yields_no_answer() {
+        assert_eq!(answer_after_reasoning(""), None);
+        assert_eq!(answer_after_reasoning("   \n  "), None);
     }
 }

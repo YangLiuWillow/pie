@@ -133,7 +133,11 @@ from an unrelated session on this machine. A clean `SIGTERM` released it:
 reboot. Both failure modes present identically in that warning, so on a shared
 machine check for another `pie serve` *before* believing the leak reading.
 Budget ~22.6 GiB for this model at `total_pages 512 / max_forward_requests 8 /
-max_model_len 16384`; 32768 is refused, 16384 boots.
+max_model_len 16384`. **32768 is not a ceiling** — the first boot of the
+session ran 32768/1024 pages/32 reqs and came up in 3 s; the later refusal at
+those settings came only after a second `pie serve` was resident. Admission is
+`want + min(transient,2GiB) + 2GiB > reclaimable`, a function of what else is
+on the machine. Measured `want`: 24.77 GiB at 32768, 22.55 GiB at 16384.
 
 **Two more findings, both of which only a capable model could surface:**
 

@@ -98,7 +98,16 @@ def http(method, path, body=None, headers=None, auth=True, timeout=None):
         ttfb = None
         last = time.monotonic()
         while True:
-            chunk = resp.read(65536)
+            # read1, NOT read: on a chunked response CPython's
+            # `_readinto_chunked` blocks until it has the full 65536 bytes or
+            # the body ends, so every inter-chunk gap collapses into one and
+            # ttfb becomes the whole turn. That measures Python's buffering
+            # rather than the wire, and it silently defeats the keepalive test
+            # — the tell is `ttfb == max_gap == turn duration`, which is
+            # exactly what this suite printed before the fix. `read1` returns
+            # what one underlying read produced. (Found by the openclaw
+            # session, which shares this plumbing.)
+            chunk = resp.read1(65536)
             now = time.monotonic()
             if not chunk:
                 break

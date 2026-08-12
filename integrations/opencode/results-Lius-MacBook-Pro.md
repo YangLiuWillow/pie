@@ -249,7 +249,16 @@ The operational rules that follow:
 - **one `pie serve` at a time**, and stop it with `SIGTERM`, not `kill -9` — a
   hard kill during a fire is what genuinely leaks a wedged context;
 - budget ~22.6 GiB for this model at the settings above;
-- `max_model_len 32768` is refused on this machine; 16384 boots.
+- `max_model_len 32768` is **not** out of reach on this machine, and an
+  earlier revision of this file said it was. The first 35B boot of the session
+  ran `total_pages 1024 / max_forward_tokens 2048 / max_forward_requests 32 /
+  max_model_len 32768` and came up in 3 s. The later refusal at those settings
+  happened only once a second `pie serve` was resident. Admission is
+  `want + min(transient, 2 GiB) + 2 GiB margin > reclaimable`, so it tracks
+  what else is on the machine, not the model alone. Measured `want` for this
+  checkpoint: **24.77 GiB** at 32768/1024 pages/32 reqs (18.16 weights +
+  4.466 KV/state/scratch), **22.55 GiB** at 16384/512 pages/8 reqs (18.16 +
+  2.259). Pick from the arithmetic and the machine's reclaimable figure.
 
 ## Reproduce
 

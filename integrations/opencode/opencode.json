@@ -9,6 +9,13 @@
         "apiKey": "pie-local"
       },
       "models": {
+        "qwen3.6-35b-a3b": {
+          "name": "Qwen3.6 35B-A3B (pie)",
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          }
+        },
         "qwen3-0.6b": {
           "name": "Qwen3 0.6B (pie)",
           "limit": {
@@ -19,5 +26,5 @@
       }
     }
   },
-  "model": "pie/qwen3-0.6b"
+  "model": "pie/qwen3.6-35b-a3b"
 }
