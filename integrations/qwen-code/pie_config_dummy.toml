@@ -19,6 +19,13 @@ type = "dummy"
 device = ["cpu"]
 vocab_size = 151936
 arch_name = "qwen3"
+# Ceiling worth knowing: the dummy driver derives its own pool
+# (worker/src/embedded_driver.rs) — 256 pages x 16 tokens = 4096 tokens —
+# and rejects kv_page_size/total_pages/max_model_len as public knobs. A real
+# qwen-code turn is ~9K tokens of system prompt + tools, so it cannot run
+# here: the prefill is refused with "allocation of 2534 units can never fit
+# (pool total 256)" and the turn degrades. This profile is for transport and
+# acceptance work (small prompts); agent-scale runs need Metal or CUDA.
 
 [runtime]
 request_timeout = "600s"

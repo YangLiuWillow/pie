@@ -9,8 +9,12 @@ prompt tokens, task success — and a trajectory-equivalence check in the
 make the same tool calls in the same order; the serving stack changes
 where prefill FLOPs happen, not what the model does.
 
+With one directory it summarizes that arm alone (no comparison) — useful
+when only one arm ran, which is exactly when the numbers are most at risk
+of being lost.
+
 Usage:
-    python3 summarize.py results/pie-qwen3-coder results/vllm-Qwen_Qwen3-Coder-30B-A3B-Instruct
+    python3 summarize.py results/pie-qwen3-coder [results/vllm-Qwen_...]
 """
 
 from __future__ import annotations
@@ -47,7 +51,37 @@ def read_task(tdir: Path) -> dict:
     }
 
 
+def summarize_one(a_dir: Path) -> int:
+    """Single-arm report: no baseline, so no ratio and no trajectory check."""
+    tasks = sorted(p.name for p in a_dir.iterdir() if p.is_dir())
+    if not tasks:
+        print(f"no task dirs under {a_dir}")
+        return 2
+    hdr = f"{'task':<16} {'ok':<4} {'wall_s':>7} {'reqs':>4} {'prompt':>8} {'cached':>8} {'compl':>6}  tool calls"
+    print(hdr)
+    print("-" * len(hdr))
+    tot = dict(wall=0.0, ok=0, prompt=0, cached=0, compl=0)
+    for t in tasks:
+        r = read_task(a_dir / t)
+        print(f"{t:<16} {'y' if r['ok'] else 'N':<4} "
+              f"{r['wall'] if r['wall'] is not None else -1:>7.1f} {r['reqs']:>4} "
+              f"{r['prompt']:>8} {r['cached']:>8} {r['completion']:>6}  "
+              f"{'>'.join(r['calls']) or '-'}")
+        tot["wall"] += r["wall"] or 0
+        tot["ok"] += r["ok"]
+        tot["prompt"] += r["prompt"]
+        tot["cached"] += r["cached"]
+        tot["compl"] += r["completion"]
+    reuse = 100.0 * tot["cached"] / tot["prompt"] if tot["prompt"] else 0.0
+    print(f"\nTOTAL {a_dir.name}: ok {tot['ok']}/{len(tasks)}, wall {tot['wall']:.1f}s, "
+          f"prompt {tot['prompt']}, cached {tot['cached']} ({reuse:.1f}% reuse), "
+          f"completion {tot['compl']}")
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 2:
+        return summarize_one(Path(sys.argv[1]))
     if len(sys.argv) != 3:
         print(__doc__)
         return 2

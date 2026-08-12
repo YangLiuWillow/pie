@@ -44,6 +44,11 @@ use serde::Deserialize;
 /// Defaults when the client sends none — Qwen3 no-think guidance (qwen-code
 /// sends `max_tokens` always but `temperature`/`top_p` only if configured).
 const DEFAULT_MAX_TOKENS: usize = 4096;
+/// Content for a turn that failed after the stream opened. Must be
+/// non-whitespace (see the degrade macro) and should read as a message,
+/// since the client echoes it back as assistant history.
+const DEGRADED_TURN_TEXT: &str = "The server could not complete this turn.";
+
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_TOP_P: f32 = 0.8;
 
@@ -230,7 +235,15 @@ impl Daemon {
             ($msg:expr) => {{
                 eprintln!("[chat-completions] degraded turn: {}", $msg);
                 if stream {
-                    send(chunk::ev_chunk(req_id, &meta.content_delta(" ")));
+                    // NOT whitespace: qwen-code trims content before its
+                    // non-empty check, so a " " delta still reads as an empty
+                    // turn and burns the 4x NO_FINISH_REASON retry budget on
+                    // an error that will not fix itself (dummy-driver harness
+                    // run: 3 identical retries per task, then session abort).
+                    send(chunk::ev_chunk(
+                        req_id,
+                        &meta.content_delta(DEGRADED_TURN_TEXT),
+                    ));
                     send(chunk::ev_chunk(req_id, &meta.finish_chunk("length")));
                     if setup.include_usage {
                         send(chunk::ev_chunk(req_id, &meta.usage_chunk(0, 0, 0)));
