@@ -57,6 +57,65 @@ struct Input {
     /// index API does not cover).
     #[serde(default = "default_true")]
     save_kv: bool,
+    /// Chat path (turn 0): OpenAI-style messages, rendered token-id-native
+    /// via chat.wit. When present, wins over prompt/prompt_tokens and the
+    /// rendered ids are reported back as `prompt_token_ids`.
+    #[serde(default)]
+    messages: Option<Vec<ChatMsg>>,
+}
+
+#[derive(Deserialize)]
+struct ChatMsg {
+    role: String,
+    /// String, or OpenAI parts array (text parts concatenated).
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+impl ChatMsg {
+    fn text(&self) -> String {
+        match &self.content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Render an OpenAI message list to token ids via the model's own template
+/// (chat.wit — every fill returns ids, so this is the templating the engine
+/// itself believes, not a re-implementation).
+fn render_messages(messages: &[ChatMsg]) -> ::std::result::Result<Vec<u32>, String> {
+    let mut ids: Vec<u32> = Vec::new();
+    let mut i = 0;
+    if messages.is_empty() {
+        return Err("messages must be non-empty".into());
+    }
+    if messages[0].role == "system" {
+        if messages.len() >= 2 && messages[1].role == "user" {
+            ids.extend(chat::system_user(&messages[0].text(), &messages[1].text()));
+            i = 2;
+        } else {
+            ids.extend(chat::system(&messages[0].text()));
+            i = 1;
+        }
+    } else if messages[0].role == "user" {
+        ids.extend(chat::first_user(&messages[0].text()));
+        i = 1;
+    }
+    for m in &messages[i..] {
+        match m.role.as_str() {
+            "user" => ids.extend(chat::user(&m.text())),
+            "assistant" => ids.extend(chat::assistant(&m.text())),
+            other => return Err(format!("unsupported role in position >0: {other}")),
+        }
+    }
+    ids.extend(chat::cue());
+    Ok(ids)
 }
 
 fn default_true() -> bool {
@@ -134,6 +193,10 @@ struct Output {
     cached_tokens: usize,
     /// Boundary length this run saved for the next turn (0 = nothing saved).
     saved_len: usize,
+    /// The rendered prompt ids (messages path only — the bridge already has
+    /// them on the token-id path).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prompt_token_ids: Vec<u32>,
     #[serde(skip_serializing_if = "String::is_empty")]
     text: String,
 }
@@ -241,10 +304,16 @@ impl BindState for inferlet::ptir::hybrid::ForwardPass {
 
 macro_rules! define_run_one {
     ($name:ident, $kind:ident) => {
-        async fn $name(input: &Input, stop_tokens: &[u32]) -> Result<RunResult> {
+        async fn $name(
+            input: &Input,
+            stop_tokens: &[u32],
+            rendered: Option<&[u32]>,
+        ) -> Result<RunResult> {
             use inferlet::ptir::$kind::{ForwardPass, submit_frame};
 
-            let prompt_vec: Vec<u32> = if let Some(tokens) = input.prompt_tokens.as_deref() {
+            let prompt_vec: Vec<u32> = if let Some(tokens) =
+                rendered.or(input.prompt_tokens.as_deref())
+            {
                 tokens.to_vec()
             } else {
                 let mut p = chat::system_user("You are a helpful assistant.", &input.prompt);
@@ -411,10 +480,14 @@ macro_rules! define_run_one {
                     .with_context(|| format!("bind prefill chunk @{base}"))?;
                 let drop_tok_c = Channel::new([1], dtype::i32).named("drop_tok_c");
                 let drop_sink = drop_tok_c.clone();
-                let chunk_rng = prefill_rng.clone();
+                // Greedy, rng-less sample: the output is discarded, and a
+                // seeded rng channel stages exactly ONE cell consumed by the
+                // first pass instance that fires — sharing prefill_rng across
+                // several chunk passes fails the second chunk's instantiation
+                // with MissingSeed ("seeded but no seed was put before the
+                // first fire").
                 fwd_c.epilogue(move || {
-                    let (t, _lp) =
-                        sample_lp(intrinsics::logits(), vocab, temperature, top_p, chunk_rng);
+                    let (t, _lp) = sample_lp(intrinsics::logits(), vocab, 0.0, 1.0, None);
                     drop_sink.put(&t);
                 });
                 fwd_c
@@ -651,9 +724,18 @@ async fn main(input: Input) -> Result<Output> {
         chat::stop_tokens()
     };
 
+    let rendered: Option<Vec<u32>> = match &input.messages {
+        Some(msgs) => Some(render_messages(msgs)?),
+        None => None,
+    };
+
     let result = match model::pass_kind() {
-        model::ForwardKind::Attention => run_one_attention(&input, &stop_tokens).await?,
-        model::ForwardKind::Hybrid => run_one_hybrid(&input, &stop_tokens).await?,
+        model::ForwardKind::Attention => {
+            run_one_attention(&input, &stop_tokens, rendered.as_deref()).await?
+        }
+        model::ForwardKind::Hybrid => {
+            run_one_hybrid(&input, &stop_tokens, rendered.as_deref()).await?
+        }
         model::ForwardKind::Recurrent => {
             return Err("rl-rollout has no recurrent-only path".to_string().into());
         }
@@ -675,6 +757,7 @@ async fn main(input: Input) -> Result<Output> {
         finish_reason: result.finish_reason,
         cached_tokens: result.cached_tokens,
         saved_len: result.saved_len,
+        prompt_token_ids: rendered.unwrap_or_default(),
         text,
     })
 }
