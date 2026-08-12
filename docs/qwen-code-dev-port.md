@@ -780,12 +780,28 @@ subsequent turn is a `resume miss`. The dense 0.6B attention path retains
 normally (`retained qwenchat/… (seq N)`), so this is specific to the hybrid
 port.
 
-Leading hypothesis, untested: `generate_for` calls `pipe.close()` before
-returning, and `seal` then opens a *fresh* `Pipeline` and binds the same
-`RsWorkingSet`. A `WorkingSet` survives that; a folded recurrent state
-apparently does not. If so the fix is to seal on the generation pipeline
-rather than a new one — which also has the right semantics, since the seal
-must extend the same fold.
+**Root cause (confirmed by reading, fix NOT yet run).** `run_ahead` closes
+the pipeline it is handed, deliberately — `ptir.rs` documents the departing
+lane holding the seal 4-8 ms and releasing it on time being worth "+9.5% to
++18.7%". So by the time `seal` runs, the pipeline that produced the fold is
+already gone, and the seal binds the old `RsWorkingSet` into a fresh one.
+The opencode branch reports the openclaw session independently hitting the
+same must-make-a-fresh-pipeline-after-`run_ahead` behaviour.
+
+A `WorkingSet` tolerates that rebinding, which is why the attention path
+never saw it. A folded state does not, and the surfaces say why: a
+`kv-working-set` has `update-index` / `from-index` / `remove-index` /
+`slice`, while an `rs-working-set` has only `fork`. A fold has no
+cross-pipeline identity to re-establish, so binding it into a pipeline that
+did not fold it presents exactly as an epoch mismatch.
+
+Sealing on the generation pipeline is therefore impossible, not merely
+awkward. The fix taken instead uses the one re-ordering the surface offers:
+`fork` is documented as producing a child "ordered on `on`", so the seal
+forks the fold onto its OWN pipeline, seals there, and retains the fork.
+Implemented; **not yet verified live** — it needs the 35B and the machine is
+in single-tenant use for another session's measurement pass. Until it has
+run, treat KV reuse on Qwen3.6 as still unmeasured, not as fixed.
 
 Until this is fixed, **pie's KV-reuse result is unobtainable on Qwen3.6**,
 which is the only geometry where Metal implements CoW fork at all (§17). It

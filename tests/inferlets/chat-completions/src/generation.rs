@@ -450,7 +450,7 @@ where
 /// `at`, committing the assistant turn so the retained working set replays
 /// as sealed history. One fire on a fresh pipeline; the host take at the end
 /// guarantees the write landed before the working set is stored/forked.
-pub async fn seal(state: &SessionState, at: u32, seal_tokens: &[u32]) -> Result<u32> {
+pub async fn seal(state: &mut SessionState, at: u32, seal_tokens: &[u32]) -> Result<u32> {
     if seal_tokens.is_empty() {
         return Ok(at);
     }
@@ -467,20 +467,18 @@ pub async fn seal(state: &SessionState, at: u32, seal_tokens: &[u32]) -> Result<
 /// advances over the turn suffix too. If it did not, the retained state would
 /// stand at the pre-seal boundary while KV stood at the post-seal one, and the
 /// next turn would resume a fold that is short by exactly the suffix.
-async fn seal_for<W>(state: &SessionState, at: u32, seal_tokens: &[u32]) -> Result<u32>
+async fn seal_for<W>(state: &mut SessionState, at: u32, seal_tokens: &[u32]) -> Result<u32>
 where
     W: PassWit,
     Pass<W>: BindState,
 {
-    let ws = &state.ws;
-    let rs = &state.rs[..];
     let m = seal_tokens.len() as u32;
     let page_t = kv_page_size();
     let end = at + m;
     let need = end.div_ceil(page_t);
-    let have = ws.page_len();
+    let have = state.ws.page_len();
     if need > have {
-        ws.reserve(need - have).context("seal reserve")?;
+        state.ws.reserve(need - have).context("seal reserve")?;
     }
     let pool = need.max(have);
     let pool_ids: Vec<u32> = (0..pool).collect();
@@ -499,10 +497,31 @@ where
     let sink = Channel::new([1], dtype::i32).named("sink_s");
 
     let pipe = Pipeline::new();
+
+    // A folded recurrent state has NO cross-pipeline identity. `run_ahead`
+    // closes the generation pipeline on purpose (it is worth +9.5–18.7% to
+    // release the lane on time, `ptir.rs`), so by the time the seal runs, the
+    // pipeline that produced the fold is gone. Binding the old state into a
+    // fresh pipeline is what produced
+    //
+    //     channel is poisoned: driver published poison epoch 1
+    //
+    // on every single turn, which dropped every session and made KV reuse
+    // measure 0% on Qwen3.6 (docs §18). `fork` is the only re-ordering the
+    // `rs-working-set` surface offers — a `kv-working-set` has
+    // `update-index`/`from-index`/`slice`, a folded state has only this — and
+    // it is documented as producing a child "ordered on `on`". So the fold is
+    // forked onto the seal's own pipeline, sealed there, and the FORK becomes
+    // the retained state. A `WorkingSet` tolerates the rebinding directly,
+    // which is why the attention path never hit this.
+    let mut rs_owned: Vec<RsWorkingSet> = Vec::with_capacity(state.rs.len());
+    for r in &state.rs {
+        rs_owned.push(r.fork(&pipe).context("rs.fork for seal")?);
+    }
     let fwd: Pass<W> = Pass::new();
     fwd.embed(&toks, &embed_indptr)?;
     fwd.bind_state(
-        ws,
+        &state.ws,
         KvGeometry {
             readable_pages: ..,
             writable_pages: (at / page_t)..,
@@ -514,7 +533,7 @@ where
             positions: &positions,
             mask: None,
         },
-        rs,
+        &rs_owned,
     )?;
     fwd.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
@@ -523,5 +542,9 @@ where
     fwd.submit(&pipe).context("seal submit")?;
     let _ = sink.take_host::<i32>().await.context("seal take")?;
     pipe.close();
+    // The seal advanced the fork's fold over the turn suffix, so the fork —
+    // not the state the turn generated on — is what must be retained, or the
+    // next resume would replay a fold short by exactly the suffix.
+    state.rs = rs_owned;
     Ok(end)
 }

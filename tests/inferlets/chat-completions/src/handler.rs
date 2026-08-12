@@ -397,7 +397,7 @@ impl Daemon {
             .await
         };
 
-        let Generation { state, total_len, generated, hit_max, gen_error } = match gen_result {
+        let Generation { mut state, total_len, generated, hit_max, gen_error } = match gen_result {
             Ok(g) => g,
             Err(e) => degrade!(format!("generation setup failed: {e}")),
         };
@@ -504,7 +504,7 @@ impl Daemon {
         // closes, and the retained set must already exist for the resume to
         // hit. Failures are non-fatal (the next request pays a full rebuild).
         let save_debug = if gen_error.is_none() {
-            match generation::seal(&state, total_len, self.renderer.seal_tokens()).await {
+            match generation::seal(&mut state, total_len, self.renderer.seal_tokens()).await {
                 Ok(total_final) => {
                     let mut canons = session::canon_messages(&setup.messages);
                     if !final_content.is_empty() {
