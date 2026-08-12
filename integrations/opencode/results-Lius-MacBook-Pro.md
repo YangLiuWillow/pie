@@ -149,6 +149,20 @@ direct launch rejected: pie_metal_launch failed with status -1
 **It is not hybrid-specific.** The dense Qwen3-0.6B fails identically at N≥2 on
 the shipped build, so this is the serving path, not the GDN model.
 
+**Re-confirmed under isolation.** Two other sessions could not reproduce it, and
+`$PIE_HOME/programs/chat-completions/0.1.0.wasm` turned out to be a GLOBAL path
+that all three sessions install to — an 824 KB build (not ours; ours is 639 KB)
+was found installed there mid-session, so some of these runs could have been
+measuring another branch's inferlet. Re-run with a private `PIE_HOME`
+(`/tmp/pie_home_oc`, models symlinked) and a byte-verified copy of our own
+build: **identical result** — N=1 clean, N=2 → 2/2 degraded, N=4 → 4/4
+degraded, 6 launch failures in the log. The defect is ours and it is real.
+
+`$PIE_HOME/programs/<name>/<version>.wasm` is a shared namespace with no
+per-branch scoping. Any two checkouts building an inferlet with the same name
+and version overwrite each other, silently, and the loser's server runs the
+winner's code. Use a private `PIE_HOME` for anything you intend to measure.
+
 Three things follow, and none of them are comfortable:
 
 1. **The acceptance suite is entirely sequential**, so 25/25 green never

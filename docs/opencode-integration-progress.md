@@ -20,6 +20,90 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-12 — why upstream's benchmarks run and ours break: they bench a different inferlet, on a different concurrency architecture, with engine knobs we never set
+
+Read the last week of upstream `dev` (356 commits; our base `58cb77936` IS the
+tip, so nothing newer exists). Six findings, in descending order of how much
+they explain our week.
+
+**1. They do not benchmark our inferlet, and they do not go through our
+ingress.** `benches/pie_bench.py` drives **`text-completion-bench`**, which is
+deliberately *not* in the curated set — it must be passed via `--inferlet-dir`
+or `PIE_BENCH_INFERLET_DIR`. It talks to the engine through the pie client
+(`install_program` + `launch_process`), so the OpenAI gateway, SSE framing,
+chat templating and tool decoding are all absent from every number upstream
+publishes. Our path shares only the engine.
+
+**2. The concurrency architecture is different, and this is the big one.**
+`text-completion-bench` takes a `prompts` ARRAY plus `batch_concurrency` and
+runs the fleet **inside ONE process** (`lib.rs:840`: clamp, then a sliding
+window of concurrent futures over one launch). `chat-completions` is *"one
+request per process launch"* by design — so N concurrent HTTP requests are N
+concurrent **processes**, each with its own `Pipeline`, `WorkingSet` and wasm
+instance.
+
+Upstream's contention sweeps therefore exercise N rows in one process. Our
+N-processes shape is the axis they do not bench — and it is exactly where we
+fail (`pie_metal_launch failed with status -1` at N≥2, both models).
+
+**3. They configure engine internals our trimmed config never mentions.**
+`pie_bench.py` sets `SchedulerConfig(max_concurrent_processes=…)` and
+`RuntimeConfig(wasm_max_instances=max(4096, cap*4), wasm_warm_slots,
+wasm_warm_memory_mb, worker_threads)`. Their comment on the instance ceiling is
+the one to read:
+
+> pie's spawn pipeline can hold prewarm + bind (2x the execution limit,
+> double-buffered) + executing at once, so **4x the admission cap is the true
+> ceiling**. `None` means the engine falls back to `max_forward_requests` (R).
+
+Our config sets **zero** of these, so `wasm_max_instances` falls back to
+R = 8 — while we launch one process per request. That is a strong candidate for
+our N≥2 failure and it is **cheap to test**: add a `[scheduler]`/runtime block
+and re-run the concurrency ladder. Not yet tested, so not yet a cause.
+
+**4. `[model].expert_slab_bytes` admits a model bigger than the machine, and I
+told two sessions no such knob existed.** Commit `5c6d28c99` (*"let an operator
+say the one thing that admits an oversized model"*) wires it into
+`MetalDriverOptions`; `pie_bench.py` exposes it as `--expert-slab-mb`. It caps
+the routed expert bank at a fixed number of device bytes and pages experts
+through a slab. Note the distinction the commit insists on: `stream_routed_experts`
+maps the bank and **every mapped page is wired on Apple Silicon**, so it moves
+bytes off the heap and bounds nothing; only a slab budget caps anything, at the
+cost of a submit-and-wait per mixture layer. My earlier claim — "the only escape
+is a C++ test hook" — was about *bypassing the fit check* and missed the
+supported way to *reduce what must be admitted*. Correction issued to both
+sessions.
+
+**5. They hit our exact operational failures and fixed them in the harness.**
+Worth stealing wholesale:
+
+- `d66d72f78` *"a wedged pie is not a transient failure, so stop retrying into
+  it"* — adds `refuse_if_a_wedged_pie_is_still_dying()`, which refuses to start
+  when wedged processes still hold GPU memory, and states why memory "reads
+  healthy right up until it doesn't": a wedged context's pages are accounted to
+  no live process.
+- `dacb3a1a6` *"the staleness guards missed worker/, target/, and the wasm
+  entirely"* + `pie_bench.py:125` — refuses to bench when the wasm is older
+  than `src/`, because *"an edited inferlet silently benches the previous
+  build"*. This is the family our corrupt/stale-wasm wedge belongs to; they
+  refuse, we hung.
+- `052710fcd` *"a hung run cost the sweep every cell before it"*.
+
+**6. The engine-comparison harnesses, for the A/B we eventually want.** All
+share `common.py`'s argument surface, so the same `--model` flows through each:
+`pie_bench.py` (1778 lines), `vllm_bench.py` (813), `sglang_bench.py` (364),
+`llamacpp_bench.py` (216), `mlx_bench.py` (340), `contention_sweep.py` (287,
+the pie-vs-vLLM contention axis), `three_way.py` (186, pie vs mlx-lm vs
+llama.cpp on Metal).
+
+**The conclusion for us.** Upstream's benchmarks work because they exercise a
+narrower, better-instrumented path: one process, N rows, no gateway, explicit
+scheduler and runtime limits, and harness guards for the wedge/staleness
+failures we met by hand. None of that makes our problems less real — serving a
+coding agent means N concurrent *processes* through an HTTP ingress, which is
+the path nobody upstream benchmarks. It does mean our next concurrency
+experiment should start by setting the knobs `pie_bench.py` sets.
+
 ### 2026-08-12 — PA.1 m2 blocker found before we built on it: `run_ahead` overshoot is incompatible with a fold
 
 The qwen-code session ran the seal fix we had both reasoned our way to, and it
