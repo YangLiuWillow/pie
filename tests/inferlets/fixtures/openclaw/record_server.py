@@ -154,8 +154,10 @@ def pick_tool(body):
     for name in PREFERRED_TOOLS:
         if name in fns:
             return name, synth_arguments(fns[name])
-    name = next(iter(fns))
-    return name, synth_arguments(fns[name])
+    # No read-like tool in the surface (e.g. lean mode): don't synthesize a
+    # call to an arbitrary tool — exec-like tools would run the placeholder
+    # as a real command. Fall back to a text answer instead.
+    return None, None
 
 
 def tool_response(body):

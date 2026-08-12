@@ -11,7 +11,7 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | id | task | status |
 |---|---|---|
 | oc-P0.1 | Source-derived OpenClaw wire audit → AUDIT.md | **done** |
-| oc-P0.2 | Real wire captures + fixture bank | pending |
+| oc-P0.2 | Real wire captures + fixture bank | **done** (gateway-only side-calls + image fixture pending, see README gaps) |
 | oc-P0.3 | Renderer parity on OpenClaw fixtures | pending |
 | oc-PA.1 | Keyed sticky affinity in gateway (shared w/ opencode track) | pending |
 | oc-PA.2 | `extensions/pie/` bundled provider in OpenClaw | pending |
@@ -23,6 +23,30 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-PB.5 | Optional depth (grammar calls, speculation, embeddings) | pending |
 
 ## Log
+
+### 2026-08-11 — oc-P0.2 done: real wire captures banked
+
+`tests/inferlets/fixtures/openclaw/wire/req-002..006.json` captured from the
+published CLI (`openclaw@2026.7.1-2` via npx, Node 24.19.0 via nvm, SDK 6.45.0
+on the wire) against the adapted recorder: plain turn (34 tools / 56 KB,
+33 KB system prompt), tool-call turn, **history replay** (assistant
+`content: null` + `tool_calls` + `role:"tool"` string result), and two
+lean-mode turns (4-tool surface). Driver: `openclaw agent --local
+--session-key … --model pie/test-model` with `OPENCLAW_CONFIG_PATH` +
+`OPENCLAW_STATE_DIR` isolation (`integrations/openclaw/openclaw.capture.json`;
+the repo CLI's `agent exec --config` flags don't exist on the npm release yet).
+
+AUDIT.md upgraded: §8 records capture-verified rows and the **version-skew
+table S-1..S-6** — the npm client sends user content as a plain *string* with a
+timestamp envelope prefix (repo HEAD sends part arrays → pie must accept both),
+puts `strict: false` on every tool, ships a 34-tool default / 4-tool lean
+surface, and normalizes tool-call ids (`call_record_001`→`callrecord001`, so
+ids must never be assumed to round-trip). Recorder hardened: in tool mode it
+now only synthesizes calls for read-like tools (the lean run showed it would
+otherwise pick `exec` and run the placeholder as a real command).
+
+Known gaps (README): gateway-only side-calls (title/heartbeat/compaction),
+image-part fixture, and repo-HEAD (`2026.8.1`) recapture once released.
 
 ### 2026-08-11 — oc-P0.1 done: source-derived wire audit
 

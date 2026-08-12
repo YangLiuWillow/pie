@@ -5,9 +5,10 @@
 `2026.8.1`); line numbers refer to it. Uses official `openai` npm SDK `6.49.0`
 (`package.json:2057`) — SDK internals could not be read (no `node_modules` in the
 checkout); SDK-attributed claims are marked *(SDK, uncited)*.
-**Verification status:** everything below is **source-derived** (oc-P0.1). Rows are
-upgraded to **capture-verified** as oc-P0.2 fixtures land in `wire/`. Capture client
-is the published npm CLI (skew note in `README.md` when captures land).
+**Verification status:** §1–§2 request-side claims are **capture-verified** against
+`wire/req-002..006.json` where §8 says so; everything else is **source-derived**
+(oc-P0.1). Capture client is the published npm CLI `2026.7.1-2` (SDK **6.45.0**),
+which diverges from repo HEAD in ways §8 enumerates — pie must tolerate both.
 
 Companion: the opencode audit (`../opencode/AUDIT.md`). §6 lists the divergences —
 they are the load-bearing content for the shared gateway ingress.
@@ -319,6 +320,41 @@ compat: {
 // model entry: reasoning: true  (enables reasoning_content surfacing)
 // provider: timeoutSeconds for slow cold loads; localService { command: "pie", args: ["serve"], healthUrl: ".../health" }
 ```
+
+## 8. Capture results (oc-P0.2) — verified rows and version skew
+
+Captured with `openclaw@2026.7.1-2` (npm) / SDK 6.45.0; source audit targets repo
+`2026.8.1` / SDK 6.49.0. Inventory in `README.md`.
+
+**Capture-verified (agree with §1–§2):** single string system prompt (33 KB) with
+the **three-newline boundary artifact** and no marker; tools name-sorted;
+`tool_choice:"auto"`; `max_completion_tokens` (=32000, the model's maxTokens);
+`stream_options:{include_usage:true}` on loopback; `Accept: application/json`;
+`Authorization: Bearer`; no `prompt_cache_key`/`temperature`/`top_p`/`store` by
+default; assistant tool-call replay `content: null` (D-3); tool result = plain
+string with `tool_call_id`; empty-turn retry observed (one retry, D-14);
+lean mode drastically reduces the surface; recorder's SSE (comment line, split
+tool-call deltas, usage-only chunk, `[DONE]`) accepted end-to-end.
+
+**Version-skew divergences (published CLI vs repo-HEAD source):**
+
+| # | Wire item | npm `2026.7.1-2` (fixtures) | repo `2026.8.1` (source audit) |
+|---|---|---|---|
+| S-1 | user content | **plain string**, with a `[Tue 2026-08-11 18:08 PDT] ` envelope prefix | content-part array (§1b) |
+| S-2 | tool `strict` | **`strict: false` present on every tool** | key absent for custom endpoints (§1c) |
+| S-3 | lean wire list | **4 tools**: `exec, tool_call, tool_describe, tool_search` | 9 tools incl. read/write/edit/apply_patch/process |
+| S-4 | default surface | 34 tools (incl. `cron`, `browser`, `canvas`, `dir_*`, `file_*`, `node_inference`, `memory_*`) | ~40 tools, `automations` (alias `cron`), different roster |
+| S-5 | tool-call id replay | normalized: `call_record_001` → `callrecord001` (underscores stripped) — ids don't round-trip verbatim (they stay self-consistent within a request) | `[^a-zA-Z0-9_-]`→`_`, ≤40 chars (§1b) |
+| S-6 | SDK / UA | `OpenAI/JS 6.45.0` | 6.49.0 pinned |
+
+Ingress consequences: accept string **and** parts user content (already required
+by D-2 vs S-1 — both shapes are in the wild); tolerate `strict: false` on tool
+schemas; never key snapshots or matching on tool-call ids surviving verbatim;
+the timestamp envelope prefix means the **user message** (not just the system
+suffix) has per-turn dynamic content — session-inferlet delta protocol is
+unaffected, but content-addressed (Strategy A) snapshot reuse must treat the
+trailing user turn as always-fresh (it already does: resume strips the trailing
+user/tool suffix).
 
 Pie-side ingress/inferlet action items surfaced by this audit:
 1. Keepalive: switch per-client `: ping` to empty-delta chunks (universal).

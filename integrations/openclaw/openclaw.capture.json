@@ -1,0 +1,29 @@
+{
+  "agents": {
+    "defaults": {
+      "model": "pie/test-model",
+      "workspace": "/private/tmp/claude-501/-Users-yangliu-Desktop-Lin-startup/00cdd6fa-9b98-46a1-b2dd-fc6a1f0c64da/scratchpad/capture-ws"
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "pie": {
+        "baseUrl": "http://127.0.0.1:8123/v1",
+        "apiKey": "pie-capture-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "test-model",
+            "name": "Pie Capture Model",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 262144,
+            "maxTokens": 32000
+          }
+        ]
+      }
+    }
+  }
+}
