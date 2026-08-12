@@ -97,6 +97,57 @@ is the Strategy A milestone: a stock coding agent doing real agentic work on a
 
 ---
 
+## Measured, single-tenant and warm (2026-08-12, post-`read1`)
+
+Every earlier timing in this file was taken with other `pie serve` processes
+resident, and every `ttfb` predating the `read1` fix is an artifact of CPython
+buffering rather than a property of the server. **These are the numbers to
+quote.** One `pie serve`, nothing else on the GPU, model warmed with a
+throwaway request first, config exactly as in §Configuration.
+
+| | Qwen3.6-35B-A3B (MLX 4-bit, Metal) |
+|---|---|
+| prefill | **421 tok/s** (5221-token prompt, first content at 12.41 s, n=3, σ<0.05 s) |
+| decode, single-stream | **90 tok/s** (400 tokens, n=3: 87.9 / 89.6 / 90.0) |
+| TTFB (first SSE byte) | **0.003 s** |
+| 8 concurrent long prompts | 98.6 s wall, 8/8 completed; per-request 35.6 / 73.5 / 98.6 s (min/median/max) |
+| stock-opencode agentic task, end to end | **81.2 s** (read → write, 2 tool calls, correct file) |
+
+Two of those need their labels read carefully:
+
+- **TTFB is not time-to-first-token.** This inferlet emits the role chunk
+  before prefill starts, deliberately, so a long prefill cannot look like a
+  dead stream. 0.003 s is that chunk. The number a user feels is
+  `first_content`, 12.4 s on a 5.2k prompt.
+- **"8 concurrent" is 8 requested, 4 seated.** A hybrid model costs two
+  admission seats per lane (`seat_cost=2`), so `max_forward_requests = 8`
+  seats 4 and the other four queue. Reporting it as 8-way concurrency would
+  overstate it by exactly 2×.
+
+### What the numbers say about the roadmap
+
+Prefill is 421 tok/s and decode is 90 tok/s, and the agentic task took 81.2 s.
+Those three facts together are the argument for the rest of this project:
+
+```
+3 model turns re-prefilling ~24k tokens of history   = ~57 s
+generating ~200 tokens of actual output              = ~2 s
+                                                       ─────
+                                            ~70% of the task is re-prefill
+```
+
+opencode re-sends the whole conversation every turn, so pie re-prefills a
+history that changed by a few hundred tokens. With the KV working set resumed
+across turns, turns 2 and 3 would prefill only their deltas: **~81 s → ~21 s on
+this task, from the same model on the same hardware.**
+
+That is PA.1 milestone 2 and Strategy B, and it is no longer a claim from the
+paper — it is the measured shape of our own e2e run. It is also why the
+constraints in the progress log matter so much: the RS index surface gap
+decides whether this is reachable on a hybrid model at all.
+
+---
+
 ## Findings
 
 ### 1. The serving inferlet could not run a hybrid (GDN) model — FIXED
