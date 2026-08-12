@@ -12,7 +12,7 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 |---|---|---|
 | oc-P0.1 | Source-derived OpenClaw wire audit → AUDIT.md | **done** |
 | oc-P0.2 | Real wire captures + fixture bank | **done** (gateway-only side-calls + image fixture pending, see README gaps) |
-| oc-P0.3 | Renderer parity on OpenClaw fixtures | pending |
+| oc-P0.3 | Renderer parity on OpenClaw fixtures | **done — all 5 token-exact** |
 | oc-PA.1 | Keyed sticky affinity in gateway (shared w/ opencode track) | pending |
 | oc-PA.2 | `extensions/pie/` bundled provider in OpenClaw | pending |
 | oc-PA.3 | Acceptance suite + e2e + A/B vs Ollama/llama.cpp | pending |
@@ -23,6 +23,30 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-PB.5 | Optional depth (grammar calls, speculation, embeddings) | pending |
 
 ## Log
+
+### 2026-08-11 — oc-P0.3 done: renderer parity — ALL 5 OpenClaw fixtures token-exact
+
+The opencode parity harness (`integrations/opencode/parity/`, unmodified —
+`--fixtures-dir` pointed at the openclaw wire captures) vs HF
+`apply_chat_template(enable_thinking=False)`, Qwen/Qwen3-0.6B,
+transformers 5.15.0 (+ jinja2, now a known venv dep):
+
+```
+req-002 24133 tok | req-003 24139 | req-004 24236 | req-005 8642 | req-006 8687 — all exact
+```
+
+The D1–D4 fixes from the opencode track generalize with **zero new divergence
+classes** at 3× the prompt length: the 34-tool/56 KB schema block (nested
+unions, big maximums, `strict: false` keys) survives the `python_json`
+formatter, and the history-replay turn (assistant `content: null` +
+normalized tool-call id + string tool result) renders exactly.
+
+Sizing consequence for oc-PA.3: full-surface OpenClaw prompts render ≈24.2k
+tokens (lean ≈8.7k) — the live-serve config needs `max_model_len ≥ 32768`
+(1024 pages × 32), double the opencode profile's 16384.
+
+**Phase 0 complete.** Next: oc-PA.1 keyed sticky affinity (gateway),
+oc-PA.2 `extensions/pie/` in OpenClaw, oc-PA.3 acceptance + e2e + A/B.
 
 ### 2026-08-11 — oc-P0.2 done: real wire captures banked
 
