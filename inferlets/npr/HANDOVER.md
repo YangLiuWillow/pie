@@ -67,12 +67,24 @@ real GPU hardware**.
   with 2 parallel blocks, 5 branches, multi-chunk refill joins of 1.5k-token
   siblings, 4,005 tokens in 17.4 s.
 
-Ten engine-level bugs were found on the way; **six are fixed on this branch**
+- **Third backend**: the ggml **Metal** path runs the whole pipeline on Apple
+  silicon. Selftest passes on NPR-4B (TVs ≤ 0.0003, control 0.5571 vs the H200's
+  0.55) and AIME 2025 I/1 solves correctly — but at 17.7 tok/s serial with poor
+  batching, so it is for correctness work, not sweeps (DESIGN.md §12).
+
+Eleven engine-level bugs were found on the way; **seven are fixed on this branch**
 (the commits below), four are documented-but-unfixed (§7).
 
-## 4. Commits on the branch (12)
+## 4. Commits on the branch (16)
 
 ```
+6125f7a  fix(inferlets/npr): download the CMake tarball to a file, with retries
+54425a3  fix(inferlets/npr): pod bootstrap installs CMake >= 3.23 and finds nvcc
+f46f8f9  chore(inferlets/npr): pod bootstrap does the bf16 cast and installs eval deps
+60c2a16  feat(inferlets/npr): avg@8 AIME25 eval harness + Metal bring-up
+b5380d3  fix(driver/portable): size the sampling tail by slot count, not request count
+124cb85  docs(inferlets/npr): restore CPU validation detail, correct migration note
+d759a07  docs(inferlets/npr): handover — design study, pod artifacts, run transcripts
 e7a45dc  fix(inferlets/npr): parse plans without relying on the rendered open tag
 8de3f5e  fix(driver/cuda): skip logits tail for prefill-only batches
 7b883f2  feat(inferlets/npr): RunPod bootstrap script + standalone JSON-WS client
@@ -85,11 +97,13 @@ c0218d2  fix(sdk): prevent trap in Context::destroy from double resource release
 (+ this handover commit)
 ```
 
-Four of these are **upstreamable pie bug fixes independent of NPR** — worth
+Five of these are **upstreamable pie bug fixes independent of NPR** — worth
 separate PRs to `pie-project/pie`: `c0218d2` (SDK destroy trap), `e10b9ac`
 (portable KV write index — a real data-corruption bug), `86ed682` (runtime commit
 check), `8de3f5e` (CUDA prefill OOB — crashes any prompt longer than the request
-cap, so it affects far more than NPR).
+cap, so it affects far more than NPR), and `b5380d3` (portable sampling reshape —
+aborts the whole server process on any batch that mixes a prefill with decodes,
+so it hits any concurrent workload, not just NPR).
 
 ## 5. How to run it (from zero, on a GPU pod)
 
@@ -106,18 +120,21 @@ cap, so it affects far more than NPR).
 curl -fsSL https://raw.githubusercontent.com/YangLiuWillow/pie/npr-inferlet/inferlets/npr/pod-setup.sh -o pod-setup.sh
 bash pod-setup.sh      # run under nohup/setsid if over ssh; it survives disconnects
 
-# 3. Convert the checkpoint to bf16 (REQUIRED — the published NPR-4B is fp32 and
-#    pie's loader does not cast; symptom otherwise:
-#    "gemm_act_x_w: unsupported dtype combo (act=bf16, w=fp32, y=bf16)").
-python3 /workspace/pie/inferlets/npr/convert_bf16.py    # edit paths at the top
-sed -i 's|hf_repo = .*|hf_repo = "/workspace/NPR-4B-bf16"|' /workspace/npr-cuda.toml
-
-# 4. Serve + run.
+# 3. Serve + run. (pod-setup.sh now does the fp32->bf16 cast itself and points
+#    the config at the result; that used to be a manual step.)
 cd /workspace/pie
 PIE_CONFIG=/workspace/npr-cuda.toml nohup ./target/release/pie serve > /workspace/serve.log 2>&1 &
 /workspace/venv/bin/python inferlets/npr/client.py --input '{"selftest": true}'
 /workspace/venv/bin/python inferlets/npr/client.py --input '{"max_new_tokens": 30000, "question": "..."}'
+
+# 4. The sweep (see inferlets/npr/evals/README.md).
+/workspace/venv/bin/python inferlets/npr/evals/run_eval.py --k 8 --concurrency 32
 ```
+
+**Image note**: a plain `nvidia/cuda:12.8.1-devel-ubuntu22.04` works and is what
+the eval pod used; `pod-setup.sh` installs a current CMake (Ubuntu 22.04's 3.22
+is below driver/cuda's 3.23 minimum) and puts `/usr/local/cuda/bin` on PATH.
+Install `curl` and `git` first — that image has neither.
 
 Local CPU/Metal smoke tests need no GPU: use `configs/npr-portable.toml` (real
 tokens, ~1 tok/s) or `configs/npr-dummy.toml` (random tokens, exercises control
@@ -171,7 +188,10 @@ assumption. (`write_kv_kernel` in the CUDA driver was already slot-correct.)
    back to `pie_client`.
 5. **Pass-level speculation is disabled** throughout the inferlet — stale staged
    run-ahead passes for destroyed branch contexts raced the join's refills and
-   crashed the driver once. If you re-enable it, expect that race.
+   crashed the driver once. If you re-enable it, expect that race. *Caveat*: the
+   `build_qwen3_graph` crash that motivated this turned out to have a second,
+   fork-independent cause — see DESIGN.md §12, bug 11 — so the speculation race
+   may never have been the culprit.
 6. **`hf_repo` must be a resolved local snapshot path**, and the config uses the
    combined `[gateway]` / `[worker.*]` section layout (a flat `[[model]]` is
    silently not found).
@@ -179,13 +199,13 @@ assumption. (`write_kv_kernel` in the CUDA driver was already slot-correct.)
 
 ## 8. Suggested next steps
 
-1. **The eval that's actually missing**: avg@8 on AIME25 (and HMMT25/AMC23)
-   comparing `join_mode=refill` vs `join_mode=textual` vs a sequential baseline,
-   plus tokens/sec, against the paper's Table 2/3 numbers. The NPR repo's
-   `evals/evaluate.py` has the scoring harness (`math_equal`, `extract_answer`,
-   pass@k) — driving it against pie means replacing the SGLang engine calls with
-   `client.py` launches. This is the headline result: *does the user-space
-   inferlet reproduce NPR Engine quality and speed?*
+1. **The eval**: `inferlets/npr/evals/` now holds the harness — AIME 2025 (30
+   problems), a concurrent sweep driver, and a scorer for avg@k / pass@k /
+   throughput, across `refill` vs `textual` vs a `sequential` baseline
+   (`max_plans=0`). See `evals/README.md`; run it per §5 on a CUDA pod.
+   Accuracy runs at high concurrency, the speed pass must run at concurrency 1.
+   This is the headline result: *does the user-space inferlet reproduce NPR
+   Engine quality and speed?*
 2. **Phase 3 — `context.adopt_pages`**: the O(1) KV page-graft op (DESIGN.md §4)
    that replaces refill recomputation and closes the last efficiency gap.
 3. **Upstream the four independent pie fixes** as PRs (§4).
