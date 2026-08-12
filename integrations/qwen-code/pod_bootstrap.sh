@@ -57,6 +57,12 @@ source "$HOME/.cargo/env"
 python3 -c 'import cmake' 2>/dev/null || pip install -q cmake ninja
 pip install -q websockets msgpack blake3 cryptography huggingface_hub
 apt-get install -y -qq jq netcat-openbsd rsync >/dev/null 2>&1 || true
+# qwen-code (the e2e/benchmark client) needs node; rc=127 from the bench
+# harness means this block was skipped.
+command -v node >/dev/null 2>&1 || {
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1
+    apt-get install -y -qq nodejs >/dev/null 2>&1
+}
 
 # ── 4. Build server + inferlet ──────────────────────────────────────────────
 echo "── building pie-bin (driver-cuda, sm_$CUDA_ARCH)"

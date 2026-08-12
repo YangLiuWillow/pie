@@ -41,10 +41,31 @@ task battery. Old-engine result (old plan §5b): pie 1.47× slower overall,
 divergence (C3: byte-exact) and per-request daemon overhead (long-lived
 instance). Steps:
 - [x] Branch pushed to fork
-- [ ] Port `bench/` harness (old branch `f380e9904`) to the new CLI/stack
-- [ ] Provision H100/H200 pod, bootstrap, pull 30B weights
-- [ ] pie arm + vLLM arm runs, trajectory diff, summary
-- [ ] Results appended to `docs/qwen-code-dev-port.md`
+- [x] `bench/` harness carried over + arm boot scripts codified
+      (`start_pie_arm.sh`, `start_vllm_arm.sh`, H200 30B config)
+- [x] First H200 pod (f5nlisg6y3jxcr) bootstrapped — then handed over to
+      the parallel NPR session, which checked out its branch over ours;
+      benchmark needs exclusive GPU, so it moved to a fresh pod. Fixes
+      that came out of that bring-up: pod_bootstrap artifact check
+      (prefetch made import self-skip), 300s `silence_timeout` (30B first
+      request outlives the 30s default and the kill takes the WS down),
+      shim full-reconnect with backoff.
+- [x] Replacement pod 4ld75rjrqf0znl (H200 secure): bootstrapped, 30B
+      imported, pie arm ran (5/5 rc=0, 61.5 s total wall)
+- [ ] **BLOCKED — RunPod credit exhausted mid-run.** Balance hit $0 while
+      four pods across sessions burned $7.92–11.51/hr; RunPod terminated
+      every pod, including ours, before the vLLM arm ran. Balance $2.66,
+      no pods live, nothing further can run until the account is topped
+      up. The `results/` directory (wire captures, per-task logs) died
+      with the pod — only the console summary survived (recorded in
+      docs §10).
+- [ ] vLLM arm: never ran. Root cause found and now guarded in
+      `start_vllm_arm.sh`: vllm 0.25.1 ships CUDA-13 wheels and needs
+      driver ≥ 580; this pod had 575.57.08. Swapping torch to cu128 fixes
+      torch but not vllm's own extensions (`libcudart.so.13`). Next run:
+      provision a driver-≥580 pod, or pin a cu12-era vllm and document
+      the version delta.
+- [ ] Trajectory diff, summary, results into `docs/qwen-code-dev-port.md`
 
 ## Later / parked
 

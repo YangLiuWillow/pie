@@ -228,6 +228,47 @@ position-independent `/no_think` user-turn decoration vs HF's empty
 remains normalized-and-reported by the checker (`[KNOWN-DIV]`), not silently
 accepted. Acceptance stayed 25/27 on dummy (the 2 are real-model rows).
 
+## 10. 30B A/B rerun (2026-08-12) — INCOMPLETE, pie arm only
+
+Attempted on H200 (secure pod, sm_90, CUDA 12.9 toolkit, driver 575.57.08),
+Qwen3-Coder-30B-A3B-Instruct, same 5-task battery as the old §5b run. **The
+run did not complete**: the RunPod account's credit ran out mid-benchmark
+(four pods across parallel sessions burning $7.92–11.51/hr), RunPod
+terminated every pod, and the results directory — wire captures, per-task
+logs — went with it. Only the console summary survives:
+
+| task | wall | rc | check |
+|---|---|---|---|
+| shell-create | 20.50 s | 0 | PASS |
+| fix-off-by-one | 11.58 s | 0 | FAIL |
+| grep-count | 16.91 s | 0 | PASS |
+| add-function | 8.92 s | 0 | FAIL |
+| rename-refactor | 3.58 s | 0 | FAIL |
+
+Total wall 61.5 s (old-engine pie arm: 45.1 s, 5/5). **Do not read this as a
+regression**: different pod and driver, no token/cache statistics were
+collected (`summarize.py` never ran), and the vLLM arm never started, so
+there is no baseline for this hardware. The one substantive observation,
+from the single surviving capture I inspected before the pod died:
+`rename-refactor` ended after one model turn that returned prose and
+`finish_reason:"stop"` with no tool call — i.e. a no-call turn, not a
+decode failure. Temperature was the inferlet default (0.7): qwen-code
+v0.21.6 still has no settings path that puts `temperature` on the wire, so
+t=0 equivalence remains impossible without a fork patch (same constraint as
+§5b).
+
+**vLLM arm blocker (fixed for next time).** vllm 0.25.1 ships CUDA-13-linked
+wheels (torch cu130 + extensions against `libcudart.so.13`) and requires
+driver ≥ 580 — the old §5b pod had 580.159.04, this one had 575.57.08.
+Torch refuses to initialize; force-swapping torch to cu128 gets torch
+working but leaves vllm's own extensions unloadable. `start_vllm_arm.sh`
+now gates on driver major ≥ 580 and fails fast with that explanation.
+
+To finish this benchmark: top up RunPod, provision an H200 whose driver is
+≥ 580, run `pod_bootstrap.sh`, then the two arm scripts and `summarize.py`.
+Budget ~1.5 h at ~$4.60/hr, and watch for other sessions' pods on the same
+account.
+
 Note for the record: generation-time turns save KV containing the model's own
 compact-JSON tool-call bytes, while a rebuild-from-history renders the
 tojson-spaced form; addresses hash canon strings (not bytes), and each path
