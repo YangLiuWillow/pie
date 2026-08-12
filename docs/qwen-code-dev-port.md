@@ -480,3 +480,39 @@ prompts resent every turn, that difference dominates wall-clock. Any run-3
 report must therefore state plainly that the vLLM arm ran without prefix
 caching, and must not present the gap as an engine-vs-engine result. This
 strengthens, not replaces, §4's existing rule about `cached_tokens`.
+
+### A better reference for the new gate: vLLM's `/render`
+
+vLLM 0.27 exposes `POST /v1/chat/completions/render`, which returns the
+exact `token_ids` it would feed the model (9,626 for fixture
+`episode0/…eff10f97`). That is a strictly better parity reference than
+`apply_chat_template`: it *is* the baseline arm's behavior, so it removes
+the "is our reference even right?" question that §12 had to answer by hand.
+The new gate should compare pie's `echo_tokens` against this endpoint.
+
+It requires the server to run with `--enable-auto-tool-choice
+--tool-call-parser qwen3_xml` (alias `qwen3_coder`; both map to
+`Qwen3EngineToolParser`, `structural_tag_model = "qwen_3_coder"`). Without
+those flags a tools-bearing request is rejected with HTTP 400 — and, more
+importantly, **the benchmark arm would not emit `tool_calls` at all**,
+reproducing run 2's failure mode on the vLLM side. `start_vllm_arm.sh`
+must set them.
+
+Decoding that stream against `hf_reference()` already caught a real
+divergence, 3 bytes over 43 KB:
+
+```
+vllm: …</system-reminder><system-reminder>\nThis is the Qwen Code…
+hf  : …</system-reminder>\n<system-reminder>\nThis is the Qwen Code…
+```
+
+**Multi-part text content concatenates with no separator.** The template's
+`render_content` macro emits `item.text` per part with nothing between,
+while both `check_render.py`'s `hf_reference` (`"\n".join(...)`) and pie's
+`MessageContent::as_text()` join with `\n`. The corpus has 146 multi-part
+messages, so under Qwen3.6 pie would diverge on nearly every turn. Fixing
+this means `as_text()` needs to be dialect-aware — the `\n` join is correct
+for the hermes captures it was written against and wrong here.
+
+Confirmed from the same decode: the generation prompt really does end
+`<|im_start|>assistant\n<think>\n`, so the thinking seed is unavoidable.
