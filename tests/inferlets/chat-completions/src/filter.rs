@@ -26,9 +26,21 @@ pub struct VisibleFilter {
 
 impl VisibleFilter {
     pub fn new() -> Self {
+        Self::starting(false)
+    }
+
+    /// Construct a filter for a turn that begins INSIDE a `<think>` block,
+    /// because the cue opened one and left it open (Qwen3.5/3.6 lineage —
+    /// see `render_text::THINK_OPEN`).
+    ///
+    /// This is the only construction that is correct regardless of whether
+    /// the model tags its reasoning: there is no opener to miss, and a turn
+    /// truncated mid-reasoning yields empty content rather than leaked
+    /// reasoning, because the filter never left think-mode.
+    pub fn starting(in_think: bool) -> Self {
         Self {
             pending: String::new(),
-            mode: Mode::Text,
+            mode: if in_think { Mode::Think } else { Mode::Text },
             emitted_any: false,
         }
     }
@@ -135,4 +147,45 @@ fn holdback(s: &str, markers: &[&str]) -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Starting inside the block is correct whether or not the model tags
+    /// its reasoning — the case that defeats every marker-based approach.
+    #[test]
+    fn think_mode_start_suppresses_untagged_reasoning() {
+        let mut f = VisibleFilter::starting(true);
+        // Untagged reasoning prose, exactly what was observed with a cue that
+        // opened no block at all. Nothing here is a marker.
+        assert_eq!(f.feed("Thinking Process:\n1. Analyze the request.\n"), "");
+        assert_eq!(f.feed("2. Decide on a greeting.\n"), "");
+        // Only after the model closes the block does content become visible.
+        let out = f.feed("</think>\n\nHello there friend");
+        assert_eq!(out.trim(), "Hello there friend");
+    }
+
+    /// A turn truncated by `max_tokens` before any closer yields EMPTY
+    /// content rather than leaked reasoning. This is the property the
+    /// non-streaming `cut_leading_reasoning` workaround cannot provide,
+    /// because it needs a closer to fire at all.
+    #[test]
+    fn truncation_mid_reasoning_leaks_nothing() {
+        let mut f = VisibleFilter::starting(true);
+        assert_eq!(f.feed("Here's a thinking process:\n\n1. Analyze"), "");
+        assert_eq!(f.feed(" the user input, which is"), "");
+        // Stream ends here — nothing was ever emitted.
+        assert!(!f.emitted_any);
+    }
+
+    /// The non-thinking lineage is unchanged: a filter that starts in text
+    /// mode still emits text and still strips a tagged block.
+    #[test]
+    fn text_mode_start_is_unchanged() {
+        let mut f = VisibleFilter::starting(false);
+        assert_eq!(f.feed("plain "), "plain ");
+        assert_eq!(f.feed("<think>hidden</think>tail"), "tail");
+    }
 }

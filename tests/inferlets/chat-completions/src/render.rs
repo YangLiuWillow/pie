@@ -45,6 +45,10 @@ pub struct Renderer {
     /// Tool-calling dialect this model was tuned on. Coder-tuned models
     /// served the hermes prompt answer in prose and never call a tool.
     dialect: rt::Dialect,
+    /// True when the generation prompt leaves a `<think>` block OPEN
+    /// (Qwen3.5/3.6 lineage). The turn then begins inside the block, so the
+    /// visible-text filter must start in think-mode.
+    opens_think: bool,
 }
 
 impl Renderer {
@@ -72,7 +76,15 @@ impl Renderer {
         // assistant prefix. Rendered here (not via `chat::cue()`) so
         // generation and replay share one code path; the engine's cue for
         // ChatML models is the same bytes.
-        let generation_header = make_prefix("assistant");
+        let opens_think = rt::lineage_opens_think(&model::name(), &model::architecture());
+        // The thinking lineage's template ends the generation prompt inside
+        // an open `<think>` block; every other lineage ends at the role
+        // header. Rendered into the cue itself so generation and replay
+        // share one code path.
+        let mut generation_header = make_prefix("assistant");
+        if opens_think {
+            generation_header.extend(encode(rt::THINK_OPEN));
+        }
 
         let mut stop_ids = chat::stop_tokens();
         if im_start.len() == 1 && !stop_ids.contains(&im_start[0]) {
@@ -94,6 +106,7 @@ impl Renderer {
             newline,
             turn_suffix,
             generation_header,
+            opens_think,
             tool_call_open: encode(rt::TOOL_CALL_OPEN),
             tool_call_mid: encode(rt::TOOL_CALL_MID),
             tool_call_close: encode(rt::TOOL_CALL_CLOSE),
@@ -107,6 +120,12 @@ impl Renderer {
 
     pub fn dialect(&self) -> rt::Dialect {
         self.dialect
+    }
+
+    /// Whether the cue left a `<think>` block open, so the turn starts
+    /// inside it.
+    pub fn opens_think(&self) -> bool {
+        self.opens_think
     }
 
     fn role_tokens(&self, prefix: &[u32], msg: &str) -> Vec<u32> {

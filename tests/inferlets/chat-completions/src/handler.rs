@@ -304,7 +304,7 @@ impl Daemon {
         let has_tools = !setup.tool_schemas.is_empty();
         let tool_decoder = has_tools.then(tools_wit::Decoder::new);
         let chat_dec = inferlet::chat::Decoder::new();
-        let mut filter = VisibleFilter::new();
+        let mut filter = VisibleFilter::starting(self.renderer.opens_think());
         let mut visible_text = String::new();
         let mut emitted_visible = false;
         let mut calls: Vec<ToolCallOut> = Vec::new();

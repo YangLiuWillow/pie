@@ -26,6 +26,16 @@ impl Dialect {
     /// `[model] name` and the architecture, and `qwen3_moe` covers both the
     /// Coder and non-Coder MoE models — so the name is the only signal, and
     /// a Coder deployment must carry "coder" in it (the bench config does).
+    ///
+    /// **Detection must not depend on the spelling of `architecture`.** The
+    /// engine passes the driver's arch *stem* — `architectures[0]` lowercased
+    /// with the task suffix stripped — so `Qwen3_5MoeForConditionalGeneration`
+    /// arrives as `qwen3_5moe`, without the underscore an HF `model_type`
+    /// would have. Keying on that spelling is how the engine-side
+    /// `instruct::create` silently dropped every tool schema for Qwen MoE/VL
+    /// models (found on `liu/opencode-integration`, fixed there in
+    /// `model/src/instruct.rs`). The substring tests below are chosen to hold
+    /// under either spelling.
     pub fn detect(model_name: &str, architecture: &str) -> Dialect {
         let hay = format!("{model_name} {architecture}").to_lowercase();
         if hay.contains("coder") {
@@ -35,6 +45,38 @@ impl Dialect {
         }
     }
 }
+
+/// Whether the loaded model is a Qwen3.5/3.6-lineage *thinking* model, whose
+/// chat template ends the generation prompt inside an OPEN `<think>` block
+/// rather than after the bare role header.
+///
+/// This is a separate axis from [`Dialect`] on purpose: it decides how the
+/// turn *starts*, not how tools are spelled, and the two need not move
+/// together while the Qwen3.6 tool dialect is still unimplemented (§14).
+///
+/// Substring-based for the reason given on [`Dialect::detect`] — `qwen3_5`,
+/// `qwen3_5moe`, `qwen3_5_moe`, `qwen3.6` and `qwen3_6` must all match.
+pub fn lineage_opens_think(model_name: &str, architecture: &str) -> bool {
+    let hay = format!("{model_name} {architecture}").to_lowercase();
+    let hay: String = hay.chars().filter(|c| *c != '_' && *c != '.' && *c != '-').collect();
+    hay.contains("qwen35") || hay.contains("qwen36") || hay.contains("qwen3next")
+}
+
+/// The generation-prompt tail for a thinking-lineage model: the block is
+/// opened and deliberately left open, so the model continues *inside* it.
+///
+/// Why open rather than closed-and-empty: a filter that starts in think-mode
+/// suppresses reasoning deterministically from token zero — no buffering, no
+/// markers to miss, and a turn truncated by `max_tokens` mid-reasoning
+/// yields empty content instead of leaked reasoning. The alternatives both
+/// fail somewhere: emitting nothing leaves the model free to reason untagged
+/// (observed on `liu/opencode-integration`), and emitting a *closed* empty
+/// block leaves its own closer unmatched (also observed there). Neither
+/// failure is reliably reproducible — it depends on prompt context and
+/// possibly sampling temperature, still unresolved between the two branches
+/// — which is exactly why starting inside the block is preferred: its
+/// correctness does not rest on that question.
+pub const THINK_OPEN: &str = "<think>\n";
 
 /// The Coder template's stand-in system message when a request carries tools
 /// but no system turn of its own.
@@ -400,6 +442,45 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(got, expect, "coder tool-response batching diverges");
+    }
+
+    /// The stem trap: the engine hands us `architectures[0]` lowercased with
+    /// the task suffix stripped, NOT an HF `model_type`. Both spellings must
+    /// reach the same answer, or the thinking lineage silently renders the
+    /// non-thinking cue — the same class of bug that dropped tool schemas
+    /// engine-side for every Qwen MoE/VL model.
+    #[test]
+    fn thinking_lineage_survives_both_arch_spellings() {
+        // HF model_type spellings.
+        for arch in ["qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_next"] {
+            assert!(lineage_opens_think("default", arch), "model_type {arch}");
+        }
+        // Driver arch-stem spellings (underscores collapsed by the stem rule).
+        for arch in ["qwen3_5moe", "qwen35moe", "qwen3next"] {
+            assert!(lineage_opens_think("default", arch), "arch stem {arch}");
+        }
+        // And from the config name alone, which is what we actually rely on.
+        for name in ["qwen3.6-35b-a3b", "Qwen3.5-35B-A3B", "qwen3_6"] {
+            assert!(lineage_opens_think(name, "unknown"), "config name {name}");
+        }
+        // Non-thinking lineages must NOT open a block.
+        for (name, arch) in [
+            ("qwen3-coder-30b-a3b", "qwen3_moe"),
+            ("default", "qwen3moe"),
+            ("Qwen3-0.6B", "qwen3"),
+            ("default", "llama"),
+        ] {
+            assert!(!lineage_opens_think(name, arch), "{name}/{arch}");
+        }
+    }
+
+    /// The open block is deliberately left unclosed — closing it here is the
+    /// failure mode the opencode branch hit, where the model's own closer
+    /// then has no opener.
+    #[test]
+    fn think_open_is_an_opener_only() {
+        assert_eq!(THINK_OPEN, "<think>\n");
+        assert!(!THINK_OPEN.contains("</think>"));
     }
 
     #[test]
