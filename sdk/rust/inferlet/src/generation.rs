@@ -75,6 +75,12 @@ pub struct Generator<'ctx> {
     output_buffer: VecDeque<u32>,
     tokens_generated: usize,
     rebid_each_step: bool,
+    /// Offset added to slot-derived position ids (see
+    /// [`position_offset`](Self::position_offset)). 0 = positions == slots.
+    pos_offset: i64,
+    /// When false, runtime pass-level speculation (run-ahead staging) is
+    /// disabled on every step.
+    allow_pass_speculation: bool,
     done: bool,
 }
 
@@ -124,6 +130,8 @@ impl<'ctx> Generator<'ctx> {
             output_buffer: VecDeque::new(),
             tokens_generated: 0,
             rebid_each_step: true,
+            pos_offset: 0,
+            allow_pass_speculation: true,
             done: false,
         }
     }
@@ -210,6 +218,33 @@ impl<'ctx> Generator<'ctx> {
     /// `max_tokens` then a Lindy heuristic.
     pub fn horizon(mut self, n: usize) -> Self {
         self.horizon = Some(n);
+        self
+    }
+
+    /// Decouple position ids from KV-slot indices: every slot-derived
+    /// position is shifted by `offset` (may be negative). Use after an
+    /// operation that compressed positions relative to slots (e.g. a
+    /// parallel-branch join where sibling steps share a position range).
+    ///
+    /// When the offset is non-zero the generator also attaches explicit
+    /// slot-causal attention masks (`all_true` over the slots each input
+    /// token may see) — the runtime's synthesized causal mask assumes
+    /// `position == slot` and would otherwise hide KV written past the
+    /// compressed positions. System speculation is disabled in this mode
+    /// (draft positions assume contiguous layouts).
+    pub fn position_offset(mut self, offset: i64) -> Self {
+        self.pos_offset = offset;
+        if offset != 0 && matches!(self.speculation, SpecMode::System { .. }) {
+            self.speculation = SpecMode::None;
+        }
+        self
+    }
+
+    /// Disable runtime pass-level speculation (run-ahead staging) on every
+    /// step. Use alongside custom KV layouts — staged run-ahead passes
+    /// assume plain causal continuation.
+    pub fn disable_pass_speculation(mut self) -> Self {
+        self.allow_pass_speculation = false;
         self
     }
 
@@ -580,22 +615,23 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         let is_custom = matches!(parent.speculation, SpecMode::Custom(_));
         let do_sdk_verify = is_custom && n_drafted > 0 && n_pending > 0;
 
+        // Position base for slot-derived positions: `seq_len` shifted by the
+        // configured offset (0 in the common position==slot case).
+        let pos_base = (parent.ctx.seq_len as i64 + parent.pos_offset) as u32;
         if do_sdk_verify {
             let mut all_tokens = Vec::with_capacity((n_pending + n_drafted) as usize);
             all_tokens.extend_from_slice(&pending);
             all_tokens.extend_from_slice(&drafts);
-            let mut all_positions: Vec<u32> =
-                (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
+            let mut all_positions: Vec<u32> = (pos_base..pos_base + n_pending).collect();
             all_positions.extend_from_slice(&draft_positions);
             pass.input_tokens(&all_tokens, &all_positions);
         } else {
             if n_pending > 0 {
                 if n_pending == 1 {
-                    let positions = [parent.ctx.seq_len];
+                    let positions = [pos_base];
                     pass.input_tokens(&pending, &positions);
                 } else {
-                    let positions: Vec<u32> =
-                        (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
+                    let positions: Vec<u32> = (pos_base..pos_base + n_pending).collect();
                     pass.input_tokens(&pending, &positions);
                 }
             }
@@ -611,8 +647,8 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         {
             pass.output_speculative_tokens(true);
         }
-        if max_tokens_remaining
-            .map_or(false, |remaining| {
+        if !parent.allow_pass_speculation
+            || max_tokens_remaining.map_or(false, |remaining| {
                 remaining <= (n_drafted as usize).saturating_add(1)
             })
         {
@@ -639,6 +675,18 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // Per-call extra probes (registered on this GenStep).
         for (idx, wit) in &extra_probes {
             pass.sampler(&[*idx], wit);
+        }
+
+        // Slot-causal attention masks when positions are decoupled from
+        // slots (`position_offset`): input token i may see KV slots
+        // [0, seq_len + i], i.e. everything already written plus itself.
+        // The runtime's synthesized causal mask derives visibility from
+        // position ids and would hide slots past the compressed positions.
+        if parent.pos_offset != 0 {
+            let rows: Vec<Vec<u32>> = (0..(n_pending + n_drafted) as usize)
+                .map(|i| vec![0, parent.ctx.seq_len + i as u32 + 1])
+                .collect();
+            pass.attention_mask(&rows);
         }
 
         if let Some(m) = &mask {

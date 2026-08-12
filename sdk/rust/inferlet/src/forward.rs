@@ -111,6 +111,13 @@ pub struct Forward<'ctx> {
     /// Slot attachments in declaration order.
     slots: Vec<SlotSpec>,
     next_slot: u32,
+    /// Position-id override for the auto-input window. When set, the
+    /// auto-inputs still occupy the next free KV slots (reserve + commit as
+    /// usual) but carry these caller-supplied position ids instead of
+    /// `seq_len..`. Length must equal the auto-input count at execute time.
+    auto_positions: Option<Vec<u32>>,
+    /// Per-execute override for runtime pass-level speculation.
+    allow_pass_speculation: Option<bool>,
     mask: Option<Vec<u32>>,
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
@@ -155,6 +162,8 @@ impl<'ctx> Forward<'ctx> {
             explicit_inputs: Vec::new(),
             slots: Vec::new(),
             next_slot: 0,
+            auto_positions: None,
+            allow_pass_speculation: None,
             mask: None,
             attn_mask: None,
             adapter: None,
@@ -210,6 +219,22 @@ impl<'ctx> Forward<'ctx> {
         );
         self.explicit_inputs
             .push((tokens.to_vec(), positions.to_vec()));
+        self
+    }
+
+    /// Override the position ids of the auto-input window. The tokens still
+    /// occupy the next free KV slots and commit like any [`input`](Self::input)
+    /// — only the RoPE positions the model sees change. Use when KV-slot
+    /// order is deliberately decoupled from position ids (e.g. refilling
+    /// parallel branches whose positions overlap). Length must equal the
+    /// total auto-input count at execute time.
+    ///
+    /// Positions decoupled from slots also decouple the runtime's
+    /// synthesized causal mask (which assumes `position == slot`), so callers
+    /// of this method should almost always pass an explicit
+    /// [`attention_mask`](Self::attention_mask) as well.
+    pub fn positions(&mut self, positions: &[u32]) -> &mut Self {
+        self.auto_positions = Some(positions.to_vec());
         self
     }
 
@@ -291,6 +316,15 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
+    /// Control runtime pass-level speculation (run-ahead staging) for this
+    /// execute. Disable for passes with custom KV layouts (explicit
+    /// positions / attention masks) — staged run-ahead passes assume plain
+    /// causal continuation.
+    pub fn pass_speculation(&mut self, flag: bool) -> &mut Self {
+        self.allow_pass_speculation = Some(flag);
+        self
+    }
+
     // ── Execute ────────────────────────────────────────────────────────
 
     /// Run the forward pass. Reserves working pages for any auto-inputs,
@@ -303,6 +337,8 @@ impl<'ctx> Forward<'ctx> {
             explicit_inputs,
             slots,
             next_slot: _,
+            auto_positions,
+            allow_pass_speculation,
             mask,
             attn_mask,
             adapter,
@@ -345,9 +381,24 @@ impl<'ctx> Forward<'ctx> {
         if let Some(seed) = zo_seed {
             crate::pie::zo::zo::adapter_seed(&pass, seed);
         }
+        if let Some(flag) = allow_pass_speculation {
+            pass.pass_speculation(flag);
+        }
 
         if n_auto > 0 {
-            let positions: Vec<u32> = (ctx.seq_len..ctx.seq_len + n_auto).collect();
+            let positions: Vec<u32> = match auto_positions {
+                Some(p) => {
+                    if p.len() != n_auto as usize {
+                        return Err(format!(
+                            "Forward::execute: positions() length {} != auto-input count {}",
+                            p.len(),
+                            n_auto
+                        ));
+                    }
+                    p
+                }
+                None => (ctx.seq_len..ctx.seq_len + n_auto).collect(),
+            };
             pass.input_tokens(&auto_inputs, &positions);
         }
         for (toks, pos) in &explicit_inputs {

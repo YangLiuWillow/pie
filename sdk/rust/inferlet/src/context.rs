@@ -344,6 +344,15 @@ impl Context {
         self
     }
 
+    /// Take the buffered (not yet flushed) tokens, leaving the buffer empty.
+    /// For callers that need to route pending tokens through a custom
+    /// forward pass (e.g. [`forward`](Self::forward) with explicit positions)
+    /// instead of [`flush`](Self::flush)'s slot-derived positions.
+    pub fn take_buffer(&mut self) -> Vec<u32> {
+        self.flush_pending_system();
+        std::mem::take(&mut self.buffer)
+    }
+
     /// Register `tools` in the chat template's tool block. Each tool's
     /// metadata is wrapped in the `{name, description, parameters}` envelope
     /// the host expects, then spliced into the buffer via the model's
