@@ -540,11 +540,59 @@ the phase-2 fixes had never been exercised on (CPU and CUDA only).
 - **Real problem**: AIME 2025 I/1 → **70** (correct), 2 parallel blocks, 5 branches,
   5,429 tokens in 308 s serial = **17.7 tok/s** (H200: 230 tok/s, ~13× faster).
 
-Throughput does not batch well here: 0.6B goes 46 → 254 tok/s from concurrency 1
-to 24 (5.5×), but NPR-4B at concurrency 8 reaches only ~2× aggregate, because
-pie's per-token guest↔host round trip is a fixed serial cost per decode step and
-the 4B model is closer to compute-bound on this GPU. Apple silicon is therefore
-good for correctness work and single-trajectory inspection, and impractical for
-a 720-run sweep (tens of hours vs ~1 hour on an H200).
+Batching on Metal was measured only for Qwen3-0.6B: 46 → 254 tok/s from
+concurrency 1 to 24 (5.5×). The NPR-4B concurrency probe was stopped after one
+of eight runs completed, so it yields no reliable aggregate figure — do not read
+the earlier "~2×" claim as measured. The venue decision rested on the serial
+number alone, which is solid: **17.7 tok/s vs 135 (H100 PCIe) / 230 (H200)**.
+Apple silicon is good for correctness work and single-trajectory inspection, and
+impractical for a 720-run sweep.
 
 Config: `configs/npr-metal.toml` (needs `PIE_PORTABLE_METAL=1` at *build* time).
+
+### Throughput scales with concurrency; decode is KV-bandwidth-bound
+
+Measured on the H100 PCIe eval pod (steady state, 5-minute delta):
+
+| concurrency | aggregate | per run | GPU util |
+|---|---|---|---|
+| 1 | 135 tok/s | 135 tok/s | — |
+| 64 | **1,314 tok/s** | ~20.5 tok/s | ~52% |
+
+**9.7× aggregate scaling at 64-way concurrency** — the engine's batching is
+doing its job, and the sweep is GPU-throughput-limited, not runtime-limited.
+
+The per-run rate (~49 ms/token) is the batch *step time*, not a per-token
+software overhead: with 64 requests coalesced into one decode step, each run
+advances one token per step. A batch-64 step at these context lengths is
+memory-bound and roughly accounted for by traffic alone — 7.5 GB of weights plus
+~64 × 4k tokens × 144 KB/token ≈ 37 GB of KV per step ≈ 23 ms at this card's
+2.0 TB/s. KV reads dominate and grow with context length, which is why
+`nvidia-smi` reports only ~52% "utilization" (fraction of wall time with a
+kernel resident) while the memory system is the real limit.
+
+> **Correction.** An earlier revision of this section claimed a ~110 ms
+> per-token *guest↔host round trip*. That was wrong. It divided an early,
+> prefill-heavy completion rate by the concurrency, which measures queueing
+> delay, not round-trip latency, and the 32-way "~290 tok/s" figure behind it
+> was never a steady-state measurement. Pie co-locates the inferlet with the
+> engine precisely so no such per-token hop exists; the paper's round-trip
+> argument (§7.1) is about *client↔server* hops for external I/O, and its
+> overhead analysis (§7.4) puts even full inferlet launch well under a token
+> time. Nothing in the measurements supports a per-token runtime tax.
+
+### Selftest gap on the H100 pod
+
+The numeric oracle could **not** be re-run on this pod: every `Distribution`
+probe returns an all-zero distribution (top ids `[0,1,2]`), so all six TVs read
+0.0000 *including the control*, which is a degenerate result rather than a pass.
+Ruled out: the model (it generates valid NPR format and solves AIME 2025 I/1
+correctly), the `logit_rows_required > workspace` guard (it would log driver
+stderr, and the reference probe is a ~35-token prefill), and the portable-driver
+change above (CUDA path untouched). Not root-caused.
+
+The sweep does not depend on it — refill-join passes carry custom masks and
+explicit positions but **no sampler slot**, and ordinary token sampling works —
+but it means the refill arm's numeric fidelity here rests on the same inferlet
+code passing the oracle exactly on CPU, at ≤ 0.0003 on Metal, and on H200 CUDA
+previously, not on a check performed on this machine.
