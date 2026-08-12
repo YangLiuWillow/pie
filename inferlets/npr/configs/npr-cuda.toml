@@ -1,0 +1,32 @@
+# Standalone `pie serve` config for the NPR inferlet on a CUDA pod.
+#
+#   PIE_CONFIG=/path/to/npr-cuda.toml ./target/release/pie serve
+#
+# NOTE the combined [gateway] / [worker.*] section layout — bin/pie splits the
+# file per role (see bin/pie/src/derive.rs). A flat `[[model]]` at top level is
+# NOT read and boots with "at least one [[model]] section is required".
+#
+# `hf_repo` must be a RESOLVED LOCAL SNAPSHOT PATH; the worker never downloads
+# (R3). And the weights must be bf16 — the published NPR-4B checkpoint is fp32,
+# so run `convert_bf16.py` first and point here at its output.
+
+[gateway]
+listen = "127.0.0.1:8092"
+
+[worker.server]
+host = "127.0.0.1"
+port = 8093
+
+[worker.auth]
+enabled = false
+
+[[worker.model]]
+name = "default"
+hf_repo = "/workspace/NPR-4B-bf16"
+
+[worker.model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[worker.model.driver.options]
+gpu_mem_utilization = 0.90

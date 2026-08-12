@@ -1,0 +1,35 @@
+# Standalone `pie serve` config for local CPU/Metal smoke tests (portable
+# driver, any small Qwen3). Useful for the `selftest` oracle without a GPU —
+# expect ~1 tok/s on CPU, so keep budgets tiny.
+#
+#   PIE_CONFIG=/path/to/npr-portable.toml ./target/release/pie serve
+#
+# macOS: build the binary with the Accelerate link workaround —
+#   cargo rustc --release -p pie-bin --bin pie --no-default-features \
+#     --features driver-portable -- -C link-arg=-framework -C link-arg=Accelerate
+# and set PIE_PORTABLE_METAL=1 at build time for GPU acceleration.
+
+[gateway]
+listen = "127.0.0.1:8092"
+
+[worker.server]
+host = "127.0.0.1"
+port = 8093
+
+[worker.auth]
+enabled = false
+
+[[worker.model]]
+name = "default"
+# Resolved local snapshot path, e.g.
+# ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<sha>
+hf_repo = "/path/to/models--Qwen--Qwen3-0.6B/snapshots/<sha>"
+
+[worker.model.driver]
+type = "portable"
+device = ["cpu"]
+
+[worker.model.driver.options]
+total_pages = 2048
+max_forward_tokens = 4096
+max_forward_requests = 32

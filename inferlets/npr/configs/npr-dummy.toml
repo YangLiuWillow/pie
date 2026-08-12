@@ -1,0 +1,33 @@
+# Standalone `pie serve` config for the dummy driver — random tokens, no
+# weights loaded. Exercises the NPR control flow (fork / concurrent branches /
+# budget ledger / join bookkeeping) in ~100 ms with no GPU and no model.
+#
+#   PIE_CONFIG=/path/to/npr-dummy.toml ./target/release/pie serve
+#
+# Build with `--features driver-dummy`. `hf_repo` still needs to point at a real
+# snapshot dir — the dummy driver reads vocab_size / arch_name out of its
+# config.json (any Qwen3 checkpoint will do).
+#
+# Gotcha: after killing a server, the POSIX shared-memory segment can linger and
+# the next boot fails with `shm_open("/pie_shmem_g0"): Permission denied`. Clear
+# it with:
+#   python3 -c "import ctypes; ctypes.CDLL('libc.dylib').shm_unlink(b'/pie_shmem_g0')"
+# (on Linux: ctypes.CDLL('librt.so.1'), or remove /dev/shm/pie_shmem_g0)
+
+[gateway]
+listen = "127.0.0.1:8091"
+
+[worker.server]
+host = "127.0.0.1"
+port = 8090
+
+[worker.auth]
+enabled = false
+
+[[worker.model]]
+name = "default"
+hf_repo = "/path/to/models--Qwen--Qwen3-0.6B/snapshots/<sha>"
+
+[worker.model.driver]
+type = "dummy"
+device = ["cpu"]
