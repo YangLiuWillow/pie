@@ -42,30 +42,57 @@ merely bad. Plan for the 35B (a ~23 GiB, one-serve-at-a-time machine slot) or a
 CUDA box from the start. No exposure today: nothing in `inferlets/` or
 `integrations/` touches `fork`/`copy_kv` yet — the seam is still unimplemented.
 
-**2. Their cue hypothesis — that our closed-empty-block cue CAUSES the unmatched
-`</think>` — is not supported by our data, and `cut_leading_reasoning` stays.**
-The suggestion was to render no think block at all for this lineage and watch the
-stray closer disappear. We ran that configuration by accident and it is worse.
-Before the `instruct.rs` fix, `has_thinking` was false, so `cue_no_think` fell
-through to plain `cue()` — no think block — and Qwen3.6 produced:
+**2. Whether Qwen3.6 tags its reasoning is NOT determined by the cue alone, and
+neither arm has isolated what does determine it. UNRESOLVED — experiment below.**
 
-```
-Thinking Process:
-1.  **Analyze the user's request:** The user wants me to "Say hello" …
-```
+The qwen-code session proposed that our closed-empty-block cue *causes* the
+unmatched `</think>`, and that rendering no think block would let us delete
+`cut_leading_reasoning`. We had run that configuration by accident: before the
+`instruct.rs` fix `has_thinking` was false, so `cue_no_think` fell through to
+plain `cue()` — no think block — and Qwen3.6 produced untagged reasoning prose,
+`Thinking Process:\n1. **Analyze the user's request:** …`, with no `<think>` or
+`</think>` anywhere. On that basis they withdrew the causal claim.
 
-Untagged reasoning prose: no `<think>`, no `</think>`, nothing for a
-marker-based filter to catch at any point. Their clean result is a `2+2`
-arithmetic prompt, which elicits almost no reasoning and so cannot discriminate
-between the two cues. So the no-block cue does not reliably make the model open
-its own block; it just removes the evidence.
+**But our evidence has a confound, and it is ours, not theirs.** Both untagged
+runs were sent without a `temperature` field, so they sampled at the inferlet's
+`DEFAULT_TEMPERATURE` of **0.6**. Their tagged run was at **t=0**. Their
+observation is solid on its own terms — `finish_reason:"stop"`, 139 completion
+tokens, content exactly `"4"` — and a marker-based filter cannot turn 139 tokens
+of *untagged* prose into one character, so something tagged was certainly there.
+They also ruled out the obvious confound on their side: their `no_think()` fires
+only on an explicit `chat_template_kwargs.enable_thinking == false`, which their
+requests never sent, so their cue really was the bare
+`<|im_start|>assistant\n`.
+
+So the two arms saw the same cue and different tagging, with at least two live
+explanations: prompt context (their hermes tool preamble and system-turn
+handling differ from ours), or sampling temperature. Our data does not separate
+cue from temperature, so the claim "the no-block cue does not reliably elicit
+tags" is not established — withdrawn to "unknown".
+
+**The experiment that settles it**, for whoever holds the GPU next: a 2×2 of
+{no-block cue, closed-block cue} × {t=0, t=0.6}, several samples each, on a
+prompt that actually elicits reasoning (`Say hello in exactly three words`, or
+the Tokyo tool prompt — NOT `2+2`, which elicits none and so cannot
+discriminate). Report raw content, not filtered content.
+
+**Either answer strengthens the same conclusion**, which is why this is worth
+recording but not worth fighting for the GPU over. If tagging depends on prompt
+context we do not control, no marker-based filter is safe in either direction.
+If it depends on *temperature*, that is worse: the same prompt tags or doesn't
+run to run. And their point below holds regardless.
 
 Their second point stands and is a real limit on our fix: a turn cut off by
 `max_tokens` **before** the closer still leaks the preamble, because
 `cut_leading_reasoning` needs a closer to fire. Both of us agree the end state
 is the lineage-aware OPEN-block cue plus a filter that starts in think-mode —
-deterministic, no buffering, and the only version that fixes streaming. They are
-building it as part of the third-dialect renderer.
+deterministic, no buffering, indifferent to whether the model tags, and the only
+version that fixes streaming. They are building it as part of the third-dialect
+renderer.
+
+`cut_leading_reasoning` stays meanwhile, and that decision does *not* rest on the
+confounded data: the stray closer was observed directly on the real opencode
+client path, at opencode's own sampling settings, with the cue we actually ship.
 
 **3. A simplification available for `engine.rs`, deliberately not taken yet.**
 `run_ahead<W: PassWit>` and `impl<W: PassWit> Pass<W>` are already generic, so
