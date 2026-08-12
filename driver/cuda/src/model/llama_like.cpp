@@ -761,6 +761,19 @@ void llama_like_forward_paged(
         }
     }
 
+    // A batch with zero sampling rows outside pure decode (a prefill-only
+    // fill, e.g. a context flush) never reads logits — and running the
+    // lm_head over all N rows would overflow the [max_logit_rows, V]
+    // workspace for prefills longer than the planner's request cap
+    // (max_logit_rows = output_rows = R0, not N). Skip the logits tail.
+    // Pure decode keeps its lm_head (graph capture passes num_logit_rows=0
+    // with N == R, which both needs and fits the buffer), num_logit_rows
+    // == -1 keeps meaning "full logits over every row" (MTP verify), and
+    // > 0 selects the compact gathered rows.
+    if (num_logit_rows == 0 && !is_pure_decode) {
+        return;
+    }
+
     const bool use_tp_greedy =
         tp_greedy_argmax && T > 1 && tp != nullptr &&
         w.lm_head_tp_shard != nullptr &&
