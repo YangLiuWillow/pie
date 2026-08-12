@@ -67,6 +67,18 @@ instance). Steps:
       the version delta.
 - [ ] Trajectory diff, summary, results into `docs/qwen-code-dev-port.md`
 
+**Local fallback attempt (2026-08-12) — cannot substitute for the GPU run.**
+Three independent walls: (1) vLLM has no Apple Silicon GPU backend, so the
+comparison arm cannot exist locally at all; (2) the Metal driver's boot
+guard needs `want + 2 GiB` host-reclaimable and this 8 GB M2 has ~1.8 GiB
+with the usual apps open — the 2 GiB margin alone exceeds what is free, so
+no model size fixes it; (3) the dummy driver caps at 4096-token contexts,
+below a ~9K-token qwen-code turn. The dummy run was still worth it: it
+found the degrade-path whitespace bug (qwen-code retry storm) and the
+single-arm gap in `summarize.py`, both now fixed. To run the pie arm
+locally on Qwen3-0.6B-4bit for harness validation, free ~3 GiB of memory
+first; expect most task checks to fail on a 0.6B model regardless.
+
 ## Later / parked
 
 - `/no_think` parity fixtures (`enable_thinking:false` corpus).
