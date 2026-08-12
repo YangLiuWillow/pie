@@ -162,6 +162,54 @@ a re-implementation guided by a validated spec, not a rebase. Plus §3 prereqs.
 
 ## 2. Strategy B — harness-adjacent session inferlet (programmable-KV-native)
 
+> **2026-08-12 — what the SOSP'25 paper says, read after Phase A shipped.**
+> Strategy B is not merely the more interesting option; it is the shape the
+> system was designed around, and Strategy A runs against its grain. Worth
+> stating precisely, because it reframes several Phase A defects as symptoms
+> rather than isolated bugs.
+>
+> - **Agentic workflows are the motivating case, not an application of it.**
+>   Of the three requirements the paper derives for next-generation serving,
+>   **R3** is *"Agentic workflows and interactions with external systems
+>   necessitate tightly coupling token generation with arbitrary computations
+>   and I/O **within the generation flow**, without … complex external
+>   orchestration."* The headline result is ours: *"1.1×–2.4× lower latency,
+>   1.3×–3.4× higher throughput"* on agentic workflows, against 3–12% latency
+>   overhead on plain text completion. Pie is *supposed* to be good at this.
+>
+> - **The unit of service is a long-lived program, not a request.** *"Each
+>   inferlet executes within a single-threaded, event-driven runtime.
+>   Concurrency within an inferlet is handled through asynchronous,
+>   non-blocking API calls, a model well-suited for I/O-bound agentic
+>   workflows."* The ILM launches an inferlet and *"users can communicate with
+>   inferlets through the ILM after launch"* via `send`/`receive`. Upstream's
+>   own `text-completion-bench` is built exactly this way: a `prompts` array
+>   plus `batch_concurrency`, N generations concurrent **inside one process**.
+>
+> - **Our Strategy A is the opposite shape by necessity.** Stock opencode
+>   speaks OpenAI over HTTP, so `chat-completions` is one inferlet per request
+>   and N concurrent turns are N concurrent *inferlets*. That axis is
+>   unbenchmarked upstream, and it is where we found the N≥2 defect.
+>
+> - **The contention policy is tuned for independent tenants.** *"To handle
+>   resource contention, the control layer uses a First Come First Serve
+>   (FCFS) policy, terminating the most recently created inferlets until
+>   sufficient resources are freed."* Reasonable when concurrent inferlets are
+>   separate tenants; exactly inverted when they are N turns of ONE user's
+>   agent session, because the newest request — the one the user is waiting on
+>   — is the first killed. **Not confirmed as our mechanism** (our failure is
+>   a synchronous `PIE_STATUS_INVALID_ARGUMENT` descriptor rejection, not a
+>   termination), but it is the designed behaviour in the neighbourhood and
+>   should be ruled in or out before the concurrency work is called done.
+>
+> **Consequence for phasing.** The 2026-08-12 measurement — ~70% of a
+> two-tool-call opencode task is re-prefill of a history that changed by a few
+> hundred tokens, `~81 s → ~21 s` with resume — is the same conclusion the
+> paper argues from first principles. Strategy A remains the right
+> compatibility path and is now green; but the performance argument for this
+> project lives here, and the concurrency defect is a reason to reach it
+> sooner rather than a reason to keep hardening the shim.
+
 **Thesis.** Strategy A treats pie as a vLLM stand-in and reconstructs continuity
 by hashing. Strategy B changes the *contract*: one long-lived
 **`opencode-session` inferlet per opencode session**, attached over the existing
