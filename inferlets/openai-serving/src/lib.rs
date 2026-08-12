@@ -37,7 +37,7 @@ pub mod session;
 pub mod streaming;
 pub mod types;
 
-pub use filter::{VisibleFilter, sanitize_messages};
+pub use filter::{VisibleFilter, cut_leading_reasoning, sanitize_messages};
 pub use render::{RenderError, RenderOp, plan_render, plan_render_messages};
 pub use salvage::{parse_fenced_tool_calls, parse_hermes_tool_calls};
 pub use session::{CanonItem, canon_messages, snapshot_address, split_resume_point};

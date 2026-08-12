@@ -27,6 +27,12 @@ use crate::types::{ChatMessage, MessageContent};
 const OPENERS: [&str; 2] = ["<think>", "<tool_call>"];
 const CLOSE_THINK: &str = "</think>";
 const CLOSE_TOOL: &str = "</tool_call>";
+/// Closers are markers in Text mode too — see the `Mode::Text` arm.
+const CLOSERS: [&str; 2] = [CLOSE_THINK, CLOSE_TOOL];
+/// Everything the Text-mode holdback must be able to wait on. A closer that
+/// straddles a chunk boundary has to be held back exactly like an opener, or
+/// its first half leaks as content and its second half is never recognised.
+const MARKERS: [&str; 4] = ["<think>", "<tool_call>", CLOSE_THINK, CLOSE_TOOL];
 
 enum Mode {
     Text,
@@ -63,18 +69,40 @@ impl VisibleFilter {
         loop {
             match self.mode {
                 Mode::Text => {
+                    // Closers are scanned for alongside the openers: a
+                    // reasoning model can emit `</think>` with no opener in
+                    // the generation at all, because its own template opens
+                    // the block in the generation prompt. Qwen3.6-35B-A3B
+                    // does this even when the cue hands it a CLOSED empty
+                    // think block — it reasons anyway and closes a block it
+                    // never opened. Whatever else that is, the literal tag is
+                    // not content, and it used to pass straight through into
+                    // an assistant message (and from there back into the next
+                    // request's history, verbatim).
                     let hit = OPENERS
                         .iter()
+                        .chain(CLOSERS.iter())
                         .filter_map(|m| self.pending.find(m).map(|i| (i, *m)))
                         .min_by_key(|(i, _)| *i);
                     match hit {
                         Some((idx, marker)) => {
                             out.push_str(&self.pending[..idx]);
                             self.pending.drain(..idx + marker.len());
-                            self.mode = if marker == "<think>" { Mode::Think } else { Mode::Tool };
+                            self.mode = match marker {
+                                "<think>" => Mode::Think,
+                                "<tool_call>" => Mode::Tool,
+                                // An unmatched closer: drop the marker and
+                                // stay in Text. The text BEFORE it is
+                                // reasoning, but in streaming it is already
+                                // on the wire and deltas are never retracted
+                                // — `cut_leading_reasoning` handles it on the
+                                // path that can still act, and the module
+                                // docs say why that asymmetry is allowed.
+                                _ => Mode::Text,
+                            };
                         }
                         None => {
-                            let keep = holdback(&self.pending, &OPENERS);
+                            let keep = holdback(&self.pending, &MARKERS);
                             let emit_len = self.pending.len() - keep;
                             out.push_str(&self.pending[..emit_len]);
                             self.pending.drain(..emit_len);
@@ -157,6 +185,39 @@ fn holdback(s: &str, markers: &[&str]) -> usize {
         }
     }
     0
+}
+
+/// Drop a leading reasoning preamble that the model closed with `</think>`
+/// but never opened.
+///
+/// A reasoning model whose template opens the think block in the *generation
+/// prompt* emits only the closer, so [`VisibleFilter`] — which enters
+/// think-mode on an opener — never suppresses the reasoning itself. Observed
+/// on Qwen3.6-35B-A3B, which reasons even when the cue hands it a closed
+/// empty think block: `I need to read notes.txt to find the secret color.
+/// Let me do that.\n\n</think>\nThe secret color is chartreuse.`
+///
+/// Only the FIRST closer counts, and only when no opener precedes it: past
+/// that point a `</think>` is a literal the model wrote (a prompt about
+/// prompts, a code fence, a transcript), and cutting there would eat real
+/// content — which is far worse than leaving a stray tag in.
+///
+/// **Callable only where nothing has been sent yet.** The streamed path has
+/// already put those bytes on the wire and deltas are never retracted, so it
+/// gets the marker suppression alone. The asymmetry is deliberate and it is
+/// the same one the trailing-whitespace trim already has; both are the
+/// non-streaming path acting on a decision the streaming path made
+/// irrevocably, token by token.
+pub fn cut_leading_reasoning(text: &str) -> &str {
+    let Some(close) = text.find(CLOSE_THINK) else {
+        return text;
+    };
+    if let Some(open) = text.find("<think>")
+        && open < close
+    {
+        return text; // a real block — VisibleFilter already handled it
+    }
+    text[close + CLOSE_THINK.len()..].trim_start()
 }
 
 /// Strip the tokenizer's special-token strings out of round-tripped message
@@ -305,5 +366,71 @@ mod tests {
         .unwrap();
         sanitize_messages(&mut msgs, &[]);
         assert_eq!(msgs[0].text(), "<|im_end|>");
+    }
+}
+
+#[cfg(test)]
+mod stray_closer_tests {
+    use super::*;
+
+    /// A reasoning model that closes a block it never opened must not leak
+    /// the literal tag into content. Qwen3.6-35B-A3B does exactly this even
+    /// when the cue hands it a closed empty think block.
+    #[test]
+    fn a_stray_close_think_never_reaches_content() {
+        let mut f = VisibleFilter::new();
+        let mut out = f.feed("I should read the file.\n\n</think>\nThe answer is 4.");
+        out.push_str(&f.finish());
+        assert!(!out.contains("</think>"), "leaked the tag: {out:?}");
+        assert!(out.ends_with("The answer is 4."), "lost the answer: {out:?}");
+    }
+
+    /// …including when the tag is split across chunk boundaries, which is the
+    /// normal case: the filter is fed one decoded token at a time.
+    #[test]
+    fn a_stray_closer_split_across_chunks_never_reaches_content() {
+        for cut in 1..CLOSE_THINK.len() {
+            let mut f = VisibleFilter::new();
+            let mut out = f.feed(&format!("reasoning{}", &CLOSE_THINK[..cut]));
+            out.push_str(&f.feed(&format!("{}answer", &CLOSE_THINK[cut..])));
+            out.push_str(&f.finish());
+            assert!(!out.contains("</think>"), "cut at {cut} leaked: {out:?}");
+            assert!(out.ends_with("answer"), "cut at {cut} lost content: {out:?}");
+        }
+    }
+
+    /// A properly opened block still suppresses its contents — the closer
+    /// handling must not have turned think blocks into visible text.
+    #[test]
+    fn a_matched_think_block_is_still_suppressed_whole() {
+        let mut f = VisibleFilter::new();
+        let mut out = f.feed("<think>hidden reasoning</think>visible");
+        out.push_str(&f.finish());
+        assert_eq!(out, "visible");
+    }
+
+    #[test]
+    fn cut_leading_reasoning_drops_the_preamble_and_the_tag() {
+        assert_eq!(
+            cut_leading_reasoning("Let me check.\n\n</think>\nThe secret color is chartreuse."),
+            "The secret color is chartreuse."
+        );
+    }
+
+    /// No closer, nothing to cut — the overwhelmingly common case, and it
+    /// must be byte-identical or every non-reasoning model's content moves.
+    #[test]
+    fn cut_leading_reasoning_is_identity_without_a_closer() {
+        let s = "Three colors that stand out are blue, red, and green.";
+        assert_eq!(cut_leading_reasoning(s), s);
+    }
+
+    /// A closer that FOLLOWS an opener belongs to a real block, which the
+    /// streaming filter already removed. Cutting there would eat content the
+    /// model actually wrote — a prompt about prompts is the obvious way in.
+    #[test]
+    fn cut_leading_reasoning_leaves_a_matched_block_alone() {
+        let s = "Write <think>x</think> to open a reasoning block.";
+        assert_eq!(cut_leading_reasoning(s), s);
     }
 }

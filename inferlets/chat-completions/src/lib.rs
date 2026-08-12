@@ -52,7 +52,7 @@ mod turn;
 use inferlet::{chat, model, runtime, session, tools};
 use pie_openai_serving::error::{INVALID_REQUEST_ERROR, SERVER_ERROR, error_body, parse_request};
 use pie_openai_serving::streaming::ChunkMeta;
-use pie_openai_serving::{RenderOp, plan_render, sanitize_messages};
+use pie_openai_serving::{RenderOp, cut_leading_reasoning, plan_render, sanitize_messages};
 use serde_json::{Value, json};
 use turn::TurnState;
 
@@ -267,8 +267,13 @@ async fn main(input: String) -> inferlet::Result<String> {
     } else {
         // Non-streaming (curl/debug/acceptance path): exactly one body
         // message. The old handler trimmed trailing whitespace here (and
-        // only here — streamed bytes are already on the wire).
-        state.visible_text = state.visible_text.trim_end().to_string();
+        // only here — streamed bytes are already on the wire). The leading
+        // reasoning cut rides on the same "nothing is sent yet" licence: a
+        // model that closes a think block it never opened (Qwen3.6) leaves
+        // its reasoning in front of the answer, and this is the last point
+        // at which that is still removable.
+        state.visible_text =
+            cut_leading_reasoning(state.visible_text.trim_end()).to_string();
         let content = state.final_content(&raw_text);
         let calls: Vec<(String, String, String)> = state
             .calls

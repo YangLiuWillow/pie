@@ -17,12 +17,36 @@ use std::sync::Arc;
 /// R1) stated as its own arm rather than implied by a directory. The rows
 /// dispatch on the *model type*; the generation crates only hold the
 /// implementations.
+///
+/// ## Two spellings reach this function, and only one of them is a model type
+///
+/// The string the engine passes is the driver's arch *stem*: `architectures[0]`
+/// lowercased with its task suffix removed (`arch_stem` in `driver/metal`, and
+/// its Rust twin in `worker/src/embedded_driver.rs`). CamelCase word boundaries
+/// carry no separator through that, so `Qwen3_5MoeForConditionalGeneration`
+/// arrives as `qwen3_5moe` — NOT as the HF model type `qwen3_5_moe` this
+/// registry was written against. The mismatch falls to the `_` arm, whose
+/// `has_tools: false` makes `equip_after_system` drop every tool schema and
+/// `has_thinking: false` stops the think channel being handled: chat still
+/// renders, the model still answers, and tool calling is simply gone with no
+/// error anywhere. Observed serving Qwen3.6-35B-A3B, where a tools request and
+/// a tools-free one rendered to the identical prompt-token count.
+///
+/// So the qwen rows carry BOTH spellings. Stems are listed beside the model
+/// types they correspond to rather than normalized on the fly — a spelling that
+/// reaches a registry is data, and guessing at underscore placement is how the
+/// silent version of this bug comes back.
 pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
 
     match arch_name {
+        // model types …
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_moe"
-        | "qwen3_vl" | "qwen3_vl_text" => Arc::new(QwenInstruct::new(
+        | "qwen3_vl" | "qwen3_vl_text"
+        // … and the driver stems for the same releases: Qwen3MoeForCausalLM,
+        // Qwen3_5Moe{ForCausalLM,ForConditionalGeneration},
+        // Qwen3VLForConditionalGeneration.
+        | "qwen3moe" | "qwen3_5moe" | "qwen3vl" => Arc::new(QwenInstruct::new(
             tokenizer,
             ChatMLConfig {
                 has_thinking: true,
@@ -99,5 +123,104 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vocabulary with the ChatML control tokens the qwen instruct emits, so
+    /// a rendered prompt is comparable across arch strings.
+    fn tok() -> Arc<Tokenizer> {
+        let v: Vec<String> = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "system",
+            "\n",
+            "user",
+            "assistant",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tools>",
+            "</tools>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        Arc::new(Tokenizer::from_vocab(&v))
+    }
+
+    /// The task suffix the driver's `arch_stem` strips off `architectures[0]`.
+    /// Mirrors `worker/src/embedded_driver.rs` so the two cannot drift apart
+    /// silently — which is exactly how the bug below shipped.
+    fn arch_stem(architectures_0: &str) -> String {
+        let low = architectures_0.to_lowercase();
+        low.strip_suffix("forconditionalgeneration")
+            .or_else(|| low.strip_suffix("forcausallm"))
+            .unwrap_or(&low)
+            .to_string()
+    }
+
+    /// Does this arch string reach an instruct that renders tool schemas?
+    ///
+    /// Asked through the public surface rather than by reading `has_tools`:
+    /// dropping the schemas is precisely the failure, so the test asserts on
+    /// the rendering, not on the flag that governs it.
+    fn renders_tools(arch: &str) -> bool {
+        let schema = r#"{"name":"get_time","description":"t","parameters":{}}"#.to_string();
+        let with = create(arch, tok()).equip_after_system(None, &[schema]);
+        let without = create(arch, tok()).equip_after_system(None, &[]);
+        with != without
+    }
+
+    /// Every qwen release the driver can hand us must reach the tool-capable
+    /// instruct — through EITHER spelling.
+    ///
+    /// The engine passes the driver's arch stem, not the HF model type, and
+    /// CamelCase word boundaries vanish in it: `Qwen3_5MoeForConditionalGeneration`
+    /// arrives as `qwen3_5moe`, which used to miss `qwen3_5_moe` and fall to
+    /// the tools-less default arm. Nothing failed — the model just never saw a
+    /// tool schema again. Serving Qwen3.6-35B-A3B, a request with tools and one
+    /// without rendered to the identical prompt-token count.
+    #[test]
+    fn every_qwen_release_reaches_the_tool_capable_instruct() {
+        for architectures_0 in [
+            "Qwen3ForCausalLM",
+            "Qwen3MoeForCausalLM",                // Qwen3-Coder-30B-A3B
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration", // Qwen3.6-35B-A3B
+            "Qwen3VLForConditionalGeneration",
+        ] {
+            let stem = arch_stem(architectures_0);
+            assert!(
+                renders_tools(&stem),
+                "{architectures_0} -> arch stem {stem:?} does not reach a tool-capable \
+                 instruct: tool schemas would be dropped silently"
+            );
+        }
+        // The model types the same releases report, which is what this
+        // registry was originally written against. Both spellings, forever.
+        for model_type in [
+            "qwen3",
+            "qwen3_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+            "qwen3_vl",
+        ] {
+            assert!(renders_tools(model_type), "model type {model_type:?} lost its tools");
+        }
+    }
+
+    /// The default arm stays tools-less: an unknown architecture gets a prompt
+    /// that renders, not a guess at a tool dialect it may not speak.
+    #[test]
+    fn an_unknown_architecture_still_falls_through_to_plain_chatml() {
+        assert!(!renders_tools("something_nobody_has_registered"));
     }
 }

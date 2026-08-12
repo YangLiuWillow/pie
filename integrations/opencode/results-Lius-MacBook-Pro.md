@@ -14,16 +14,19 @@ reference tokenizer.
 
 | what | result |
 |---|---|
-| Native suites (`pie-openai-serving` / `pie-model-qwen-3 --features chat` / `pie-gateway`) | 45 · 24 · 40+1+6 — all green |
+| Native suites (`pie-openai-serving` / `pie-model` / `pie-model-qwen-3 --features chat` / `pie-gateway`) | 49 · 16+3+4+23 · 24 · 40+1+6 — all green |
 | Acceptance suite, live, `Qwen3-0.6B` (MLX int4) | **25 passed, 0 failed, 0 warnings** |
-| Stock opencode e2e, tool call | **works** — `read` tool call + correct answer |
-| Live run on `Qwen3.6-35B-A3B` (MLX 4-bit) | **blocked on host RAM**; the code gap it exposed is fixed (see below) |
+| Acceptance suite, live, **`Qwen3.6-35B-A3B` (MLX 4-bit, GDN hybrid MoE)** | **25 passed, 0 failed, 0 warnings** |
+| Stock opencode e2e, 0.6B | `read` tool call + correct answer |
+| Stock opencode e2e, **35B, multi-step** | **read → write → correct file on disk** |
 
 **No wire-level first-contact bugs.** Every hard assertion in the 25-test suite
 passed on the first live run, including the two fixture replays (req-004 tool
 turn, req-005 7.5k-token history replay), tool-call delta atomicity, id
 uniqueness across processes, envelope non-leakage and the SSE keepalive path.
-The two bugs first contact did find were both *below* the wire (§Findings).
+Everything first contact did find was *below* the wire (§Findings) — and the
+three that only a real model could expose were all found by the 35B, not the
+0.6B.
 
 ---
 
@@ -69,7 +72,28 @@ agentic tool call and a correct answer.
 A second, two-step prompt ("list the files, then write summary.md") produced a
 correct `glob` call and then *narrated* the write instead of emitting the second
 tool call. That is 0.6B capability, not a wire fault: the call it did emit was
-well-formed and the text was coherent.
+well-formed and the text was coherent — and the same prompt on the 35B below
+completes the whole thing.
+
+### Stock opencode on Qwen3.6-35B-A3B — multi-step, end to end
+
+```
+$ opencode run -m pie/qwen3.6-35b-a3b \
+    "Read notes.txt, then write a file summary.md with one sentence describing what it says."
+> build · qwen3.6-35b-a3b
+→ Read notes.txt
+I'll read notes.txt and create summary.md with a one-sentence description.
+← Write summary.md
+Wrote file successfully.
+Done. Created summary.md with: "PIE is a programmable LLM serving system that runs inferlets over WebSocket."
+
+$ cat summary.md
+PIE is a programmable LLM serving system that runs inferlets over WebSocket.
+```
+
+Two tool calls, correct order, a real file on disk with correct content. This
+is the Strategy A milestone: a stock coding agent doing real agentic work on a
+35B MoE served entirely by pie.
 
 ---
 
@@ -107,9 +131,91 @@ prefill's folded state. Shape ported from
 `tests/inferlets/text-completion-bench`.
 
 The attention path is byte-identical after the rewrite (same completion text,
-25/25 still green). **The hybrid path has not been exercised live** — see below.
+25/25 still green), and the hybrid path is now **confirmed live**: the 35B
+generates through it and the full suite is green on it.
 
-### 2. Inferlet diagnostics were invisible — FIXED
+### 2. Every Qwen MoE/VL model silently lost its tool schemas — FIXED
+
+With the hybrid path working, the 35B still produced no tool calls where the
+0.6B did — backwards. The tell was in `usage`: the same request **with and
+without a `tools` array rendered to the identical prompt length** (15 tokens
+both ways), and asked to call a tool the model wrote *"Since I'm simulating,
+I'll assume there's a standard time tool available like `current_time`…"*. It
+had never been shown the schemas.
+
+`instruct::create` keys on HF **model types** (`qwen3_5_moe`). The string the
+engine actually passes is the driver's arch **stem** — `architectures[0]`
+lowercased with the task suffix stripped (`arch_stem`, mirrored in
+`worker/src/embedded_driver.rs`). CamelCase word boundaries carry no separator
+through that:
+
+| `architectures[0]` | stem | matched? |
+|---|---|---|
+| `Qwen3ForCausalLM` | `qwen3` | yes |
+| `Qwen3MoeForCausalLM` | `qwen3moe` | **no** → Qwen3-Coder-30B-A3B |
+| `Qwen3_5MoeForConditionalGeneration` | `qwen3_5moe` | **no** → Qwen3.6-35B-A3B |
+| `Qwen3VLForConditionalGeneration` | `qwen3vl` | **no** |
+
+A miss falls to the `_` arm, whose `has_tools: false` makes
+`equip_after_system` drop every schema and `has_thinking: false` leaves the
+think channel unhandled. Chat still renders and the model still answers
+fluently — tool calling is just gone, with no error anywhere.
+
+Fixed in `model/src/instruct.rs`: the qwen rows carry both spellings, with a
+test that runs `arch_stem` over the six qwen `architectures[0]` strings and
+asserts each reaches a tool-capable instruct (asserting on *rendering*, not on
+the `has_tools` flag — dropping schemas is the failure being tested).
+
+Live proof: prompt_tokens 19 → 165 for the same request, and
+
+```
+finish_reason: "tool_calls"   get_time({"timezone":"Asia/Tokyo"})   24 tokens
+```
+
+Worth recording: **Qwen3.6 follows the tool dialect it is shown.** Given
+hermes-style schemas it emits hermes-style calls, even though its own template
+pairs JSON schemas with XML-style `<function=…>` calls. Serving works today;
+byte-exact prompt parity against vLLM would still need the native dialect.
+
+### 3. A reasoning model's `</think>` leaked into content — FIXED
+
+`VisibleFilter` entered think-mode on an *opening* `<think>`. Qwen3.6 reasons
+whether or not the cue closes the think block for it, and emits only the
+closer — so the reasoning text was served as content and the bare `</think>`
+went out as a literal, into the assistant message and from there back into the
+next request's history verbatim. opencode showed it plainly:
+
+```
+→ Read notes.txt
+I need to read the notes.txt file to find the secret color. Let me do that.
+
+</think>
+The secret color is chartreuse (line 4).
+```
+
+Two fixes, split by what each path can still act on:
+
+- **`VisibleFilter`** now scans for closers alongside openers in Text mode and
+  drops an unmatched one, with closers added to the boundary holdback so a tag
+  split across chunks cannot leak its first half. The literal tag never
+  reaches content on any path.
+- **`cut_leading_reasoning`** drops the preamble itself, and runs only on the
+  non-streaming path — streamed deltas are already on the wire and are never
+  retracted. It fires on the FIRST closer and only when no opener precedes it;
+  past that a `</think>` is a literal the model wrote. Same asymmetry the
+  trailing-whitespace trim already has.
+
+After: `"What is 17 times 3? Answer with just the number."` → content `'51'`,
+`finish_reason: "stop"`.
+
+**Known limitation:** on the *streaming* path the reasoning preamble is still
+delivered as content (only the tag is suppressed) — a delta cannot be
+un-sent. The real fix belongs in the template layer: Qwen3.6's own generation
+prompt ends `<|im_start|>assistant\n<think>\n`, so a lineage-aware cue would
+leave the block open and let the filter suppress the reasoning deterministically
+with no buffering. That is renderer work, tracked with the Qwen3.6 dialect.
+
+### 4. Inferlet diagnostics were invisible — FIXED
 
 A launched process routes stdout/stderr to the process actor, not the runtime
 log, and `gateway/src/ingress/openai.rs` dropped those events. So the
@@ -119,33 +225,31 @@ finding #1 took a rebuild with hand-added traces. The ingress now logs them
 
 ---
 
-## Blocked: the Qwen3.6-35B-A3B live run
+## Host memory: what actually blocked the 35B, and what did not
 
-The model imports and boots (`19.51 GB of weights bound where they lie`), but
-re-admission now fails:
+The first 35B attempt was refused — it needs 22.55 GiB resident at
+`total_pages 512 / max_forward_requests 8 / max_model_len 16384`, and only
+15.54 GiB was reclaimable. The driver's own warning named the usual suspect:
 
 ```
-this model does not fit the memory this machine has left: it needs 24.77 GiB
-resident (18.16 GiB of weights, 4.466 GiB of KV, state and scratch) … and only
-21.83 GiB is reclaimable.
+[pie-metal] warning: 24.17 GiB of this machine's 48.00 GiB is wired before this
+model is loaded. … a GPU context whose command buffer never signalled is
+abandoned rather than released, and its pages stay wired until reboot.
 ```
 
-Two causes, both host-side, neither in this branch:
+**That diagnosis was wrong here, and it is worth knowing why.** The 24 GiB was
+the *live* Metal heap of a second `pie serve` from an unrelated session on the
+same machine. A clean `SIGTERM` to it released everything: wired went 24.17 GiB
+→ 2.85 GiB in seconds, and the 35B booted on the next try. No reboot was needed.
 
-1. **A second `pie serve` on the same machine** (an unrelated `pie-npr` /
-   NPR-4B session) holds its own Metal heap.
-2. **Wired pages from abandoned GPU contexts.** The driver reported
-   `26.22 GiB of this machine's 48.00 GiB is wired before this model is
-   loaded` — a context whose command buffer never signalled is abandoned
-   rather than released, survives `kill -9`, and is cleared only by a reboot.
-   Every `pie serve` killed mid-flight during this session contributed.
+So on a shared machine, check for another `pie serve` before believing the
+leaked-context reading. Both failure modes present identically in that warning.
+The operational rules that follow:
 
-To finish: **reboot**, keep one `pie serve` at a time, and re-run with
-`total_pages`/`max_forward_requests` sized for ~21 GiB of headroom. The
-first thing to check afterwards is a bare completion — the hybrid binding
-above is the untested half.
-
----
+- **one `pie serve` at a time**, and stop it with `SIGTERM`, not `kill -9` — a
+  hard kill during a fire is what genuinely leaks a wedged context;
+- budget ~22.6 GiB for this model at the settings above;
+- `max_model_len 32768` is refused on this machine; 16384 boots.
 
 ## Reproduce
 
