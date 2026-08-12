@@ -20,6 +20,81 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-12 — PA.1 m2 blocker found before we built on it: `run_ahead` overshoot is incompatible with a fold
+
+The qwen-code session ran the seal fix we had both reasoned our way to, and it
+**failed** — then the driver's second rejection explained why, and the real
+cause is one neither of us proposed. Recording it here because it lands on our
+`engine.rs`, and because the shared reasoning that produced the wrong fix was
+agreed by two sessions and still false.
+
+**The fix that failed.** `fork` the fold onto the seal's own pipeline. It
+doesn't re-order the fold, it mints a *different* one:
+
+```
+paged continuation: recurrent slot 1 holds sequence 9223372036854775808,
+                    this fire is sequence 9223372036854775809
+```
+
+A continuation must carry the slot's own sequence; `fork` produces 2^63+1. So
+the `close()`/`fork()` pipeline story — ours as much as theirs — was never the
+mechanism.
+
+**The actual cause is position accounting, and it is structural:**
+
+```
+recurrent slot 0 is at position 165, this fire starts at 160   <- fold 5 AHEAD
+recurrent slot 0 is at position 14,  this fire starts at 15    <- fold 1 BEHIND
+```
+
+- **Ahead:** `run_ahead` submits speculatively past the stop token. For KV that
+  is documented as harmless, and it is — a later fire's `kv_len` and page CSR
+  only ever cover valid tokens, so the overshoot is masked. **A fold has no
+  `kv_len`.** It advances on every fire that *executes*, cannot be rewound, and
+  the seal then lands behind it.
+- **Behind:** the stop token is truncated-at rather than written, so
+  `total_len` can sit one past where the fold stopped.
+
+So the accounting the whole decode loop rests on — tolerate overshoot, mask it
+with `kv_len`, truncate at the stop token — is exactly what an irreversible
+fold cannot support. It is the same property the SDK states for eviction
+("dropping a KV page does not undo the fold"), reaching the seal by another
+route.
+
+**We have this exposure.** `engine.rs`'s `define_generate!` expands
+`run_ahead` for BOTH pass kinds, so the hybrid path speculates, and the SDK is
+explicit: *"Up to one window of fires may still be in flight at that point —
+their cells are simply never taken."* Never taken, but **executed, and
+therefore folded.**
+
+It is harmless today and only today: one request per process, the working set
+is discarded at the end of the turn, so nothing reads the over-advanced fold.
+The moment PA.1 m2 publishes that state it becomes wrong — and wrong in the
+silent direction, because a resumed fold that is a few tokens ahead of its KV
+still generates fluent text.
+
+**So the PA.1 m2 ordering changes again, and this constraint now comes first:**
+
+1. **the fold position and the KV length must agree by construction** — which
+   our decode loop currently does not provide on a hybrid pass;
+2. no RS index surface (`rs-working-set` has only `fork`), so the fold cannot
+   be published across processes at all;
+3. `copy_kv` on Metal accepts only hybrid geometry.
+
+(2) still decides whether hybrid KV-session correctness is demonstrable at all.
+(1) is the one we would have built on top of and discovered late.
+
+**Two candidate directions, neither attempted, both with a cost we should
+measure rather than assume:** no speculation on a hybrid pass — every fire's
+tokens accepted before the next is submitted, which gives up `run_ahead` and
+therefore some part of the **90 tok/s decode we measured with it**; or seal at
+the fold's position rather than the accepted length, which is only sound if
+nothing was ever folded that KV does not contain — and the stop-token
+truncation violates that today.
+
+Full detail on `liu/qwen-code-dev` @ `760ef8624`. KV reuse on Qwen3.6 stays
+recorded as **0%, cause understood**, not as a pending fix.
+
 ### 2026-08-12 — inbound from the qwen-code session, and one constraint that shapes PA.1 m2
 
 Cross-checked against our own run. Recorded here because two of the three

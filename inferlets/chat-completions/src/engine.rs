@@ -44,6 +44,30 @@
 //! and the decode fires, so decode continues the prefill's folded state
 //! rather than starting cold.
 //!
+//! ## SEAM (KV snapshot sessions): this loop's fold OVERSHOOTS, and must not
+//!
+//! `run_ahead` submits speculatively: "up to one window of fires may still be
+//! in flight" when `on_token` breaks, and their cells are never taken. Never
+//! taken, but EXECUTED — and therefore folded. For KV that is harmless by
+//! construction, because a later fire's `kv_len` and page CSR only ever cover
+//! valid tokens, so the overshoot is masked. A fold has no `kv_len`: it
+//! advances on every fire that executes and cannot be rewound.
+//!
+//! Harmless today and only today — one request per process, the working set
+//! is discarded when the turn ends, so nothing ever reads the over-advanced
+//! fold. The moment sessions publish that state it is wrong, and wrong
+//! silently: a resumed fold a few tokens ahead of its KV still generates
+//! fluent text. Measured driver-side by the qwen-code session as
+//! `recurrent slot 0 is at position 165, this fire starts at 160`.
+//!
+//! So before this loop's state can be sealed on a hybrid pass, the fold
+//! position and the KV length have to agree BY CONSTRUCTION — either no
+//! speculation on a hybrid pass (costing part of the 90 tok/s decode measured
+//! with `run_ahead`), or sealing at the fold's position rather than the
+//! accepted length, which is only sound once the stop token is written rather
+//! than truncated-at. Do not build the session seam on top of this loop
+//! without resolving it.
+//!
 //! Failures never escape as `Err` to the wire: [`generate`] reports the
 //! first error and the caller degrades the turn to `finish_reason:"length"`
 //! (the audit's overflow discipline — a KV/context overflow mid-decode is
