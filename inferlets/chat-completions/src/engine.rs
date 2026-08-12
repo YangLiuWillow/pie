@@ -187,7 +187,7 @@ macro_rules! define_generate {
             cfg: &GenConfig,
             on_token: &mut impl FnMut(u32) -> std::ops::ControlFlow<()>,
         ) -> Result<()> {
-            use inferlet::ptir::$kind::{ForwardPass, run_ahead};
+            use inferlet::ptir::$kind::{ForwardPass, run_ahead, submit_frame};
 
             let temperature = cfg.temperature;
             let top_p = cfg.top_p;
@@ -369,12 +369,39 @@ macro_rules! define_generate {
                     pool_ids_ch.put(&pids);
                 });
 
-                run_ahead(&pipe, &fwd, budget, async || {
-                    let t = out.take_host::<Vec<i32>>().await?;
-                    let token = *t.first().unwrap_or(&0) as u32;
-                    Ok(on_token(token))
-                })
-                .await?;
+                // MEASUREMENT SWITCH (not a shipped feature — see the
+                // module's overshoot seam). The default `run_ahead` path
+                // speculates: up to one window of fires stays in flight when
+                // the callback breaks, executed and therefore FOLDED. The
+                // sequential path submits one fire and takes its result
+                // before submitting the next, so nothing is ever folded that
+                // the turn did not accept — the property a hybrid seal needs.
+                //
+                // It is hand-written rather than `run_ahead(.., 1, ..)` in a
+                // loop, because `run_ahead` calls `on.close()` as soon as its
+                // budget is spent (ptir.rs: "call close right after the last
+                // submit"), so a second call submits into a closed pipeline.
+                // That does not error — it HANGS, which cost a 300 s timeout
+                // to discover.
+                const SEQUENTIAL_DECODE: bool = false;
+                if !SEQUENTIAL_DECODE {
+                    run_ahead(&pipe, &fwd, budget, async || {
+                        let t = out.take_host::<Vec<i32>>().await?;
+                        let token = *t.first().unwrap_or(&0) as u32;
+                        Ok(on_token(token))
+                    })
+                    .await?;
+                } else {
+                    for _ in 0..budget {
+                        submit_frame(&pipe, &[Some(&fwd)])?;
+                        let t = out.take_host::<Vec<i32>>().await?;
+                        let token = *t.first().unwrap_or(&0) as u32;
+                        if on_token(token).is_break() {
+                            break;
+                        }
+                    }
+                    pipe.close();
+                }
             }
 
             // Any fire still in flight after an early stop is left untaken; close

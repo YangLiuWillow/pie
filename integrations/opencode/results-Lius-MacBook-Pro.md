@@ -110,7 +110,7 @@ throwaway request first, config exactly as in §Configuration.
 | prefill | **421 tok/s** (5221-token prompt, first content at 12.41 s, n=3, σ<0.05 s) |
 | decode, single-stream | **90 tok/s** (400 tokens, n=3: 87.9 / 89.6 / 90.0) |
 | TTFB (first SSE byte) | **0.003 s** |
-| 8 concurrent long prompts | 98.6 s wall, 8/8 completed; per-request 35.6 / 73.5 / 98.6 s (min/median/max) |
+| 8 concurrent long prompts | ~~98.6 s wall, 8/8 completed~~ **WRONG — see §Concurrency below. All 8 turns DEGRADED; 13 completion tokens across 8 requests should have been the tell.** |
 | stock-opencode agentic task, end to end | **81.2 s** (read → write, 2 tool calls, correct file) |
 
 Two of those need their labels read carefully:
@@ -122,7 +122,78 @@ Two of those need their labels read carefully:
 - **"8 concurrent" is 8 requested, 4 seated.** A hybrid model costs two
   admission seats per lane (`seat_cost=2`), so `max_forward_requests = 8`
   seats 4 and the other four queue. Reporting it as 8-way concurrency would
-  overstate it by exactly 2×.
+  overstate it by exactly 2×. **And it did not work at all** — see below.
+
+### Concurrency: the serving inferlet cannot serve two requests at once
+
+Reported here as an open defect rather than a measurement, because the first
+version of this file recorded the 8-way row as "8/8 completed" and it was not.
+Thirteen completion tokens across eight requests was sitting in the same line
+and I read the completion count instead. Every one of those turns had degraded.
+
+Isolated afterwards, with one dedicated server per variant:
+
+| concurrent requests | speculative (`run_ahead`, shipped) | sequential (one fire at a time) |
+|---|---|---|
+| 1 | 200 tokens — fine | 200 tokens — fine |
+| 2 | **2/2 degraded** (1 and 3 tokens) | 0/2 degraded |
+| 4 | **4/4 degraded** (1, 2, 3, 1 tokens) | 2/4 degraded |
+
+The driver rejects the launch:
+
+```
+out take: channel is poisoned: pipeline: forward failed:
+direct launch rejected: pie_metal_launch failed with status -1
+```
+
+**It is not hybrid-specific.** The dense Qwen3-0.6B fails identically at N≥2 on
+the shipped build, so this is the serving path, not the GDN model.
+
+Three things follow, and none of them are comfortable:
+
+1. **The acceptance suite is entirely sequential**, so 25/25 green never
+   covered this. "Phase A works" means one request at a time.
+2. **The degradation discipline hides it.** A rejected launch becomes
+   `finish_reason: "length"` with a one-token answer — indistinguishable on
+   the wire from a model that simply stopped. That discipline is right for a
+   KV overflow and wrong for a hard fault; the two need different reasons.
+   The `'…'` placeholder assertion does not catch these, because a
+   one-real-token answer is not the placeholder.
+3. **Sequential decode largely fixes it and costs nothing measurable**
+   (90.6 vs 91.0 tok/s at N=1, see below), which inverts the trade-off this
+   measurement was commissioned to price.
+
+### Speculative vs sequential decode — the PA.1 m2 go/no-go
+
+Commissioned to price what dropping `run_ahead` would cost on a hybrid pass,
+since its speculative overshoot is what a fold cannot tolerate. One dedicated
+server per variant (a hot-swap of the installed wasm under a live server was
+tried first and produced unusable data — degraded turns and unstable prefill;
+do not do that).
+
+| | median decode, n=5 full runs, 35B |
+|---|---|
+| speculative `run_ahead` (shipped) | **91.0 tok/s** |
+| sequential, one fire at a time | **90.6 tok/s** |
+
+**0.4% — inside the noise.** At batch-1 on an embedded worker the "host round
+trip" `run_ahead` exists to hide is a channel operation, not IPC, so there is
+almost nothing to hide. Its value should show up with many lanes in flight and
+with a remote worker; neither applies here.
+
+Combined with the concurrency result above, the answer is not "cheap enough":
+**the sequential path is strictly better on this machine.** It costs nothing
+measurable at N=1, it is what a hybrid seal requires, and it degrades far less
+under concurrency. What was framed as a cost of sessions turns out to be a
+partial fix for a defect we did not know we had.
+
+Two caveats on that. The sequential path is **not** a complete concurrency fix
+(2/4 still degraded at N=4), so the underlying launch rejection needs its own
+diagnosis. And `run_ahead` is single-use per pipeline — it calls `on.close()`
+once its budget is spent, so a "sequential" loop written as repeated
+`run_ahead(.., 1, ..)` submits into a closed pipeline and **hangs** rather than
+erroring. The working shape is a hand-written `submit_frame` + take loop with a
+single `close()` at the end.
 
 ### What the numbers say about the roadmap
 
