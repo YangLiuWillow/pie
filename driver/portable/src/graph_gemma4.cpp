@@ -54,6 +54,11 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
     const std::int32_t n_kv_heads = h.num_key_value_heads;
     const std::int32_t n_total    = plan.total_n_tokens;
     const std::int32_t n_req      = static_cast<std::int32_t>(plan.reqs.size());
+    // Rows the lm_head produces = sampling slots, which is independent
+    // of n_req (prefill-only requests contribute none; spec-decode
+    // verify contributes several).
+    const std::int32_t n_slots =
+        static_cast<std::int32_t>(plan.sampling_pos_i32.size());
     const ArchSpec spec = arch_spec_for(h.arch, h);
 
     auto* gf = ggml_new_graph_custom(
@@ -522,9 +527,9 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
         ggml_tensor* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/nullptr,
                                                 /*scale=*/inv_t, /*max_bias=*/0.0f);
         top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
-        ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_req);
+        ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_slots);
         ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
-        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_req);
+        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_slots);
         ggml_set_name(top_k_idx,   "top_k_idx");
         ggml_set_name(top_k_probs, "top_k_probs");
         ggml_set_output(top_k_idx);

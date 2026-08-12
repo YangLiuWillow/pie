@@ -60,6 +60,11 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
     const std::int32_t n_embd_gqa = n_kv_heads * head_dim;
     const std::int32_t n_total    = plan.total_n_tokens;
     const std::int32_t n_req      = static_cast<std::int32_t>(plan.reqs.size());
+    // Rows the lm_head produces = sampling slots, which is independent of
+    // n_req (prefill-only requests contribute none; spec-decode verify
+    // contributes several).
+    const std::int32_t n_slots =
+        static_cast<std::int32_t>(plan.sampling_pos_i32.size());
     const ArchSpec spec = arch_spec_for(h.arch, h);
 
     // Graph node budget: each layer adds ~10 ops per request (mostly attention
@@ -840,10 +845,14 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         // the get_rows trick used by the MoE router (build_moe_ffn).
         // probs reshaped to [1, vocab, n_slots]; get_rows along ne[1]
         // with index [K, n_slots] yields [1, K, n_slots] → reshape.
+        // n_slots, NOT n_req: logits are [vocab, out_idx] and sampling
+        // slots are flat across requests, so a batch that mixes a
+        // prefill-only request (no slots) with decodes has fewer slots
+        // than requests — reshaping by n_req aborts in ggml_reshape_3d.
         ggml_tensor* probs_3d = ggml_reshape_3d(
-            ctx, probs, 1, h.vocab_size, n_req);
+            ctx, probs, 1, h.vocab_size, n_slots);
         ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
-        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_req);
+        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_slots);
 
         ggml_set_name(top_k_idx, "top_k_idx");
         ggml_set_name(top_k_probs, "top_k_probs");

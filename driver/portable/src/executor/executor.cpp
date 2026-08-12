@@ -49,6 +49,13 @@ struct Executor::GraphCache {
     bool          all_greedy         = false;
     bool          uniform_top_sample = false;
     std::int32_t  uniform_top_k      = 0;
+    // Sampling slots are FLAT across requests and independent of
+    // n_request: a prefill-only request contributes none, a spec-decode
+    // verify pass contributes several. `out_idx` is sized to exactly this
+    // count, so a cached graph reused at a different count would either
+    // under-fill it (stale slot) or overrun its buffer in
+    // upload_graph_inputs. Part of the signature, like total_pages_in_batch.
+    std::int32_t  n_sample_slots     = 0;
     const Adapter* adapter           = nullptr;
     // Slow-path only: per-request mask + gather shapes. Empty on pure-
     // decode (where the packed tensors are fully determined by
@@ -82,6 +89,8 @@ struct Executor::GraphCache {
         if (all_greedy != plan.all_greedy) return false;
         if (uniform_top_sample != plan.uniform_top_sample) return false;
         if (uniform_top_k != plan.uniform_top_k) return false;
+        if (n_sample_slots !=
+            static_cast<std::int32_t>(plan.sampling_pos_i32.size())) return false;
         if (adapter != plan.active_adapter) return false;
         if (plan.pure_decode) {
             if (total_pages_in_batch !=
@@ -115,6 +124,7 @@ struct Executor::GraphCache {
         all_greedy         = plan.all_greedy;
         uniform_top_sample = plan.uniform_top_sample;
         uniform_top_k      = plan.uniform_top_k;
+        n_sample_slots     = static_cast<std::int32_t>(plan.sampling_pos_i32.size());
         adapter            = plan.active_adapter;
         if (plan.pure_decode) {
             n_tokens_pad_per_req.clear();
