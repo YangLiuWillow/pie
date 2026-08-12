@@ -1,0 +1,28 @@
+# pie arm, H200 x Qwen3-Coder-30B-A3B-Instruct (A/B rerun on the rewritten
+# engine; old-engine numbers in docs/qwen-code-integration-plan.md §5b).
+
+[server]
+host = "127.0.0.1"
+port = 18080
+registry = "https://registry.pie-project.org/"
+verbose = false
+telemetry = false
+
+[model]
+name = "default"
+model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+gpu_mem_utilization = 0.90
+
+[runtime]
+request_timeout = "600s"
+
+[sandbox]
+allow_fs = false
+allow_network = true
+network_allowed_hosts = ["*"]
