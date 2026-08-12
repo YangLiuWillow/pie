@@ -61,11 +61,14 @@ class InferletBridge:
         self._reader = None
 
     async def start(self):
+        await self._connect_client()
+        await self.client.install_program(self.wasm, self.manifest, force_overwrite=True)
+        await self._launch()
+
+    async def _connect_client(self):
         self.client = PieClient(self.pie_uri, identity=self.identity)
         await self.client.connect()
         await self.client.authenticate("shim")
-        await self.client.install_program(self.wasm, self.manifest, force_overwrite=True)
-        await self._launch()
 
     async def _launch(self):
         self.proc = await self.client.launch_process(self.inferlet, input={}, capture_outputs=True)
@@ -99,11 +102,23 @@ class InferletBridge:
             q.put_nowait(("error", {"status": 500,
                                     "error": openai_error("inferlet exited", "server_error")["error"]}))
         self.queues.clear()
-        try:
-            await self._launch()
-        except Exception as e:
-            LOG(f"relaunch failed: {e!r}")
-            self.proc = None
+        # The WS itself may be the casualty (gateway restart, silence kill):
+        # relaunch needs a live client first, so rebuild the whole chain with
+        # backoff rather than assuming the connection survived the process.
+        self.proc = None
+        for delay in (0, 2, 5, 10, 30):
+            await asyncio.sleep(delay)
+            try:
+                await self._launch()
+                return
+            except Exception:
+                try:
+                    await self._connect_client()
+                    await self._launch()
+                    return
+                except Exception as e:
+                    LOG(f"reconnect attempt failed: {e!r}")
+        LOG("giving up on relaunch; next request will retry via _launch")
 
     async def request(self, body):
         """Async generator of (event, data) for one chat-completion request."""

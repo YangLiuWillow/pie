@@ -21,6 +21,9 @@ gpu_mem_utilization = 0.90
 
 [runtime]
 request_timeout = "600s"
+# First 30B request pays PTIR compile + warmup and can exceed the default
+# 30s silence window — the engine then kills the inferlet mid-warmup.
+silence_timeout = "300s"
 
 [sandbox]
 allow_fs = false
