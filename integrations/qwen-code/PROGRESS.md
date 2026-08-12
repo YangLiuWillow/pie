@@ -79,6 +79,16 @@ single-arm gap in `summarize.py`, both now fixed. To run the pie arm
 locally on Qwen3-0.6B-4bit for harness validation, free ~3 GiB of memory
 first; expect most task checks to fail on a 0.6B model regardless.
 
+**Smoke-run attempt (2026-08-12).** Metal refused again, empirically:
+needs 2.465 GiB resident + the 2 GiB margin against 1.503 GiB reclaimable.
+The margin alone exceeds what is free, so this is not a
+pick-a-smaller-model problem — nothing boots until ~3 GiB is freed. What
+was validated instead, GPU-free: the A/B reporting layer, now covered by
+`bench/test_summarize.py` (synthetic arms built from the checked-in
+captures; asserts trajectory-mismatch detection, the equivalence path, and
+single-arm summarization). That closes the last untested piece of the
+benchmark pipeline — everything except the model itself has now run.
+
 ## Later / parked
 
 - `/no_think` parity fixtures (`enable_thinking:false` corpus).
