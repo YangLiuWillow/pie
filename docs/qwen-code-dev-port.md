@@ -585,3 +585,53 @@ result this benchmark exists to show** (76.9% on the run-2 30B). Combined
 with vllm-metal's APC ❌ for the 3.5/3.6 family (§14), there is a real risk
 that run 3 on Qwen3.6 measures neither arm's prefix reuse. Worth deciding
 deliberately rather than discovering after the run.
+
+## 16. What `dev` already has for Qwen3.6 (2026-08-12)
+
+Searched `fork/dev` for a Qwen3.6-35B-A3B benchmark against vLLM / SGLang /
+llama.cpp / mlx-lm. **No such result set is checked in.** What exists:
+
+| | |
+|---|---|
+| `benches/` | runners for Pie, vLLM, SGLang, **llama.cpp**, **TensorRT-LLM** — no mlx-lm anywhere on `dev` (the only "mlx" hit is a substring in `website/package-lock.json`) |
+| Pie's bench arm | `inferlets/text-completion-bench/src/lib.rs` (293 lines), selected by `benches/pie_bench.py:37` |
+| Qwen3.6-35B-A3B | appears only in `benches/smoke_deterministic.py` as `qwen3_6_moe` — a **determinism** check (temp 0, sha ledger, TP2), not a perf comparison |
+| checked-in results | `results_pie/vllm/sglang.json` are all **Qwen3-0.6B** |
+| published figures | `website/docs/overview/benchmarks.mdx` — Llama 3 1B on an L4 vs vLLM 0.6.0 / SGLang 0.4.4, from the SOSP '25 paper |
+| llama.cpp link | `driver/portable` (GGUF/ggml); `driver/portable/dev_qwen3_5_35b.toml` targets this exact model |
+
+### The part that changes our plan
+
+`smoke_deterministic.py` drives `pie_bench.py`, which runs the
+`text-completion-bench` inferlet — so **Qwen3.6-35B-A3B already runs
+through pie on `dev`**. That inferlet uses the **high-level
+`Context`/`Model::generate` API** (`Context::new`, `ctx.generate(sampler)`),
+not raw PTIR, and carries no `ForwardKind` gate at all.
+
+So §15's blocker is narrower than stated: it is not "the inferlet layer
+cannot do hybrid", it is "**our** inferlet hand-rolls a raw-PTIR
+`ptir::attention` loop". Two routes now:
+
+1. Port `generation.rs` to `ptir::hybrid` + `RsWorkingSet` (keeps chunked
+   prefill and the device-carried decode loop, and keeps explicit KV
+   control — which is the whole point of the KV-reuse story).
+2. Drop to the high-level `Context::generate` path for hybrid models, as
+   `text-completion-bench` does. Cheaper, and there is a working reference —
+   but it likely surrenders the explicit KV retention that
+   `session.rs` is built on, so it may cost the reuse result.
+
+Route 1 still looks right for this integration, but `text-completion-bench`
+is now a working reference for how the SDK drives this model, and worth
+reading before writing the hybrid pass.
+
+**Caveat:** that path is verified on **CUDA TP2** (`smoke_deterministic`
+pins `devices="cuda:0,cuda:1"`), not on Metal.
+
+Also useful — In Gim's portable-driver bring-up (`a6f710a32`, "Qwen3.5-35B-A3B
+verified") documents three Qwen3.6 config traps, the nastiest being
+`tie_word_embeddings` living at the **outer** level of a multimodal-wrapped
+checkpoint: reading only `text_config` silently ties `lm_head`↔`tok_embd`
+and flips argmax on the first token while per-layer activations still match
+HF at cosine 0.9985. Checked: `driver/metal/src/model_facts.cpp:303-313`
+already handles this (tries `text_config`, falls back to top level, citing
+Qwen3.5-35B-A3B), so Metal is not exposed to it.
