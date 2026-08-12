@@ -1,20 +1,34 @@
 # opencode ↔ Pie integration — handover
 
-**For:** a fresh Claude Code session, on this machine or a new one.
+**For:** a fresh Claude Code session picking this up cold.
 **Written:** 2026-08-12, at the end of the first working stretch.
 **Branch:** `liu/opencode-integration` on `https://github.com/YangLiuWillow/pie.git`
 (the `fork` remote), based on pie `dev` @ `58cb77936`.
-
-**Working tree** (if it came across with you): `~/Documents/Liszt_ai/pie-opencode`,
-a git worktree of `~/Documents/Liszt_ai/pie`. The project tree moved from
-`~/Desktop/Lin_startup` to `~/Documents/Liszt_ai` on 2026-08-12; git worktree
-links survived the move, and every path in this repo's docs and scripts was
-rewritten to match. If you are starting from nothing, §3 rebuilds it from the
-remote.
+**Working tree:** `~/Documents/Liszt_ai/pie-opencode` — a git worktree of
+`~/Documents/Liszt_ai/pie`. (§3 rebuilds it if you are starting from nothing.)
 
 Read this first, then `docs/opencode-integration.md` (the design), then
 `docs/opencode-integration-progress.md` (the task-by-task log, newest first).
-Those two are the durable record; this file is just the bridge.
+Those two are the durable record; this file is the bridge.
+
+## 0. Orient yourself in one minute
+
+Run this before anything else. It confirms you are on the right branch, up to
+date, and that the machine reproduces the green test state.
+
+```sh
+cd ~/Documents/Liszt_ai/pie-opencode
+export CARGO_TARGET_DIR=~/Documents/Liszt_ai/.cargo-target/pie-opencode  # see §3 — do NOT share this
+
+git status -sb && git log --oneline -3          # expect: liu/opencode-integration, clean
+cargo test -p pie-openai-serving                # expect 43 passed
+cargo test -p pie-model-qwen-3 --features chat  # expect 24 passed
+cargo test -p pie-gateway                       # expect 40 + 1 + 6 passed
+```
+
+If those pass, the repo is healthy and the next thing to do is §4 — the live
+run, which has **never been executed**. If they fail, something about the
+environment differs from where this was written; fix that before building on it.
 
 ---
 
@@ -56,10 +70,13 @@ contexts, subagents, and multi-tenant load. Don't claim wins outside it.
 | PB.1 | `opencode-session` inferlet + AI SDK provider | not started |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | not started (optional) |
 
-**Everything is committed and pushed. Nothing was lost in the migration** —
-verified by a fresh clone of the remote after the old working tree was deleted.
+**Everything is committed and pushed** to the fork branch; the local tree and
+the remote agreed at handover. (The project directory moved from
+`~/Desktop/Lin_startup` to `~/Documents/Liszt_ai` on 2026-08-12 — git worktree
+links survived, and every path in this repo's docs and scripts was rewritten to
+match. If you find a stale `Lin_startup` path anywhere, it is a bug; fix it.)
 
-Test status (all green at handover, native/unit level):
+Test status at handover (all green, native/unit level — §0 re-runs them):
 `pie-openai-serving` 43/43 · `pie-model-qwen-3 --features chat` 24/24 ·
 `pie-gateway` 40+1+6 · renderer parity **5/5 fixtures token-exact** vs HF ·
 inferlet builds clean for `wasm32-wasip2` (606 KB; 35 s on Linux).
@@ -90,12 +107,33 @@ git worktree add -b liu/opencode-integration ../pie-opencode fork/liu/opencode-i
 cd ../pie-opencode
 ```
 
-**Build discipline (matters):** the old machine ran out of disk with 24 GB of
-cargo artifacts per checkout. Point worktree builds at one shared target dir:
+### Build discipline — read this, it has already bitten twice
+
+**Use a target dir private to THIS worktree:**
 
 ```sh
-export CARGO_TARGET_DIR=~/Documents/Liszt_ai/pie/target
+export CARGO_TARGET_DIR=~/Documents/Liszt_ai/.cargo-target/pie-opencode
 ```
+
+**Do not share one target dir across the sibling worktrees.** The earlier advice
+here was to share `~/Documents/Liszt_ai/pie/target` to save disk, and it is
+wrong: `pie-openclaw` (and potentially other integration worktrees) contains a
+crate with the **identical package name** `pie-openai-serving` but different
+content, and sharing a target dir makes their build artifacts collide. The
+symptom is baffling — in *this* worktree, `cargo test -p pie-openai-serving`
+reports **39 passed / 6 failed** with failures like
+`every_openclaw_fixture_parses_and_renders` (a test that does not exist in this
+source tree) panicking on a missing fixture file. With a private target dir the
+same command is **43/43**. If you ever see a test name you cannot find with
+grep, suspect this first.
+
+The opposite failure mode is also real: the old machine hit **ENOSPC** with
+~24 GB of artifacts per checkout, which killed a build mid-run. Keep an eye on
+`du -sh ~/Documents/Liszt_ai/.cargo-target/*` and `cargo clean` the worktrees
+you are not using. Correctness first, disk second.
+
+`run_pie_opencode.sh` honors `CARGO_TARGET_DIR` for both the `pie` binary and
+the inferlet wasm, falling back to the crate-local and legacy shared paths.
 
 Toolchain: `rust-toolchain.toml` pins **1.97.1** and declares the
 `wasm32-wasip2` target. Materialize it once (`cargo --version` inside the repo)
@@ -117,17 +155,43 @@ component install.
 
 ## 4. Next step: PA.3, the live run
 
-This is the whole remaining Phase A. Two paths; pick by what hardware the new
-machine has.
-
-### Path A — local Metal (Apple Silicon)
+This is the whole remaining Phase A. Four steps; step 3 differs by hardware.
 
 ```sh
 cd ~/Documents/Liszt_ai/pie-opencode
-CARGO_TARGET_DIR=~/Documents/Liszt_ai/pie/target \
-  cargo build -p pie-bin --release --features driver-metal   # ← the feature is REQUIRED
-bash integrations/opencode/run_pie_opencode.sh               # boots, waits /health, runs the suite
+export CARGO_TARGET_DIR=~/Documents/Liszt_ai/.cargo-target/pie-opencode  # per-worktree, see §3
+
+# 1. Toolchain, once, before any parallel build (rust-toolchain.toml pins
+#    1.97.1 + wasm32-wasip2; concurrent first use races rustup's installer).
+cargo --version
+
+# 2. The server binary. The driver feature is MANDATORY — without it the
+#    binary builds fine and then fails at boot with "driver type ... is not
+#    built into this binary". Pick ONE:
+cargo build -p pie-bin --release --features driver-metal   # Apple Silicon
+# cargo build -p pie-bin --release --features driver-cuda  # NVIDIA (needs CUDA >= 12.8)
+
+# 3. Weights. Metal needs the MLX 4-bit build (the Metal llama path is
+#    4-bit-only; a raw bf16 repo imports fine and then fails to bind at load):
+$CARGO_TARGET_DIR/release/pie model import mlx-community/Qwen3-0.6B-4bit
+# CUDA takes raw bf16:  pie model import Qwen/Qwen3-0.6B
+$CARGO_TARGET_DIR/release/pie model list    # confirm the artifact is stored
+
+# 4. The inferlet. THE LAUNCH SCRIPT DOES NOT BUILD THIS — it only copies an
+#    existing artifact into ~/.pie/programs/ and warns "no built wasm" if it
+#    is missing, which then fails at request time. It looks for the wasm at
+#    $CARGO_TARGET_DIR/wasm32-wasip2/release/chat_completions.wasm, so
+#    CARGO_TARGET_DIR must be exported for this build too (the crate is its
+#    own workspace; unset, it would land in inferlets/chat-completions/target
+#    and the script would not find it).
+(cd inferlets/chat-completions && cargo build --target wasm32-wasip2 --release)
+ls -la $CARGO_TARGET_DIR/wasm32-wasip2/release/chat_completions.wasm   # ~606 KB
+
+# 5. The live run: boots the server, waits /health, runs the 25 tests, exits.
+bash integrations/opencode/run_pie_opencode.sh
 ```
+
+### Path A — local Metal (Apple Silicon)
 
 **Known blocker on the old machine:** the Metal driver refuses admission unless
 `needed (~1.2 GiB) + a flat 2 GiB host margin < reclaimable RAM` — it had only
@@ -154,21 +218,47 @@ proxy, which failed PTY allocation. **Pods bill hourly — terminate them the
 moment the results are banked.** Three were left running at $7.92/h before the
 user caught it; all are now terminated.
 
-### Then
+### Driving it by hand
+
+`run_pie_opencode.sh` wraps all of this, but when debugging you will want the
+pieces separately:
 
 ```sh
+bash integrations/opencode/run_pie_opencode.sh --serve-only &   # boot + wait, no tests
 PIE_BASE_URL=http://127.0.0.1:8080 python3 integrations/opencode/test_acceptance.py
+python3 integrations/opencode/test_acceptance.py --collect-only     # list the 25 tests
+python3 integrations/opencode/test_acceptance.py --only stream      # run a subset
+curl -s localhost:8080/health; curl -s localhost:8080/v1/models      # ingress liveness
 ```
 
-25 tests, stdlib-only. Wire-shape assertions are hard; 0.6B model-behavior ones
-are soft `[WARN]`. `--collect-only` lists them, `--only <substr>` filters, exit
-2 = server unreachable. Then the stock-opencode e2e per
-`integrations/opencode/README.md` (`opencode run -m pie/qwen3-0.6b …` with the
-committed `opencode.json`).
+Suite conventions: stdlib-only (no pip deps). **Wire-shape assertions are hard;
+0.6B model-behaviour ones are soft `[WARN]`** — a warn about the model not
+choosing to call a tool is not a failure, a malformed tool-call delta is. Exit
+code 2 means the server was unreachable, not that tests failed.
+
+Then the stock-opencode e2e per `integrations/opencode/README.md`
+(`opencode run -m pie/qwen3-0.6b …` against the committed `opencode.json`).
 
 **Expect first-contact bugs.** Nothing below the HTTP layer has met a real
-engine. Bank results to `integrations/opencode/results-<host>.md` and add a
-progress-log entry either way — a failure list is a deliverable.
+engine, so budget for real debugging here, not a victory lap. Useful reflexes:
+the server log is the first place to look (the script prints its path); a 500
+means the inferlet trapped or the envelope broke; a hang usually means the
+inferlet never sent the `{"status":…}` header. Bank results to
+`integrations/opencode/results-<host>.md` and add a progress-log entry either
+way — **a failure list is a deliverable**, and the CUDA/RAM dead ends are logged
+precisely so nobody pays for them twice.
+
+### Re-run the parity harness after touching templates or rendering
+
+```sh
+cargo build -p render-tokens
+python3 integrations/opencode/parity/check_render.py \
+    --bin $CARGO_TARGET_DIR/debug/render-tokens        # needs: pip install transformers huggingface_hub
+```
+
+Expect `exact` for all five fixtures. It downloads tokenizer files only, never
+weights. This is the test that keeps pie's prompt byte-identical to what the
+model was fine-tuned on; treat a regression here as serious.
 
 ---
 
@@ -250,15 +340,42 @@ Request path: **opencode → `POST /v1/chat/completions` (gateway ingress) →
 
 ---
 
-## 8. If you're picking this up cold — the first three moves
+## 8. The order of work from here
 
-1. `git clone` + worktree per §3; set `CARGO_TARGET_DIR`; run the test suites
-   listed in §2 to confirm the machine reproduces green.
-2. Restore model weights + build the binary with the right driver feature (§4),
-   then run `integrations/opencode/run_pie_opencode.sh`. **Fix what first
-   contact breaks** — that is the actual work now, and it is expected to be
-   non-trivial.
-3. Only once the suite and the opencode e2e are green, start **PA.1 milestone 2**
-   (KV snapshot sessions — the seams are marked in-code: attach at
-   `build_prompt` + a pre-finish save, then report real `cached_tokens`) and
-   then **Strategy B**, which is where the interesting research claim lives.
+1. **Orient** — §0. Working tree on the right branch, three test suites green.
+2. **Bring it up live** — §4, all five steps. This is the immediate task and the
+   only thing standing between "written" and "works". Fix what first contact
+   breaks; commit each fix with a progress-log entry.
+3. **Stock-opencode e2e** — a real agent turn against pie, tool call included.
+   That closes Phase A. Write the results file.
+4. **PA.1 milestone 2 — KV snapshot sessions.** The seams are marked in-code and
+   the pure logic is already written and tested in
+   `pie-openai-serving::session` (`split_resume_point`, `snapshot_address`).
+   Attach at prompt build + a pre-finish save via the working-set
+   `update-index`/`from-index` WIT calls, then report real `cached_tokens`.
+   This is what makes the endpoint *pie* rather than a slow vLLM.
+5. **Strategy B** — the `opencode-session` inferlet. This is where the research
+   claim lives (in-place context editing, KV forking for subagents, overlap);
+   `opencode-integration.md` §2 is the design and §4 the measurement plan.
+
+Deferred inside PA.1, in-code seams marked: grammar-constrained tool calls
+(gate behind a driver-capability probe — it trapped the guest on drivers without
+grammar support) and the Qwen3-Coder XML tool dialect (`ToolFormat::Coder` plus
+its salvage parser, portable from
+`openhands-integration-updated:runtime/src/model/instruct/qwen3.rs`).
+
+---
+
+## 9. Where things live (quick map)
+
+| Path | What |
+|---|---|
+| `docs/opencode-integration.md` | The design: both strategies, the B-1…B-6 table, phasing, measurement |
+| `docs/opencode-integration-progress.md` | Task-by-task log, newest first — read the top three entries |
+| `gateway/src/ingress/openai.rs` | HTTP surface + **the authoritative envelope contract** (module docs) |
+| `gateway/tests/openai_ingress.rs` | 6 ingress tests against a stub envelope worker |
+| `inferlets/chat-completions/` | The serving guest wasm (`lib.rs` envelope, `engine.rs` generation, `turn.rs` state machine) |
+| `inferlets/openai-serving/` | All engine-free logic + 43 native tests — **put new logic here** |
+| `model/qwen_3/src/chat.rs` | The Qwen chat template (replay primitives, no-think cue) |
+| `integrations/opencode/` | Acceptance suite, launch script, opencode profile, parity harness |
+| `tests/inferlets/fixtures/opencode/` | 5 real captured opencode requests + `AUDIT.md` (the hazard table) |

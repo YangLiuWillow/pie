@@ -39,6 +39,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+# Same CARGO_TARGET_DIR reasoning as the wasm lookup below.
+if [ -z "${PIE_BIN:-}" ]; then
+    for CAND in "${CARGO_TARGET_DIR:-}/release/pie" "$REPO/target/release/pie" \
+                "$REPO/../pie/target/release/pie"; do
+        if [ -n "${CAND#/release*}" ] && [ -x "$CAND" ]; then PIE_BIN="$CAND"; break; fi
+    done
+fi
 PIE_BIN="${PIE_BIN:-$REPO/../pie/target/release/pie}"
 PIE_HOME="${PIE_HOME:-$HOME/.pie}"
 PIE_PORT="${PIE_PORT:-8080}"
@@ -101,7 +108,17 @@ fi
 # ── refresh the chat-completions inferlet in \$PIE_HOME/programs ─────────────
 # The gateway launches the serving inferlet by name; the engine resolves it
 # from \$PIE_HOME/programs/<name>/<version>.wasm + <version>.toml.
-WASM_SRC="$REPO/../pie/target/wasm32-wasip2/release/chat_completions.wasm"
+# Honor CARGO_TARGET_DIR — sibling worktrees (pie-openclaw, …) carry crates
+# with IDENTICAL package names but different content, so a target dir shared
+# across them collides; a per-worktree dir is the safe default. Falls back to
+# the crate-local target, then the old shared path.
+for CAND in \
+    "${CARGO_TARGET_DIR:-}/wasm32-wasip2/release/chat_completions.wasm" \
+    "$REPO/inferlets/chat-completions/target/wasm32-wasip2/release/chat_completions.wasm" \
+    "$REPO/../pie/target/wasm32-wasip2/release/chat_completions.wasm"; do
+    if [ -n "${CAND#/wasm32*}" ] && [ -f "$CAND" ]; then WASM_SRC="$CAND"; break; fi
+done
+WASM_SRC="${WASM_SRC:-$REPO/inferlets/chat-completions/target/wasm32-wasip2/release/chat_completions.wasm}"
 MANIFEST_SRC="$REPO/inferlets/chat-completions/Pie.toml"
 PROG_DIR="$PIE_HOME/programs/chat-completions"
 if [ -f "$WASM_SRC" ]; then
@@ -109,7 +126,7 @@ if [ -f "$WASM_SRC" ]; then
         mkdir -p "$PROG_DIR"
         cp "$WASM_SRC" "$PROG_DIR/0.1.0.wasm"
         cp "$MANIFEST_SRC" "$PROG_DIR/0.1.0.toml"
-        echo "── refreshed $PROG_DIR/0.1.0.{wasm,toml} from the shared target dir"
+        echo "── refreshed $PROG_DIR/0.1.0.{wasm,toml} from $(dirname "$WASM_SRC")"
     fi
 else
     echo "── warning: no built wasm at $WASM_SRC — using whatever is installed" >&2
