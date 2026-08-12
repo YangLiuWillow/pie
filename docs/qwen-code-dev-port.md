@@ -635,3 +635,66 @@ and flips argmax on the first token while per-layer activations still match
 HF at cosine 0.9985. Checked: `driver/metal/src/model_facts.cpp:303-313`
 already handles this (tries `text_config`, falls back to top level, citing
 Qwen3.5-35B-A3B), so Metal is not exposed to it.
+
+## 17. The pie arm is live on Qwen3.6-35B-A3B, Metal (2026-08-12) — VERIFIED
+
+The hybrid port of §15/§16 has now served real tokens through *our* inferlet:
+
+```
+pie serve -c <metal qwen3.6, max_model_len 16384>   → 19.51 GB bound, seated=4 of 8 lanes
+POST /v1/chat/completions  t=0
+  "What is 2+2? Answer with just the number."      → "4"          (139 tok, 6.0 s)
+  "Write a one-line Python function…"              → coherent      (48 tok, 0.6 s)
+```
+
+~80 tok/s after warm-up. This closes the existential question for the pie
+arm: **Metal + `qwen3_5_moe` + our chat-completions inferlet generates
+correctly.** The §13 garbage is confined to the llama-family `qwen3_moe`
+path and does not touch this one.
+
+Cross-check against the oracle: vLLM-metal on the same machine and model at
+t=0 opens both answers identically ("Here's a thinking process:\n\n1.
+**Analyze User Input:**…") and diverges only later — expected, because the
+two prompts still differ (§14). Under identical prompts they should agree
+token-for-token; that is the parity gate, not this smoke test.
+
+### The `</think>` hazard, and why our renderer misses it
+
+The opencode branch found Qwen3.6 emitting a `</think>` it never opened,
+leaking reasoning text into content and the bare tag into replayed history.
+We do **not** reproduce it, and the reason is instructive: their `cue_no_think`
+renders a *closed* empty block (`<think>\n\n</think>\n\n`, the Qwen3-0.6B
+convention their parity fixtures pin), so the model appends its reasoning
+*after* an already-closed block and its own closer has no opener. Our cue
+emits no think block at all, so the model opens its own `<think>`, and
+`filter.rs` — which enters `Mode::Think` on the opener and drops to
+`</think>` — strips the whole block cleanly. Full content for the arithmetic
+prompt is exactly `"4"`.
+
+This is luck, not design, and it is fragile in one direction: a turn cut off
+by `max_tokens` *before* the closer arrives still emits the reasoning
+preamble as content (seen here at 48 tokens). The durable fix is the same
+one the opencode branch identified from the other side — a lineage-aware cue
+that leaves the block OPEN for the 3.5/3.6 lineage, matching that template's
+`<|im_start|>assistant\n<think>\n`, so the filter can start in think-mode
+and suppress deterministically with no buffering and no heuristics. That is
+renderer work, and it belongs with the third-dialect implementation (§14).
+
+### Also confirmed: KV fork is Metal-unsupported off this geometry
+
+Acceptance on the dense 0.6B is 31/1, and the one failure is `turn 2
+(echo-back history)` — the resume path — with:
+
+```
+[pie-driver-metal] copy_kv: UNSUPPORTED — this increment only supports
+                   the qwen3.6 (GDN-hybrid) checkpoint geometry
+```
+
+Proven pre-existing by re-running the identical suite against stashed,
+unmodified inferlet code: same 31/1. So `WorkingSet::fork` — the entire
+KV-reuse resume path, and pie's headline benchmark result — is currently
+implemented on Metal *only* for the qwen3.6 geometry. That explains why the
+handover's 33/33 was measured on an RTX 3090, and it means the KV-reuse half
+of run 3 is only testable locally on the model we happen to have chosen.
+Reuse on Qwen3.6 itself is still unmeasured: `cached_tokens` was 0 on every
+turn here because each probe was a fresh conversation.
