@@ -18,7 +18,7 @@
 //! decoding trapped the guest on the old portable driver, and a dead stream
 //! is strictly worse than a no-call turn; re-add behind a capability probe.
 //!
-//! Session retention (the port's storage change): retained `WorkingSet`s
+//! Session retention (the port's storage change): retained `SessionState`s
 //! live in a process-local map keyed by the content address from
 //! `session.rs`. On a hit the turn generates on a CoW fork; after a clean
 //! turn the extended fork is stored under the echo-back address and the
@@ -38,7 +38,7 @@ use crate::types::{ChatCompletionRequest, ChatMessage, tool_schema_envelopes};
 
 use inferlet::model;
 use inferlet::pie::inferlet::tools as tools_wit;
-use inferlet::ptir::WorkingSet;
+use crate::generation::SessionState;
 use serde::Deserialize;
 
 /// Defaults when the client sends none — Qwen3 no-think guidance (qwen-code
@@ -89,11 +89,10 @@ struct TurnSetup {
 
 pub struct Daemon {
     renderer: Renderer,
-    sessions: HashMap<String, (WorkingSet, u32)>,
+    sessions: HashMap<String, (generation::SessionState, u32)>,
     lru: Vec<String>,
     uniq: String,
     counter: u64,
-    attention_model: bool,
 }
 
 impl Daemon {
@@ -109,7 +108,6 @@ impl Daemon {
             lru: Vec::new(),
             uniq,
             counter: 0,
-            attention_model: model::pass_kind() == model::ForwardKind::Attention,
         }
     }
 
@@ -156,21 +154,10 @@ impl Daemon {
             ));
             return;
         }
-        if !self.attention_model {
-            // Hybrid/recurrent state has no fork/retention surface; the
-            // PTIR path here is attention-only. Honest refusal beats a
-            // silently wrong pass construction.
-            send(chunk::ev_error(
-                req_id,
-                500,
-                "server_error",
-                &format!(
-                    "unsupported model architecture {:?}: this daemon requires an attention-only model",
-                    model::pass_kind()
-                ),
-            ));
-            return;
-        }
+        // Attention and hybrid (GDN) models both serve here: `generation`
+        // dispatches on `model::pass_kind()` and binds a recurrent-state
+        // working set alongside the KV one when the model has a fold.
+        // Recurrent-only is still refused, inside `generation`.
 
         let stream = request.stream;
         self.counter += 1;
@@ -323,9 +310,9 @@ impl Daemon {
         let mut calls: Vec<ToolCallOut> = Vec::new();
 
         let gen_result = {
-            let resume_ref: Option<(&WorkingSet, u32)> = resume_hit
+            let resume_ref: Option<(&SessionState, u32)> = resume_hit
                 .as_ref()
-                .and_then(|(k, t)| self.sessions.get(k).map(|(ws, _)| (ws, *t)));
+                .and_then(|(k, t)| self.sessions.get(k).map(|(st, _)| (st, *t)));
             let calls_ref = &mut calls;
             let visible_ref = &mut visible_text;
             let emitted_ref = &mut emitted_visible;
@@ -402,7 +389,7 @@ impl Daemon {
             .await
         };
 
-        let Generation { ws, total_len, generated, hit_max, gen_error } = match gen_result {
+        let Generation { state, total_len, generated, hit_max, gen_error } = match gen_result {
             Ok(g) => g,
             Err(e) => degrade!(format!("generation setup failed: {e}")),
         };
@@ -498,7 +485,7 @@ impl Daemon {
         // closes, and the retained set must already exist for the resume to
         // hit. Failures are non-fatal (the next request pays a full rebuild).
         let save_debug = if gen_error.is_none() {
-            match generation::seal(&ws, total_len, self.renderer.seal_tokens()).await {
+            match generation::seal(&state, total_len, self.renderer.seal_tokens()).await {
                 Ok(total_final) => {
                     let mut canons = session::canon_messages(&setup.messages);
                     if !final_content.is_empty() {
@@ -520,7 +507,7 @@ impl Daemon {
                         canons.iter(),
                     );
                     let parent = resume_hit.as_ref().map(|(k, _)| k.clone());
-                    self.retain(new_key.clone(), ws, total_final, parent);
+                    self.retain(new_key.clone(), state, total_final, parent);
                     format!("retained {new_key} (seq {total_final})")
                 }
                 Err(e) => format!("seal failed, session dropped: {e}"),
@@ -583,14 +570,15 @@ impl Daemon {
 
     /// Insert a retained session; drop the parent entry it extended (≤1 live
     /// retained set per conversation branch — the old take-on-hit bound) and
-    /// LRU-evict past the cap. Dropping a `WorkingSet` releases its pages.
-    fn retain(&mut self, key: String, ws: WorkingSet, total: u32, parent: Option<String>) {
+    /// LRU-evict past the cap. Dropping a `SessionState` releases its KV
+    /// pages and, on a hybrid model, its folded recurrent state.
+    fn retain(&mut self, key: String, state: SessionState, total: u32, parent: Option<String>) {
         if let Some(p) = parent {
             if self.sessions.remove(&p).is_some() {
                 self.lru.retain(|k| k != &p);
             }
         }
-        if self.sessions.insert(key.clone(), (ws, total)).is_none() {
+        if self.sessions.insert(key.clone(), (state, total)).is_none() {
             self.lru.push(key);
         }
         while self.sessions.len() > MAX_RETAINED_SESSIONS && !self.lru.is_empty() {

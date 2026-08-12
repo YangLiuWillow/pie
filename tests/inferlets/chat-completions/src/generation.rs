@@ -13,7 +13,132 @@
 //! fire's `kv_len`/page-CSR only ever cover valid tokens, and `seal()`
 //! overwrites the head of it with the turn suffix.
 
+use core::ops::RangeBounds;
+use inferlet::model;
 use inferlet::ptir::attention::prelude::*;
+use inferlet::ptir::{KvBinding, Pass, PassWit, RsGeometry, RsWorkingSet};
+
+/// The WIT pass resources behind `ptir::{attention,hybrid}::ForwardPass`.
+/// Named directly so the generation body can be generic over the pass kind
+/// instead of textually duplicated per kind.
+use inferlet::pie::inferlet::forward::ForwardPass as WitAttention;
+use inferlet::pie::inferlet::forward_hybrid::ForwardPass as WitHybrid;
+
+/// The one thing that differs between the three forward interfaces, for THIS
+/// algorithm. `pie:inferlet` exposes `forward-attention`, `forward-hybrid` and
+/// `forward-recurrent` as three *unrelated* wit-bindgen types whose
+/// `attention` signatures deliberately diverge — an attention-only algorithm
+/// must not be able to name a folded recurrent state. Saying what they have in
+/// common here is the guest's job.
+///
+/// Shape taken from `inferlets/chat-completions/src/engine.rs` on
+/// `liu/opencode-integration` (commit 04db752f4), which solved this first and
+/// has it verified live on Qwen3.6-35B-A3B.
+trait BindState {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> core::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>;
+}
+
+impl BindState for inferlet::ptir::attention::ForwardPass {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> core::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        // A pure-attention model has no recurrent state, and the type system
+        // proves this set can only be empty.
+        debug_assert!(rs.is_empty());
+        self.attention(ws, geom)
+    }
+}
+
+impl BindState for inferlet::ptir::hybrid::ForwardPass {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> core::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        // Serving folds every fire and never buffers. The SAME rs working set
+        // is bound by the prefill chunks, the decode fires and the seal, so
+        // each continues the previous fold rather than restarting it.
+        self.attention(
+            Some(KvBinding {
+                working_set: ws,
+                geometry: geom,
+            }),
+            rs,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )
+    }
+}
+
+/// The retained per-session device state. On a hybrid model the folded
+/// recurrent state is part of the conversation prefix just as much as the KV
+/// pages are: resuming KV at token N while the fold still stands at 0 would
+/// silently serve a different context. So the two are retained and forked
+/// together, or not at all.
+pub struct SessionState {
+    pub ws: WorkingSet,
+    /// Empty on attention-only models. Exactly one entry on a recurrent-state
+    /// model: the driver wants one rs working set per request row, and this
+    /// algorithm fires a single row. Held as the slice the bind takes, since
+    /// `RsWorkingSet` is deliberately not `Clone` — a folded state has one
+    /// owner and is shared only through `fork`.
+    pub rs: Vec<RsWorkingSet>,
+}
+
+impl SessionState {
+    /// Fresh state for whichever forward kind this model reports.
+    pub fn new() -> Self {
+        SessionState {
+            ws: WorkingSet::new(),
+            rs: match model::pass_kind() {
+                model::ForwardKind::Attention => Vec::new(),
+                _ => vec![RsWorkingSet::new()],
+            },
+        }
+    }
+
+    /// Copy-on-write child of both halves, ordered on the same pipeline.
+    /// `RsWorkingSet::fork` shares the current folded state and buffered
+    /// suffix, which is what makes append-only turn growth resumable.
+    pub fn fork(&self, on: &Pipeline) -> Result<SessionState> {
+        let mut rs = Vec::with_capacity(self.rs.len());
+        for r in &self.rs {
+            rs.push(r.fork(on).context("rs.fork")?);
+        }
+        Ok(SessionState {
+            ws: self.ws.fork(on).context("ws.fork")?,
+            rs,
+        })
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct GenParams {
     pub temperature: f32,
@@ -22,7 +147,9 @@ pub struct GenParams {
 }
 
 pub struct Generation {
-    pub ws: WorkingSet,
+    /// KV pages plus, on a recurrent-state model, the folded state that
+    /// belongs to the same prefix. Retained as a unit.
+    pub state: SessionState,
     /// Valid tokens in KV: prompt + accepted (stop token excluded — it is
     /// truncated at, never written).
     pub total_len: u32,
@@ -59,20 +186,57 @@ const SEAL_MARGIN: u32 = 8;
 /// point). `on_token` receives each accepted token; returning `false` stops
 /// generation (client stop-strings).
 pub async fn generate(
-    resume: Option<(&WorkingSet, u32)>,
+    resume: Option<(&SessionState, u32)>,
+    prefill: &[u32],
+    params: &GenParams,
+    stop_ids: &[u32],
+    on_prefill_chunk: impl FnMut(),
+    on_token: impl FnMut(u32) -> bool,
+) -> Result<Generation> {
+    // One body, selected by the model's forward kind. `run_ahead` and every
+    // `Pass` method except `attention` are already generic over the wit type,
+    // so the algorithm is written once and cannot drift between kinds.
+    match model::pass_kind() {
+        model::ForwardKind::Attention => {
+            generate_for::<WitAttention>(
+                resume, prefill, params, stop_ids, on_prefill_chunk, on_token,
+            )
+            .await
+        }
+        model::ForwardKind::Hybrid => {
+            generate_for::<WitHybrid>(resume, prefill, params, stop_ids, on_prefill_chunk, on_token)
+                .await
+        }
+        // No registered model reports recurrent-only, and this loop's paged
+        // prompt geometry has nothing to bind on a pass with no KV at all —
+        // so it degrades the turn rather than pretending.
+        model::ForwardKind::Recurrent => Err(
+            "this model is recurrent-only; the serving inferlet has no KV-free path".to_string(),
+        ),
+    }
+}
+
+async fn generate_for<W>(
+    resume: Option<(&SessionState, u32)>,
     prefill: &[u32],
     params: &GenParams,
     stop_ids: &[u32],
     mut on_prefill_chunk: impl FnMut(),
     mut on_token: impl FnMut(u32) -> bool,
-) -> Result<Generation> {
+) -> Result<Generation>
+where
+    W: PassWit,
+    Pass<W>: BindState,
+{
     let page_t = kv_page_size();
     let pipe = Pipeline::new();
 
-    let (ws, n0) = match resume {
-        Some((parent, cached)) => (parent.fork(&pipe).context("ws.fork")?, cached),
-        None => (WorkingSet::new(), 0),
+    let (state, n0) = match resume {
+        Some((parent, cached)) => (parent.fork(&pipe)?, cached),
+        None => (SessionState::new(), 0),
     };
+    let ws = &state.ws;
+    let rs = &state.rs[..];
 
     let n_suffix = prefill.len() as u32;
     if n_suffix == 0 {
@@ -122,10 +286,10 @@ pub async fn generate(
         let page_indptr = Channel::from([0u32, abs_e.div_ceil(page_t)]).named("pidx_p");
         let outc = Channel::new([1], dtype::i32).named("g0");
 
-        let fwd: ForwardPass = ForwardPass::new();
+        let fwd: Pass<W> = Pass::new();
         fwd.embed(&toks, &embed_indptr)?;
-        fwd.attention(
-            &ws,
+        fwd.bind_state(
+            ws,
             KvGeometry {
                 readable_pages: ..,
                 // Start at the cached/committed boundary: declaring the
@@ -139,6 +303,7 @@ pub async fn generate(
                 positions: &positions,
                 mask: None,
             },
+            rs,
         )?;
         if ci == last_ci {
             let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
@@ -194,10 +359,10 @@ pub async fn generate(
         let rng = Channel::from([0x9e37_u32, 0]).named("rng");
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
-        let fwd: ForwardPass = ForwardPass::new();
+        let fwd: Pass<W> = Pass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.attention(
-            &ws,
+        fwd.bind_state(
+            ws,
             KvGeometry {
                 readable_pages: ..,
                 writable_pages: (n / page_t)..,
@@ -209,6 +374,7 @@ pub async fn generate(
                 positions: &pos,
                 mask: None,
             },
+            rs,
         )?;
         let pool_pages_u = pool_pages;
         fwd.epilogue(move || {
@@ -273,7 +439,7 @@ pub async fn generate(
     let hit_max = generated.len() >= params.max_tokens;
     Ok(Generation {
         total_len: n + generated.len() as u32,
-        ws,
+        state,
         generated,
         hit_max,
         gen_error,
@@ -284,11 +450,31 @@ pub async fn generate(
 /// `at`, committing the assistant turn so the retained working set replays
 /// as sealed history. One fire on a fresh pipeline; the host take at the end
 /// guarantees the write landed before the working set is stored/forked.
-pub async fn seal(ws: &WorkingSet, at: u32, seal_tokens: &[u32]) -> Result<u32> {
-    let m = seal_tokens.len() as u32;
-    if m == 0 {
+pub async fn seal(state: &SessionState, at: u32, seal_tokens: &[u32]) -> Result<u32> {
+    if seal_tokens.is_empty() {
         return Ok(at);
     }
+    match model::pass_kind() {
+        model::ForwardKind::Attention => seal_for::<WitAttention>(state, at, seal_tokens).await,
+        model::ForwardKind::Hybrid => seal_for::<WitHybrid>(state, at, seal_tokens).await,
+        model::ForwardKind::Recurrent => Err(
+            "this model is recurrent-only; the serving inferlet has no KV-free path".to_string(),
+        ),
+    }
+}
+
+/// The seal binds the SAME recurrent state the turn generated on, so the fold
+/// advances over the turn suffix too. If it did not, the retained state would
+/// stand at the pre-seal boundary while KV stood at the post-seal one, and the
+/// next turn would resume a fold that is short by exactly the suffix.
+async fn seal_for<W>(state: &SessionState, at: u32, seal_tokens: &[u32]) -> Result<u32>
+where
+    W: PassWit,
+    Pass<W>: BindState,
+{
+    let ws = &state.ws;
+    let rs = &state.rs[..];
+    let m = seal_tokens.len() as u32;
     let page_t = kv_page_size();
     let end = at + m;
     let need = end.div_ceil(page_t);
@@ -313,10 +499,10 @@ pub async fn seal(ws: &WorkingSet, at: u32, seal_tokens: &[u32]) -> Result<u32> 
     let sink = Channel::new([1], dtype::i32).named("sink_s");
 
     let pipe = Pipeline::new();
-    let fwd: ForwardPass = ForwardPass::new();
+    let fwd: Pass<W> = Pass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    fwd.attention(
-        &ws,
+    fwd.bind_state(
+        ws,
         KvGeometry {
             readable_pages: ..,
             writable_pages: (at / page_t)..,
@@ -328,6 +514,7 @@ pub async fn seal(ws: &WorkingSet, at: u32, seal_tokens: &[u32]) -> Result<u32> 
             positions: &positions,
             mask: None,
         },
+        rs,
     )?;
     fwd.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
