@@ -14,11 +14,59 @@ completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
 | P0.4 | Renderer parity harness | **done** |
 | PA.1 | `chat-completions` inferlet on dev | **milestone 1 done** (sessions/grammar/coder-dialect pending) |
 | PA.2 | Gateway OpenAI ingress | **done** |
-| PA.3 | Acceptance suite + stock-opencode e2e | suite + scaffolding **authored**; live run pending (RAM blocker) |
+| PA.3 | Acceptance suite + stock-opencode e2e | suite + scaffolding **authored**; live run pending (needs a CUDA ≥12.8 GPU box, or ~1.5 GB more free RAM locally) |
 | PB.1 | `opencode-session` inferlet + AI SDK provider package | pending |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-11 — GPU bring-up attempt (RunPod H100): blocked on the image's CUDA, pod terminated
+
+Attempted the PA.3 live run on a rented H100 PCIe (sm_90, driver 580.142,
+`runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`) because the local
+Metal path is RAM-blocked. **No acceptance results — the host build never
+finished.** The pod was terminated at the user's request (all account pods
+stopped; the H100 alone billed $2.89/h). Everything needed to retry lives in
+git, so the loss is build state only.
+
+**The blocker, and the note that makes the next attempt cheap: the stock
+CUDA 12.4 image cannot build pie's sm_90 kernels.** The vendored XQA
+attention kernels emit Hopper TMA bulk-copy instructions that 12.4's `ptxas`
+rejects:
+
+```
+ptxas …-6_attention_xqa_gqa8_sm90.ptx, line 1922; error : State space
+        incorrect for instruction 'cp.async.bulk.tensor'
+```
+
+Dozens of these; `cargo build -p pie-bin --release --features driver-cuda`
+died at ~28 min with `BUILD_EXIT=101`. It is a *compiler* limit, not a driver
+one (580.142 is fine) — the prior validated H200 bring-up ran a 12.8-era
+toolkit, which is why `qwen-code-integration-plan.md` §5b never mentions it.
+That doc's bring-up list should gain this next to its cmake-≥3.23 note.
+
+Recipe for the next pod:
+
+- Prefer a **CUDA ≥ 12.8 devel image** — it removes a ~10-min apt step and a
+  full kernel recompile. If stuck on 12.4:
+  `apt-get install -y cuda-toolkit-12-8` (toolkit only, no driver), then
+  `export PATH=/usr/local/cuda-12.8/bin:$PATH CUDACXX=…/nvcc` (plus
+  `CMAKE_CUDA_COMPILER` if cmake cached the old one), and delete **only**
+  `target/release/build/pie-worker-*/out/cuda` so cmake reconfigures while
+  the Rust artifacts survive. Fallback: `.run` installer, `--toolkit --silent`.
+- The image ships **no `nvcc` on `PATH`** (it is at `/usr/local/cuda/bin`),
+  and **no apt cmake at all** — `pip install cmake ninja`.
+- Its NVIDIA apt list served a stale `Packages.gz` ("Mirror sync in
+  progress"), which fails `apt-get update` hard: move
+  `/etc/apt/sources.list.d/cuda-*.list` aside for the base installs, restore
+  it only if you need the 12.8 toolkit.
+- Materialize the Rust toolchain ONCE (`cargo --version` inside the repo)
+  before launching parallel builds — concurrent first-use races rustup's
+  component install (`could not rename 'component' file … File exists`).
+- What did work, for timing reference: prereqs + rustup ≈ 3 min; clone 25 s;
+  **the wasm inferlet builds clean on Linux in 35.5 s** (604 KB); HF
+  `Qwen/Qwen3-0.6B` snapshot ≈ 4 s. The pod also confirmed by inspection that
+  `CHAT_INFERLET` is the fixed `chat-completions@0.1.0` on this branch.
 
 ### 2026-08-11 — PA.3 first half: acceptance suite + launch scaffolding AUTHORED (not yet run live)
 
