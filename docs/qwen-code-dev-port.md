@@ -406,3 +406,77 @@ would refute the hypothesis. `pie model info` does not surface it.
 This does not affect §12 — rendering never runs the model — but it blocks
 local Coder e2e work, and it is a driver bug worth fixing or filing
 regardless of this integration.
+
+## 14. Retarget to Qwen3.6-35B-A3B + vllm-metal (2026-08-12) — plan and cost
+
+Decision: run 3 switches the benchmark model to `Qwen3.6-35B-A3B` and
+replaces the CUDA-pod A/B with a fully local one against
+`vllm-project/vllm-metal`. Both arms then run on this 48 GB Mac.
+
+**HANDOVER §5's "vLLM does not run on Apple Silicon GPUs" is now stale.**
+`vllm-project/vllm-metal` (community-maintained, MLX-backed) installs
+cleanly here: plugin 0.3.0.dev + vLLM **0.27.0** into `~/.venv-vllm-metal`,
+native arm64 Python 3.12 required. Note the baseline moves on *two* axes at
+once — 0.25.1→0.27.0 and CUDA→MLX — so run-3 numbers are not comparable to
+run 2's, which were invalid anyway.
+
+### The renderer cost: Qwen3.6 is a THIRD dialect
+
+Because pie's renderer is now byte-exact to the Qwen3-Coder template (§12),
+diffing Qwen3.6's template against Qwen3-Coder's over the same 23 fixtures
+measures the renderer delta directly. Result: **0/23 identical, 23/23
+differ**, first divergence at byte 19. It is neither `Hermes` nor `Coder`:
+
+| | Coder (implemented) | Qwen3.6 (not implemented) |
+|---|---|---|
+| system turn | system content, then tools | **tools first**, then `\n\n` + *trimmed* system content |
+| `<tools>` body | Coder XML `<function><name>…` | **`tool \| tojson`** — hermes-style JSON, envelope kept whole |
+| call format | `<function=…>/<parameter=…>` | same |
+| arg values | `\| string` → `True` for bools | **inverted**: strings raw, all else `tojson` → `true` |
+| first call spacing | always `\n<tool_call>` | `\n\n<tool_call>` if content, else `<tool_call>` |
+| tool responses | `<tool_response>\n…\n</tool_response>\n` each | `<\|im_start\|>user` + `\n<tool_response>\n…\n</tool_response>` |
+| assistant content | raw | `\| trim` |
+| thinking | none | `<think>` state machine (see below) |
+| generation prompt | `<\|im_start\|>assistant\n` | + **`<think>\n`**, or `<think>\n\n</think>\n\n` when `enable_thinking:false` |
+| multi-part text | joined with `\n` | **concatenated with no separator** |
+
+So this is a new `Dialect` variant in `render_text.rs`/`render.rs`, not a
+tweak. Two parts carry real risk:
+
+1. **The thinking state machine.** Assistant turns keep their
+   `<think>…</think>` block only when they fall *after* the last genuine
+   user query (`ns.last_query_index`, computed by scanning messages in
+   reverse and skipping user turns that are wholly `<tool_response>`);
+   earlier ones are stripped to content alone. `reasoning_content` is taken
+   from the message field when present, else split out of the content. No
+   existing pie code path models any of this, and it is *position
+   dependent* — which is exactly the property `no_think_decorate` was
+   written to avoid, because it interacts with KV-prefix reuse: a turn's
+   rendering changes as later turns arrive, so retained prefixes can be
+   invalidated. This needs checking against `session.rs` addressing.
+2. **The `/no_think` class becomes load-bearing.** Qwen3.6 is a thinking
+   model, so `enable_thinking` now changes the generation prompt itself.
+   HANDOVER §3 lists that path as untested, with no fixtures.
+
+Also note the fixture corpus was captured from a *hermes* model; retargeting
+to Qwen3.6 means the 23 wire captures no longer represent what qwen-code
+would send this model, so a fresh capture is needed for a fair gate.
+
+### The engine cost
+
+`Qwen3.6-35B-A3B` is `qwen3_5_moe`: 40 layers in a 3:1
+`linear_attention`/`full_attention` GDN hybrid, **256 experts** (8 active),
+2 KV heads, head_dim 256 — and multimodal (vision tower present). pie's
+Metal driver cannot correctly run *plain* `qwen3_moe` today (§13), so this
+is a larger ask than the bug already open. `mlx-community/Qwen3.6-35B-A3B-4bit`
+(~20 GB) fits 48 GB; bf16 (71.9 GB) does not.
+
+### The fairness constraint, carried forward
+
+vllm-metal's support matrix marks **Automatic Prefix Cache ❌ for the
+Qwen3.5/3.6 family** (✅ for dense Qwen3, Qwen2.5, Llama 3, …). pie reuses
+KV across agent turns; on this model the vLLM arm cannot. With ~9–15K-token
+prompts resent every turn, that difference dominates wall-clock. Any run-3
+report must therefore state plainly that the vLLM arm ran without prefix
+caching, and must not present the gap as an engine-vs-engine result. This
+strengthens, not replaces, §4's existing rule about `cached_tokens`.
