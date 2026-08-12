@@ -7,6 +7,45 @@ explicitly marked unverified — please keep that distinction.
 
 ---
 
+## 0. Setting up a fresh machine
+
+Prerequisites (Homebrew + Xcode command line tools assumed):
+
+```bash
+xcode-select --install 2>/dev/null || true
+brew install cmake node jq git
+curl -sSf https://sh.rustup.rs | sh -s -- -y      # toolchain + wasm target
+source "$HOME/.cargo/env"                          # come from rust-toolchain.toml
+```
+
+Clone and build (the wasm target is pinned by `rust-toolchain.toml`, so
+rustup installs it on first build):
+
+```bash
+mkdir -p ~/Documents/Liszt_ai && cd ~/Documents/Liszt_ai
+git clone -b liu/qwen-code-dev https://github.com/YangLiuWillow/pie.git
+cd pie
+git remote add fork https://github.com/YangLiuWillow/pie.git 2>/dev/null || true
+
+cargo build --release -p pie-bin --features driver-metal        # ~15 min cold
+(cd tests/inferlets && cargo build --target wasm32-wasip2 --release -p chat-completions)
+```
+
+Python side (a fresh venv — the old machine's venv will not survive the
+move; `transformers` is only needed for the parity check):
+
+```bash
+python3 -m venv ~/.venvs/pie && source ~/.venvs/pie/bin/activate
+pip install -q websockets msgpack blake3 cryptography transformers huggingface_hub
+```
+
+Sanity-check the toolchain before pulling 17 GB of weights:
+
+```bash
+(cd tests/inferlets && cargo test -p chat-completions)   # expect 25 passed
+python3 integrations/qwen-code/bench/test_summarize.py   # expect PASS
+```
+
 ## 1. Where things are
 
 | | |
@@ -241,10 +280,40 @@ integrations/qwen-code/
 
 ## 10. Suggested order of work
 
-1. Boot locally with `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`,
-   confirm generation, then run `check_render.py --hf-model
-   Qwen/Qwen3-Coder-30B-A3B-Instruct`. **Gate: byte-exact.** This closes the
-   biggest unverified claim in the whole port.
+1. **Close the Coder-dialect gate locally** — the biggest unverified claim
+   in the port. Exact sequence:
+
+   ```bash
+   cd ~/Documents/Liszt_ai/pie
+   source ~/.venvs/pie/bin/activate
+   CFG=integrations/qwen-code/pie_config_metal_coder.toml
+
+   ./target/release/pie --config $CFG model import \
+       mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit      # ~17 GB
+   ./target/release/pie --config $CFG doctor                # must not say "cannot boot"
+
+   PIE_CONFIG=$CFG ./target/release/pie serve > /tmp/pie.log 2>&1 &
+   grep -q "standalone serving" <(tail -f /tmp/pie.log)     # wait for ready
+
+   python3 integrations/qwen-code/shim.py --pie ws://127.0.0.1:18080 --port 8123 \
+     --wasm tests/inferlets/target/wasm32-wasip2/release/chat_completions.wasm \
+     --manifest tests/inferlets/chat-completions/Pie.toml > /tmp/shim.log 2>&1 &
+
+   # 1a. does it generate at all? (first request is slow: PTIR compile)
+   curl -s -m 600 http://127.0.0.1:8123/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"say hi"}],"max_tokens":16,"stream":false}'
+
+   # 1b. THE GATE — prompt bytes must match the model's own template
+   python3 integrations/qwen-code/parity/check_render.py \
+       --hf-model Qwen/Qwen3-Coder-30B-A3B-Instruct
+   ```
+
+   Expected: `23 exact, 0 known-divergence, 0 mismatched`. Anything in the
+   MISMATCH column is a rendering bug — the script prints the first
+   diverging byte and a diff; fix `render_text.rs` until it is exact. Also
+   confirm the shim log shows the Coder dialect took effect (a tool-using
+   request should produce `tool_calls`, not prose).
 2. Add a t=0 knob (inferlet + shim passthrough) so decoding can be pinned.
 3. Extend `check_render.py` coverage to the `/no_think` class by capturing
    fixtures with `enable_thinking:false`.

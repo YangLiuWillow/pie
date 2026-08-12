@@ -1,0 +1,48 @@
+# Metal profile for the Coder-dialect gate (Apple Silicon, >= 48 GB).
+#
+# This is the config that makes HANDOVER.md §10 step 1 possible locally:
+# serve a Qwen3-Coder model and prove our rendered prompt is byte-identical
+# to its real chat template.
+
+[server]
+host = "127.0.0.1"
+port = 18080
+registry = "https://registry.pie-project.org/"
+verbose = false
+telemetry = false
+
+[model]
+# MUST contain "coder": it is the only signal the inferlet has for picking
+# the <function=…> XML tool dialect. pie exposes no HF id, and
+# architecture() reports `qwen3_moe` for Coder and non-Coder alike. Get this
+# wrong and the model is served hermes/JSON tool prompts, answers in prose,
+# and never calls a tool (docs §11).
+name = "qwen3-coder-30b-a3b"
+# Metal's llama path is 4-bit-only, so this must be an MLX build (~17 GB).
+model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+
+[driver]
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+kv_page_size = 32
+# max_model_len is THE knob that sizes the KV ring (total_pages is not).
+# A real qwen-code turn is ~9-15K tokens, so do not go below 16384 for agent
+# runs. If the driver refuses to boot ("does not fit"), lower this first —
+# and remember the guard also needs ~2 GiB of host headroom beyond the
+# model, so close heavy apps rather than fighting the number.
+max_model_len = 32768
+total_pages = 4096
+max_forward_tokens = 4096
+max_forward_requests = 8
+
+[runtime]
+request_timeout = "600s"
+# The first request on a 30B pays PTIR compile + warmup and blows through
+# the 30 s default; the kill takes the gateway WebSocket down with it.
+silence_timeout = "300s"
+
+[sandbox]
+allow_fs = false
+allow_network = true
+network_allowed_hosts = ["*"]
