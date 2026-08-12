@@ -20,6 +20,63 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-12 — inbound from the qwen-code session, and one constraint that shapes PA.1 m2
+
+Cross-checked against our own run. Recorded here because two of the three
+change what the next task can assume.
+
+**1. `copy_kv` on Metal is supported ONLY for GDN-hybrid geometry.** The
+qwen-code session's dense-0.6B acceptance fails its echo-back-history turn with
+`[pie-driver-metal] copy_kv: UNSUPPORTED — this increment only supports the
+qwen3.6 (GDN-hybrid) checkpoint geometry`, and they confirmed it is pre-existing
+on unmodified code. Verified in `driver/metal/src/context.cpp:1978` — the gate
+is `if (!facts_.has_linear_attn)`, i.e. the support is inverted from the
+intuition: **hybrid works, dense is refused.**
+
+This lands directly on **PA.1 milestone 2** (KV snapshot sessions), whose whole
+point is `working-set from-index`/`update-index` resume. On Metal that path will
+work with **Qwen3.6-35B-A3B and not with Qwen3-0.6B** — so sessions cannot be
+developed against the cheap fast model the way Phase A was, and any KV-reuse
+number measured on a dense Metal model is currently unobtainable rather than
+merely bad. Plan for the 35B (a ~23 GiB, one-serve-at-a-time machine slot) or a
+CUDA box from the start. No exposure today: nothing in `inferlets/` or
+`integrations/` touches `fork`/`copy_kv` yet — the seam is still unimplemented.
+
+**2. Their cue hypothesis — that our closed-empty-block cue CAUSES the unmatched
+`</think>` — is not supported by our data, and `cut_leading_reasoning` stays.**
+The suggestion was to render no think block at all for this lineage and watch the
+stray closer disappear. We ran that configuration by accident and it is worse.
+Before the `instruct.rs` fix, `has_thinking` was false, so `cue_no_think` fell
+through to plain `cue()` — no think block — and Qwen3.6 produced:
+
+```
+Thinking Process:
+1.  **Analyze the user's request:** The user wants me to "Say hello" …
+```
+
+Untagged reasoning prose: no `<think>`, no `</think>`, nothing for a
+marker-based filter to catch at any point. Their clean result is a `2+2`
+arithmetic prompt, which elicits almost no reasoning and so cannot discriminate
+between the two cues. So the no-block cue does not reliably make the model open
+its own block; it just removes the evidence.
+
+Their second point stands and is a real limit on our fix: a turn cut off by
+`max_tokens` **before** the closer still leaks the preamble, because
+`cut_leading_reasoning` needs a closer to fire. Both of us agree the end state
+is the lineage-aware OPEN-block cue plus a filter that starts in think-mode —
+deterministic, no buffering, and the only version that fixes streaming. They are
+building it as part of the third-dialect renderer.
+
+**3. A simplification available for `engine.rs`, deliberately not taken yet.**
+`run_ahead<W: PassWit>` and `impl<W: PassWit> Pass<W>` are already generic, so
+`define_generate!` could be a generic `fn generate_for<W>` with `BindState`
+supplying the one differing `attention` call — one body instead of two
+expansions. Confirmed the SDK surface supports it (`sdk/rust/inferlet/src/ptir.rs`
+:1054, :1525). Not applied: it is stylistic, not a correctness difference (the
+macro has one source body too), and re-validating both pass kinds live costs a
+GPU slot on a machine that fits one `pie serve`. Worth folding in the next time
+`engine.rs` is opened for real work.
+
 ### 2026-08-12 (later) — PA.3 DONE: 25/25 on Qwen3.6-35B-A3B, and stock opencode does real agentic work on it
 
 The entry below got the pipe working on a 0.6B. This one is the milestone that
