@@ -1749,10 +1749,19 @@ impl ContextManager {
             masks.push(materialize_lineage_mask(&info.mask, info.position));
         }
 
-        // Validate positions are strictly after any previously committed position.
+        // Validate positions are strictly after any previously committed
+        // position. Tokens that carried an explicit per-token attention mask
+        // are exempt: an explicit mask means the guest deliberately decoupled
+        // position ids from KV-slot order (e.g. refilling parallel branches
+        // at overlapped positions), and both the page hashes and the restore
+        // replay carry (token, position, mask) verbatim, so non-monotonic
+        // positions round-trip correctly. Default-mask fills keep the strict
+        // check — there a position regression is always a bookkeeping bug.
         if let Some(max_committed) = ctx.max_committed_position {
-            for &pos in &positions {
-                if pos <= max_committed {
+            for (info, &pos) in committed_token_infos.iter().zip(&positions) {
+                let explicit_mask =
+                    !(info.mask.buffer.is_empty() && info.mask.total_size == 0);
+                if !explicit_mask && pos <= max_committed {
                     anyhow::bail!(
                         "Position {} must be > max committed position {}",
                         pos,
@@ -1800,10 +1809,14 @@ impl ContextManager {
         ctx.working_page_tokens.drain(..total_tokens);
         ctx.driver_repaired_spec_tail = 0;
         ctx.committed_hashes.extend_from_slice(&hashes);
+        // The watermark can only advance. With explicit-mask commits allowed
+        // at overlapped (lower) positions, a batch's max may be below the
+        // previous watermark — never let it shrink.
         ctx.max_committed_position = positions
             .iter()
             .copied()
             .max()
+            .max(ctx.max_committed_position)
             .or(ctx.max_committed_position);
 
         // Refresh cached effective_pages after chain extension.
