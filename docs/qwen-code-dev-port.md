@@ -516,3 +516,72 @@ for the hermes captures it was written against and wrong here.
 
 Confirmed from the same decode: the generation prompt really does end
 `<|im_start|>assistant\n<think>\n`, so the thinking seed is unavoidable.
+
+## 15. Scoping the pie arm for Qwen3.6 (2026-08-12) — the driver was never the problem
+
+Tested rather than reasoned about: imported `mlx-community/Qwen3.6-35B-A3B-4bit`
+(20.5 GiB `.zt`) and served it on Metal. **It boots and serves.**
+
+```
+[pie-metal] 19.51 GB of weights bound where they lie, and out of the heap
+pie standalone serving listen=127.0.0.1:18080
+```
+
+So the §14 worry that a 3:1 GDN hybrid with 256 experts would need new
+driver work was **wrong**. `driver/metal/src/model/qwen3_5/` already
+implements the routed decode end to end — router, top-k, sort, gather,
+expert gate/up/silu/down, combine, shared expert — and `facts.hpp` already
+maps `qwen3_5_moe`, `qwen3_5_moe_text` and even `qwen3_6` to
+`ModelFamily::Qwen35`. A comment in `decode_step_mb.hpp` sizes its dispatch
+tables against "the 40-layer 256-expert MoE", i.e. this exact model.
+
+**This also localizes §13.** `qwen3_moe` (the Coder 30B) maps to
+`ModelFamily::Llama`; `qwen3_5_moe` maps to `ModelFamily::Qwen35`. They are
+*different decode paths*. The garbage output is confined to the llama-family
+MoE path, and says nothing about the Qwen35 one.
+
+Two boot notes: `max_model_len = 32768` is refused here (23.19 GiB wanted +
+the 2 GiB margin against 24.85 GiB reclaimable); **16384 boots**, and still
+covers the 15,396-token longest fixture. The engine also caps lanes on this
+model — `requested=8 seated=4`, because each lane holds a recurrent-state
+slot per posted frame — so `max_forward_requests` is effectively 4.
+
+### The actual blocker is the inferlet, not the engine
+
+```
+HTTP 500: unsupported model architecture ForwardKind::Hybrid:
+          this daemon requires an attention-only model
+```
+
+`handler.rs:112` sets `attention_model = pass_kind() == ForwardKind::Attention`
+and `handler.rs:159` refuses everything else. `generation.rs:16` imports
+`inferlet::ptir::attention::prelude::*` and calls `fwd.attention(...)` at
+three sites (125-127, 197-199, 316-318).
+
+The SDK already has what is needed: `ptir::hybrid`
+(`pie:inferlet/forward-hybrid`, documented as "attention layers and
+recurrent layers in ONE forward (Qwen3.5 GDN, Nemotron-H Mamba2)"), plus
+`RsWorkingSet` for the folded recurrent state — with `state_size`,
+`buffer_page_size`, `discard_buffered`, `reorder_buffer`, and **`fork`**, a
+"copy-on-write child sharing the current folded state and buffered suffix".
+
+So the port is bounded: swap the prelude, bind an `RsWorkingSet` per request
+alongside the KV `WorkingSet`, retain and fork it per session the way
+`session.rs` already retains working sets, and delete the gate.
+
+### The one thing to design carefully: reuse semantics
+
+The handler's comment says hybrid "has no fork/retention surface". Given
+`RsWorkingSet::fork` exists, that reads as over-conservative — but the
+`ptir` docs draw a sharper line: **"KV eviction algorithms are NOT valid
+here: dropping a KV page does not undo the fold that already consumed those
+tokens."** Append-only growth (fork the state at the end of turn N, extend
+with turn N+1) matches what `split_resume_point` already does, so agent-turn
+reuse should survive. What does not survive is dropping or rewinding pages
+inside a conversation — the fold is irreversible.
+
+That needs verifying before it is claimed, because **KV reuse is the pie
+result this benchmark exists to show** (76.9% on the run-2 30B). Combined
+with vllm-metal's APC ❌ for the 3.5/3.6 family (§14), there is a real risk
+that run 3 on Qwen3.6 measures neither arm's prefix reuse. Worth deciding
+deliberately rather than discovering after the run.
