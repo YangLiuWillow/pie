@@ -671,6 +671,26 @@ emits no think block at all, so the model opens its own `<think>`, and
 `</think>` — strips the whole block cleanly. Full content for the arithmetic
 prompt is exactly `"4"`.
 
+**Correction (same day):** the causal half of that reading is withdrawn. The
+opencode branch ran the control — before their `instruct.rs` fix,
+`has_thinking` was false, so their cue fell through to plain `cue()`, i.e.
+no think block, exactly our configuration — and Qwen3.6 emitted *untagged*
+reasoning prose, no tags anywhere. So omitting the block does not reliably
+make the model tag, and the closed block is not established as the cause.
+
+The two observations do still conflict, and it is unresolved. Ours was
+`finish_reason:"stop"`, **139 completion tokens, content exactly `"4"`** —
+which untagged prose cannot produce through a marker-based filter, so a
+tagged block was present in our run. The `/no_think` confound is ruled out:
+`no_think()` fires only on an explicit `chat_template_kwargs.enable_thinking
+== false`, which these requests never sent. Same cue, different tagging, so
+the deciding factor is elsewhere in the prompt — our hermes tool preamble
+and system-turn handling versus theirs.
+
+That unresolved dependence argues *for* the open-block cue rather than
+against it: if tagging varies with prompt context neither side controls, no
+marker-based filter is safe in either direction.
+
 This is luck, not design, and it is fragile in one direction: a turn cut off
 by `max_tokens` *before* the closer arrives still emits the reasoning
 preamble as content (seen here at 48 tokens). The durable fix is the same
@@ -690,7 +710,9 @@ Acceptance on the dense 0.6B is 31/1, and the one failure is `turn 2
                    the qwen3.6 (GDN-hybrid) checkpoint geometry
 ```
 
-Proven pre-existing by re-running the identical suite against stashed,
+The gate is `driver/metal/src/context.cpp:1978`, `if (!facts_.has_linear_attn)`
+— so hybrid is the *supported* case and dense checkpoints are the refused
+one, not the other way round. Proven pre-existing by re-running the identical suite against stashed,
 unmodified inferlet code: same 31/1. So `WorkingSet::fork` — the entire
 KV-reuse resume path, and pie's headline benchmark result — is currently
 implemented on Metal *only* for the qwen3.6 geometry. That explains why the
