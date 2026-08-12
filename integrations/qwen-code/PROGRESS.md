@@ -109,6 +109,40 @@ captures; asserts trajectory-mismatch detection, the equivalence path, and
 single-arm summarization). That closes the last untested piece of the
 benchmark pipeline — everything except the model itself has now run.
 
+**Coder-dialect gate CLOSED (2026-08-12, 48 GB machine).**
+`parity/check_render.py --hf-model Qwen/Qwen3-Coder-30B-A3B-Instruct`
+against pie serving `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` on
+Metal: **23 exact, 0 known-divergence, 0 mismatched**, first run, **no
+`render_text.rs` changes needed**. Verified it is genuinely the Coder path
+(eight dialect markers: Coder `# Tools` header, `<function>` schema form,
+`<function=`/`<parameter=` replay; hermes preamble and hermes JSON call
+form both absent). Gate 1 of the run-3 preconditions is closed. This was
+the port's biggest unverified claim. Details: docs §12.
+
+Scope of that claim, kept narrow on purpose: it covers **prompt bytes
+only**. `echo_tokens` returns before the forward pass (23 fixtures in
+2.1 s), so nothing about generation is verified — including "a tool-using
+request produces `tool_calls`, not prose", which is still open.
+
+**New blocker: the 30B MoE generates garbage on Metal.** Loads and admits
+fine (32768 context, 17.18 GB bound out of heap), then emits deterministic
+token salad under greedy — numerics, not sampling. Dense `Qwen3-0.6B-4bit`
+control on the same driver/binary is coherent, so the Metal driver is fine
+and the MoE path is not. Evidenced hypothesis (not confirmed): the MLX
+build is mixed-precision — all 48 `mlp.gate` routers overridden to 8-bit
+against a global 4-bit — and `model_facts.cpp:74-82` parses only the global
+`bits`/`group_size`. Docs §13. Local Coder *generation* work is blocked;
+local Coder *rendering* work is not.
+
+Two setup gaps found on the fresh machine, both now fixed in HANDOVER §0:
+the venv needs **Python ≥ 3.10** (`client/python` uses `str | Path`; stock
+macOS 3.9.6 fails at import and the shim never starts), and **`jinja2` is a
+required dep** that `transformers` does not pull in. Also worth knowing:
+the MLX 4-bit build ships an **older chat template** than the official repo
+(no `# Tools` header) — regenerating the golden from it would install the
+wrong reference. Its tokenizer is byte-identical, so `echo_tokens` decoding
+compares soundly.
+
 ## Later / parked
 
 - `/no_think` parity fixtures (`enable_thinking:false` corpus).

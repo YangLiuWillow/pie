@@ -34,10 +34,22 @@ cargo build --release -p pie-bin --features driver-metal        # ~15 min cold
 Python side (a fresh venv — the old machine's venv will not survive the
 move; `transformers` is only needed for the parity check):
 
+**The venv needs Python ≥ 3.10, and a bare macOS box does not have one.**
+`client/python` uses PEP-604 annotations (`str | Path`), so the stock
+CommandLineTools 3.9.6 fails at *import* with `TypeError: unsupported
+operand type(s) for |` and the shim never starts. With no Homebrew, `uv`
+installs a standalone interpreter without sudo (both gaps hit on the
+2026-08-12 bring-up):
+
 ```bash
-python3 -m venv ~/.venvs/pie && source ~/.venvs/pie/bin/activate
-pip install -q websockets msgpack blake3 cryptography transformers huggingface_hub
+curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.12
+uv venv --python 3.12 ~/.venvs/pie && source ~/.venvs/pie/bin/activate
+uv pip install websockets msgpack blake3 cryptography transformers huggingface_hub jinja2
 ```
+
+`jinja2` is **required** and is not pulled in by `transformers` — without
+it `apply_chat_template` raises and `check_render.py` cannot run at all.
 
 Sanity-check the toolchain before pulling 17 GB of weights:
 
@@ -91,12 +103,19 @@ Envelope contracts (stable, both directions):
 - Unit tests 25/25 native; wasm builds clean.
 - Reporting layer (`bench/summarize.py`) regression-tested offline
   (`bench/test_summarize.py`).
+- **Coder-dialect prompt parity: 23/23 exact against a *served* Coder
+  model** (2026-08-12, Metal, `pie_config_metal_coder.toml`, referenced to
+  `Qwen/Qwen3-Coder-30B-A3B-Instruct`). No renderer changes were needed.
+  Confirmed to be genuinely the Coder path, not a pass for the wrong
+  reason, by eight dialect markers. Gate 1 of §4 is **closed**. Details and
+  caveats: `docs/qwen-code-dev-port.md` §12.
 
 **NOT verified — this is the top of the queue:**
-- **Coder dialect end-to-end.** The `<function=…>` XML rendering is
-  implemented and unit-tested against the model's real `chat_template.jinja`
-  via a checked-in golden, but it has **never been exercised against a
-  served Coder model**. Until it is, treat Coder-model results as unproven.
+- **Coder tool-calling end-to-end.** §12 covers *prompt bytes only*;
+  `echo_tokens` short-circuits before the forward pass. That a served Coder
+  model actually emits `tool_calls` rather than prose is still unproven,
+  and cannot be proven locally — see the MoE blocker in §5 / port doc §13.
+  Needs a CUDA pod.
 - **Trajectory equivalence vs vLLM.** Never validly measured (see §4).
 - **The `/no_think` divergence class.** No fixture sets
   `enable_thinking:false`, so that path is untested; `check_render.py`
@@ -145,8 +164,18 @@ memory and the 2 GiB margin alone exceeded what was free.
   a bf16 repo imports fine and then fails to bind at load). Use MLX builds:
   - smoke/parity: `mlx-community/Qwen3-0.6B-4bit`
   - **Coder dialect: `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`
-    (~17 GB)** — this is what makes gate 1 above doable locally. Verify it
-    loads; if the MoE path misbehaves on Metal, fall back to a GPU pod.
+    (~17 GB)** — this is what makes gate 1 above doable locally. It loads
+    and admits fine at `max_model_len = 32768` on 48 GB (weights are mapped
+    where they lie, *not* on the heap, so the admission arithmetic is much
+    kinder than the raw 17 GB suggests).
+  - **But that model's MoE path generates garbage on Metal** — the "if the
+    MoE path misbehaves, fall back to a GPU pod" case, now confirmed.
+    Deterministic token salad under greedy; a dense `Qwen3-0.6B-4bit`
+    control on the same driver and binary is coherent. Evidenced hypothesis:
+    the build is mixed-precision (routers 8-bit, everything else 4-bit) and
+    `model_facts.cpp:74-82` reads only the global `bits`/`group_size`. Port
+    doc §13. **Rendering is unaffected** (it never runs the model), so the
+    parity gate is still valid locally — generation work is not.
 - `[driver] max_model_len` is the knob that shrinks KV (it sizes the M=1
   ring); `total_pages` is **not** and never was. Default is the driver
   ceiling (~14.6 GiB on a small model) — always set it.
@@ -280,8 +309,12 @@ integrations/qwen-code/
 
 ## 10. Suggested order of work
 
-1. **Close the Coder-dialect gate locally** — the biggest unverified claim
-   in the port. Exact sequence:
+1. ~~**Close the Coder-dialect gate locally**~~ — **DONE 2026-08-12:
+   `23 exact, 0 known-divergence, 0 mismatched`, no renderer changes
+   needed** (port doc §12). The prompt half of this step is closed; the
+   "should produce `tool_calls`, not prose" half is **not**, and is blocked
+   locally by the Metal MoE bug (§5, port doc §13) — carry it into step 4
+   on the pod. The sequence below still reproduces the gate verbatim:
 
    ```bash
    cd ~/Documents/Liszt_ai/pie
@@ -311,10 +344,13 @@ integrations/qwen-code/
 
    Expected: `23 exact, 0 known-divergence, 0 mismatched`. Anything in the
    MISMATCH column is a rendering bug — the script prints the first
-   diverging byte and a diff; fix `render_text.rs` until it is exact. Also
-   confirm the shim log shows the Coder dialect took effect (a tool-using
-   request should produce `tool_calls`, not prose).
+   diverging byte and a diff; fix `render_text.rs` until it is exact.
 2. Add a t=0 knob (inferlet + shim passthrough) so decoding can be pinned.
+   **Start by checking what already works**: sending `"temperature": 0` in
+   the request body demonstrably changed the served output (and made greedy
+   repeats identical), so the per-request path may already be wired end to
+   end — observed, not yet traced in `handler.rs`. If it is, the remaining
+   work is only forcing it on for qwen-code, which never sends the field.
 3. Extend `check_render.py` coverage to the `/no_think` class by capturing
    fixtures with `enable_thinking:false`.
 4. Only then: GPU pod, run 3, two arms, two repeats, `summarize.py`.

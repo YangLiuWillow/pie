@@ -322,3 +322,87 @@ compact-JSON tool-call bytes, while a rebuild-from-history renders the
 tojson-spaced form; addresses hash canon strings (not bytes), and each path
 is self-consistent, so reuse is unaffected — but extend-vs-rebuild token
 streams for the same conversation differ in those bytes by design.
+
+## 12. Coder-dialect gate (2026-08-12) — CLOSED, 23/23 exact on a served Coder model
+
+The §11 fix was implemented and golden-tested but had never faced a served
+Coder model. It has now, locally on the 48 GB machine:
+
+```
+pie serve  -c integrations/qwen-code/pie_config_metal_coder.toml   # 17.18 GB bound
+parity/check_render.py --hf-model Qwen/Qwen3-Coder-30B-A3B-Instruct
+→ 23 exact, 0 known-divergence, 0 mismatched of 23 fixtures
+```
+
+**No `render_text.rs` changes were needed** — the golden-driven port was
+already byte-exact against the real template. The three divergence classes
+a static audit of `chat_template.jinja` flagged as reachable in principle
+(`| string` on a list-valued `type`; `| string` on boolean/null *tool-call
+argument values*, where `coder_assistant_calls_text` uses
+`serde_json::to_string` and would emit `true`, not Python's `True`; and the
+template's `loop.previtem` guard suppressing the `<|im_start|>user` header
+when a tool message opens the conversation) are all **unreachable in these
+23 fixtures** — verified by scanning the corpus: 0 boolean/null tool-call
+args, 0 list-valued param types, no tool-first conversation. They remain
+latent bugs, not fixed ones, and a wider corpus can still trip them.
+
+Because "23 exact" alone could pass for the wrong reason, the run was
+checked against eight discriminating markers: the prompt carries the Coder
+`# Tools` header, `<function>/<name>` schema form, `<function=…>` call
+format and `<parameter=…>` replay, and carries *neither* hermes preamble
+nor the hermes JSON call form, with no stray `/no_think`. All eight hold —
+the Coder dialect is genuinely what a served Coder deployment now receives.
+
+Two facts about the reference, both load-bearing:
+
+- **The MLX 4-bit build ships an older chat template than the official
+  repo** — no `# Tools` header, and `render_item_list` in place of
+  `render_extra_keys`. pie renders the *official* template (hardcoded in
+  `render_text.rs`), which is also what vLLM serves from
+  `Qwen/Qwen3-Coder-30B-A3B-Instruct`, so the A/B stays apples-to-apples.
+  But regenerating the golden from the MLX snapshot would silently install
+  the wrong reference.
+- The two repos' **tokenizers are byte-identical** (vocab, added/special
+  tokens, encode and decode round-trip), so decoding `echo_tokens` through
+  the MLX artifact and comparing against the official tokenizer is sound.
+
+### Still NOT verified: Coder tool-calling behavior end-to-end
+
+The gate covers **prompt bytes only**. `echo_tokens` short-circuits before
+the forward pass (the 23-fixture run takes 2.1 s), so it never touched the
+model's numerics — and the numerics are broken here. See §13. The
+handover's second half of step 1, "a tool-using request should produce
+`tool_calls`, not prose", remains **unverified** and needs a CUDA pod.
+
+## 13. Blocker: the 30B MoE produces garbage on Metal (2026-08-12)
+
+`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` loads, admits, and
+generates on Metal — incoherently:
+
+```
+"say hi"              → ".isoizonoczoczbar2andrardard2andr-dimensionalood people illiol"
+"What is 2+2?" (t=0)  → "/\n/\n/</</</</</</<_bad/</</</</<<|fim_middle|>/<<//<"
+```
+
+Greedy output is **deterministic across repeats**, so this is numerics, not
+sampling. Controlled against a dense model on the same driver, same binary,
+same day: `mlx-community/Qwen3-0.6B-4bit` answers all three probe prompts
+coherently. **The Metal driver is fine; the MoE path is not.**
+
+**Root-cause hypothesis (evidenced, NOT confirmed).** The Coder MLX build
+is mixed-precision: `quantization` is globally `{group_size: 64, bits: 4}`,
+but every MoE router — `model.layers.N.mlp.gate`, all 48 — carries a
+per-tensor override to **8 bits**. `driver/metal/src/model_facts.cpp:74-82`
+reads only the top-level `bits`/`group_size` and has no per-tensor override
+path. An 8-bit router decoded as 4-bit is noise, so top-8-of-128 routing
+picks the wrong experts every token — which is exactly the observed failure
+shape (locally fluent fragments, globally meaningless). The dense 0.6B has
+a single uniform quant block and no overrides, consistent with it working.
+
+Not yet checked: whether the `.zt` artifact carries per-tensor quant
+metadata that the loader honors independently of these config facts, which
+would refute the hypothesis. `pie model info` does not surface it.
+
+This does not affect §12 — rendering never runs the model — but it blocks
+local Coder e2e work, and it is a driver bug worth fixing or filing
+regardless of this integration.
