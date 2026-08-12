@@ -173,8 +173,6 @@ logs
 .plan
 *profiling_result.json
 /profiling-artifacts/
-# Locally archived Markdown documents.
-/docs/
 # No MCP files
 .memory-bank
 # raw eval data
