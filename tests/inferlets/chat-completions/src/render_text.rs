@@ -7,6 +7,40 @@
 //! from these strings + `model::encode`; see `render.rs` for the token
 //! assembly. Keeping the strings pure keeps them natively testable.
 
+/// Which tool-calling dialect the loaded model was fine-tuned on.
+///
+/// This is not cosmetic. Serving a Coder-tuned model the hermes/JSON tool
+/// prompt makes it answer in prose and stop without ever calling a tool —
+/// measured on the 2026-08-12 H200 A/B, where 2 of 5 agent tasks produced
+/// zero tool calls and the rest took divergent paths (docs §11).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    /// `<tool_call>{"name": …, "arguments": …}</tool_call>` (Qwen3, Qwen3.5).
+    Hermes,
+    /// `<tool_call><function=…><parameter=…>` XML (Qwen3-Coder).
+    Coder,
+}
+
+impl Dialect {
+    /// Pick a dialect from the model identity. pie exposes only the config's
+    /// `[model] name` and the architecture, and `qwen3_moe` covers both the
+    /// Coder and non-Coder MoE models — so the name is the only signal, and
+    /// a Coder deployment must carry "coder" in it (the bench config does).
+    pub fn detect(model_name: &str, architecture: &str) -> Dialect {
+        let hay = format!("{model_name} {architecture}").to_lowercase();
+        if hay.contains("coder") {
+            Dialect::Coder
+        } else {
+            Dialect::Hermes
+        }
+    }
+}
+
+/// The Coder template's stand-in system message when a request carries tools
+/// but no system turn of its own.
+pub const CODER_DEFAULT_SYSTEM: &str =
+    "You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.";
+
 /// Serialize a JSON value the way transformers' chat templating does
 /// (`tojson`: `json.dumps(x, ensure_ascii=False)` — `", "`/`": "`
 /// separators, insertion-order keys, no sorting). Replayed tool schemas
@@ -77,6 +111,177 @@ pub fn merged_system_content(system_content: Option<&str>, tools: &[String]) -> 
     }
 }
 
+/// Qwen3-Coder's tool preamble, byte-for-byte with that model's chat
+/// template (`chat_template.jinja`, the `# Tools` branch). It carries its
+/// own leading `"\n\n"` because the template appends it directly to the
+/// system message with no separator of its own.
+pub fn build_coder_tool_system_prompt(tools: &[String]) -> String {
+    use std::fmt::Write as _;
+
+    // The template's render_extra_keys macro: mappings/sequences via
+    // `tojson`, everything else via Jinja's `| string`. That filter is
+    // Python's `str()`, so booleans and null render capitalized —
+    // `<additionalProperties>True</additionalProperties>`, not `true`.
+    fn render_val(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => tojson(v),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(true) => "True".to_string(),
+            serde_json::Value::Bool(false) => "False".to_string(),
+            serde_json::Value::Null => "None".to_string(),
+            other => other.to_string(),
+        }
+    }
+    fn extra_keys(out: &mut String, v: Option<&serde_json::Value>, handled: &[&str]) {
+        if let Some(serde_json::Value::Object(map)) = v {
+            for (k, val) in map {
+                if handled.contains(&k.as_str()) {
+                    continue;
+                }
+                let _ = write!(out, "\n<{k}>{}</{k}>", render_val(val));
+            }
+        }
+    }
+
+    let mut p = String::from(
+        "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>",
+    );
+    for tool in tools {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) else {
+            continue;
+        };
+        // Accept both {"type":"function","function":{…}} and a bare function.
+        let func = parsed.get("function").unwrap_or(&parsed);
+        let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let _ = write!(p, "\n<function>\n<name>{name}</name>");
+        if let Some(d) = func.get("description").and_then(|d| d.as_str()) {
+            let _ = write!(p, "\n<description>{}</description>", d.trim());
+        }
+        p.push_str("\n<parameters>");
+        let params = func.get("parameters");
+        if let Some(props) = params
+            .and_then(|x| x.get("properties"))
+            .and_then(|x| x.as_object())
+        {
+            for (pname, pfields) in props {
+                let _ = write!(p, "\n<parameter>\n<name>{pname}</name>");
+                if let Some(t) = pfields.get("type") {
+                    let _ = write!(p, "\n<type>{}</type>", render_val(t));
+                }
+                if let Some(d) = pfields.get("description").and_then(|d| d.as_str()) {
+                    let _ = write!(p, "\n<description>{}</description>", d.trim());
+                }
+                extra_keys(&mut p, Some(pfields), &["name", "type", "description"]);
+                p.push_str("\n</parameter>");
+            }
+        }
+        extra_keys(&mut p, params, &["type", "properties"]);
+        p.push_str("\n</parameters>");
+        extra_keys(&mut p, Some(func), &["type", "name", "description", "parameters"]);
+        p.push_str("\n</function>");
+    }
+    p.push_str(
+        "\n</tools>\n\n\
+         If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+         <tool_call>\n\
+         <function=example_function_name>\n\
+         <parameter=example_parameter_1>\n\
+         value_1\n\
+         </parameter>\n\
+         <parameter=example_parameter_2>\n\
+         This is the value for the second parameter\n\
+         that can span\n\
+         multiple lines\n\
+         </parameter>\n\
+         </function>\n\
+         </tool_call>\n\n\
+         <IMPORTANT>\n\
+         Reminder:\n\
+         - Function calls MUST follow the specified format: an inner <function=...></function> \
+         block must be nested within <tool_call></tool_call> XML tags\n\
+         - Required parameters MUST be specified\n\
+         - You may provide optional reasoning for your function call in natural language BEFORE \
+         the function call, but NOT after\n\
+         - If there is no function call available, answer the question like normal with your \
+         current knowledge and do not tell the user about function calls\n\
+         </IMPORTANT>",
+    );
+    p
+}
+
+/// Inner text of the system turn, or `None` when the conversation has no
+/// system turn at all (no system message and no tools).
+pub fn system_turn_content(
+    dialect: Dialect,
+    system_content: Option<&str>,
+    tools: &[String],
+) -> Option<String> {
+    let system = system_content.filter(|s| !s.is_empty());
+    match dialect {
+        Dialect::Hermes => match (system, tools.is_empty()) {
+            (s, true) => s.map(str::to_string), // no tools: no preamble at all
+            (s, false) => Some(merged_system_content(s, tools)),
+        },
+        Dialect::Coder => {
+            if tools.is_empty() {
+                return system.map(str::to_string);
+            }
+            let head = system.unwrap_or(CODER_DEFAULT_SYSTEM);
+            Some(format!("{head}{}", build_coder_tool_system_prompt(tools)))
+        }
+    }
+}
+
+/// Coder assistant turn carrying tool calls: everything between
+/// `<|im_start|>assistant` and `<|im_end|>`. Content is trimmed and wrapped
+/// in newlines only when non-empty, matching the template's branch.
+pub fn coder_assistant_calls_text(content: Option<&str>, calls: &[(String, String)]) -> String {
+    let mut out = String::new();
+    if let Some(c) = content {
+        let c = c.trim();
+        if !c.is_empty() {
+            out.push('\n');
+            out.push_str(c);
+            out.push('\n');
+        }
+    }
+    for (name, arguments_json) in calls {
+        out.push_str("\n<tool_call>\n<function=");
+        out.push_str(name);
+        out.push_str(">\n");
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(arguments_json)
+        {
+            for (key, value) in &map {
+                out.push_str("<parameter=");
+                out.push_str(key);
+                out.push_str(">\n");
+                out.push_str(&match value {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => tojson(value),
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                });
+                out.push_str("\n</parameter>\n");
+            }
+        }
+        out.push_str("</function>\n</tool_call>");
+    }
+    out
+}
+
+/// Coder tool-result run: inner text of the single `user` turn that a run of
+/// consecutive `tool` messages collapses into. Note this differs from the
+/// hermes batching — each block is newline-terminated here.
+pub fn coder_tool_response_text(values: &[String]) -> String {
+    let mut out = String::new();
+    for v in values {
+        out.push_str("<tool_response>\n");
+        out.push_str(v);
+        out.push_str("\n</tool_response>\n");
+    }
+    out
+}
+
 /// `/no_think` soft switch on a user turn — position-independent (applied to
 /// *every* user turn) so a turn replays identically once it becomes history.
 pub fn no_think_decorate(text: &str) -> String {
@@ -132,6 +337,89 @@ mod tests {
         let bare = merged_system_content(None, &tools);
         assert!(bare.starts_with("# Tools"));
         assert_eq!(merged_system_content(Some(""), &tools), bare);
+    }
+
+    /// The Coder builders must reproduce `apply_chat_template` byte-for-byte.
+    /// The golden is generated from the real model's template (see
+    /// `tests/coder_template_golden.json`, regenerate with transformers).
+    #[test]
+    fn coder_render_matches_the_real_template() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/coder_template_golden.json"
+        ))
+        .expect("golden parses");
+        let tools: Vec<String> = golden["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(tojson)
+            .collect();
+        let with_system = golden["cases"]["with_system_and_tools"].as_str().unwrap();
+        let no_system = golden["cases"]["no_system_with_tools"].as_str().unwrap();
+
+        // 1. System turn, with and without a system message of its own.
+        let sys = system_turn_content(Dialect::Coder, Some("You are Qwen Code."), &tools).unwrap();
+        let expect_sys = with_system
+            .strip_prefix("<|im_start|>system\n")
+            .unwrap()
+            .split("<|im_end|>")
+            .next()
+            .unwrap();
+        assert_eq!(sys, expect_sys, "coder system turn diverges");
+
+        let bare = system_turn_content(Dialect::Coder, None, &tools).unwrap();
+        let expect_bare = no_system
+            .strip_prefix("<|im_start|>system\n")
+            .unwrap()
+            .split("<|im_end|>")
+            .next()
+            .unwrap();
+        assert_eq!(bare, expect_bare, "coder default-system turn diverges");
+        assert!(bare.starts_with(CODER_DEFAULT_SYSTEM));
+
+        // 2. Assistant turn with a tool call (string, integer and object args).
+        let calls = vec![(
+            "run_shell_command".to_string(),
+            r#"{"command":"ls -la","timeout":30,"opts":{"cwd":"/tmp"}}"#.to_string(),
+        )];
+        let got = coder_assistant_calls_text(Some("I'll look."), &calls);
+        let seg = with_system.split("<|im_start|>assistant").nth(1).unwrap();
+        let expect = seg.split("<|im_end|>").next().unwrap();
+        assert_eq!(got, expect, "coder tool-call replay diverges");
+
+        // 3. A run of tool results collapses into one user turn.
+        let got = coder_tool_response_text(&[
+            "a.txt\nb.txt".to_string(),
+            "second result".to_string(),
+        ]);
+        let after = with_system.split("</tool_call><|im_end|>\n").nth(1).unwrap();
+        let expect = after
+            .strip_prefix("<|im_start|>user\n")
+            .unwrap()
+            .split("<|im_end|>")
+            .next()
+            .unwrap();
+        assert_eq!(got, expect, "coder tool-response batching diverges");
+    }
+
+    #[test]
+    fn dialect_detection_keys_on_the_model_identity() {
+        assert_eq!(
+            Dialect::detect("qwen3-coder-30b-a3b", "qwen3_moe"),
+            Dialect::Coder
+        );
+        assert_eq!(Dialect::detect("default", "qwen3_moe"), Dialect::Hermes);
+        assert_eq!(Dialect::detect("Qwen3-0.6B", "qwen3"), Dialect::Hermes);
+    }
+
+    #[test]
+    fn hermes_system_turn_is_absent_only_without_system_and_tools() {
+        assert!(system_turn_content(Dialect::Hermes, None, &[]).is_none());
+        assert!(system_turn_content(Dialect::Coder, None, &[]).is_none());
+        assert_eq!(
+            system_turn_content(Dialect::Hermes, Some("S"), &[]).unwrap(),
+            "S"
+        );
     }
 
     #[test]

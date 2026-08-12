@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ImportError: cannot import name 'median' from 'stats' (/tmp/tmp.uWYqKZOHw4/repo/stats.py)
+check_rc=1

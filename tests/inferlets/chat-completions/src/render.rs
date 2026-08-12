@@ -42,6 +42,9 @@ pub struct Renderer {
     pub stop_ids: Vec<u32>,
     /// Special-token strings for message sanitization.
     specials: Vec<String>,
+    /// Tool-calling dialect this model was tuned on. Coder-tuned models
+    /// served the hermes prompt answer in prose and never call a tool.
+    dialect: rt::Dialect,
 }
 
 impl Renderer {
@@ -98,7 +101,12 @@ impl Renderer {
             tool_response_suffix: encode(rt::TOOL_RESPONSE_SUFFIX),
             stop_ids,
             specials,
+            dialect: rt::Dialect::detect(&model::name(), &model::architecture()),
         }
+    }
+
+    pub fn dialect(&self) -> rt::Dialect {
+        self.dialect
     }
 
     fn role_tokens(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
@@ -145,6 +153,12 @@ impl Renderer {
         if calls.is_empty() {
             return self.assistant(content.unwrap_or(""));
         }
+        if self.dialect == rt::Dialect::Coder {
+            let mut tokens = self.assistant_prefix_no_nl.clone();
+            tokens.extend(model::encode(&rt::coder_assistant_calls_text(content, calls)));
+            tokens.extend(&self.turn_suffix);
+            return tokens;
+        }
         let mut tokens = self.assistant_prefix_no_nl.clone();
         if let Some(c) = content {
             if !c.is_empty() {
@@ -179,6 +193,15 @@ impl Renderer {
         if results.is_empty() {
             return Vec::new();
         }
+        if self.dialect == rt::Dialect::Coder {
+            // Coder wraps each result in its own newline-terminated block
+            // inside one `<|im_start|>user\n … <|im_end|>\n` turn.
+            let values: Vec<String> = results.iter().map(|(_, v)| v.clone()).collect();
+            let mut tokens = self.user_prefix.clone();
+            tokens.extend(model::encode(&rt::coder_tool_response_text(&values)));
+            tokens.extend(&self.turn_suffix);
+            return tokens;
+        }
         let mut tokens = self.user_prefix_no_nl.clone();
         for (_name, value) in results {
             tokens.extend(&self.tool_response_open);
@@ -202,19 +225,21 @@ impl Renderer {
 
         // The chat template folds a leading system message's content into
         // the *same* system turn as the tool schemas rather than two
-        // consecutive system turns.
-        if !tool_schemas.is_empty() {
-            let leading_system = if messages.first().map(|m| m.role.as_str()) == Some("system") {
-                rest = &messages[1..];
-                Some(messages[0].text())
-            } else {
-                None
-            };
-            let merged = rt::merged_system_content(
-                leading_system.as_deref().filter(|s| !s.is_empty()),
-                tool_schemas,
-            );
-            out.extend(self.system(&merged));
+        // consecutive system turns. Under the Coder dialect a tools-bearing
+        // request with no system message of its own still gets one, carrying
+        // the template's stand-in text.
+        let leading_system = if messages.first().map(|m| m.role.as_str()) == Some("system") {
+            rest = &messages[1..];
+            Some(messages[0].text())
+        } else {
+            None
+        };
+        if let Some(content) = rt::system_turn_content(
+            self.dialect,
+            leading_system.as_deref(),
+            tool_schemas,
+        ) {
+            out.extend(self.system(&content));
         }
 
         self.render_messages(rest, no_think, &mut out)?;
@@ -245,7 +270,11 @@ impl Renderer {
                     // otherwise retained KV prefixes would diverge from the
                     // rebuilt token stream.
                     let text = msg.text();
-                    if no_think {
+                    // Coder models have no thinking channel and no soft
+                    // switch, so the decoration would be bare noise appended
+                    // to every user turn — and a divergence from what a
+                    // template-driven server sends.
+                    if no_think && self.dialect != rt::Dialect::Coder {
                         out.extend(self.user(&rt::no_think_decorate(&text)));
                     } else {
                         out.extend(self.user(&text));

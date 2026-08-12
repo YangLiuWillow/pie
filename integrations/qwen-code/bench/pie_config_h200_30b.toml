@@ -9,7 +9,13 @@ verbose = false
 telemetry = false
 
 [model]
-name = "default"
+# The name is the ONLY signal the inferlet has for picking a tool-calling
+# dialect: `architecture()` reports `qwen3_moe` for both the Coder and
+# non-Coder MoE models, and pie does not expose the HF id. It must contain
+# "coder" for a Coder deployment, or the renderer serves the hermes/JSON
+# tool prompt and the model answers in prose without ever calling a tool
+# (docs §11).
+name = "qwen3-coder-30b-a3b"
 model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
 [driver]

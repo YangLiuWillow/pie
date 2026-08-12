@@ -1,0 +1,83 @@
+{
+ "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "run_shell_command",
+    "description": "  Runs a shell command.  ",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string",
+       "description": "The command"
+      },
+      "timeout": {
+       "type": "integer",
+       "description": "Seconds",
+       "default": 30
+      },
+      "opts": {
+       "type": "object",
+       "description": "Options",
+       "additionalProperties": true
+      }
+     },
+     "required": [
+      "command"
+     ]
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are Qwen Code."
+  },
+  {
+   "role": "user",
+   "content": "list files"
+  },
+  {
+   "role": "assistant",
+   "content": "I'll look.",
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "run_shell_command",
+      "arguments": {
+       "command": "ls -la",
+       "timeout": 30,
+       "opts": {
+        "cwd": "/tmp"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "a.txt\nb.txt"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "second result"
+  },
+  {
+   "role": "user",
+   "content": "thanks"
+  }
+ ],
+ "cases": {
+  "with_system_and_tools": "<|im_start|>system\nYou are Qwen Code.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>run_shell_command</name>\n<description>Runs a shell command.</description>\n<parameters>\n<parameter>\n<name>command</name>\n<type>string</type>\n<description>The command</description>\n</parameter>\n<parameter>\n<name>timeout</name>\n<type>integer</type>\n<description>Seconds</description>\n<default>30</default>\n</parameter>\n<parameter>\n<name>opts</name>\n<type>object</type>\n<description>Options</description>\n<additionalProperties>True</additionalProperties>\n</parameter>\n<required>[\"command\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nlist files<|im_end|>\n<|im_start|>assistant\nI'll look.\n\n<tool_call>\n<function=run_shell_command>\n<parameter=command>\nls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n<parameter=opts>\n{\"cwd\": \"/tmp\"}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response>\n<tool_response>\nsecond result\n</tool_response>\n<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n",
+  "no_system_with_tools": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>run_shell_command</name>\n<description>Runs a shell command.</description>\n<parameters>\n<parameter>\n<name>command</name>\n<type>string</type>\n<description>The command</description>\n</parameter>\n<parameter>\n<name>timeout</name>\n<type>integer</type>\n<description>Seconds</description>\n<default>30</default>\n</parameter>\n<parameter>\n<name>opts</name>\n<type>object</type>\n<description>Options</description>\n<additionalProperties>True</additionalProperties>\n</parameter>\n<required>[\"command\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nlist files<|im_end|>\n<|im_start|>assistant\nI'll look.\n\n<tool_call>\n<function=run_shell_command>\n<parameter=command>\nls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n<parameter=opts>\n{\"cwd\": \"/tmp\"}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response>\n<tool_response>\nsecond result\n</tool_response>\n<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n",
+  "no_tools": "<|im_start|>system\nYou are Qwen Code.<|im_end|>\n<|im_start|>user\nlist files<|im_end|>\n<|im_start|>assistant\n"
+ }
+}
