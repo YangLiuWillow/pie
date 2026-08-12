@@ -46,12 +46,24 @@ echo "== build npr inferlet =="
 
 echo "== python client =="
 python3 -m venv "$WORK/venv"
-"$WORK/venv/bin/pip" install -q -e client/python "huggingface_hub[cli]"
+# websockets + blake3 for client.py / evals; torch + safetensors for the
+# fp32 -> bf16 cast (pie's loader does not cast).
+"$WORK/venv/bin/pip" install -q -e client/python "huggingface_hub[cli]" \
+    websockets blake3 torch safetensors numpy
 
 echo "== model download ($MODEL_REPO) =="
 "$WORK/venv/bin/hf" download "$MODEL_REPO" >/dev/null
 SNAP=$(ls -d "$HOME"/.cache/huggingface/hub/models--${MODEL_REPO//\//--}/snapshots/*/ | head -1)
 echo "snapshot: $SNAP"
+
+# The published NPR-4B is fp32; serving it directly fails with
+# "gemm_act_x_w: unsupported dtype combo (act=bf16, w=fp32, y=bf16)".
+BF16="$WORK/$(basename "$MODEL_REPO")-bf16"
+if [ ! -f "$BF16/config.json" ]; then
+    echo "== cast to bf16 -> $BF16 =="
+    "$WORK/venv/bin/python" inferlets/npr/convert_bf16.py "$SNAP" "$BF16"
+fi
+SNAP="$BF16"
 
 echo "== config =="
 cat > "$WORK/npr-cuda.toml" <<EOF
@@ -80,3 +92,4 @@ EOF
 echo "== done =="
 echo "start:  cd $WORK/pie && PIE_CONFIG=$WORK/npr-cuda.toml nohup ./target/release/pie serve > $WORK/serve.log 2>&1 &"
 echo "test:   $WORK/venv/bin/python $WORK/pie/inferlets/npr/client.py --input '{\"selftest\": true}'"
+echo "eval:   $WORK/venv/bin/python $WORK/pie/inferlets/npr/evals/run_eval.py --k 8 --concurrency 32"
