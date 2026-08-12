@@ -268,9 +268,17 @@ impl Daemon {
                 Some((_, _)) => {
                     let split = session::split_resume_point(&setup.messages).unwrap();
                     let mut suffix = Vec::new();
-                    match self.renderer.render_messages(
+                    // Absolute position matters: the Qwen3.5/3.6 think-replay
+                    // rule keys on the index of the last user query across the
+                    // WHOLE conversation, so a suffix rendered with
+                    // suffix-relative indices would disagree with the prefix
+                    // already sitting in KV.
+                    let last_query = Renderer::last_query_index(&setup.messages);
+                    match self.renderer.render_messages_at(
                         &setup.messages[split..],
                         setup.no_think,
+                        split,
+                        last_query,
                         &mut suffix,
                     ) {
                         Ok(()) => Ok(suffix),
@@ -465,11 +473,22 @@ impl Daemon {
         let final_content = if !visible_text.is_empty() || !calls.is_empty() {
             visible_text.clone()
         } else {
-            let cleaned = raw_text
-                .replace("<think>", "")
-                .replace("</think>", "")
-                .trim()
-                .to_string();
+            // Take the body AFTER the reasoning, never the reasoning itself.
+            // Stripping only the tags (what this did before) hands the
+            // client the model's private reasoning as its answer — and under
+            // the open-block cue that is the common case, not a rare one:
+            // the turn starts inside `<think>`, so a turn truncated by
+            // `max_tokens` has an unterminated block and NO content by
+            // construction. Substituting the reasoning there would reinstate
+            // exactly the leak the cue exists to prevent.
+            let body = match raw_text.rfind("</think>") {
+                Some(i) => &raw_text[i + "</think>".len()..],
+                // No closer. Under the open cue the whole turn was reasoning;
+                // otherwise the model never opened a block and it is content.
+                None if self.renderer.opens_think() => "",
+                None => raw_text.as_str(),
+            };
+            let cleaned = body.replace("<think>", "").trim().to_string();
             if cleaned.is_empty() { "…".to_string() } else { cleaned }
         };
 

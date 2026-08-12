@@ -15,10 +15,15 @@
 /// zero tool calls and the rest took divergent paths (docs §11).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dialect {
-    /// `<tool_call>{"name": …, "arguments": …}</tool_call>` (Qwen3, Qwen3.5).
+    /// `<tool_call>{"name": …, "arguments": …}</tool_call>` (Qwen3).
     Hermes,
     /// `<tool_call><function=…><parameter=…>` XML (Qwen3-Coder).
     Coder,
+    /// Qwen3.5/3.6: hermes-style **JSON** schemas inside `<tools>`, but
+    /// Coder-style **XML** calls — and the argument-value rule inverted
+    /// relative to Coder (strings raw, everything else `tojson`, so a bool
+    /// renders `true`, not Python's `True`). Neither of the other two.
+    Qwen36,
 }
 
 impl Dialect {
@@ -38,7 +43,11 @@ impl Dialect {
     /// under either spelling.
     pub fn detect(model_name: &str, architecture: &str) -> Dialect {
         let hay = format!("{model_name} {architecture}").to_lowercase();
-        if hay.contains("coder") {
+        // Lineage first: a Qwen3.5/3.6 checkpoint uses its own dialect even
+        // if "coder" appears in the deployment name.
+        if lineage_opens_think(model_name, architecture) {
+            Dialect::Qwen36
+        } else if hay.contains("coder") {
             Dialect::Coder
         } else {
             Dialect::Hermes
@@ -50,9 +59,9 @@ impl Dialect {
 /// chat template ends the generation prompt inside an OPEN `<think>` block
 /// rather than after the bare role header.
 ///
-/// This is a separate axis from [`Dialect`] on purpose: it decides how the
-/// turn *starts*, not how tools are spelled, and the two need not move
-/// together while the Qwen3.6 tool dialect is still unimplemented (§14).
+/// Kept as its own predicate rather than folded into [`Dialect`] because it
+/// answers a different question — how the turn *starts*, not how tools are
+/// spelled — and `Dialect::detect` consumes it, so the two cannot disagree.
 ///
 /// Substring-based for the reason given on [`Dialect::detect`] — `qwen3_5`,
 /// `qwen3_5moe`, `qwen3_5_moe`, `qwen3.6` and `qwen3_6` must all match.
@@ -222,33 +231,148 @@ pub fn build_coder_tool_system_prompt(tools: &[String]) -> String {
         extra_keys(&mut p, Some(func), &["type", "name", "description", "parameters"]);
         p.push_str("\n</function>");
     }
-    p.push_str(
-        "\n</tools>\n\n\
-         If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
-         <tool_call>\n\
-         <function=example_function_name>\n\
-         <parameter=example_parameter_1>\n\
-         value_1\n\
-         </parameter>\n\
-         <parameter=example_parameter_2>\n\
-         This is the value for the second parameter\n\
-         that can span\n\
-         multiple lines\n\
-         </parameter>\n\
-         </function>\n\
-         </tool_call>\n\n\
-         <IMPORTANT>\n\
-         Reminder:\n\
-         - Function calls MUST follow the specified format: an inner <function=...></function> \
-         block must be nested within <tool_call></tool_call> XML tags\n\
-         - Required parameters MUST be specified\n\
-         - You may provide optional reasoning for your function call in natural language BEFORE \
-         the function call, but NOT after\n\
-         - If there is no function call available, answer the question like normal with your \
-         current knowledge and do not tell the user about function calls\n\
-         </IMPORTANT>",
-    );
+    p.push_str(CALL_FORMAT_TAIL);
     p
+}
+
+/// Everything from `</tools>` to `</IMPORTANT>`: the XML call format and the
+/// reminder block. **Byte-identical in the Qwen3-Coder and Qwen3.5/3.6
+/// templates**, verified against both goldens, so it is shared rather than
+/// duplicated — two copies would be two things to keep in sync for no gain.
+pub const CALL_FORMAT_TAIL: &str = "\n</tools>\n\n\
+     If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+     <tool_call>\n\
+     <function=example_function_name>\n\
+     <parameter=example_parameter_1>\n\
+     value_1\n\
+     </parameter>\n\
+     <parameter=example_parameter_2>\n\
+     This is the value for the second parameter\n\
+     that can span\n\
+     multiple lines\n\
+     </parameter>\n\
+     </function>\n\
+     </tool_call>\n\n\
+     <IMPORTANT>\n\
+     Reminder:\n\
+     - Function calls MUST follow the specified format: an inner <function=...></function> \
+     block must be nested within <tool_call></tool_call> XML tags\n\
+     - Required parameters MUST be specified\n\
+     - You may provide optional reasoning for your function call in natural language BEFORE \
+     the function call, but NOT after\n\
+     - If there is no function call available, answer the question like normal with your \
+     current knowledge and do not tell the user about function calls\n\
+     </IMPORTANT>";
+
+/// Qwen3.5/3.6 tool preamble. Unlike Coder, the schemas are dumped whole as
+/// JSON (`tool | tojson`, envelope and all, no per-field trimming) — the
+/// hermes shape — while the *call* format below is Coder's XML.
+pub fn build_qwen36_tool_system_prompt(tools: &[String]) -> String {
+    let mut p =
+        String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for tool in tools {
+        p.push('\n');
+        // `tojson` of whatever the request carried, re-serialized so spacing
+        // and key order match what a template-driven server feeds the model.
+        match serde_json::from_str::<serde_json::Value>(tool) {
+            Ok(v) => p.push_str(&tojson(&v)),
+            Err(_) => p.push_str(tool),
+        }
+    }
+    p.push_str(CALL_FORMAT_TAIL);
+    p
+}
+
+/// Qwen3.5/3.6 assistant turn carrying tool calls: everything between
+/// `<|im_start|>assistant\n` and `<|im_end|>`.
+///
+/// Two differences from [`coder_assistant_calls_text`] that a hand-port
+/// would get wrong, both pinned by the golden:
+/// - the separator before the FIRST call is `\n\n` when content is present
+///   and nothing at all when it is not (Coder always uses a single `\n`);
+/// - argument values invert the rule: strings render raw, everything else
+///   through `tojson`, so a bool is `true` and not Python's `True`.
+pub fn qwen36_assistant_calls_text(content: Option<&str>, calls: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let trimmed = content.map(str::trim).unwrap_or("");
+    if !trimmed.is_empty() {
+        out.push_str(trimmed);
+    }
+    for (i, (name, arguments_json)) in calls.iter().enumerate() {
+        if i == 0 {
+            if !trimmed.is_empty() {
+                out.push_str("\n\n");
+            }
+        } else {
+            out.push('\n');
+        }
+        out.push_str("<tool_call>\n<function=");
+        out.push_str(name);
+        out.push_str(">\n");
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(arguments_json)
+        {
+            for (key, value) in &map {
+                out.push_str("<parameter=");
+                out.push_str(key);
+                out.push_str(">\n");
+                out.push_str(&match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => tojson(other),
+                });
+                out.push_str("\n</parameter>\n");
+            }
+        }
+        out.push_str("</function>\n</tool_call>");
+    }
+    out
+}
+
+/// Qwen3.5/3.6 tool-result run: inner text of the single `user` turn a run of
+/// consecutive `tool` messages collapses into. Blocks are joined by `\n` and
+/// the last is NOT newline-terminated — the turn's `<|im_end|>` follows
+/// directly. (Coder terminates every block, including the last.)
+pub fn qwen36_tool_response_text(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|v| format!("<tool_response>\n{v}\n</tool_response>"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Qwen3.5/3.6 assistant turn on replay, thinking included.
+///
+/// The template keeps a turn's `<think>` block only when the turn falls
+/// AFTER the last genuine user query, and strips it to bare content
+/// otherwise. `keep_thinking` carries that decision, which is positional and
+/// therefore computed by the caller — see `render.rs`.
+pub fn qwen36_assistant_text(content: &str, keep_thinking: bool) -> String {
+    let (reasoning, body) = split_thinking(content);
+    if keep_thinking {
+        format!("<think>\n{}\n</think>\n\n{}", reasoning.trim(), body)
+    } else {
+        body.to_string()
+    }
+}
+
+/// Split `<think>…</think>` content the way the template does: reasoning is
+/// what sits between the tags, body is everything after the last closer with
+/// leading newlines stripped.
+pub fn split_thinking(content: &str) -> (&str, &str) {
+    match content.rfind("</think>") {
+        Some(end) => {
+            let head = &content[..end];
+            let reasoning = match head.rfind("<think>") {
+                Some(open) => &head[open + "<think>".len()..],
+                None => head,
+            };
+            (
+                reasoning.trim_start_matches('\n'),
+                content[end + "</think>".len()..].trim_start_matches('\n'),
+            )
+        }
+        None => ("", content),
+    }
 }
 
 /// Inner text of the system turn, or `None` when the conversation has no
@@ -270,6 +394,20 @@ pub fn system_turn_content(
             }
             let head = system.unwrap_or(CODER_DEFAULT_SYSTEM);
             Some(format!("{head}{}", build_coder_tool_system_prompt(tools)))
+        }
+        // Qwen3.5/3.6 inverts the order: the tools block comes FIRST and the
+        // system message follows it, trimmed, after a `\n\n`. With no tools
+        // there is no preamble and no stand-in system message either — the
+        // template simply omits the turn.
+        Dialect::Qwen36 => {
+            if tools.is_empty() {
+                return system.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            let block = build_qwen36_tool_system_prompt(tools);
+            Some(match system.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(c) => format!("{block}\n\n{c}"),
+                None => block,
+            })
         }
     }
 }
@@ -444,6 +582,114 @@ mod tests {
         assert_eq!(got, expect, "coder tool-response batching diverges");
     }
 
+    /// The Qwen3.5/3.6 builders must reproduce `apply_chat_template`
+    /// byte-for-byte, same discipline as the Coder golden. Generated from
+    /// `Qwen/Qwen3.6-35B-A3B`'s real template — regenerate with transformers.
+    #[test]
+    fn qwen36_render_matches_the_real_template() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/qwen36_template_golden.json"))
+                .expect("golden parses");
+        let tools: Vec<String> = golden["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(tojson)
+            .collect();
+        let case = |k: &str| golden["cases"][k].as_str().unwrap().to_string();
+
+        // 1. System turn: tools block first, system message after it.
+        let with_system = case("with_system_and_tools");
+        let expect = with_system
+            .strip_prefix("<|im_start|>system\n")
+            .unwrap()
+            .split("<|im_end|>")
+            .next()
+            .unwrap()
+            .to_string();
+        let got = system_turn_content(Dialect::Qwen36, Some("You are Qwen Code."), &tools).unwrap();
+        assert_eq!(got, expect, "qwen3.6 system turn diverges");
+        assert!(got.starts_with("# Tools\n\nYou have access to the following functions:"));
+        assert!(got.ends_with("</IMPORTANT>\n\nYou are Qwen Code."));
+
+        // No system message: the tools block stands alone (no stand-in text,
+        // unlike Coder).
+        let bare = system_turn_content(Dialect::Qwen36, None, &tools).unwrap();
+        let no_system = case("no_system_with_tools");
+        let expect_bare = no_system
+            .strip_prefix("<|im_start|>system\n")
+            .unwrap()
+            .split("<|im_end|>")
+            .next()
+            .unwrap();
+        assert_eq!(bare, expect_bare, "qwen3.6 tools-only system turn diverges");
+        assert!(!bare.contains(CODER_DEFAULT_SYSTEM));
+
+        // 2. Assistant tool call: string raw, int/bool/object via tojson.
+        // `true` lowercase is the inversion versus Coder's `True`.
+        let a = case("assistant_tool_call");
+        let seg = a.split("<|im_start|>assistant\n").nth(1).unwrap();
+        let expect_call = seg.split("<|im_end|>").next().unwrap();
+        let calls = vec![(
+            "run_shell_command".to_string(),
+            r#"{"command":"ls -la","timeout":30,"background":true,"opts":{"cwd":"/tmp"}}"#
+                .to_string(),
+        )];
+        let got = qwen36_assistant_calls_text(Some("I'll look."), &calls);
+        assert_eq!(got, expect_call, "qwen3.6 tool-call replay diverges");
+        assert!(got.contains("<parameter=background>\ntrue\n</parameter>"));
+        assert!(!got.contains("True"));
+
+        // 3. A run of tool results: blocks joined by \n, last NOT terminated.
+        let after = a.split("</tool_call><|im_end|>\n").nth(1).unwrap();
+        let expect_resp = after
+            .strip_prefix("<|im_start|>user\n")
+            .unwrap()
+            .split("<|im_end|>")
+            .next()
+            .unwrap();
+        let got = qwen36_tool_response_text(&[
+            "a.txt\nb.txt".to_string(),
+            "second result".to_string(),
+        ]);
+        assert_eq!(got, expect_resp, "qwen3.6 tool-response batching diverges");
+        assert!(!got.ends_with('\n'));
+
+        // 4. Thinking replay: kept after the last user query, stripped before.
+        let th = case("thinking_replay");
+        let mut turns = th.split("<|im_start|>assistant\n").skip(1);
+        let early = turns.next().unwrap().split("<|im_end|>").next().unwrap();
+        let late = turns.next().unwrap().split("<|im_end|>").next().unwrap();
+        assert_eq!(
+            qwen36_assistant_text("<think>early reasoning</think>early answer", false),
+            early,
+            "pre-last-query turn must drop its think block"
+        );
+        assert_eq!(
+            qwen36_assistant_text("<think>late reasoning</think>late answer", true),
+            late,
+            "post-last-query turn must keep and reformat its think block"
+        );
+    }
+
+    #[test]
+    fn qwen36_generation_prompt_opens_the_block() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/qwen36_template_golden.json")).unwrap();
+        let with_system = golden["cases"]["with_system_and_tools"].as_str().unwrap();
+        // The cue we emit is the assistant header plus THINK_OPEN.
+        assert!(with_system.ends_with(&format!("<|im_start|>assistant\n{THINK_OPEN}")));
+    }
+
+    #[test]
+    fn split_thinking_matches_the_template_split() {
+        assert_eq!(
+            split_thinking("<think>\nreasoning\n</think>\n\nbody"),
+            ("reasoning\n", "body")
+        );
+        assert_eq!(split_thinking("no tags here"), ("", "no tags here"));
+    }
+
     /// The stem trap: the engine hands us `architectures[0]` lowercased with
     /// the task suffix stripped, NOT an HF `model_type`. Both spellings must
     /// reach the same answer, or the thinking lineage silently renders the
@@ -526,5 +772,69 @@ mod tests {
     fn no_think_decoration_is_trim_stable() {
         assert_eq!(no_think_decorate("hi\n"), "hi /no_think");
         assert_eq!(no_think_decorate(no_think_decorate("hi").trim_end()), "hi /no_think /no_think");
+    }
+}
+
+#[cfg(test)]
+mod qwen36_rules {
+    use super::*;
+
+    /// The multi-part rule, which vLLM's own `/render` caught: Qwen3.5/3.6
+    /// concatenates text parts with NOTHING between them, while the hermes
+    /// captures were normalized with `\n`.
+    #[test]
+    fn part_separator_differs_by_lineage() {
+        use crate::types::{ContentPart, MessageContent};
+        let parts = MessageContent::Parts(vec![
+            ContentPart { part_type: "text".into(), text: "part one".into() },
+            ContentPart { part_type: "text".into(), text: "part two".into() },
+        ]);
+        assert_eq!(parts.as_text_sep(""), "part onepart two");
+        assert_eq!(parts.as_text_sep("\n"), "part one\npart two");
+    }
+
+    /// `</system-reminder><system-reminder>` versus
+    /// `</system-reminder>\n<system-reminder>` is exactly the 3-byte
+    /// divergence measured against vLLM over a 43 KB prompt.
+    #[test]
+    fn the_measured_divergence_is_reproduced() {
+        use crate::types::{ContentPart, MessageContent};
+        let parts = MessageContent::Parts(vec![
+            ContentPart { part_type: "text".into(), text: "</system-reminder>".into() },
+            ContentPart { part_type: "text".into(), text: "<system-reminder>".into() },
+        ]);
+        assert_eq!(parts.as_text_sep(""), "</system-reminder><system-reminder>");
+        assert_ne!(parts.as_text_sep(""), parts.as_text_sep("\n"));
+    }
+
+    #[test]
+    fn dialect_detection_puts_the_lineage_first() {
+        assert_eq!(Dialect::detect("qwen3.6-35b-a3b", "qwen3_5moe"), Dialect::Qwen36);
+        assert_eq!(Dialect::detect("qwen3-coder-30b-a3b", "qwen3_moe"), Dialect::Coder);
+        assert_eq!(Dialect::detect("default", "qwen3"), Dialect::Hermes);
+        // A 3.6 checkpoint deployed under a name containing "coder" is still
+        // 3.6 — lineage wins over the name heuristic.
+        assert_eq!(Dialect::detect("qwen3.6-coder", "qwen3_5moe"), Dialect::Qwen36);
+    }
+
+    /// Tool-call argument values: strings raw, everything else `tojson`.
+    /// The bool spelling is the trap — Coder's template renders `True`.
+    #[test]
+    fn argument_values_invert_the_coder_rule() {
+        let calls = vec![(
+            "f".to_string(),
+            r#"{"s":"raw","b":true,"n":3,"o":{"k":1},"a":[1,2]}"#.to_string(),
+        )];
+        let q = qwen36_assistant_calls_text(None, &calls);
+        assert!(q.contains("<parameter=s>\nraw\n</parameter>"));
+        assert!(q.contains("<parameter=b>\ntrue\n</parameter>"), "{q}");
+        assert!(q.contains("<parameter=n>\n3\n</parameter>"));
+        assert!(q.contains("<parameter=o>\n{\"k\": 1}\n</parameter>"));
+        assert!(q.contains("<parameter=a>\n[1, 2]\n</parameter>"));
+        // Coder, same args, renders the bool capitalized.
+        let c = coder_assistant_calls_text(None, &calls);
+        assert!(c.contains("<parameter=b>\ntrue\n</parameter>") || c.contains("True"));
+        // With no content the first call has NO leading separator.
+        assert!(q.starts_with("<tool_call>"));
     }
 }

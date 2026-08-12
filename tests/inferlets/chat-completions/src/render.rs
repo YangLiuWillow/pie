@@ -128,6 +128,21 @@ impl Renderer {
         self.opens_think
     }
 
+    /// Flatten a message's content with this dialect's part separator.
+    /// Qwen3.5/3.6 concatenates text parts with nothing between them; every
+    /// other lineage joins with `\n` (see `MessageContent::as_text_sep`).
+    fn msg_text(&self, msg: &ChatMessage) -> String {
+        msg.text_sep(self.part_separator())
+    }
+
+    /// The separator this dialect puts between text parts.
+    pub fn part_separator(&self) -> &'static str {
+        match self.dialect {
+            rt::Dialect::Qwen36 => "",
+            _ => "\n",
+        }
+    }
+
     fn role_tokens(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = prefix.to_vec();
         tokens.extend(model::encode(msg));
@@ -178,6 +193,15 @@ impl Renderer {
             tokens.extend(&self.turn_suffix);
             return tokens;
         }
+        if self.dialect == rt::Dialect::Qwen36 {
+            // Qwen3.5/3.6 always emits the newline after the role tag, then
+            // trimmed content, then the calls (see `qwen36_assistant_calls_text`
+            // for the first-call spacing rule).
+            let mut tokens = self.assistant_prefix.clone();
+            tokens.extend(model::encode(&rt::qwen36_assistant_calls_text(content, calls)));
+            tokens.extend(&self.turn_suffix);
+            return tokens;
+        }
         let mut tokens = self.assistant_prefix_no_nl.clone();
         if let Some(c) = content {
             if !c.is_empty() {
@@ -221,6 +245,15 @@ impl Renderer {
             tokens.extend(&self.turn_suffix);
             return tokens;
         }
+        if self.dialect == rt::Dialect::Qwen36 {
+            // Same one-turn collapse, but blocks are joined by `\n` and the
+            // last is not terminated — `<|im_end|>` follows it directly.
+            let values: Vec<String> = results.iter().map(|(_, v)| v.clone()).collect();
+            let mut tokens = self.user_prefix.clone();
+            tokens.extend(model::encode(&rt::qwen36_tool_response_text(&values)));
+            tokens.extend(&self.turn_suffix);
+            return tokens;
+        }
         let mut tokens = self.user_prefix_no_nl.clone();
         for (_name, value) in results {
             tokens.extend(&self.tool_response_open);
@@ -249,7 +282,7 @@ impl Renderer {
         // the template's stand-in text.
         let leading_system = if messages.first().map(|m| m.role.as_str()) == Some("system") {
             rest = &messages[1..];
-            Some(messages[0].text())
+            Some(self.msg_text(&messages[0]))
         } else {
             None
         };
@@ -261,17 +294,76 @@ impl Renderer {
             out.extend(self.system(&content));
         }
 
-        self.render_messages(rest, no_think, &mut out)?;
+        // `rest` starts at 1 when a leading system message was consumed, so
+        // absolute indices stay aligned with the caller's message list.
+        let offset = messages.len() - rest.len();
+        let last_query = Self::last_query_index(messages);
+        self.render_messages_at(rest, no_think, offset, last_query, &mut out)?;
         Ok(out)
+    }
+
+    /// Index of the last genuine user query — the template's
+    /// `ns.last_query_index`. Scans in reverse and skips user turns whose
+    /// content is wholly a `<tool_response>` block, because those are
+    /// tool results wearing the user role, not a new question. Assistant
+    /// turns after this index keep their `<think>` block on replay; earlier
+    /// ones are stripped to bare content.
+    ///
+    /// Returns `usize::MAX` when there is no user turn at all, so nothing
+    /// compares greater and no block is kept.
+    pub fn last_query_index(messages: &[ChatMessage]) -> usize {
+        for (i, m) in messages.iter().enumerate().rev() {
+            if m.role != "user" {
+                continue;
+            }
+            let t = m.text();
+            let t = t.trim();
+            if t.starts_with("<tool_response>") && t.ends_with("</tool_response>") {
+                continue;
+            }
+            return i;
+        }
+        usize::MAX
     }
 
     /// Render a run of messages (also used for the suffix after a session
     /// resume — the suffix never contains the leading system message, so no
     /// tool-equip handling is needed here).
+    /// Suffix rendering on resume. `offset` is where `messages` begins in the
+    /// caller's full list and `last_query` is computed over that full list —
+    /// both are required because the Qwen3.5/3.6 think-replay rule is
+    /// POSITIONAL, and a suffix rendered with suffix-relative indices would
+    /// disagree with the prefix already in KV.
+    pub fn render_messages_at(
+        &self,
+        messages: &[ChatMessage],
+        no_think: bool,
+        offset: usize,
+        last_query: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        self.render_run(messages, no_think, offset, last_query, out)
+    }
+
+    /// Positionless entry point, kept for the dialects whose replay does not
+    /// depend on position. Under `Qwen36` it would strip every think block,
+    /// which is right only when the suffix contains no post-query assistant
+    /// turn — so callers on that dialect should use `render_messages_at`.
     pub fn render_messages(
         &self,
         messages: &[ChatMessage],
         no_think: bool,
+        out: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        self.render_run(messages, no_think, 0, usize::MAX, out)
+    }
+
+    fn render_run(
+        &self,
+        messages: &[ChatMessage],
+        no_think: bool,
+        offset: usize,
+        last_query: usize,
         out: &mut Vec<u32>,
     ) -> Result<(), String> {
         let mut i = 0;
@@ -279,7 +371,7 @@ impl Renderer {
             let msg = &messages[i];
             match msg.role.as_str() {
                 "system" | "developer" => {
-                    out.extend(self.system(&msg.text()));
+                    out.extend(self.system(&self.msg_text(msg)));
                     i += 1;
                 }
                 "user" => {
@@ -288,12 +380,18 @@ impl Renderer {
                     // replays identically once it becomes history —
                     // otherwise retained KV prefixes would diverge from the
                     // rebuilt token stream.
-                    let text = msg.text();
+                    let text = self.msg_text(msg);
                     // Coder models have no thinking channel and no soft
                     // switch, so the decoration would be bare noise appended
                     // to every user turn — and a divergence from what a
                     // template-driven server sends.
-                    if no_think && self.dialect != rt::Dialect::Coder {
+                    if self.dialect == rt::Dialect::Qwen36 {
+                        // The template trims every message's content, and the
+                        // `/no_think` soft switch is a Qwen3 convention this
+                        // lineage does not use — `enable_thinking` changes the
+                        // generation prompt instead (see `THINK_OPEN`).
+                        out.extend(self.user(text.trim()));
+                    } else if no_think && self.dialect != rt::Dialect::Coder {
                         out.extend(self.user(&rt::no_think_decorate(&text)));
                     } else {
                         out.extend(self.user(&text));
@@ -303,13 +401,21 @@ impl Renderer {
                 "assistant" => {
                     let calls = msg.calls();
                     if calls.is_empty() {
-                        out.extend(self.assistant(&msg.text()));
+                        if self.dialect == rt::Dialect::Qwen36 {
+                            // Positional: keep the block only after the last
+                            // genuine user query, exactly as the template does.
+                            let keep = offset + i > last_query;
+                            let text = rt::qwen36_assistant_text(&self.msg_text(msg), keep);
+                            out.extend(self.role_tokens(&self.assistant_prefix, &text));
+                        } else {
+                            out.extend(self.assistant(&self.msg_text(msg)));
+                        }
                     } else {
                         let pairs: Vec<(String, String)> = calls
                             .iter()
                             .map(|c| (c.function.name.clone(), c.function.arguments.clone()))
                             .collect();
-                        let content = msg.text();
+                        let content = self.msg_text(msg);
                         out.extend(self.assistant_with_tool_calls(
                             Some(content.as_str()).filter(|s| !s.is_empty()),
                             &pairs,
@@ -322,7 +428,7 @@ impl Renderer {
                     // — the model was fine-tuned on the merged form.
                     let mut batch: Vec<(String, String)> = Vec::new();
                     while i < messages.len() && messages[i].role == "tool" {
-                        batch.push((String::new(), messages[i].text()));
+                        batch.push((String::new(), self.msg_text(&messages[i])));
                         i += 1;
                     }
                     out.extend(self.answer_batch(&batch));

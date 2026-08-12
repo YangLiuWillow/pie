@@ -720,3 +720,74 @@ handover's 33/33 was measured on an RTX 3090, and it means the KV-reuse half
 of run 3 is only testable locally on the model we happen to have chosen.
 Reuse on Qwen3.6 itself is still unmeasured: `cached_tokens` was 0 on every
 turn here because each probe was a fresh conversation.
+
+## 18. Qwen3.6 dialect + open-think cue (2026-08-12) — and a seal bug the measurement found
+
+### Implemented and live-verified
+
+`Dialect::Qwen36` now renders the Qwen3.5/3.6 template, generated as a
+golden from `Qwen/Qwen3.6-35B-A3B`'s real `chat_template.jinja`
+(`tests/qwen36_template_golden.json`) and matched byte-for-byte:
+
+- tools block FIRST, then `\n\n` + the trimmed system message (inverted vs Coder)
+- `<tools>` carries `tool | tojson` — hermes-style JSON, envelope whole
+- calls are Coder-style XML, but the argument rule is **inverted**: strings
+  raw, everything else `tojson`, so a bool renders `true`, not `True`
+- first-call spacing is `\n\n` with content, nothing without
+- tool-result blocks joined by `\n`, last NOT terminated
+- multi-part text concatenated with NO separator (`part_separator()`)
+- think replay is POSITIONAL — kept only after the last genuine user query,
+  so `render_messages_at` takes an absolute offset and the last-query index
+  computed over the WHOLE list; a suffix rendered with suffix-relative
+  indices would disagree with the prefix already in KV
+
+The cue leaves the block OPEN (`<|im_start|>assistant\n<think>\n`) and
+`VisibleFilter::starting(true)` begins in think-mode. **Verified live on the
+35B, and the property that matters held at both temperatures:**
+
+| max_tokens | t=0 | t=0.6 |
+|---|---|---|
+| 8 (truncated mid-reasoning) | `'…'` — no leak | `'…'` — no leak |
+| 700 (allowed to finish) | `'Hello to you.'` (218 reasoning tokens suppressed) | `'Hello to you.'` (201 suppressed) |
+
+Temperature-indifference is the point: it is what the marker-based
+alternatives cannot offer while the tagging question stays open (§17).
+
+Live verification also caught a bug unit tests could not. The empty-content
+fallback stripped only the `<think>`/`</think>` *tags* from the raw
+generation and kept the reasoning body — so exactly when the filter
+correctly returned nothing, the handler substituted the model's private
+reasoning as its answer. Under the open cue that is the common case, not a
+rare one. Fixed to take the body after the last `</think>`, and to treat an
+unterminated block under the open cue as having no content at all.
+
+Regression: hermes parity still **23 exact / 0 known-div / 0 mismatched**,
+37 native tests, acceptance 31/1 (the 1 being §17's `copy_kv` limit).
+
+### NOT working: session retention on the hybrid path
+
+KV reuse on Qwen3.6 measured **0%**, and the cause is not page granularity
+or address mismatch — **the seal fire fails on every turn**:
+
+```
+seal failed, session dropped: seal take: sink_s take:
+channel is poisoned: driver published poison epoch 1        (8 of 8 turns)
+```
+
+`handler.rs` only skips retention on `gen_error`, so every turn reaches
+`seal`, and every seal fails, so every session is dropped and every
+subsequent turn is a `resume miss`. The dense 0.6B attention path retains
+normally (`retained qwenchat/… (seq N)`), so this is specific to the hybrid
+port.
+
+Leading hypothesis, untested: `generate_for` calls `pipe.close()` before
+returning, and `seal` then opens a *fresh* `Pipeline` and binds the same
+`RsWorkingSet`. A `WorkingSet` survives that; a folded recurrent state
+apparently does not. If so the fix is to seal on the generation pipeline
+rather than a new one — which also has the right semantics, since the seal
+must extend the same fold.
+
+Until this is fixed, **pie's KV-reuse result is unobtainable on Qwen3.6**,
+which is the only geometry where Metal implements CoW fork at all (§17). It
+is now the top of the queue: the reuse number is the headline pie result the
+A/B exists to produce.

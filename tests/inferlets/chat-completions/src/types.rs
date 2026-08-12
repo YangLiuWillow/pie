@@ -124,9 +124,15 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn text(&self) -> String {
+        self.text_sep("\n")
+    }
+
+    /// Flatten with an explicit part separator — `""` for the Qwen3.5/3.6
+    /// lineage, `"\n"` everywhere else.
+    pub fn text_sep(&self, sep: &str) -> String {
         self.content
             .as_ref()
-            .map(MessageContent::as_text)
+            .map(|c| c.as_text_sep(sep))
             .unwrap_or_default()
     }
 
@@ -143,10 +149,15 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
-    /// Flatten to text. Multiple text parts join with `\n` — matching
-    /// vLLM's chat-content normalization, which the wire fixtures were
-    /// captured against.
-    pub fn as_text(&self) -> String {
+    /// Flatten to text, joining multiple text parts with `sep`.
+    ///
+    /// The separator is dialect-dependent and NOT cosmetic. Qwen3's hermes
+    /// captures were taken against vLLM's chat-content normalization, which
+    /// joins with `\n`; Qwen3.5/3.6's template loops the parts and emits
+    /// `item.text` with NOTHING between them. Decoding vLLM's own
+    /// `/v1/chat/completions/render` output caught this — 3 bytes of
+    /// divergence over 43 KB, on 146 of the 23 fixtures' messages.
+    pub fn as_text_sep(&self, sep: &str) -> String {
         match self {
             MessageContent::Text(s) => s.clone(),
             MessageContent::Parts(parts) => parts
@@ -154,8 +165,13 @@ impl MessageContent {
                 .filter(|p| p.part_type == "text")
                 .map(|p| p.text.as_str())
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join(sep),
         }
+    }
+
+    /// Legacy `\n` join, correct for the hermes and Coder lineages.
+    pub fn as_text(&self) -> String {
+        self.as_text_sep("\n")
     }
 }
 
