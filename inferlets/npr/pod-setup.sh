@@ -20,6 +20,24 @@ apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     cmake build-essential pkg-config libssl-dev python3-venv git curl
 
+# driver/cuda needs CMake >= 3.23; Ubuntu 22.04 ships 3.22. Kitware's binary
+# tarball is the least invasive fix (no apt repo, no pip into the system env).
+CMAKE_MIN=3.23
+have_cmake=$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')
+if [ -z "$have_cmake" ] || [ "$(printf '%s\n%s\n' "$CMAKE_MIN" "$have_cmake" | sort -V | head -1)" != "$CMAKE_MIN" ]; then
+    echo "cmake ${have_cmake:-none} < $CMAKE_MIN — installing a newer one"
+    CMAKE_VER=${CMAKE_VER:-3.31.6}
+    curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz" \
+        | tar xz -C /opt
+    export PATH="/opt/cmake-${CMAKE_VER}-linux-x86_64/bin:$PATH"
+    cmake --version | head -1
+fi
+
+# nvcc is not on PATH in the plain nvidia/cuda images.
+if ! command -v nvcc >/dev/null 2>&1 && [ -x /usr/local/cuda/bin/nvcc ]; then
+    export PATH="/usr/local/cuda/bin:$PATH"
+fi
+
 echo "== rust =="
 if ! command -v cargo >/dev/null 2>&1; then
     curl https://sh.rustup.rs -sSf | sh -s -- -y
