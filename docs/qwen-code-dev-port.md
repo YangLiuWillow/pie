@@ -833,3 +833,48 @@ Until this is fixed, **pie's KV-reuse result is unobtainable on Qwen3.6**,
 which is the only geometry where Metal implements CoW fork at all (§17). It
 is now the top of the queue: the reuse number is the headline pie result the
 A/B exists to produce.
+
+## 19. A parity gate referenced to vLLM, not to the template (2026-08-12)
+
+`check_render.py` compares pie against `apply_chat_template`, which answers
+"does our renderer match my reading of the template". That was the right
+question while the template *was* the specification (§12). For the Qwen3.6
+A/B it is the wrong one: what the benchmark compares against is what the
+**vLLM arm actually feeds the model**, and vLLM 0.27 will just tell us —
+`POST /v1/chat/completions/render` returns the exact `token_ids`.
+
+The served reference also removes a class of error the HF path cannot avoid,
+because `hf_reference()` has to re-implement vLLM's content normalization by
+hand. It had the multi-part separator wrong until vLLM's own render caught
+it — 3 bytes over 43 KB (§14).
+
+Both stacks want ~20 GB and cannot be up at once on 48 GB, so the gate is
+split in two:
+
+```bash
+# 1. capture the reference (vLLM up, pie down)
+vllm serve mlx-community/Qwen3.6-35B-A3B-4bit --port 18000 \
+    --max-model-len 16384 --enable-auto-tool-choice --tool-call-parser qwen3_xml &
+python3 parity/capture_vllm_render.py --base http://127.0.0.1:18000 \
+    --model mlx-community/Qwen3.6-35B-A3B-4bit -o parity/vllm_render_qwen36.json
+
+# 2. compare (vLLM down, pie up) — token ids, not text
+python3 parity/check_render.py --base http://127.0.0.1:8123 \
+    --reference parity/vllm_render_qwen36.json
+```
+
+Comparing **ids rather than text** drops decode round-tripping out of the
+loop; text existed in the HF path only because `apply_chat_template` returns
+a string. The capture script drops generation policy (`max_tokens`, `stream`,
+…) and sends only the conversation fields, so `/render` cannot reject a
+request over a field that has no effect on the prompt.
+
+The `--enable-auto-tool-choice --tool-call-parser qwen3_xml` flags are not
+optional: without them a tools-bearing request 400s, and a *benchmark* arm
+launched without them emits no `tool_calls` at all — run 2's failure mode
+reproduced on the vLLM side.
+
+Written and syntax-checked; **not yet run** — the machine is with another
+session measuring non-speculative hybrid decode throughput (§18). The
+captured reference is reusable by any branch doing prompt-parity work
+without needing both stacks up.

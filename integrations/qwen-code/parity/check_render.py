@@ -111,12 +111,70 @@ def first_diff(a, b, ctx=90):
             f"    hf:  …{b[max(0, i - ctx):i + ctx]!r}…")
 
 
+def run_against_reference(args):
+    """Compare pie's rendered ids against vLLM's own, token for token.
+
+    Token ids rather than text: the text comparison in the HF path exists
+    because `apply_chat_template` returns a string, but ids are what the
+    model is actually fed, and comparing them removes decode round-tripping
+    from the loop entirely. A divergence is reported at the first differing
+    id, with a decoded window either side so it is readable.
+    """
+    ref = json.loads(Path(args.reference).read_text())
+    renders = ref["renders"]
+    fixtures = sorted(Path(args.fixtures).glob("episode*/openai-*.json"))
+    if not fixtures:
+        print(f"no fixtures under {args.fixtures}", file=sys.stderr)
+        return 2
+
+    exact = mismatched = missing = 0
+    for f in fixtures:
+        key = f"{f.parent.name}/{f.name}"
+        want = renders.get(key)
+        if want is None:
+            missing += 1
+            print(f"[NO-REF]     {key}")
+            continue
+        request = json.loads(f.read_text())["request"]
+        echo = post_echo(args.base, request)
+        got = echo.get("rendered_ids") or []
+        if got == want:
+            exact += 1
+            print(f"[EXACT]      {key}  ({len(got)} tok)")
+            continue
+        mismatched += 1
+        n = min(len(got), len(want))
+        i = next((k for k in range(n) if got[k] != want[k]), n)
+        print(f"[MISMATCH]   {key}  pie {len(got)} tok vs vllm {len(want)} tok, "
+              f"first differing id at {i}")
+        text = echo.get("rendered_text") or ""
+        print(f"    pie ids  …{got[max(0, i - 8):i + 8]}")
+        print(f"    vllm ids …{want[max(0, i - 8):i + 8]}")
+        if text:
+            # Best-effort locator: the decoded prefix length is a good proxy
+            # for where in the prompt to look.
+            print(f"    (pie rendered text is {len(text)} chars; the divergence "
+                  f"is ~{100 * i / max(1, len(got)):.0f}% through the prompt)")
+
+    total = len(fixtures)
+    print(f"\n{exact} exact, {mismatched} mismatched, {missing} without a "
+          f"reference, of {total} fixtures  [reference: {ref.get('model')}]")
+    return 1 if (mismatched or missing) else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:8123")
     ap.add_argument("--hf-model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--fixtures", default=str(DEFAULT_FIXTURES))
+    ap.add_argument("--reference", help=(
+        "compare against a captured vLLM /render file (capture_vllm_render.py) "
+        "instead of apply_chat_template. This is what the A/B actually compares "
+        "against, and it needs no tokenizer download and no second stack up."))
     args = ap.parse_args()
+
+    if args.reference:
+        return run_against_reference(args)
 
     from transformers import AutoTokenizer  # deferred: slow import
     tok = AutoTokenizer.from_pretrained(args.hf_model)
