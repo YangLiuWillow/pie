@@ -27,8 +27,12 @@ have_cmake=$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')
 if [ -z "$have_cmake" ] || [ "$(printf '%s\n%s\n' "$CMAKE_MIN" "$have_cmake" | sort -V | head -1)" != "$CMAKE_MIN" ]; then
     echo "cmake ${have_cmake:-none} < $CMAKE_MIN — installing a newer one"
     CMAKE_VER=${CMAKE_VER:-3.31.6}
-    curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz" \
-        | tar xz -C /opt
+    # Download to a file rather than piping into tar: a truncated transfer
+    # otherwise surfaces only as "gzip: unexpected end of file".
+    curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+        -o /tmp/cmake.tar.gz \
+        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
+    tar xzf /tmp/cmake.tar.gz -C /opt && rm -f /tmp/cmake.tar.gz
     export PATH="/opt/cmake-${CMAKE_VER}-linux-x86_64/bin:$PATH"
     cmake --version | head -1
 fi
