@@ -14,11 +14,104 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 | P0.4 | Renderer parity harness | **done** |
 | PA.1 | `chat-completions` inferlet on dev | **milestone 1 done** (sessions/grammar/coder-dialect pending) |
 | PA.2 | Gateway OpenAI ingress | **done** |
-| PA.3 | Acceptance suite + stock-opencode e2e | suite + scaffolding **authored**; live run pending (needs a CUDA ≥12.8 GPU box, or ~1.5 GB more free RAM locally) |
+| PA.3 | Acceptance suite + stock-opencode e2e | **done on Qwen3-0.6B / Metal** — 25/25 live, stock opencode drives a real tool call. Re-run on Qwen3.6-35B-A3B pending a reboot (host RAM) |
 | PB.1 | `opencode-session` inferlet + AI SDK provider package | pending |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-12 — PA.3 live: FIRST TOKENS SERVED. 25/25 acceptance + stock opencode e2e on Metal; hybrid-model support added
+
+The thing that had never happened has happened. Full results, configs and
+reproduction in `integrations/opencode/results-Lius-MacBook-Pro.md`; this entry
+is the durable summary.
+
+**Green, live, on `Qwen3-0.6B` (MLX int4) / Metal / 48 GB M-series:**
+
+- native suites reproduce: `pie-openai-serving` 45, `pie-model-qwen-3
+  --features chat` 24, `pie-gateway` 40+1+6;
+- **acceptance suite: 25 passed, 0 failed, 0 warnings** — first live run, no
+  wire-level first-contact bugs at all. Both fixture replays pass (req-004
+  tool turn; req-005 at 7473 prompt tokens), as do tool-delta atomicity, id
+  uniqueness across processes, envelope non-leakage, `[DONE]`, and keepalive;
+- **stock opencode 1.18.17, unmodified**, on the committed `opencode.json`
+  profile: `opencode run -m pie/qwen3-0.6b "Read the file notes.txt and tell
+  me the secret color."` → `→ Read notes.txt` → `The secret color is
+  **chartreuse**.` A real agentic tool call, end to end, over pie.
+
+A two-step prompt got the first tool call right and then narrated the second
+instead of emitting it — 0.6B capability, not a wire fault.
+
+**Two real findings, both fixed, both BELOW the wire:**
+
+1. **The serving inferlet could not run a hybrid (GDN) model.**
+   `Qwen3.6-35B-A3B` is `qwen3_5_moe` — 40 layers, every 4th full attention,
+   the rest Gated DeltaNet. It loads and serves `/health` fine, then answers
+   every completion in ~50 ms with `finish_reason:"length"`,
+   `completion_tokens: 0` and the `"…"` placeholder. `pie:inferlet` exposes
+   three forward interfaces and `ForwardPass` is three unrelated types;
+   `engine.rs` was written against `ptir::attention` alone, and for a
+   recurrent-state model the driver requires one rs-working-set per request
+   row (`runtime/engine/src/pipeline/fire/rs.rs::validate_count`:
+   *"resolved forward has 1 request row(s), but recurrent-state model bound 0
+   rs-working-set(s)"*). The submit fails, and the turn's own degradation
+   discipline turns that into a clean empty answer — working as designed, and
+   perfectly concealing. Fixed by a `BindState` trait with one impl per
+   interface plus a `define_generate!` macro that expands the generation body
+   once per pass kind (so they cannot drift), dispatched on
+   `model::pass_kind()`. Serving never buffers
+   (`RsGeometry { fold_len: None, buffer: 0..0 }`), and the same rs working
+   set is bound by the prefill chunks and the decode fires so decode continues
+   the prefill's folded state. Shape ported from
+   `tests/inferlets/text-completion-bench`, which solved the same problem for
+   the benchmark harness. **The attention path is byte-identical after the
+   rewrite** (same completion text, 25/25 still green); the hybrid path is
+   written but NOT yet exercised live.
+
+2. **Inferlet diagnostics reached nobody.** A launched process routes
+   stdout/stderr to the process actor rather than the runtime log, and the
+   OpenAI ingress dropped those events, so the inferlet's `eprintln!` on a
+   degraded turn was invisible — finding #1 cost a rebuild with hand-added
+   traces to localise. `gateway/src/ingress/openai.rs` now logs them
+   (`pie::inferlet`, stderr at `warn`) while still keeping them off the wire.
+
+**Blocked, host-side: the Qwen3.6-35B-A3B live run.** It imports in 5 s
+(`pie model import mlx-community/Qwen3.6-35B-A3B-4bit` → 19.0 GiB `.zt`) and
+boots (`19.51 GB of weights bound where they lie`), but re-admission now fails:
+it needs 24.77 GiB resident and only 21.83 GiB is reclaimable. Two causes,
+neither in this branch: a second `pie serve` from an unrelated session
+(`pie-npr`) holding its own heap, and — the one that matters —
+
+```
+[pie-metal] warning: 26.22 GiB of this machine's 48.00 GiB is wired before
+this model is loaded. … a GPU context whose command buffer never signalled is
+abandoned rather than released, and its pages stay wired until reboot.
+```
+
+Every `pie serve` killed mid-flight leaks its heap until reboot. **Operational
+rule for this machine: one `pie serve` at a time, shut it down cleanly, and
+reboot before a big-model run.**
+
+**Two time sinks worth writing down:**
+
+- **The first request after a boot pays wasm JIT**, and on a memory-pressured
+  machine that reads as a hang (a 5-minute one, here). Warm with a throwaway
+  4-token request before timing anything or pointing opencode at the port.
+- **`pie run` binds `[server].port`** even as a one-shot, so it collides with a
+  running `serve` (`Address already in use`). Give the one-shot its own port.
+  Running the reference `tests/inferlets/chat-completion` this way is the
+  fastest way to decide engine-vs-inferlet when generation misbehaves — it is
+  what proved the engine and the model were fine here.
+
+**Aside, for benchmarking later:** `Qwen/Qwen3.6-35B-A3B` is a model pie's own
+devs benchmark with. `benches/smoke_deterministic.py` (present on the fork's
+stale `dev`, since refactored away on this base) registers it as the
+`qwen3_6_moe` spec at `tp_size 2` on 2×L40 and drives it through
+`benches/pie_bench.py` — the harness `benches/vllm_bench.py` and
+`benches/sglang_bench.py` mirror shape-for-shape via `common.py`'s shared
+`--model` argument. So a pie-vs-vLLM-vs-SGLang comparison on exactly this model
+is a CUDA-side, already-paved road. On Metal the analogous harness is
+`benches/three_way.py` (pie vs mlx-lm vs llama.cpp).
 
 ### 2026-08-11 — GPU bring-up attempt (RunPod H100): blocked on the image's CUDA, pod terminated
 

@@ -22,8 +22,12 @@
 //!     turn's clean `Eos`.
 //!   - non-streaming: exactly one subsequent message, the full response (or
 //!     OpenAI error) body.
-//! Process `stdout`/`stderr` events are instrumentation, never wire data —
-//! they are dropped here (the runtime logs them). A process `error` event maps
+//! Process `stdout`/`stderr` events are instrumentation, never wire data — they
+//! are logged here (`pie::inferlet` target, stderr at `warn`) and dropped from
+//! the stream. Logging matters: a launched process routes its output to the
+//! process actor rather than the runtime's log, so without this the inferlet's
+//! own diagnostics (`eprintln!` on a degraded turn) are invisible to everyone.
+//! A process `error` event maps
 //! to 500 (genuine server fault — the 400-vs-500 discipline lives in the
 //! inferlet, which must classify malformed input itself; opencode retries 5xx
 //! without bound, so 500 is reserved for real faults).
@@ -216,8 +220,22 @@ async fn next_msg(rx: &mut TokenRx) -> Msg {
                 match event.as_str() {
                     "message" => return Msg::Payload(value),
                     "error" => return Msg::Fault(value),
-                    // stdout/stderr = instrumentation; return value is not
-                    // wire data on this contract (the envelope carries it).
+                    // stdout/stderr = instrumentation; not wire data on this
+                    // contract (the envelope carries the response). Logged
+                    // rather than dropped — a launched process's output goes
+                    // to the process actor, not the runtime log, so this is
+                    // the only place the inferlet's diagnostics can surface.
+                    "stderr" => {
+                        for line in value.lines().filter(|l| !l.trim().is_empty()) {
+                            tracing::warn!(target: "pie::inferlet", "{line}");
+                        }
+                    }
+                    "stdout" => {
+                        for line in value.lines().filter(|l| !l.trim().is_empty()) {
+                            tracing::info!(target: "pie::inferlet", "{line}");
+                        }
+                    }
+                    // Anything else (return value, custom events) stays dropped.
                     _ => {}
                 }
             }
