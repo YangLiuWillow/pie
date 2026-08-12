@@ -16,9 +16,16 @@ else is derived from).
 | Pie side: audit, fixtures, gateway, serving crate, harness | `pie` | `liu/openclaw-integration` (forked from `liu/opencode-integration` @ `1053a7790`) | `fork` = `github.com/YangLiuWillow/pie` |
 | OpenClaw side: the `pie` provider extension | `openclaw` | `liu/pie-provider` (forked from `main` @ `0790d9f`-era) | see §2 — needs a fork |
 
-Local worktrees on the old machine (recreate as you like):
-`~/Desktop/Lin_startup/pie-openclaw` (pie, this branch) and
-`~/Desktop/Lin_startup/openclaw` (openclaw, branch checked out in place).
+Local layout is up to you; the docs' `~/Desktop/Lin_startup/...` paths are
+historical. Scripts here resolve paths relative to the repo, so they survive
+being moved — only prose and the capture profile ever hardcoded a location.
+
+**If you relocate a checkout that has git worktrees** (pie has seven), the
+registrations store absolute paths and every worktree goes `prunable` until
+repaired. Move the whole tree as one unit so the siblings stay siblings, then
+from the main checkout run `git worktree repair <new-path-of-each-worktree>`.
+Bare `git worktree repair` with no arguments does NOT fix the registrations —
+it only repairs the `.git` files pointing back — so pass the paths explicitly.
 
 **Dependency:** this branch sits on top of `liu/opencode-integration` and
 shares its crates (`inferlets/openai-serving`, `inferlets/chat-completions`,

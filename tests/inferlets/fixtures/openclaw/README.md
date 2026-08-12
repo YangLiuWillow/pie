@@ -31,11 +31,13 @@ reset only on parsed chunks (AUDIT §2a). Keepalives must be empty-delta chunks.
 ## Re-running the capture
 
 ```bash
-SCRATCH=<workdir>; mkdir -p $SCRATCH/capture-ws $SCRATCH/openclaw-state
-echo "hello from the capture workspace" > $SCRATCH/capture-ws/hello.txt
+# capture-ws must match `agents.defaults.workspace` in the capture config
+# (openclaw.capture.json pins /tmp/pie-openclaw-capture-ws).
+SCRATCH=/tmp/pie-openclaw-capture; mkdir -p /tmp/pie-openclaw-capture-ws $SCRATCH/openclaw-state
+echo "hello from the capture workspace" > /tmp/pie-openclaw-capture-ws/hello.txt
 
 # 1. recorder (this dir): text or tool mode
-RECORD_MODE=tool RECORD_TOOL_FILE=$SCRATCH/capture-ws/hello.txt python3 record_server.py &
+RECORD_MODE=tool RECORD_TOOL_FILE=/tmp/pie-openclaw-capture-ws/hello.txt python3 record_server.py &
 
 # 2. drive turns with the published CLI (needs Node >=24; nvm install 24)
 export OPENCLAW_CONFIG_PATH=../../../../integrations/openclaw/openclaw.capture.json

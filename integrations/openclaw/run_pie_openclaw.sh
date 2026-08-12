@@ -42,7 +42,7 @@ done
 
 [ -x "$PIE_BIN" ] || {
     echo "no pie binary at $PIE_BIN (set PIE_BIN); NOT building — the release" >&2
-    echo "build lives in the shared target dir …/Lin_startup/pie/target" >&2
+    echo "build lives in the shared target dir <workspace>/pie/target" >&2
     exit 1
 }
 

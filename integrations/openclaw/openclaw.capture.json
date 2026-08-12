@@ -2,7 +2,7 @@
   "agents": {
     "defaults": {
       "model": "pie/test-model",
-      "workspace": "/private/tmp/claude-501/-Users-yangliu-Desktop-Lin-startup/00cdd6fa-9b98-46a1-b2dd-fc6a1f0c64da/scratchpad/capture-ws"
+      "workspace": "/tmp/pie-openclaw-capture-ws"
     }
   },
   "models": {
