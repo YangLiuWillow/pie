@@ -1,5 +1,9 @@
 # qwen-code ↔ Pie on the rewritten engine — progress log
 
+> **Picking this up fresh? Read [HANDOVER.md](HANDOVER.md) first.** It has
+> the verified-vs-unverified split, the two gates the benchmark needs, the
+> 48 GB-machine specifics, and the gotchas list.
+
 Running status of the port and its follow-ups. Design + detailed results:
 `docs/qwen-code-dev-port.md`. Branch: `liu/qwen-code-dev` (pushed to fork
 `YangLiuWillow/pie`). Never commit to `dev`/`main`.
@@ -78,6 +82,22 @@ found the degrade-path whitespace bug (qwen-code retry storm) and the
 single-arm gap in `summarize.py`, both now fixed. To run the pie arm
 locally on Qwen3-0.6B-4bit for harness validation, free ~3 GiB of memory
 first; expect most task checks to fail on a 0.6B model regardless.
+
+**Run 2 + the dialect bug (2026-08-12).** The A/B completed on one H200
+(both arms, driver 580) and was **invalid**: the port rendered the
+hermes/JSON tool prompt for a Coder-tuned model, which then answered in
+prose without calling tools (2/5 tasks) and diverged on the rest. Fixed by
+implementing the Coder XML dialect, verified against the model's real
+`chat_template.jinja` through a checked-in golden. Raw run-2 data archived
+under `bench/results-2026-08-12-run1/`; analysis in docs §11. Run 3 is
+gated on (a) Coder-dialect prompt parity against a served Coder model and
+(b) pinning t=0 on both arms — qwen-code never puts `temperature` on the
+wire, so trajectory comparison is meaningless until decoding is greedy.
+
+**Migration (2026-08-12).** Repo moved to `~/Documents/Liszt_ai/pie`; work
+continues on a 48 GB machine, where `mlx-community/Qwen3-Coder-30B-A3B-
+Instruct-4bit` (~17 GB) should make the Coder-dialect gate testable locally
+for the first time. All RunPod pods terminated; balance ~$247.
 
 **Smoke-run attempt (2026-08-12).** Metal refused again, empirically:
 needs 2.465 GiB resident + the 2 GiB margin against 1.503 GiB reclaimable.
