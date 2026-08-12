@@ -208,6 +208,22 @@ impl Shared {
             "textual" => JoinMode::Textual,
             other => return Err(format!("unknown join_mode: {other}")),
         };
+        // Diagnostic: report how each structural tag resolved. A tag whose
+        // special-token bytes are missing from the tokenizer's table will
+        // misrender in trajectories (and would break literal-tag parsing).
+        for tag in ["<guideline>", "</guideline>", "<plan>", "</plan>", "<step>", "</step>", "<takeaway>", "</takeaway>"] {
+            match special_ids.get(tag.as_bytes()) {
+                Some(id) => {
+                    let render = String::from_utf8_lossy(
+                        token_bytes.get(*id as usize).map(|v| v.as_slice()).unwrap_or(&[]),
+                    );
+                    if render != tag {
+                        println!("[npr] tag {tag} = special id {id}, but renders as {render:?}");
+                    }
+                }
+                None => println!("[npr] tag {tag}: no special token (plain BPE)"),
+            }
+        }
         Ok(Shared {
             tokenizer,
             token_bytes,
@@ -707,10 +723,14 @@ fn run_branch(
 /// Extract the plan labels of the *last* `<guideline>` block in the
 /// segment, mirroring NPR's `<plan>\s*([0-9]+(?:\.[0-9]+)*)\s*:` regex
 /// over `prefix_input[prefix_input.rfind("<guideline>"):]`.
+///
+/// A segment spans exactly one guideline block (it starts right after the
+/// previous `<takeaway>`/turn start and ends at `</guideline>`), so when
+/// the literal `<guideline>` open tag is absent from the rendered bytes —
+/// the tokenizer's byte table can misrender added special tokens, and a
+/// model may occasionally skip the open tag — scan the whole segment.
 fn parse_plans(segment: &str) -> Vec<String> {
-    let Some(start) = segment.rfind("<guideline>") else {
-        return Vec::new();
-    };
+    let start = segment.rfind("<guideline>").unwrap_or(0);
     let mut rest = &segment[start..];
     let mut plans = Vec::new();
     while let Some(pos) = rest.find("<plan>") {
