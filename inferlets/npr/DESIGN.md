@@ -581,6 +581,65 @@ kernel resident) while the memory system is the real limit.
 > overhead analysis (§7.4) puts even full inferlet launch well under a token
 > time. Nothing in the measurements supports a per-token runtime tax.
 
+### Engine bug 12 — chunking ignores the logit/prob row caps
+
+The first full AIME sweep (H100 PCIe, 720 runs, concurrency 64) **failed and
+produced no usable numbers**: 499 runs died with
+`Failed to commit pages: commit: need N tokens, have 0` — the §7.1 empty-success
+signature. The server log named the real error five times:
+
+```
+future output failed: forward request needs 2508 logit rows, exceeding driver limit 512
+```
+
+Mechanism. A fill that carries a sampler needs one logit row **per token in the
+request**, because the CUDA driver's compact-logits path is disabled whenever
+top-k/top-p sampling is present (`any_topk_topp`, `executor.cpp`), and for
+top-p it also wants one prob row per token. Meanwhile the memory planner only
+ever considers `output_rows = R0` with `R0 ≤ N` (`cuda_memory_planner.cpp:543`),
+so `max_logit_rows` (512 here) is structurally below what a large fill demands.
+NPR's textual join — which appends every sibling's `<step>` tokens and then
+decodes — sends exactly such a fill (2,508–2,794 tokens).
+
+The runtime already has the machinery to survive this: `maybe_start_chunking`
+splits an oversized request into sequential prefix chunks. But it triggers
+**only** on `max_forward_tokens` and sizes chunks by that limit alone, so a
+2,508-token fill under an 8,192-token / 512-row driver was neither chunked nor
+admissible — it was rejected outright.
+
+**Fixed** (`runtime/src/inference/scheduler{.rs,/chunked.rs}`): chunking now
+engages on any token-proportional capacity, and `chunk_size_for` sizes chunks by
+`min(max_forward_tokens, max_logit_rows, max_prob_rows)` — applying the row caps
+only when the request actually materializes rows per token, so a sampler-free
+context flush (which projects zero logit rows at any length) is still sent
+whole. `chunk_limit_error` gained the matching per-chunk assertions. Two
+regression tests cover both directions.
+
+Rejections were also **silent**: `prepare_pending_with_usage` dropped the
+request via `send_error` with no log line, which is why 497 dead runs left five
+traces. They now log at `warn` with the request shape.
+
+The deeper fix belongs in the CUDA driver: `compact_logit_rows` excludes
+top-k/top-p unnecessarily — only the sampling rows need logits, and their probs
+could be computed over the compacted rows. That would remove the chunking
+entirely for this case. Not attempted here; it needs GPU hardware to validate.
+
+**Unresolved.** The five logged rejections do not account for all 499 failures.
+The sweep ran *clean for ~200 runs and then failed 100% for the remaining ~500*,
+across all three arms, while a freshly restarted server was healthy again at
+concurrency 1, 4, and 8. That cliff suggests a rejected or failed forward can
+leave the engine unable to serve anyone, which would be a far more serious bug
+than the capacity limit itself. It is not reproducible locally: the portable and
+dummy drivers publish `max_logit_rows = u32::MAX`, so the rejection path never
+fires, and 160 runs against a deliberately starved 256-page pool showed no
+leak. Confirming it needs the instrumented build on a GPU — the new warn logs
+are what that run should be looking for.
+
+**The chunking fix is unverified on CUDA hardware.** It is covered by unit tests
+and leaves local Metal behaviour unchanged (selftest still 0.2192, concurrent
+sweeps clean), but the pod was terminated before it could be exercised against
+the driver whose limits provoked the bug.
+
 ### Selftest gap on the H100 pod
 
 The numeric oracle could **not** be re-run on this pod: every `Distribution`
