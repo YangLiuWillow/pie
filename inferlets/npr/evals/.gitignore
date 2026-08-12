@@ -1,0 +1,3 @@
+# Raw sweep output: one JSONL line per run, each carrying a full trajectory.
+# Committed summaries live in ../DESIGN.md and results/*.md instead.
+results/*.jsonl

@@ -461,3 +461,90 @@ The real NPR-4B model runs end-to-end on pie's CUDA driver. Setup via
   slot-causal decode rows.
 - Temp-1.0 sampling gives high run-to-run variance (occasionally a short
   non-format answer); a quality/speed A/B needs avg@8.
+
+---
+
+## 12. Eval harness and Apple-silicon bring-up (2026-08-12)
+
+### The harness
+
+`inferlets/npr/evals/` — avg@8 on AIME 2025 (30 problems, `math-ai/aime25`)
+across three arms: `refill`, `textual`, and a `sequential` baseline
+(`max_plans=0`, so the model emits the same schema but decodes it in one causal
+stream — NPR's own degrade-to-sequential path). `run_eval.py` drives a running
+`pie serve` concurrently; `score.py` reports avg@k, pass@k, format-failure rate,
+parallel-trigger rate, and throughput. See `evals/README.md` for methodology.
+
+Two protocol constraints shaped the driver, both worth knowing before writing
+any other multi-run pie client:
+
+- **One connection per run.** The gateway's session loop does `cur = Some(new_rx)`
+  on every incoming client frame (`gateway/src/ingress/ws.rs:96`), so a second
+  `launch_process` on a live connection silently drops the first run's event
+  stream — the turn model is strictly one-at-a-time.
+- **`launch_processes` never terminates its turn.** `turn_terminal`
+  (`worker/src/link/gateway.rs`) learns the process id from the launch ack, but
+  a batch launch's ack carries a JSON *array*, which matches no pid, so the turn
+  stays open forever. The code comments this as "a known follow-on".
+
+**Accuracy and speed must be measured separately.** `elapsed_ms` is per-run wall
+clock, so under a concurrent sweep it reflects batching contention, not the
+parallel-decode speedup. Accuracy runs at high concurrency; the speed comparison
+must run at concurrency 1.
+
+### Engine bug 11 — portable sampling path assumed one logit row per request
+
+Found by running the sweep at concurrency 24: a hard `GGML_ASSERT` abort of the
+whole server process in `build_qwen3_graph`, with **no forks involved** (the
+sequential arm on a stock model). This is the same crash signature attributed in
+§10 to the speculation race (bug 8) — that attribution was wrong, or at least
+incomplete; the real cause is independent of NPR.
+
+The GPU non-greedy fast path reshapes the softmax by request count:
+
+```cpp
+ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_req);   // graph_qwen3.cpp:843
+```
+
+but `probs` is `[vocab, n_slots]`, where slots come from `plan.sampling_pos_i32`
+— flat across requests and **independent of `n_req`**. A prefill-only request
+contributes zero slots (the detection code even says so: *"prefill-only requests
+have empty `samplers`"*), and a spec-decode verify pass contributes several. Any
+batch mixing a prefill with decodes therefore aborts the process. Concurrency is
+what makes such batches common; a single-stream run almost never produces one.
+
+**Fixed** in all five graph builders (`graph_qwen3`, `graph_qwen3_5`,
+`graph_gemma4`, `graph_phi3small`, `graph_phi3_5moe`): reshape by
+`plan.sampling_pos_i32.size()`.
+
+The same assumption had a second, quieter form: `Executor::GraphCache` keyed on
+`n_request` but not on the slot count, so a cached graph could be reused for a
+batch with a different number of slots — `upload_graph_inputs` then writes
+`n_slots * 4` bytes into an `out_idx` tensor sized for a different count
+(stale slot, or a buffer overrun in the growing direction). **Fixed** by adding
+`n_sample_slots` to the cache signature, alongside the `total_pages_in_batch`
+field that exists for exactly this reason.
+
+Note the family resemblance to CUDA bug 9: both are "number of logit rows ==
+number of requests" assumptions in a sampling tail. Worth auditing any new
+backend for the same.
+
+### Metal / Apple-silicon validation (M5 Pro, 48 GB)
+
+The portable driver's ggml **Metal** backend runs the full pipeline — a backend
+the phase-2 fixes had never been exercised on (CPU and CUDA only).
+
+- **selftest on Qwen3-0.6B**: pass; TVs 0.0000–0.0004, control 0.2192 (CPU: 0.2186).
+- **selftest on NPR-4B**: pass; TVs 0.0000–0.0003, control 0.5571 (H200 CUDA: 0.55).
+  Three backends now agree on the refill join's numerics.
+- **Real problem**: AIME 2025 I/1 → **70** (correct), 2 parallel blocks, 5 branches,
+  5,429 tokens in 308 s serial = **17.7 tok/s** (H200: 230 tok/s, ~13× faster).
+
+Throughput does not batch well here: 0.6B goes 46 → 254 tok/s from concurrency 1
+to 24 (5.5×), but NPR-4B at concurrency 8 reaches only ~2× aggregate, because
+pie's per-token guest↔host round trip is a fixed serial cost per decode step and
+the 4B model is closer to compute-bound on this GPU. Apple silicon is therefore
+good for correctness work and single-trajectory inspection, and impractical for
+a 720-run sweep (tens of hours vs ~1 hour on an H200).
+
+Config: `configs/npr-metal.toml` (needs `PIE_PORTABLE_METAL=1` at *build* time).

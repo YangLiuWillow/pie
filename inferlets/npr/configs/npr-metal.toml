@@ -1,0 +1,43 @@
+# `pie serve` config for the real NPR-4B checkpoint on Apple silicon (portable
+# driver, ggml Metal backend). Validated on an M5 Pro / 48 GB.
+#
+#   PIE_PORTABLE_METAL=1 cargo rustc --release -p pie-bin --bin pie \
+#     --no-default-features --features driver-portable -- \
+#     -C link-arg=-framework -C link-arg=Accelerate
+#   PIE_CONFIG=/path/to/npr-metal.toml ./target/release/pie serve
+#
+# The Metal build flag is needed at BUILD time, not run time, and the extra
+# link args work around `worker/build.rs` link-args not propagating to the
+# binary (HANDOVER.md §7.2).
+#
+# `hf_repo` must be a resolved local snapshot path holding **bf16** weights —
+# the published NPR-4B is fp32; run `convert_bf16.py` first.
+#
+# KV sizing: Qwen3-4B is 36 layers x 8 KV heads x 128 head_dim, so bf16 KV costs
+# 144 KB/token = 4.5 MB per 32-token page. 3072 pages = ~14 GB = ~98k tokens of
+# context across all concurrent runs, which with 7.5 GB of weights leaves ample
+# headroom under Metal's working-set limit on a 48 GB machine. Raise
+# `total_pages` on a bigger box; concurrency is bounded by it.
+
+[gateway]
+listen = "127.0.0.1:8092"
+
+[worker.server]
+host = "127.0.0.1"
+port = 8093
+
+[worker.auth]
+enabled = false
+
+[[worker.model]]
+name = "default"
+hf_repo = "/path/to/NPR-4B-bf16"
+
+[worker.model.driver]
+type = "portable"
+device = ["metal"]
+
+[worker.model.driver.options]
+total_pages = 3072
+max_forward_tokens = 4096
+max_forward_requests = 64
