@@ -5,7 +5,7 @@
 `@ai-sdk/openai-compatible@2.0.41` / `@ai-sdk/provider-utils@4.0.23` — the exact versions
 pinned in the source repo (`packages/opencode/package.json:71`) and confirmed by the
 `User-Agent` header on the wire.
-**Source cross-reference:** `/Users/yangliu/Desktop/Lin_startup/opencode` (repo HEAD; line
+**Source cross-reference:** `/Users/yangliu/Documents/Liszt_ai/opencode` (repo HEAD; line
 numbers below refer to it). SDK source read from `@ai-sdk/openai-compatible@2.0.41` dist.
 **Captures:** `wire/req-001..005.json` in this directory, recorded by `record_server.py`
 against the config in `./opencode.json` (custom provider `pie`, npm

@@ -1,7 +1,7 @@
 # opencode ↔ Pie integration — two strategies
 
 **Date:** 2026-08-11. Target: pie `dev` (`58cb77936`), opencode `1.18.16`
-(`~/Desktop/Lin_startup/opencode`). Companions: `qwen-code-integration-plan.md`
+(`~/Documents/Liszt_ai/opencode`). Companions: `qwen-code-integration-plan.md`
 (the validated Option-A precedent), `codex-integration.md` (Responses-API precedent),
 and the SOSP'25 paper (`~/Desktop/pie.pdf`) for the performance model.
 

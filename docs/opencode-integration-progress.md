@@ -1,7 +1,7 @@
 # opencode ↔ Pie integration — progress log
 
 Companion to `opencode-integration.md` (the two-strategy plan). One entry per
-completed task, newest first. Worktree: `Lin_startup/pie-opencode`, branch
+completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 `liu/opencode-integration` (from `dev` @ `58cb77936`).
 
 ## Task board
@@ -140,7 +140,7 @@ root via empty `[workspace]` table — same exclusion policy as
 Serves one OpenAI chat-completions request per process launch on the PA.2
 gateway⇄inferlet envelope (`{"status":u16}` first, then verbatim chunk JSON
 per message / one unary body). Build (verified):
-`cd inferlets/chat-completions && CARGO_TARGET_DIR=…/Lin_startup/pie/target
+`cd inferlets/chat-completions && CARGO_TARGET_DIR=…/Liszt_ai/pie/target
 cargo build --target wasm32-wasip2 --release`.
 
 - **`src/engine.rs`** — generation core ported from
@@ -418,7 +418,7 @@ Load-bearing findings for PA.1/PA.2:
 Disk filled to zero mid-build (killed tool execution). Freed ~19.6 GB by
 deleting `~/Library/Caches/vscode-cpptools` (17 GB, IntelliSense cache —
 regenerates) and `~/Library/Caches/pip`. To avoid re-duplicating build
-artifacts, worktree builds use `CARGO_TARGET_DIR=…/Lin_startup/pie/target`
+artifacts, worktree builds use `CARGO_TARGET_DIR=…/Liszt_ai/pie/target`
 (same commit as the main checkout → 24 GB of artifacts shared). The
 `pie-opencode/target` dir was deleted; keep using the shared target dir.
 

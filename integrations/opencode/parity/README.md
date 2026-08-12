@@ -28,7 +28,7 @@ wire captures in `tests/inferlets/fixtures/opencode/wire/`.
 
 ```sh
 # 1. Build the bin (see the progress log's shared-target-dir note):
-CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target cargo build -p render-tokens
+CARGO_TARGET_DIR=$HOME/Documents/Liszt_ai/pie/target cargo build -p render-tokens
 
 # 2. Python side needs transformers (tokenizer-only, no torch) + huggingface_hub:
 python3 -m venv /path/to/venv && /path/to/venv/bin/pip install transformers huggingface_hub
@@ -37,7 +37,7 @@ python3 -m venv /path/to/venv && /path/to/venv/bin/pip install transformers hugg
 #    --dump-dir DIR to keep both decoded prompts, --cache-dir DIR to
 #    redirect the HF download cache):
 /path/to/venv/bin/python integrations/opencode/parity/check_render.py \
-    --bin $HOME/Desktop/Lin_startup/pie/target/debug/render-tokens
+    --bin $HOME/Documents/Liszt_ai/pie/target/debug/render-tokens
 ```
 
 Exit code 0 iff every fixture is token-exact.

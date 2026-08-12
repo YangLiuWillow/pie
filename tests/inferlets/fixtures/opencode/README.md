@@ -14,7 +14,7 @@ Nothing here touches your real `~/.config/opencode` — isolation is via `XDG_*`
 pointed at a scratch dir.
 
 ```bash
-FIX=/Users/yangliu/Desktop/Lin_startup/pie-opencode/tests/inferlets/fixtures/opencode
+FIX=/Users/yangliu/Documents/Liszt_ai/pie-opencode/tests/inferlets/fixtures/opencode
 SCRATCH=$(mktemp -d)
 mkdir -p "$SCRATCH/proj" "$SCRATCH/xdg"
 cp "$FIX/opencode.json" "$SCRATCH/proj/"

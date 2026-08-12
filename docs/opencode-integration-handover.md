@@ -1,10 +1,16 @@
 # opencode ↔ Pie integration — handover
 
-**For:** a fresh Claude Code session on a new machine.
+**For:** a fresh Claude Code session, on this machine or a new one.
 **Written:** 2026-08-12, at the end of the first working stretch.
 **Branch:** `liu/opencode-integration` on `https://github.com/YangLiuWillow/pie.git`
-(the `fork` remote), based on pie `dev` @ `58cb77936`. HEAD at handover:
-`7097a784f`.
+(the `fork` remote), based on pie `dev` @ `58cb77936`.
+
+**Working tree** (if it came across with you): `~/Documents/Liszt_ai/pie-opencode`,
+a git worktree of `~/Documents/Liszt_ai/pie`. The project tree moved from
+`~/Desktop/Lin_startup` to `~/Documents/Liszt_ai` on 2026-08-12; git worktree
+links survived the move, and every path in this repo's docs and scripts was
+rewritten to match. If you are starting from nothing, §3 rebuilds it from the
+remote.
 
 Read this first, then `docs/opencode-integration.md` (the design), then
 `docs/opencode-integration-progress.md` (the task-by-task log, newest first).
@@ -69,8 +75,8 @@ as "done pending first contact."
 
 ```sh
 # 1. The repo. Upstream is pie-project/pie; the work lives on the fork.
-git clone https://github.com/YangLiuWillow/pie.git ~/Desktop/Lin_startup/pie
-cd ~/Desktop/Lin_startup/pie
+git clone https://github.com/YangLiuWillow/pie.git ~/Documents/Liszt_ai/pie
+cd ~/Documents/Liszt_ai/pie
 git remote add fork https://github.com/YangLiuWillow/pie.git   # if `origin` is upstream
 git fetch fork liu/opencode-integration
 
@@ -83,7 +89,7 @@ cd ../pie-opencode
 cargo artifacts per checkout. Point worktree builds at one shared target dir:
 
 ```sh
-export CARGO_TARGET_DIR=~/Desktop/Lin_startup/pie/target
+export CARGO_TARGET_DIR=~/Documents/Liszt_ai/pie/target
 ```
 
 Toolchain: `rust-toolchain.toml` pins **1.97.1** and declares the
@@ -99,7 +105,7 @@ component install.
 | Inferlet program cache | `~/.pie/programs/chat-completions/0.1.0.{wasm,toml}` | Build the inferlet, copy the wasm + `Pie.toml` there. `run_pie_opencode.sh` does this automatically. |
 | `~/.pie/config.toml` | local | `pie config init`; `run_pie_opencode.sh` generates a trimmed one if you pass no config arg. |
 | HF tokenizer cache + venv | scratchpad | `check_render.py` re-downloads tokenizer files only (never weights); `pip install transformers huggingface_hub`. |
-| **RunPod API key** | `Lin_startup/pie-rl/.env` (`RUNPOD_API_KEY`) | **Secret — bring it across by hand.** Also `HF_TOKEN`, `GH_TOKEN` there. |
+| **RunPod API key** | `Liszt_ai/pie-rl/.env` (`RUNPOD_API_KEY`) | **Secret — bring it across by hand.** Also `HF_TOKEN`, `GH_TOKEN` there. |
 | Local memory files | `~/.claude/projects/…/memory/` | Their content is folded into this doc (§6, §7). |
 
 ---
@@ -112,8 +118,8 @@ machine has.
 ### Path A — local Metal (Apple Silicon)
 
 ```sh
-cd ~/Desktop/Lin_startup/pie-opencode
-CARGO_TARGET_DIR=~/Desktop/Lin_startup/pie/target \
+cd ~/Documents/Liszt_ai/pie-opencode
+CARGO_TARGET_DIR=~/Documents/Liszt_ai/pie/target \
   cargo build -p pie-bin --release --features driver-metal   # ← the feature is REQUIRED
 bash integrations/opencode/run_pie_opencode.sh               # boots, waits /health, runs the suite
 ```
