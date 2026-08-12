@@ -269,6 +269,54 @@ To finish this benchmark: top up RunPod, provision an H200 whose driver is
 Budget ~1.5 h at ~$4.60/hr, and watch for other sessions' pods on the same
 account.
 
+## 11. 30B A/B, run 2 (2026-08-12) — INVALID, and the bug it exposed
+
+Ran cleanly end to end on an H200 (secure, driver 580.126.09, CUDA 12.9
+toolkit) with both arms on one machine: pie (serve + shim + inferlet) and
+vLLM 0.25.1 fair tier, Qwen3-Coder-30B-A3B-Instruct, the 5-task battery.
+Raw result, archived under `bench/results-2026-08-12-run1/`:
+
+| arm | ok | wall | prompt tok | cached | completion |
+|---|---|---|---|---|---|
+| pie | 3/5 | 123.7 s | 187,333 | 144,035 (76.9%) | 2,091 |
+| vLLM | 5/5 | 30.3 s | 226,877 | (APC internal) | 2,956 |
+
+**These speed numbers mean nothing, and must not be quoted.** All five
+trajectories diverged, and the cause was ours: the port renders the
+hermes/JSON tool preamble for every model, but Qwen3-Coder is tuned on the
+`<function=…>` XML dialect. Served the wrong dialect, the 30B answered two
+tasks with a sentence of intent and `finish_reason:"stop"` — no tool call
+at all — and took different paths on the rest. vLLM, driving the model's
+own template, produced the correct trajectories. So the A/B measured a
+prompt bug in pie's client, not the serving stacks.
+
+The bug is not a port regression in the strict sense — the old engine had
+`ToolFormat::{Json,Coder}` and picked Coder for these models — but the port
+carried over only the *parser* (`salvage.rs` handles bare Coder-XML) and
+not the *renderer*. The C3 parity check missed it because every wire
+fixture came from a hermes-dialect model, so 23/23 exact said nothing about
+the Coder path.
+
+Fixed in `render_text.rs` (`Dialect::{Hermes,Coder}`), verified against the
+model's real `chat_template.jinja` through a checked-in golden. Two details
+that golden caught, both of which hand-porting would have gotten wrong:
+`| string` in the template's `render_extra_keys` is Python's `str()`, so
+booleans render `True`/`False`, not `true`/`false`; and a request carrying
+a system message but no tools must not get an empty `<tools>` preamble.
+Dialect selection reads the config's `[model] name` — pie exposes no HF id,
+and `architecture()` is `qwen3_moe` for Coder and non-Coder alike — so a
+Coder deployment must carry "coder" in that name; the bench config does.
+
+Also worth recording from this run, independent of the bug: pie's KV
+sessions worked exactly as designed on a real agent workload — 76.9% of
+prompt tokens served from cache, resume hits of ~8.7K tokens per follow-up
+turn. And vLLM reports no `cached_tokens`, so its APC savings are invisible
+to this harness; reuse cannot be compared arm-to-arm, only pie's measured
+against its own prompt volume.
+
+Run 3 (dialect fixed) is the first run whose speed numbers will be worth
+reading. Gate it on a Coder-dialect C3 parity check before benchmarking.
+
 Note for the record: generation-time turns save KV containing the model's own
 compact-JSON tool-call bytes, while a rebuild-from-history renders the
 tojson-spaced form; addresses hash canon strings (not bytes), and each path
