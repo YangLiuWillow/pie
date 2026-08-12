@@ -1,8 +1,10 @@
 # OpenClaw ↔ Pie integration — progress log
 
-Companion to `openclaw-integration.md` (two-strategy spec) and
-`openclaw-integration-plan.md` (task-level plan). One entry per completed
-task, newest first. Worktree: `Lin_startup/pie-openclaw`, branch
+Companions: `openclaw-integration.md` (two-strategy spec),
+`openclaw-integration-plan.md` (task-level plan), and
+`openclaw-integration-handover.md` (**start here on a new machine**: setup,
+build flags, the live-run blocker, verification gaps, next steps). One entry
+per completed task, newest first. Worktree: `Lin_startup/pie-openclaw`, branch
 `liu/openclaw-integration` (from `liu/opencode-integration` @ `1053a7790`).
 Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 
@@ -24,6 +26,42 @@ Builds: `CARGO_TARGET_DIR=$HOME/Desktop/Lin_startup/pie/target`.
 | oc-PB.5 | Optional depth (grammar calls, speculation, embeddings) | pending |
 
 ## Log
+
+### 2026-08-12 — live run BLOCKED on Metal admission; handover written
+
+Rebuilt the release binary with today's gateway changes — note the build
+line: `cargo build --release -p pie-bin --features pie-bin/driver-metal`
+(the bin package is `pie-bin`, not `pie`; omitting the driver feature makes
+the worker build script panic about `driver-cuda` being Linux-only).
+
+`run_pie_openclaw.sh` never got past boot. Metal's host-side admission
+(`driver/metal/src/batch/forward.cpp:855-900`, flat 2 GiB margin + up to a
+2 GiB copy window) refused all three profiles tried:
+
+| profile | needs | reclaimable |
+|---|---|---|
+| 32k ctx / 1024 pages / default row budget | 4.245 GiB | 2.501 GiB |
+| 12k ctx / 384 pages / `PIE_METAL_ROW_BUDGET_MB=256` | 2.058 GiB | 2.398 GiB |
+| 10k ctx / 320 pages / `PIE_METAL_ROW_BUDGET_MB=192` | 1.839 GiB | 2.486 GiB |
+
+Same class of blocker the opencode track hit, worse here (the 32k profile
+doubles the pages). The driver's message notes a wedged prior run can hold
+pages until reboot.
+
+Dummy-driver fallback prepared instead (exercises ingress/envelope/inferlet/
+SSE without a GPU); `pie doctor` passes on it, but the suite run was
+interrupted before finishing, so **no acceptance test has yet met real
+server bytes**. Two config traps found while getting there, both recorded in
+the handover: `[model.driver]`/`[model.scheduler]` are now
+`[driver]`/`[runtime]`, and dummy driver options are flat keys on `[driver]`
+(no `options` table) — without `vocab_size`/`arch_name` it tries to read a
+`config.json` inside the `.zt` artifact and fails `Not a directory`.
+
+`openclaw-integration-handover.md` written for the machine switch: repo/
+branch/remote map, build + venv setup, what is done, the blocker above, the
+**five verification gaps** (nothing live-run; keepalive path unproven; keyed
+affinity never observed routing; zero OpenClaw-repo gates run;
+`context_overflow_body` unwired), and the ordered next steps.
 
 ### 2026-08-11 — oc-PA.2 done + oc-PA.3 authored
 
