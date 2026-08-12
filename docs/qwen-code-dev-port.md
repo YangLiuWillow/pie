@@ -878,3 +878,66 @@ Written and syntax-checked; **not yet run** — the machine is with another
 session measuring non-speculative hybrid decode throughput (§18). The
 captured reference is reusable by any branch doing prompt-parity work
 without needing both stacks up.
+
+## 20. Tool calls on Qwen3.6, and a concurrency guard (2026-08-12)
+
+**Acceptance on Qwen3.6-35B-A3B, Metal: 34 passed, 1 failed.** The single
+failure is §18's seal/fold bug (`cached_tokens = 0`). Everything else —
+streaming, tool-call atomicity, id uniqueness, degrade discipline, fixture
+replays, concurrency — is green on the 35B.
+
+### The parser was the mirror of run 2
+
+Getting there needed one fix, and it is the exact inverse of the bug that
+invalidated run 2. There, the renderer was wrong and the model never called
+a tool. Here the renderer is right — the model emitted a textbook Qwen3.6
+call —
+
+```
+<tool_call>\n<function=get_time>\n<parameter=timezone>\nAsia/Tokyo\n</parameter>\n</function>\n</tool_call>
+```
+
+— and the turn still returned `tool_calls: null` with that text sitting in
+`content`. The **parser** dropped what the model correctly produced.
+
+Cause: the Coder/XML salvage scanned only `visible_text`. A *well-formed*
+call is wrapped in `<tool_call>…</tool_call>`, and `filter.rs` treats
+`<tool_call>` as an opener and drops the whole block — so a correct call is
+absent from `visible_text` **by construction**. The condition therefore
+caught the malformed case (a bare `<function=` leaking into content) and
+missed the correct one: exactly inverted. The engine `tools::Decoder`
+understands only the hermes JSON form, so nothing else catches the XML
+dialects. Now scans the visible text first and then the raw generation.
+
+This would have invalidated run 3 the same way the dialect bug invalidated
+run 2 — a Coder-dialect model producing zero parsed tool calls — and no unit
+test could have caught it, because it needs a real model emitting a real
+call through the real filter.
+
+### Concurrency: ours is clean, and now guarded
+
+`liu/opencode-integration` found their serving path degrades **every**
+request at N≥2 on both a dense and a hybrid model — a rejected launch
+(`pie_metal_launch failed with status -1`) turned by the degrade discipline
+into `finish_reason:"length"` with a one-token answer, indistinguishable on
+the wire from a model that stopped.
+
+Ours does not reproduce it, measured on both models:
+
+| N | Qwen3-0.6B (dense) | Qwen3.6-35B (hybrid) |
+|---|---|---|
+| 1 | 200 tok | 150 tok |
+| 2 | 200, 200 | 150, 150 |
+| 4 | 200 ×4 | 150 ×4 |
+
+No `pie_metal_launch` rejections in either log; the 8 launch failures on the
+35B run are all §18 seal-position mismatches. Concurrency is also *faster*
+here — 4 requests in 2.1 s against 4.4 s for one — so batching works.
+
+The suite now carries a guard for the class, because a sequential suite
+cannot see it: N=2 and N=4 concurrent requests, asserting on **token count,
+not status**. Every request is given a budget it should exhaust, so a turn
+that stops at `"length"` after a handful of tokens is nonsense on its face —
+`"length"` means the budget was hit. That shape also survives the `'…'`
+placeholder check, since one *real* token is not the placeholder. Assertion
+shape suggested by the opencode session.

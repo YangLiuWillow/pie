@@ -206,6 +206,49 @@ def main() -> None:
             check("turn 2 resumed from KV snapshot (cached_tokens > 0)",
                   cached > 0, f"cached_tokens={cached}")
 
+    # ── Concurrency ──────────────────────────────────────────────────
+    # A sequential suite cannot see this class at all. The
+    # liu/opencode-integration serving path degrades EVERY request at N>=2
+    # on both a dense and a hybrid model — a rejected launch
+    # (`pie_metal_launch failed with status -1`) is turned by the degrade
+    # discipline into `finish_reason:"length"` with a one-token answer,
+    # which is indistinguishable on the wire from a model that stopped.
+    # Their 25/25 green never covered it, and neither did our 33.
+    #
+    # The assertion is on token COUNT, not status: every request here is
+    # given a budget it should exhaust, so a turn that stops at "length"
+    # after a handful of tokens is nonsense on its face — "length" means
+    # the budget was hit. That shape also survives the `'…'` placeholder
+    # check, because one *real* token is not the placeholder.
+    import threading
+
+    def _one(i, out, n_tokens=64):
+        try:
+            st, _, raw = post(base, {
+                "messages": [{"role": "user",
+                              "content": f"Count from {i} to thirty, one per line."}],
+                "max_tokens": n_tokens, "stream": False, **kwargs})
+            d = json.loads(raw)
+            out[i] = (st, d["usage"]["completion_tokens"],
+                      d["choices"][0]["finish_reason"])
+        except Exception as e:  # noqa: BLE001 - reported, not raised
+            out[i] = (None, None, repr(e)[:60])
+
+    for n in (2, 4):
+        out: dict = {}
+        threads = [threading.Thread(target=_one, args=(i, out)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        bad = [i for i in range(n)
+               if out.get(i, (None,))[0] != 200
+               or (out[i][2] == "length" and (out[i][1] or 0) < 5)]
+        check(f"{n} concurrent requests all produce real turns",
+              not bad,
+              "degraded: " + ", ".join(
+                  f"req{i}={out.get(i)}" for i in bad))
+
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 

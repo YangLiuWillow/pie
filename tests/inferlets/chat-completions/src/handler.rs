@@ -442,11 +442,38 @@ impl Daemon {
                 push_salvaged(name, args, &mut calls);
             }
         }
-        // Coder-XML: `<function=…>` blocks without the `<tool_call>` wrapper.
-        if calls.is_empty() && has_tools && visible_text.contains("<function=") {
-            for (name, args) in salvage::parse_coder_xml_calls(&visible_text, &setup.tool_schemas)
-            {
-                push_salvaged(name, args, &mut calls);
+        // Coder / Qwen3.6 XML calls. Scan the visible text first — that is a
+        // BARE `<function=` that leaked into content — and then the RAW
+        // generation.
+        //
+        // Scanning raw is not a fallback, it is the main case. A WELL-FORMED
+        // call is wrapped in `<tool_call>…</tool_call>`, and the filter treats
+        // `<tool_call>` as an opener and drops the whole block, so a correct
+        // call is *absent* from `visible_text` by construction. Keying only on
+        // the visible text therefore caught the malformed case and missed the
+        // correct one — exactly inverted. Measured on Qwen3.6-35B-A3B: the
+        // model emitted a textbook
+        //
+        //     <tool_call>\n<function=get_time>\n<parameter=timezone>\n
+        //     Asia/Tokyo\n</parameter>\n</function>\n</tool_call>
+        //
+        // and the turn still came back `tool_calls: null` with the call
+        // sitting in `content`. That is run 2's failure mode with the sides
+        // swapped: there the renderer was wrong, here the renderer is right
+        // and the parser drops what the model correctly produced. The engine
+        // `tools::Decoder` only understands the hermes JSON form, so the XML
+        // dialects have nothing else to catch them.
+        if calls.is_empty() && has_tools {
+            for src in [visible_text.as_str(), raw_text.as_str()] {
+                if !src.contains("<function=") {
+                    continue;
+                }
+                for (name, args) in salvage::parse_coder_xml_calls(src, &setup.tool_schemas) {
+                    push_salvaged(name, args, &mut calls);
+                }
+                if !calls.is_empty() {
+                    break;
+                }
             }
         }
         // Hermes with the closing tag missing — the filter swallowed the
