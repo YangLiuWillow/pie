@@ -66,7 +66,11 @@ echo "── building chat_completions.wasm"
 
 # ── 5. Model ────────────────────────────────────────────────────────────────
 CFG="$REPO/integrations/qwen-code/pie_config_cuda.toml"
-"$REPO/target/release/pie" --config "$CFG" model list 2>/dev/null | grep -q "$(basename "$MODEL")" || {
+# Check for the converted .zt artifact specifically — `model list` also
+# prints raw HF-cache snapshots, which a prefetch satisfies without there
+# being anything servable (this skipped the 30B import on the H200 pod).
+ARTIFACT="$HOME/.pie/models/$(echo "$MODEL" | sed 's|/|--|').zt"
+[ -f "$ARTIFACT" ] || {
     echo "── importing $MODEL"
     "$REPO/target/release/pie" --config "$CFG" model import "$MODEL"
 }
