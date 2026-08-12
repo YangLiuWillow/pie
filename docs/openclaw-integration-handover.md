@@ -237,7 +237,28 @@ Things that are **written but never executed**:
 
 ---
 
-## 7. Facts worth carrying in your head
+## 7. Sibling work on the same fork (checked 2026-08-12)
+
+Everything below was verified present on `fork` = `github.com/YangLiuWillow/pie`,
+so a fresh clone loses nothing. Recorded here because the working tree made
+some of it look local-only:
+
+- **OpenHands integration** — `openhands-integration` and
+  `openhands-integration-updated` (105 files under `integrations/openhands/`,
+  incl. `pie_openhands/{llm,editor_repair,__init__}.py`, the tests, and the
+  benchmark harness). The working-tree `integrations/openhands/` directory is
+  **not** a source of truth: its `.py` files are gone, leaving only
+  `__pycache__` bytecode, `.pytest_cache`, packaging metadata, and a **930 MB
+  `.venv`**. Recreate the venv from the branch checkout; never commit it.
+- **RL rollout fixtures** — `liu/rl-completions` carries
+  `tests/inferlets/fixtures/rl_completions/` and `rl_completions_1.7b/`
+  (137 files, ~48 MB; the untracked working-tree copies were byte-identical).
+  `liu/rl-rollout-05` is also pushed now. Both were local-only until this date.
+- **Other integration branches**: `liu/opencode-integration` (this branch's
+  base), `liu/codex-integration`, `npr-inferlet`, `liu/qwen-code-dev` (which
+  now also carries the 11 previously-ignored design docs under `docs/`).
+
+## 8. Facts worth carrying in your head
 
 - **Keepalives must be empty-delta chunks, not `: ping` comments.** This is
   the single most load-bearing finding (D-1) and it changed the shared
