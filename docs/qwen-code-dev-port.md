@@ -780,28 +780,54 @@ subsequent turn is a `resume miss`. The dense 0.6B attention path retains
 normally (`retained qwenchat/… (seq N)`), so this is specific to the hybrid
 port.
 
-**Root cause (confirmed by reading, fix NOT yet run).** `run_ahead` closes
-the pipeline it is handed, deliberately — `ptir.rs` documents the departing
-lane holding the seal 4-8 ms and releasing it on time being worth "+9.5% to
-+18.7%". So by the time `seal` runs, the pipeline that produced the fold is
-already gone, and the seal binds the old `RsWorkingSet` into a fresh one.
-The opencode branch reports the openclaw session independently hitting the
-same must-make-a-fresh-pipeline-after-`run_ahead` behaviour.
+**The pipeline hypothesis was WRONG, and the fix built on it was too.** Both
+this branch and `liu/opencode-integration` reasoned that `run_ahead` closing
+the generation pipeline left the fold with no cross-pipeline identity, and
+that forking it onto the seal's own pipeline would re-order it. That was
+plausible, agreed by both branches, and false. Run with the fork in place:
 
-A `WorkingSet` tolerates that rebinding, which is why the attention path
-never saw it. A folded state does not, and the surfaces say why: a
-`kv-working-set` has `update-index` / `from-index` / `remove-index` /
-`slice`, while an `rs-working-set` has only `fork`. A fold has no
-cross-pipeline identity to re-establish, so binding it into a pipeline that
-did not fold it presents exactly as an epoch mismatch.
+```
+[pie-driver-metal] paged continuation: recurrent slot 1 holds sequence
+                   9223372036854775808, this fire is sequence 9223372036854775809
+```
 
-Sealing on the generation pipeline is therefore impossible, not merely
-awkward. The fix taken instead uses the one re-ordering the surface offers:
-`fork` is documented as producing a child "ordered on `on`", so the seal
-forks the fold onto its OWN pipeline, seals there, and retains the fork.
-Implemented; **not yet verified live** — it needs the 35B and the machine is
-in single-tenant use for another session's measurement pass. Until it has
-run, treat KV reuse on Qwen3.6 as still unmeasured, not as fixed.
+`fork` mints a NEW sequence (2^63 → 2^63+1) and the driver requires a
+continuation to carry the slot's own. The fork did not fix the bug; it added
+a second, different rejection on top. Reverted.
+
+**The actual cause is position accounting, and it is structural.** The
+pre-fork driver messages say it plainly:
+
+```
+recurrent slot 0 is at position 165, this fire starts at 160   ← fold 5 AHEAD
+recurrent slot 0 is at position 14,  this fire starts at 15    ← fold 1 BEHIND
+```
+
+Two distinct mismatches, both fatal to the seal:
+
+- **Fold ahead.** The decode loop uses `run_ahead`, which fires
+  speculatively past the stop token. For KV that is harmless and
+  deliberate — `generation.rs` says so: those fires "leave garbage KV beyond
+  the accepted length; it is never referenced because every later fire's
+  `kv_len`/page-CSR only ever cover valid tokens". **A fold has no
+  `kv_len`.** It advances on every fire that executes and cannot be rewound,
+  so the speculative overshoot is permanently folded in. The seal then tries
+  to start at the *accepted* length and lands 5 behind the fold.
+- **Fold behind.** The stop token is "truncated at, never written" for KV,
+  so `total_len` can sit one past where the fold stopped.
+
+So the KV-side accounting this loop is built on — tolerate overshoot, mask
+it with `kv_len`, truncate at the stop token — is exactly what an
+irreversible fold cannot support. This is the same property the SDK warns
+about for eviction ("dropping a KV page does not undo the fold"), reaching
+the seal by a different route.
+
+Fixing it means making the fold position and `total_len` agree by
+construction: either no speculation on a hybrid pass (each fire's tokens all
+accepted before the next is submitted), or the seal starts at the fold's
+position rather than the accepted length — and the second only works if
+nothing was ever folded that KV does not contain. Neither is a small change,
+and neither is attempted here.
 
 Until this is fixed, **pie's KV-reuse result is unobtainable on Qwen3.6**,
 which is the only geometry where Metal implements CoW fork at all (§17). It

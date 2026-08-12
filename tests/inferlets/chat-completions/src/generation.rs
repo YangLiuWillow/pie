@@ -498,26 +498,13 @@ where
 
     let pipe = Pipeline::new();
 
-    // A folded recurrent state has NO cross-pipeline identity. `run_ahead`
-    // closes the generation pipeline on purpose (it is worth +9.5–18.7% to
-    // release the lane on time, `ptir.rs`), so by the time the seal runs, the
-    // pipeline that produced the fold is gone. Binding the old state into a
-    // fresh pipeline is what produced
-    //
-    //     channel is poisoned: driver published poison epoch 1
-    //
-    // on every single turn, which dropped every session and made KV reuse
-    // measure 0% on Qwen3.6 (docs §18). `fork` is the only re-ordering the
-    // `rs-working-set` surface offers — a `kv-working-set` has
-    // `update-index`/`from-index`/`slice`, a folded state has only this — and
-    // it is documented as producing a child "ordered on `on`". So the fold is
-    // forked onto the seal's own pipeline, sealed there, and the FORK becomes
-    // the retained state. A `WorkingSet` tolerates the rebinding directly,
-    // which is why the attention path never hit this.
-    let mut rs_owned: Vec<RsWorkingSet> = Vec::with_capacity(state.rs.len());
-    for r in &state.rs {
-        rs_owned.push(r.fork(&pipe).context("rs.fork for seal")?);
-    }
+    // NOTE: the fold is bound DIRECTLY, not forked. Forking re-orders it onto
+    // this pipeline but mints a new sequence id, and the driver rejects that
+    // outright — "recurrent slot 1 holds sequence 2^63, this fire is sequence
+    // 2^63+1". Neither form works today; see the position analysis in §18.
+    let rs_owned: Vec<RsWorkingSet> = Vec::new();
+    let _ = &rs_owned;
+
     let fwd: Pass<W> = Pass::new();
     fwd.embed(&toks, &embed_indptr)?;
     fwd.bind_state(
@@ -533,7 +520,7 @@ where
             positions: &positions,
             mask: None,
         },
-        &rs_owned,
+        &state.rs,
     )?;
     fwd.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
@@ -542,9 +529,5 @@ where
     fwd.submit(&pipe).context("seal submit")?;
     let _ = sink.take_host::<i32>().await.context("seal take")?;
     pipe.close();
-    // The seal advanced the fork's fold over the turn suffix, so the fork —
-    // not the state the turn generated on — is what must be retained, or the
-    // next resume would replay a fold short by exactly the suffix.
-    state.rs = rs_owned;
     Ok(end)
 }
