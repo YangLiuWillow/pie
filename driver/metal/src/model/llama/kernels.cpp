@@ -46,6 +46,14 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // compiling them anyway would let an unrelated shader error fail a load
     // that would otherwise have worked.
     if (g.is_moe()) {
+        // The router at its own width, when the checkpoint gave it one. Same
+        // entrypoint as the dense matvec the router otherwise shares -- only
+        // the suffix differs, because only the bytes do.
+        if (g.has_alt_router_quant()) {
+            specs.push_back({"quantized_qmv.metal",
+                             "affine_qmv_fast" + g.router_quant.kernel_suffix(),
+                             &out.router_alt});
+        }
         specs.push_back({"moe_route.metal", "router_topk_bfloat16", &out.router_topk});
         specs.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});

@@ -87,6 +87,17 @@ struct LlamaPsos {
 
     // Routed FFN. Left invalid on a dense checkpoint -- see `valid()`.
     Pso router_topk{};
+    /// The router's matvec at ITS OWN affine width, for a checkpoint that
+    /// quantized `mlp.gate` differently from the rest of the model. Invalid
+    /// when the model is uniform, which is the usual case; `pso_for` then
+    /// leaves the router on the shared dense pipeline as before.
+    ///
+    /// Only the matvec, and that is not an omission: `llama_is_dense_proj`
+    /// deliberately excludes the router from the GEMM ("its N is the expert
+    /// count, tens of columns against a hidden of thousands"), so this one
+    /// pipeline covers the router at every row count. See
+    /// `LlamaGeometry::router_quant` for what goes wrong without it.
+    Pso router_alt{};
     /// The routed matvec. Unbiased: Qwen's experts carry no bias, unlike
     /// gpt-oss's.
     Pso qmv_routed{};

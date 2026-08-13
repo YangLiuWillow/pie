@@ -53,6 +53,29 @@ struct LlamaGeometry {
     /// a pipeline built for the wrong pair answers instead of failing.
     AffineFormat quant{4, 64};
 
+    /// The MoE router's affine format, when `mlp.gate` is quantized differently
+    /// from the rest of the model. `{0,0}` means it is not, which is the usual
+    /// case and costs nothing.
+    ///
+    /// mlx-lm's quantization predicate can single out tensors by NAME, and
+    /// `config.json` records only the model-wide choice in its top-level
+    /// `bits`/`group_size` -- the per-tensor overrides sit beside them under
+    /// their own keys. mlx-community's Qwen3-Coder-30B-A3B-Instruct-4bit spares
+    /// exactly one tensor per layer this way: `mlp.gate` is 8-bit where
+    /// everything else is 4.
+    ///
+    /// Reading it at the model-wide width is not a rounding difference. It
+    /// walks an 8-bit tensor's rows at half their stride, and the router's
+    /// output is a top-k SELECTION -- so every token routes to essentially
+    /// random experts and the model emits fluent-looking noise. gemma4 hit this
+    /// first and measured the router's logits at cosine 0.10 to mlx-lm's "with
+    /// every tensor feeding them at 0.9999"; llama had no equivalent and so
+    /// served this checkpoint as garbage.
+    AffineFormat router_quant{0, 0};
+    bool has_alt_router_quant() const {
+        return router_quant.bits != 0 && router_quant.group != 0;
+    }
+
     /// Qwen3 RMS-normalises q and k per head before the rotation. Not a scale
     /// difference -- the norm is over `head_dim` with its own learned weight,
     /// and omitting it on a checkpoint that has one is a wrong model that still

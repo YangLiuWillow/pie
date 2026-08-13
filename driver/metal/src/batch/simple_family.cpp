@@ -3,6 +3,7 @@
 #include "simple_family.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -1372,6 +1373,42 @@ class LlamaEngine final : public SimpleFamilyEngine {
         max_rows_ = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
         max_sampled_ = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
         if (max_sampled_ > max_rows_) max_sampled_ = max_rows_;
+
+        // Is the router in a second affine format? Asked of the TENSORS rather
+        // than the config, for the reason gemma4's copy of this gives: mlx-lm
+        // singles tensors out by name and `config.json` states only the
+        // model-wide choice. Asked here because the PSO tables are built below
+        // and need the answer.
+        //
+        // `mlp.gate.weight` and not `mlp.gate`: the dense SwiGLU's
+        // `mlp.gate_proj.weight` and the mixture's `switch_mlp.gate_proj.weight`
+        // both contain the shorter string, and picking either would answer this
+        // question with a tensor that is not the router.
+        if (g_.is_moe()) {
+            const auto view = load_plan.view();
+            for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                const auto& t = view.tensors.ptr[i];
+                const std::string name(reinterpret_cast<const char*>(t.name.ptr),
+                                       t.name.len);
+                if (name.find("mlp.gate.weight") == std::string::npos) continue;
+                const AffineFormat f{int(t.quant_bits_per_element),
+                                     int(t.quant_group_size)};
+                if (f.bits != 0 && f.group != 0 &&
+                    (f.bits != g_.quant.bits || f.group != g_.quant.group)) {
+                    g_.router_quant = f;
+                    // Said out loud, because the failure it prevents is silent:
+                    // without this the router runs the model-wide pipeline over
+                    // the wrong bytes and the model emits fluent nonsense, with
+                    // nothing in any log to say why.
+                    std::fprintf(stderr,
+                                 "[pie-metal] router `mlp.gate` is %d-bit at group %d "
+                                 "where the model is %d-bit at group %d; "
+                                 "building it a second pipeline\n",
+                                 f.bits, f.group, g_.quant.bits, g_.quant.group);
+                }
+                break;
+            }
+        }
 
         try {
             const auto storage = load_plan.view();

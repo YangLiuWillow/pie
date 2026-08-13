@@ -353,6 +353,12 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
         case Kind::ExpertSort:    return ll.moe_sort;
         case Kind::ExpertGather:  return ll.moe_gather;
         case Kind::ExpertCombine: return ll.moe_combine;
+        // A checkpoint whose `mlp.gate` is in a second affine format. Left
+        // invalid by a uniform one, which falls through to the shared dense
+        // matvec exactly as it always did.
+        case Kind::Router:
+            if (ll.router_alt.valid()) return ll.router_alt;
+            break;
         case Kind::ExpertGate:
         case Kind::ExpertUp:
         case Kind::ExpertDown: {
