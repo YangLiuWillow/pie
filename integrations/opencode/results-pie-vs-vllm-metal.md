@@ -18,7 +18,10 @@
 > never emitting sense — and no quality, trajectory or tool-calling claim from
 > this workload survives. One cause is found and fixed (the router was read at
 > the wrong quantization width; see the 2026-08-13 commits); at least one more
-> remains, and the model now stops instantly instead.
+> is proven to be the chat-template cue (an empty `<think>` block injected into a
+> model with no thinking channel) rather than anything in the driver — see
+> `results-prefill-profile.md`. With the router fixed the model answers
+> ordinary prompts correctly.
 >
 > **2. The prefill ratios are superseded.** The matrix-unit attention landed on
 > 2026-08-13 and is worth **2.35× on prefill**. See the fresh, valid measurement
@@ -45,6 +48,13 @@ request, so it never reaches it — by construction, not by luck.
 Remaining, in the order A2 ranked them: the quantized GEMM is still ~2.4×
 behind MLX's `quantized_matmul` on these shapes, and that is now the largest
 single item left.
+
+---
+
+# The original 2026-08-12 measurement, on Coder-30B
+
+*Superseded for prefill and suspect for behaviour — see the warning at the top.
+Kept because the config-parity work and the method notes below still stand.*
 
 *Machine: `Lius-MacBook-Pro`, M-series, 48 GB unified, macOS 26.5.1, Metal.
 One server at a time (each model is ~20 GB). Same replayed transcript, same

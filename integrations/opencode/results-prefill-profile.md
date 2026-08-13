@@ -860,10 +860,57 @@ this — gemma4's comment records the router at "cosine 0.10 to mlx-lm's, with
 every tensor feeding them at 0.9999" — and llama simply had none. It does now,
 and says so at load.
 
-**It is not the whole story.** With the router fixed, Coder-30B stops emitting
-word salad and instead emits `<|endoftext|>` immediately. So at least one more
-defect remains in llama's routed path. Qwen3-0.6B is byte-identical before and
-after, and `llama_numerics_test` is unchanged at 51/18.
+**With the router fixed, the model works.** Coder-30B answers properly now:
+
+```
+"Write a Python function that adds two numbers."
+  -> ```python\ndef add_numbers(a, b):\n    """\n    Add two numbers ...
+"The capital of France is"  ->  "The capital of France is Paris."   (finish: stop)
+"def fibonacci(n):"         ->  a correct iterative implementation
+```
+
+Qwen3-0.6B is byte-identical before and after — a uniform checkpoint leaves the
+slot invalid and falls through to the shared dense matvec — and
+`llama_numerics_test` is unchanged at 51/18.
+
+### The second defect, and it is not in the driver at all
+
+Some prompts still return `<|endoftext|>` immediately. That is **the known cue
+divergence**, and it is now proven rather than suspected. pie renders 21 prompt
+tokens where the official template renders 17, and the four are exactly
+`<think>\n\n</think>\n\n` — `cue_no_think()`, which `QwenInstruct` emits when
+`has_thinking` is set.
+
+Proven **without pie in the picture at all**, on mlx-lm, same checkpoint, same
+prompt, only the cue changed:
+
+| cue | mlx-lm's answer |
+|---|---|
+| `<\|im_start\|>assistant\n` | `1, yte, 3, 4, 5, 6, 7, 8, ` |
+| `…assistant\n<think>\n\n</think>\n\n` | `''` — immediate EOS |
+
+So the empty think block alone silences this model. Qwen3-Coder has no thinking
+channel and never saw those tokens in training.
+
+**Why pie gets it wrong, and why it is not a one-line fix.** `create()` in
+`model/src/instruct.rs` dispatches on the architecture stem, and Qwen3-Coder-30B
+and the *thinking* Qwen3-30B are both `Qwen3MoeForCausalLM` → `qwen3moe`. The
+tokenizer cannot separate them either — both carry `<think>` (151667) in vocab.
+The one signal that does is the **chat template**, and the artifact does not
+carry it: `chat_template` appears zero times in the `.zt`, because this
+checkpoint keeps it in a separate `chat_template.jinja` that the build never
+imported. `has_thinking` is already a `ChatMLConfig` field and `cue_no_think()`
+already returns the plain cue when it is false — what is missing is a way to
+know.
+
+Commit `1e8e16140` measured this divergence (`-4 tokens`) and says the real fix
+— `Dialect::Qwen36` plus a Coder dialect, golden-tested 23/23 — exists on
+`liu/qwen-code-dev` and "touches shared model-side code so it needs coordinating
+with the openclaw track". Left for that coordination rather than forced here.
+
+What this adds to that commit: the divergence is not only a parity nicety. It is
+half of why this model was unusable, and now that the router is fixed it is the
+whole of what remains.
 
 **What this costs the record**: `results-pie-vs-vllm-metal.md` was measured
 entirely on Coder-30B. Its timings still describe work done, but no claim about
