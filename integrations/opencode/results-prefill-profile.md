@@ -710,3 +710,49 @@ to test against — that rests on the argmax-amplification argument above, which
 is the same reasoning `device_tuning.hpp` invokes when it names the greedy gate
 as the catcher. Three prompts is also a thin set: widen `PROMPTS` rather than
 trusting a green run on three.
+
+## Scope correction: the MMA fix is NOT four files of wiring
+
+Reading the code to apply it found a blocker that the earlier scoping missed.
+
+**The Qwen prefill attention is strided; the MMA kernel is not.**
+
+`sdpa_paged.metal` has a contiguous kernel and a strided twin — "the prefill's
+twin: q and out rows a uniform pitch apart" — and the contiguous one calls
+through with `q_row_pitch=0, o_row_pitch=0`. The Qwen prefill selects
+`sdpa_paged_tiled_strided` under `strided_rows > 0`
+(`decode_step_mb.cpp:931`), and there is **no** non-strided tiled selection in
+that module at all, so there is no contiguous path to wire the matrix kernel
+into as a first step.
+
+`sdpa_paged_mma` takes buffers 0–17 with **no pitch parameters**. It is the
+contiguous shape only.
+
+Two other things the earlier note got wrong, both corrected here:
+
+- The non-sink variant already exists — `instantiate_sdpa_paged_mma("",
+  bfloat16, bfloat, 64, 16, false)`, commented "llama / qwen d=64". It is
+  instantiated in the `.metal` and **no PSO is ever built for it**: only
+  gpt-oss's `_sink` variant is compiled. So it is prepared-and-unwired rather
+  than absent.
+- The threadgroup-memory figure was short. With the query tile included, D=128
+  KT=16 is **16,384 B** (not 12,288), which still fits the 32 KB budget.
+
+**Real scope**, in dependency order:
+
+1. Add `q_row_pitch` / `o_row_pitch` to `sdpa_paged_mma`, mirroring
+   `sdpa_paged_tiled_strided`. This is a kernel change, not wiring — and it is
+   the one carrying the register-layout risk the driver warns about.
+2. Instantiate at D=128 (`..., 128, 16, false`).
+3. A PSO slot in the shared set + build it.
+4. Widen `kSdpaMmaHeadDim` to a supported set.
+5. Wire selection, matching grid **and** threadgroup size — 128 threads for MMA
+   against 1024 for tiled. gpt-oss's note is explicit that disagreeing here "is
+   a grid that describes a kernel other than the one that runs", and the Qwen
+   site's own comment says handing it the wrong head count "is a wrong answer
+   rather than a refusal".
+
+The greedy gate (`test_attention_paths.py`) is the right check for all of it and
+is already in place. The estimate that changed is the effort, not the prize:
+attention is still 6× behind and 56% of the forward, so ~1.9× on prefill is
+still what this buys.
