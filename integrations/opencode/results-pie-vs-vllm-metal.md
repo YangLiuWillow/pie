@@ -73,15 +73,36 @@ vs 64/34/50/53/59/49), so it is not losing by doing more decode work.
 
 ## What this measurement does NOT establish
 
-1. **The prompts are not byte-identical between stacks.** pie renders through its
-   WIT template; vLLM renders the checkpoint's `chat_template.jinja`. Turn 1:
-   7268 tokens (pie) vs 7235 (vLLM) on the Coder-30B, 7351 vs 7471 on the 35B —
-   0.5% to 2.7% apart. That difference is small in size and evidently large in
-   effect: pie ran to `max_tokens` every turn while vLLM stopped after 11 tokens,
-   which is a behavioural divergence, not a timing one. **Fixing this is the next
-   prerequisite**, and vLLM exposes `/v1/chat/completions/render` for exactly
-   that comparison (the trick `parity/capture_vllm_render.py` uses on
-   `liu/qwen-code-dev`).
+1. **The prompts are not byte-identical, and the cause is now known — it is a
+   pie rendering BUG, not a formatting nit.** Measured exactly with
+   `parity/check_render_vllm.py` against vLLM's own
+   `/v1/chat/completions/render` (5/5 fixtures diverge):
+
+   | | pie | vLLM |
+   |---|---|---|
+   | generation cue | `<\|im_start\|>assistant\n<think>\n\n</think>\n\n` | `<\|im_start\|>assistant\n` |
+   | tool preamble | `# Tools\n\nYou may call one or more…` | `You have access to the following functions…` |
+
+   pie renders **Qwen3-Coder with the Qwen3 hermes/ChatML tool dialect** instead
+   of the Coder XML dialect (~50 tokens), and injects an empty think block into
+   a **non-thinking** model (4 tokens). This is the invariant-#9 class: the arch
+   stem `qwen3moe` maps to the generic `QwenInstruct` template.
+
+   **It explains the behavioural divergence**: pie ran to `max_tokens` (96) every
+   turn while vLLM stopped at 11, because the model is being prompted in a
+   dialect it was not tuned for on this checkpoint.
+
+   **Consequence for the numbers above:** the pie-vs-pie A/B is unaffected (both
+   arms share the renderer), and the *prefill-rate* comparison survives (a token
+   is a token, and the profiling sweep used tool-free prompts where only the
+   4-token cue differs). What is **not** valid is any comparison of generation
+   behaviour, output quality, or completion length on the Coder-30B.
+
+   The qwen-code branch already solved this — `Dialect::Qwen36` and a Coder
+   dialect in its `render_text.rs`, golden-tested against the real
+   `chat_template.jinja`, reported as "Coder-dialect prompt parity: 23/23 exact
+   against a served Coder model". Porting it into the WIT template path is the
+   fix.
 2. **This is a Metal result — but the gap is NOT Metal-only.** An earlier
    version of this section cited the OpenHands evaluation as measuring pie
    **~26% faster** than litellm+vLLM on CUDA, and used it to argue the Metal
