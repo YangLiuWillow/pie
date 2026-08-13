@@ -1,0 +1,5 @@
+{"instance_id": "astropy__astropy-13398", "model_name_or_path": "pie-qwen3-coder-30b", "model_patch": ""}
+{"instance_id": "django__django-11749", "model_name_or_path": "pie-qwen3-coder-30b", "model_patch": ""}
+{"instance_id": "django__django-16333", "model_name_or_path": "pie-qwen3-coder-30b", "model_patch": ""}
+{"instance_id": "sphinx-doc__sphinx-8035", "model_name_or_path": "pie-qwen3-coder-30b", "model_patch": ""}
+{"instance_id": "sympy__sympy-24066", "model_name_or_path": "pie-qwen3-coder-30b", "model_patch": ""}
