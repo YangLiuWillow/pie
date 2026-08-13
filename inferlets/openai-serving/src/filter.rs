@@ -24,20 +24,36 @@
 
 use crate::types::{ChatMessage, MessageContent};
 
-const OPENERS: [&str; 2] = ["<think>", "<tool_call>"];
+/// `<function=` is an opener in its own right, not only inside `<tool_call>`.
+///
+/// Qwen3-Coder emits a bare `<function=read>…</function>` with no wrapper often
+/// enough that the tool DECODER has a back-off for it, and the filter needs the
+/// same one or the two disagree: the call is executed, and its raw XML also
+/// arrives as assistant text. Seen end to end — stock opencode ran `Read
+/// hello.txt` and answered correctly, with the markup printed above the answer
+/// and replayed into the next request's history.
+///
+/// A wrapped call never reaches this arm: `<tool_call>` sorts earlier and
+/// `Mode::Tool` swallows through `</tool_call>`, nested function tag included.
+const OPENERS: [&str; 3] = ["<think>", "<tool_call>", "<function="];
 const CLOSE_THINK: &str = "</think>";
 const CLOSE_TOOL: &str = "</tool_call>";
+const CLOSE_FUNCTION: &str = "</function>";
 /// Closers are markers in Text mode too — see the `Mode::Text` arm.
-const CLOSERS: [&str; 2] = [CLOSE_THINK, CLOSE_TOOL];
+const CLOSERS: [&str; 3] = [CLOSE_THINK, CLOSE_TOOL, CLOSE_FUNCTION];
 /// Everything the Text-mode holdback must be able to wait on. A closer that
 /// straddles a chunk boundary has to be held back exactly like an opener, or
 /// its first half leaks as content and its second half is never recognised.
-const MARKERS: [&str; 4] = ["<think>", "<tool_call>", CLOSE_THINK, CLOSE_TOOL];
+const MARKERS: [&str; 6] = [
+    "<think>", "<tool_call>", "<function=", CLOSE_THINK, CLOSE_TOOL, CLOSE_FUNCTION,
+];
 
 enum Mode {
     Text,
     Think,
     Tool,
+    /// Inside a `<function=…>` that arrived without a `<tool_call>` wrapper.
+    Function,
 }
 
 pub struct VisibleFilter {
@@ -91,6 +107,7 @@ impl VisibleFilter {
                             self.mode = match marker {
                                 "<think>" => Mode::Think,
                                 "<tool_call>" => Mode::Tool,
+                                "<function=" => Mode::Function,
                                 // An unmatched closer: drop the marker and
                                 // stay in Text. The text BEFORE it is
                                 // reasoning, but in streaming it is already
@@ -117,6 +134,11 @@ impl VisibleFilter {
                 }
                 Mode::Tool => {
                     if !self.drop_until(CLOSE_TOOL) {
+                        break;
+                    }
+                }
+                Mode::Function => {
+                    if !self.drop_until(CLOSE_FUNCTION) {
                         break;
                     }
                 }
@@ -294,6 +316,39 @@ pub fn sanitize_messages(messages: &mut [ChatMessage], specials: &[String]) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bare_function_block_is_markup_not_content() {
+        // Qwen3-Coder emits this shape with no <tool_call> wrapper. The tool
+        // decoder already accepts it; if the filter does not, the call is both
+        // executed AND printed.
+        let mut f = VisibleFilter::new();
+        let mut out = f.feed(
+            "<function=read>\n<parameter=filePath>\n/tmp/hello.txt\n</parameter>\n</function>",
+        );
+        out.push_str(&f.feed("The answer is 42."));
+        out.push_str(&f.finish());
+        assert_eq!(out, "The answer is 42.");
+    }
+
+    #[test]
+    fn a_wrapped_call_is_still_swallowed_whole() {
+        // The nested `<function=` must not end the block early: `</tool_call>`
+        // is what closes it, and anything between is markup.
+        let mut f = VisibleFilter::new();
+        let mut out = f.feed("<tool_call>\n<function=read>\n</function>\n</tool_call>ok");
+        out.push_str(&f.finish());
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn a_function_opener_split_across_chunks_does_not_leak() {
+        let mut f = VisibleFilter::new();
+        let mut out = f.feed("<funct");
+        out.push_str(&f.feed("ion=read>\nx\n</function>done"));
+        out.push_str(&f.finish());
+        assert_eq!(out, "done");
+    }
     use super::*;
 
     fn run(chunks: &[&str]) -> (Vec<String>, String) {
