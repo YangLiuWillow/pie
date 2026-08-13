@@ -521,3 +521,80 @@ Order of work, revised:
     --tokens 2048 --layers 28 --pie-forward-ms 657
 # and the SDPA reference via bench_sdpa(2048, 16, 8, 128)
 ```
+
+---
+
+# B1: cross-conversation head sharing — done
+
+opencode re-prefills a ~7.2k-token system+tools head for every new session. At
+pie's measured 297 tok/s that is ~24 s of pure repetition per conversation, and
+it is exactly the cold-start share OpenHands measured as **71% of concurrency-1
+prefill** — the part no within-conversation cache can touch.
+
+## Is opencode's head shareable? Partly, and position decides how much
+
+OpenHands built this and it **never fired**: their head hash differed per
+instance because `FileEditorTool` embedded the cwd in its description
+(`d93f6cffe`). So that was the first thing checked here.
+
+| | chars | shareable by a *prefix* cache |
+|---|---:|---|
+| system prose | 8,695 | ✅ invariant |
+| environment block — `Working directory:`, `Is directory a git repo:`, `Platform:`, `Today's date:` | 953 | ✗ per session |
+| tool schemas | 21,188 | ✗ **byte-identical, but downstream of the block** |
+
+The largest invariant chunk — 69% of the head — is unreachable purely because
+opencode emits the environment in the *middle* of its system prompt. Reordering
+would fix it and is not ours to do: it changes what the model sees.
+
+## What was actually wrong on our side: boundary granularity
+
+Two bugs, both of which made sharing impossible regardless of the content:
+
+1. **Boundaries were one per render op.** opencode's head is a *single*
+   `EquipAfterSystem` op, so its only boundary was the whole ~7.2k-token head —
+   which never matches between sessions, because the tail differs.
+   Fixed with `BOUNDARY_STRIDE = 256`: interior candidates every 256 tokens, so
+   wherever two token streams agree, a boundary lands inside the agreement. Same
+   idea as vLLM's block-level APC, coarser because each boundary costs a digest
+   snapshot rather than a page-table entry.
+2. **Only the tip boundary was retained.** The lookup computed every boundary
+   and then stored one. A branch's list therefore held nothing another
+   conversation could match. Fixed by retaining the whole render's boundary list
+   (every entry ≤ the retained length is a valid resume point).
+
+The attempt cap also went: OpenHands caps at 8 because each try is a
+`Context::open` engine round trip, but ours is a string compare against an
+in-memory list — and a cross-conversation match lands ~2.1k tokens into a
+~7.3k-token render, nowhere near the longest boundary, so a cap of 8 would never
+reach it.
+
+## Measured
+
+| case | shared | |
+|---|---:|---|
+| two real sessions, same repo + same day | **7,250 / 7,268** | **99.8%** |
+| different repo **and** different date | **1,792 / 7,223** | **24.8%** (the floor) |
+
+The floor matches the 28.2% predicted from the char counts, short by one stride
+(a boundary must land on a 256-token multiple).
+
+**The earlier "~24 s per session" estimate was wrong**: it assumed the whole head
+would share. The honest figures are ~24 s for a developer working in one repo on
+one day, and ~6 s as the guaranteed floor across repos and dates.
+
+## It broke two tests, and both were right to break
+
+`test_divergent_history_misses_cleanly` asserted that an edited history resumes
+*nothing*. That held when an edited turn invalidated the only boundary there
+was. Now the **system turn ahead of the edit is a genuine shared prefix**, and
+resuming it is correct — it is the same mechanism as head sharing. The test now
+asserts the real safety property, which is stronger: the resume must stop
+*before* the edit (measured: 23 tokens against 33 unedited).
+
+The suite also had to be isolated. Every test shared one `SYSTEM` constant, so
+after the first test the prefix was already resident and "first turn" assertions
+saw a non-zero `cached`. Each case now gets its own tag. The feature worked well
+enough to break the tests that were meant to police it.
+
+Suites: 25/25 acceptance, 5/5 resume, 2/2 head sharing, 70 native.

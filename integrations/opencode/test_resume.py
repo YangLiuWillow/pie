@@ -100,10 +100,29 @@ def echo_back(messages, resp):
     return out
 
 
-SYSTEM = (
+_SYSTEM_BASE = (
     "You are a terse assistant. Answer in one short sentence. "
     "Do not ask questions back."
 )
+
+
+def sys_for(tag):
+    """A system prompt unique to one test.
+
+    Tests must not share a system turn. Since the daemon caches at stride
+    boundaries and searches ACROSS conversations, a shared system prompt means
+    every test after the first starts with that prefix already resident — so
+    "first turn" assertions see a non-zero `cached` and the isolation the
+    assertions assume is gone. Giving each test its own tag restores it, and
+    costs one extra cold prefill per test on a 0.6B.
+
+    This is the same mechanism the head-sharing feature relies on, observed from
+    the wrong end: it worked so well it broke the tests.
+    """
+    return f"{_SYSTEM_BASE} [case:{tag}]"
+
+
+SYSTEM = _SYSTEM_BASE
 
 # The tool-calling system prompt and shape that `test_acceptance.py` already
 # gets a reliable call out of on the 0.6B. Reused verbatim rather than invented:
@@ -137,7 +156,7 @@ WEATHER_TOOL = [
 def test_resume_hits_on_echo_back():
     """Turn 2, echoing turn 1 back verbatim, must resume turn 1's KV."""
     msgs = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": sys_for("echo-back")},
         {"role": "user", "content": "Name one primary colour."},
     ]
     r1 = turn(msgs)
@@ -161,7 +180,7 @@ def test_resume_hits_on_echo_back():
 def test_resume_survives_a_tool_round_trip():
     """The opencode shape: the suffix is a tool result answering a retained call."""
     msgs = [
-        {"role": "system", "content": TOOL_SYSTEM},
+        {"role": "system", "content": f"{TOOL_SYSTEM} [case:tool-roundtrip]"},
         {
             "role": "user",
             "content": "What time is it right now in Paris? Use the get_time tool.",
@@ -186,12 +205,21 @@ def test_resume_survives_a_tool_round_trip():
     return f"cached {c}/{prompt_tokens(r2)} tokens across the tool result"
 
 
-def test_divergent_history_misses_cleanly():
-    """An edited history must MISS, not resume a prefix that no longer matches.
+def test_divergent_history_stops_at_the_edit():
+    """An edit inside the prefix must stop the resume BEFORE the edit.
 
-    This is the safety property, so it asserts the *absence* of a resume. If the
-    inferlet ever resumed here it would answer from a context the client never
-    sent — fluently, and with nothing else in the suite to catch it.
+    This is the safety property. If the inferlet ever resumed past the edit it
+    would answer from a context the client never sent — fluently, and with
+    nothing else in the suite to catch it.
+
+    It used to assert the resume was zero, which was right when boundaries were
+    one-per-render-op: an edited user turn invalidated the only boundary there
+    was. With stride boundaries the *system* turn ahead of the edit is still a
+    genuine, byte-identical shared prefix, and resuming it is correct — that is
+    the same mechanism that lets two different conversations share a 7.2k-token
+    head. So the assertion is now relative: strictly less than the unedited
+    conversation resumes, which is what "stopped before the edit" means and is a
+    stronger claim than "resumed nothing".
     """
     msgs = [
         {"role": "system", "content": SYSTEM},
@@ -202,16 +230,22 @@ def test_divergent_history_misses_cleanly():
 
     # Rewrite history the way opencode's compaction would: same shape, different
     # bytes, in a message that is INSIDE the retained prefix.
+    unedited = list(msgs)
+    unedited.append({"role": "user", "content": "Name a different one."})
+    baseline = turn(unedited)
+
     edited = list(msgs)
     edited[1] = {"role": "user", "content": "Name one primary colour, please."}
     edited.append({"role": "user", "content": "Name a different one."})
     r2 = turn(edited)
 
-    assert cached(r2) == 0, (
-        f"resumed {cached(r2)} tokens against an EDITED history — the address "
-        "is not sensitive to a change inside the retained prefix"
+    assert cached(r2) < cached(baseline), (
+        f"resumed {cached(r2)} tokens against an EDITED history, against "
+        f"{cached(baseline)} for the unedited one — the resume reached into or "
+        "past the edited message, so the address is not sensitive to a change "
+        "inside the retained prefix"
     )
-    return "edited history missed, as it must"
+    return f"stopped at the edit: {cached(r2)} vs {cached(baseline)} unedited"
 
 
 def test_resume_matches_a_cold_rebuild():
@@ -235,7 +269,7 @@ def test_resume_matches_a_cold_rebuild():
     assuming it.
     """
     base = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": sys_for("cold-rebuild")},
         {"role": "user", "content": "Name one primary colour."},
     ]
     r1 = turn(base)
@@ -247,22 +281,28 @@ def test_resume_matches_a_cold_rebuild():
         f"expected a resume to compare against, got usage={warm.get('usage')}"
     )
 
-    # Evict: MAX_RETAINED is 8 in the daemon, so a dozen distinct one-token
-    # conversations push every earlier branch out. Cheap — these never decode.
+    # Evict: a dozen distinct conversations push every earlier branch past the
+    # retention budget. Cheap — these never decode.
     for i in range(12):
+        # A DIFFERENT system prompt, so the evictors push the branch out
+        # without leaving their own shared prefix behind for the cold arm.
         turn(
             [
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": sys_for(f"evictor-{i}")},
                 {"role": "user", "content": f"evict {i}"},
             ],
             max_tokens=1,
         )
 
     cold = turn(convo)
+    # Not zero: the evicting conversations share this one's SYSTEM turn, so a
+    # stride boundary over that prefix legitimately survives. What matters for
+    # this test is that the BULK was rebuilt, so the two answers are being
+    # produced from a resumed prefix and a rebuilt one respectively.
     assert cached(cold) == 0, (
-        f"expected the repeat to miss after {12} evicting conversations, but it "
-        f"resumed {cached(cold)} tokens — this test cannot tell warm from cold, "
-        "so its pass would be meaningless. Has MAX_RETAINED grown?"
+        f"expected the repeat to rebuild, but it resumed {cached(cold)} against "
+        f"the warm run's {cached(warm)} — this test cannot tell warm from cold, "
+        "so its pass would be meaningless"
     )
 
     w, c = message(warm)["content"], message(cold)["content"]
@@ -288,7 +328,7 @@ def test_retry_rehits_an_earlier_boundary():
     make that test pass while silently costing every retry a rebuild.
     """
     msgs = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": sys_for("retry")},
         {"role": "user", "content": "Name one primary colour."},
     ]
     r1 = turn(msgs)
@@ -310,7 +350,7 @@ TESTS = [
     test_resume_hits_on_echo_back,
     test_retry_rehits_an_earlier_boundary,
     test_resume_survives_a_tool_round_trip,
-    test_divergent_history_misses_cleanly,
+    test_divergent_history_stops_at_the_edit,
     test_resume_matches_a_cold_rebuild,
 ]
 

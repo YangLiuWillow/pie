@@ -319,7 +319,7 @@ impl Daemon {
         // resume candidates.
         let model_id = model::name();
         let addressed = prefix_addresses(&model_id, TEMPLATE_MARKER, &full, &bounds);
-        let save_address = match addressed.last() {
+        let _save_address = match addressed.last() {
             Some((_, a)) => a.clone(),
             None => {
                 eprintln!("[opencode-session] render produced no boundaries");
@@ -329,13 +329,18 @@ impl Daemon {
         };
 
         // ── Resume: scan candidates longest-first ────────────────────────
-        // Capped, because each attempt is a scan and the useful hit is nearly
-        // always the longest. Upstream measured 1.97 attempts per call.
+        // Every boundary is tried, longest-first. OpenHands caps this at 8
+        // because each attempt is a `Context::open` — an engine round trip. Ours
+        // is a string compare against an in-memory list, so ~30 boundaries × ≤8
+        // branches is a few hundred comparisons and the cap would only cost
+        // hits: a cross-conversation match lands ~2.1k tokens into a ~7.3k-token
+        // render, which is nowhere near the longest boundary and a cap of 8
+        // would never reach it.
         //
         // The final boundary (this turn's whole render) is deliberately NOT a
         // candidate: resuming there would leave an empty delta, and re-rendering
         // one trailing unit is cheaper than a special case for it.
-        const MAX_ATTEMPTS: usize = 8;
+        const MAX_ATTEMPTS: usize = usize::MAX;
         let page_t = kv_page_size();
         let mut resume_at: Option<(usize, u32)> = None; // (branch index, boundary)
         for (b, addr) in addressed.iter().rev().skip(1).take(MAX_ATTEMPTS) {
@@ -401,9 +406,6 @@ impl Daemon {
         // to mutate it — which is two live borrows of the same value.
         let keepalive = state.meta.keepalive();
         let ka_sink = sink.clone();
-        // Boundaries carried over from the branch we resumed (empty on a cold
-        // turn); this turn's own boundary is appended on retain.
-        let mut parent_boundaries: Vec<(u32, String)> = Vec::new();
 
         // The branch is TAKEN out of the list: the turn extends that very
         // working set (nothing forks — see `engine::Resume`), so leaving a
@@ -430,10 +432,7 @@ impl Daemon {
 
         let run = {
             let resume = match owned_parent.take() {
-                Some(r) => {
-                    parent_boundaries = r.boundaries;
-                    engine::Resume::InPlace(r.state, cached_tokens)
-                }
+                Some(r) => engine::Resume::InPlace(r.state, cached_tokens),
                 None => engine::Resume::Cold,
             };
             let st = &mut state;
@@ -498,7 +497,7 @@ impl Daemon {
         // with the decoded token count, the turn state machine and the decode
         // loop have diverged.
         let accepted = run.accepted;
-        let retained = self.retain_turn(run, parent_boundaries, save_address);
+        let retained = self.retain_turn(run, addressed);
         // Built as ONE string and printed with a single placeholder. A
         // multi-fragment `eprintln!` is split by the runtime's stderr capture
         // into one client message PER FRAGMENT, so the interpolated form
@@ -559,15 +558,27 @@ impl Daemon {
     fn retain_turn(
         &mut self,
         run: engine::Generation,
-        mut boundaries: Vec<(u32, String)>,
-        address: String,
+        addressed: Vec<(u32, String)>,
     ) -> String {
         if let Some(e) = run.gen_error {
             // Dropping `run` releases the state.
             return format!("not retained (generation error: {e})");
         }
         let total = run.total_len;
-        boundaries.push((total, address.clone()));
+        // Store EVERY boundary of this render, not just the tip. The retained
+        // KV covers [0, total), so every boundary at or below it is a valid
+        // resume point — and the interior ones are the only thing another
+        // conversation can ever match, since two sessions agree on a shared
+        // head and diverge before the end. Storing the tip alone silently
+        // reduces the cache to "resume your own last turn", which is what it
+        // did until this was measured: two conversations with byte-identical
+        // 7.2k-token heads shared nothing.
+        let boundaries: Vec<(u32, String)> =
+            addressed.into_iter().filter(|(l, _)| *l <= total).collect();
+        let address = boundaries
+            .last()
+            .map(|(_, a)| a.clone())
+            .unwrap_or_default();
         let candidate = Retained { state: run.state, boundaries };
         // kv_verify on the way IN as well as on the way out: a state that fails
         // its own invariants must never enter the map, or the next turn pays
@@ -642,12 +653,54 @@ impl Daemon {
 /// so a candidate prefix is a literal token prefix of this render **by
 /// construction** — a bad split cannot plant a wrong suffix. The final boundary
 /// is the whole render.
+/// Extra resume candidates emitted *inside* a long render op, every this many
+/// tokens.
+///
+/// Render-unit boundaries alone are too coarse to share anything across
+/// conversations, and the reason is a position accident. opencode's head is ONE
+/// op — `EquipAfterSystem` folds the system turn and the tool schemas together —
+/// so its only boundary is the whole ~7.3k-token head, which never matches
+/// between two sessions because the system prompt carries a per-session
+/// environment block:
+///
+/// ```text
+/// Working directory: /private/tmp/.../oc-project
+/// Is directory a git repo: no
+/// Today's date: Tue Aug 11 2026
+/// ```
+///
+/// That block sits 8,695 chars into a 9,648-char system message, *ahead* of
+/// 21,188 chars of tool schemas that ARE byte-identical across sessions. So a
+/// prefix cache can reach only the 28% before it — and only if a boundary
+/// exists there, which per-op boundaries do not provide.
+///
+/// Striding fixes it without knowing anything about opencode: wherever two
+/// token streams happen to agree, some stride boundary lands inside the
+/// agreement and the scan finds it. It is the same idea as vLLM's block-level
+/// APC, at coarser granularity because each boundary costs a digest snapshot
+/// and a scan entry rather than a page-table entry.
+const BOUNDARY_STRIDE: u32 = 256;
+
 fn render_history(ops: &[RenderOp]) -> Result<(Vec<u32>, Vec<u32>), String> {
     let mut out = Vec::new();
-    let mut bounds = Vec::with_capacity(ops.len());
+    let mut bounds: Vec<u32> = Vec::with_capacity(ops.len() * 4);
     for op in ops {
+        let before = out.len() as u32;
         render_one(op, &mut out)?;
-        bounds.push(out.len() as u32);
+        let after = out.len() as u32;
+        // Interior stride points, then the op's own edge. Ascending and
+        // duplicate-free, which `prefix_addresses` and the boundary list both
+        // require.
+        let mut at = before.next_multiple_of(BOUNDARY_STRIDE);
+        while at < after {
+            if at > before {
+                bounds.push(at);
+            }
+            at += BOUNDARY_STRIDE;
+        }
+        if bounds.last() != Some(&after) {
+            bounds.push(after);
+        }
     }
     Ok((out, bounds))
 }
