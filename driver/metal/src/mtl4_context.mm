@@ -2329,6 +2329,7 @@ StepTiming RawMetalContext::run_steps(
         return tm;
     }
 
+    const auto encode_begin = M0TimingCounters::Clock::now();
     double t0 = nowms();
     [I.alloc[ab] reset];
     // One allocator can back several command buffers; `reset` only requires
@@ -2341,6 +2342,11 @@ StepTiming RawMetalContext::run_steps(
             encode_one_command_buffer(&I, ab, encode_fn));
     }
     double t1 = nowms();
+    // Host time spent encoding this forward's command buffers. Recorded so a
+    // caller can split a forward into encode (CPU) and wait (GPU) without a
+    // rebuild — the two were computed here and thrown away.
+    m0_timing_counters().record_encode(
+        M0TimingCounters::Clock::now() - encode_begin);
 
     const uint64_t signalled = I.commit_and_signal(cbs.data(), cbs.size(), 0);
 

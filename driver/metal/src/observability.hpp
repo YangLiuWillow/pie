@@ -7,6 +7,13 @@
 namespace pie::metal {
 
 struct M0TimingSnapshot {
+    // Host time spent building command buffers for a forward. Paired with
+    // `forward_wait_ns` (the block on the GPU's completion event) this splits a
+    // forward into "what the CPU did" and "what the GPU did", which is the
+    // decomposition a prefill-throughput investigation needs and the one the
+    // driver was computing and discarding.
+    std::uint64_t encode_samples = 0;
+    std::uint64_t encode_ns = 0;
     std::uint64_t cpu_epilogue_samples = 0;
     std::uint64_t cpu_epilogue_ns = 0;
     std::uint64_t bf16_conversion_samples = 0;
@@ -20,6 +27,8 @@ inline M0TimingSnapshot operator-(
     const M0TimingSnapshot& after,
     const M0TimingSnapshot& before) {
     return {
+        after.encode_samples - before.encode_samples,
+        after.encode_ns - before.encode_ns,
         after.cpu_epilogue_samples - before.cpu_epilogue_samples,
         after.cpu_epilogue_ns - before.cpu_epilogue_ns,
         after.bf16_conversion_samples - before.bf16_conversion_samples,
@@ -34,6 +43,9 @@ class M0TimingCounters {
   public:
     using Clock = std::chrono::steady_clock;
 
+    void record_encode(Clock::duration duration) {
+        record(encode_samples_, encode_ns_, duration);
+    }
     void record_cpu_epilogue(Clock::duration duration) {
         record(cpu_epilogue_samples_, cpu_epilogue_ns_, duration);
     }
@@ -49,6 +61,8 @@ class M0TimingCounters {
 
     M0TimingSnapshot snapshot() const {
         return {
+            encode_samples_.load(std::memory_order_relaxed),
+            encode_ns_.load(std::memory_order_relaxed),
             cpu_epilogue_samples_.load(std::memory_order_relaxed),
             cpu_epilogue_ns_.load(std::memory_order_relaxed),
             bf16_conversion_samples_.load(std::memory_order_relaxed),
@@ -60,6 +74,8 @@ class M0TimingCounters {
     }
 
     void reset_for_tests() {
+        encode_samples_.store(0, std::memory_order_relaxed);
+        encode_ns_.store(0, std::memory_order_relaxed);
         cpu_epilogue_samples_.store(0, std::memory_order_relaxed);
         cpu_epilogue_ns_.store(0, std::memory_order_relaxed);
         bf16_conversion_samples_.store(0, std::memory_order_relaxed);
@@ -83,6 +99,8 @@ class M0TimingCounters {
             std::memory_order_relaxed);
     }
 
+    std::atomic<std::uint64_t> encode_samples_{0};
+    std::atomic<std::uint64_t> encode_ns_{0};
     std::atomic<std::uint64_t> cpu_epilogue_samples_{0};
     std::atomic<std::uint64_t> cpu_epilogue_ns_{0};
     std::atomic<std::uint64_t> bf16_conversion_samples_{0};

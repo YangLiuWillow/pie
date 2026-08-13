@@ -1870,11 +1870,22 @@ class Context::Impl {
         }
         for (const auto& [wait_id, epoch] : notifications) notify(wait_id, epoch);
         notify(job->completion.wait_id, job->completion.target_epoch);
-        if (cfg_.runtime.verbose) {
+        // `PIE_METAL_TIMING=1` surfaces this without needing `runtime.verbose`,
+        // which an operator config cannot set: the driver's TOML blob is
+        // engine-generated and the Rust schema rejects `verbose` in [runtime].
+        // The encode/wait split is the decomposition a prefill investigation
+        // needs, and it was unreachable without a rebuild.
+        static const bool timing_env = [] {
+            const char* v = std::getenv("PIE_METAL_TIMING");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (cfg_.runtime.verbose || timing_env) {
             const M0TimingSnapshot timing =
                 m0_timing_counters().snapshot() - timing_before;
             std::cerr
                 << "[pie-driver-metal] ptir_m0_timing"
+                << " encode_ns=" << timing.encode_ns
+                << " encode_samples=" << timing.encode_samples
                 << " cpu_epilogue_ns=" << timing.cpu_epilogue_ns
                 << " cpu_epilogue_samples=" << timing.cpu_epilogue_samples
                 << " bf16_conversion_ns=" << timing.bf16_conversion_ns

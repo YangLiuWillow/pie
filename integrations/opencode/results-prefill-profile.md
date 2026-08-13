@@ -402,3 +402,51 @@ not a tuning-constant problem.** On CUDA the constants *were* the problem and
 tuning bought 2×. Here the exposed constants do nothing, which points at the
 kernel or the dispatch/layout rather than at a selection heuristic — and makes
 the MLX microbenchmark the decisive next step rather than one option among many.
+
+---
+
+# A1 result: prefill is **99.95% GPU execution**. The host is not involved.
+
+The Metal driver was already computing an encode/wait split per forward and
+discarding it. `PIE_METAL_TIMING=1` now surfaces it (additive, env-gated,
+default off; `runtime.verbose` remains unreachable from an operator config
+because the driver's TOML blob is engine-generated).
+
+One 2,556-token prefill on Qwen3-0.6B, Apple M5 Pro (20-core GPU):
+
+| | time | share |
+|---|---:|---:|
+| encode (host builds command buffers) | **0.33 ms** | **0.05%** |
+| forward wait (host blocked on the GPU event) | **657.07 ms** | **99.95%** |
+| cpu epilogue | 0.00 ms | 0% |
+| bf16 conversion | 0.00 ms | 0% |
+
+**This eliminates the entire host side in one measurement**: command-buffer
+encoding, dispatch construction, the epilogue, and dtype conversion together
+account for 0.05% of prefill. No amount of host-side work can recover anything.
+It also confirms the sampling profile from the other direction — the process was
+parked in `await_event` because there is genuinely nothing else to do.
+
+## What that leaves: the kernels, and a roofline to aim at
+
+Same work, same weights, same machine — 3.07 TFLOP of GEMM for 2,556 tokens:
+
+| | time | achieved |
+|---|---:|---:|
+| pie | 1.024 s | **3.00 TFLOPS** |
+| vLLM-metal (MLX) | 0.269 s | **11.40 TFLOPS** |
+
+pie is doing the same arithmetic at **~3.8× lower FLOPS on the same GPU**. That
+is not a scheduling, batching, or bookkeeping problem — it is the kernel.
+
+(FLOPs estimated as `2 × params × tokens`, which ignores attention and is
+therefore a slight undercount for both stacks equally; the ratio is what
+matters.)
+
+## Consequence for the plan
+
+A1 was meant to either localize the gap or eliminate the host, and it did both.
+**A2 (the MLX microbenchmark) is now the only open question on the driver
+track**, and it is narrower than it was: not "where does the time go" — that is
+answered — but "what does MLX's `quantized_matmul` do at M=2048 that pie's
+kernel does not". Everything else on Track A can wait on that answer.
