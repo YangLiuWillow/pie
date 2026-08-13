@@ -60,17 +60,29 @@ identical prompts exercising the boolean `replaceAll`:
 | 3 | ✓ | `{}` — empty arguments, 3 required missing |
 | **schema-valid** | **3/3** | **1/3** |
 
-vLLM's trial 2 is the important one: its parser *can* emit a correct boolean,
-so this is not a systematic mistyping. On the other two it returned a
-mis-named key and then no arguments at all while still reporting a tool call —
-a call it recognised and could not extract.
+**Retraction.** I wrote that this was "the same class of bug pie fixed —
+arguments must be typed from the schema". I then read vLLM's parser, and that
+attribution is wrong. The parser is:
 
-**What this does NOT establish** is where the fault lies. Both stacks render
-the Coder dialect and both parse XML; I did not isolate whether vLLM's
-extraction is dropping the arguments or its rendering is producing model
-output that cannot be extracted. The empty-argument case points at
-extraction, because a prompt difference does not usually yield a call with no
-arguments — but that is an inference, not a measurement.
+- `vllm/tool_parsers/qwen3_engine_tool_parser.py` — an 8-line adapter;
+- `vllm/parser/qwen3.py` — the XML grammar and state machine
+  (`<tool_call>` / `<function=` / `<parameter=`), whose `_qwen3_arg_converter`
+  does store every value as a raw string;
+- `vllm/parser/engine/parser_engine.py` — the engine, which then calls
+  `find_tool_properties(self._tools, func_name)` and `coerce_to_schema_type`
+  on the result.
+
+So vLLM **does** type arguments from the tool schema; it just does it one
+layer up from the converter I first read. Its trial-2 `replaceAll=true` is
+that coercion working. pie has no advantage here, and the sentence claiming
+one is withdrawn.
+
+**What the measured failures actually are**, re-read with that in mind:
+`{"path": …}` is a *wrong parameter name*, and `{}` is *nothing extracted* —
+neither is a typing error, and schema coercion cannot repair either. A wrong
+name is the model's; an empty extraction is either the model emitting
+something unparseable or the engine's segmentation. **I did not isolate
+which**, and n=3 cannot carry the attribution.
 
 **Why this was not "fixed".** vLLM's parser is a compiled Rust extension
 (`_rust_tool_parser.abi3.so`); this build exposes no `--tool-parser-plugin`,
