@@ -108,6 +108,59 @@ worth 1.50× on arm A and 1.31× on arm B.
 **Decode is at near-parity; prefill is 4.1× behind.** That is the whole story in
 one line.
 
+## Runtime profile: is that 4× GPU kernels, or pie's orchestration?
+
+The sweep above is black-box — it says *the per-token cost is 4× worse*, not
+*where in the process that time is spent*. Sampling the live server settles it.
+
+`sample <pid> 10` against `pie serve` during a ~9k-token prefill on the
+Coder-30B:
+
+- **95%+ of process samples are parked** — `psynch_cvwait`, idle rayon workers,
+  parked tokio workers, `__workq_kernreturn`.
+- The one thread doing anything is the Metal driver thread, and its deepest
+  frames are:
+
+```
+pie::metal::RawMetalContext::Impl::await_event(unsigned long long)
+  -[IOSurfaceSharedEvent waitUntilSignaledValue:timeoutMS:]   (in IOSurface)
+    iokit_user_client_trap                                     (in IOKit)
+```
+
+**The host is blocked on a GPU event.** pie's prefill time is GPU execution
+time, not orchestration, not wasm, not the engine's scheduling.
+
+**And it is not a synchronisation-cadence problem either.** `mtl4_context.mm`
+encodes *all* command buffers for a forward, then calls `commit_and_signal`
+**once**, then `await_event` **once** (`mtl4_context.mm:2338-2352`). One sync
+per forward, not per layer — so the gap is not death-by-round-trips.
+
+Combined with the black-box result, the localization is:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| per-call host overhead | **ruled out** | pie ~0 ms vs vLLM ~117 ms |
+| dispatch/sync cadence | **ruled out** | one commit + one await per forward |
+| MoE expert path | **ruled out** | same gap on a 0.6B dense model |
+| attention scaling | **secondary** | both stacks decay; pie slightly worse |
+| **GPU kernel throughput** | **this is it** | host parked in `await_event`; uniform ~4× per token |
+
+### An observability gap worth fixing upstream
+
+The Metal driver already measures exactly the right decomposition —
+`M0TimingCounters` carries `encode_ms`, `gpu_exec_ms`, `forward_wait_ns`, and
+`bf16_conversion_ns` (`context.cpp:1875`) — but it prints them only under
+`cfg_.runtime.verbose`, and **that flag is not reachable from an operator
+config**: the driver's TOML blob is engine-generated, and the Rust schema
+rejects `verbose` in `[runtime]` (`unknown field 'verbose'`). So the one
+breakdown that would separate encode time from GPU time on a real workload
+cannot be switched on without a rebuild. Worth a `[driver] verbose` passthrough.
+
+Also unrun on this machine: `pie config tune`, which doctor warns about on every
+boot ("planner profile none; the forward step has never been timed here"). It is
+a provisioning sweep that holds the whole device, so it was not run mid-session,
+but it is the obvious next action and may recover part of the gap.
+
 ## Cross-check against CUDA
 
 `openhands-integration-updated:integrations/openhands/runpod`, same model, H100,
