@@ -70,10 +70,15 @@ vs 64/34/50/53/59/49), so it is not losing by doing more decode work.
    prerequisite**, and vLLM exposes `/v1/chat/completions/render` for exactly
    that comparison (the trick `parity/capture_vllm_render.py` uses on
    `liu/qwen-code-dev`).
-2. **This is a Metal result, not a verdict on pie.** The OpenHands evaluation
-   measured pie **~26% faster** than litellm+vLLM on CUDA
-   (`PIE_VS_VLLM_EVALUATION.md` §4.2). pie's Metal driver is far younger than its
-   CUDA one. The gap here is most likely kernel maturity on this backend.
+2. **This is a Metal result — but the gap is NOT Metal-only.** An earlier
+   version of this section cited the OpenHands evaluation as measuring pie
+   **~26% faster** than litellm+vLLM on CUDA, and used it to argue the Metal
+   result was an artifact. **That was wrong twice over.** The 26% came from a
+   baseline the runpod handover calls *crippled* (`--enforce-eager` plus an
+   untuned MoE kernel); their fair-parity rerun puts pie at **parity to ~9%
+   behind** on an H100, with **prefill specifically 1.86× behind** (24.1k vs
+   44.9k tok/s). So the prefill gap exists on tuned CUDA too. Metal widens it to
+   4.4–6.4× (see `results-prefill-profile.md`); it does not create it.
 3. **Single run, no repetitions, shared laptop, batch-1, single tenant** — the
    regime the project's own honest performance frame says pie loses in. Nothing
    here touches multi-tenant load or subagent forking, which is where pie's
