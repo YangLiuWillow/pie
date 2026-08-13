@@ -680,3 +680,33 @@ So the honest prerequisite is a numerical guard: run the same prompt through the
 tiled and MMA paths and compare logits, or extend `llama_bench`'s greedy gate,
 which `device_tuning.hpp` names as the thing that would catch it. That is the
 next piece of work, and it should come **before** the four-file change, not after.
+
+## The greedy gate is in place
+
+`integrations/opencode/test_attention_paths.py` compares generated tokens across
+attention implementations at temperature 0. Greedy is the sensitive probe:
+the engine takes `reduce_argmax` at temperature 0, so any numerical drift large
+enough to flip one argmax becomes a visible, exactly-located divergence, and
+drift too small to flip an argmax anywhere in a long generation is drift that
+does not matter.
+
+Validated in both directions on Qwen3-0.6B:
+
+- **Positive** — the tiled kernel against the per-row kernel (forced with
+  `PIE_METAL_SDPA_TILE_MIN_ROWS=1000000`, so `sdpa_should_tile` never fires).
+  Two genuinely different attention implementations, **byte-identical output on
+  all three prompts** (21 / 323 / 1523 prompt tokens).
+- **Negative** — one character flipped inside the longest generation. The gate
+  fails, locates it at char 68, prints both contexts, and exits 1.
+
+So the harness distinguishes, and today's two paths agree. When the MMA path
+lands, capture a third with it enabled and compare against the tiled capture —
+same harness, no changes.
+
+**What this does and does not establish.** It proves the comparison is sensitive
+to a single token and that the two *existing* kernels agree. It does not prove
+the gate would catch any wrong MMA kernel, because there is no wrong kernel here
+to test against — that rests on the argmax-amplification argument above, which
+is the same reasoning `device_tuning.hpp` invokes when it names the greedy gate
+as the catcher. Three prompts is also a thin set: widen `PROMPTS` rather than
+trusting a green run on three.
