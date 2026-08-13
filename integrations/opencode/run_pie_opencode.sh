@@ -187,6 +187,13 @@ max_model_len = 16384
 
 [runtime]
 request_timeout = "300s"
+# The engine kills an inferlet that has been silent for this long, and under
+# strategy b that kill takes the gateway WebSocket down WITH it — the shim sees
+# `terminal event error: 'WebSocket connection closed'`, every in-flight turn
+# 500s, and the whole retained working set dies with the process. A 30 s default
+# is far inside a single 7k-token prefill on a 30B (measured: 44 s to first
+# content), so a long agentic turn trips it routinely.
+silence_timeout = "300s"
 
 [sandbox]
 allow_fs = false

@@ -62,6 +62,37 @@ pub enum FrameLaunchOutcome {
     Impossible,
 }
 
+/// Rewrite a copy plan's device-side domains to `device`, or `None` when the
+/// plan already agrees and no clone is needed.
+///
+/// A *device* domain names "wherever this backend's pages live"; the concrete
+/// tag only means something to the driver that receives it. `HOST_PINNED` is
+/// left alone — it names host memory on every backend, and rewriting it would
+/// silently turn an offload's device↔host transfer into a same-domain copy.
+#[cfg(feature = "driver-metal")]
+fn localize_device_domain(
+    plan: &KvCopyPlan,
+    device: pie_driver_abi::PieMemoryDomain,
+) -> Option<KvCopyPlan> {
+    let is_device = |d: pie_driver_abi::PieMemoryDomain| {
+        d != pie_driver_abi::PIE_MEMORY_DOMAIN_HOST_PINNED
+    };
+    let src = if is_device(plan.src_domain) { device } else { plan.src_domain };
+    let dst = if is_device(plan.dst_domain) { device } else { plan.dst_domain };
+    if src == plan.src_domain && dst == plan.dst_domain {
+        return None;
+    }
+    Some(KvCopyPlan {
+        src_domain: src,
+        dst_domain: dst,
+        src_device_ordinal: plan.src_device_ordinal,
+        dst_device_ordinal: plan.dst_device_ordinal,
+        src_page_ids: plan.src_page_ids.clone(),
+        dst_page_ids: plan.dst_page_ids.clone(),
+        cells: plan.cells.clone(),
+    })
+}
+
 pub enum DriverBackend {
     Dummy(DummyDriver),
     #[cfg(feature = "driver-cuda")]
@@ -274,13 +305,52 @@ impl DriverBackend {
         }
     }
 
+    /// Issue a KV copy, normalizing the plan's *device* memory domain to this
+    /// backend's own.
+    ///
+    /// The scheduler builds every pre-launch copy-on-write plan with
+    /// `PIE_MEMORY_DOMAIN_CUDA_DEVICE` hardcoded
+    /// (`scheduler.rs`, four sites). On Metal the driver refuses it on its
+    /// second guard:
+    ///
+    /// ```text
+    /// [pie-driver-metal] copy_kv: UNSUPPORTED — only same-domain
+    ///   (PIE_MEMORY_DOMAIN_METAL_SHARED) copies are supported; there is no
+    ///   host-pinned swap pool in this build
+    /// ```
+    ///
+    /// which makes `WorkingSet::fork` fail for EVERY model on Metal — the KV
+    /// branching primitive the whole programmable-cache story rests on. The
+    /// failure is close to undiagnosable from a guest: the fork is ordered on
+    /// the pipeline and only materializes when a later fire declares a shared
+    /// page writable, so the inferlet sees a poisoned channel at an unrelated
+    /// prefill take and nothing anywhere names the fork.
+    ///
+    /// The device domain is a property of the backend, not of the caller, so it
+    /// is resolved here rather than at each construction site — one place, and
+    /// no call site can be missed. Only device domains are rewritten:
+    /// `HOST_PINNED` is meaningful on every backend and the offload path
+    /// (`scheduler/dispatch.rs`) depends on it staying put.
     pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.copy_kv(desc),
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.copy_kv(desc),
             #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.copy_kv(desc),
+            Self::Metal(driver) => {
+                let localized;
+                let desc = match localize_device_domain(
+                    desc,
+                    pie_driver_abi::PIE_MEMORY_DOMAIN_METAL_SHARED,
+                ) {
+                    Some(fixed) => {
+                        localized = fixed;
+                        &localized
+                    }
+                    None => desc,
+                };
+                driver.copy_kv(desc)
+            }
             Self::Remote(driver) => driver.copy_kv(desc),
         }
     }

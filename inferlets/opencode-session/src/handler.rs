@@ -277,26 +277,23 @@ impl Daemon {
         let keepalive = state.meta.keepalive();
         let ka_sink = sink.clone();
 
-        // On the in-place path the retained entry is TAKEN out of the map: the
-        // turn extends that very working set, so leaving a second handle to it
-        // in the map would advertise a prefix whose tail is about to be
-        // overwritten. `retain_turn` puts the extended state back under the new
-        // address; a failed turn drops it, which is a clean miss.
+        // The retained entry is TAKEN out of the map: the turn extends that very
+        // working set (nothing forks — see `engine::Resume`), so leaving a
+        // second handle in the map would advertise a prefix whose tail is about
+        // to be overwritten. `retain_turn` puts the extended state back under
+        // the new address; a failed turn drops it, which is a clean miss.
         let owned_parent = match &resume_key {
-            Some(k) if !engine::needs_fork() => {
+            Some(k) => {
                 self.lru.retain(|x| x != k);
                 self.sessions.remove(k)
             }
-            _ => None,
+            None => None,
         };
 
         let run = {
             let resume = match owned_parent {
                 Some((st, t)) => engine::Resume::InPlace(st, t),
-                None => match resume_key.as_ref().and_then(|k| self.sessions.get(k)) {
-                    Some((st, t)) => engine::Resume::Fork(st, *t),
-                    None => engine::Resume::Cold,
-                },
+                None => engine::Resume::Cold,
             };
             let st = &mut state;
             engine::generate(

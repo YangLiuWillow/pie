@@ -15,10 +15,121 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 | PA.1 | `chat-completions` inferlet on dev | **milestone 1 done, frozen.** Milestone 2 (KV snapshot sessions) **cancelled** — superseded by PB.1, see the 2026-08-12 decision |
 | PA.2 | Gateway OpenAI ingress | **done** |
 | PA.3 | Acceptance suite + stock-opencode e2e | **DONE** — 25/25 live on Qwen3-0.6B *and* Qwen3.6-35B-A3B; stock opencode does multi-step agentic work (read → write) on the 35B |
-| PB.1 | `opencode-session` inferlet + client shim | **m1 DONE, LIVE** — 25/25 acceptance + 4/4 resume on Qwen3-0.6B; KV resume verified exact against a cold rebuild. m2: A/B on the 35B, then the AI SDK provider |
+| PB.1 | `opencode-session` inferlet + client shim | **m1 DONE + A/B BANKED** — 4.4× end-to-end, 11.6× steady-state vs frozen Strategy A on Qwen3-Coder-30B. Hybrid (GDN) resume BLOCKED upstream. m2: the AI SDK provider |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-12 — the A/B: 4.4x end-to-end, 11.6x steady-state, on an attention-only 30B
+
+Full write-up with method and caveats: `integrations/opencode/results-ab-strategy-b.md`.
+
+| | A (frozen) | B (session) |
+|---|---|---|
+| 6 turns, total | 304.53 s | **69.40 s** (4.4x) |
+| turns 2-6 | 261.80 s | **22.48 s** (11.6x) |
+| turn 1 (cold) | 42.73 s | 46.92 s (**0.9x** — B is slower) |
+| time to first content | ~48 s | **~2.2 s** |
+| cached tokens | 0, every turn | ~97.5% |
+
+Model: `Qwen3-Coder-30B-A3B-Instruct-4bit`, attention-only MoE, Metal, one server
+at a time. Prompts byte-identical across arms by construction (`bench_ab.py`
+replays a canned transcript built from the real captured opencode fixtures;
+driving stock opencode twice cannot give identical prompts, because turn N+1
+contains turn N's reply).
+
+**The `~81 s -> ~21 s` prediction is confirmed in shape and exceeded in degree**,
+against the control the handover named.
+
+**The caveat that matters more than the number.** Strategy A has no prefix
+caching at all — `cached=0` on every A row — so this measures a session inferlet
+against an uncached baseline, NOT against a production serving system. The
+OpenHands evaluation is explicit that a growing agentic prefix is exactly what
+vLLM's APC already reuses, so "multi-turn/agentic" is not by itself a pie
+advantage; their measured 1.36x over litellm+vLLM came from decode throughput
+and from removing a 10 s/call WebSocket close timeout, not from out-reusing APC.
+A vLLM arm on the same box is what would settle it.
+
+### 2026-08-12 — hybrid (GDN) resume is BLOCKED upstream, three walls deep
+
+Qwen3.6-35B-A3B does not resume. In order of discovery:
+
+1. **`copy_kv` names CUDA unconditionally.** `runtime/engine/src/scheduler.rs`
+   builds every pre-launch CoW plan with `PIE_MEMORY_DOMAIN_CUDA_DEVICE`
+   hardcoded (four sites), and the Metal driver refuses any domain but
+   `METAL_SHARED`. `WorkingSet::fork` therefore failed for **every** model on
+   Metal — the KV branching primitive the programmable-cache story rests on.
+   Diagnosis was hard out of proportion to the bug: a fork is ordered on the
+   pipeline and only materializes when a later fire declares a shared page
+   writable, so the guest sees `prefill take @47: channel is poisoned` and
+   nothing anywhere names the fork.
+   **FIXED** in this branch at the backend boundary
+   (`runtime/engine/src/driver/backend.rs::copy_kv`), where the code actually
+   knows which driver it is. Only device domains are rewritten; `HOST_PINNED`
+   is left alone because the offload path depends on it.
+2. **`RsWorkingSet::fork` mints a new sequence id** and the driver rejects the
+   child as a continuation of its parent — `recurrent slot 1 holds sequence
+   2^63, this fire is sequence 2^63+1`. No guest-side workaround exists. This is
+   the same wall the qwen-code session hit from the other direction (sealing on
+   a fresh pipeline), and it is why `Resume::Fork` no longer exists: both pass
+   kinds now extend in place and nothing forks.
+3. **The fold advances even when told not to.** Generation was rebuilt to buffer
+   rather than fold — `fold_len: Some(0)` plus `discard_buffered`, the SDK's
+   documented "fold nothing … unfolded tokens cost nothing to abandon" mode,
+   pinned upstream by `runtime/engine/tests/inferlets/gdn-foldcommit`. Turns then
+   generated and retained correctly on the 35B, but the next turn was refused:
+   `recurrent slot 4 is at position 42, this fire starts at 33`, where
+   42 = 33 (render boundary) + 7 (cue) + 2 (decode fires). The fold advanced over
+   the buffered span anyway and `discard_buffered` did not rewind it.
+
+(3) is unresolved. Either the guest holds the buffer API wrong or the Metal
+hybrid path ignores `fold_len` when a KV binding is present; telling those apart
+needs driver knowledge this session does not have, so it is recorded rather than
+guessed at. **On hybrid models Strategy B has no resume today**; Strategy A
+remains the working path there.
+
+A side benefit of (2): removing the fork unified the two pass kinds onto one
+in-place path, and the decode loop became host-driven (one fire per token, all
+ports host-known). The device-carried loop cannot be used with a buffered
+recurrent fire at all — the strict geometry gate rejects it with `EmbedTokens is
+not host-derivable: channel 0 has no host-known value`.
+
+### 2026-08-12 — read across from the OpenHands integration
+
+`openhands-integration-updated` carries a full prior Strategy-B-shaped attempt
+(`inferlets/openhands-coder-session`) plus a vLLM head-to-head. What transfers:
+
+- **Their prefix cache hashes TOKEN IDS, not messages** (`prefix_cache.rs`):
+  "a snapshot's name is a hash of the exact token sequence its KV holds, so a
+  name match implies identical tokens … A false hit is impossible." Ours hashes
+  canonicalized *messages* plus tool schemas. **That is a real gap**: a chat
+  template change (a WIT template edit, a tokenizer swap) moves the tokens but
+  NOT our address, so we would resume KV rendered by the old template. They
+  guard it with a `TEMPLATE_MARKER` folded into every name. Cheapest fix for us
+  is the same marker; the fuller fix is to hash the rendered tokens.
+- **They keep many boundaries, we keep one.** Content-addressing every prefix
+  lets retry/branch/truncate re-hit a still-valid earlier boundary instead of
+  rebuilding; we drop the parent on retain, so a second retry misses.
+- **They gate every hit on `seq_len()` matching the sliced length**, so a name
+  collision or truncated snapshot is rejected rather than trusted.
+- **`--kv-verify`**: re-render the full prompt every call and assert its token
+  ids equal the session's accumulated ids. Always-on, and they report zero
+  errors across the run. Strictly stronger than our one-shot differential test.
+- **The system+tools head must be instance-invariant to share across
+  conversations** (`d93f6cffe`): OpenHands' FileEditorTool appended the cwd to a
+  tool description, so the head hash differed per instance and cross-conversation
+  sharing could never fire. opencode's ~7.3k-token head is identical across
+  turns but likely carries cwd/date too — sharing it across sessions is a large
+  unclaimed win gated on exactly this.
+- **Method lessons**: measure the layer, don't divide the aggregate;
+  sub-millisecond variance across dozens of samples is a timeout, not work;
+  validate at the scale you will run at (a snapshot leak was invisible in every
+  single-instance validation).
+
+Their engine-side `max_snapshots_per_prefix` (`ed8cdec3f`) does not apply to us:
+named snapshots outlive their creating process, while our retention is in-process
+and dies with it. That is a genuine advantage of the long-lived-process shape —
+there is no cross-process leak to bound.
 
 ### 2026-08-12 — PB.1 m1: the `opencode-session` inferlet is live, and resume is exact
 
