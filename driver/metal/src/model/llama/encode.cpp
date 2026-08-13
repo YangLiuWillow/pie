@@ -22,6 +22,7 @@
 #include "encode.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 #include "../../model/qwen3_5/decode_dispatch.hpp"
@@ -70,12 +71,61 @@ using pie::metal::qmm_t_dispatch;
 using pie::metal::rms_mb_dispatch;
 using pie::metal::rope_mb_dispatch;
 using pie::metal::sdpa_paged_dispatch;
+using pie::metal::sdpa_paged_mma_dispatch;
 using pie::metal::sdpa_paged_tiled_dispatch;
 using pie::metal::sdpa_should_tile;
 
 namespace {
 int llama_sdpa_simdgroups(const LlamaGeometry& g) {
     return g.head_dim == 64 && g.kv_page_size == 32 ? 8 : 32;
+}
+
+/// Whether this fire's tiled attention runs on the simdgroup MATRIX unit.
+///
+/// Split out for the same reason gpt-oss's `sdpa_mma_this_fire` is: `pso_for`
+/// and `launch_shape` ask separately, and the two shapes have DIFFERENT
+/// threadgroup sizes -- 128 against 1024. Disagreeing is not a slower kernel,
+/// it is a grid that describes a kernel other than the one that runs.
+///
+/// It cannot consult `ll.sdpa_paged_mma.valid()`, because `launch_shape` is not
+/// handed a `LlamaPsos`. That is why `build_llama_psos` makes a failure to
+/// compile this pipeline FATAL under the same conditions rather than leaving an
+/// invalid PSO for someone to fall back from.
+///
+/// `paged_kv_enabled` because the matrix kernel is page-addressed and has no
+/// contiguous form; `sdpa_should_tile` because the matrix path is the tiled
+/// path's replacement, not a third option -- a fleet of decodes still loses by
+/// staging a key tile per request, and that judgement has not changed.
+bool llama_sdpa_mma_this_fire(const LlamaGeometry& g, int rows, int requests) {
+    const bool yes = g.paged_kv_enabled && sdpa_should_tile(rows, requests) && sdpa_mma() &&
+                     sdpa_mma_head_dim_supported(g.head_dim, /*with_sink=*/false);
+    // `PIE_METAL_SDPA_TRACE=1`: which attention ran, and which clause decided.
+    //
+    // This exists because the answer was not observable, and that cost real
+    // time. Wiring the matrix path and measuring it showed prefill unchanged to
+    // within 2%, which reads as "the kernel is no faster" -- and it was not
+    // that at all: three server restarts had silently lost the port to the
+    // first one, so every measurement, on both settings, ran the same process.
+    // /health answered `ok` throughout. Nothing in a throughput number can tell
+    // "the fast path is no faster" from "the fast path never ran", so the
+    // decision says so itself. Only fires wide enough to reach the tiled shape
+    // at all are worth a line: `rows > 1` was the first guard here and it was
+    // not enough -- a server's warm-up fires a stream of 15-row prompts that
+    // exhausted the cap before the prefill under test ever ran, which is the
+    // same "the evidence never arrived" failure one level down.
+    if (rows >= kSdpaQueryTile && std::getenv("PIE_METAL_SDPA_TRACE") != nullptr) {
+        static int seen = 0;
+        if (seen < 32) {
+            ++seen;
+            std::fprintf(stderr,
+                         "[sdpa] rows=%d requests=%d paged=%d tile=%d mma_on=%d "
+                         "hd=%d -> %s\n",
+                         rows, requests, int(g.paged_kv_enabled),
+                         int(sdpa_should_tile(rows, requests)), int(sdpa_mma()),
+                         g.head_dim, yes ? "MMA" : "tiled/per-row");
+        }
+    }
+    return yes;
 }
 
 int llama_dense_qmm_bm(int rows, int requests) {
@@ -280,6 +330,10 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             // the per-row kernel's is N, so choosing one here and shaping the
             // other there launches a thirty-second of the attention.
             if (!g.paged_kv_enabled) return ll.sdpa;
+            // The matrix shape before the scalar one: same tile, same grid
+            // height, a quarter of the threads. Same predicates as
+            // `launch_shape`, for the reason on `llama_sdpa_mma_this_fire`.
+            if (llama_sdpa_mma_this_fire(g, R, requests)) return ll.sdpa_paged_mma;
             if (sdpa_should_tile(R, requests)) return ll.sdpa_paged_tiled;
             if (llama_sdpa_simdgroups(g) == 8 && ll.sdpa_paged_sg8.valid())
                 return ll.sdpa_paged_sg8;
@@ -646,6 +700,13 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             // The row axis is `grid.y`, which at R == 1 is the M=1 shape
             // unchanged -- the ring kernel reads y as the query's sequence
             // index and a decode has exactly one.
+            // Same predicates as `pso_for`, for the same reason. The matrix
+            // shape is 128 threads where the scalar one is 1024, so this is not
+            // just a different pipeline behind the same launch.
+            if (llama_sdpa_mma_this_fire(g, R, requests)) {
+                sdpa_paged_mma_dispatch(g.n_q_heads, R, grid, tg);
+                return;
+            }
             if (sdpa_should_tile(R, requests)) {
                 sdpa_paged_tiled_dispatch(g.n_q_heads, R, grid, tg);
                 return;

@@ -205,25 +205,79 @@ template <typename T, int D, int KT, bool WITH_SINK>
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       // ── S = (q·scale) Kᵀ ──
-      simdgroup_matrix<half, 8, 8> S[KF];
-      for (int c = 0; c < KF; c++) S[c] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
-      for (int i = 0; i < DF; i++) {
+      //
+      // Chunked at DCH fragments, and that is a PRECISION bound rather than a
+      // register one. `simdgroup_multiply_accumulate` carries its accumulator
+      // in the fragment type, so a score is a chain of DF half roundings --
+      // one per fragment down the head. At d=64 that chain is 8 long and the
+      // numerics test passes on it. Widening to d=128 doubled it, and the
+      // dense attention case's worst rel_l2 went 0.0281 -> 0.0992 while a
+      // borderline mixture case flipped from pass to fail outright: the extra
+      // error was enough to change which experts a row routed to.
+      //
+      // So the chain is capped and the partial sums are folded into float
+      // between chunks. At d=64 the cap is the whole head -- one chunk, the
+      // arithmetic gpt-oss shipped with, bit for bit, which is the point of
+      // making this width-dependent rather than uniform.
+      //
+      // At d=128 the cap is 4, and it does not have to be argued from accuracy
+      // alone because it is also the fastest. Worst rel_l2 in
+      // `llama_numerics_test` (scalar path: 0.0281 attention, 0.1145 mixture,
+      // tolerance 0.12), and marginal prefill on Qwen3-0.6B:
+      //
+      //     DCH          2        4        8       16
+      //     attention    0.0249   0.0251   0.0237  0.0992
+      //     mixture      0.1427   0.0724   0.1619  0.1910
+      //     tok/s                 3531             2593
+      //
+      // The 36% between 4 and 16 is the surprise, and it is why this is not a
+      // precision tax to be minimised: a shorter chain is FASTER here as well
+      // as more accurate. A 16-deep chain keeps a fragment accumulator live
+      // across the whole head where a 4-deep one does not, and at d=128 that
+      // is the difference between fitting the register file and not.
+      //
+      // Read the accuracy columns with care. Among 2, 4 and 8 the attention
+      // numbers differ by less than a thousandth in no consistent direction --
+      // noise, not a trend. The mixture column swings by a factor of two and is
+      // NOT monotone: 2 is strictly more accurate arithmetic than 4 and scores
+      // worse. A metric that moves the wrong way when the arithmetic improves
+      // is not measuring the arithmetic; it is a routed model amplifying a tiny
+      // input change into a different expert. So the mixture number is not
+      // evidence for 4 over 8, and tuning against it would be fitting to that
+      // amplifier. The throughput is what settles it, and 4 also happens to
+      // leave the whole suite at parity with the scalar baseline.
+      constexpr int DCH = D <= 64 ? 8 : 4;
+      float sv[KF * 2];
+      for (int c = 0; c < KF * 2; c++) sv[c] = 0.0f;
+      for (int i0 = 0; i0 < DF; i0 += DCH) {
+        const int i1 = i0 + DCH < DF ? i0 + DCH : DF;
+        simdgroup_matrix<half, 8, 8> S[KF];
+        for (int c = 0; c < KF; c++) S[c] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+        for (int i = i0; i < i1; i++) {
+          for (int c = 0; c < KF; c++) {
+            // ktile IS Kᵀ -- the staging wrote it transposed -- so this is an
+            // ordinary load. Transposing here instead would put the whole result
+            // on `simdgroup_load`'s transpose argument, whose orientation is not
+            // something to guess at when the staging can settle it for free.
+            simdgroup_matrix<half, 8, 8> Bk;
+            simdgroup_load(Bk, ktile, KT, ulong2(uint(c * 8), uint(i * 8)), false);
+            simdgroup_multiply_accumulate(S[c], Qf[i], Bk, S[c]);
+          }
+        }
         for (int c = 0; c < KF; c++) {
-          // ktile IS Kᵀ -- the staging wrote it transposed -- so this is an
-          // ordinary load. Transposing here instead would put the whole result
-          // on `simdgroup_load`'s transpose argument, whose orientation is not
-          // something to guess at when the staging can settle it for free.
-          simdgroup_matrix<half, 8, 8> Bk;
-          simdgroup_load(Bk, ktile, KT, ulong2(uint(c * 8), uint(i * 8)), false);
-          simdgroup_multiply_accumulate(S[c], Qf[i], Bk, S[c]);
+          thread auto& e = S[c].thread_elements();
+          sv[c * 2 + 0] += float(e[0]);
+          sv[c * 2 + 1] += float(e[1]);
         }
       }
 
       // ── mask, row max, probabilities, row sum ──
-      float sv[KF * 2];
+      //
+      // The masked score has to be driven to -inf AFTER the chunks are joined,
+      // not inside them: a chunk holds a partial dot product, and there is no
+      // value to reject until the last one has landed.
       float lmax = NEG_INF;
       for (int c = 0; c < KF; c++) {
-        thread auto& e = S[c].thread_elements();
         for (int j = 0; j < 2; j++) {
           const int kk = c * 8 + int(fn) + j;
           bool keep = mine && kk < cnt;
@@ -235,7 +289,7 @@ template <typename T, int D, int KT, bool WITH_SINK>
                        attention_mask[size_t(my_row) * attention_mask_stride + uint(kp)] == 0);
             }
           }
-          const float s = keep ? float(e[j]) : NEG_INF;
+          const float s = keep ? sv[c * 2 + j] : NEG_INF;
           sv[c * 2 + j] = s;
           lmax = s > lmax ? s : lmax;
         }
@@ -247,8 +301,13 @@ template <typename T, int D, int KT, bool WITH_SINK>
       const float new_max = max(max_score, lmax);
       const float factor = max_score == NEG_INF ? 0.0f : fast::exp(max_score - new_max);
       float lsum = 0.0f;
+      // P is its own array now that the score accumulator lives inside the
+      // chunk loop. Same lane layout -- `thread_elements()` hands this lane the
+      // two columns of `fm` it has owned throughout -- so writing the
+      // probabilities straight in is the same store that used to overwrite S.
+      simdgroup_matrix<half, 8, 8> P[KF];
       for (int c = 0; c < KF; c++) {
-        thread auto& e = S[c].thread_elements();
+        thread auto& e = P[c].thread_elements();
         for (int j = 0; j < 2; j++) {
           const float p = sv[c * 2 + j] == NEG_INF ? 0.0f : fast::exp(sv[c * 2 + j] - new_max);
           e[j] = half(p);
@@ -269,7 +328,7 @@ template <typename T, int D, int KT, bool WITH_SINK>
         for (int n = 0; n < DF; n++) {
           simdgroup_matrix<half, 8, 8> Bv;
           simdgroup_load(Bv, vtile, D, ulong2(uint(n * 8), uint(c * 8)), false);
-          simdgroup_multiply_accumulate(PV[n], S[c], Bv, PV[n]);
+          simdgroup_multiply_accumulate(PV[n], P[c], Bv, PV[n]);
         }
       }
       // The accumulator is float and the fragments are half: a pass accumulates
@@ -310,9 +369,26 @@ template <typename T, int D, int KT, bool WITH_SINK>
       const constant int&, const device itype*, const constant int&,         \
       uint3, uint3, uint, uint);
 
-// KT is what the 32 KB of threadgroup memory allows: three tiles of KT*D halves
-// plus the query tile, which at d=64 is 20 KB. A wider head would have to halve
-// it, and none is instantiated until one is measured -- `kSdpaMmaHeadDim` is
-// the list, and it has one entry.
+// KT is what the 32 KB of threadgroup memory allows. The three staged tiles are
+// `QT*D` (queries) + `D*KT` (Kᵀ) + `KT*D` (V) halves, so at KT=16 the cost is
+// linear in the head width and the cap is a long way off until the head is very
+// wide:
+//
+//     d=64   8 KB      d=128  16 KB      d=256  32 KB  <- exactly the cap
+//
+// d=256 is therefore NOT a matter of picking a KT -- at KT=16 it already spends
+// the entire allowance on staging, and the register file is the second wall
+// (`Ov[D/4]` floats is 64 registers a lane before Q and PV). It stays on the
+// scalar path until someone restructures the accumulator for it.
+//
+// `sdpa_mma_head_dim_supported` is the list, and it must agree with this file:
+// a width named there and not instantiated here fails to build a pipeline at
+// load, by name, which is the good outcome.
 instantiate_sdpa_paged_mma("", bfloat16, bfloat, 64, 16, false)      // llama / qwen d=64
 instantiate_sdpa_paged_mma("_sink", bfloat16, bfloat, 64, 16, true)  // gpt-oss
+// llama, mistral, qwen2, qwen3 and the Qwen MoEs -- the width this driver's
+// dense families overwhelmingly use, and the one the prefill profile was taken
+// on. KT stays 16 rather than the 32 that also fits: 16 KB of threadgroup
+// memory leaves room for a second resident threadgroup where 24 KB does not,
+// and the deeper pass buys only half the staging barriers.
+instantiate_sdpa_paged_mma("", bfloat16, bfloat, 128, 16, false)

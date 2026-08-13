@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 
+#include "../../device_tuning.hpp"
+#include "../qwen3_5/decode_dispatch_mb.hpp"
+
 namespace pie::metal::llama {
 
 bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
@@ -70,6 +73,32 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
             if (err != nullptr) {
                 *err = "llama PSO '" + spec.fn + "' (" + spec.file +
                        "): " + compile_error;
+            }
+            return false;
+        }
+    }
+    // Not in the list above because it is conditional, and it is conditional on
+    // exactly what `llama_sdpa_mma_this_fire` asks -- minus the row count,
+    // which is a per-fire question and this is load time. Gating the COMPILE on
+    // `sdpa_mma()` as well as the width is what makes `PIE_METAL_SDPA_MMA=0` a
+    // complete way back: it removes the pipeline and every dispatch that would
+    // have chosen it, so the switch cannot half-apply.
+    //
+    // Where it IS asked for, a failure is fatal rather than a fallback. The
+    // matrix shape is 128 threads and the scalar one is 1024, and the fire's
+    // choice between them is made in `launch_shape`, which is not handed a
+    // `LlamaPsos` and so cannot notice an invalid one. Falling back silently
+    // here would leave the grid describing a kernel other than the one that
+    // runs -- wrong numbers, not a crash.
+    if (sdpa_mma() && sdpa_mma_head_dim_supported(g.head_dim, /*with_sink=*/false)) {
+        const std::string mma_name = "sdpa_paged_mma_bfloat16" + d;
+        std::string compile_error;
+        out.sdpa_paged_mma = ctx.compile_pso_from_file(
+            dir + "sdpa_paged_mma.metal", mma_name.c_str(), &compile_error);
+        if (!out.sdpa_paged_mma.valid()) {
+            if (err != nullptr) {
+                *err = "llama PSO '" + mma_name + "' (sdpa_paged_mma.metal): " +
+                       compile_error;
             }
             return false;
         }

@@ -63,6 +63,20 @@ struct LlamaPsos {
     /// simdgroup, K/V staged per threadgroup. Chosen by row count, not by
     /// model: see `sdpa_should_tile`.
     Pso sdpa_paged_tiled{};
+    /// The tiled attention again, on the simdgroup MATRIX unit: a simdgroup
+    /// owns eight query rows and issues Q Kᵀ and P V as 8x8 matrix multiplies
+    /// instead of walking dot products by hand. The scalar tiled kernel it
+    /// replaces was measured at ~0.5 TFLOP/s against the ~5.6 the quantized
+    /// GEMM one dispatch away reaches, and on this repo's prefill profile the
+    /// attention it runs is 56% of the forward and 6x behind vLLM-metal.
+    ///
+    /// Compiled only when `sdpa_mma()` is on AND the width is instantiated, so
+    /// `PIE_METAL_SDPA_MMA=0` removes both the pipeline and every dispatch that
+    /// would have chosen it -- one switch, not a pipeline that is built and
+    /// then not used. Left invalid otherwise, and never consulted: the fire's
+    /// choice is `llama_sdpa_mma_this_fire`, which cannot ask a PSO because
+    /// `launch_shape` is not given one. See `dense_valid`.
+    Pso sdpa_paged_mma{};
     Pso row_gather{};
     /// RoPE from a supplied frequency table, decode and batched. Compiled only
     /// when `g.rope_freq_table` -- a checkpoint whose frequencies really are a

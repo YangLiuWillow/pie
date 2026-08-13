@@ -752,7 +752,96 @@ Two other things the earlier note got wrong, both corrected here:
    site's own comment says handing it the wrong head count "is a wrong answer
    rather than a refusal".
 
-The greedy gate (`test_attention_paths.py`) is the right check for all of it and
-is already in place. The estimate that changed is the effort, not the prize:
-attention is still 6× behind and 56% of the forward, so ~1.9× on prefill is
-still what this buys.
+### That correction was itself wrong: step 1 is not needed
+
+**I read the wrong module.** `decode_step_mb.cpp` is `model/qwen3_5/` — the
+GDN-hybrid family, `head_dim = 256`, which serves Qwen3.**6**-35B-A3B. It is
+the only family whose prefill batches `sdpa_paged_tiled_strided`, and the d=256
+instantiation is the only one that exists.
+
+The model everything here is profiled on is **Qwen3-0.6B**, and Qwen3-0.6B is
+served by `model/llama/` — `head_dim = 128`, and its prefill selects
+`sdpa_paged_tiled`, the **contiguous** kernel, passing `q_row_pitch = 0`
+(`llama/encode.cpp:283`, `:649`). `sdpa_paged.metal` says so in as many words:
+"gemma4, gpt-oss and llama all run the packed pipeline."
+
+So the matrix kernel's contiguous-only addressing is not a blocker for the
+target at all, and the pitch work — the one step carrying the register-layout
+risk — is not on this path. It would be needed only to bring the 35B along, and
+that family has a harder problem anyway: at d=256, KT=16 already spends the
+entire 32 KB of threadgroup memory on staging, so it needs the accumulator
+restructured, not a KT chosen.
+
+**Generalisable lesson, and it is the second time this exact shape has bitten
+this document**: "which module serves this checkpoint" is a question to answer
+by looking, not by matching the model's name to a directory. `qwen3_5/` does not
+mean "Qwen", and the file that convinced me otherwise was one I had already read
+twice.
+
+## Applied, measured — 2.35× on prefill
+
+Steps 2–5 above, in `model/llama/` rather than `model/qwen3_5/`. Clean A/B on
+one binary, each arm's path confirmed by `PIE_METAL_SDPA_TRACE=1` rather than
+inferred:
+
+| prompt | scalar tiled | MMA | speedup |
+|---:|---:|---:|---:|
+| 251 | 0.068 s | 0.063 s | 1.08× |
+| 875 | 0.224 s | 0.164 s | 1.37× |
+| 1,716 | 0.550 s | 0.329 s | 1.67× |
+| 3,396 | 1.637 s | 0.801 s | 2.04× |
+| 5,052 | 3.254 s | 1.418 s | **2.29×** |
+| **marginal rate** | **1,502 tok/s** | **3,531 tok/s** | **2.35×** |
+
+The speedup **grows with context**, which is the signature of a quadratic term
+being fixed rather than a constant being shaved — exactly what A2 predicted, and
+better than the ~1.9× it estimated.
+
+Baseline reproducibility: 1502.3 / 1504.8 / 1506.2 tok/s across three separate
+boots. MMA: 3526.5 / 3531.3.
+
+### The precision fix this needed, which the estimate did not anticipate
+
+`simdgroup_multiply_accumulate` carries its accumulator in the fragment type, so
+a score is a chain of `D/8` **half** roundings down the head. At d=64 that chain
+is 8 long and is what gpt-oss shipped and measured. Doubling the head width
+doubled it, and the first working version regressed
+`llama_numerics_test`: the dense attention case went 0.0281 → 0.0992 worst
+rel_l2 and a routed case crossed its tolerance.
+
+Capping the chain and folding the partial sums into float between chunks fixes
+it, and — the surprise — is also **36% faster** (3,531 vs 2,593 tok/s), because
+a 16-deep chain keeps a fragment accumulator live across the whole head and at
+d=128 that is the difference between fitting the register file and not. So this
+is not a precision tax; both axes want the same thing. Details and the
+measured table are in `sdpa_paged_mma.metal`.
+
+d=64 keeps a single chunk, so **gpt-oss's arithmetic is untouched, bit for bit**.
+
+### Verification
+
+- **`llama_numerics_test`: identical verdict set to the scalar baseline** —
+  51 passed / 18 failed both ways, no test changing pass/fail. On the case that
+  measures attention directly, MMA is *better* than the scalar path it replaces
+  (0.0237 vs 0.0281).
+- **Greedy gate**: byte-identical output on all three prompts, tiled vs MMA,
+  each arm's kernel confirmed by trace.
+- **Suites**: 25/25 acceptance, 5/5 resume, 2/2 head sharing.
+
+**A caveat on the 18 pre-existing failures**: they are almost all the routed
+(MoE) cases, and they are not small — one reads `worst rel_l2 14.0270`. That is
+not rounding. See the Coder-30B finding below.
+
+### Two method failures worth keeping
+
+1. **`pkill -f "pie serve"` never matched anything.** The process is
+   `pie -c <config> serve`, so "pie serve" is not a substring of it. Three
+   restarts silently lost the port to the first server; `/health` answered `ok`
+   throughout because something *was* listening. Four measurements — both arms
+   of an A/B — ran against one process booted with one setting, and produced the
+   perfectly reasonable-looking conclusion "the MMA kernel is no faster". Boots
+   are now verified by matching the live process against the boot's own mktemp
+   config path, not by asking a port whether anyone is home.
+2. **A throughput number cannot distinguish "no faster" from "never ran."**
+   That is why `PIE_METAL_SDPA_TRACE=1` now prints which attention was chosen
+   and which clause decided it, for any fire wide enough to tile.

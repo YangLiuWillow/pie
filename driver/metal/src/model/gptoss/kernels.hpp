@@ -72,8 +72,10 @@ struct GptOssPsos {
     /// The tiled attention again, on the simdgroup MATRIX unit: a simdgroup owns
     /// eight rows and issues Q Kᵀ and P V as 8x8 matrix multiplies rather than
     /// walking dot products. Selected over `sdpa_sink_paged_tiled` whenever it
-    /// compiled and `sdpa_mma()` is on. Only head_dim 64 and 128 are
-    /// instantiated, so an unusual width leaves this invalid and falls back.
+    /// compiled and `sdpa_mma()` is on. The sink form is instantiated at
+    /// head_dim 64 only -- see `sdpa_mma_head_dim_supported` -- and at a width
+    /// that IS on the list a compile failure is fatal rather than a fallback,
+    /// because the two shapes disagree on threadgroup size.
     Pso sdpa_sink_paged_mma{};
     /// YaRN, as a frequency table the host computed once.
     Pso rope_freqs{};

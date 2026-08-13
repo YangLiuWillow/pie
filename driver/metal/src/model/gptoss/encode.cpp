@@ -363,7 +363,7 @@ bool sdpa_tile_this_fire(int rows, int requests) {
 /// than the one that runs.
 bool sdpa_mma_this_fire(const GptOssGeometry& g, int rows, int requests) {
     return sdpa_tile_this_fire(rows, requests) && sdpa_mma() &&
-           g.head_dim == kSdpaMmaHeadDim;
+           sdpa_mma_head_dim_supported(g.head_dim, /*with_sink=*/true);
 }
 
 /// The pipeline for a dispatch whose tiling depends on the batch. Split from

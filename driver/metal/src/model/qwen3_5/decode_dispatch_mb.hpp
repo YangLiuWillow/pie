@@ -453,9 +453,26 @@ inline void sdpa_paged_tiled_dispatch(int n_q_heads, int N, Grid& g, Threadgroup
 }
 
 // The head widths `sdpa_paged_mma.metal` is instantiated for. The matrix path
-// stages three tiles of KT*D halves in 32 KB of threadgroup memory, which is
-// what bounds the list: adding a width means choosing its KT there first.
-inline constexpr int kSdpaMmaHeadDim = 64;
+// stages three tiles -- queries, Kᵀ and V -- in 32 KB of threadgroup memory,
+// which is what bounds the list: adding a width means choosing its KT there
+// first, and at 256 there is no KT that leaves room, so that width is a
+// restructuring rather than an entry here.
+//
+// This is a SET rather than the single constant it used to be, and the two
+// halves must stay in step: a width named here with no instantiation in the
+// .metal fails to compile a pipeline at load, by name. That is the loud
+// failure. The quiet one is the reverse -- an instantiation no caller asks
+// for, which simply never runs.
+// `with_sink` because the two instantiation lists are genuinely different, not
+// because the kernel cares: `WITH_SINK` is a separate template argument and so
+// a separate pipeline, and only gpt-oss has ever needed one. Asking one
+// question for both would let a hypothetical d=128 gpt-oss request
+// `sdpa_paged_mma_sink_bfloat16_d_128`, which does not exist -- a load failure
+// for a family that works today.
+inline constexpr bool sdpa_mma_head_dim_supported(int head_dim, bool with_sink) {
+    if (with_sink) return head_dim == 64;
+    return head_dim == 64 || head_dim == 128;
+}
 
 // sdpa_paged_mma: the same tile of `kSdpaQueryTile` rows, but a simdgroup owns
 // EIGHT of them and multiplies 8x8 fragments, so the threadgroup is 128 threads

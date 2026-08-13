@@ -77,7 +77,7 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // the scalar tiled kernel. Where it IS asked for, a failure is fatal --
     // the grid for the matrix shape is 128 threads and the scalar one's is
     // 1024, so falling back silently would launch the wrong geometry.
-    if (g.head_dim == kSdpaMmaHeadDim) {
+    if (sdpa_mma_head_dim_supported(g.head_dim, /*with_sink=*/true)) {
         std::string compile_error;
         out.sdpa_sink_paged_mma = ctx.compile_pso_from_file(
             dir + "sdpa_paged_mma.metal", sink_mma_name, &compile_error);
