@@ -450,3 +450,74 @@ A1 was meant to either localize the gap or eliminate the host, and it did both.
 track**, and it is narrower than it was: not "where does the time go" — that is
 answered — but "what does MLX's `quantized_matmul` do at M=2048 that pie's
 kernel does not". Everything else on Track A can wait on that answer.
+
+---
+
+# A2 result: it is **attention**, not the GEMM
+
+A1 proved the time is GPU-side. A2 asks which kernel. Answer: mostly the one I
+was not looking at.
+
+## Method
+
+Prefill cost decomposes as `t(n) = a·n + b·n²` — the linear term is the dense
+projections (GEMM), the quadratic term is attention. Least-squares fit over the
+5-point sweep for both stacks (worst residual 1.7% for pie, 3.0% for vLLM),
+evaluated at n = 2048, on Qwen3-0.6B / Apple M5 Pro:
+
+| | pie | vLLM | ratio |
+|---|---:|---:|---|
+| **GEMM** (linear) | 310.4 ms | 131.2 ms | **2.4×** |
+| **attention** (quadratic) | 403.1 ms | 67.2 ms | **6.0×** |
+| total | 713.6 ms | 198.4 ms | 3.6× |
+
+**The fit is validated independently.** vLLM's fitted GEMM term (131.2 ms) lands
+within 5% of MLX's directly measured `quantized_matmul` sum for the same
+projections (124.6 ms, at 14.48 TFLOPS). A curve fit agreeing with a direct
+kernel measurement it never saw is about as good as this kind of decomposition
+gets.
+
+Direct MLX reference for attention: `mx.fast.scaled_dot_product_attention` at
+the same shape (16q/8kv heads, d=128, causal) is **0.954 ms/layer = 26.7 ms**
+for 28 layers. vLLM's 67.2 ms is ~2.5× that, which is the honest price of paged
+attention with block tables over a dense fused kernel — so **67 ms, not 27 ms,
+is pie's fair target.**
+
+## What this changes
+
+I had assumed the GEMM, and the CUDA record encouraged it — their prefill lever
+was tile shapes, and their fused-path tactic sweep found a decode-shaped 128×16
+default costing 73%. On Metal that reasoning was wrong in a way no amount of
+GEMM tuning would have revealed:
+
+- **Attention is 56% of pie's prefill forward at 2048 tokens** (and only 34% of
+  vLLM's), so it is both the larger share *and* the larger gap.
+- It also explains a symptom recorded much earlier and never accounted for:
+  pie's prefill rate decays with context faster than vLLM's (326→179 vs
+  2491→1135 tok/s). That is the quadratic term dominating.
+- The two SDPA knobs (`sdpa_tile_min_rows_per_request = 32`,
+  `sdpa_mma = true`) are already in their intended state for a 2048-row prefill,
+  so this is **not** a selection heuristic — it is the paged prefill attention
+  kernel itself.
+
+## The target
+
+Closing attention alone — 403 ms → ~67 ms — takes the forward from 713 ms to
+~377 ms, i.e. **~1.9× on prefill**, and is the single largest available win.
+Closing the GEMM as well (310 → 131) would reach ~198 ms, which is parity.
+
+Order of work, revised:
+
+1. **Paged prefill attention on Metal.** 6× behind, 56% of the forward. Start
+   here.
+2. **The quantized GEMM.** 2.4× behind. MLX reaches 14.48 TFLOPS on these
+   shapes; pie's implied rate is ~6.
+3. Nothing else — A1 closed the host side at 0.05%.
+
+## Reproduce
+
+```sh
+~/.venv-vllm-metal/bin/python integrations/opencode/parity/mlx_gemm_roofline.py \
+    --tokens 2048 --layers 28 --pie-forward-ms 657
+# and the SDPA reference via bench_sdpa(2048, 16, 8, 128)
+```
