@@ -46,24 +46,44 @@ machine, graded by the same Docker harness.
 **What is real regardless of the score** is *how* the vLLM arm failed. Its
 runs are an order of magnitude shorter — 10, 11, 39, 88, 146 s against pie's
 309–1265 s — which is an agent giving up, not an agent working faster. And
-instance 1 says why:
+instance 1 said why: `Edit … failed: The edit tool was called with invalid
+arguments: SchemaError`.
 
-```
-✗ Edit django/forms/widgets.py failed
-Error: The edit tool was called with invalid arguments: SchemaError
-```
+That was a guess when first written. It has since been measured directly,
+same checkpoint and the same `edit` schema opencode actually sends, three
+identical prompts exercising the boolean `replaceAll`:
 
-vLLM's `--tool-call-parser qwen3_coder` emitted arguments the tool schema
-rejected. That is the same class of problem pie hit and fixed this session:
-Qwen3-Coder's calls are XML, XML carries no types, and the arguments have to
-be typed **from the schema** on the way out. Three of vLLM's five runs ended
-with an empty patch in under 90 s, which is consistent with an agent whose
-edits will not apply.
+| trial | pie | vLLM-metal |
+|---|---|---|
+| 1 | `filePath, oldString, newString, replaceAll=true` ✓ | `{"path": …}` — 3 required missing |
+| 2 | ✓ | ✓ (`replaceAll=true`) |
+| 3 | ✓ | `{}` — empty arguments, 3 required missing |
+| **schema-valid** | **3/3** | **1/3** |
 
-So the honest summary: on this small, biased set, pie resolved more — and the
-mechanism visible in the logs is tool-call argument fidelity, not serving
-speed. That is a hypothesis about vLLM's parser, from five runs; it is worth
-checking directly before it is repeated.
+vLLM's trial 2 is the important one: its parser *can* emit a correct boolean,
+so this is not a systematic mistyping. On the other two it returned a
+mis-named key and then no arguments at all while still reporting a tool call —
+a call it recognised and could not extract.
+
+**What this does NOT establish** is where the fault lies. Both stacks render
+the Coder dialect and both parse XML; I did not isolate whether vLLM's
+extraction is dropping the arguments or its rendering is producing model
+output that cannot be extracted. The empty-argument case points at
+extraction, because a prompt difference does not usually yield a call with no
+arguments — but that is an inference, not a measurement.
+
+**Why this was not "fixed".** vLLM's parser is a compiled Rust extension
+(`_rust_tool_parser.abi3.so`); this build exposes no `--tool-parser-plugin`,
+so the checkpoint's own Python reference parser cannot be loaded in its
+place, and `qwen3_coder` / `qwen3_xml` are two names for the same adapter.
+More decisive than either: **vLLM is the baseline.** A vLLM patched by us is
+not the thing the comparison is against, and the honest place for this fix is
+upstream. What belongs here is a reproduction, and that is what the table is.
+
+Read together with the run above: the vLLM arm is handicapped by a tool-call
+defect, so 4/5 vs 1/5 is measuring tool-call fidelity at least as much as it
+is measuring serving. That is a real difference and it matters to an agent —
+but it is not a claim about prefill, decode, or KV reuse.
 
 ## Read the instance set before reading the number
 
