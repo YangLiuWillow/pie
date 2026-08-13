@@ -388,6 +388,7 @@ impl Daemon {
             self.stop_ids.clone(),
             stop_strings,
             has_tools,
+            &pie_openai_serving::types::tool_schema_envelopes(&req.tools),
         );
 
         // ── Commit the stream. From here every failure must be shaped as a

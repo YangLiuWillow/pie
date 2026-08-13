@@ -158,6 +158,20 @@ pub trait Instruct: Send + Sync {
     fn chat_decoder(&self) -> Box<dyn ChatDecoder>;
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
+
+    /// The same decoder, told which tools the request offered.
+    ///
+    /// Additive, with a default that ignores the schemas, because only one
+    /// dialect needs them: Qwen3-Coder's calls are XML, and XML carries no
+    /// types, so the schema is the only thing that can say whether `30` is the
+    /// number 30 or the string "30". Hermes-style calls are already JSON and
+    /// answer that themselves, which is why this was not needed before.
+    ///
+    /// A decoder built without them still parses every call — it just types
+    /// every argument as a string.
+    fn tool_decoder_with_tools(&self, _tools: &[String]) -> Box<dyn ToolDecoder> {
+        self.tool_decoder()
+    }
     /// Returns the parsed tool-call grammar that constrains generation to
     /// the architecture's tool-call format, given a list of tool schemas.
     /// Returns `None` if the architecture doesn't support constrained tool calling.

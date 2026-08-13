@@ -205,7 +205,8 @@ async fn main(input: String) -> inferlet::Result<String> {
         model: model::name(),
         created: now_unix_secs(),
     };
-    let mut state = TurnState::new(meta, streaming, uniq, stop_ids, stop_strings, has_tools);
+    let mut state = TurnState::new(meta, streaming, uniq, stop_ids, stop_strings, has_tools,
+        &pie_openai_serving::types::tool_schema_envelopes(&req.tools));
 
     // ── Commit the envelope. From here every failure must be shaped as a
     // well-formed turn (finish_reason "length"), never a fault — a dead

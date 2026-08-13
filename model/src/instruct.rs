@@ -76,7 +76,7 @@ fn is_coder_lineage(arch_name: &str, model_name: &str) -> bool {
 /// reaches a registry is data, and guessing at underscore placement is how the
 /// silent version of this bug comes back.
 pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
+    use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolDialect};
 
     match arch_name {
         // model types …
@@ -93,6 +93,16 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 // empty think block. See `is_coder_lineage`.
                 has_thinking: !is_coder_lineage(arch_name, model_name),
                 has_tools: true,
+                // The same signal decides both halves: a checkpoint with no
+                // thinking channel is the Coder release, and the Coder release
+                // speaks XML tool calls. Splitting them into two predicates
+                // would let a future edit set one and not the other, which is
+                // a prompt in one dialect read by a parser for the other.
+                tool_dialect: if is_coder_lineage(arch_name, model_name) {
+                    ToolDialect::Coder
+                } else {
+                    ToolDialect::Hermes
+                },
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -102,6 +112,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: false,
+                tool_dialect: ToolDialect::Hermes,
                 generation_suffix: "<think>\n",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -120,6 +131,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                tool_dialect: ToolDialect::Hermes,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
@@ -161,6 +173,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
             ChatMLConfig {
                 has_thinking: false,
                 has_tools: false,
+                tool_dialect: ToolDialect::Hermes,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },

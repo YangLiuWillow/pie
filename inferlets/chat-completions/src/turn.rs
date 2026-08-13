@@ -60,6 +60,7 @@ impl TurnState {
         stop_ids: Vec<u32>,
         stop_strings: Vec<String>,
         has_tools: bool,
+        tool_schemas: &[String],
     ) -> Self {
         Self {
             meta,
@@ -67,7 +68,7 @@ impl TurnState {
             uniq,
             stop_ids,
             stop_strings,
-            tool_decoder: has_tools.then(tools::Decoder::new),
+            tool_decoder: has_tools.then(|| tools::Decoder::with_tools(tool_schemas)),
             chat_decoder: chat::Decoder::new(),
             filter: VisibleFilter::new(),
             generated: Vec::new(),

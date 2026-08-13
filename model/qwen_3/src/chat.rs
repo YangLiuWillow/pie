@@ -20,10 +20,35 @@ use std::sync::Arc;
 // the verbatim copy that used to sit here as a static was never read — the
 // checkpoint's own `chat_template` is the reference.
 
+/// How a checkpoint spells tool schemas and tool calls.
+///
+/// Both dialects wrap a call in `<tool_call>`, and that shared tag is what
+/// makes getting this wrong so quiet: the model emits *something* either way.
+/// What differs is everything inside it, and a model prompted in one dialect
+/// answers in that dialect no matter which one the parser expects.
+///
+/// This is not a preference — it is a property of what the checkpoint was
+/// fine-tuned on. Qwen3-Coder handed the Hermes preamble replies with a bare
+/// `{"name": …, "arguments": {…}}` and no wrapper at all, so a decoder looking
+/// for `<tool_call>` finds nothing, `tool_calls` comes back `null`, and a
+/// tool-driven agent sees a wall of text where it expected a call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolDialect {
+    /// Qwen3: JSON schemas in `<tools>`, and a call is one JSON object inside
+    /// `<tool_call>`.
+    Hermes,
+    /// Qwen3-Coder: XML schemas in `<tools>`, and a call is nested XML —
+    /// `<tool_call><function=name><parameter=k>v</parameter></function>`.
+    /// Arguments arrive as *strings* and are typed from the schema on the way
+    /// out, because XML carries no types.
+    Coder,
+}
+
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
+    pub tool_dialect: ToolDialect,
     pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
@@ -130,15 +155,43 @@ impl QwenInstruct {
     fn assistant_with_tool_calls_inner_text(
         content: Option<&str>,
         calls: &[(String, String)],
+        dialect: ToolDialect,
     ) -> String {
         let mut text = String::new();
         if let Some(c) = content {
             if !c.is_empty() {
                 text.push('\n');
                 text.push_str(c);
+                // The Coder template trims the content and closes it with a
+                // newline of its own before the first call; Hermes does not.
+                if dialect == ToolDialect::Coder {
+                    text = format!("\n{}\n", c.trim());
+                }
             }
         }
         for (name, arguments_json) in calls {
+            if dialect == ToolDialect::Coder {
+                // Arguments go back out as the XML the model produced them in.
+                // A value that was typed on the way IN (an int, a bool, an
+                // object) is rendered as its plain text here, because that is
+                // what the template does and what the model saw: XML has no
+                // types, and re-quoting a number would replay a turn the model
+                // never wrote.
+                text.push_str(&format!("\n<tool_call>\n<function={name}>\n"));
+                if let Ok(serde_json::Value::Object(args)) =
+                    serde_json::from_str::<serde_json::Value>(arguments_json)
+                {
+                    for (k, v) in &args {
+                        let body = match v.as_str() {
+                            Some(s) => s.to_string(),
+                            None => v.to_string(),
+                        };
+                        text.push_str(&format!("<parameter={k}>\n{body}\n</parameter>\n"));
+                    }
+                }
+                text.push_str("</function>\n</tool_call>");
+                continue;
+            }
             text.push_str("\n<tool_call>\n{\"name\": \"");
             text.push_str(name);
             text.push_str("\", \"arguments\": ");
@@ -208,6 +261,129 @@ impl QwenInstruct {
         );
         prompt
     }
+
+    /// `render_item_list` from the Coder template: `[`a`, `b`]` for strings,
+    /// bare for anything else, wrapped in a tag, and emitted only when the list
+    /// is present and non-empty.
+    fn coder_item_list(out: &mut String, list: Option<&serde_json::Value>, tag: &str) {
+        let Some(items) = list.and_then(|v| v.as_array()) else { return };
+        if items.is_empty() {
+            return;
+        }
+        out.push_str(&format!("\n<{tag}>["));
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            match item.as_str() {
+                Some(s) => out.push_str(&format!("`{s}`")),
+                None => out.push_str(&item.to_string()),
+            }
+        }
+        out.push_str(&format!("]</{tag}>"));
+    }
+
+    /// The Coder checkpoint's tool preamble, transcribed from its own
+    /// `chat_template.jinja`.
+    ///
+    /// Transcribed rather than approximated: the model was fine-tuned on these
+    /// exact bytes, and the whole failure this fixes is a preamble that looked
+    /// reasonable and was not what training saw. The trailing `<IMPORTANT>`
+    /// block is part of it — it is what tells the model to nest `<function=…>`
+    /// inside `<tool_call>`, which is precisely the structure pie's decoder
+    /// then looks for.
+    fn build_tool_system_prompt_coder(tools: &[String]) -> String {
+        let mut out = String::from("You have access to the following functions:\n\n<tools>");
+        for tool in tools {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(tool) else { continue };
+            // Accept either the bare function object or the OpenAI envelope.
+            let f = v.get("function").unwrap_or(&v);
+            let name = f.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            out.push_str(&format!("\n<function>\n<name>{name}</name>"));
+            if let Some(d) = f.get("description").and_then(|x| x.as_str()) {
+                out.push_str(&format!("\n<description>{}</description>", d.trim()));
+            }
+            out.push_str("\n<parameters>");
+            let params = f.get("parameters");
+            if let Some(props) = params.and_then(|p| p.get("properties")).and_then(|p| p.as_object())
+            {
+                for (pname, pf) in props {
+                    out.push_str(&format!("\n<parameter>\n<name>{pname}</name>"));
+                    if let Some(t) = pf.get("type") {
+                        let t = t.as_str().map(str::to_string).unwrap_or_else(|| t.to_string());
+                        out.push_str(&format!("\n<type>{t}</type>"));
+                    }
+                    if let Some(d) = pf.get("description").and_then(|x| x.as_str()) {
+                        out.push_str(&format!("\n<description>{}</description>", d.trim()));
+                    }
+                    Self::coder_item_list(&mut out, pf.get("enum"), "enum");
+                    // Any remaining schema key, tag-named after the template's
+                    // normalisation. Mappings go out as JSON, scalars as text.
+                    if let Some(obj) = pf.as_object() {
+                        for (k, val) in obj {
+                            if matches!(k.as_str(), "type" | "description" | "enum" | "required") {
+                                continue;
+                            }
+                            let tag = k.replace(['-', ' '], "_").replace('$', "");
+                            let body = if val.is_object() || val.is_array() {
+                                val.to_string()
+                            } else {
+                                val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string())
+                            };
+                            out.push_str(&format!("\n<{tag}>{body}</{tag}>"));
+                        }
+                    }
+                    Self::coder_item_list(&mut out, pf.get("required"), "required");
+                    out.push_str("\n</parameter>");
+                }
+            }
+            Self::coder_item_list(&mut out, params.and_then(|p| p.get("required")), "required");
+            out.push_str("\n</parameters>");
+            if let Some(r) = f.get("return") {
+                let body = if r.is_object() || r.is_array() {
+                    r.to_string()
+                } else {
+                    r.as_str().map(str::to_string).unwrap_or_else(|| r.to_string())
+                };
+                out.push_str(&format!("\n<return>{body}</return>"));
+            }
+            out.push_str("\n</function>");
+        }
+        out.push_str("\n</tools>");
+        out.push_str(
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO \
+             suffix:\n\n\
+             <tool_call>\n\
+             <function=example_function_name>\n\
+             <parameter=example_parameter_1>\n\
+             value_1\n\
+             </parameter>\n\
+             <parameter=example_parameter_2>\n\
+             This is the value for the second parameter\n\
+             that can span\n\
+             multiple lines\n\
+             </parameter>\n\
+             </function>\n\
+             </tool_call>\n\n\
+             <IMPORTANT>\n\
+             Reminder:\n\
+             - Function calls MUST follow the specified format: an inner \
+             <function=...></function> block must be nested within <tool_call></tool_call> XML \
+             tags\n\
+             - Required parameters MUST be specified\n\
+             - You may provide optional reasoning for your function call in natural language \
+             BEFORE the function call, but NOT after\n\
+             - If there is no function call available, answer the question like normal with your \
+             current knowledge and do not tell the user about function calls\n\
+             </IMPORTANT>",
+        );
+        out
+    }
+
+    /// The stand-in system turn the Coder template opens with when a request
+    /// carries tools but no system message of its own.
+    const CODER_DEFAULT_SYSTEM: &'static str =
+        "You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.";
 
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
     fn build_tool_call_grammar(tools: &[String]) -> Option<String> {
@@ -318,9 +494,18 @@ impl Instruct for QwenInstruct {
                 None => Vec::new(),
             };
         }
-        let tools_block = Self::build_tool_system_prompt(tools);
+        let coder = self.config.tool_dialect == ToolDialect::Coder;
+        let tools_block = if coder {
+            Self::build_tool_system_prompt_coder(tools)
+        } else {
+            Self::build_tool_system_prompt(tools)
+        };
         let merged = match system_content {
             Some(c) if !c.is_empty() => format!("{c}\n\n{tools_block}"),
+            // The Coder template does not open a bare tools turn: with tools
+            // and no system message it emits its own stand-in system line
+            // first, and the model saw that line in training.
+            _ if coder => format!("{}\n\n{tools_block}", Self::CODER_DEFAULT_SYSTEM),
             _ => tools_block,
         };
         self.system(&merged)
@@ -347,7 +532,7 @@ impl Instruct for QwenInstruct {
         // splits on either way, so this stays deterministic; content must be
         // special-token-sanitized upstream (the serving layer's job), exactly
         // as with HF templates.
-        let text = Self::assistant_with_tool_calls_inner_text(content, calls);
+        let text = Self::assistant_with_tool_calls_inner_text(content, calls, self.config.tool_dialect);
         let mut tokens = self.assistant_prefix_no_nl.clone();
         tokens.extend(self.tokenizer.encode(&text));
         tokens.extend(&self.turn_suffix);
@@ -390,11 +575,17 @@ impl Instruct for QwenInstruct {
     }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
+        self.tool_decoder_with_tools(&[])
+    }
+
+    fn tool_decoder_with_tools(&self, tools: &[String]) -> Box<dyn ToolDecoder> {
         Box::new(QwenToolDecoder {
             decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             inside: false,
             has_tools: self.config.has_tools,
+            dialect: self.config.tool_dialect,
+            schemas: tools.to_vec(),
         })
     }
 
@@ -411,11 +602,105 @@ impl Instruct for QwenInstruct {
 // Tool Decoder
 // =============================================================================
 
+/// Turn one Coder `<function=…>…</function>` body into `(name, arguments_json)`.
+///
+/// Transcribed from `qwen3coder_tool_parser.py`, which the CHECKPOINT ships and
+/// vLLM loads as `--tool-call-parser qwen3_coder`. Two rules in it are not
+/// guessable from the wire format and are the reason to follow the reference
+/// rather than write a plausible XML reader:
+///
+///   * **XML carries no types.** Every parameter arrives as text, and the
+///     schema is what decides whether `3` is the number 3 or the string "3".
+///     Guessing by shape instead would send `{"timeout": 30}` to a tool whose
+///     schema says `string`, and the mismatch surfaces as a tool error the
+///     model then tries to reason about.
+///   * **One leading and one trailing newline are part of the delimiter, not
+///     the value.** They are stripped exactly once — a value that genuinely
+///     ends in a blank line keeps the rest.
+///
+/// Unparseable values degrade to the raw string rather than dropping the call,
+/// which is also what the reference does: a tool call with one odd argument is
+/// worth more to an agent than no call at all.
+fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
+    let gt = body.find('>')?;
+    let name = body[..gt].trim().to_string();
+    let rest = &body[gt + 1..];
+
+    // The declared type of each parameter of THIS function, if we were told.
+    let mut types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for s in schemas {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { continue };
+        let f = v.get("function").unwrap_or(&v);
+        if f.get("name").and_then(|x| x.as_str()) != Some(name.as_str()) {
+            continue;
+        }
+        if let Some(props) =
+            f.get("parameters").and_then(|p| p.get("properties")).and_then(|p| p.as_object())
+        {
+            for (k, pf) in props {
+                if let Some(t) = pf.get("type").and_then(|x| x.as_str()) {
+                    types.insert(k.clone(), t.to_ascii_lowercase());
+                }
+            }
+        }
+        break;
+    }
+
+    let mut args = serde_json::Map::new();
+    let mut tail = rest;
+    while let Some(open) = tail.find("<parameter=") {
+        let after = &tail[open + "<parameter=".len()..];
+        let Some(gt) = after.find('>') else { break };
+        let pname = after[..gt].trim().to_string();
+        let vstart = &after[gt + 1..];
+        // An unterminated parameter is a truncated generation, not a parse
+        // failure: take the rest and let the caller decide.
+        let (raw, consumed) = match vstart.find("</parameter>") {
+            Some(end) => (&vstart[..end], end + "</parameter>".len()),
+            None => (vstart, vstart.len()),
+        };
+        let mut val = raw;
+        val = val.strip_prefix('\n').unwrap_or(val);
+        val = val.strip_suffix('\n').unwrap_or(val);
+
+        let ty = types.get(&pname).map(String::as_str).unwrap_or("string");
+        let parsed = if val.eq_ignore_ascii_case("null") {
+            serde_json::Value::Null
+        } else if matches!(ty, "string" | "str" | "text" | "varchar" | "char" | "enum") {
+            serde_json::Value::String(val.to_string())
+        } else if ty.starts_with("int") || ty.starts_with("uint") || ty.starts_with("long")
+            || ty.starts_with("short") || ty.starts_with("unsigned")
+        {
+            val.parse::<i64>()
+                .map(Into::into)
+                .unwrap_or_else(|_| serde_json::Value::String(val.to_string()))
+        } else if ty.starts_with("num") || ty.starts_with("float") || ty.starts_with("double") {
+            val.parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(val.to_string()))
+        } else if matches!(ty, "boolean" | "bool" | "binary") {
+            serde_json::Value::Bool(val.eq_ignore_ascii_case("true"))
+        } else {
+            serde_json::from_str::<serde_json::Value>(val)
+                .unwrap_or_else(|_| serde_json::Value::String(val.to_string()))
+        };
+        args.insert(pname, parsed);
+        tail = &vstart[consumed..];
+    }
+    Some((name, serde_json::Value::Object(args).to_string()))
+}
+
 struct QwenToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
     inside: bool,
     has_tools: bool,
+    dialect: ToolDialect,
+    /// The request's schemas, needed only by [`ToolDialect::Coder`] — it is the
+    /// only source of argument types, because the wire format has none.
+    schemas: Vec<String>,
 }
 
 impl ToolDecoder for QwenToolDecoder {
@@ -435,10 +720,22 @@ impl ToolDecoder for QwenToolDecoder {
                 return ToolEvent::Start;
             }
         } else if let Some(pos) = self.accumulated.find("</tool_call>") {
-            let call_json = self.accumulated[..pos].trim().to_string();
+            let call_body = self.accumulated[..pos].trim().to_string();
             self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
             self.inside = false;
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json) {
+            if self.dialect == ToolDialect::Coder {
+                // `<function=name>` … `</function>`, the reference's shape.
+                if let Some(fs) = call_body.find("<function=") {
+                    let after = &call_body[fs + "<function=".len()..];
+                    let body = match after.find("</function>") {
+                        Some(fe) => &after[..fe],
+                        None => after,
+                    };
+                    if let Some((name, args)) = parse_coder_function_call(body, &self.schemas) {
+                        return ToolEvent::Call(name, args);
+                    }
+                }
+            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_body) {
                 let name = v["name"].as_str().unwrap_or("").to_string();
                 let args = v["arguments"].to_string();
                 return ToolEvent::Call(name, args);
@@ -490,6 +787,7 @@ mod tests {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
+                tool_dialect: ToolDialect::Hermes,
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
@@ -502,6 +800,7 @@ mod tests {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
+                tool_dialect: ToolDialect::Hermes,
                 has_thinking: false,
                 has_tools: true,
                 generation_suffix: "",
@@ -514,6 +813,7 @@ mod tests {
         QwenInstruct::new(
             make_tok(),
             ChatMLConfig {
+                tool_dialect: ToolDialect::Hermes,
                 has_thinking: true,
                 has_tools: false,
                 generation_suffix: "",
@@ -675,7 +975,8 @@ mod tests {
         assert_eq!(
             QwenInstruct::assistant_with_tool_calls_inner_text(
                 Some("Hello"),
-                &[("f".to_string(), "{}".to_string())]
+                &[("f".to_string(), "{}".to_string())],
+                ToolDialect::Hermes,
             ),
             "\nHello\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
         );
@@ -689,10 +990,101 @@ mod tests {
         assert_eq!(
             QwenInstruct::assistant_with_tool_calls_inner_text(
                 None,
-                &[("f".to_string(), "{}".to_string())]
+                &[("f".to_string(), "{}".to_string())],
+                ToolDialect::Hermes,
             ),
             "\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
         );
+    }
+
+    #[test]
+    fn coder_call_types_arguments_from_the_schema() {
+        // XML carries no types, so the schema is the only thing that can say
+        // whether `30` is the number 30 or the string "30". Both appear here.
+        let schema = r#"{"name":"read","parameters":{"properties":{
+            "path":{"type":"string"},"offset":{"type":"integer"},
+            "raw":{"type":"boolean"},"ratio":{"type":"number"}}}}"#
+            .to_string();
+        let body = "read>\n<parameter=path>\n30\n</parameter>\n\
+                    <parameter=offset>\n30\n</parameter>\n\
+                    <parameter=raw>\nTRUE\n</parameter>\n\
+                    <parameter=ratio>\n1.5\n</parameter>\n";
+        let (name, args) = parse_coder_function_call(body, &[schema]).unwrap();
+        assert_eq!(name, "read");
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        // Same text, different types — decided by the schema, not by shape.
+        assert_eq!(v["path"], serde_json::json!("30"));
+        assert_eq!(v["offset"], serde_json::json!(30));
+        assert_eq!(v["raw"], serde_json::json!(true));
+        assert_eq!(v["ratio"], serde_json::json!(1.5));
+    }
+
+    #[test]
+    fn coder_call_strips_exactly_one_delimiter_newline() {
+        // The newline after `>` and the one before `</parameter>` belong to the
+        // delimiter. A value that genuinely ends in a blank line keeps the rest.
+        let schema = r#"{"name":"write","parameters":{"properties":{"body":{"type":"string"}}}}"#
+            .to_string();
+        let body = "write>\n<parameter=body>\nline1\n\n</parameter>\n";
+        let (_, args) = parse_coder_function_call(body, &[schema]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["body"], serde_json::json!("line1\n"));
+    }
+
+    #[test]
+    fn coder_call_without_a_schema_degrades_to_strings_not_to_nothing() {
+        // The decoder is constructible without schemas. A call must still be a
+        // call: an agent can recover from a stringly-typed argument, not from
+        // a tool call that was never reported.
+        let body = "ls>\n<parameter=n>\n7\n</parameter>\n";
+        let (name, args) = parse_coder_function_call(body, &[]).unwrap();
+        assert_eq!(name, "ls");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&args).unwrap()["n"],
+                   serde_json::json!("7"));
+    }
+
+    #[test]
+    fn coder_preamble_carries_the_nesting_rule_the_decoder_relies_on() {
+        let schema = r#"{"type":"function","function":{"name":"get_time",
+            "description":"Get the time","parameters":{"type":"object",
+            "properties":{"tz":{"type":"string","description":"zone"}},
+            "required":["tz"]}}}"#
+            .to_string();
+        let p = QwenInstruct::build_tool_system_prompt_coder(&[schema]);
+        assert!(p.starts_with("You have access to the following functions:\n\n<tools>"));
+        assert!(p.contains("<function>\n<name>get_time</name>"));
+        assert!(p.contains("<parameter>\n<name>tz</name>\n<type>string</type>"));
+        assert!(p.contains("<required>[`tz`]</required>"));
+        // The instruction the model needs in order to emit what we parse.
+        assert!(p.contains("<tool_call>\n<function=example_function_name>"));
+        assert!(p.contains("must be nested within <tool_call></tool_call> XML tags"));
+        // And NOT the Hermes preamble it used to get.
+        assert!(!p.contains("# Tools"));
+    }
+
+    #[test]
+    fn coder_replay_round_trips_through_the_parser() {
+        // A replayed turn must be re-readable by the decoder, or a multi-turn
+        // agent drifts from what it was told it said.
+        let calls = vec![("read".to_string(), r#"{"path":"/a.rs","offset":3}"#.to_string())];
+        let text = QwenInstruct::assistant_with_tool_calls_inner_text(
+            None,
+            &calls,
+            ToolDialect::Coder,
+        );
+        assert!(text.contains("<tool_call>\n<function=read>\n"));
+        assert!(text.contains("<parameter=path>\n/a.rs\n</parameter>"));
+        // The int went out unquoted, as the template renders it.
+        assert!(text.contains("<parameter=offset>\n3\n</parameter>"));
+        let schema = r#"{"name":"read","parameters":{"properties":{
+            "path":{"type":"string"},"offset":{"type":"integer"}}}}"#
+            .to_string();
+        let inner = text.split("<function=").nth(1).unwrap().split("</function>").next().unwrap();
+        let (name, args) = parse_coder_function_call(inner, &[schema]).unwrap();
+        assert_eq!(name, "read");
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["path"], serde_json::json!("/a.rs"));
+        assert_eq!(v["offset"], serde_json::json!(3));
     }
 
     #[test]
@@ -759,6 +1151,7 @@ mod tests {
         let inst = QwenInstruct::new(
             tok,
             ChatMLConfig {
+                tool_dialect: ToolDialect::Hermes,
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",

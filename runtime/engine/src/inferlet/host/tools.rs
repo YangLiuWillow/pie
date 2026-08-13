@@ -106,6 +106,12 @@ impl pie::inferlet::tools::HostDecoder for ProcessCtx {
         Ok(self.ctx().table.push(decoder)?)
     }
 
+    async fn with_tools(&mut self, tools: Vec<String>) -> Result<Resource<Decoder>> {
+        let inner = crate::model::model().instruct().tool_decoder_with_tools(&tools);
+        let decoder = Decoder { inner };
+        Ok(self.ctx().table.push(decoder)?)
+    }
+
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

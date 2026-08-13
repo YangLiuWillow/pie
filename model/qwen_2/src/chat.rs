@@ -9,7 +9,7 @@
 // `QwenInstruct` is vendor-shared chat: Qwen3 owns it, and Qwen2, Qwen3.5,
 // GLM-5 and Nemotron-H bind it. The generation that implements a thing keeps
 // it; the others name it.
-use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
+use pie_model_qwen_3::chat::{ToolDialect, ChatMLConfig, QwenInstruct};
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
         tokenizer,
         ChatMLConfig {
             has_thinking: false,
+            tool_dialect: ToolDialect::Hermes,
             has_tools: true,
             generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
