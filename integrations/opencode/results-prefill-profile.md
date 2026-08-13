@@ -375,3 +375,30 @@ information: Metal's gap is not the same gap CUDA had.
 - **Config sizing** — done, and it was worth 1.73×.
 - **Anything in this integration.** Session KV reuse took pie 6.6× faster than
   itself and moved the vLLM gap from 6.4× to 4.1×. The rest is not here.
+
+## Metal tuning knobs: three more tested, all neutral
+
+Following the CUDA finding that a decode-shaped **128×16** default tile cost
+~73% on prefill (a sweep found 128×128×128 cluster 1×2 at 23.6k vs the default's
+13.6k), the Metal analogues were swept on the 0.6B dense model:
+
+| | 1308 tok | 2556 tok | 5052 tok |
+|---|---:|---:|---:|
+| default | 0.358 s | 1.004 s | 3.229 s |
+| `PIE_METAL_QMM_BN_CROSSOVER_TG=8` (BN=16→32 sooner) | 0.359 s | 1.006 s | 3.228 s |
+| `PIE_METAL_FP16_QMM=1` | 0.359 s | 1.007 s | 3.233 s |
+
+Identical to the millisecond. With the earlier `MOE_TILE_WIDE_PER` sweep
+(neutral-to-negative) and the chunk-size sweep (~18%, converges), that is **four
+tuning levers tested and none of them touches the gap**.
+
+*Caveat:* results this identical are also consistent with the env vars not
+reaching the driver at all. Nothing logs the resolved tuning table, so this
+could not be confirmed — treat these as "no observed effect" rather than "the
+knob does nothing".
+
+**Read together with the CUDA record, the conclusion is that Metal's deficit is
+not a tuning-constant problem.** On CUDA the constants *were* the problem and
+tuning bought 2×. Here the exposed constants do nothing, which points at the
+kernel or the dispatch/layout rather than at a selection heuristic — and makes
+the MLX microbenchmark the decisive next step rather than one option among many.
