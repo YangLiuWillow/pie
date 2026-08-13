@@ -107,6 +107,18 @@ impl<I: PoolId> Pool<I> {
         self.pending.iter().map(|(_, ids)| ids.len()).sum()
     }
 
+    /// The epoch range still waiting to retire — the number `retire_through`
+    /// is actually being compared against.
+    pub fn pending_epoch_range(&self) -> (u64, u64) {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for (e, _) in &self.pending {
+            lo = lo.min(*e);
+            hi = hi.max(*e);
+        }
+        if lo == u64::MAX { (0, 0) } else { (lo, hi) }
+    }
+
     pub fn capacity(&self) -> u32 {
         self.capacity
     }

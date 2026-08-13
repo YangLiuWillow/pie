@@ -338,6 +338,7 @@ impl KvStore {
     /// unsettled sequence is greater than E. With nothing in flight the whole
     /// pending set retires.
     pub fn retire_idle(&mut self) {
+        self.trace_pool("retire_idle");
         // Nothing in flight: everything retires, and the tracking set is
         // resynced. `settle` and `cancel_prepared` both remove their own
         // sequence, so `outstanding` should already be empty here; the clear
@@ -366,7 +367,36 @@ impl KvStore {
     pub fn install_working_set(&mut self, prepared: PreparedWorkingSet) -> WorkingSetId {
         let ws = self.table.create_working_set();
         self.flat.insert(ws, prepared.entry);
+        self.trace_pool("install_ws");
         ws
+    }
+
+    /// `PIE_KV_TRACE=1`: the pool's occupancy, at the two moments that decide
+    /// whether it is leaking — a working set being created, and the recycler
+    /// running.
+    ///
+    /// It exists because `kv_pages.allocated` / `kv_pages.available` are
+    /// DEFINED in `telemetry.rs` and never recorded anywhere, so the pool has
+    /// been unobservable in a running server. A serving stack that degrades
+    /// after sustained load and reports nothing is a stack whose next
+    /// degradation costs another night.
+    pub(crate) fn trace_pool(&self, at: &str) {
+        if std::env::var_os("PIE_KV_TRACE").is_none() {
+            return;
+        }
+        eprintln!(
+            "[kv] store={:p} {at:<12} avail={:>6}/{:<6} live_ws={:<5} pending_recycle={:<6} \
+in_flight={:<4} outstanding={:<4} seq={} pending_epochs={:?}",
+            self as *const _,
+            self.pool.available(),
+            self.pool.capacity(),
+            self.flat.len(),
+            self.pending_recycle_pages(),
+            self.in_flight,
+            self.outstanding.len(),
+            self.seq,
+            self.pool.pending_epoch_range(),
+        );
     }
 
     fn validate_index_key(key: &[u8]) -> Result<(), KvStoreError> {
