@@ -63,8 +63,18 @@ mod wire;
 /// sequential per session anyway; parallelism across sessions is parallelism
 /// across processes.
 #[inferlet::main]
-async fn main(_input: String) -> inferlet::Result<String> {
-    let mut daemon = handler::Daemon::new();
+async fn main(input: String) -> inferlet::Result<String> {
+    // `{"retain_tokens": N}` — the KV residency budget, in tokens. The launcher
+    // supplies it because it is the only party that has read the driver config;
+    // nothing on the `pie:inferlet` surface reports the KV pool size, so the
+    // guest cannot derive it. See `handler::DEFAULT_RETAIN_TOKENS`.
+    let retain_tokens = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|v| v.get("retain_tokens").and_then(|n| n.as_u64()))
+        .map(|n| n as u32)
+        .unwrap_or(handler::DEFAULT_RETAIN_TOKENS);
+    eprintln!("[opencode-session] retain_tokens={retain_tokens}\n");
+    let mut daemon = handler::Daemon::new(retain_tokens);
     let mut served = 0u64;
     while let Some(msg) = inferlet::session::receive().await {
         daemon.handle(&msg).await;

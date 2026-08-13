@@ -76,12 +76,17 @@ class InferletBridge:
     promptly rather than by LRU. Correctness does not depend on it.
     """
 
-    def __init__(self, pie_uri, identity, wasm, manifest, inferlet):
+    def __init__(self, pie_uri, identity, wasm, manifest, inferlet, retain_tokens=None):
         self.pie_uri = pie_uri
         self.identity = identity
         self.wasm = wasm
         self.manifest = manifest
         self.inferlet = inferlet
+        # KV residency budget handed to the guest at launch. The guest cannot
+        # derive it: nothing on the pie:inferlet surface reports the KV pool
+        # size, and over-committing does not degrade gracefully — the engine
+        # kills the process and takes this WebSocket down with it.
+        self.retain_tokens = retain_tokens
         self.client = None
         self.proc = None
         self.queues = {}  # req_id -> asyncio.Queue of (event, data)
@@ -102,8 +107,11 @@ class InferletBridge:
         await self.client.authenticate("session-shim")
 
     async def _launch(self):
+        launch_input = {}
+        if self.retain_tokens:
+            launch_input["retain_tokens"] = int(self.retain_tokens)
         self.proc = await self.client.launch_process(
-            self.inferlet, input={}, capture_outputs=True
+            self.inferlet, input=launch_input, capture_outputs=True
         )
         LOG(f"session inferlet up: {self.inferlet} process={self.proc.process_id}")
         self._reader = asyncio.create_task(self._pump())
@@ -477,13 +485,23 @@ async def main():
     ap.add_argument("--manifest", default=str(REPO / "inferlets/opencode-session/Pie.toml"))
     ap.add_argument("--inferlet", default="opencode-session@0.1.0")
     ap.add_argument(
+        "--retain-tokens",
+        type=int,
+        default=None,
+        help="KV residency budget in tokens handed to the guest at launch. "
+             "Derive it from the driver config: total_pages * kv_page_size "
+             "leaves room for the live turn's scratch, so about half of that.",
+    )
+    ap.add_argument(
         "--model-name",
         default="pie",
         help="the id reported by /v1/models (opencode matches its config against it)",
     )
     args = ap.parse_args()
 
-    bridge = InferletBridge(args.pie, args.identity, args.wasm, args.manifest, args.inferlet)
+    bridge = InferletBridge(
+        args.pie, args.identity, args.wasm, args.manifest, args.inferlet, args.retain_tokens
+    )
     await bridge.start()
 
     server = await asyncio.start_server(

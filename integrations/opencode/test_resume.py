@@ -223,10 +223,16 @@ def test_resume_matches_a_cold_rebuild():
     nothing else in this repo would notice. Only a differential against a cold
     rebuild of the SAME BYTES sees it.
 
-    Getting a genuinely cold arm without restarting the daemon: retention drops
-    the parent branch it extended (one live state per branch), so sending the
-    same conversation a second time necessarily misses. Byte-identical request,
-    resumed once and rebuilt once.
+    Getting a genuinely cold arm without restarting the daemon: flood the
+    branch cache until the one we want is evicted, then send the SAME bytes
+    again. Byte-identical request, resumed once and rebuilt once.
+
+    This used to rely on retention dropping the parent branch it extended, so a
+    repeat necessarily missed. That stopped being true once the daemon began
+    keeping every render boundary — a repeat now re-hits an earlier one, which
+    is the retry-resilience the boundary scan exists for. The test noticed
+    before anything else did, by asserting the miss it depends on rather than
+    assuming it.
     """
     base = [
         {"role": "system", "content": SYSTEM},
@@ -241,11 +247,22 @@ def test_resume_matches_a_cold_rebuild():
         f"expected a resume to compare against, got usage={warm.get('usage')}"
     )
 
+    # Evict: MAX_RETAINED is 8 in the daemon, so a dozen distinct one-token
+    # conversations push every earlier branch out. Cheap — these never decode.
+    for i in range(12):
+        turn(
+            [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": f"evict {i}"},
+            ],
+            max_tokens=1,
+        )
+
     cold = turn(convo)
     assert cached(cold) == 0, (
-        f"expected the repeat to miss (the parent branch is dropped on retain), "
-        f"but it resumed {cached(cold)} tokens — this test cannot tell warm from "
-        "cold, so its pass would be meaningless"
+        f"expected the repeat to miss after {12} evicting conversations, but it "
+        f"resumed {cached(cold)} tokens — this test cannot tell warm from cold, "
+        "so its pass would be meaningless. Has MAX_RETAINED grown?"
     )
 
     w, c = message(warm)["content"], message(cold)["content"]
@@ -257,8 +274,41 @@ def test_resume_matches_a_cold_rebuild():
     return f"resumed({cached(warm)} cached) == rebuilt, {len(w)} chars"
 
 
+def test_retry_rehits_an_earlier_boundary():
+    """Re-sending the same turn must resume, not rebuild.
+
+    This is what keeping every render boundary buys, and it is the shape a
+    client retry actually has: opencode reissues a turn after a transport error
+    or a tool failure, byte-identical. With one boundary per branch the retry
+    misses and pays a full rebuild at the worst possible moment; with the
+    boundary list it re-hits the still-valid earlier one.
+
+    Guarding it explicitly because the cold-rebuild test above depends on the
+    opposite behaviour, and a regression that collapsed the boundary list would
+    make that test pass while silently costing every retry a rebuild.
+    """
+    msgs = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": "Name one primary colour."},
+    ]
+    r1 = turn(msgs)
+    convo = echo_back(msgs, r1)
+    convo.append({"role": "user", "content": "Name a different one."})
+
+    first = turn(convo)
+    assert cached(first) > 0, f"setup turn did not resume: {first.get('usage')}"
+
+    retry = turn(convo)
+    assert cached(retry) > 0, (
+        "a byte-identical retry rebuilt from scratch — the branch kept only its "
+        f"tip boundary. usage={retry.get('usage')}"
+    )
+    return f"retry resumed {cached(retry)} tokens"
+
+
 TESTS = [
     test_resume_hits_on_echo_back,
+    test_retry_rehits_an_earlier_boundary,
     test_resume_survives_a_tool_round_trip,
     test_divergent_history_misses_cleanly,
     test_resume_matches_a_cold_rebuild,

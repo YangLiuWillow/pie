@@ -38,8 +38,6 @@
 //! trailing-whitespace trim in the response path silently broke every later
 //! resume, and nothing pointed at it.
 
-use std::collections::HashMap;
-
 use crate::engine::{self, GenConfig, SessionState};
 use crate::turn::TurnState;
 use crate::wire::{Envelope, Sink, recover_req_id, send_error};
@@ -48,9 +46,8 @@ use inferlet::{chat, model, runtime, tools};
 use pie_openai_serving::error::{INVALID_REQUEST_ERROR, SERVER_ERROR, parse_request};
 use pie_openai_serving::streaming::ChunkMeta;
 use pie_openai_serving::{
-    ChatCompletionRequest, RenderOp, canon_messages, cut_leading_reasoning, plan_render,
-    plan_render_suffix, sanitize_messages, snapshot_address, split_retain_point,
-    tool_schema_envelopes,
+    ChatCompletionRequest, RenderOp, TEMPLATE_MARKER, cut_leading_reasoning, plan_render,
+    prefix_addresses, sanitize_messages,
 };
 
 /// Defaults when the client sends none. opencode always sends `max_tokens` but
@@ -59,12 +56,32 @@ const DEFAULT_MAX_TOKENS: usize = 4096;
 const DEFAULT_TEMPERATURE: f32 = 0.6;
 const DEFAULT_TOP_P: f32 = 0.95;
 
-/// Retained conversation branches. Each pins its KV pages (and, on a hybrid
-/// model, its folded state) for as long as it lives, so this is a memory bound
-/// as much as a hit-rate one. Eight covers a linear conversation plus the
-/// retries and title side-calls opencode interleaves; past that the LRU tail is
-/// almost certainly dead branches.
+/// Hard cap on retained branches, as a backstop. The REAL bound is
+/// [`Daemon::retain_tokens`] — see below.
 const MAX_RETAINED: usize = 8;
+
+/// Default retained-KV budget, in tokens, when the launcher supplies none.
+///
+/// ## Why a token budget and not a branch count
+///
+/// A branch count is not a resource bound. Eight branches of a 200-token chat
+/// is nothing; eight branches of an 8k-token coding session is 64k tokens
+/// against a pool of `total_pages * kv_page_size` — 16,384 in the profile this
+/// integration ships. Over-committing does not degrade: the engine kills the
+/// process, which takes the gateway WebSocket down with it, and every retained
+/// branch dies at once. Measured here on the sixth turn of a 6-turn bench, and
+/// it is the same failure class OpenHands hit ("the cache did not evict, it
+/// blocked forever" — their first A/B wedged at 4 of 13 instances).
+///
+/// ## Why the guest has to guess
+///
+/// Nothing on the `pie:inferlet` surface reports the KV pool size. The guest is
+/// asked to manage residency without being told the budget: `kv_page_size()`
+/// and `max_embed_length()` exist, a pool capacity does not. So the launcher
+/// passes one in (`{"retain_tokens": N}`), because it is the only party that
+/// has read the driver config, and this default is what a 16k pool can hold
+/// while still leaving room for the live turn's scratch.
+pub const DEFAULT_RETAIN_TOKENS: u32 = 8192;
 
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -73,11 +90,31 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// One retained conversation branch.
+impl Retained {
+    /// Tokens of KV this branch pins.
+    fn tip(&self) -> u32 {
+        self.boundaries.last().map(|(l, _)| *l).unwrap_or(0)
+    }
+}
+
+pub struct Retained {
+    state: SessionState,
+    /// Ascending `(token length, address of the render's first `len` tokens)`
+    /// for every boundary this state's KV is valid at; the last is its current
+    /// length. Keeping the whole list — rather than only the tip — is what lets
+    /// a retry, a truncation or a branch re-hit a still-valid EARLIER boundary
+    /// instead of rebuilding. One `SessionState` serves them all, because the
+    /// tokens below any boundary are untouched by later extension.
+    boundaries: Vec<(u32, String)>,
+}
+
 pub struct Daemon {
-    /// Content address → (retained state, valid token count).
-    sessions: HashMap<String, (SessionState, u32)>,
-    /// Insertion order for the LRU cap.
-    lru: Vec<String>,
+    /// Retained branches, least-recently-used first.
+    sessions: Vec<Retained>,
+    /// Total tokens of retained KV this process will hold. See
+    /// [`DEFAULT_RETAIN_TOKENS`].
+    retain_tokens: u32,
     /// Per-instance id fragment, shared by every turn this process serves.
     uniq: String,
     /// Turn counter. Tool-call ids must be unique across the whole SESSION, not
@@ -92,7 +129,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new() -> Self {
+    pub fn new(retain_tokens: u32) -> Self {
         let uniq: String = runtime::instance_id()
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
@@ -116,8 +153,8 @@ impl Daemon {
             .collect();
 
         Self {
-            sessions: HashMap::new(),
-            lru: Vec::new(),
+            sessions: Vec::new(),
+            retain_tokens,
             uniq: if uniq.is_empty() { "local".to_string() } else { uniq },
             counter: 0,
             specials,
@@ -173,48 +210,38 @@ impl Daemon {
         let max_tokens = req.effective_max_tokens(DEFAULT_MAX_TOKENS);
         let has_tools = !req.tools.is_empty();
         let stop_strings = req.stop_strings();
-        let no_think = req.no_think();
-        let schemas = tool_schema_envelopes(&req.tools);
-
-        // Sanitize before BOTH rendering and canonicalization, so the address
-        // hashes what actually replays.
+        // Sanitize before rendering, so the address hashes what actually
+        // replays. Note the tool schemas need no separate hashing any more:
+        // `plan_render` folds them into the system turn, so they are part of
+        // the token stream and therefore part of the address for free. Same for
+        // the thinking channel — it is whatever the cue rendered.
         sanitize_messages(&mut req.messages, &self.specials);
 
-        // ── Resume ───────────────────────────────────────────────────────
-        // Hash the prefix up to and including the last assistant message: the
-        // previous turn retained its post-generation state under exactly that
-        // address. Generation forks the hit, so a client-side retry of the same
-        // turn can re-hit the same parent.
-        let mut resume_key: Option<String> = None;
-        let mut cached_tokens = 0u32;
-        let retain_split = split_retain_point(&req.messages);
-        if let Some(split) = retain_split {
-            let canons = canon_messages(&req.messages[..split]);
-            let key = snapshot_address(&schemas, no_think, canons.iter());
-            if let Some((_, total)) = self.sessions.get(&key) {
-                cached_tokens = *total;
-                resume_key = Some(key);
-            }
-        }
-
-        // ── Render: the suffix on a hit, the whole history on a miss ──────
-        let ops = match &resume_key {
-            Some(_) => {
-                plan_render_suffix(&req.messages, retain_split.unwrap())
-            }
-            None => plan_render(&req),
-        };
-        let ops = match ops {
+        // ── Render the FULL history, once ────────────────────────────────
+        // Not just the resume suffix. Rendering everything costs host template
+        // calls (~7 ms on a 7k-token history upstream) and buys three things a
+        // suffix-only render cannot:
+        //
+        //   * the address can hash TOKEN IDS instead of messages, so a chat
+        //     template or tokenizer change misses cleanly instead of handing
+        //     the model KV rendered by the old template;
+        //   * every render-unit boundary becomes a candidate resume point, so a
+        //     retry or a truncation re-hits an earlier one;
+        //   * the hit can be GATED on the boundary length, which is what makes
+        //     "a false hit is impossible" true rather than hoped for.
+        //
+        // The saving that matters was never the render; it was the prefill.
+        let ops = match plan_render(&req) {
             Ok(o) => o,
             Err(e) => {
                 send_error(req_id, 400, INVALID_REQUEST_ERROR, &e.to_string());
                 return;
             }
         };
-        // Split the plan at its trailing `Cue`. The delta is rendered history
-        // and is what gets retained; the cue is generation scaffolding and must
-        // NOT be — replaying this turn as history renders no cue at all, so a
-        // retained cue is tokens no re-render will ever produce (engine docs).
+        // Split the plan at its trailing `Cue`. The history is what gets
+        // retained; the cue is generation scaffolding and must NOT be —
+        // replaying this turn as history renders no cue at all, so a retained
+        // cue is tokens no re-render will ever produce (engine docs).
         let (delta_ops, cue_ops) = match ops.split_last() {
             Some((RenderOp::Cue, head)) => (head, &ops[ops.len() - 1..]),
             _ => {
@@ -223,8 +250,8 @@ impl Daemon {
                 return;
             }
         };
-        let rendered = render_ops(delta_ops).and_then(|d| render_ops(cue_ops).map(|c| (d, c)));
-        let (delta, cue) = match rendered {
+        let rendered = render_history(delta_ops).and_then(|(f, b)| render_ops(cue_ops).map(|c| (f, b, c)));
+        let (full, bounds, cue) = match rendered {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[opencode-session] render fault: {e}");
@@ -232,7 +259,7 @@ impl Daemon {
                 return;
             }
         };
-        if delta.is_empty() {
+        if full.is_empty() {
             send_error(
                 req_id,
                 400,
@@ -241,6 +268,43 @@ impl Daemon {
             );
             return;
         }
+
+        // Address every boundary in one streaming pass. The LAST entry is this
+        // turn's own render — the address we will retain under. The rest are
+        // resume candidates.
+        let model_id = model::name();
+        let addressed = prefix_addresses(&model_id, TEMPLATE_MARKER, &full, &bounds);
+        let save_address = match addressed.last() {
+            Some((_, a)) => a.clone(),
+            None => {
+                eprintln!("[opencode-session] render produced no boundaries");
+                send_error(req_id, 500, SERVER_ERROR, "internal error while rendering the prompt");
+                return;
+            }
+        };
+
+        // ── Resume: scan candidates longest-first ────────────────────────
+        // Capped, because each attempt is a scan and the useful hit is nearly
+        // always the longest. Upstream measured 1.97 attempts per call.
+        //
+        // The final boundary (this turn's whole render) is deliberately NOT a
+        // candidate: resuming there would leave an empty delta, and re-rendering
+        // one trailing unit is cheaper than a special case for it.
+        const MAX_ATTEMPTS: usize = 8;
+        let mut resume_at: Option<(usize, u32)> = None; // (branch index, boundary)
+        for (b, addr) in addressed.iter().rev().skip(1).take(MAX_ATTEMPTS) {
+            if let Some(i) = self
+                .sessions
+                .iter()
+                .position(|r| r.boundaries.iter().any(|(l, a)| l == b && a == addr))
+            {
+                resume_at = Some((i, *b));
+                break;
+            }
+        }
+
+        let cached_tokens = resume_at.map(|(_, b)| b).unwrap_or(0);
+        let delta = &full[cached_tokens as usize..];
         let prompt_tokens = cached_tokens + (delta.len() + cue.len()) as u32;
 
         self.counter += 1;
@@ -276,23 +340,39 @@ impl Daemon {
         // to mutate it — which is two live borrows of the same value.
         let keepalive = state.meta.keepalive();
         let ka_sink = sink.clone();
+        // Boundaries carried over from the branch we resumed (empty on a cold
+        // turn); this turn's own boundary is appended on retain.
+        let mut parent_boundaries: Vec<(u32, String)> = Vec::new();
 
-        // The retained entry is TAKEN out of the map: the turn extends that very
+        // The branch is TAKEN out of the list: the turn extends that very
         // working set (nothing forks — see `engine::Resume`), so leaving a
-        // second handle in the map would advertise a prefix whose tail is about
-        // to be overwritten. `retain_turn` puts the extended state back under
-        // the new address; a failed turn drops it, which is a clean miss.
-        let owned_parent = match &resume_key {
-            Some(k) => {
-                self.lru.retain(|x| x != k);
-                self.sessions.remove(k)
+        // second handle behind would advertise a prefix whose tail is about to
+        // be overwritten. `retain_turn` puts the extended state back; a failed
+        // turn drops it, which is a clean miss.
+        //
+        // Resuming at boundary `b` invalidates every boundary ABOVE it — those
+        // tokens are about to be rewritten by this turn's delta — so the
+        // surviving list is truncated to `<= b` before the state is reused.
+        let mut owned_parent: Option<Retained> = None;
+        if let Some((idx, b)) = resume_at {
+            let mut r = self.sessions.remove(idx);
+            let tip = r.boundaries.last().map(|(l, _)| *l).unwrap_or(0);
+            if b < tip {
+                eprintln!(
+                    "[opencode-session] resuming at an earlier boundary ({b} < {tip}): \
+                     a retry or a truncated history"
+                );
             }
-            None => None,
-        };
+            r.boundaries.retain(|(l, _)| *l <= b);
+            owned_parent = Some(r);
+        }
 
         let run = {
-            let resume = match owned_parent {
-                Some((st, t)) => engine::Resume::InPlace(st, t),
+            let resume = match owned_parent.take() {
+                Some(r) => {
+                    parent_boundaries = r.boundaries;
+                    engine::Resume::InPlace(r.state, cached_tokens)
+                }
                 None => engine::Resume::Cold,
             };
             let st = &mut state;
@@ -357,7 +437,7 @@ impl Daemon {
         // with the decoded token count, the turn state machine and the decode
         // loop have diverged.
         let accepted = run.accepted;
-        let retained = self.retain_turn(run, &req, &schemas, no_think, resume_key);
+        let retained = self.retain_turn(run, parent_boundaries, save_address);
         // Built as ONE string and printed with a single placeholder. A
         // multi-fragment `eprintln!` is split by the runtime's stderr capture
         // into one client message PER FRAGMENT, so the interpolated form
@@ -398,55 +478,66 @@ impl Daemon {
         }
     }
 
-    /// Retain the rendered-history state under the address the NEXT request
-    /// will hash.
+    /// Retain the rendered-history state, addressed by the TOKENS it holds.
     ///
-    /// The address is the canon of **this request's own messages** — nothing the
-    /// server produced enters it, because nothing the server produced is in the
-    /// retained KV either (`engine` module docs). Next turn the client echoes our
-    /// assistant turn back and appends; `split_retain_point` lands immediately
-    /// before that assistant message, so the prefix it hashes is exactly this
-    /// message list.
+    /// The address is `hash(model ‖ template ‖ full_render)` — this turn's own
+    /// render, and nothing the server produced. Next turn that same render
+    /// reappears as an interior boundary of the next one (history is
+    /// append-only), so it is found by the boundary scan without either side
+    /// predicting anything.
+    ///
+    /// That "never name a prediction" rule is load-bearing and was measured
+    /// upstream: an OpenHands version that predicted the next boundary from the
+    /// inferlet's own text and tool calls saw its hit rate collapse to ~3%,
+    /// because the host re-serializes JSON arguments with different bytes.
+    /// Naming only full host renders restored 96.6%.
     ///
     /// Returns a log fragment. A turn that errored mid-generation is not
-    /// retained. On the fork path its damage was confined to a scratch fork
-    /// anyway, but on the in-place path the delta prefill may have stopped
-    /// part-way, so the length recorded here would over-claim.
+    /// retained: the delta prefill may have stopped part-way, so the length
+    /// recorded here would over-claim.
     fn retain_turn(
         &mut self,
         run: engine::Generation,
-        req: &ChatCompletionRequest,
-        schemas: &[String],
-        no_think: bool,
-        parent: Option<String>,
+        mut boundaries: Vec<(u32, String)>,
+        address: String,
     ) -> String {
         if let Some(e) = run.gen_error {
-            // Dropping `run` releases the state (and the scratch fork with it).
+            // Dropping `run` releases the state.
             return format!("not retained (generation error: {e})");
         }
-
-        let canons = canon_messages(&req.messages);
-        let key = snapshot_address(schemas, no_think, canons.iter());
         let total = run.total_len;
+        boundaries.push((total, address.clone()));
+        self.sessions.push(Retained { state: run.state, boundaries });
 
-        // Drop the parent this turn extended: one live state per conversation
-        // branch. The fork shares the parent's pages copy-on-write, so keeping
-        // both pins two copies of a prefix that only one of them will ever be
-        // resumed from.
-        if let Some(p) = parent {
-            if self.sessions.remove(&p).is_some() {
-                self.lru.retain(|k| k != &p);
+        // Evict oldest-first until BOTH bounds hold. The token budget is the
+        // one that matters; the count is a backstop for pathological cases
+        // (very many tiny branches). Dropping a `Retained` releases its KV
+        // pages and, on a hybrid model, its folded recurrent state.
+        //
+        // The newest branch is never evicted even if it alone exceeds the
+        // budget: it is the one the next turn will resume, and dropping it
+        // would guarantee a rebuild every turn rather than risk one.
+        loop {
+            let held: u32 = self.sessions.iter().map(Retained::tip).sum();
+            let over = held > self.retain_tokens || self.sessions.len() > MAX_RETAINED;
+            if !over || self.sessions.len() <= 1 {
+                if over {
+                    eprintln!(
+                        "[opencode-session] retained {held} tokens in 1 branch, over the \
+                         {} budget — raise retain_tokens or lower the context",
+                        self.retain_tokens
+                    );
+                }
+                break;
             }
+            let dropped = self.sessions.remove(0);
+            eprintln!(
+                "[opencode-session] evicted a branch ({} tokens); {held} held over a {} budget",
+                dropped.tip(),
+                self.retain_tokens
+            );
         }
-        if self.sessions.insert(key.clone(), (run.state, total)).is_none() {
-            self.lru.push(key.clone());
-        }
-        while self.sessions.len() > MAX_RETAINED && !self.lru.is_empty() {
-            let evict = self.lru.remove(0);
-            self.sessions.remove(&evict);
-            eprintln!("[opencode-session] evicted retained branch {evict}");
-        }
-        format!("retained {key} (len {total})")
+        format!("retained {} (len {total})", &address[..16])
     }
 
     /// A turn that failed before producing anything still has to look like a
@@ -476,28 +567,56 @@ impl Daemon {
 /// no-think channel, matching the token-exact parity verdict against HF
 /// `enable_thinking=False`, and matching Strategy A so the A/B compares servers
 /// rather than renderers.
+/// Render the history ops, recording the token length after each one.
+///
+/// The boundaries are the safe resume points: every one lands on a render-unit
+/// edge (the system+tools block, a user/assistant turn, a merged tool batch),
+/// so a candidate prefix is a literal token prefix of this render **by
+/// construction** — a bad split cannot plant a wrong suffix. The final boundary
+/// is the whole render.
+fn render_history(ops: &[RenderOp]) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let mut out = Vec::new();
+    let mut bounds = Vec::with_capacity(ops.len());
+    for op in ops {
+        render_one(op, &mut out)?;
+        bounds.push(out.len() as u32);
+    }
+    Ok((out, bounds))
+}
+
 fn render_ops(ops: &[RenderOp]) -> Result<Vec<u32>, String> {
     let mut out = Vec::new();
     for op in ops {
-        match op {
-            RenderOp::EquipAfterSystem { system, tools: schemas } => {
-                out.extend(tools::equip_after_system(system.as_deref(), schemas)?);
-            }
-            RenderOp::User(t) => out.extend(chat::user(t)),
-            RenderOp::Assistant(t) => out.extend(chat::assistant(t)),
-            RenderOp::AssistantWithToolCalls { content, calls } => {
-                let wit_calls: Vec<tools::ToolCall> = calls
-                    .iter()
-                    .map(|(name, args)| tools::ToolCall {
-                        name: name.clone(),
-                        arguments_json: args.clone(),
-                    })
-                    .collect();
-                out.extend(tools::assistant_with_tool_calls(content.as_deref(), &wit_calls));
-            }
-            RenderOp::AnswerBatch(batch) => out.extend(tools::answer_batch(batch)),
-            RenderOp::Cue => out.extend(chat::cue_no_think()),
-        }
+        render_one(op, &mut out)?;
     }
     Ok(out)
+}
+
+/// Map one engine-free render op onto the WIT template surface.
+///
+/// `Cue` renders through `chat::cue_no_think` — this milestone always serves the
+/// no-think channel, matching the token-exact parity verdict against HF
+/// `enable_thinking=False`, and matching Strategy A so the A/B compares servers
+/// rather than renderers.
+fn render_one(op: &RenderOp, out: &mut Vec<u32>) -> Result<(), String> {
+    match op {
+        RenderOp::EquipAfterSystem { system, tools: schemas } => {
+            out.extend(tools::equip_after_system(system.as_deref(), schemas)?);
+        }
+        RenderOp::User(t) => out.extend(chat::user(t)),
+        RenderOp::Assistant(t) => out.extend(chat::assistant(t)),
+        RenderOp::AssistantWithToolCalls { content, calls } => {
+            let wit_calls: Vec<tools::ToolCall> = calls
+                .iter()
+                .map(|(name, args)| tools::ToolCall {
+                    name: name.clone(),
+                    arguments_json: args.clone(),
+                })
+                .collect();
+            out.extend(tools::assistant_with_tool_calls(content.as_deref(), &wit_calls));
+        }
+        RenderOp::AnswerBatch(batch) => out.extend(tools::answer_batch(batch)),
+        RenderOp::Cue => out.extend(chat::cue_no_think()),
+    }
+    Ok(())
 }

@@ -10,27 +10,68 @@ Six turns of a growing agentic conversation, replayed byte-identically to both a
 
 | turn | A (frozen) | B (session) | speedup | A ttfc | B ttfc | prompt | B cached |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 42.73 s | 46.92 s | **0.9×** | 34.93 | 44.62 | 7268 | 0 |
-| 2 | 52.74 s | 4.39 s | 12.0× | 44.80 | 2.12 | 7454 | 7261 |
-| 3 | 54.64 s | 4.37 s | 12.5× | 46.70 | 2.14 | 7640 | 7447 |
-| 4 | 56.26 s | 4.50 s | 12.5× | 48.26 | 2.16 | 7826 | 7633 |
-| 5 | 57.31 s | 4.57 s | 12.5× | 49.25 | 2.20 | 8012 | 7819 |
-| 6 | 40.85 s | 4.64 s | 8.8× | 32.92 | 2.23 | 8198 | 8005 |
-| **total** | **304.53 s** | **69.40 s** | **4.4×** | | | | |
-| turns 2–6 | 261.80 s | 22.48 s | **11.6×** | | | | |
+| 1 | 42.73 s | 41.09 s | 1.0× | 34.93 | 39.06 | 7268 | 0 |
+| 2 | 52.74 s | 3.89 s | 13.6× | 44.80 | 1.85 | 7454 | 7261 |
+| 3 | 54.64 s | 3.93 s | 13.9× | 46.70 | 1.87 | 7640 | 7447 |
+| 4 | 56.26 s | 3.98 s | 14.1× | 48.26 | 1.90 | 7826 | 7633 |
+| 5 | 57.31 s | 4.03 s | 14.2× | 49.25 | 1.92 | 8012 | 7819 |
+| 6 | 40.85 s | 4.08 s | 10.0× | 32.92 | 1.95 | 8198 | 8005 |
+| **total** | **304.53 s** | **60.99 s** | **5.0×** | | | | |
+| turns 2–6 | 261.80 s | 19.91 s | **13.2×** | | | | |
 
-Raw: `/tmp/ab_a.json`, `/tmp/ab_b.json` (regenerate with `bench_ab.py`).
+Raw: `/tmp/ab_a.json`, `/tmp/ab_b2.json` (regenerate with `bench_ab.py`).
 
-**Read the first row before the last one.** On the cold turn B is *slower* —
-46.9 s against 42.7 s, about 10% — because it pays for retention and runs a
-host-driven decode loop instead of the device-carried one. Every turn after
-that is ~12× faster because the ~7.3k-token history is already resident and
-only the ~190-token delta is prefilled. Time to first content is the honest
-latency number a user feels: **~48 s → ~2.2 s**.
+Steady-state time to first content — the latency a user actually feels —
+is **44.39 s → 1.90 s, 23×**. The cold turn is a wash (41.1 s vs 42.7 s):
+B pays for retention and runs a host-driven decode loop, and gets it back
+because it no longer canonicalizes the message list per turn.
+
+**An earlier revision of this run measured 69.40 s and a cold turn that was
+~10% SLOWER than A.** That version addressed retention by hashing canonicalized
+*messages*; the current one hashes rendered *token ids*. Hashing tokens is
+strictly more correct (see "What changed" below) and turned out to be faster
+too, because canonicalizing every message into a fresh `Vec<CanonItem>` of
+cloned `String`s each turn cost more than rendering the history a second time.
+The superseded numbers are kept here rather than deleted, since "the safer
+design was also the faster one" is not the result anyone predicts.
 
 Turn 6 on arm A (40.85 s) breaks the otherwise monotonic 52→57 s trend on the
 *longest* prompt of the run. That is unexplained; it is one sample of machine
 variance on a shared laptop, and it is left in rather than smoothed.
+
+## What changed since the first revision
+
+Retention is now addressed by **rendered token ids**, not by canonicalized
+messages, following the OpenHands prefix cache
+(`openhands-integration-updated:inferlets/openhands-coder-session/src/prefix_cache.rs`).
+Three things follow:
+
+1. **Template drift misses cleanly.** A message-level address does not move when
+   the chat template, the cue or the tokenizer changes — so a resume would have
+   handed the model KV rendered by the *old* template, fluently and
+   undetectably. A token-level address moves by construction, and
+   `TEMPLATE_MARKER` covers what the ids cannot express.
+2. **Every render-unit boundary is a resume candidate**, scanned longest-first
+   (cap 8). A byte-identical retry — which opencode does after a transport error
+   or a tool failure — now re-hits an earlier boundary instead of rebuilding.
+   `test_retry_rehits_an_earlier_boundary` pins it.
+3. **Tool schemas need no separate hashing.** `plan_render` folds them into the
+   system turn, so they are part of the token stream and therefore part of the
+   address for free. Same for the thinking channel.
+
+**And it caught a real bug at bench scale.** Keeping many branches over-committed
+the KV pool: 8 branches × ~8k tokens against a pool of `512 pages × 32 = 16,384`
+tokens. Over-committing does not degrade — the engine kills the process and the
+gateway WebSocket goes with it, so turn 6 completed and retained inferlet-side
+and then 500ed on delivery. Retention is now bounded by a **token budget**
+(`retain_tokens`, passed at launch), not a branch count, because a branch count
+is not a resource bound.
+
+The guest cannot derive that budget: **nothing on the `pie:inferlet` surface
+reports the KV pool size.** `kv_page_size()` and `max_embed_length()` exist; a
+pool capacity does not. So the launcher — the only party that has read the driver
+config — passes it in. That is a gap worth closing upstream: a guest asked to
+manage KV residency is not told how much KV it may hold.
 
 ## Method — and why it is a replay, not stock opencode
 
@@ -50,10 +91,13 @@ and the *canned* assistant turn appended before the next. Both arms see the same
 bytes at every turn; only the server differs.
 
 The canned reply favours neither arm. A retains nothing regardless. B addresses
-retention by the **client's** messages only — no server output enters the
-address — so a canned assistant turn resumes exactly as a real one would. (Under
-the earlier seal-through-the-generated-turn design it would not have, which is
-one more reason that design was wrong.)
+retention by the token ids of the **client's own render** — no server output
+enters the address — so a canned assistant turn resumes exactly as a real one
+would. (Under the earlier seal-through-the-generated-turn design it would not
+have, which is one more reason that design was wrong. OpenHands measured that
+same mistake from the other side: predicting the next boundary from the
+inferlet's own output collapsed their hit rate to ~3%, because the host
+re-serializes JSON arguments with different bytes.)
 
 Controls: `max_tokens=96` on both arms so the comparison is dominated by
 prefill, which is where the strategies differ; `temperature=0`; a throwaway
@@ -83,8 +127,8 @@ out-reusing APC.
 
 So the honest claim from this run is bounded:
 
-- ✅ **Strategy B removes the re-prefill that Strategy A pays**, 11.6× on
-  steady-state turns, ~22× to first content. The `~81 s → ~21 s` prediction in
+- ✅ **Strategy B removes the re-prefill that Strategy A pays**, 13.2× on
+  steady-state turns, 23× to first content. The `~81 s → ~21 s` prediction in
   the handover is confirmed in shape and exceeded in degree, against the control
   it named.
 - ❌ It says nothing about pie vs vLLM+APC, because APC would capture most of

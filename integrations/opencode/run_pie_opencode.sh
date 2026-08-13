@@ -236,7 +236,14 @@ if [ "$PIE_STRATEGY" = b ]; then
         exit 1
     fi
     SESSION_MANIFEST="$REPO/inferlets/opencode-session/Pie.toml"
-    echo "── strategy b: session inferlet $SESSION_WASM ($(wc -c <"$SESSION_WASM" | tr -d ' ') bytes)"
+    # KV residency budget for the guest, derived from the config THIS script
+    # generated: total_pages * kv_page_size is the whole pool, and the live
+    # turn needs its own scratch inside it, so hand over about half. The guest
+    # cannot work this out for itself — no pool capacity is reported on the
+    # pie:inferlet surface — and over-committing kills the process rather than
+    # evicting.
+    PIE_RETAIN_TOKENS="${PIE_RETAIN_TOKENS:-$(( 512 * 32 / 2 ))}"
+    echo "── strategy b: session inferlet $SESSION_WASM ($(wc -c <"$SESSION_WASM" | tr -d ' ') bytes), retain_tokens=$PIE_RETAIN_TOKENS"
 fi
 
 if [ "$PIE_STRATEGY" = a ] && [ -f "$WASM_SRC" ]; then
@@ -328,6 +335,7 @@ if [ "$PIE_STRATEGY" = b ]; then
         --host 127.0.0.1 --port "$PIE_PORT" \
         --wasm "$SESSION_WASM" --manifest "$SESSION_MANIFEST" \
         --model-name "$PIE_MODEL" \
+        --retain-tokens "$PIE_RETAIN_TOKENS" \
         >"$SHIM_LOG" 2>&1 &
     SHIM_PID=$!
     echo -n "── waiting for $BASE_URL/v1/models "
