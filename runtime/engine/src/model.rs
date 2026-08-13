@@ -64,6 +64,7 @@ fn descriptor_field(descriptor: &serde_json::Value, key: &str) -> Result<u32> {
 
 pub fn register(
     name: String,
+    checkpoint: &str,
     arch_name: &str,
     kv_page_size: u32,
     rs: RsCaps,
@@ -94,7 +95,7 @@ pub fn register(
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
-    let instruct = instruct::create(arch_name, tokenizer.clone());
+    let instruct = instruct::create(arch_name, checkpoint, tokenizer.clone());
 
     let model = Arc::new(Model {
         name,

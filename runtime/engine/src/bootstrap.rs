@@ -135,6 +135,20 @@ pub struct RuntimeConfig {
 
 pub struct ModelConfig {
     pub name: String,
+    /// What is actually being served — the store name or `.zt` path — as
+    /// distinct from `name`, which names the DEPLOYMENT and is routinely
+    /// `"default"`.
+    ///
+    /// Carried because for one family it is the only thing that answers a
+    /// question the model files cannot: Qwen3-Coder and the *thinking*
+    /// Qwen3-MoE share `Qwen3MoeForCausalLM`, share `model_type qwen3_moe`,
+    /// share `<think>` in vocab, and this checkpoint ships no
+    /// `_name_or_path` — so `config.json` cannot tell them apart, and the one
+    /// file that could, `chat_template.jinja`, is not imported into the
+    /// artifact. Cueing the wrong one costs the whole generation: a model with
+    /// no thinking channel, handed an empty `<think>` block, answers nothing.
+    /// See `pie_model::instruct::is_coder_lineage`.
+    pub checkpoint: String,
     pub arch_name: String,
     pub kv_page_size: usize,
     /// The tokenizer file, for a model served from a HuggingFace snapshot.
@@ -278,6 +292,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let ModelConfig {
         name,
+        checkpoint,
         arch_name,
         kv_page_size,
         tokenizer_path,
@@ -383,6 +398,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     };
     model::register(
         name.clone(),
+        &checkpoint,
         &arch_name,
         kv_page_size as u32,
         rs_caps,

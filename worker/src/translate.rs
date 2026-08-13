@@ -142,6 +142,7 @@ fn build_model(
 
     Ok(pie_engine::bootstrap::ModelConfig {
         name: m.name.clone(),
+        checkpoint: m.model.clone(),
         arch_name: group0_caps.arch_name,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
