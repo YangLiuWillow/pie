@@ -1,0 +1,33 @@
+# Guest wasm crate — NOT a member of the root host workspace (same policy as
+# `inferlets/chat-completions`, `tests/inferlets/*` and `sdk/rust/*`: wasm-target
+# crates keep their own lockfiles so wasm-only deps never enter the host build
+# graph). The empty [workspace] table below makes this crate its own workspace
+# root, so cargo never walks up into the host manifest.
+#
+# Build:
+#   cd inferlets/opencode-session && \
+#   CARGO_TARGET_DIR=~/Documents/Liszt_ai/.cargo-target/pie-opencode \
+#   cargo build --target wasm32-wasip2 --release
+
+[package]
+name = "opencode-session"
+version = "0.1.0"
+edition = "2024"
+description = "Long-lived opencode session inferlet (Strategy B): one process per session, KV working set retained in-process across turns, fed over the sticky WebSocket"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+# The same pure-logic serving library Strategy A uses — wire types, chunk
+# builders, render plan, session canon, visible-text filter, salvage parsers.
+# Sharing it is what keeps the A/B honest: both arms render from one planner.
+pie-openai-serving = { path = "../openai-serving" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[workspace]
+
+[profile.release]
+lto = true

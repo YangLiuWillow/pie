@@ -271,7 +271,22 @@ class PieClient:
         if not ok:
             raise Exception(f"Username '{username}' rejected by server: {result}")
 
-        if result == "Authenticated (Engine disabled authentication)":
+        # Early-return on a no-challenge success. The engine answers a
+        # challenge-less `auth_identify` in two cases that are both already
+        # good: key auth disabled, or the trust-edge gateway path, where the
+        # session is pre-authenticated from the verified `x-pie-identity`
+        # header and so answers "Already authenticated"
+        # (runtime/engine/src/server.rs:371). Neither carries a base64
+        # challenge, so there is nothing to sign.
+        #
+        # The Rust client has accepted both sentinels all along
+        # (client/rust/src/client.rs:343); this one accepted only the first,
+        # which made every gateway-routed Python client fail with a demand for
+        # a private key that the server never actually asked for.
+        if result in (
+            "Authenticated (Engine disabled authentication)",
+            "Already authenticated",
+        ):
             return
 
         if private_key is None:

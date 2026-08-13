@@ -9,8 +9,31 @@
 #                                            #   (for the stock-opencode e2e)
 #
 #   PIE_MODEL=qwen3.6-35b-a3b ./run_pie_opencode.sh          # the 35B run
+#   PIE_STRATEGY=b ./run_pie_opencode.sh                     # session inferlet
+#
+# ── The two strategies, and why one script serves both ──────────────────────
+#
+#   a (default)  stock opencode → gateway OpenAI ingress → one `chat-completions`
+#                inferlet PER REQUEST. KV dies with the request. Frozen: this is
+#                the control arm for the A/B, so nothing here may change its
+#                behaviour.
+#   b            stock opencode → session_shim.py → ONE long-lived
+#                `opencode-session` inferlet over the sticky WebSocket, holding
+#                the conversation's KV working set across turns.
+#
+# The arms are deliberately indistinguishable from the client's side: in BOTH,
+# opencode and the acceptance suite talk to http://127.0.0.1:$PIE_PORT/v1. Under
+# `b` the shim binds that port and `pie serve` moves to $PIE_ENGINE_PORT. So
+# ./opencode.json and test_acceptance.py need no per-arm configuration, and a
+# difference in the measurement cannot be a difference in how the client was
+# pointed. (qwen-code's run-2 lost a benchmark exactly this way — the arms
+# turned out to be measuring their renderers, not their servers.)
 #
 # Environment:
+#   PIE_STRATEGY  a | b                  (default: a — see above)
+#   PIE_ENGINE_PORT
+#                 gateway port under strategy b (default: 18080). Under `a` the
+#                 gateway is on PIE_PORT directly and this is unused.
 #   PIE_MODEL     which model to serve   (default: qwen3-0.6b). One of the
 #                                        profile keys below, or a raw artifact
 #                                        name from `pie model list` — a raw
@@ -64,6 +87,28 @@ PIE_HOME="${PIE_HOME:-$HOME/.pie}"
 PIE_PORT="${PIE_PORT:-8080}"
 BASE_URL="${PIE_BASE_URL:-http://127.0.0.1:$PIE_PORT}"
 LOG="${LOG:-/tmp/pie_opencode_serve.log}"
+
+# ── strategy ────────────────────────────────────────────────────────────────
+# Under `b` the shim owns the client-facing port and the gateway moves aside, so
+# both arms answer on $PIE_PORT. See the header.
+PIE_STRATEGY="${PIE_STRATEGY:-a}"
+case "$PIE_STRATEGY" in
+    a|A) PIE_STRATEGY=a ;;
+    b|B) PIE_STRATEGY=b ;;
+    *) echo "PIE_STRATEGY must be 'a' or 'b' (got '$PIE_STRATEGY')" >&2; exit 1 ;;
+esac
+PIE_ENGINE_PORT="${PIE_ENGINE_PORT:-18080}"
+# The shim imports the pie python client (websockets/msgpack/blake3/cryptography);
+# point this at a venv that has them if the system python3 does not.
+PIE_PYTHON="${PIE_PYTHON:-python3}"
+if [ "$PIE_STRATEGY" = b ]; then
+    SERVE_PORT="$PIE_ENGINE_PORT"
+    HEALTH_URL="http://127.0.0.1:$SERVE_PORT"
+    SHIM_LOG="${SHIM_LOG:-/tmp/pie_opencode_shim.log}"
+else
+    SERVE_PORT="$PIE_PORT"
+    HEALTH_URL="$BASE_URL"
+fi
 
 SERVE_ONLY=0
 CFG=""
@@ -124,7 +169,7 @@ if [ -z "$CFG" ]; then
     cat >"$CFG" <<EOF
 [server]
 host = "127.0.0.1"
-port = $PIE_PORT
+port = $SERVE_PORT
 
 [model]
 name = "default"
@@ -167,7 +212,27 @@ done
 WASM_SRC="${WASM_SRC:-$REPO/inferlets/chat-completions/target/wasm32-wasip2/release/chat_completions.wasm}"
 MANIFEST_SRC="$REPO/inferlets/chat-completions/Pie.toml"
 PROG_DIR="$PIE_HOME/programs/chat-completions"
-if [ -f "$WASM_SRC" ]; then
+
+# Strategy b resolves its own guest the same way, but does NOT install it here:
+# the shim pushes it over the WebSocket with `install_program`, which is
+# atomic server-side and needs no $PIE_HOME write from this script.
+if [ "$PIE_STRATEGY" = b ]; then
+    for CAND in \
+        "${CARGO_TARGET_DIR:-}/wasm32-wasip2/release/opencode_session.wasm" \
+        "$REPO/inferlets/opencode-session/target/wasm32-wasip2/release/opencode_session.wasm"; do
+        if [ -n "${CAND#/wasm32*}" ] && [ -f "$CAND" ]; then SESSION_WASM="$CAND"; break; fi
+    done
+    SESSION_WASM="${SESSION_WASM:-}"
+    if [ -z "$SESSION_WASM" ]; then
+        echo "no built opencode-session wasm found. Build it:" >&2
+        echo "  (cd $REPO/inferlets/opencode-session && cargo build --target wasm32-wasip2 --release)" >&2
+        exit 1
+    fi
+    SESSION_MANIFEST="$REPO/inferlets/opencode-session/Pie.toml"
+    echo "── strategy b: session inferlet $SESSION_WASM ($(wc -c <"$SESSION_WASM" | tr -d ' ') bytes)"
+fi
+
+if [ "$PIE_STRATEGY" = a ] && [ -f "$WASM_SRC" ]; then
     if [ ! -f "$PROG_DIR/0.1.0.wasm" ] || [ "$WASM_SRC" -nt "$PROG_DIR/0.1.0.wasm" ]; then
         mkdir -p "$PROG_DIR"
         # Copy to a temp name and rename. `cp` straight onto the destination
@@ -194,7 +259,7 @@ if [ -f "$WASM_SRC" ]; then
         echo "── refreshed $PROG_DIR/0.1.0.{wasm,toml} from $(dirname "$WASM_SRC")" \
              "($(wc -c <"$PROG_DIR/0.1.0.wasm" | tr -d ' ') bytes)"
     fi
-else
+elif [ "$PIE_STRATEGY" = a ]; then
     echo "── warning: no built wasm at $WASM_SRC — using whatever is installed" >&2
 fi
 
@@ -206,11 +271,20 @@ echo "── pie doctor (config parse + driver preflight)"
 }
 
 # ── boot ─────────────────────────────────────────────────────────────────────
-echo "── pie serve on :$PIE_PORT (config: $CFG, log: $LOG)"
+echo "── pie serve on :$SERVE_PORT (config: $CFG, log: $LOG)"
 "$PIE_BIN" -c "$CFG" serve >"$LOG" 2>&1 &
 PIE_PID=$!
+SHIM_PID=""
 cleanup() {
+    # Shim first: it holds the WebSocket, and tearing the engine out from under
+    # it just produces a relaunch storm in its log on the way down.
+    if [ -n "$SHIM_PID" ] && kill -0 "$SHIM_PID" 2>/dev/null; then
+        kill "$SHIM_PID" 2>/dev/null || true
+        wait "$SHIM_PID" 2>/dev/null || true
+    fi
     if kill -0 "$PIE_PID" 2>/dev/null; then
+        # SIGTERM, never -9: a hard kill mid-fire is what actually leaves a
+        # wedged Metal context behind.
         kill "$PIE_PID" 2>/dev/null || true
         wait "$PIE_PID" 2>/dev/null || true
     fi
@@ -218,10 +292,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Model load + Metal heap admission can take a while; 180s budget.
-echo -n "── waiting for $BASE_URL/health "
+echo -n "── waiting for $HEALTH_URL/health "
 UP=0
 for _ in $(seq 1 180); do
-    if curl -sf -o /dev/null --max-time 2 "$BASE_URL/health"; then
+    if curl -sf -o /dev/null --max-time 2 "$HEALTH_URL/health"; then
         UP=1
         break
     fi
@@ -239,10 +313,41 @@ echo
 [ "$UP" = 1 ] || { echo "server never became healthy — see $LOG" >&2; exit 1; }
 echo "── up."
 
+# ── strategy b: the session shim owns the client-facing port ────────────────
+if [ "$PIE_STRATEGY" = b ]; then
+    echo "── session shim on :$PIE_PORT -> ws://127.0.0.1:$SERVE_PORT (log: $SHIM_LOG)"
+    "$PIE_PYTHON" "$HERE/session_shim.py" \
+        --pie "ws://127.0.0.1:$SERVE_PORT" \
+        --host 127.0.0.1 --port "$PIE_PORT" \
+        --wasm "$SESSION_WASM" --manifest "$SESSION_MANIFEST" \
+        --model-name "$PIE_MODEL" \
+        >"$SHIM_LOG" 2>&1 &
+    SHIM_PID=$!
+    echo -n "── waiting for $BASE_URL/v1/models "
+    SHIM_UP=0
+    for _ in $(seq 1 60); do
+        if curl -sf -o /dev/null --max-time 2 "$BASE_URL/v1/models"; then
+            SHIM_UP=1
+            break
+        fi
+        if ! kill -0 "$SHIM_PID" 2>/dev/null; then
+            echo
+            echo "session shim exited during startup — last log lines:" >&2
+            tail -n 30 "$SHIM_LOG" >&2
+            exit 1
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo
+    [ "$SHIM_UP" = 1 ] || { echo "shim never came up — see $SHIM_LOG" >&2; exit 1; }
+    echo "── shim up (session inferlet launched)."
+fi
+
 if [ "$SERVE_ONLY" = 1 ]; then
     cat <<EOF
 
-── serve-only mode. Point stock opencode at it:
+── serve-only mode (strategy $PIE_STRATEGY). Point stock opencode at it:
 
      cd $HERE && opencode run -m pie/$PIE_MODEL "read the file $HERE/README.md and summarize it"
 

@@ -15,10 +15,152 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 | PA.1 | `chat-completions` inferlet on dev | **milestone 1 done, frozen.** Milestone 2 (KV snapshot sessions) **cancelled** — superseded by PB.1, see the 2026-08-12 decision |
 | PA.2 | Gateway OpenAI ingress | **done** |
 | PA.3 | Acceptance suite + stock-opencode e2e | **DONE** — 25/25 live on Qwen3-0.6B *and* Qwen3.6-35B-A3B; stock opencode does multi-step agentic work (read → write) on the 35B |
-| PB.1 | `opencode-session` inferlet + AI SDK provider package | **ACTIVE — the project's main line** (decision 2026-08-12) |
+| PB.1 | `opencode-session` inferlet + client shim | **m1 DONE, LIVE** — 25/25 acceptance + 4/4 resume on Qwen3-0.6B; KV resume verified exact against a cold rebuild. m2: A/B on the 35B, then the AI SDK provider |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-12 — PB.1 m1: the `opencode-session` inferlet is live, and resume is exact
+
+**Status: 25/25 acceptance + 4/4 resume, 0 warnings, on Qwen3-0.6B/Metal.**
+Strategy A re-verified 25/25 on the same machine afterwards — the control is
+untouched.
+
+**What was built**
+
+- `inferlets/opencode-session/` — one long-lived process per opencode session
+  over a `session::receive()` loop, holding the conversation's KV working set
+  (plus the folded recurrent state on hybrids) in process memory across turns.
+- `integrations/opencode/session_shim.py` — stdlib-only HTTP/SSE front end that
+  multiplexes requests onto `launch_process` + `signal_process` by `req_id`.
+  Pure transport: every OpenAI semantic still comes from `pie-openai-serving`,
+  shared with Strategy A, so the A/B compares servers and not renderers.
+- `run_pie_opencode.sh` gained `PIE_STRATEGY=b`. Under `b` the shim binds
+  `$PIE_PORT` and the gateway moves to `$PIE_ENGINE_PORT`, so **both arms answer
+  on the same URL** and `opencode.json`/`test_acceptance.py` need no per-arm
+  configuration. A difference in the measurement therefore cannot be a
+  difference in how the client was pointed (qwen-code run-2's failure mode).
+- `integrations/opencode/test_resume.py` — 4 checks the acceptance suite
+  structurally cannot make (see below).
+
+**The wire decision: full-history + content-addressed resume, not the delta wire**
+
+`opencode-integration.md` §2 specifies an AI SDK provider that shadows server
+state and sends only the suffix. Built the qwen-code shape instead — stateless
+OpenAI wire, continuity recovered server-side by hashing — because the failure
+modes are asymmetric. A hash mismatch is a clean MISS: one full rebuild, correct
+output, slower. A shadow-diff mismatch is silently the *wrong context*. The
+delta wire buys B-2 (in-place context editing) and B-3 (subagent forking) and
+nothing else that hashing cannot already express, so it follows rather than
+leads.
+
+**Retain rendered history only — the defect that took a differential test to see**
+
+First working version retained through the generated turn and appended
+`<|im_end|>\n` to seal it, which is what the qwen-code port does. Acceptance
+passed. `test_resume_matches_a_cold_rebuild` did not:
+
+```
+resumed prompt: 64 tokens -> 'Secondary colour is blue.'
+rebuilt prompt: 60 tokens -> 'Red.'
+```
+
+The generation cue is `<|im_start|>assistant\n<think>\n\n</think>\n\n`; replaying
+that same turn as history renders `<|im_start|>assistant\n` with thinking
+stripped. A sealed state therefore holds ~4 tokens **no re-render of the
+conversation will ever produce**, every turn, cumulatively. The same asymmetry
+is in HF's own template — invisible only because a stateless server re-renders
+every turn.
+
+Fix: retain at the **render boundary**. A turn is three spans (rendered delta,
+cue, decode) and only the first survives. `split_retain_point` splits *before*
+the trailing assistant message, so the retained prefix is
+`render(messages[..split])` by construction and concatenates with
+`render(messages[split..]) + cue` to exactly the full render. Verified:
+
+```
+turn 7  cached=33 delta=20 cue=7   = 60 tokens   (resumed)
+turn 8  cached=0  delta=53 cue=7   = 60 tokens   (cold rebuild, same bytes)
+                                     same answer at t=0
+```
+
+Cost: the assistant turn is re-prefilled each turn — tens to a few hundred
+tokens against a history of tens of thousands.
+
+This also **deletes two hazard classes outright**:
+- there is no seal fire, so the qwen-code seal saga (a fold cannot be bound on a
+  fresh pipeline — poison epoch; forking it there mints a new sequence id) does
+  not arise at all;
+- the address hashes nothing the server produced, so the response/save
+  unification invariant (§6.3 — a trim or fallback in the response path silently
+  breaking every later resume) has nothing left to break.
+
+**Metal implements `copy_kv` ONLY for GDN-hybrid checkpoints**
+
+Resume failed on the 0.6B with `prefill take @47: channel is poisoned …
+pre-launch KV copy rejected: pie_metal_copy_kv failed with status -3`. Status -3
+is `PIE_STATUS_UNSUPPORTED`, and the driver named the reason itself in the serve
+log:
+
+```
+[pie-driver-metal] copy_kv: UNSUPPORTED — this increment only supports the
+                   qwen3.6 (GDN-hybrid) checkpoint geometry
+```
+
+`Context::copy_kv_impl`'s first guard is `if (!facts_.has_linear_attn)`. So
+copy-on-write forking of a KV working set does not exist on Metal for
+attention-only models. A fork does not fail at `fork()` — it is ordered on the
+pipeline and materializes when a later fire declares a shared page writable, so
+the guest sees only a poisoned channel with nothing pointing at the fork.
+
+Resolved as a design split rather than a workaround (`engine::Resume`):
+- **hybrid** — fork. Required for correctness (a fold cannot be rewound, so a
+  turn that dies mid-generation must not have touched the parent), and this is
+  exactly the geometry Metal implements `copy_kv` for.
+- **attention-only** — extend in place. Sound because everything past the
+  parent's recorded length is scratch, and it issues no `copy_kv` at all.
+
+Generation always runs on state that is thrown away: a second fork on hybrids,
+or writes past the render boundary on attention.
+
+**Two upstream fixes made along the way**
+
+1. `client/python` rejected the engine's `"Already authenticated"` sentinel and
+   demanded a private key the server never asked for. The Rust client has
+   accepted both sentinels all along (`client/rust/src/client.rs:343`); this is
+   the trust-edge gateway path, where the session is pre-authenticated from
+   `x-pie-identity`. Same bug qwen-code hit (their handover §8.7).
+2. `pie-openai-serving::plan_render_suffix` — planning a resume suffix in
+   isolation resolves every `tool_call_id` to `""`, because the answering call
+   is in the retained prefix. Invisible on Qwen today
+   (`answer_batch_inner_text` ignores the name) but a latent divergence; the
+   suffix plan now seeds names from the prefix, with a test asserting it equals
+   the tail of the full plan.
+
+**Why `test_resume.py` exists separately**
+
+`test_acceptance.py` is 25 independent conversations, so every one of them is a
+first turn. It passes identically against both strategies — that is the point of
+it — and every turn of the first green Strategy B run logged `cached=0`. A green
+acceptance run says nothing about whether KV is being reused. The resume suite
+asserts on `usage.prompt_tokens_details.cached_tokens` and covers: echo-back
+resume, a tool round-trip, an edited history missing *cleanly* (the safety
+property), and the cold-rebuild differential (the correctness property).
+
+Measured on the 0.6B: **191/236 prompt tokens (81%) served from KV across a tool
+round-trip.**
+
+**Not done yet**
+
+- **The A/B against Strategy A on the 35B is not run.** The `~81 s → ~21 s`
+  claim remains untested; both arms are green and answer on the same URL, so the
+  run is set up but the number is not banked.
+- The hybrid **fork** path is written and compiles but is **unexercised** — the
+  0.6B is attention-only, so every live turn so far took the in-place path. The
+  35B run is what tests it, and it is where `copy_kv` is actually implemented.
+- One process serves every conversation (branches separated by content address,
+  LRU 8). Per-session processes would bound memory per conversation.
+- B-2/B-3/B-4/B-5 and the AI SDK provider are untouched.
 
 ### 2026-08-12 — DECISION: Strategy B becomes the main line; Strategy A frozen green
 

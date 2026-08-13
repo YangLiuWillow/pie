@@ -1,0 +1,13 @@
+[package]
+name = "opencode-session"
+version = "0.1.0"
+description = "Long-lived opencode session inferlet: KV working set retained in-process across turns"
+authors = ["Liu Yang <liu@liszt.ai>"]
+
+[runtime]
+core = "^0.2.0"
+
+# No CLI parameters and no launch input. Unlike `chat-completions` (one process
+# per request, request JSON as the launch input), this process is launched ONCE
+# per opencode session and then fed turn envelopes over `session::receive`.
+[parameters]

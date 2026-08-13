@@ -40,9 +40,13 @@ pub mod types;
 pub use filter::{
     VisibleFilter, answer_after_reasoning, cut_leading_reasoning, sanitize_messages,
 };
-pub use render::{RenderError, RenderOp, plan_render, plan_render_messages};
+pub use render::{
+    RenderError, RenderOp, plan_render, plan_render_messages, plan_render_suffix,
+};
 pub use salvage::{parse_fenced_tool_calls, parse_hermes_tool_calls};
-pub use session::{CanonItem, canon_messages, snapshot_address, split_resume_point};
+pub use session::{
+    CanonItem, canon_messages, snapshot_address, split_resume_point, split_retain_point,
+};
 pub use streaming::{ChunkMeta, sse_done, sse_frame, sse_ping, usage_object};
 pub use types::{ChatCompletionRequest, ChatMessage, MessageContent, tool_schema_envelopes};
 

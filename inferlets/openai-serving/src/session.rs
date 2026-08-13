@@ -154,6 +154,41 @@ pub fn split_resume_point(messages: &[ChatMessage]) -> Option<usize> {
     Some(last + 1)
 }
 
+/// Split *before* the trailing assistant turn: everything strictly earlier can
+/// have been retained, and the suffix begins with the assistant message the
+/// server itself produced last turn.
+///
+/// ## Why this exists next to [`split_resume_point`], rather than replacing it
+///
+/// The two encode different answers to "what is safe to keep in KV".
+///
+/// `split_resume_point` (+1) keeps the assistant turn in the retained prefix.
+/// That is the maximum-reuse split, and it is what a snapshot-based design
+/// wants — but it means the retained KV contains the tokens the model
+/// *generated*, sitting behind a generation cue. On Qwen those two things
+/// differ from the replayed form of the same turn: `cue_no_think()` emits
+/// `<|im_start|>assistant\n<think>\n\n</think>\n\n`, while replaying that turn
+/// as history emits `<|im_start|>assistant\n` and strips thinking. The retained
+/// prefix is then ~4 tokens longer than any re-render of the same conversation
+/// will ever produce, every turn, cumulatively — measured as a resumed prompt
+/// of 64 tokens against a cold rebuild of 60, with different answers at
+/// temperature 0.
+///
+/// This split keeps only rendered history. Nothing generated is ever retained,
+/// so the retained prefix is `render(messages[..split])` by construction and
+/// concatenates with `render(messages[split..]) + cue` to exactly the full
+/// render. The assistant turn is re-prefilled each turn — tens to a few hundred
+/// tokens against a history of tens of thousands.
+///
+/// It also dissolves the response/save unification hazard: the address no
+/// longer hashes anything the server produced, so a trim or a fallback in the
+/// response path can no longer silently break every subsequent resume.
+///
+/// Returns `None` when there is no assistant message (first turn).
+pub fn split_retain_point(messages: &[ChatMessage]) -> Option<usize> {
+    messages.iter().rposition(|m| m.role == "assistant")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,11 +254,44 @@ mod tests {
     }
 
     #[test]
+    fn retain_point_excludes_the_assistant_turn_and_round_trips() {
+        // Turn 1's request. Retained under the canon of exactly these messages
+        // — nothing the server produced enters the address.
+        let sent = msgs(serde_json::json!([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"}
+        ]));
+        let saved = snapshot_address(&[], true, canon_messages(&sent).iter());
+
+        // Turn 2: the client echoes our assistant turn back and appends.
+        let next = msgs(serde_json::json!([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok, checking",
+             "tool_calls": [{"id": "call_x_0",
+                             "function": {"name": "read_file", "arguments": "{\"p\":1}"}}]},
+            {"role": "tool", "tool_call_id": "call_x_0", "content": "body"}
+        ]));
+        let split = split_retain_point(&next).unwrap();
+        // Before the assistant turn, where `split_resume_point` lands after it.
+        assert_eq!(split, 2);
+        assert_eq!(split_resume_point(&next).unwrap(), 3);
+
+        let resumed = snapshot_address(&[], true, canon_messages(&next[..split]).iter());
+        assert_eq!(saved, resumed);
+
+        // And the suffix carries the assistant turn, so it gets re-rendered
+        // rather than resumed out of KV.
+        assert_eq!(next[split].role, "assistant");
+    }
+
+    #[test]
     fn first_turn_has_no_resume_point() {
         let m = msgs(serde_json::json!([
             {"role": "system", "content": "s"},
             {"role": "user", "content": "u"}
         ]));
         assert!(split_resume_point(&m).is_none());
+        assert!(split_retain_point(&m).is_none());
     }
 }

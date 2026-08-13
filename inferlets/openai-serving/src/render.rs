@@ -80,9 +80,49 @@ pub fn plan_render(req: &ChatCompletionRequest) -> Result<Vec<RenderOp>, RenderE
 /// resume path renders only the suffix after the split point — pass the
 /// suffix here with empty `tool_schemas`; a suffix never contains the
 /// leading system message, so no equip op is produced for it).
+///
+/// Prefer [`plan_render_suffix`] for the resume path: it resolves tool names
+/// against the calls in the *retained prefix*, which this cannot see.
 pub fn plan_render_messages(
     messages: &[ChatMessage],
     tool_schemas: Vec<String>,
+) -> Result<Vec<RenderOp>, RenderError> {
+    plan_from(messages, tool_schemas, std::collections::HashMap::new())
+}
+
+/// Plan the resume suffix `messages[split..]`, with `tool_call_id → name`
+/// seeded from the retained prefix `messages[..split]`.
+///
+/// Why this is not just `plan_render_messages(&messages[split..], vec![])`:
+/// the split point sits immediately after an assistant message, so a tool
+/// result in the suffix answers a call that lives in the PREFIX. Planning the
+/// suffix in isolation resolves every such id to `""`, and the suffix then
+/// renders differently from the same messages inside a full-history render.
+///
+/// On the Qwen templates that divergence is currently invisible —
+/// `answer_batch_inner_text` ignores the name and emits only
+/// `<tool_response>…</tool_response>` — so this changes no tokens today. It is
+/// here because "resume renders the same tokens as a full render" is the
+/// property the whole strategy stands on, and leaving it true only by accident
+/// of one template is how a silent divergence gets built on later.
+pub fn plan_render_suffix(
+    messages: &[ChatMessage],
+    split: usize,
+) -> Result<Vec<RenderOp>, RenderError> {
+    let split = split.min(messages.len());
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in &messages[..split] {
+        for c in m.calls() {
+            names.insert(c.id.clone(), c.function.name.clone());
+        }
+    }
+    plan_from(&messages[split..], Vec::new(), names)
+}
+
+fn plan_from(
+    messages: &[ChatMessage],
+    tool_schemas: Vec<String>,
+    mut call_names: std::collections::HashMap<String, String>,
 ) -> Result<Vec<RenderOp>, RenderError> {
     let mut ops = Vec::with_capacity(messages.len() + 2);
     let mut rest = messages;
@@ -102,10 +142,10 @@ pub fn plan_render_messages(
         ops.push(RenderOp::EquipAfterSystem { system, tools: tool_schemas });
     }
 
-    // tool_call_id → tool name, accumulated from assistant turns as we walk
-    // so each tool result resolves against the calls that precede it.
-    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
+    // tool_call_id → tool name, accumulated from assistant turns as we walk so
+    // each tool result resolves against the calls that precede it. Seeded by
+    // the caller on the resume path, where the answering call is in the
+    // retained prefix rather than in `messages`.
     let mut i = 0;
     while i < rest.len() {
         let msg = &rest[i];
@@ -211,6 +251,50 @@ mod tests {
                                        ("read".into(), "out1".into())])
         );
         assert_eq!(ops[4], RenderOp::Cue);
+    }
+
+    #[test]
+    fn suffix_plan_resolves_names_against_the_retained_prefix() {
+        // The resume shape: everything up to and including the assistant turn
+        // is in KV; the suffix is the tool result opencode added since.
+        let r = req(serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "c1",
+                                 "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "out1"}
+            ]
+        }));
+        let split = crate::session::split_resume_point(&r.messages).unwrap();
+        assert_eq!(split, 3);
+
+        // The name comes from the PREFIX, which the suffix cannot see.
+        let suffix = plan_render_suffix(&r.messages, split).unwrap();
+        assert_eq!(
+            suffix,
+            vec![
+                RenderOp::AnswerBatch(vec![("read".into(), "out1".into())]),
+                RenderOp::Cue
+            ]
+        );
+
+        // Planning the suffix in isolation loses it — the bug this guards.
+        let naive = plan_render_messages(&r.messages[split..], vec![]).unwrap();
+        assert_eq!(
+            naive,
+            vec![
+                RenderOp::AnswerBatch(vec![("".into(), "out1".into())]),
+                RenderOp::Cue
+            ]
+        );
+
+        // And the suffix plan is exactly the tail of the full plan: resume must
+        // render the same ops a full-history render would, or the two arms of
+        // the A/B are measuring different prompts.
+        let full = plan_render(&r).unwrap();
+        assert_eq!(&full[full.len() - suffix.len()..], &suffix[..]);
     }
 
     #[test]
