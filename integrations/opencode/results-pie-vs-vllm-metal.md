@@ -13,17 +13,25 @@ MLX checkpoints on Apple Silicon — so both stacks serve **the same
 > blocker requiring a rented CUDA box. That was wrong, and the correction is
 > what made this measurement possible at all.
 
-## Result — Qwen3-Coder-30B-A3B-4bit
+## Result — Qwen3-Coder-30B-A3B-4bit, MATCHED CONFIG
+
+Re-run 2026-08-12 after a config-parity check found pie running with a KV pool
+12× smaller than the baseline's. Both stacks now at prefill chunk 2048; pie's KV
+pool raised 16,384 → 65,536 tokens. Matching was worth **1.50× on arm A and
+1.31× on arm B** on its own.
 
 | turn | pie A | pie B | vLLM | pie B ttfc | vLLM ttfc | pie B gen | vLLM gen |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 42.73 s | 41.09 s | 6.93 s | 39.06 | 6.12 | 96 | 40 |
-| 2 | 52.74 s | 3.89 s | 0.67 s | 1.85 | 0.46 | 96 | 11 |
-| 3 | 54.64 s | 3.93 s | 0.65 s | 1.87 | 0.44 | 96 | 11 |
-| 4 | 56.26 s | 3.98 s | 0.68 s | 1.90 | 0.47 | 96 | 11 |
-| 5 | 57.31 s | 4.03 s | 0.68 s | 1.92 | 0.47 | 96 | 11 |
-| 6 | 40.85 s | 4.08 s | 0.69 s | 1.95 | 0.47 | 96 | 11 |
-| **total** | **304.53 s** | **60.99 s** | **10.30 s** | | | | |
+| 1 | 37.13 s | 26.54 s | 6.76 s | 24.52 | 5.95 | 96 | 40 |
+| 2 | 27.38 s | 3.88 s | 0.67 s | 1.84 | 0.46 | 96 | 11 |
+| 3 | 28.42 s | 3.92 s | 0.64 s | 1.87 | 0.43 | 96 | 11 |
+| 4 | 35.59 s | 3.97 s | 0.68 s | 1.90 | 0.47 | 96 | 11 |
+| 5 | 42.81 s | 4.02 s | 0.68 s | 1.92 | 0.47 | 96 | 11 |
+| 6 | 32.10 s | 4.07 s | 0.69 s | 1.95 | 0.47 | 96 | 11 |
+| **total** | **203.44 s** | **46.41 s** | **10.12 s** | | | | |
+
+*(Superseded starved-config totals, kept for the record: pie A 304.53 s,
+pie B 60.99 s, vLLM 10.30 s.)*
 
 **Do not read those totals as a 6× ratio.** pie generated 96 tokens every turn
 (hitting `max_tokens`); vLLM generated 11. Decode dominates once the prefix is
@@ -31,19 +39,23 @@ cached, so the totals compare different amounts of work. The comparable numbers:
 
 | | pie (Strategy B) | vLLM-metal | ratio |
 |---|---:|---:|---|
-| cold prefill rate | 186 tok/s | **1183 tok/s** | **6.4× vLLM** |
+| cold prefill rate | 296 tok/s | **1216 tok/s** | **4.1× vLLM** |
 | steady-state ttfc | 1.90 s | **0.46 s** | **4.1× vLLM** |
-| steady-state decode | 46.0 tok/s | 51.9 tok/s | 1.13× vLLM (~parity) |
-| prefix reuse | ~97.5% cached | 82.2% hit rate | both work |
+| steady-state decode | 46.2 tok/s | 51.7 tok/s | 1.12× vLLM (~parity) |
+| prefix reuse | ~97.5% cached | 78.9% hit rate | both work |
+
+Strategy B over Strategy A, matched: **4.4×**.
 
 **Both stacks reuse the prefix.** vLLM's APC is on and hitting — 82.2% per its
 own logger. So this is not "session inferlet vs uncached baseline"; it is two
 caching stacks, and the difference is the kernels underneath.
 
-**The honest summary: on this workload and this machine, vLLM-metal is ~6×
+**The honest summary: on this workload and this machine, vLLM-metal is ~4×
 faster than pie at prefill, ties at decode, and Strategy B does not close that
-gap.** Strategy B is a 5× win *against pie's own uncached baseline* and remains
-so; it does not make pie competitive with vLLM here.
+gap.** Strategy B is a 4.4× win *against pie's own uncached baseline* and remains
+so; it does not make pie competitive with vLLM here. The per-token deficit is
+uniform across dense and MoE and across 50× of model size — see
+`results-prefill-profile.md`.
 
 ### Qwen3.6-35B-A3B (GDN hybrid)
 

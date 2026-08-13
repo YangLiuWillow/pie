@@ -130,6 +130,22 @@ done
 # ./opencode.json, so `PIE_MODEL=x` and `opencode run -m pie/x` name the same
 # thing. A value that matches no key is passed through as a raw artifact name
 # (see `pie model list`).
+# ── driver sizing ────────────────────────────────────────────────────────────
+# These are matched to what vllm-metal actually boots with, because a ratio
+# against a differently-configured baseline measures the configuration:
+#
+#   vLLM: max_num_batched_tokens=2048, KV pool 193,536 tokens, dtype bfloat16
+#   pie:  max_forward_tokens=2048,     KV pool total_pages*kv_page_size
+#
+# `total_pages = 512` (16,384 tokens) was this repo's inherited default and it
+# is a KV-STARVED setting: raising it to 2048 is worth **1.73x on prefill** at
+# no memory pressure on this box (measured, `results-prefill-profile.md`). It
+# was never memory-forced — the activation pool sat at 24 MB of a 1024 MB
+# budget. Lower it again only if a model will not admit.
+PIE_TOTAL_PAGES="${PIE_TOTAL_PAGES:-2048}"
+PIE_KV_PAGE_SIZE="${PIE_KV_PAGE_SIZE:-32}"
+PIE_MAX_FORWARD_TOKENS="${PIE_MAX_FORWARD_TOKENS:-2048}"
+
 PIE_MODEL="${PIE_MODEL:-qwen3-0.6b}"
 case "$PIE_MODEL" in
     qwen3-0.6b)       ARTIFACT="Qwen--Qwen3-0.6B-optimized" ;;
@@ -179,9 +195,9 @@ model = "$ARTIFACT"
 type = "metal"
 device = ["metal:0"]
 activation_dtype = "bfloat16"
-kv_page_size = 32
-total_pages = 512
-max_forward_tokens = 1024
+kv_page_size = $PIE_KV_PAGE_SIZE
+total_pages = $PIE_TOTAL_PAGES
+max_forward_tokens = $PIE_MAX_FORWARD_TOKENS
 max_forward_requests = 8
 max_model_len = 16384
 
@@ -242,7 +258,7 @@ if [ "$PIE_STRATEGY" = b ]; then
     # cannot work this out for itself — no pool capacity is reported on the
     # pie:inferlet surface — and over-committing kills the process rather than
     # evicting.
-    PIE_RETAIN_TOKENS="${PIE_RETAIN_TOKENS:-$(( 512 * 32 / 2 ))}"
+    PIE_RETAIN_TOKENS="${PIE_RETAIN_TOKENS:-$(( PIE_TOTAL_PAGES * PIE_KV_PAGE_SIZE / 2 ))}"
     echo "── strategy b: session inferlet $SESSION_WASM ($(wc -c <"$SESSION_WASM" | tr -d ' ') bytes), retain_tokens=$PIE_RETAIN_TOKENS"
 fi
 
