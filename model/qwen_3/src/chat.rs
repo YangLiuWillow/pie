@@ -583,6 +583,7 @@ impl Instruct for QwenInstruct {
             decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             inside: false,
+            unwrapped: false,
             has_tools: self.config.has_tools,
             dialect: self.config.tool_dialect,
             schemas: tools.to_vec(),
@@ -696,6 +697,9 @@ struct QwenToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
     inside: bool,
+    /// Whether the call being read arrived WITHOUT a `<tool_call>` wrapper, so
+    /// `</function>` is what closes it. See the back-off in `feed`.
+    unwrapped: bool,
     has_tools: bool,
     dialect: ToolDialect,
     /// The request's schemas, needed only by [`ToolDialect::Coder`] — it is the
@@ -712,34 +716,60 @@ impl ToolDecoder for QwenToolDecoder {
         self.accumulated.push_str(&text);
 
         if !self.inside {
-            if self.accumulated.contains("<tool_call>") {
+            if let Some(pos) = self.accumulated.find("<tool_call>") {
                 self.inside = true;
-                if let Some(pos) = self.accumulated.find("<tool_call>") {
-                    self.accumulated = self.accumulated[pos + "<tool_call>".len()..].to_string();
-                }
+                self.unwrapped = false;
+                self.accumulated = self.accumulated[pos + "<tool_call>".len()..].to_string();
                 return ToolEvent::Start;
             }
-        } else if let Some(pos) = self.accumulated.find("</tool_call>") {
-            let call_body = self.accumulated[..pos].trim().to_string();
-            self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
-            self.inside = false;
+            // The reference parser's back-off, and it is not a nicety. Asked to
+            // read a file with ten tools offered, Qwen3-Coder-30B emits a
+            // perfectly well-formed `<function=read>…</function>` with NO
+            // `<tool_call>` wrapper — and the entire call is dropped for want of
+            // an opening tag the model never wrote. `qwen3coder_tool_parser`
+            // keys its quick check on `<function=` for exactly this reason and
+            // falls back to the whole output when the wrapper is absent.
+            //
+            // The prefix is KEPT rather than consumed: it carries the function
+            // name, and `</function>` then closes what `</tool_call>` would have.
             if self.dialect == ToolDialect::Coder {
-                // `<function=name>` … `</function>`, the reference's shape.
-                if let Some(fs) = call_body.find("<function=") {
-                    let after = &call_body[fs + "<function=".len()..];
-                    let body = match after.find("</function>") {
-                        Some(fe) => &after[..fe],
-                        None => after,
-                    };
-                    if let Some((name, args)) = parse_coder_function_call(body, &self.schemas) {
-                        return ToolEvent::Call(name, args);
-                    }
+                if let Some(pos) = self.accumulated.find("<function=") {
+                    self.inside = true;
+                    self.unwrapped = true;
+                    self.accumulated = self.accumulated[pos..].to_string();
+                    return ToolEvent::Start;
                 }
-            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_body) {
-                let name = v["name"].as_str().unwrap_or("").to_string();
-                let args = v["arguments"].to_string();
-                return ToolEvent::Call(name, args);
             }
+            return ToolEvent::Start;
+        }
+
+        let close = if self.unwrapped { "</function>" } else { "</tool_call>" };
+        let Some(pos) = self.accumulated.find(close) else {
+            return ToolEvent::Start;
+        };
+        // An unwrapped call needs its own closer INSIDE the body, because that
+        // is what bounds the parameter list; a wrapped one is cut before it.
+        let body_end = if self.unwrapped { pos + close.len() } else { pos };
+        let call_body = self.accumulated[..body_end].trim().to_string();
+        self.accumulated = self.accumulated[pos + close.len()..].to_string();
+        self.inside = false;
+        self.unwrapped = false;
+
+        if self.dialect == ToolDialect::Coder {
+            if let Some(fs) = call_body.find("<function=") {
+                let after = &call_body[fs + "<function=".len()..];
+                let body = match after.find("</function>") {
+                    Some(fe) => &after[..fe],
+                    None => after,
+                };
+                if let Some((name, args)) = parse_coder_function_call(body, &self.schemas) {
+                    return ToolEvent::Call(name, args);
+                }
+            }
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_body) {
+            let name = v["name"].as_str().unwrap_or("").to_string();
+            let args = v["arguments"].to_string();
+            return ToolEvent::Call(name, args);
         }
         ToolEvent::Start
     }
@@ -748,6 +778,7 @@ impl ToolDecoder for QwenToolDecoder {
         self.decoder.reset();
         self.accumulated.clear();
         self.inside = false;
+        self.unwrapped = false;
     }
 }
 
@@ -994,6 +1025,24 @@ mod tests {
                 ToolDialect::Hermes,
             ),
             "\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
+        );
+    }
+
+    #[test]
+    fn coder_call_survives_a_missing_tool_call_wrapper() {
+        // Observed on Qwen3-Coder-30B replaying a real opencode turn with ten
+        // tools offered: a well-formed `<function=read>…</function>` and no
+        // `<tool_call>` around it. Requiring the wrapper drops the whole call.
+        let schema = r#"{"name":"read","parameters":{"properties":{"filePath":{"type":"string"}}}}"#;
+        let raw = "<function=read>\n<parameter=filePath>\n/tmp/hello\n</parameter>\n</function>";
+        let fs = raw.find("<function=").unwrap();
+        let after = &raw[fs + "<function=".len()..];
+        let body = &after[..after.find("</function>").unwrap()];
+        let (name, args) = parse_coder_function_call(body, &[schema.to_string()]).unwrap();
+        assert_eq!(name, "read");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap()["filePath"],
+            serde_json::json!("/tmp/hello")
         );
     }
 
