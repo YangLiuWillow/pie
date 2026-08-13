@@ -20,6 +20,108 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-12 — the OpenHands equivalence methodology, and what it means for a pie-vs-vLLM run
+
+Target set by the user: **pie vs vLLM, opencode as the harness, SWE-bench.**
+`openhands-integration-updated` has already done this against OpenHands, and its
+method is worth copying almost wholesale.
+
+**How they establish trajectory equivalence** (`benchmarks/compare_equivalence.py`,
+`PIE_VS_VLLM_EVALUATION.md` §4.2):
+
+1. **Two arms at temperature 0**, compared instance by instance on
+   `model_patch` (the actual artifact) plus three trajectory-shape fields:
+   `agent_iterations`, `num_llm_calls`, `completion_tokens`. Exit code 0 =
+   all equivalent, 1 = a mismatch, 2 = a kv-verify error in either arm.
+2. **`--kv-verify`, always on**: after materializing the prompt KV, assert
+   `ctx.seq_len() == full_tokens.len()` and **error rather than silently
+   rebuild**. "0 kv-verify errors" is reported as a headline metric next to the
+   speedup, which is the right place for it.
+3. **Failures attributed to model vs machinery, with evidence.** Their two
+   losses were both model-side and they proved it: one wrong-but-clean patch,
+   one where the model corrupted its own workspace path at call 19 and thrashed
+   — all 63 tool calls well-formed, `modes={rebuilt:1, extended:62}`, no KV or
+   grammar involvement.
+4. **Trajectory divergence at t=0 is expected between runs, and is not a
+   regression.** Their failure set MOVED between two runs at the same 11/13.
+   So the claim is "near-identical trajectories", never "identical", and the
+   comparison is on the artifact plus shape rather than token-exact paths.
+5. **Selection bias, named out loud.** Their 13 instances *are* the baseline's
+   own `resolved_ids`, so the baseline scores 13/13 by construction and parity
+   is pie's ceiling. Honest phrasing: *"reproduces 11 of 13"*, never *"2
+   worse"*. Wallclock is measured independently per arm and therefore carries
+   none of that bias. **A neutral set is required before any accuracy claim.**
+
+**The finding that lands directly on our design** (§ "Why the naming rule is the
+load-bearing detail"):
+
+> An earlier version predicted the next turn's boundary from the inferlet's own
+> text and tool_calls; the host re-serializes JSON arguments with different
+> bytes, so `hash(predicted) != hash(host resend)` and the hit rate collapsed to
+> **~3%**. Naming only full renders restored **96.6%**.
+
+That is the same bug class as our cue-drift finding, measured. Our
+`split_retain_point` change — address only the client's own messages, never our
+output — is the fix, and our bench measured ~97.5% cached, consistent with their
+96.6%. Good news; it also means the remaining gaps are known rather than
+suspected.
+
+**Three gaps between their cache and ours, all closed by one change.** They
+render the FULL history every call and hash TOKEN IDS; we render only the suffix
+on a hit and hash canonicalized messages. Rendering everything buys:
+
+- **template-drift safety** — a chat-template or tokenizer change moves the
+  tokens but not our message-based address, so we would resume KV rendered by
+  the old template. They fold a `TEMPLATE_MARKER` into every name and hash the
+  tokens themselves, so "a false hit is impossible".
+- **many coexisting boundaries** — they scan boundaries longest-first
+  (`MAX_OPEN_ATTEMPTS = 8`), so a retry, a branch or a truncation re-hits a
+  still-valid earlier boundary. We keep one entry per branch and drop the
+  parent, so a second retry misses.
+- **a gate on every hit** — `seq_len() == L`, so a collision or a truncated
+  state is rejected rather than trusted.
+
+**And the cost objection is already answered.** The whole apparatus measures
+**under 9 ms per call**: render 6.8 ms, hash 0.3, open 0.6 across 1.97 attempts,
+save 0.6 — against 92.9% of the call spent in decode. So "render everything
+every turn" is not a real cost, and the saving that matters was never the render;
+it was always the prefill.
+
+### 2026-08-12 — what a pie-vs-vLLM SWE-bench run actually needs
+
+Scoped against `benchmarks/run_swe_bench.py`, which drives three backends
+(`pie`, `litellm` → a vLLM OpenAI endpoint, `test`).
+
+**Easier for us than it was for them, in one respect.** Their pie arm needed a
+bespoke `PieLLM`; ours is already OpenAI-compatible on both strategies, so the
+two arms differ by a `baseURL` in `opencode.json` and nothing else. That is the
+same property that made our own A/B clean.
+
+**Blocking, in order:**
+
+1. **vLLM does not run on Metal.** This box is a 48 GB Mac; the baseline arm
+   cannot exist here at all. The run needs CUDA — the RunPod playbook in the
+   handover (§6b: H100 PCIe ~$2.89/h, terminate the moment results are banked),
+   or the Slurm setup they used.
+2. **opencode is not installed here** (`command -v opencode` empty,
+   `~/Documents/Liszt_ai/opencode` gone); node/npx are present.
+3. **No SWE-bench driver for opencode.** Theirs does: check out the repo at
+   `base_commit`, run the agent, capture the patch — note `capture_patch`
+   deliberately does NOT use a plain `git diff HEAD`, which "silently drops"
+   untracked files. opencode has a non-interactive `opencode run -m <model>
+   "<prompt>"` (already exercised in PA.3), so the driver is tractable but real.
+4. **We have no `kv_verify`.** This is the prerequisite for any equivalence
+   claim, it is guest-side, and it needs neither CUDA nor vLLM — so it is the
+   one piece that can be built here, now, and should be built first.
+
+**Recommended order:** kv_verify → adopt token-hashed multi-boundary addressing
+(same change, and it is what makes kv_verify's assertion meaningful) → opencode
+SWE-bench driver, validated against pie alone on this box → rent CUDA and run
+both arms. Do not rent the box until everything except the vLLM arm is green
+locally; their own method lesson is "validate at the scale you will run at", and
+the inverse — debug the harness on the cheap box — is what makes the rented hour
+productive.
+
 ### 2026-08-12 — the A/B: 4.4x end-to-end, 11.6x steady-state, on an attention-only 30B
 
 Full write-up with method and caveats: `integrations/opencode/results-ab-strategy-b.md`.
