@@ -143,6 +143,10 @@ done
 # was never memory-forced — the activation pool sat at 24 MB of a 1024 MB
 # budget. Lower it again only if a model will not admit.
 PIE_TOTAL_PAGES="${PIE_TOTAL_PAGES:-2048}"
+# Context ceiling. A prompt longer than this is REFUSED by the Metal driver,
+# not chunked, so an agent benchmark that explores a real repo needs headroom
+# that a chat replay does not.
+PIE_MAX_MODEL_LEN="${PIE_MAX_MODEL_LEN:-16384}"
 PIE_KV_PAGE_SIZE="${PIE_KV_PAGE_SIZE:-32}"
 PIE_MAX_FORWARD_TOKENS="${PIE_MAX_FORWARD_TOKENS:-2048}"
 
@@ -199,7 +203,7 @@ kv_page_size = $PIE_KV_PAGE_SIZE
 total_pages = $PIE_TOTAL_PAGES
 max_forward_tokens = $PIE_MAX_FORWARD_TOKENS
 max_forward_requests = 8
-max_model_len = 16384
+max_model_len = $PIE_MAX_MODEL_LEN
 
 [runtime]
 request_timeout = "300s"

@@ -27,7 +27,7 @@
           "name": "Qwen3-Coder 30B-A3B (pie)",
           "tool_call": true,
           "limit": {
-            "context": 16384,
+            "context": 32768,
             "output": 4096
           }
         }
