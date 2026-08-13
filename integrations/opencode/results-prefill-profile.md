@@ -34,7 +34,57 @@ and neither announced itself:
 
 Both were caught by numbers being *implausible*, not by anything failing.
 
-## Result
+> ## Correction, same day: the first version of this profile was not config-matched
+>
+> It compared pie at `total_pages = 512` (16,384 KV tokens) against vLLM at
+> **193,536** KV tokens — a 12× asymmetry inherited from this repo's
+> memory-constrained profile and never checked against the baseline. Raising
+> pie to `total_pages = 2048` is worth **1.73× on prefill, for free**, and moves
+> the gap from 6.4× to **3.9×**.
+>
+> The headline below ("flat ~6×") is therefore **superseded**: it measured a
+> starved pie. Matched, the gap is 3.9× mean and it **grows with context**
+> (3.6× → 4.4×) rather than being flat. Kept rather than deleted, because
+> "measure the layer" does not help if the two layers are configured
+> differently — a fair-parity check belongs beside every ratio.
+>
+> `kv_page_size` 16 vs 32 was tested and makes no material difference; the KV
+> pool size is the knob.
+>
+> | segment | pie 512p | pie 2048p | speedup | vLLM | gap |
+> |---|---:|---:|---:|---:|---:|
+> | 444→1284 | 326 | 692 | 2.12× | 2491 | 3.6× |
+> | 1284→2532 | 255 | 449 | 1.76× | 1662 | 3.7× |
+> | 2532→3780 | 243 | 335 | 1.38× | 1511 | 4.5× |
+> | 3780→5028 | 179 | 256 | 1.43× | 1135 | 4.4× |
+> | **mean** | **251** | **433** | **1.73×** | **1700** | **3.9×** |
+>
+> **Still standing after the correction:** the bottleneck is the forward pass,
+> not per-call overhead (pie ~0 ms vs vLLM ~117 ms); chunk size is a trim, not
+> the gap; and the gap is real on tuned CUDA too (1.86×).
+>
+> **Needs re-deriving at matched config:** the dense-vs-MoE decomposition below
+> (4.4× dense / 6.4× MoE → "MoE adds 1.44×"). Both pie arms there ran at
+> `total_pages = 512`, and a 0.6B dense model has a far smaller KV footprint, so
+> the two were not starved equally. Do not quote the 1.44× until it is re-run.
+
+## Config parity — check this before any ratio
+
+| knob | vLLM-metal | pie (original profile) | matched? |
+|---|---|---|---|
+| checkpoint | `mlx-community` 4-bit | same artifact | ✓ |
+| compute dtype | `torch.bfloat16` | `bfloat16` | ✓ |
+| `max_model_len` | 16384 | 16384 | ✓ |
+| graph capture | `enforce_eager=False` | n/a on Metal | ✓ (not crippled) |
+| prefill chunk | `max_num_batched_tokens=2048` | `max_forward_tokens=1024` | ✗ half |
+| KV block | `block_size=16` | `kv_page_size=32` | ✗ (immaterial) |
+| **KV pool** | **193,536 tokens** | **16,384 tokens** | ✗ **12× smaller** |
+
+pie's activation pool was 24 MB of a 1024 MB budget at chunk 1024, so nothing
+about the small chunk or the small pool was memory-forced — both were inherited
+defaults.
+
+## Result (original, un-matched — superseded by the correction above)
 
 Marginal prefill rate, per context segment:
 
