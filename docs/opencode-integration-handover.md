@@ -1,7 +1,8 @@
 # opencode ↔ Pie integration — handover
 
 **For:** a fresh Claude Code session picking this up cold.
-**Written:** 2026-08-12, at the end of the first working stretch.
+**Written:** 2026-08-12. **Rewritten same day** after the first live serving run
+and a change of strategy — read §2 and §4 even if you have seen this file before.
 **Branch:** `liu/opencode-integration` on `https://github.com/YangLiuWillow/pie.git`
 (the `fork` remote), based on pie `dev` @ `58cb77936`.
 **Working tree:** `~/Documents/Liszt_ai/pie-opencode` — a git worktree of
@@ -21,13 +22,14 @@ cd ~/Documents/Liszt_ai/pie-opencode
 export CARGO_TARGET_DIR=~/Documents/Liszt_ai/.cargo-target/pie-opencode  # see §3 — do NOT share this
 
 git status -sb && git log --oneline -3          # expect: liu/opencode-integration, clean
-cargo test -p pie-openai-serving                # expect 43 passed
+cargo test -p pie-openai-serving                # expect 56 passed
+cargo test -p pie-model                         # expect 16 + 3 + 4 + 23 passed
 cargo test -p pie-model-qwen-3 --features chat  # expect 24 passed
 cargo test -p pie-gateway                       # expect 40 + 1 + 6 passed
 ```
 
-If those pass, the repo is healthy and the next thing to do is §4 — the live
-run, which has **never been executed**. If they fail, something about the
+If those pass, the repo is healthy. **Strategy A is finished and frozen; the
+next work is PB.1 (Strategy B) — see §4.** If they fail, something about the
 environment differs from where this was written; fix that before building on it.
 
 ---
@@ -40,10 +42,10 @@ open-source TypeScript coding agent).
 
 Two strategies were planned; they are phased, not competing:
 
-- **Strategy A (in progress)** — serve stock opencode from an OpenAI-compatible
+- **Strategy A (DONE, frozen green)** — serve stock opencode from an OpenAI-compatible
   `/v1/chat/completions` endpoint. Pie is a drop-in vLLM-style backend; KV reuse
   is content-addressed and best-effort. Zero opencode changes.
-- **Strategy B (not started)** — a long-lived `opencode-session` inferlet holding
+- **Strategy B (THE MAIN LINE, 2026-08-12)** — a long-lived `opencode-session` inferlet holding
   the conversation's KV working set, fed turn *deltas* over the sticky
   WebSocket. This is where pie's unique programmability pays: in-place context
   editing instead of client-side compaction+re-prefill, KV forking for
@@ -56,35 +58,44 @@ contexts, subagents, and multi-tenant load. Don't claim wins outside it.
 
 ---
 
-## 2. State at handover
+## 2. State — Strategy A is DONE and LIVE; Strategy B is the main line
 
 | id | task | status |
 |---|---|---|
-| P0.1 | Tool-history replay primitives (Instruct + WIT + host + SDK) | **done** |
+| P0.1 | Tool-history replay primitives | **done** |
 | P0.2 | opencode wire audit + fixture capture | **done** |
 | P0.3 | Shared `pie-openai-serving` crate | **done** |
 | P0.4 | Renderer parity harness | **done — token-exact** |
-| PA.1 | `chat-completions` inferlet | **milestone 1 done** (sessions/grammar/coder-dialect deferred) |
+| PA.1 | `chat-completions` inferlet | **m1 done, FROZEN**; m2 (KV sessions) **CANCELLED** — see §4 |
 | PA.2 | Gateway OpenAI ingress | **done** |
-| PA.3 | Acceptance suite + stock-opencode e2e | suite **authored**, **never run live** ← *you are here* |
-| PB.1 | `opencode-session` inferlet + AI SDK provider | not started |
-| PB.2 | Native `packages/llm` protocol in opencode V2 | not started (optional) |
+| PA.3 | Acceptance suite + stock-opencode e2e | **DONE, LIVE** |
+| PB.1 | `opencode-session` inferlet + AI SDK provider | **ACTIVE ← you are here** |
+| PB.2 | Native `packages/llm` protocol in opencode V2 | optional |
 
-**Everything is committed and pushed** to the fork branch; the local tree and
-the remote agreed at handover. (The project directory moved from
-`~/Desktop/Lin_startup` to `~/Documents/Liszt_ai` on 2026-08-12 — git worktree
-links survived, and every path in this repo's docs and scripts was rewritten to
-match. If you find a stale `Lin_startup` path anywhere, it is a bug; fix it.)
+**The line that used to be here — "a single real token has never been served"
+— is obsolete.** It has now been served, a great many of them:
 
-Test status at handover (all green, native/unit level — §0 re-runs them):
-`pie-openai-serving` 43/43 · `pie-model-qwen-3 --features chat` 24/24 ·
-`pie-gateway` 40+1+6 · renderer parity **5/5 fixtures token-exact** vs HF ·
-inferlet builds clean for `wasm32-wasip2` (606 KB; 35 s on Linux).
+- acceptance **25/25, 0 warnings** on Qwen3-0.6B *and* Qwen3.6-35B-A3B
+  (hybrid GDN MoE, MLX 4-bit, Metal);
+- **stock opencode 1.18.17, unmodified**, on the 35B: `Read notes.txt` →
+  `Write summary.md` — two tool calls, correct order, correct file on disk;
+- single-tenant, warm: prefill **421 tok/s**, decode **90 tok/s**, TTFB
+  0.003 s (the role chunk, *not* first token — first content is 12.4 s on a
+  5.2k prompt), agentic task end-to-end **81.2 s**.
 
-**The one thing that has never happened: a single real token served
-end-to-end.** Everything is verified against unit tests, stub workers, and the
-HF reference tokenizer — not against a running engine. Treat every "done" above
-as "done pending first contact."
+**The measurement that decided the strategy:** ~3 turns re-prefilling ~24k
+tokens of history ≈ 57 s of that 81.2 s, while generating the ~200 tokens of
+actual output ≈ 2 s. **~70% of an agentic task is re-prefill** of a history
+that changed by a few hundred tokens. With the KV working set resumed across
+turns: **~81 s → ~21 s**, same model, same hardware. Full write-up in
+`integrations/opencode/results-Lius-MacBook-Pro.md`.
+
+Live serving found five real defects, all fixed and all *below* the wire:
+hybrid pass unsupported in the inferlet; tool schemas silently dropped for
+every Qwen MoE/VL model; `</think>` leaking into content; reasoning served as
+the answer; and a decode ring sized at exactly `channel_capacity()`. Two are
+recorded and NOT fixed, both upstream: the device-geometry batch limit (§4) and
+the missing RS index surface (§4).
 
 ---
 
@@ -153,112 +164,67 @@ component install.
 
 ---
 
-## 4. Next step: PA.3, the live run
+## 4. Next step: PB.1 — the `opencode-session` inferlet
 
-This is the whole remaining Phase A. Four steps; step 3 differs by hardware.
+**The shape.** One long-lived inferlet per opencode session: launched once,
+talked to via `send`/`receive` over the sticky WebSocket, holding one
+`WorkingSet` (plus one `RsWorkingSet` on hybrid models) for its whole life.
+The client sends turn **deltas**; the inferlet appends and generates. Design in
+`opencode-integration.md` §2, which also carries the paper's own argument for
+this shape.
 
-```sh
-cd ~/Documents/Liszt_ai/pie-opencode
-export CARGO_TARGET_DIR=~/Documents/Liszt_ai/.cargo-target/pie-opencode  # per-worktree, see §3
+### Three blockers dissolve because of that shape — do NOT re-solve them
 
-# 1. Toolchain, once, before any parallel build (rust-toolchain.toml pins
-#    1.97.1 + wasm32-wasip2; concurrent first use races rustup's installer).
-cargo --version
+| blocker under Strategy A | why B removes it |
+|---|---|
+| Metal refuses **2 device-geometry programs in one batch** (`driver/metal/src/context.cpp:997`) — N concurrent HTTP requests are N such programs, so N≥2 degrades every turn | a session inferlet is **one** program |
+| a **fold cannot be published across processes** — `rs-working-set` has `fork` and no `update-index`/`from-index` | the fold never leaves its process |
+| the control layer's FCFS policy *"terminating the most recently created inferlets"* kills the newest turn | N turns are N rows in one inferlet, not N tenants |
 
-# 2. The server binary. The driver feature is MANDATORY — without it the
-#    binary builds fine and then fails at boot with "driver type ... is not
-#    built into this binary". Pick ONE:
-cargo build -p pie-bin --release --features driver-metal   # Apple Silicon
-# cargo build -p pie-bin --release --features driver-cuda  # NVIDIA (needs CUDA >= 12.8)
+The middle one reframes the whole week: PA.1 m2 was blocked because a fold has
+no cross-process identity, and **B never needs one**. That gap is a consequence
+of the request-per-process contract, not a property of hybrid models.
 
-# 3. Weights. Metal needs the MLX 4-bit build (the Metal llama path is
-#    4-bit-only; a raw bf16 repo imports fine and then fails to bind at load):
-$CARGO_TARGET_DIR/release/pie model import mlx-community/Qwen3-0.6B-4bit
-# CUDA takes raw bf16:  pie model import Qwen/Qwen3-0.6B
-$CARGO_TARGET_DIR/release/pie model list    # confirm the artifact is stored
+### One blocker does NOT dissolve, and becomes load-bearing
 
-# 4. The inferlet. THE LAUNCH SCRIPT DOES NOT BUILD THIS — it only copies an
-#    existing artifact into ~/.pie/programs/ and warns "no built wasm" if it
-#    is missing, which then fails at request time. It looks for the wasm at
-#    $CARGO_TARGET_DIR/wasm32-wasip2/release/chat_completions.wasm, so
-#    CARGO_TARGET_DIR must be exported for this build too (the crate is its
-#    own workspace; unset, it would land in inferlets/chat-completions/target
-#    and the script would not find it).
-(cd inferlets/chat-completions && cargo build --target wasm32-wasip2 --release)
-ls -la $CARGO_TARGET_DIR/wasm32-wasip2/release/chat_completions.wasm   # ~606 KB
+`run_ahead` speculates past the stop token — the SDK says *"up to one window of
+fires may still be in flight … their cells are simply never taken"* — but they
+**execute, and therefore fold**. Measured driver-side as
+`recurrent slot 0 is at position 165, this fire starts at 160`.
 
-# 5. The live run: boots the server, waits /health, runs the 25 tests, exits.
-bash integrations/opencode/run_pie_opencode.sh
-```
+Under A this was harmless: the working set died with the request. **Under B the
+state is reused every turn, so an over-advanced fold compounds across a session
+and yields fluent, wrong output with nothing to catch it.**
 
-### Path A — local Metal (Apple Silicon)
+**Use sequential decode from day one.** `engine.rs` carries the switch
+(`SEQUENTIAL_DECODE`, defaulted off) and the cost is already measured at
+**0.4%** — 91.0 → 90.6 tok/s single-stream on the 35B. Write it as a
+hand-rolled `submit_frame` + take loop with ONE `close()` at the end:
+`run_ahead` calls `on.close()` when its budget is spent, so a loop of repeated
+`run_ahead(.., 1, ..)` submits into a closed pipeline and **hangs** rather than
+erroring (a 300 s timeout to discover).
 
-**Known blocker on the old machine:** the Metal driver refuses admission unless
-`needed (~1.2 GiB) + a flat 2 GiB host margin < reclaimable RAM` — it had only
-~1.9 GiB free. That margin is deliberate (over-admitting on unified memory
-produces an *unkillable* wedged process; only a reboot recovers), so **do not
-try to bypass it** — free RAM instead (~1.5 GB was needed). Reboot before the
-run if in doubt. `PIE_METAL_ROW_BUDGET_MB` shrinks the activation-row
-reservation but does **not** move the flat margin.
+### Keep Strategy A alive
 
-### Path B — GPU box / RunPod
+It is the compatibility path for anything that only speaks OpenAI, **and it is
+the control for the `~81 s → ~21 s` claim.** Without the baseline there is no
+A/B, only an assertion. Freeze it; do not delete it.
 
-**Use a CUDA ≥ 12.8 devel image.** The stock `cuda-12.4.1-devel` image cannot
-build pie's sm_90 kernels at all: its `ptxas` rejects the Hopper TMA bulk-copy
-instructions the vendored XQA attention kernels emit
-(`error : State space incorrect for instruction 'cp.async.bulk.tensor'`),
-failing ~28 min into the build. It's a compiler limit, not a driver one. Full
-recipe + the image's other potholes (no `nvcc` on `PATH`, no apt cmake, stale
-NVIDIA apt mirror) are in the progress log's 2026-08-11 GPU entry.
+### Reusable from Phase A
 
-RunPod, if used again (GraphQL at `https://api.runpod.io/graphql?api_key=…`,
-mutation `podFindAndDeployOnDemand`, terminate with `podTerminate`): SSH via the
-pod's **direct TCP mapping** (`root@<ip> -p <port>`), not the `ssh.runpod.io`
-proxy, which failed PTY allocation. **Pods bill hourly — terminate them the
-moment the results are banked.** Three were left running at $7.92/h before the
-user caught it; all are now terminated.
+`pie_openai_serving::session` (canon, `snapshot_address`,
+`split_resume_point`) still decides what a "delta" *is*, even with nothing
+being hashed into an index. The renderer, filters and salvage are all
+model-side and dialect-agnostic.
 
-### Driving it by hand
-
-`run_pie_opencode.sh` wraps all of this, but when debugging you will want the
-pieces separately:
+### Running Strategy A (still works, for the baseline)
 
 ```sh
-bash integrations/opencode/run_pie_opencode.sh --serve-only &   # boot + wait, no tests
+PIE_MODEL=qwen3.6-35b-a3b integrations/opencode/run_pie_opencode.sh
 PIE_BASE_URL=http://127.0.0.1:8080 python3 integrations/opencode/test_acceptance.py
-python3 integrations/opencode/test_acceptance.py --collect-only     # list the 25 tests
-python3 integrations/opencode/test_acceptance.py --only stream      # run a subset
-curl -s localhost:8080/health; curl -s localhost:8080/v1/models      # ingress liveness
 ```
 
-Suite conventions: stdlib-only (no pip deps). **Wire-shape assertions are hard;
-0.6B model-behaviour ones are soft `[WARN]`** — a warn about the model not
-choosing to call a tool is not a failure, a malformed tool-call delta is. Exit
-code 2 means the server was unreachable, not that tests failed.
-
-Then the stock-opencode e2e per `integrations/opencode/README.md`
-(`opencode run -m pie/qwen3-0.6b …` against the committed `opencode.json`).
-
-**Expect first-contact bugs.** Nothing below the HTTP layer has met a real
-engine, so budget for real debugging here, not a victory lap. Useful reflexes:
-the server log is the first place to look (the script prints its path); a 500
-means the inferlet trapped or the envelope broke; a hang usually means the
-inferlet never sent the `{"status":…}` header. Bank results to
-`integrations/opencode/results-<host>.md` and add a progress-log entry either
-way — **a failure list is a deliverable**, and the CUDA/RAM dead ends are logged
-precisely so nobody pays for them twice.
-
-### Re-run the parity harness after touching templates or rendering
-
-```sh
-cargo build -p render-tokens
-python3 integrations/opencode/parity/check_render.py \
-    --bin $CARGO_TARGET_DIR/debug/render-tokens        # needs: pip install transformers huggingface_hub
-```
-
-Expect `exact` for all five fixtures. It downloads tokenizer files only, never
-weights. This is the test that keeps pie's prompt byte-identical to what the
-model was fine-tuned on; treat a regression here as serious.
+`PIE_MODEL` accepts `qwen3-0.6b`, `qwen3.6-35b-a3b`, or a raw artifact name.
 
 ---
 
@@ -329,6 +295,59 @@ Request path: **opencode → `POST /v1/chat/completions` (gateway ingress) →
 
 ---
 
+9. **The chat registry sees the driver's arch STEM, not the HF model type.**
+   `architectures[0]` lowercased with the task suffix stripped, so
+   `Qwen3_5MoeForConditionalGeneration` → `qwen3_5moe`, NOT `qwen3_5_moe`. A
+   miss lands on the `_` arm with `has_tools:false` and **every tool schema is
+   dropped silently** — chat renders, the model answers fluently, tool calling
+   is simply gone. `model/src/instruct.rs` now carries both spellings with a
+   test. Cheap check: same request with and without `tools`, compare
+   `usage.prompt_tokens`; identical means dropped.
+10. **Never fall back to raw generation for content.** Stripping `<think>` tags
+   and keeping the body serves the model's private reasoning as its answer —
+   fluent, on-topic, wrong in kind, invisible to every test. Use
+   `answer_after_reasoning`.
+11. **`$PIE_HOME/programs/<name>/<version>.wasm` is a GLOBAL path.** Every
+   worktree building `chat-completions@0.1.0` overwrites it, silently, and the
+   loser's server runs the winner's code. Use a private `PIE_HOME` (models and
+   `py-runtime` symlinked back) for anything you intend to measure.
+12. **Install a wasm atomically** — temp name, check the `\0asm` magic, `mv`.
+   A torn or foreign wasm does **not** error: it hangs. No launch ack, nothing
+   logged, `/health` still answering 200, every completion blocked forever.
+13. **Size the decode ring ABOVE `channel_capacity()`**, not at it
+   (`+ 7 * live_slots()`). At exactly `cap` the engine's ticket check silently
+   skips continuations — upstream measured 12% of frames lost with no error.
+
+---
+
+## 6b. Operating this machine
+
+- **One `pie serve` at a time**, stopped with **SIGTERM**. `kill -9` mid-fire is
+  what actually leaks a wedged Metal context. Verify with `pgrep -fl` *after*
+  killing — `pkill` exits 1 silently when its pattern matches nothing, so
+  "I cleaned up" and "my pattern is broken" look identical.
+- The driver's *"wired pages … only cleared by reboot"* warning is
+  **ambiguous**: it reads identically when another `pie serve` is simply
+  holding its heap. Check for a second server before believing the leak
+  reading. (24.17 GiB of "leaked" memory turned out to be a live peer process;
+  a SIGTERM took it to 2.85 GiB.)
+- The 35B wants ~22.6 GiB at `total_pages 512 / max_forward_requests 8 /
+  max_model_len 16384`. **32768 is NOT a ceiling** — it booted fine on a quiet
+  machine. Admission is `want + min(transient,2GiB) + 2GiB > reclaimable`, so
+  it tracks what else is resident, not the model.
+- **The first request after a boot pays wasm JIT** and reads as a hang. Warm
+  with a throwaway 4-token request before timing anything.
+- **Backgrounding `run_pie_opencode.sh --serve-only` kills the server** when the
+  wrapper shell is reaped (its EXIT trap). Launch `pie` directly with
+  `nohup … & disown`.
+- **CUDA**: `ptxas` needs **≥12.8**, cuBLASLt needs **≥12.9**
+  (`driver/cuda/src/ops/gemm.cpp:1886`). Build on 12.9+; installing
+  `cuda-toolkit-12-9` over a 12.8 image preserves the compiled Rust crates if
+  you delete only `target/release/build/pie-worker-*/out/cuda`. RunPod H100
+  PCIe ≈ $2.89/h — **terminate the moment results are banked.**
+
+---
+
 ## 7. Working agreements from the user
 
 - **Commit as we go**, at task boundaries, with a progress-log entry per task.
@@ -342,27 +361,34 @@ Request path: **opencode → `POST /v1/chat/completions` (gateway ingress) →
 
 ## 8. The order of work from here
 
-1. **Orient** — §0. Working tree on the right branch, three test suites green.
-2. **Bring it up live** — §4, all five steps. This is the immediate task and the
-   only thing standing between "written" and "works". Fix what first contact
-   breaks; commit each fix with a progress-log entry.
-3. **Stock-opencode e2e** — a real agent turn against pie, tool call included.
-   That closes Phase A. Write the results file.
-4. **PA.1 milestone 2 — KV snapshot sessions.** The seams are marked in-code and
-   the pure logic is already written and tested in
-   `pie-openai-serving::session` (`split_resume_point`, `snapshot_address`).
-   Attach at prompt build + a pre-finish save via the working-set
-   `update-index`/`from-index` WIT calls, then report real `cached_tokens`.
-   This is what makes the endpoint *pie* rather than a slow vLLM.
-5. **Strategy B** — the `opencode-session` inferlet. This is where the research
-   claim lives (in-place context editing, KV forking for subagents, overlap);
-   `opencode-integration.md` §2 is the design and §4 the measurement plan.
+1. **Orient** — §0. Right branch, four suites green.
+2. **PB.1** — §4. Build the `opencode-session` inferlet with **sequential
+   decode from the start**, and the AI SDK provider package on the client side.
+3. **A/B it** against frozen Strategy A on the same model and machine. The
+   claim to test is `~81 s → ~21 s`; A is the control, which is why it stays.
+4. Then PB.2 (native `packages/llm`) if the numbers justify the deeper change.
 
-Deferred inside PA.1, in-code seams marked: grammar-constrained tool calls
-(gate behind a driver-capability probe — it trapped the guest on drivers without
-grammar support) and the Qwen3-Coder XML tool dialect (`ToolFormat::Coder` plus
-its salvage parser, portable from
-`openhands-integration-updated:runtime/src/model/instruct/qwen3.rs`).
+### The lesson that cost the most time, four separate times
+
+**The answer was already in the output.** `ttfb == max_gap` was CPython's
+buffering, not the server. "8/8 completed" sat on the same line as 13 completion
+tokens. An 824 KB wasm was another branch's build, not a torn copy. And the
+concurrency root cause — `2 device-geometry programs in one batch` — was in
+**every** log collected all session, unseen because every grep was for a string
+already expected (`pie_metal_launch failed`, `pie::inferlet`) rather than for
+the driver's own output. It cost two rounds of source-diving, a rebuilt binary
+with two diagnostics that found nothing, and a rented H100.
+
+**Read the whole log before theorising about it.**
+
+### Correct the durable record, not just the conversation
+
+Three claims made this session were wrong — "32768 is refused", "no operator
+knob admits an oversized model" (`[model].expert_slab_bytes` does), and an
+8-way concurrency row reported as "8/8 completed". All three are corrected in
+place, with the reasoning, where someone would actually read them. The pattern
+in each was the same: **an observation made once, under conditions that were
+not controlled, written down as a property of the system.**
 
 ---
 
@@ -379,3 +405,26 @@ its salvage parser, portable from
 | `model/qwen_3/src/chat.rs` | The Qwen chat template (replay primitives, no-think cue) |
 | `integrations/opencode/` | Acceptance suite, launch script, opencode profile, parity harness |
 | `tests/inferlets/fixtures/opencode/` | 5 real captured opencode requests + `AUDIT.md` (the hazard table) |
+
+## 10. Other sessions on this machine
+
+Two peer Claude sessions share this codebase and hardware. Both caught real
+bugs in our code today; both are worth talking to.
+
+- **qwen-code** — `~/Documents/Liszt_ai/pie-qwen`, `liu/qwen-code-dev`. Has a
+  golden-tested **Qwen3.6 dialect renderer** and a lineage-aware **open-block
+  cue**, verified live at both temperatures: a truncated turn yields `'…'`
+  instead of leaked reasoning. Take that cue if you touch think-channel
+  handling; it is strictly better than our closed-empty-block cue.
+- **openclaw** — `liu/openclaw-integration`, forks this branch. Implemented KV
+  snapshot sessions in the SHARED `chat-completions` inferlet, and added
+  `test_no_placeholder_content` and
+  `test_length_finish_actually_reached_the_budget` to the shared base suite.
+
+Reach them via `SendMessage` (find addresses with `ListAgents`). Coordinate
+before touching `inferlets/chat-completions`, `integrations/opencode/test_acceptance.py`
+or `gateway/src/ingress/openai.rs` — all three are shared, and we have already
+collided on two of them.
+
+---
+
