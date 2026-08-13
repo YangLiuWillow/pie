@@ -598,3 +598,85 @@ saw a non-zero `cached`. Each case now gets its own tag. The feature worked well
 enough to break the tests that were meant to police it.
 
 Suites: 25/25 acceptance, 5/5 resume, 2/2 head sharing, 70 native.
+
+---
+
+# The attention fix: found, scoped, not yet applied
+
+A2 said attention is 6× behind and 56% of pie's prefill forward. Tracing that
+into the Metal driver found the cause, already diagnosed **in the driver's own
+comments**, with the fix **already written** — and wired for one model family
+that is not Qwen.
+
+## The cause, in the driver's words
+
+`device_tuning.hpp`, on `sdpa_mma`:
+
+> `sdpa_paged_tiled` computes Q Kᵀ and P V as **hand-walked dot products** — it
+> was measured at 35.8% of a 2048-token gpt-oss prefill, running near
+> **0.5 TFLOP/s while the quantized GEMM one dispatch away reaches ~5.6** on the
+> same silicon. The arithmetic is a matmul; issuing it as one is what
+> `sdpa_paged_mma.metal` is.
+
+An 11× kernel-level gap on the op that is 56% of our prefill. That is the 6×.
+
+## Why Qwen does not get the fast path
+
+Everything needed exists:
+
+| piece | state |
+|---|---|
+| `sdpa_paged_mma.metal` | **written**, templated `<T, D, KT, WITH_SINK>` |
+| `sdpa_paged_mma_dispatch` in `qwen3_5/decode_dispatch_mb.hpp` | **present** |
+| `sdpa_mma()` tuning gate | **on by default** |
+| instantiation | **only** `("_sink", bfloat16, bfloat, 64, 16, true)` — gpt-oss |
+| PSO slot | **only** `gptoss/kernels.hpp: sdpa_sink_paged_mma` — not in the shared set |
+| Qwen selection (`decode_step_mb.cpp:932`) | picks `sdpa_paged_tiled_strided`, never consults `sdpa_mma()` |
+
+And the stated bound on adding a width:
+
+```cpp
+// The matrix path stages three tiles of KT*D halves in 32 KB of threadgroup
+// memory, which is what bounds the list: adding a width means choosing its KT.
+inline constexpr int kSdpaMmaHeadDim = 64;
+```
+
+**Qwen3 uses head_dim 128.** The bound is not binding for it:
+
+| | threadgroup memory | |
+|---|---:|---|
+| D=64, KT=16 (today, gpt-oss) | 6,144 B | fits |
+| **D=128, KT=16** | **12,288 B** | **fits in 32 KB** |
+| D=128, KT=32 | 24,576 B | also fits |
+
+## The change
+
+Same shape as the CUDA decode fix, which its own porting doc describes as
+"three files, ~25 lines. No new CUDA — the prefill kernel is already compiled
+and already used for prefill." Here there is no new Metal kernel either:
+
+1. `sdpa_paged_mma.metal` — add
+   `instantiate_sdpa_paged_mma("", bfloat16, bfloat, 128, 16, false)`.
+2. `kernels/decode_psos.{hpp,cpp}` — a PSO slot for it in the shared set.
+3. `qwen3_5/decode_dispatch_mb.hpp` — `kSdpaMmaHeadDim` becomes a supported set
+   {64, 128}.
+4. `qwen3_5/decode_step_mb.cpp:932` — prefer the MMA PSO when `sdpa_mma()`, the
+   head width is supported, and `sdpa_should_tile` already holds. Mirror
+   `gptoss/encode.cpp:378`.
+
+**Expected:** attention 403 ms → toward vLLM's 67 ms, prefill 713 ms → ~380 ms,
+i.e. **~1.9× on prefill** and the pie-vs-vLLM gap from 4.1× to roughly 2.2×.
+
+## Why it is not applied here
+
+The driver's own warning: the matrix path "depends on the register layout of
+`simdgroup_matrix<T,8,8>` … a machine whose layout differs would produce **wrong
+numbers rather than slow ones**." A new head width is exactly where that bites,
+and this repo has no numerical attention check — the suites here (25/25
+acceptance, 5/5 resume) would all pass on subtly wrong attention output, because
+they assert on wire shape and cache behaviour, not on logits.
+
+So the honest prerequisite is a numerical guard: run the same prompt through the
+tiled and MMA paths and compare logits, or extend `llama_bench`'s greedy gate,
+which `device_tuning.hpp` names as the thing that would catch it. That is the
+next piece of work, and it should come **before** the four-file change, not after.
