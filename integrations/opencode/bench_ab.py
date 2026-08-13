@@ -159,11 +159,25 @@ def main():
             "stream_options": {"include_usage": True},
         }
 
-    # Warm-up: the first request after a boot pays wasm JIT and reads as a hang.
-    # Timing it would put a one-off cost into turn 1 of whichever arm ran first.
-    print(f"[{args.arm}] warming up (throwaway 4-token request)...", flush=True)
-    warm = body_for(seqs[0])
-    warm["max_tokens"] = 4
+    # Warm-up: the first request after a boot pays wasm JIT / kernel compile and
+    # reads as a hang. Timing it would put a one-off cost into turn 1 of
+    # whichever arm ran first.
+    #
+    # It MUST NOT share a prefix with any measured turn. Sending turn 1's own
+    # messages here primes a prefix cache, which silently converts turn 1 from a
+    # cold prefill into a cache hit — and only on the arms that HAVE a cache, so
+    # it favours them. Measured: it took vLLM's turn-1 TTFC on a 7.5k-token
+    # prompt to 0.34 s, an implausible ~22k tok/s prefill, while pie's turn 1
+    # stayed cold because pie excludes its own final boundary as a resume
+    # candidate. Two arms, two different meanings for "turn 1".
+    print(f"[{args.arm}] warming up (unrelated short prompt)...", flush=True)
+    warm = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+    }
     try:
         stream_turn(args.base_url, warm, args.timeout)
     except Exception as e:  # noqa: BLE001
