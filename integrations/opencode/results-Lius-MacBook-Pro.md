@@ -124,60 +124,86 @@ Two of those need their labels read carefully:
   seats 4 and the other four queue. Reporting it as 8-way concurrency would
   overstate it by exactly 2×. **And it did not work at all** — see below.
 
-### Concurrency: the serving inferlet cannot serve two requests at once
+### Concurrency: ROOT-CAUSED — the Metal scheduler batches two device-geometry
+### programs, and the driver refuses
 
-Reported here as an open defect rather than a measurement, because the first
-version of this file recorded the 8-way row as "8/8 completed" and it was not.
-Thirteen completion tokens across eight requests was sitting in the same line
-and I read the completion count instead. Every one of those turns had degraded.
+Reported here as an open defect for most of the session, with two wrong
+framings before the right one. The first version of this file recorded the
+8-way row as "8/8 completed" when all eight had degraded (13 completion tokens
+across 8 requests, in the same line). The second called it "the serving
+inferlet cannot serve two concurrent requests", which put the blame on us.
 
-Isolated afterwards, with one dedicated server per variant:
+**The actual cause**, from the driver's own output:
 
-| concurrent requests | speculative (`run_ahead`, shipped) | sequential (one fire at a time) |
+```
+[pie-driver-metal] launch: 2 device-geometry programs in one batch
+                           (at most one is supported)
+```
+
+and its source comment (`driver/metal/src/context.cpp:997`):
+
+> *"Phase 2 (C3): at most one device-geometry program per launch batch — the
+> same structural constraint **the runtime's scheduler already upholds**
+> (`metal_ptir_plan.md §6`); a defensive re-check here so a **scheduling bug**
+> fails the launch loudly instead of resolving two programs' geometry against
+> one shared forward."*
+
+So:
+
+1. Our decode loop is **device-geometry** by construction — the loop-carried
+   epilogue resolves `w_slot`, `w_off`, `klen`, `pos`, `fill`, `pages` and
+   `page_indptr` on device. That is the whole point of the design.
+2. `chat-completions` is **one inferlet process per HTTP request**, so N
+   concurrent requests are N device-geometry programs.
+3. The Metal scheduler batches two of them into one launch, and the driver
+   rejects the batch. Correctly — the alternative is silently resolving two
+   programs' geometry against one shared forward.
+4. **The check firing means the scheduler did not uphold a constraint it is
+   documented as upholding.** This is an upstream scheduler bug, and the driver
+   author left a tripwire precisely for it.
+
+It accounts for every observation: N=1 always clean (one program); N≥2 always
+degraded; **flat across `max_forward_requests` 8 / 32 / 64** with exactly 6
+launch failures each time (a structural limit, not capacity); and sequential
+decode helping partially (fewer in-flight fires → fewer chances for the batcher
+to pair two device-geometry fires).
+
+**Why upstream never sees it.** `benches/pie_bench.py` drives
+`text-completion-bench`, which takes a `prompts` ARRAY plus `batch_concurrency`
+and runs the fleet **inside one process**. One process is one program, so
+however wide the concurrency, there is never more than one device-geometry
+program in flight. The N-concurrent-*processes* shape is the OpenAI-serving
+shape, and it is structurally unreachable from upstream's harness.
+
+| concurrent requests | speculative (shipped) | sequential (one fire at a time) |
 |---|---|---|
 | 1 | 200 tokens — fine | 200 tokens — fine |
-| 2 | **2/2 degraded** (1 and 3 tokens) | 0/2 degraded |
-| 4 | **4/4 degraded** (1, 2, 3, 1 tokens) | 2/4 degraded |
+| 2 | 2/2 degraded | 0/2 degraded |
+| 4 | 4/4 degraded | 2/4 degraded |
 
-The driver rejects the launch:
+**Hypotheses eliminated on the way**, recorded so nobody re-runs them: window
+oversubscription against a global budget (disconfirmed by the flat R sweep);
+channel-name collision (`named()` is documented as trace-only); duplicate
+instance ids in the roster (deduplicated by a `HashMap` in
+`scheduler/batch.rs:308`); instance missing from the driver registry (added a
+diagnostic at `context.cpp:930`, never fired).
 
-```
-out take: channel is poisoned: pipeline: forward failed:
-direct launch rejected: pie_metal_launch failed with status -1
-```
+**How it was actually found, which is the lesson.** The message was in EVERY
+log collected all session — 6 occurrences in the isolated run, 54 in the
+concurrency ladder. It went unseen because the greps were for
+`pie_metal_launch failed` and `pie::inferlet`, the strings already known,
+rather than for the driver's own output. Two rounds of source-diving and a
+rebuilt binary to surface a line that was already on disk. **Read the whole
+log before theorising about it.**
 
-**It is not hybrid-specific.** The dense Qwen3-0.6B fails identically at N≥2 on
-the shipped build, so this is the serving path, not the GDN model.
+**Where this leaves us.** Not our bug, but our problem: Strategy A serves N
+concurrent turns as N processes, and on Metal that is currently limited to one
+in-flight device-geometry program. Options, none yet taken: host-resolved
+geometry per fire (costs the device-carried decode loop, sidesteps the
+constraint), an upstream scheduler fix so it upholds §6, or Strategy B, where
+one long-lived session inferlet is one program by construction.
 
-**Re-confirmed under isolation.** Two other sessions could not reproduce it, and
-`$PIE_HOME/programs/chat-completions/0.1.0.wasm` turned out to be a GLOBAL path
-that all three sessions install to — an 824 KB build (not ours; ours is 639 KB)
-was found installed there mid-session, so some of these runs could have been
-measuring another branch's inferlet. Re-run with a private `PIE_HOME`
-(`/tmp/pie_home_oc`, models symlinked) and a byte-verified copy of our own
-build: **identical result** — N=1 clean, N=2 → 2/2 degraded, N=4 → 4/4
-degraded, 6 launch failures in the log. The defect is ours and it is real.
-
-`$PIE_HOME/programs/<name>/<version>.wasm` is a shared namespace with no
-per-branch scoping. Any two checkouts building an inferlet with the same name
-and version overwrite each other, silently, and the loser's server runs the
-winner's code. Use a private `PIE_HOME` for anything you intend to measure.
-
-Three things follow, and none of them are comfortable:
-
-1. **The acceptance suite is entirely sequential**, so 25/25 green never
-   covered this. "Phase A works" means one request at a time.
-2. **The degradation discipline hides it.** A rejected launch becomes
-   `finish_reason: "length"` with a one-token answer — indistinguishable on
-   the wire from a model that simply stopped. That discipline is right for a
-   KV overflow and wrong for a hard fault; the two need different reasons.
-   The `'…'` placeholder assertion does not catch these, because a
-   one-real-token answer is not the placeholder.
-3. **Sequential decode largely fixes it and costs nothing measurable**
-   (90.6 vs 91.0 tok/s at N=1, see below), which inverts the trade-off this
-   measurement was commissioned to price.
-
-### Speculative vs sequential decode — the PA.1 m2 go/no-go
+### Speculative vs sequential decode### Speculative vs sequential decode — the PA.1 m2 go/no-go
 
 Commissioned to price what dropping `run_ahead` would cost on a hybrid pass,
 since its speculative overshoot is what a fold cannot tolerate. One dedicated

@@ -20,6 +20,65 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 
 ## Log
 
+### 2026-08-12 — concurrency ROOT-CAUSED: the Metal scheduler batches two device-geometry programs (upstream bug); CUDA pod terminated
+
+The N≥2 defect is **not ours**. The driver says so directly:
+
+```
+[pie-driver-metal] launch: 2 device-geometry programs in one batch
+                           (at most one is supported)
+```
+
+`driver/metal/src/context.cpp:997` explains it: *"at most one device-geometry
+program per launch batch — the same structural constraint **the runtime's
+scheduler already upholds** (`metal_ptir_plan.md §6`); a defensive re-check
+here so a **scheduling bug** fails the launch loudly."* The tripwire firing
+means the scheduler formed a batch it is documented as never forming.
+
+Our decode loop is device-geometry by construction (the loop-carried epilogue
+resolves the whole write descriptor on device), and `chat-completions` is one
+process per HTTP request — so N concurrent turns are N device-geometry
+programs, and the batcher pairs two.
+
+Accounts for everything: N=1 clean, N≥2 always degraded, **flat across
+`max_forward_requests` 8/32/64 with exactly 6 launch failures each** (a
+structural limit, not capacity), and sequential decode helping partially.
+Upstream never sees it because `text-completion-bench` runs its whole fleet
+inside ONE process — one program, whatever the `batch_concurrency`.
+
+**Eliminated on the way** (don't re-run): window oversubscription against a
+global budget; channel-name collision (`named()` is trace-only); duplicate
+instance ids (deduped in `scheduler/batch.rs:308`); instance missing from the
+driver registry (instrumented `context.cpp:930`, never fired).
+
+**The lesson, and it is the fourth of its kind today.** That message was in
+EVERY log collected this session — 6 in the isolated run, 54 in the
+concurrency ladder. It went unseen because every grep was for strings already
+known (`pie_metal_launch failed`, `pie::inferlet`) rather than for the
+driver's own output. Two rounds of source-diving and a rebuilt binary to
+surface a line already on disk. Same shape as `ttfb == max_gap`, as 13 tokens
+across 8 requests read as "8/8 completed", and as the 824 KB wasm. **Read the
+whole log before theorising about it.**
+
+**Options, none taken yet:** host-resolved geometry per fire (costs the
+device-carried decode loop, sidesteps the constraint entirely); an upstream
+scheduler fix so §6 is actually upheld; or Strategy B, where one long-lived
+session inferlet is one program by construction and the question dissolves.
+
+**CUDA pod terminated.** `guvvwcc05dwo3j` (H100 PCIe, $2.89/h) was deployed to
+chase this on a second driver and to probe `copy_kv`/`copy_state` for dense
+geometry. The concurrency question was answered locally before the build
+finished, so the pod was terminated at the user's direction; account is back to
+only an unrelated session's A40. **Two build facts worth keeping** — the CUDA
+version window for this tree is narrow and both ends are now known:
+`ptxas` needs **≥12.8** (12.4 rejects the Hopper TMA `cp.async.bulk.tensor` in
+the vendored XQA kernels — 2026-08-11), and cuBLASLt needs **≥12.9**
+(`CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F` and `…_VEC128_32F` are
+undeclared on 12.8, `driver/cuda/src/ops/gemm.cpp:1886`). So: **build on CUDA
+12.9+**. Installing `cuda-toolkit-12-9` over a 12.8 image works and preserves
+the compiled Rust crates if you delete only
+`target/release/build/pie-worker-*/out/cuda`.
+
 ### 2026-08-12 — why upstream's benchmarks run and ours break: they bench a different inferlet, on a different concurrency architecture, with engine knobs we never set
 
 Read the last week of upstream `dev` (356 commits; our base `58cb77936` IS the
