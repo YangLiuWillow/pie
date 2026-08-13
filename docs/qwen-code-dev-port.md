@@ -987,3 +987,52 @@ recover it, since the weights alone are 18.16 GiB. So **KV reuse on Qwen3.6
 remains 0% as measured**, and this is a candidate fix exactly like
 `a07637621` was — which failed. It should not be described as fixed until a
 turn retains and a later turn reports `cached_tokens > 0`.
+
+### Update: the seal now works. The blocker moved.
+
+Two corrections to the above, both found by running it.
+
+**The `written` accounting was mine and was off by one.** I initialised it to
+1, reasoning that the first fire "accounts for" g0. It does not: each fire
+writes the *previously sampled* token and samples the next, so k fires write
+exactly g0..g(k-1) and `written` must start at 0. The driver named the error
+precisely — `recurrent slot 0 is at position 14, this fire starts at 15`.
+
+**The stop-token semantic change was never needed.** The fire that would
+write a stop token is exactly the one not submitted, so nothing folded is
+ever a stop token, the full turn suffix is appended, and the retained
+context keeps its original meaning. The "KV must now record the stop token"
+change I flagged for a decision does not exist.
+
+With both corrected, **the seal succeeds** — first retention ever observed
+on the hybrid path:
+
+```
+first turn (no resume point) ; retained qwenchat/7b20c246e834ec08… (seq 539)
+```
+
+**The next blocker is `WorkingSet::fork`, and it is a different limit from
+§17's.** Turn 2 fails in the *resume* path, before generation:
+
+```
+copy_kv: UNSUPPORTED — only same-domain (PIE_MEMORY_DOMAIN_METAL_SHARED)
+copies are supported; there is no host-pinned swap pool in this build
+```
+
+§17's `copy_kv` refusal was about *checkpoint geometry* (dense refused,
+hybrid accepted). This one fires on the accepted geometry and is about
+memory domains: the CoW copy wants a host-pinned swap pool this build does
+not have. So `fork` is unusable on Metal for **both** geometries, for two
+unrelated reasons.
+
+Candidate fix, not attempted: resume by **extending the retained working set
+in place** instead of forking it. The fork exists so the parent survives a
+turn-level retry; a linear agent conversation does not branch, so
+extend-in-place is what that workload actually wants, and it avoids
+`copy_kv` entirely. It costs the retry-safety property and needs the
+handler's ownership of `sessions` restructured, so it is a real change
+rather than a flag.
+
+Net: **KV reuse on Qwen3.6 is still 0%**, but the seal half is fixed and
+verified, and the remaining half is a precisely-named driver limitation with
+a design answer rather than a mystery.

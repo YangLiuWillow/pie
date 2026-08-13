@@ -443,7 +443,13 @@ where
         // the pipeline as soon as its budget is spent, so that shape submits
         // into a closed pipeline and HANGS rather than erroring.
         if !state.rs.is_empty() {
-            let mut written = 1u32; // the fire below writes g0 at position n
+            // Fires executed, which is EXACTLY the number of tokens written
+            // to KV and folded. Each fire writes the *previously sampled*
+            // token at `pos` and samples the next, so k fires write g0..g(k-1).
+            // Starting this at 1 (on the theory that g0 is already accounted)
+            // put `total_len` one past the fold and the driver said so:
+            // "recurrent slot 0 is at position 14, this fire starts at 15".
+            let mut written = 0u32;
             let mut err: Option<String> = None;
             for _ in 0..budget {
                 if let Err(e) = submit_frame(&pipe, &[Some(&fwd)]) {
@@ -457,9 +463,6 @@ where
                         break;
                     }
                 };
-                // The fire executed, so this token is folded whether or not we
-                // surface it. Count it BEFORE the stop test, or KV would end a
-                // token short of the fold.
                 written += 1;
                 let token = *t.first().unwrap_or(&0) as u32;
                 if stop.contains(&token) {
@@ -479,22 +482,16 @@ where
             // mints a new sequence, which is refused differently. Sealing here
             // sidesteps both, and is what a hand-written loop buys.
             let mut end = n0 + n_suffix + written;
+            // The stop token is sampled but NEVER written: the fire that
+            // would have written it is the one we did not submit. So nothing
+            // folded is a stop token, the full turn suffix is appended, and
+            // the retained context keeps its original semantics — the
+            // "KV must now record the stop token" change this looked like it
+            // needed is not required at all.
             if gen_error.is_none() && !seal_tokens.is_empty() {
-                // If the model's own stop token is already the first byte of
-                // the turn suffix, appending the whole suffix would double it.
-                let last_written_is_seal_head = generated.len() as u32 + 1 < written;
-                let tail: &[u32] = if last_written_is_seal_head && seal_tokens.len() > 1 {
-                    &seal_tokens[1..]
-                } else if last_written_is_seal_head {
-                    &[]
-                } else {
-                    seal_tokens
-                };
-                if !tail.is_empty() {
-                    match seal_in_pipe::<W>(&pipe, &state.ws, &state.rs, end, tail).await {
-                        Ok(e2) => end = e2,
-                        Err(e) => gen_error = Some(e),
-                    }
+                match seal_in_pipe::<W>(&pipe, &state.ws, &state.rs, end, seal_tokens).await {
+                    Ok(e2) => end = e2,
+                    Err(e) => gen_error = Some(e),
                 }
             }
             pipe.close();
