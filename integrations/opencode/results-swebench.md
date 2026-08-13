@@ -112,13 +112,37 @@ Signature worth keeping:
   and of `max_tokens`.
 - Cleared by a restart, every time.
 
-Working hypothesis is KV/working-set exhaustion: the long session ran at 32k
-context against a 4,096-page pool (131,072 tokens of KV), and if retained
-sets are not released at session end the pool fills and later requests get no
-room to decode. **Hypothesis, not finding** — the pool was not instrumented,
-and the worn server logged no allocation warning. Next step: instrument the
-pool, run one long session, then one trivial request. If pages are not
-returned, the bug is in session teardown rather than the kernels.
+**The KV-exhaustion hypothesis was tested and does not survive.** The pool is
+now instrumented (`PIE_KV_TRACE=1`), which it never was — `kv_pages.allocated`
+and `kv_pages.available` are defined in `telemetry.rs` and recorded nowhere.
+Across sequential requests the trace reads:
+
+```
+install_ws   avail=1024/1024  live_ws=1  pending_recycle=0
+retire_idle  avail= 974/1024  live_ws=0  pending_recycle=50
+install_ws   avail=1024/1024  live_ws=1  pending_recycle=0   <- fully recovered
+```
+
+`live_ws` returns to 0 and the pool returns to full between requests. Working
+sets are released and their pages do come back, so "exhaustion at session
+teardown" is wrong as stated. Two attempts to reproduce the degradation under
+tracing both failed — the server kept generating — so the cause is still open.
+
+A correction worth keeping, because the shape of the error recurs: the
+`retire_idle` numbers appeared to decline monotonically (974, 925, 877) and I
+first read that as the leak. It was an artifact of two things I had chosen —
+the trace sits at retire-*entry*, before retirement runs, and my probe prompts
+grew linearly, so each line was the pool minus that request's own pages. The
+`install_ws` line, on the same object, said the opposite; I had not looked at
+it.
+
+**Found while instrumenting, and it is real**: `simple_family.cpp:313` computes
+`g_.total_pages = kv_max_ctx / kv_page_size`, silently overwriting the
+configured `total_pages`. The KV pool is therefore sized to *exactly one
+max-length sequence* — 1024 pages at `max_model_len` 32768, 512 at 16384,
+verified both ways — and the config knob does nothing. That is not this
+degradation (two concurrent 9k-token requests both completed), but it is a
+knob that lies, on the path an agent workload stresses hardest.
 
 **Why no replay found it.** Every other suite here is short and bounded: five
 captured requests, five turns, five swept prompts. None runs a real agent for
