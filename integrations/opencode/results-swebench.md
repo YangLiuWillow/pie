@@ -17,6 +17,54 @@ Artifacts: `preds-swebench-known5.jsonl`, `report-swebench-known5.json`.
 The one miss produced no patch at all after 21 minutes — the agent worked and
 committed nothing. Nothing was scored wrong; nothing was scored generously.
 
+## vLLM-metal on the same five — 1/5
+
+Same agent (opencode), same checkpoint, same prompts, same instances, same
+machine, graded by the same Docker harness.
+
+| instance | pie | vLLM-metal |
+|---|---|---|
+| django-12276 | **resolved** (545 s) | unresolved (146 s) |
+| django-13028 | empty patch (1265 s) | empty patch (88 s) |
+| django-13089 | **resolved** (332 s) | empty patch (10 s) |
+| django-14373 | **resolved** (309 s) | **resolved** (39 s) |
+| django-15569 | **resolved** (843 s) | empty patch (11 s) |
+| **resolved** | **4/5** | **1/5** |
+
+**Read this with three caveats, all of which cut against the headline.**
+
+1. **The arms were not symmetric, and that is my doing.** pie ran with
+   `--restart-cmd`, so it got a fresh server per instance; vLLM ran on one
+   server throughout. The restart exists to isolate pie's own wear defect,
+   and giving one arm a mitigation the other did not get is exactly the kind
+   of asymmetry that produces a flattering number. A fair re-run restarts
+   both.
+2. **n = 5.** One instance either way moves this by 20 points.
+3. **The set is the baseline's wins**, so it is biased toward "solvable",
+   not toward either stack.
+
+**What is real regardless of the score** is *how* the vLLM arm failed. Its
+runs are an order of magnitude shorter — 10, 11, 39, 88, 146 s against pie's
+309–1265 s — which is an agent giving up, not an agent working faster. And
+instance 1 says why:
+
+```
+✗ Edit django/forms/widgets.py failed
+Error: The edit tool was called with invalid arguments: SchemaError
+```
+
+vLLM's `--tool-call-parser qwen3_coder` emitted arguments the tool schema
+rejected. That is the same class of problem pie hit and fixed this session:
+Qwen3-Coder's calls are XML, XML carries no types, and the arguments have to
+be typed **from the schema** on the way out. Three of vLLM's five runs ended
+with an empty patch in under 90 s, which is consistent with an agent whose
+edits will not apply.
+
+So the honest summary: on this small, biased set, pie resolved more — and the
+mechanism visible in the logs is tool-call argument fidelity, not serving
+speed. That is a hypothesis about vLLM's parser, from five runs; it is worth
+checking directly before it is repeated.
+
 ## Read the instance set before reading the number
 
 These are **not** a random sample, and 4/5 is not a resolve rate. They are the
