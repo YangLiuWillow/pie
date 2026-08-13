@@ -185,6 +185,20 @@ The middle one reframes the whole week: PA.1 m2 was blocked because a fold has
 no cross-process identity, and **B never needs one**. That gap is a consequence
 of the request-per-process contract, not a property of hybrid models.
 
+> **Corrected 2026-08-12 by the qwen-code session, which has been running this
+> shape since the start.** "The fold never leaves its process" removes the
+> *persistence* half and **not** the pipeline-binding half. They hit
+> `fork`-mints-a-new-sequence (`2^63` → `2^63+1`, rejected as a continuation)
+> **inside a single process**, because their seal was a fire on a FRESH
+> pipeline — `run_ahead` having closed the generation one. A long-lived
+> inferlet does not fix that by itself.
+>
+> **The fix, and it is why sequential decode pays twice:** with a hand-written
+> submission loop you control when the last fire goes out, so **the seal can be
+> the final fire on the generation pipeline** rather than the first fire on a
+> new one. That deletes the cross-pipeline binding problem outright instead of
+> working around it. Design the session inferlet this way from the start.
+
 ### One blocker does NOT dissolve, and becomes load-bearing
 
 `run_ahead` speculates past the stop token — the SDK says *"up to one window of
@@ -209,6 +223,21 @@ erroring (a 300 s timeout to discover).
 It is the compatibility path for anything that only speaks OpenAI, **and it is
 the control for the `~81 s → ~21 s` claim.** Without the baseline there is no
 A/B, only an assertion. Freeze it; do not delete it.
+
+### There is a working reference for this shape — read it first
+
+**The qwen-code port (`~/Documents/Liszt_ai/pie-qwen`, `liu/qwen-code-dev`) has
+been Strategy B from the start**, not by choice: the `dev` rewrite removed
+in-guest HTTP, so their OpenAI surface moved client-side and the inferlet had to
+become long-lived. Their shape is what we are about to build:
+
+- one long-lived `Daemon` over a `session::receive()` loop;
+- a client-side shim multiplexing HTTP onto it by `req_id`;
+- `sessions: HashMap<String, (SessionState, u32)>` held **in-process across
+  turns**.
+
+Read it before designing ours. They have already paid for several lessons in
+it, including the seal/pipeline one above.
 
 ### Reusable from Phase A
 
@@ -366,6 +395,12 @@ Request path: **opencode → `POST /v1/chat/completions` (gateway ingress) →
    decode from the start**, and the AI SDK provider package on the client side.
 3. **A/B it** against frozen Strategy A on the same model and machine. The
    claim to test is `~81 s → ~21 s`; A is the control, which is why it stays.
+   **The two arms need identical PROMPTS as well as identical models**, or the
+   measurement is of the renderer rather than the servers (qwen-code's run-2
+   failure mode). `parity/capture_vllm_render.py` on `liu/qwen-code-dev`
+   captures vLLM's `/v1/chat/completions/render` token ids to disk, so the two
+   ~20 GB stacks never need to be co-resident and neither side re-derives the
+   reference.
 4. Then PB.2 (native `packages/llm`) if the numbers justify the deeper change.
 
 ### The lesson that cost the most time, four separate times
@@ -411,11 +446,24 @@ not controlled, written down as a property of the system.**
 Two peer Claude sessions share this codebase and hardware. Both caught real
 bugs in our code today; both are worth talking to.
 
-- **qwen-code** — `~/Documents/Liszt_ai/pie-qwen`, `liu/qwen-code-dev`. Has a
-  golden-tested **Qwen3.6 dialect renderer** and a lineage-aware **open-block
-  cue**, verified live at both temperatures: a truncated turn yields `'…'`
-  instead of leaked reasoning. Take that cue if you touch think-channel
-  handling; it is strictly better than our closed-empty-block cue.
+- **qwen-code** — `~/Documents/Liszt_ai/pie-qwen`, `liu/qwen-code-dev`.
+  **Already a Strategy B implementation** (§4) — read it before designing ours.
+  Two artifacts offered to us at `1e99c2567`:
+  - **lineage-aware open-block cue** — `render_text::{lineage_opens_think,
+    THINK_OPEN}` + `VisibleFilter::starting(bool)`, with three filter tests
+    pinning untagged reasoning, truncation-with-no-closer, and an unchanged
+    text-mode start. Verified live at both temperatures: a truncated turn
+    yields `'…'` rather than leaked reasoning. Strictly better than our
+    closed-empty-block cue.
+    **Caveat from them, and it is ours to resolve:** verified on SINGLE turns
+    only. Under a session-long working set the interesting question is whether
+    think-channel hygiene holds when the RETAINED state already contains
+    earlier turns' reasoning. Nobody has tested that shape; we will reach it
+    first.
+  - **Qwen3.6 dialect** — `Dialect::Qwen36` in `render_text.rs`, golden-tested
+    byte-for-byte against the real `chat_template.jinja`
+    (`tests/qwen36_template_golden.json`, regenerable with transformers). For
+    prompt-parity work, not for replacing our WIT template path.
 - **openclaw** — `liu/openclaw-integration`, forks this branch. Implemented KV
   snapshot sessions in the SHARED `chat-completions` inferlet, and added
   `test_no_placeholder_content` and
