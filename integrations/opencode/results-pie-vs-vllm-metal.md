@@ -1,5 +1,51 @@
 # pie vs vLLM-metal, opencode workload — first measurement, 2026-08-12
 
+> ## ⚠️ Read this before quoting anything below — 2026-08-13
+>
+> **Two things invalidate parts of this document.**
+>
+> **1. pie's Coder-30B output is garbage, and every number below was measured on
+> Coder-30B.** Asked to count from one to ten it answers
+> `""________________________________`; on longer prompts, fluent-looking word
+> salad. mlx-lm on the *same* `mlx-community` checkpoint answers
+> `1, yte, 3, 4, 5, 6, 7, 8, 9, 10.`, so the checkpoint is fine and pie is not.
+> Confirmed against the pre-change binary — byte-identical garbage — so this is
+> long-standing and not caused by any of today's work.
+>
+> The timing numbers are not thereby meaningless: the same tensors move and the
+> same kernels run whatever the values are. But **"pie generated 96 tokens every
+> turn"** now has a second reading — it never emitted a stop token because it was
+> never emitting sense — and no quality, trajectory or tool-calling claim from
+> this workload survives. One cause is found and fixed (the router was read at
+> the wrong quantization width; see the 2026-08-13 commits); at least one more
+> remains, and the model now stops instantly instead.
+>
+> **2. The prefill ratios are superseded.** The matrix-unit attention landed on
+> 2026-08-13 and is worth **2.35× on prefill**. See the fresh, valid measurement
+> immediately below.
+
+## Valid comparison — Qwen3-0.6B-4bit, 2026-08-13
+
+Same `mlx-community/Qwen3-0.6B-4bit` artifact on both stacks, one server at a
+time, prompts nonce-prefixed so neither stack's prefix cache is in the sweep.
+**Qwen3-0.6B is a model pie serves correctly**, which is what makes this the
+comparison to quote and Coder-30B's the one to discard.
+
+| | pie (before) | pie (now) | vLLM-metal | gap now |
+|---|---:|---:|---:|---|
+| marginal prefill | 1,502 tok/s | **3,534 tok/s** | 6,962 tok/s | **1.97× vLLM** |
+| ttfc @ ~5,050 tok | 3.254 s | **1.418 s** | 0.737 s | 1.92× |
+
+**The prefill gap closed from 4.63× to 1.97×** on one kernel change.
+
+Decode is untouched and remains at ~parity (1.12× on the earlier measurement):
+the matrix path is gated on `sdpa_should_tile`, and a decode is one row per
+request, so it never reaches it — by construction, not by luck.
+
+Remaining, in the order A2 ranked them: the quantized GEMM is still ~2.4×
+behind MLX's `quantized_matmul` on these shapes, and that is now the largest
+single item left.
+
 *Machine: `Lius-MacBook-Pro`, M-series, 48 GB unified, macOS 26.5.1, Metal.
 One server at a time (each model is ~20 GB). Same replayed transcript, same
 `max_tokens=96`, `temperature=0`, `max_model_len=16384` on both stacks.*

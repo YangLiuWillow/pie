@@ -832,6 +832,54 @@ d=64 keeps a single chunk, so **gpt-oss's arithmetic is untouched, bit for bit**
 (MoE) cases, and they are not small — one reads `worst rel_l2 14.0270`. That is
 not rounding. See the Coder-30B finding below.
 
+### pie serves Qwen3-Coder-30B as garbage — found while validating this
+
+The MoE model was the obvious place to check the new kernel, since Qwen MoEs are
+llama-family at head_dim 128 and take the same path. They do — and the output is
+nonsense in both arms:
+
+```
+prompt: "Count from one to ten, then stop."
+pie:     ""__________________________________________ ___ ___
+mlx-lm:  1, yte, 3, 4, 5, 6, 7, 8, 9, 10.        # same checkpoint
+```
+
+Confirmed **pre-existing** against the binary from before this work — byte for
+byte the same garbage — so it is neither the MMA change nor recent.
+
+**One cause found and fixed.** mlx-lm's quantization predicate singles tensors
+out by name, and `config.json` states only the model-wide choice at top level;
+the per-tensor overrides sit beside it. This checkpoint spares one tensor per
+layer: `mlp.gate` — the MoE **router** — is 8-bit where the model is 4-bit.
+llama read it at the model-wide width, walking an 8-bit tensor's rows at half
+their stride. Since the router's output is a top-k *selection*, that is not a
+rounding difference: every token routes to arbitrary experts.
+
+gemma4 and qwen3.5 both already carry an alternate-format table for exactly
+this — gemma4's comment records the router at "cosine 0.10 to mlx-lm's, with
+every tensor feeding them at 0.9999" — and llama simply had none. It does now,
+and says so at load.
+
+**It is not the whole story.** With the router fixed, Coder-30B stops emitting
+word salad and instead emits `<|endoftext|>` immediately. So at least one more
+defect remains in llama's routed path. Qwen3-0.6B is byte-identical before and
+after, and `llama_numerics_test` is unchanged at 51/18.
+
+**What this costs the record**: `results-pie-vs-vllm-metal.md` was measured
+entirely on Coder-30B. Its timings still describe work done, but no claim about
+output quality, trajectories or tool calling survives — and "pie generated 96
+tokens every turn" reads differently once you know it never had a sensible stop
+token to emit. A valid comparison on Qwen3-0.6B is recorded there instead.
+
+**A note on `llama_numerics_test` as an oracle.** It fails 18 cases *before* any
+of this, including dense ones at `worst rel_l2 34.5` — on a family that
+demonstrably serves real checkpoints correctly. With `PIE_NUM_DEBUG=1` the layer-0
+values track the reference closely (−3.58 vs −4.66) and compound from there,
+which is what a synthetic random model at 4 bits does against an fp32 reference.
+So its absolute verdicts are not trustworthy here; what it is good for is
+**differential** use — same binary, one knob changed — which is how it was used
+to size the accumulator chain above, and there it was decisive.
+
 ### Two method failures worth keeping
 
 1. **`pkill -f "pie serve"` never matched anything.** The process is
