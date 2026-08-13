@@ -12,13 +12,64 @@ completed task, newest first. Worktree: `Liszt_ai/pie-opencode`, branch
 | P0.2 | opencode wire audit + fixture capture | **done** |
 | P0.3 | Shared `openai-serving` crate | **done** |
 | P0.4 | Renderer parity harness | **done** |
-| PA.1 | `chat-completions` inferlet on dev | **milestone 1 done** (sessions/grammar/coder-dialect pending) |
+| PA.1 | `chat-completions` inferlet on dev | **milestone 1 done, frozen.** Milestone 2 (KV snapshot sessions) **cancelled** — superseded by PB.1, see the 2026-08-12 decision |
 | PA.2 | Gateway OpenAI ingress | **done** |
 | PA.3 | Acceptance suite + stock-opencode e2e | **DONE** — 25/25 live on Qwen3-0.6B *and* Qwen3.6-35B-A3B; stock opencode does multi-step agentic work (read → write) on the 35B |
-| PB.1 | `opencode-session` inferlet + AI SDK provider package | pending |
+| PB.1 | `opencode-session` inferlet + AI SDK provider package | **ACTIVE — the project's main line** (decision 2026-08-12) |
 | PB.2 | Native `packages/llm` protocol in opencode V2 | pending (optional) |
 
 ## Log
+
+### 2026-08-12 — DECISION: Strategy B becomes the main line; Strategy A frozen green
+
+**Decided by the user**, on the evidence below. Strategy A is not deleted — it
+is frozen in a working state as the compatibility path and as the measurement
+baseline. PA.1 milestone 2 (KV snapshot sessions inside the request-per-process
+shim) is **cancelled**: it was solving a problem that only exists in Strategy
+A's shape.
+
+**The argument.** The paper's unit of service is a long-lived program:
+*"Concurrency within an inferlet is handled through asynchronous, non-blocking
+API calls, a model well-suited for I/O-bound agentic workflows"*, with the ILM
+launching it once and users talking to it via `send`/`receive` afterwards.
+Everything measured this week points the same way.
+
+**Three independent blockers dissolve under B, and they are all artifacts of
+one-inferlet-per-request:**
+
+| blocker | why B removes it |
+|---|---|
+| Metal batches two device-geometry programs and the driver refuses (`context.cpp:997`) | one long-lived inferlet is ONE program; two can never be batched |
+| a fold cannot be published across processes (`rs-working-set` has `fork` and no index) | the fold never crosses a process boundary — the session inferlet holds it |
+| FCFS *"terminating the most recently created inferlets"* kills the newest turn | N turns are N rows in one inferlet, not N tenants |
+
+The second is the one that reframes the week: **PA.1 m2 was blocked because a
+fold has no cross-process identity, and Strategy B never needs one.** The whole
+`rs-working-set` gap is a consequence of the request-per-process contract, not
+a property of hybrid models.
+
+**One blocker does NOT dissolve, and becomes load-bearing.** `run_ahead`'s
+speculative overshoot folds tokens the turn rejected. Harmless under A (the
+working set dies with the request); under B the state is reused every turn, so
+an over-advanced fold **compounds across a session** and yields fluent wrong
+output with nothing to catch it. Sequential decode therefore becomes a
+prerequisite rather than an option — already priced at **0.4%** (91.0 → 90.6
+tok/s single-stream on the 35B), so the cost is settled.
+
+**What Strategy A keeps earning:**
+
+1. **Compatibility** — stock opencode, unmodified, speaks OpenAI over HTTP
+   today: 25/25 acceptance on both models, real multi-step agentic work on the
+   35B. Anything that only speaks OpenAI still needs it.
+2. **The control** — the `~81 s → ~21 s` claim is an A/B. Without A as the
+   baseline there is no measurement, only an assertion.
+3. It works at N=1, which is every single-user CLI session.
+
+**What B costs, stated so it is not discovered later:** the contract change.
+PB.1 needs the AI SDK provider package on the client side; B is not a drop-in
+for a stock OpenAI client. That cost is exactly why A was built first, and it
+is now a deliberate purchase rather than an accident.
+
 
 ### 2026-08-12 — concurrency ROOT-CAUSED: the Metal scheduler batches two device-geometry programs (upstream bug); CUDA pod terminated
 
