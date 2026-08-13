@@ -59,6 +59,45 @@ DATASET = "princeton-nlp/SWE-bench_Verified"
 SPLIT = "test"
 SUBSET_SEED = 1234
 
+# Instances a Qwen3-Coder-30B-A3B agent is KNOWN to solve.
+#
+# Why this list exists: a seeded random subset conflates two failures. If the
+# agent produces no patch, that is either the serving stack misbehaving or the
+# model being unable to do the task — and SWE-bench Verified's base rate for a
+# 30B is low enough that "0 of 5" is an unremarkable outcome for a healthy
+# stack. On a set the same model has already solved, a zero is attributable.
+#
+# Provenance: these are `baseline_t0_full_50.report.json`'s `resolved_ids` on
+# the OpenHands branch — the 13 that `litellm+qwen3-coder-30b-a3b-t0` resolved
+# out of a neutral 50, scored by the official Docker grader. Pie's own
+# OpenHands arm reproduced 11 of the 13; the two it missed are listed
+# separately because their failures are documented and model-side, not
+# machinery: `xarray-4966` was a wrong fix (FAIL_TO_PASS 0/4) and
+# `sklearn-10908` was a 0-byte patch after the model corrupted its own
+# workspace path and thrashed.
+#
+# Same model FAMILY, different agent (OpenHands, not opencode) and different
+# hardware (A100 CUDA, not Metal). So this bounds what the model can do; it
+# does not promise opencode reproduces it. A miss here is worth reading; a
+# clean sweep is not proof of parity.
+KNOWN_SOLVABLE_BOTH = [
+    "django__django-12276",
+    "django__django-13028",
+    "django__django-13089",
+    "django__django-14373",
+    "django__django-15569",
+    "django__django-16485",
+    "matplotlib__matplotlib-22719",
+    "pydata__xarray-4075",
+    "scikit-learn__scikit-learn-12973",
+    "scikit-learn__scikit-learn-13496",
+    "sympy__sympy-19346",
+]
+KNOWN_SOLVABLE_BASELINE_ONLY = [
+    "pydata__xarray-4966",
+    "scikit-learn__scikit-learn-10908",
+]
+
 HERE = Path(__file__).resolve().parent
 
 
@@ -87,10 +126,17 @@ Rules:
 """
 
 
-def load_problems(n: int, seed: int = SUBSET_SEED):
+def load_problems(n: int, seed: int = SUBSET_SEED, instances: list[str] | None = None):
+    """`n` seeded-random rows, or exactly the rows named in `instances`."""
     from datasets import load_dataset
 
     ds = load_dataset(DATASET, split=SPLIT)
+    if instances:
+        by_id = {r["instance_id"]: r for r in ds}
+        missing = [i for i in instances if i not in by_id]
+        if missing:
+            raise SystemExit(f"not in {DATASET}: {missing}")
+        return [by_id[i] for i in instances]
     idx = sorted(random.Random(seed).sample(range(len(ds)), n))
     return [ds[i] for i in idx]
 
@@ -196,6 +242,15 @@ def main() -> int:
     ap.add_argument("--label", default=None, help="model_name_or_path in the predictions")
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--opencode", default=os.path.expanduser("~/.opencode/bin/opencode"))
+    ap.add_argument("--known-solvable", action="store_true",
+                    help="use instances this model family has already solved "
+                         "(see KNOWN_SOLVABLE_BOTH) instead of a seeded subset")
+    ap.add_argument("--instances", nargs="+", help="explicit instance ids")
+    ap.add_argument("--restart-cmd",
+                    help="shell command run BEFORE each instance, e.g. a fresh "
+                         "`pie serve`. Isolates the server-wear defect so an "
+                         "accuracy signal is not swamped by it — and hides that "
+                         "defect, which is why it is opt-in and reported below.")
     args = ap.parse_args()
 
     label = args.label or args.model.replace("/", "-")
@@ -203,13 +258,22 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
     print(f"workspaces: {root}")
 
-    problems = load_problems(args.n)
+    chosen = args.instances or (KNOWN_SOLVABLE_BOTH[: args.n] if args.known_solvable else None)
+    problems = load_problems(args.n, instances=chosen)
+    if args.restart_cmd:
+        print("restarting the server before each instance — the wear defect is "
+              "being ISOLATED, not fixed\n")
     print(f"{len(problems)} instances: {[p['instance_id'] for p in problems]}\n")
 
     rows, summary = [], []
     for i, row in enumerate(problems, 1):
         iid = row["instance_id"]
         print(f"[{i}/{len(problems)}] {iid} ({row['repo']}) …", flush=True)
+        if args.restart_cmd:
+            r = subprocess.run(["/bin/zsh", "-c", args.restart_cmd],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"    restart FAILED: {r.stderr.strip()[:200]}")
         try:
             ws = prepare_workspace(row, root)
         except subprocess.CalledProcessError as e:

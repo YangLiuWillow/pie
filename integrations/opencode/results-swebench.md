@@ -1,98 +1,111 @@
-# SWE-bench Verified, 5 instances — first run, 2026-08-13
+# SWE-bench Verified against pie — 2026-08-13
 
-**Result: 0/5 patches, and the reason is a pie defect, not the model.**
+**Officially graded: 4/5 resolved.** pie serving Qwen3-Coder-30B-A3B on Metal,
+driven by stock opencode 1.18.18, scored by
+`swebench.harness.run_evaluation` in Docker.
 
-Harness: `integrations/opencode/run_swebench.py` (drive half), stock
-opencode 1.18.18, pie serving `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`
-at `max_model_len=32768`, `total_pages=4096`. Instances are the seeded subset
-(seed 1234) of `princeton-nlp/SWE-bench_Verified`.
+| instance | agent | patch | graded |
+|---|---:|---:|---|
+| django__django-12276 | 545 s | 411 B | **resolved** |
+| django__django-13028 | 1265 s | 0 B | empty patch |
+| django__django-13089 | 332 s | 915 B | **resolved** |
+| django__django-14373 | 309 s | 412 B | **resolved** |
+| django__django-15569 | 843 s | 483 B | **resolved** |
 
-| instance | state | secs | patch |
-|---|---|---:|---:|
-| astropy__astropy-13398 | ran | 534 | 0 B |
-| django__django-11749 | no-op | 2 | 0 B |
-| django__django-16333 | no-op | 2 | 0 B |
-| sphinx-doc__sphinx-8035 | no-op | 1 | 0 B |
-| sympy__sympy-24066 | no-op | 1 | 0 B |
+Artifacts: `preds-swebench-known5.jsonl`, `report-swebench-known5.json`.
 
-Only the first instance ran at all. The other four returned in ~1 s having
-generated nothing.
+The one miss produced no patch at all after 21 minutes — the agent worked and
+committed nothing. Nothing was scored wrong; nothing was scored generously.
 
-## The defect: pie degrades to zero-token completions
+## Read the instance set before reading the number
 
-After the first instance's 534-second agent session, **every subsequent
-request to that server returned `completion_tokens: 0`** — including
-requests that had nothing to do with the benchmark:
+These are **not** a random sample, and 4/5 is not a resolve rate. They are the
+first five of the thirteen that `litellm+qwen3-coder-30b-a3b-t0` resolved on a
+neutral 50 (the OpenHands branch's `baseline_t0_full_50.report.json`
+`resolved_ids`), scored by the same Docker grader.
 
+The set is deliberately biased, and the bias is the point. A seeded random
+subset conflates two failures — the serving stack misbehaving, and the model
+being unable to do the task — and SWE-bench Verified's base rate for a 30B is
+low enough that 0/5 is unremarkable for a *healthy* stack. On instances this
+model family has already solved, a zero is attributable. That is what makes
+this set a debugging instrument rather than a score.
+
+So: **this measures whether pie can carry a trajectory the model is known to
+be capable of.** It cannot be quoted as a SWE-bench result, and the honest
+comparison is against the baseline's 5/5 on the same five.
+
+## The run before this one: 0/5, and why
+
+The seeded-random run scored 0/5 for two reasons, only one of them the model's:
+
+1. **pie wore out.** After the first instance's 534-second agent session,
+   every subsequent request to that server returned `completion_tokens: 0` —
+   including "Say hello in one word.", which the same server had answered
+   normally an hour earlier. A freshly booted server on the identical config
+   answers correctly. Restart clears it completely.
+2. The instances were random, so even a healthy stack would likely have
+   scored 0.
+
+This run isolates (1) with `--restart-cmd`, which boots a fresh server before
+each instance. That is **isolation, not a fix** — the defect is still there,
+and a benchmark that quietly restarts around it would hide it. With the
+defect isolated, 4 of 5 land.
+
+### The wear defect, still open
+
+Signature worth keeping:
+
+- `completion_tokens: 0` with `finish_reason: "length"` — self-contradictory:
+  nothing generated, yet the stop reason is the length cap.
+- Content renders as `'…'` — opencode drawing an empty message, not the model
+  emitting an ellipsis.
+- Independent of prompt size (14-token prompts fail like 1,340-token ones)
+  and of `max_tokens`.
+- Cleared by a restart, every time.
+
+Working hypothesis is KV/working-set exhaustion: the long session ran at 32k
+context against a 4,096-page pool (131,072 tokens of KV), and if retained
+sets are not released at session end the pool fills and later requests get no
+room to decode. **Hypothesis, not finding** — the pool was not instrumented,
+and the worn server logged no allocation warning. Next step: instrument the
+pool, run one long session, then one trivial request. If pages are not
+returned, the bug is in session teardown rather than the kernels.
+
+**Why no replay found it.** Every other suite here is short and bounded: five
+captured requests, five turns, five swept prompts. None runs a real agent for
+nine minutes and then asks the server for one more token.
+
+## Scoring on Apple Silicon
+
+Docker on this box is colima + lima + the static docker CLI, all installed
+user-local without sudo or Homebrew.
+
+The one thing that does not work out of the box: SWE-bench's published images
+are **x86_64 only** (`swebench/sweb.eval.x86_64.…`), and the harness pulls
+without a platform flag, so Docker refuses with *"no matching manifest for
+linux/arm64/v8"*. Two things fix it together:
+
+```sh
+colima start --cpu 6 --memory 14 --disk 80 --vm-type vz --vz-rosetta
+docker pull --platform linux/amd64 <each image>   # then the harness finds them locally
 ```
-prompt="Say hello in one word."   gen=0  finish=length  content='…'
+
+Rosetta translation makes those containers cheap — the four graded instances
+ran in 2 min 4 s total. Note also that SWE-bench 5.0 needs the
+`SWE-bench/SWE-bench_Verified` dataset, not `princeton-nlp/…`: the harness
+reads an `image` column the older copy does not have, and dropped
+`--cache_level`.
+
+## Reproduce
+
+```sh
+# drive (fresh server per instance isolates the wear defect)
+python3 integrations/opencode/run_swebench.py --known-solvable --n 5 \
+    --timeout 1500 --out preds.jsonl --restart-cmd '<boot pie>'
+
+# score
+python -m swebench.harness.run_evaluation \
+    --dataset_name SWE-bench/SWE-bench_Verified \
+    --predictions_path preds.jsonl --max_workers 2 --run_id pie_known5
 ```
-
-The same server had answered that prompt normally an hour earlier. A
-freshly booted server on the identical config answers it correctly
-(`'Hello!'`, 3 tokens). So the server does not fail — it **wears out**.
-
-The signature is specific and worth keeping:
-
-- `completion_tokens: 0` with `finish_reason: "length"`, which is
-  self-contradictory: nothing was generated, yet the stop reason is the
-  length cap.
-- Visible content is `'…'`, which is opencode rendering an empty message,
-  not the model emitting an ellipsis.
-- Independent of prompt size (14-token prompts fail the same as 1,340-token
-  ones) and of `max_tokens` (80 and 300 behave identically).
-- Cleared completely by a restart.
-
-**Working hypothesis: KV/working-set exhaustion.** The first instance was a
-long multi-turn agent session at 32k context against a 4,096-page pool
-(131,072 tokens of KV). If retained working sets are not released when a
-session ends, the pool fills and later requests get no room to decode. That
-matches "everything after the big session fails, restart fixes it", but it is
-a hypothesis — the pool was not instrumented during the run, and the degraded
-server's log carried no admission or allocation warning.
-
-## Why no replay found this
-
-Every suite in this integration is short and bounded: the acceptance suite
-replays five captured requests, the resume suite five turns, the profiler
-sweeps five prompts and exits. **Nothing before this ran a real agent for
-nine minutes and then asked the server for one more token.** That is the
-whole value of the benchmark harness independent of any score it produces.
-
-## What is NOT the problem
-
-Ruled out by measurement during this run:
-
-- **The model.** A fresh server answers correctly, and the same checkpoint
-  passes 25/25 acceptance with zero warnings.
-- **Tool calling.** Instance 1's agent ran 534 s of real tool use.
-- **Prompt size or content.** All five prompts fail identically on a worn
-  server and all five are well under the context ceiling.
-- **opencode.** Its generic `{"name":"UnknownError","message":"Unexpected
-  server error"}` masks the real error; `--print-logs` shows the true cause
-  each time. Two distinct failures wore that same mask here, and only one of
-  them was pie's (see below).
-
-## A second, unrelated bug found on the way
-
-`ProviderModelNotFoundError: Model not found: pie/qwen3-coder-30b` — the
-harness copies `opencode.json` into each workspace and `capture_patch`
-deletes it afterwards, so any *re-run* in a used workspace has no provider
-config. Harmless to the benchmark (the copy happens before every attempt)
-but it cost an hour of misdiagnosis, because opencode reports it as the same
-"Unexpected server error" as everything else.
-
-## Next
-
-1. **Instrument the KV pool** and re-run instance 1 followed by a trivial
-   request. If pages are not returned, that is the bug and it is in session
-   teardown, not the kernels.
-2. Until then, a per-instance server restart would make the benchmark
-   *run*, but it would also hide the defect, so it is deliberately not done
-   here.
-3. Scoring still needs Docker, which this machine does not have:
-   ```sh
-   python -m swebench.harness.run_evaluation \
-       --dataset_name princeton-nlp/SWE-bench_Verified \
-       --predictions_path preds.jsonl --max_workers 4 --run_id pie-opencode
-   ```
