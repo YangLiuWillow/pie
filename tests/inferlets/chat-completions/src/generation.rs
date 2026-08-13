@@ -156,6 +156,10 @@ pub struct Generation {
     /// Accepted generated tokens, in order.
     pub generated: Vec<u32>,
     pub hit_max: bool,
+    /// True when the turn suffix was already folded in as the last fire on
+    /// the generation pipeline, so the caller must NOT seal again. Only the
+    /// recurrent-state path does this; see `decode_sequential`.
+    pub sealed: bool,
     /// Set when generation died mid-turn — the caller degrades the turn to
     /// `finish_reason:"length"` (audit §1 req. 8: never surface a
     /// context-length error to qwen-code) and skips session retention.
@@ -190,6 +194,7 @@ pub async fn generate(
     prefill: &[u32],
     params: &GenParams,
     stop_ids: &[u32],
+    seal_tokens: &[u32],
     on_prefill_chunk: impl FnMut(),
     on_token: impl FnMut(u32) -> bool,
 ) -> Result<Generation> {
@@ -199,13 +204,15 @@ pub async fn generate(
     match model::pass_kind() {
         model::ForwardKind::Attention => {
             generate_for::<WitAttention>(
-                resume, prefill, params, stop_ids, on_prefill_chunk, on_token,
+                resume, prefill, params, stop_ids, seal_tokens, on_prefill_chunk, on_token,
             )
             .await
         }
         model::ForwardKind::Hybrid => {
-            generate_for::<WitHybrid>(resume, prefill, params, stop_ids, on_prefill_chunk, on_token)
-                .await
+            generate_for::<WitHybrid>(
+                resume, prefill, params, stop_ids, seal_tokens, on_prefill_chunk, on_token,
+            )
+            .await
         }
         // No registered model reports recurrent-only, and this loop's paged
         // prompt geometry has nothing to bind on a pass with no KV at all —
@@ -221,6 +228,7 @@ async fn generate_for<W>(
     prefill: &[u32],
     params: &GenParams,
     stop_ids: &[u32],
+    seal_tokens: &[u32],
     mut on_prefill_chunk: impl FnMut(),
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<Generation>
@@ -414,6 +422,93 @@ where
         let budget = params.max_tokens.saturating_sub(1); // g0 already emitted
         let max_tokens = params.max_tokens;
         let stop: Vec<u32> = stop_ids.to_vec();
+
+        // ── The recurrent-state path decodes SEQUENTIALLY ─────────────────
+        // `run_ahead` keeps a window of fires in flight and lets the tail of
+        // it run past the stop token. For KV that is deliberate and harmless
+        // — later fires' `kv_len` never covers the overshoot. A fold has no
+        // `kv_len`: every fire that executes is folded in, irreversibly. The
+        // driver then refuses the seal outright:
+        //
+        //     paged continuation: recurrent slot 0 is at position 165,
+        //     this fire starts at 160
+        //
+        // so the whole session is dropped and reuse measures 0% (docs §18).
+        // Submitting one fire at a time and taking before submitting the next
+        // makes the fold and `kv_len` agree by construction. Measured cost of
+        // sequential decode on this model: 0.4% (91.0 → 90.6 tok/s), which is
+        // nothing against the ~3× that KV reuse is worth on an agent loop.
+        //
+        // NOT written as repeated `run_ahead(.., 1, ..)`: `run_ahead` closes
+        // the pipeline as soon as its budget is spent, so that shape submits
+        // into a closed pipeline and HANGS rather than erroring.
+        if !state.rs.is_empty() {
+            let mut written = 1u32; // the fire below writes g0 at position n
+            let mut err: Option<String> = None;
+            for _ in 0..budget {
+                if let Err(e) = submit_frame(&pipe, &[Some(&fwd)]) {
+                    err = Some(e);
+                    break;
+                }
+                let t = match out.take_host::<Vec<i32>>().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                };
+                // The fire executed, so this token is folded whether or not we
+                // surface it. Count it BEFORE the stop test, or KV would end a
+                // token short of the fold.
+                written += 1;
+                let token = *t.first().unwrap_or(&0) as u32;
+                if stop.contains(&token) {
+                    break;
+                }
+                generated.push(token);
+                if !on_token(token) || generated.len() >= max_tokens {
+                    break;
+                }
+            }
+            gen_error = err;
+
+            // The seal is the LAST FIRE ON THIS PIPELINE, not the first on a
+            // fresh one. `run_ahead` closes the pipeline it is handed, so the
+            // old external seal had to open its own — and a folded state has
+            // no identity there: binding it directly is refused, and `fork`
+            // mints a new sequence, which is refused differently. Sealing here
+            // sidesteps both, and is what a hand-written loop buys.
+            let mut end = n0 + n_suffix + written;
+            if gen_error.is_none() && !seal_tokens.is_empty() {
+                // If the model's own stop token is already the first byte of
+                // the turn suffix, appending the whole suffix would double it.
+                let last_written_is_seal_head = generated.len() as u32 + 1 < written;
+                let tail: &[u32] = if last_written_is_seal_head && seal_tokens.len() > 1 {
+                    &seal_tokens[1..]
+                } else if last_written_is_seal_head {
+                    &[]
+                } else {
+                    seal_tokens
+                };
+                if !tail.is_empty() {
+                    match seal_in_pipe::<W>(&pipe, &state.ws, &state.rs, end, tail).await {
+                        Ok(e2) => end = e2,
+                        Err(e) => gen_error = Some(e),
+                    }
+                }
+            }
+            pipe.close();
+            let hit_max = generated.len() >= params.max_tokens;
+            return Ok(Generation {
+                total_len: end,
+                state,
+                generated,
+                hit_max,
+                gen_error,
+                sealed: true,
+            });
+        }
+
         let result = run_ahead(&pipe, &fwd, budget, async || {
             let t = out.take_host::<Vec<i32>>().await?;
             let token = *t.first().unwrap_or(&0) as u32;
@@ -443,7 +538,80 @@ where
         generated,
         hit_max,
         gen_error,
+        sealed: false,
     })
+}
+
+/// Fold `tail` (the turn suffix, or what remains of it) into KV as one more
+/// fire ON AN ALREADY-OPEN PIPELINE.
+///
+/// This exists because the free-standing `seal` cannot work on a
+/// recurrent-state model: it opens a fresh `Pipeline`, and a folded state has
+/// no identity there. Binding it directly is refused with a poison epoch;
+/// forking it mints a new sequence and is refused as a continuation
+/// mismatch. Issuing the same fire before the generation pipeline closes has
+/// neither problem — and is only possible because the sequential loop, unlike
+/// `run_ahead`, does not close the pipeline out from under the caller.
+async fn seal_in_pipe<W>(
+    pipe: &Pipeline,
+    ws: &WorkingSet,
+    rs: &[RsWorkingSet],
+    at: u32,
+    tail: &[u32],
+) -> Result<u32>
+where
+    W: PassWit,
+    Pass<W>: BindState,
+{
+    let m = tail.len() as u32;
+    if m == 0 {
+        return Ok(at);
+    }
+    let page_t = kv_page_size();
+    let end = at + m;
+    let need = end.div_ceil(page_t);
+    let have = ws.page_len();
+    if need > have {
+        ws.reserve(need - have).context("seal reserve")?;
+    }
+    let pool = need.max(have);
+    let pool_ids: Vec<u32> = (0..pool).collect();
+
+    let toks_v: Vec<i32> = tail.iter().map(|&t| t as i32).collect();
+    let toks = Channel::from(toks_v).named("toks_z");
+    let embed_indptr = Channel::from([0u32, m]).named("embed_indptr_z");
+    let positions = Channel::from_iter(at..end).named("positions_z");
+    let w_slot = Channel::from((at..end).map(|p| p / page_t).collect::<Vec<u32>>()).named("w_slot_z");
+    let w_off = Channel::from((at..end).map(|p| p % page_t).collect::<Vec<u32>>()).named("w_off_z");
+    let klen = Channel::from([end]).named("klen_z");
+    let pages = Channel::from(pool_ids).named("pages_z");
+    let page_indptr = Channel::from([0u32, end.div_ceil(page_t)]).named("pidx_z");
+    let sink = Channel::new([1], dtype::i32).named("sink_z");
+
+    let fwd: Pass<W> = Pass::new();
+    fwd.embed(&toks, &embed_indptr)?;
+    fwd.bind_state(
+        ws,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (at / page_t)..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
+        rs,
+    )?;
+    fwd.epilogue(move || {
+        let tok = reduce_argmax(intrinsics::logits());
+        sink.put(&tok);
+    });
+    submit_frame(pipe, &[Some(&fwd)]).context("seal submit")?;
+    let _ = sink.take_host::<i32>().await.context("seal take")?;
+    Ok(end)
 }
 
 /// Append `seal_tokens` (the turn suffix `<|im_end|>\n`) to KV at position

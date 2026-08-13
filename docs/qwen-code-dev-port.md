@@ -941,3 +941,49 @@ that stops at `"length"` after a handful of tokens is nonsense on its face —
 `"length"` means the budget was hit. That shape also survives the `'…'`
 placeholder check, since one *real* token is not the placeholder. Assertion
 shape suggested by the opencode session.
+
+## 21. Sequential hybrid decode + in-pipeline seal (2026-08-12) — built, hybrid unverified
+
+Implements the fix §18 called for. Three changes, all confined to the
+recurrent-state path; the attention path is untouched and still uses
+`run_ahead`.
+
+1. **Sequential decode when `state.rs` is non-empty.** `submit_frame` one
+   fire, take it, then submit the next — no window, so no fire executes past
+   the stop token and nothing is folded that the turn rejected. Written as a
+   hand loop rather than repeated `run_ahead(.., 1, ..)`, which would submit
+   into a closed pipeline and **hang**: `run_ahead` closes as soon as its
+   budget is spent.
+2. **`written` counted before the stop test**, not after. The fire that
+   produces a stop token has already folded it, so KV must record it too or
+   it ends a token short of the fold. This is the semantic change: on the
+   hybrid path the retained context now contains the model's own stop token
+   instead of excluding it and re-adding it in the seal.
+3. **The seal is the last fire on the generation pipeline**, via
+   `seal_in_pipe`. The free-standing `seal` cannot work here at all — it
+   opens a fresh `Pipeline`, and a fold has no identity there: binding it
+   directly is refused with a poison epoch, forking it mints a new sequence
+   and is refused as a continuation mismatch. Only a hand-written loop makes
+   this possible, since `run_ahead` closes the pipeline out from under the
+   caller. If the model's stop token is already the first token of the turn
+   suffix, the seal appends only the remainder rather than doubling it.
+
+That the seal moves onto the generation pipeline came from the
+`liu/opencode-integration` session's framing ("the fold never leaves its
+process") — which they subsequently corrected, since it removes the
+persistence half of the problem but not the pipeline-binding half. The
+correction is right and the derived design still holds: it is the *hand
+loop*, not the process lifetime, that makes an in-pipeline seal possible.
+
+**Verified:** builds clean, 37 native tests, and the attention path is
+unregressed — acceptance 33/1 on the dense 0.6B (the 1 being §17's
+`copy_kv` limit, unrelated) with renderer parity still 23 exact / 0
+known-div / 0 mismatched.
+
+**NOT verified: the hybrid path itself.** The Metal guard prices the 35B at
+22.55 GiB + a flat 2 GiB margin against 21.5 GiB reclaimable — another
+session holds a ~3 GiB `pie serve` and lowering `max_model_len` cannot
+recover it, since the weights alone are 18.16 GiB. So **KV reuse on Qwen3.6
+remains 0% as measured**, and this is a candidate fix exactly like
+`a07637621` was — which failed. It should not be described as fixed until a
+turn retains and a later turn reports `cached_tokens > 0`.

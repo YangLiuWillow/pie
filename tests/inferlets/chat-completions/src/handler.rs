@@ -331,6 +331,10 @@ impl Daemon {
                 &prefill,
                 &params,
                 &stop_ids,
+                // On a recurrent-state model the turn suffix is folded in as
+                // the last fire of this same pipeline; the free-standing
+                // `seal` cannot bind a fold into a fresh one.
+                self.renderer.seal_tokens(),
                 || {
                     // One keepalive per committed prefill chunk (empty delta
                     // — resets the client's 240 s idle watchdog through the
@@ -397,7 +401,8 @@ impl Daemon {
             .await
         };
 
-        let Generation { mut state, total_len, generated, hit_max, gen_error } = match gen_result {
+        let Generation { mut state, total_len, generated, hit_max, gen_error, sealed } =
+            match gen_result {
             Ok(g) => g,
             Err(e) => degrade!(format!("generation setup failed: {e}")),
         };
@@ -531,7 +536,15 @@ impl Daemon {
         // closes, and the retained set must already exist for the resume to
         // hit. Failures are non-fatal (the next request pays a full rebuild).
         let save_debug = if gen_error.is_none() {
-            match generation::seal(&mut state, total_len, self.renderer.seal_tokens()).await {
+            // On a recurrent-state model the suffix was already folded in as
+            // the last fire of the generation pipeline (`sealed`), because a
+            // fold cannot be bound into a fresh one.
+            let sealed_result = if sealed {
+                Ok(total_len)
+            } else {
+                generation::seal(&mut state, total_len, self.renderer.seal_tokens()).await
+            };
+            match sealed_result {
                 Ok(total_final) => {
                     let mut canons = session::canon_messages(&setup.messages);
                     if !final_content.is_empty() {
