@@ -229,3 +229,70 @@ python3 integrations/opencode/profile_prefill.py \
   --base-url http://127.0.0.1:8080 --label pie --model coder30b \
   --repeat 2 --words 400,1200,2400,3600,4800
 ```
+
+---
+
+# B-2 (in-place context editing): design settled, one driver gate open
+
+*2026-08-12. Foundation built and tested; engine plumbing gated on a driver
+capability that must be verified before it can be trusted.*
+
+## The design, and why it is masking
+
+**Mask, do not delete.** `WorkingSet::discard` removes whole pages, but RoPE is
+baked into K *at write time*, so the surviving tail still encodes its original
+absolute positions. Renumbering densely breaks every relative distance against
+that tail. Leaving a positional gap instead is rejected by the driver, which
+requires `position_id < seqlen` — "position is outside its request KV extent"
+(`batch/forward.cpp`). Masking changes neither the KV extent nor any position,
+so both constraints hold trivially.
+
+**The cost is affordable only because of the session design.** A dense mask is
+`[lanes, kv_len]` bools per fire. On a resumed turn the fire spans the *delta*
+(~190 tokens on our bench), not the history, and lanes=1 — so the mask is
+kilobytes. A cold turn has nothing stale to mask and never pays it. The slot
+itself is pre-allocated at `max_forward_tokens × total_pages × kv_page_size`,
+which is **128 MB** at our config.
+
+**It is opt-in per request** (`pie_context_policy`). A server that silently
+stops attending to tokens the client sent is serving a different context than it
+was given — the same silent-divergence class as every other bug found this
+session. The wire stays full-history; this is one additive field, not the delta
+wire.
+
+## What is built and tested
+
+`pie-openai-serving::context_policy` — `SpanKind`/`Span`, the `ContextPolicy`
+wire type, and `spans_to_mask`, with 6 tests covering: absent policy is a no-op,
+newest-N retention, **never masking system/user/assistant turns**, a minimum
+span size, spans past the retained length being unmaskable, and keep-more-than-
+exist. 70 native tests green.
+
+## The open gate
+
+`runtime/engine/tests/inferlets/ptir-prefill-e2e` exists as a **reproducer for a
+driver-level gap** in exactly this mechanism:
+
+> The device-geometry AttnMask dense-pack computes `lanes = qo_indptr.size() - 1`
+> = number of SEQUENCES and packs ONE mask row per lane. It is DECODE-SHAPED: it
+> cannot express an `[N_query, KV]` prefill mask (a single sequence with N query
+> rows collapses to lanes=1 + a garbled stride).
+> ⇒ Variable-length prompt prefill on the ptir path is UNBUILT at the driver level.
+
+Metal uses the same convention — "byte per lane, 0/1 — the dense `[lanes,
+stride]` convention" (`pipeline/descriptor_resolve.hpp:115`).
+
+For B-2 the lanes=1 collapse is **not itself a problem**: every query token
+wants the *same* mask, so one row per lane is the shape we want. What is unknown
+is whether the stride is handled correctly on Metal today — the note is dated
+2026-07-09, describes the CUDA `executor.cpp`, and says the result was
+incoherent output rather than an error.
+
+**Do not build on this until the reproducer is run on Metal.** A mask that is
+silently mis-strided produces fluent, wrong output — the failure mode this whole
+integration is built to avoid, and one that no test here would catch.
+
+Second constraint, from `pipeline/fire/geometry.rs:36-39`: a mask-carrying fire
+is **kept solo by the scheduler**. Harmless for our single-row workload;
+disqualifying for batching under multi-tenancy, which is worth knowing before
+B-2 is proposed as a multi-tenant win.

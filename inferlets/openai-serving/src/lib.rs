@@ -29,6 +29,7 @@
 //! acceptance, 99.7% local KV reuse), adjusted for the opencode wire
 //! hazards catalogued in `tests/inferlets/fixtures/opencode/AUDIT.md`.
 
+pub mod context_policy;
 pub mod digest;
 pub mod error;
 pub mod filter;
@@ -38,6 +39,7 @@ pub mod session;
 pub mod streaming;
 pub mod types;
 
+pub use context_policy::{ContextPolicy, Span, SpanKind, spans_to_mask};
 pub use digest::{TEMPLATE_MARKER, TokenDigest, prefix_addresses};
 pub use filter::{
     VisibleFilter, answer_after_reasoning, cut_leading_reasoning, sanitize_messages,

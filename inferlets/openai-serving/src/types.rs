@@ -12,6 +12,12 @@ use serde_json::Value;
 
 #[derive(Deserialize, Debug)]
 pub struct ChatCompletionRequest {
+    /// B-2 opt-in: server-side context editing for this request. Absent means
+    /// the server attends to everything the client sent, which is the only
+    /// safe default — see `context_policy`.
+    #[serde(default)]
+    pub pie_context_policy: Option<crate::context_policy::ContextPolicy>,
+
     /// Informational — the runtime picks the first available model.
     #[serde(default)]
     pub model: Option<String>,
