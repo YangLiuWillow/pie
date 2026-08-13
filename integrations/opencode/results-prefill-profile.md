@@ -296,3 +296,82 @@ Second constraint, from `pipeline/fire/geometry.rs:36-39`: a mask-carrying fire
 is **kept solo by the scheduler**. Harmless for our single-row workload;
 disqualifying for batching under multi-tenancy, which is worth knowing before
 B-2 is proposed as a multi-tenant win.
+
+---
+
+# Where the remaining speed is — evidence, and one tested dead end
+
+## The decomposition that matters
+
+| | pie | vLLM-metal | gap |
+|---|---:|---:|---|
+| steady-state **decode** | 46.4 tok/s | 52.0 tok/s | **1.12× — parity** |
+| **prefill** | 297 tok/s | 1214 tok/s | **4.1×** |
+
+Same weights, same 4-bit checkpoint, same unified memory, same box. Decode at
+batch-1 is bandwidth-bound — you stream the whole model per token — and pie is
+at parity there, so weight loading, dequantization, KV reads and the general
+plumbing are all fine. Prefill is compute-bound, and that is where 4× goes
+missing. **The deficit is specifically in the large-M path.**
+
+And it is **not** the mixture: a 0.6B **dense** model shows the same 4.3× gap.
+No routing, no expert GEMM, no long context — and still 4× behind.
+
+## The hypothesis this supports
+
+`driver/metal/src/device_tuning.hpp` is a decode-tuned table. Its constants are
+framed in decode units throughout — crossovers "in rows per request", tok/s "at
+eight lanes", "keeps a fleet of decodes on the per-row kernel" — and nothing in
+it cites a prefill sweep. `qmm_min_batch = 8`,
+`sdpa_tile_min_rows_per_request = 32`, `moe_tile_wide_per = 1 << 24`.
+
+OpenHands found exactly this shape on CUDA and got ~2× from prefill-specific
+tile work (12.0k → 24.1k tok/s), where the default turned out to be a decode-
+shaped 128×16 tile.
+
+## Tested and dead: the 64-row MoE tile
+
+`moe_tile_wide_per = 1 << 24` hard-disables the wide MoE row tile, and OpenHands'
+CUDA lever was "chunk 2048 + **64-row tiles**", so this looked like the same bug.
+Swept `PIE_METAL_MOE_TILE_WIDE_PER=64` on the Coder-30B:
+
+| prompt | default | wide=64 |
+|---:|---:|---:|
+| 1309 | 1.824 s | 1.911 s |
+| 2557 | 4.599 s | 4.739 s |
+| 3805 | 8.327 s | 8.433 s |
+| 5053 | 18.417 s | 13.371 s |
+
+**Inconclusive, trending negative.** The first three points are 2–5% worse; the
+apparent win at 5053 is the point that has been noisy in every run this session
+(18.41 s and 15.81 s measured for *identical* configs). Not a win, and consistent
+with the chunk-size lever also failing to transfer from CUDA.
+
+This is also the second CUDA lever that did not carry over, which is itself
+information: Metal's gap is not the same gap CUDA had.
+
+## Where to look next, in priority order
+
+1. **Microbenchmark pie's quantized GEMM against MLX's, at prefill shapes.**
+   This is the decisive experiment and nobody has run it. vLLM-metal *is* MLX, so
+   "why is pie 4× slower than MLX on the same weights and hardware" is directly
+   answerable by timing `quantized_matmul` at M=2048 against pie's kernel at the
+   same shape. If MLX wins by 4× there, the answer is the kernel and the fix is
+   to match its tiling or adopt it. If they tie, the gap is dispatch/layout/
+   staging and the microbenchmark says so. Either outcome ends the guessing.
+2. **Use the 0.6B dense model as the optimization target**, not the 30B. It shows
+   the same 4.3×, boots in seconds, and removes routing, expert GEMMs and long
+   context from the picture entirely.
+3. **Sweep the dense-GEMM and attention knobs in the prefill regime**, since the
+   table was built for decode: `PIE_METAL_QMM_BN_CROSSOVER_TG` (the BN=16→32 tile
+   crossover, default 160), `PIE_METAL_SDPA_TILE_MIN_ROWS` (32),
+   `PIE_METAL_SDPA_MMA`, `PIE_METAL_FP16_QMM`. All are env vars — no rebuild.
+
+## What is NOT worth more effort
+
+- **Per-call overhead** — pie already wins it (~0 ms vs vLLM's ~117 ms).
+- **Chunk size** — swept; ~18% at mid lengths, converges.
+- **MoE tiles** — swept; see above.
+- **Config sizing** — done, and it was worth 1.73×.
+- **Anything in this integration.** Session KV reuse took pie 6.6× faster than
+  itself and moved the vLLM gap from 6.4× to 4.1×. The rest is not here.
