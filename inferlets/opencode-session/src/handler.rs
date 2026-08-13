@@ -42,6 +42,7 @@ use crate::engine::{self, GenConfig, SessionState};
 use crate::turn::TurnState;
 use crate::wire::{Envelope, Sink, recover_req_id, send_error};
 
+use inferlet::ptir::attention::prelude::kv_page_size;
 use inferlet::{chat, model, runtime, tools};
 use pie_openai_serving::error::{INVALID_REQUEST_ERROR, SERVER_ERROR, parse_request};
 use pie_openai_serving::streaming::ChunkMeta;
@@ -95,6 +96,50 @@ impl Retained {
     /// Tokens of KV this branch pins.
     fn tip(&self) -> u32 {
         self.boundaries.last().map(|(l, _)| *l).unwrap_or(0)
+    }
+
+    /// Structural self-check, run before this branch is trusted for a resume.
+    ///
+    /// ## What this catches that the address cannot
+    ///
+    /// The content address already makes a false hit near-impossible: a hit
+    /// means `hash(model ‖ template ‖ full[..L])` matched AND the recorded
+    /// length equals `L`, so the tokens agree by construction. What it cannot
+    /// see is the *state* drifting away from what we recorded about it — a
+    /// working set that came back smaller than its bookkeeping claims, a
+    /// boundary list that stopped being ordered, a tip that disagrees with the
+    /// last entry. Those are engine/driver-side failures, and the address is
+    /// blind to all of them because it only describes tokens.
+    ///
+    /// This is the cheap half of OpenHands' `kv_verify`, which asserts
+    /// `ctx.seq_len() == full_tokens.len()` and **errors rather than silently
+    /// rebuilding**. Their `seq_len()` has no equivalent here — a `WorkingSet`
+    /// reports pages, not tokens — so the check is page-granular: the pages
+    /// must be able to *hold* the tokens claimed. Weaker, but it still fails
+    /// loudly on a truncated or mis-sized set instead of serving from it.
+    ///
+    /// Returns `Err(reason)` when the branch must not be resumed.
+    fn verify(&self, page_t: u32) -> Result<(), String> {
+        if self.boundaries.is_empty() {
+            return Err("no boundaries".to_string());
+        }
+        let mut prev = 0u32;
+        for (len, _) in &self.boundaries {
+            if *len <= prev {
+                return Err(format!("boundaries not strictly ascending at {len} (prev {prev})"));
+            }
+            prev = *len;
+        }
+        let tip = self.tip();
+        let pages = self.state.ws.page_len();
+        let capacity = pages.saturating_mul(page_t);
+        if capacity < tip {
+            return Err(format!(
+                "working set holds {pages} pages ({capacity} tokens) but the branch \
+                 claims {tip} — state is smaller than its bookkeeping"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -291,6 +336,7 @@ impl Daemon {
         // candidate: resuming there would leave an empty delta, and re-rendering
         // one trailing unit is cheaper than a special case for it.
         const MAX_ATTEMPTS: usize = 8;
+        let page_t = kv_page_size();
         let mut resume_at: Option<(usize, u32)> = None; // (branch index, boundary)
         for (b, addr) in addressed.iter().rev().skip(1).take(MAX_ATTEMPTS) {
             if let Some(i) = self
@@ -298,6 +344,21 @@ impl Daemon {
                 .iter()
                 .position(|r| r.boundaries.iter().any(|(l, a)| l == b && a == addr))
             {
+                // kv_verify: a matching address is necessary but not
+                // sufficient. Refuse the resume and drop the branch rather than
+                // serving from a state that disagrees with its own bookkeeping;
+                // a rebuild is slow, a wrong prefix is silent.
+                if let Err(why) = self.sessions[i].verify(page_t) {
+                    eprint!(
+                        "{}",
+                        format!(
+                            "[opencode-session] kv_verify REFUSED a resume at boundary {b}: \
+                             {why}; dropping the branch and rebuilding\n"
+                        )
+                    );
+                    self.sessions.remove(i);
+                    continue;
+                }
                 resume_at = Some((i, *b));
                 break;
             }
@@ -507,7 +568,14 @@ impl Daemon {
         }
         let total = run.total_len;
         boundaries.push((total, address.clone()));
-        self.sessions.push(Retained { state: run.state, boundaries });
+        let candidate = Retained { state: run.state, boundaries };
+        // kv_verify on the way IN as well as on the way out: a state that fails
+        // its own invariants must never enter the map, or the next turn pays
+        // the lookup only to refuse it.
+        if let Err(why) = candidate.verify(kv_page_size()) {
+            return format!("not retained (kv_verify: {why})");
+        }
+        self.sessions.push(candidate);
 
         // Evict oldest-first until BOTH bounds hold. The token budget is the
         // one that matters; the count is a backstop for pathological cases
