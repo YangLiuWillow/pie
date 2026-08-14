@@ -99,7 +99,13 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // here would leave the grid describing a kernel other than the one that
     // runs -- wrong numbers, not a crash.
     if (sdpa_mma() && sdpa_mma_head_dim_supported(g.head_dim, /*with_sink=*/false)) {
-        const std::string mma_name = "sdpa_paged_mma_bfloat16" + d;
+        // `_p32` swaps two runtime integer divisions per staged element for a
+        // shift and a mask -- 7.52 -> 6.88 ms/layer at 184 rows / 7424 ctx.
+        // The test is exact equality, matching `paged_name` above: page size
+        // is an unvalidated operator setting, so anything inferential here
+        // would read the wrong slot rather than fail.
+        const std::string mma_name =
+            "sdpa_paged_mma_bfloat16" + d + (g.kv_page_size == 32 ? "_p32" : "");
         std::string compile_error;
         out.sdpa_paged_mma = ctx.compile_pso_from_file(
             dir + "sdpa_paged_mma.metal", mma_name.c_str(), &compile_error);

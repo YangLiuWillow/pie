@@ -34,7 +34,10 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
     const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
     const std::string sink_tiled_name = "sdpa_paged_tiled_sink_bfloat16" + d;
-    const std::string sink_mma_name = "sdpa_paged_mma_sink_bfloat16" + d;
+    // See llama/kernels.cpp: `_p32` is the shifted page addressing, chosen on
+    // exact equality because nothing validates kv_page_size as a power of two.
+    const std::string sink_mma_name =
+        "sdpa_paged_mma_sink_bfloat16" + d + (g.kv_page_size == 32 ? "_p32" : "");
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {

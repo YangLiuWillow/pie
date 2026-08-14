@@ -69,7 +69,28 @@ using namespace metal;
 
 #include "sdpa_online.h"
 
-template <typename T, int D, int KT, bool WITH_SINK>
+#if PIE_SDPA_F32ACC
+// One 8x8 fragment as this lane holds it: two floats, at (fm, fn) and
+// (fm, fn+1). MLX's `BaseMMAFrag` keeps fragments in exactly this form and
+// materializes a `simdgroup_matrix` only for the instant of the multiply --
+// which is the half of the experiment that is NOT the accumulator type. The
+// shipped path keeps live `simdgroup_matrix` objects across the whole loop,
+// and that is the candidate explanation for why pie measured a 16-deep
+// accumulation chain as 36% SLOWER while MLX runs one and wins.
+typedef vec<float, 2> frag2;
+
+inline void mma_f32(thread frag2& d, const thread frag2& a, const thread frag2& b,
+                    const thread frag2& c) {
+    simdgroup_matrix<float, 8, 8> dm, am, bm, cm;
+    reinterpret_cast<thread frag2&>(am.thread_elements()) = a;
+    reinterpret_cast<thread frag2&>(bm.thread_elements()) = b;
+    reinterpret_cast<thread frag2&>(cm.thread_elements()) = c;
+    simdgroup_multiply_accumulate(dm, am, bm, cm);
+    d = reinterpret_cast<thread frag2&>(dm.thread_elements());
+}
+#endif
+
+template <typename T, int D, int KT, bool WITH_SINK, int PAGE_SIZE>
 [[kernel]] [[max_total_threads_per_threadgroup(128)]] void sdpa_paged_mma(
     const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
     const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
@@ -142,10 +163,19 @@ template <typename T, int D, int KT, bool WITH_SINK>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+#if !PIE_SDPA_F32ACC
   simdgroup_matrix<half, 8, 8> Qf[DF];
   for (int i = 0; i < DF; i++) {
     simdgroup_load(Qf[i], qtile, D, ulong2(uint(i * 8), uint(simd_gid) * RPS), false);
   }
+#else
+  // Q is deliberately NOT hoisted here. Sixteen fp32 fragments would be 32
+  // live registers a lane before anything else, and register pressure is the
+  // very thing this experiment is testing; MLX reloads Q from threadgroup
+  // memory inside the multiply loop for the same reason. The row this lane
+  // owns is fixed, so the reload is a threadgroup read at a known offset.
+  const int q_row_base = (int(simd_gid) * RPS + int(fm)) * D + int(fn);
+#endif
 
   // Per-row bounds. Every one of these is read for THIS lane's row only, which
   // is what makes them cheap: a scalar load, not a broadcast.
@@ -184,13 +214,66 @@ template <typename T, int D, int KT, bool WITH_SINK>
       // Before the writes as well as after: the previous pass's multiplies must
       // be done with the tile this one overwrites.
       threadgroup_barrier(mem_flags::mem_threadgroup);
+      // PROBE-ONLY. `sdpa_nostage_mma.metal` drops the staging entirely and
+      // keeps the barriers, so the MMAs below run on whatever is already in
+      // threadgroup memory: numerically meaningless, timing-valid. Paired with
+      // `sdpa_nomath_mma.metal`, which keeps this loop and drops the MMAs, it
+      // splits the kernel into "move the keys" and "multiply them".
+#if PIE_SDPA_NO_STAGE
+      // ONE write per thread instead of KT*D/128 = 16. Not decoration: with
+      // nothing writing these tiles ANYWHERE in the program, the compiler can
+      // prove the loads below are loop-invariant and hoist them clean out of
+      // the key loop -- barriers order accesses, they do not manufacture a
+      // dependency that does not exist. The first version of this ablation did
+      // exactly that and priced the multiply at 3.38 ms, which works out to
+      // 6.9 TFLOP/s against a simdgroup ceiling of 5.2 measured directly. A
+      // kernel cannot beat its own unit; that impossibility is what caught it.
+      ktile[lid] = half(float(base & 7));
+      vtile[lid] = half(float(base & 7));
+#else
       for (uint e = lid; e < uint(KT * D); e += 128u) {
         const int kk = int(e) / D;
         const int d  = int(e) - kk * D;
         if (kk < cnt) {
           const int kp = base + kk;
-          const int page = int(kv_page_indices[page_base + kp / page_size]);
-          const size_t slot = size_t(page) * page_size + size_t(kp % page_size);
+#if PIE_SDPA_CONTIG_KV
+          // PROBE-ONLY TWIN. `tools/rawmetal/kernels/sdpa_contig_mma.metal`
+          // defines this and includes this file, giving a kernel identical in
+          // every respect except that the KV is addressed as one contiguous
+          // [key][kv_head][D] run instead of walked through the page table.
+          // That is the whole A/B: it prices the ADDRESSING, holding the tile
+          // shape, the staging, the fragment layout and the memory actually
+          // touched fixed. Never defined in a driver build -- an undefined
+          // identifier is 0 here, so the shipped path is the `#else`.
+          const size_t slot = size_t(kp);
+#else
+          // `page_size` is a runtime `constant int&`, so the generic form below
+          // issues two REAL integer divisions for every element staged -- and
+          // this loop stages KT*D of them per pass. Measured, at 184 rows and
+          // 7424 context: 7.52 ms/layer generic against 6.88 specialized, so
+          // the divides alone are 8.9% of the kernel.
+          //
+          // The specialization is keyed on an EXACT PAGE_SIZE, never on "is a
+          // power of two", and that is not fussiness. Nothing in this repo
+          // constrains kv_page_size: it is an operator-set TOML field
+          // (`worker/src/config.rs`, `context.cpp` BatchingConfig), both
+          // defaults are 32, and every check on it anywhere is `> 0`. A shift
+          // inferred from a pow2 assumption would be silently wrong the first
+          // time someone writes 24. `sdpa_paged.metal` reached the same
+          // conclusion and this mirrors its form deliberately.
+          int page_ix;
+          int page_off;
+          if constexpr (PAGE_SIZE == 32) {
+            page_ix = kp >> 5;
+            page_off = kp & 31;
+          } else {
+            page_ix = kp / page_size;
+            page_off = kp % page_size;
+          }
+          const int page = int(kv_page_indices[page_base + page_ix]);
+          const int stride = PAGE_SIZE == 0 ? page_size : PAGE_SIZE;
+          const size_t slot = size_t(page) * stride + page_off;
+#endif
           const size_t off = (slot * n_kv_heads + kv_head) * D + d;
           ktile[d * KT + kk] = half(float(k_pages[off]));
           vtile[e] = half(float(v_pages[off]));
@@ -202,8 +285,113 @@ template <typename T, int D, int KT, bool WITH_SINK>
           vtile[e] = half(0);
         }
       }
+#endif  // PIE_SDPA_NO_STAGE
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
+#if PIE_SDPA_NO_MATH
+      // PROBE-ONLY. Everything from here to the end of the pass is the
+      // multiply; this replaces it with the cheapest possible consumption of
+      // the staged tiles. It must CONSUME them, or the staging loop above is
+      // dead code and the compiler deletes the very thing being timed -- which
+      // would report "moving the keys is free" for the same reason a kernel
+      // ablation that matched nothing once reported that attention was free.
+      Ov[0] += float(ktile[lid]) + float(vtile[lid]);
+      sum_exp += 1.0f;
+#elif PIE_SDPA_F32ACC
+      // ── MLX's arithmetic, on pie's tile. ──
+      //
+      // Same QT, same KT, same 4 simdgroups, same fragment coordinates. Three
+      // things change, and they are one change: the accumulators are fp32, so
+      // the DCH chunking that existed to bound half-rounding is GONE and the
+      // QK loop is a single unbroken chain of DF matmads; and fragments live as
+      // pairs of floats rather than as `simdgroup_matrix` objects.
+      //
+      // Everything else -- the mask, the -inf convention, the shuffle-xor row
+      // reductions, `fast::exp`, the scale riding q at staging -- is left
+      // exactly as the shipped kernel has it, so a difference in the number is
+      // this change and not five changes.
+      float sv[KF * 2];
+      {
+        frag2 S[KF];
+        for (int c = 0; c < KF; c++) S[c] = frag2(0.0f);
+        for (int i = 0; i < DF; i++) {
+          frag2 A;
+          A[0] = float(qtile[q_row_base + i * 8 + 0]);
+          A[1] = float(qtile[q_row_base + i * 8 + 1]);
+          for (int c = 0; c < KF; c++) {
+            frag2 B;
+            B[0] = float(ktile[(i * 8 + int(fm)) * KT + c * 8 + int(fn) + 0]);
+            B[1] = float(ktile[(i * 8 + int(fm)) * KT + c * 8 + int(fn) + 1]);
+            mma_f32(S[c], A, B, S[c]);
+          }
+        }
+        for (int c = 0; c < KF; c++) {
+          sv[c * 2 + 0] = S[c][0];
+          sv[c * 2 + 1] = S[c][1];
+        }
+      }
+
+      float lmax = NEG_INF;
+      for (int c = 0; c < KF; c++) {
+        for (int j = 0; j < 2; j++) {
+          const int kk = c * 8 + int(fn) + j;
+          bool keep = mine && kk < cnt;
+          if (keep) {
+            const int kp = base + kk;
+            keep = kp <= q_pos && kp >= my_start;
+            if (keep && masked) {
+              keep = !(uint(kp) >= attention_mask_stride ||
+                       attention_mask[size_t(my_row) * attention_mask_stride + uint(kp)] == 0);
+            }
+          }
+          const float s = keep ? sv[c * 2 + j] : NEG_INF;
+          sv[c * 2 + j] = s;
+          lmax = s > lmax ? s : lmax;
+        }
+      }
+      lmax = max(lmax, simd_shuffle_xor(lmax, 1u));
+      lmax = max(lmax, simd_shuffle_xor(lmax, 8u));
+
+      const float new_max = max(max_score, lmax);
+      const float factor = max_score == NEG_INF ? 0.0f : fast::exp(max_score - new_max);
+      float lsum = 0.0f;
+      float pv[KF * 2];
+      for (int c = 0; c < KF; c++) {
+        for (int j = 0; j < 2; j++) {
+          const float p = sv[c * 2 + j] == NEG_INF ? 0.0f : fast::exp(sv[c * 2 + j] - new_max);
+          pv[c * 2 + j] = p;
+          lsum += p;
+        }
+      }
+      lsum += simd_shuffle_xor(lsum, 1u);
+      lsum += simd_shuffle_xor(lsum, 8u);
+
+      max_score = new_max;
+      sum_exp = sum_exp * factor + lsum;
+      for (int i = 0; i < DF * 2; i++) Ov[i] *= factor;
+
+      // O += P V, accumulating STRAIGHT INTO Ov. The shipped path needs a
+      // separate `PV[DF]` of half fragments because a half accumulator cannot
+      // hold a whole sequence; an fp32 accumulator can, so the extra array and
+      // the extra add per fragment both disappear. This is also 32 fewer live
+      // registers a lane, which matters for the hypothesis under test.
+      for (int c = 0; c < KF; c++) {
+        frag2 P;
+        P[0] = pv[c * 2 + 0];
+        P[1] = pv[c * 2 + 1];
+        for (int n = 0; n < DF; n++) {
+          frag2 Bv;
+          Bv[0] = float(vtile[(c * 8 + int(fm)) * D + n * 8 + int(fn) + 0]);
+          Bv[1] = float(vtile[(c * 8 + int(fm)) * D + n * 8 + int(fn) + 1]);
+          frag2 O;
+          O[0] = Ov[n * 2 + 0];
+          O[1] = Ov[n * 2 + 1];
+          mma_f32(O, P, Bv, O);
+          Ov[n * 2 + 0] = O[0];
+          Ov[n * 2 + 1] = O[1];
+        }
+      }
+#else
       // ── S = (q·scale) Kᵀ ──
       //
       // Chunked at DCH fragments, and that is a PRECISION bound rather than a
@@ -339,6 +527,7 @@ template <typename T, int D, int KT, bool WITH_SINK>
         Ov[n * 2 + 0] += float(e[0]);
         Ov[n * 2 + 1] += float(e[1]);
       }
+#endif  // PIE_SDPA_NO_MATH
     }
     sub = sub_hi;
   }
@@ -358,9 +547,13 @@ template <typename T, int D, int KT, bool WITH_SINK>
   }
 }
 
-#define instantiate_sdpa_paged_mma(sfx, name, itype, d, kt, sink)            \
-  template [[host_name("sdpa_paged_mma" sfx "_" #name "_d_" #d)]]            \
-  [[kernel]] void sdpa_paged_mma<itype, d, kt, sink>(                        \
+// `ps` is the compile-time page size (0 = read it from the buffer) and `psfx`
+// the name suffix that goes with it, exactly as `sdpa_paged.metal` names its
+// `_p32`. The two must agree: a caller that appends `_p32` gets the shifted
+// addressing, and one that does not gets the divides.
+#define instantiate_sdpa_paged_mma(sfx, name, itype, d, kt, sink, ps, psfx)  \
+  template [[host_name("sdpa_paged_mma" sfx "_" #name "_d_" #d psfx)]]       \
+  [[kernel]] void sdpa_paged_mma<itype, d, kt, sink, ps>(                    \
       const device itype*, const device itype*, const device itype*,         \
       device itype*, const constant int&, const device int*,                 \
       const device int*, const device uint*, const device uint*,             \
@@ -384,11 +577,19 @@ template <typename T, int D, int KT, bool WITH_SINK>
 // `sdpa_mma_head_dim_supported` is the list, and it must agree with this file:
 // a width named there and not instantiated here fails to build a pipeline at
 // load, by name, which is the good outcome.
-instantiate_sdpa_paged_mma("", bfloat16, bfloat, 64, 16, false)      // llama / qwen d=64
-instantiate_sdpa_paged_mma("_sink", bfloat16, bfloat, 64, 16, true)  // gpt-oss
+//
+// Each width is instantiated TWICE: once generic, once specialized to page
+// size 32. Only the second is ever dispatched today -- both defaults are 32 --
+// but the generic one is what makes a differently-configured deployment run
+// correctly instead of quietly reading the wrong slot.
+instantiate_sdpa_paged_mma("", bfloat16, bfloat, 64, 16, false, 0, "")      // llama / qwen d=64
+instantiate_sdpa_paged_mma("", bfloat16, bfloat, 64, 16, false, 32, "_p32")
+instantiate_sdpa_paged_mma("_sink", bfloat16, bfloat, 64, 16, true, 0, "")  // gpt-oss
+instantiate_sdpa_paged_mma("_sink", bfloat16, bfloat, 64, 16, true, 32, "_p32")
 // llama, mistral, qwen2, qwen3 and the Qwen MoEs -- the width this driver's
 // dense families overwhelmingly use, and the one the prefill profile was taken
 // on. KT stays 16 rather than the 32 that also fits: 16 KB of threadgroup
 // memory leaves room for a second resident threadgroup where 24 KB does not,
 // and the deeper pass buys only half the staging barriers.
-instantiate_sdpa_paged_mma("", bfloat16, bfloat, 128, 16, false)
+instantiate_sdpa_paged_mma("", bfloat16, bfloat, 128, 16, false, 0, "")
+instantiate_sdpa_paged_mma("", bfloat16, bfloat, 128, 16, false, 32, "_p32")
