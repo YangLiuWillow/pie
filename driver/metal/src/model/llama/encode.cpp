@@ -27,6 +27,7 @@
 
 #include "../../model/qwen3_5/decode_dispatch.hpp"
 #include "../../model/qwen3_5/decode_dispatch_mb.hpp"
+#include "../../batch/decode_timing.hpp"
 #include "decode_consts.hpp"
 #include "scratch.hpp"
 
@@ -772,6 +773,19 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
     for (std::size_t i = begin; i < last; ++i) {
         const Dispatch& d = dag[i];
         if (d.kind == Kind::Argmax && !run_argmax) continue;
+        // Priced by ablation; see `kernel_ablated`. Same hook the qwen3_5 walks
+        // carry (`decode_step_mb.cpp:761`), and it was missing here — which
+        // meant `PIE_METAL_ABLATE` silently did NOTHING for every checkpoint the
+        // llama family serves, and that family is the one that covers
+        // `qwen3_moe` (`geometry.hpp`). A 184-row Qwen3-Coder-30B prefill
+        // ablated with any kind returned the baseline time to within 0.06% and
+        // printed no banner, which reads exactly like "this kernel is free".
+        //
+        // `pso_kind` because this walk's `Kind` is llama's own DAG node type and
+        // `kernel_ablated` takes the driver-wide `Kernel`; `pso_kind` is the
+        // same mapping the dispatch itself uses to pick a pipeline, so a kind
+        // ablated here is exactly the kind that would otherwise have run.
+        if (kernel_ablated(pso_kind(d.kind))) continue;
         const int m = d.kind == Kind::LmHead
                           ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
                                            : std::min(head_rows, rows < 1 ? 1 : rows))

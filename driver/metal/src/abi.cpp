@@ -1,5 +1,7 @@
 #include "context.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -107,12 +109,56 @@ extern "C" int32_t pie_metal_bind_instance(
     }
 }
 
+/// Why a frame was refused, when `pie_metal_launch` returns
+/// `PIE_STATUS_INVALID_ARGUMENT`.
+///
+/// `validate::frame_desc` answers with a bare status code and no indication of
+/// WHICH of its dozen checks failed, so a rejected frame surfaces to the guest
+/// as `direct launch rejected: pie_metal_launch failed with status -1` and
+/// nothing more. That is enough to know a descriptor is malformed and useless
+/// for knowing how -- which cost this investigation two wrong hypotheses
+/// (pool exhaustion, fire width) before anyone looked here.
+///
+/// Set `PIE_METAL_FRAME_DIAG=1` to have a refusal describe the frame it
+/// refused. Off by default: this runs on the launch path.
+static void diagnose_frame(const PieFrameDesc* f) {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_FRAME_DIAG");
+        return e != nullptr && *e != '\0' && !(e[0] == '0' && e[1] == '\0');
+    }();
+    if (!on || f == nullptr) return;
+    std::fprintf(stderr, "[frame-diag] REFUSED abi=%u roster=%zu steps=%zu "
+                 "kv_xlat=%zu kv_indptr=%zu reserved=(%u,%u)\n",
+                 unsigned(f->abi_version), std::size_t(f->instance_ids.len),
+                 std::size_t(f->steps.len), std::size_t(f->kv_translation.len),
+                 std::size_t(f->kv_translation_indptr.len),
+                 unsigned(f->reserved0), unsigned(f->reserved1));
+    // The roster, and whether it repeats -- the one check in `frame_desc` that
+    // a MULTI-LANE frame can trip while every single-lane frame passes.
+    std::fprintf(stderr, "[frame-diag]   instance_ids = [");
+    for (std::size_t i = 0; i < f->instance_ids.len && i < 32; ++i) {
+        std::fprintf(stderr, "%llu%s",
+                     (unsigned long long)f->instance_ids.ptr[i],
+                     i + 1 < f->instance_ids.len ? ", " : "");
+    }
+    std::fprintf(stderr, "]\n");
+    for (std::size_t i = 0; i < f->instance_ids.len; ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (f->instance_ids.ptr[i] == f->instance_ids.ptr[j]) {
+                std::fprintf(stderr, "[frame-diag]   DUPLICATE instance id %llu "
+                             "at slots %zu and %zu -- frame_desc rejects this\n",
+                             (unsigned long long)f->instance_ids.ptr[i], j, i);
+            }
+        }
+    }
+}
+
 extern "C" int32_t pie_metal_launch(
     PieDriver* driver,
     const PieFrameDesc* frame,
     PieCompletion completion) {
     const int status = pie::driver::validate::frame_desc(frame);
-    if (status != PIE_STATUS_OK) return status;
+    if (status != PIE_STATUS_OK) { diagnose_frame(frame); return status; }
     const int completion_status =
         pie::driver::validate::completion(completion, false);
     if (completion_status != PIE_STATUS_OK) return completion_status;

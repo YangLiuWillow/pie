@@ -16,6 +16,12 @@ endfunction()
 add_rawmetal_tool(rawmetal_harness harness_main.cpp harness.cpp)
 add_rawmetal_tool(rawmetal_microbench bench_kernels.cpp harness.cpp)
 add_rawmetal_tool(roofline_probe roofline_probe.cpp harness.cpp)
+# Prices pie's PAGED attention on its own, against MLX's contiguous SDPA on
+# the same shapes -- the comparison `harness.hpp` says bench_kernel exists for.
+add_rawmetal_tool(sdpa_paged_probe sdpa_paged_probe.cpp harness.cpp)
+# Prices the M5 neural accelerators against `simdgroup_matrix`, which is the
+# last unmeasured explanation for pie's attention gap against MLX.
+add_rawmetal_tool(matrix_rate_probe matrix_rate_probe.cpp harness.cpp)
 add_rawmetal_tool(q35contract_probe q35contract_probe.cpp)
 if(PIE_LOADER_STATICLIB)
   target_link_libraries(q35contract_probe PRIVATE ${PIE_LOADER_STATICLIB})
