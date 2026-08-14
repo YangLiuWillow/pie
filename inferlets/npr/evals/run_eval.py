@@ -138,6 +138,13 @@ async def one_run(url: str, identity: str, payload: dict, timeout: float) -> dic
 
 async def worker(name: int, queue: asyncio.Queue, args, out_lock, out_file, state):
     while True:
+        # Circuit breaker: a wedged/dead server makes every remaining run
+        # fail fast, silently voiding the sweep while looking busy (the
+        # first 720-run sweep burned 499 runs this way; a parallel session
+        # nearly published dead-server results as model scores). Stop
+        # pulling work once the consecutive-failure streak trips.
+        if state.get("tripped"):
+            return
         try:
             task = queue.get_nowait()
         except asyncio.QueueEmpty:
@@ -189,6 +196,25 @@ async def worker(name: int, queue: asyncio.Queue, args, out_lock, out_file, stat
             out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
             out_file.flush()
             state["done"] += 1
+            if record.get("error") is not None:
+                state["err_streak"] = state.get("err_streak", 0) + 1
+                if (
+                    args.abort_after > 0
+                    and state["err_streak"] >= args.abort_after
+                    and not state.get("tripped")
+                ):
+                    state["tripped"] = True
+                    print(
+                        f"[ABORT] {state['err_streak']} consecutive failed runs — "
+                        "the server is likely wedged or dead (check its log for "
+                        "'Insufficient Memory' / compute failures / warn-level "
+                        "rejections). Stopping the sweep; restart the server and "
+                        "re-run with --resume.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                state["err_streak"] = 0
             ok = record.get("answer") is not None and str(record["answer"]).strip() == str(
                 record["gold"]
             ).strip()
@@ -253,6 +279,37 @@ async def main_async(args) -> int:
                 for i in range(min(args.concurrency, total))
             ]
         )
+    if state.get("tripped"):
+        print(
+            f"[done-ABORTED] {state['done']}/{total} runs in "
+            f"{time.monotonic() - t0:.0f}s -> {out_path} (circuit breaker tripped)",
+            flush=True,
+        )
+        return 3
+
+    # End-of-sweep canary: liveness proved only at boot is worthless — a
+    # server that is up at t=0 and dead at t=60 produces a summary line
+    # identical to a healthy one. Prove it can still serve after the last
+    # real run before trusting the sweep.
+    try:
+        await one_run(
+            args.url,
+            args.identity,
+            {"max_plans": 0, "max_new_tokens": 8, "question": "canary: reply with any token"},
+            min(args.timeout, 120.0),
+        )
+        print("[canary] server alive and generating at sweep end", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[canary-FAILED] server did not complete a trivial run after the "
+            f"sweep: {type(e).__name__}: {e} — treat late results with "
+            "suspicion and check the server log.",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(f"[done] {total} runs in {time.monotonic() - t0:.0f}s -> {out_path}", flush=True)
+        return 4
+
     print(f"[done] {total} runs in {time.monotonic() - t0:.0f}s -> {out_path}", flush=True)
     return 0
 
@@ -271,6 +328,13 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=30000)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument(
+        "--abort-after",
+        type=int,
+        default=10,
+        help="stop the sweep after this many CONSECUTIVE failed runs (a wedged "
+        "server fails everything fast while looking busy; 0 disables)",
+    )
     ap.add_argument(
         "--prompt-cache",
         action="store_true",
