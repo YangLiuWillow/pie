@@ -110,6 +110,28 @@ require_quiet_gpu() {
         echo "──          A/B RATIOS will skew toward the memory-bound arm."
         ps -Ao pcpu,comm -r 2>/dev/null | awk 'NR>1 && $1 > 10 {printf "    %5.1f%%  %s\n", $1, $2}' | head -4
     fi
+    # MEMORY PRESSURE, which is the one that actually corrupted a result. On
+    # 2026-08-15 a recurring 14 GB python job cycled in the background: it sat
+    # at 17% CPU (under the bar above) and left free memory looking fine, but
+    # the compressor was doing millions of decompressions and the machine's
+    # read-only streaming roof fell from ~200 GB/s to 69.8. Compute was
+    # untouched -- `matrix_rate_probe` reproduced to 4% -- so every
+    # register-bound measurement looked healthy while every memory-bound one
+    # was inflated 1.3-2.2x. That asymmetry is what makes it dangerous: it does
+    # not break an A/B, it TILTS one.
+    #
+    # `roofline_probe` is the ground truth here; this is the cheap proxy.
+    local heavy
+    heavy=$(ps -Ao rss,comm -r 2>/dev/null |
+            awk 'NR>1 && $1 > 8388608 && $2 !~ /Claude/ {n++} END{print n+0}')
+    if [ "$heavy" -gt 0 ]; then
+        echo "FATAL: ${heavy} process(es) over 8 GB resident." >&2
+        ps -Ao rss,comm -r 2>/dev/null |
+            awk 'NR>1 && $1 > 8388608 {printf "       %.1f GB  %s\n", $1/1048576, $2}' >&2
+        echo "       Memory-bound timings will be inflated and A/B ratios will" >&2
+        echo "       tilt toward the memory-bound arm. Wait for it to finish." >&2
+        return 1
+    fi
     echo "── preflight OK"
     return 0
 }

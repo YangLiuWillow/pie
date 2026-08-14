@@ -215,7 +215,85 @@ peak. So 5.38 is a floor and the ratio is quoted against pie's achieved 6.9
 instead. See "the simdgroup arm" below — that discrepancy is not yet explained
 and it cuts both ways.
 
+## RESOLVED: the DRAM discrepancy was a cycling background job
+
+`~/boN/.venv/bin/python`, ~14 GB resident, restarting every few minutes. It sat
+at 17% CPU -- under the contention bar -- and left free memory looking fine, so
+both existing gates passed. The harm was MEMORY PRESSURE: the compressor showed
+612k pages stored and 65M decompressions, and `roofline_probe`'s read-only
+streaming roof fell to **69.8 GB/s** against the ~200 GB/s this machine reaches
+when quiet. Its whole-step figure also swung 15.4 -> 34.2 ms between
+back-to-back runs.
+
+The signature is diagnostic and worth recognizing again: **compute untouched,
+DRAM halved.** `matrix_rate_probe` (registers only) reproduced to within 4%
+while every memory-touching arm inflated 1.3-2.2x. That asymmetry does not
+break an A/B, it TILTS one -- toward whichever arm is more memory-bound, which
+is exactly how a 39/49 move/multiply split became 65/45.
+
+`require_quiet_gpu` now refuses outright on any non-GUI process over 8 GB
+resident. `roofline_probe` is the ground truth if the proxy is ever in doubt.
+
 ## STEP 3 — write a neural-accelerator attention kernel
+
+### The instruction swap alone is NOT enough, and the arithmetic says so
+
+In clean units the kernel is move 2.71 ms + multiply 3.38 ms = 6.87. NAX is 6.0x
+the simdgroup unit, so the multiply becomes ~0.56 ms. Leaving the staging alone:
+
+    2.71 + 0.56 = 3.27 ms  against MLX's 1.31  -->  still 2.5x behind
+
+So a kernel that only changes the instruction is not worth writing. The staging
+has to shrink with it.
+
+### The staging is bandwidth-bound, and only BQ moves it
+
+Every threadgroup stages the WHOLE context. At QT=32 that is
+`32 heads x 6 row-tiles = 192` threadgroups, each streaming
+`7424 x 128 x 2 tensors x 2 bytes = 3.8 MB`: **730 MB per layer**, which at
+2.71 ms is ~269 GB/s. The real KV is only 15 MB; the rest is re-reads
+(each kv head is read by 8 q heads x 6 tiles = 48 times) that mostly hit cache.
+
+Two separate quantities, and confusing them is how `KT 16 -> 32` died:
+
+    staged BYTES   proportional to 1/BQ           -- independent of BK entirely
+    staged PASSES  proportional to 1/(BQ x BK)    -- barriers and loop overhead
+
+`KT 16 -> 32` moved only the second and paid occupancy for it. That is why it
+lost 60%, and why it says nothing about BQ.
+
+### The instruction change FORCES the tile change. They are one change.
+
+NAX's fragment is **16x16**, not 8x8. With 4 simdgroups, `TQ = BQ / (4 x 16)`,
+and the kernel requires `TQ == 1` -- so **BQ = 64 is forced**. That is exactly
+the change that halves staged bytes. This is not a coincidence to exploit
+later; it is why every one of MLX's NAX attention configs is `bq64`, and why
+its 8x8 config is `bq32` (pie's shape).
+
+Target: **BQ = 64, BK = 32 or 64**, giving roughly
+
+    staging ~1.35 ms + multiply ~0.56 ms = ~1.9 ms   against MLX's 1.31
+
+with the residual most likely in pass overhead. Close enough to be worth
+building; not close enough to promise parity.
+
+### The enabling trick, taken from MLX
+
+`steel_attention.h` aliases K and V onto the SAME threadgroup buffer --
+`Ks = KV_smem; Vs = KV_smem` -- because V is not needed until after S is
+computed and masked. That is what lets BK reach 64 at D=128 at all.
+
+### OPEN before writing a line: the threadgroup memory budget
+
+pie's kernel assumes "the 32 KB a threadgroup gets". **That number is a comment;
+nothing in this driver ever queries the device.** At BQ=64, BK=64, D=128 with
+MLX's 16-byte padding the estimate is Q 17.4 KB + aliased KV 18.4 KB = 35.8 KB,
+which does not fit 32 KB -- yet MLX ships that configuration. So either this
+family allows more than 32 KB, or the layout is tighter than the estimate.
+Query `maxThreadgroupMemoryLength` first and let the answer pick BK; do not
+assume 32 and quietly settle for BK=32.
+
+
 
 This is the rewrite, and it is a DIFFERENT project from the one this document
 was opened to scope. "Port MLX's tiling" is retired: pie's tiling already IS
