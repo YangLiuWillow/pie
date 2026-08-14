@@ -635,6 +635,20 @@ fires, and 160 runs against a deliberately starved 256-page pool showed no
 leak. Confirming it needs the instrumented build on a GPU — the new warn logs
 are what that run should be looking for.
 
+*Investigative lens for the next GPU session* (from a parallel session that
+root-caused an analogous permanently-wedged engine on a different pie branch):
+their failure was **not a leak** but a dead-latch — a driver fault latched a
+pressure signal, and the gateway's admission gate consulted that signal
+*before* the allocation path that contained the only recovery hook, so the two
+states held each other in place on an idle box. The productive question for
+our cliff is therefore not "what leaked after run 200" but **"after a
+rejected/failed forward, which component's next action is gated on a flag
+that only that component's next action would clear?"** A first audit here
+found no pin-latch on the batch-error path (`send_result` errors propagate to
+`api/inference.rs`, which unpins), so the latch — if that is the mechanism —
+lives elsewhere (chunking continuation state, admission claims, or the token
+wallet are the untested candidates).
+
 **The chunking fix is unverified on CUDA hardware.** It is covered by unit tests
 and leaves local Metal behaviour unchanged (selftest still 0.2192, concurrent
 sweeps clean), but the pod was terminated before it could be exercised against
@@ -655,3 +669,152 @@ explicit positions but **no sampler slot**, and ordinary token sampling works �
 but it means the refill arm's numeric fidelity here rests on the same inferlet
 code passing the oracle exactly on CPU, at ≤ 0.0003 on Metal, and on H200 CUDA
 previously, not on a check performed on this machine.
+
+## 13. Phase 3 — `adopt_kv`: the faithful join without recomputation (2026-08-13)
+
+### Why §4's proposed `adopt_pages` graft is NOT implementable as stated
+
+§4 proposed refcount-sharing a sibling's physical pages under new chain
+entries ("only the content-addressed chain hashing needs extending"). Reading
+`runtime/src/context{.rs,/pagestore.rs,/snapshot.rs}` closely, that design
+hits three structural walls:
+
+1. **Page-alignment geometry.** Committed pages must be full —
+   `kv_len = committed_len × page_size + working_tokens`, and paged-attention
+   kernels tolerate a partial page only at the tip. A sibling's step tokens
+   start at the fork point T, generally mid-page, so grafting whole pages
+   requires both src-side alignment (fixed by the sibling's page grid) and
+   dst-side alignment (the merged chain's tip). Those are the congruences
+   `r ≡ −T (mod ps)` and `r ≡ −D_j (mod ps)` on the refilled-fragment length
+   `r` — incompatible unless `D_j ≡ T (mod ps)`, which fails as soon as
+   branch lengths are arbitrary.
+2. **Replay ordering.** Suspend/restore replays lineage in slot order. Any
+   graft layout puts adopted pages at committed slots *before* the boundary
+   fragments they attended (which must live in the working region, i.e.
+   later slots). Their mask rows would reference not-yet-filled slots during
+   replay — recomputing against garbage. Fixing that needs dependency-order
+   replay with per-request page-table permutation: expressible in the ABI,
+   but a deep rewrite of restore planning.
+3. **Trie ownership.** Trie nodes own their physical pages and free them at
+   rc = 0. One physical page under two differently-chained entries (src's
+   and dst's) needs a pool-level refcount layer, and guest-influenced chain
+   hashes need salting to keep CAS dedup poison-free.
+
+### What was built instead: adopt-by-copy
+
+`context.adopt-kv(src: borrow<context>, src-token-start: u32, num-tokens:
+u32) -> result<u32, error>` — copy the KV rows for src slots
+`[start, start+n)` into dst's next free working slots **in text order** (the
+refill join's exact layout), with runtime-derived metadata:
+
+- tokens + positions come verbatim from src's lineage (the guest cannot
+  claim content the pages don't hold — commit hashing stays truthful, CAS
+  dedup stays sound, no salting needed);
+- per-token masks are synthesized host-side as the canonical hole rows
+  `[0, start) ∪ [D, D+i]` — byte-identical to the refill's rows;
+- enforced preconditions: identical (token, position, mask) history over
+  `[0, start)` on both contexts (fork siblings satisfy this; verified by an
+  O(n) compare), and a causal source range — default masks or explicit
+  slot-causal `all_true(slot+1)` rows (what position-decoupled decoding
+  emits after a previous join), no adapters, no rs_cache models.
+
+Because dst's layout and metadata equal the refill's, everything downstream
+is unchanged: commit hashing, dedup, eviction, and restore replay (which
+recomputes via ordinary fills whose masks reference only earlier slots).
+The KV bits are *better* than refill's — copied, hence bit-identical to the
+sibling's decode rather than kernel-noise-equal. Cost: a D2D row copy
+(~147 KB/token for Qwen3-4B ⇒ ~0.9 GB ≈ sub-ms for a 6k-token join) versus
+a ~1 s chunked prefill. O(n) with a ~10³ smaller constant — the same
+result the NPR Engine gets from page-table stitching, without touching the
+attention ABI.
+
+**Silent-failure hardening** (informed by a parallel session's report of a
+Metal copy refusal surfacing as a fluent one-token answer): the whole-page
+copies are fire-and-forget, but the adopt copy is **awaited** — both
+contexts are pinned, the copy is `submit`ted, and the token metadata is
+appended only on driver-confirmed success (`Message::AdoptKvComplete`,
+mirroring the ReplayComplete pattern). A refused copy (dummy driver, HND
+CUDA layout, backend error) is a hard error to the guest, and the inferlet
+falls back to the refill join per sibling — never a silent stale graft.
+
+### Implementation map
+
+| Layer | Change |
+|---|---|
+| Wire schema | `CopyRequest` gains append-only `src_rows`/`dst_rows`/`row_counts` (empty ⇒ whole-page); `SCHEMA_HASH` bumps automatically |
+| C ABI / view | regenerated `pie_driver_abi.h`; `PieInProcRequestView.copy_{src,dst}_rows`, `copy_row_counts` |
+| portable (CPU/**Metal**/Vulkan ggml) | row-segment branch in `inproc_service.cpp` D2D using per-layer `nb[1]` row strides (also correct for per-layer-head archs and quantized dtypes, unlike the layer-0 `page_bytes_of` the whole-page path uses) |
+| CUDA | `SwapPool::copy_rows_d2d` — one `cudaMemcpyAsync` per (layer, plane) segment, `row_bytes = page_bytes / page_size` (NHD keeps the slot axis outermost in K, V, and scale planes; FP4 packs along head_dim so the formula holds). HND (`PIE_CUDA_KV_LAYOUT=HND`) throws → guest falls back |
+| runtime | `driver::copy_kv_rows_d2d` (awaited, status-checked); `runtime/src/context/adopt.rs` (validation, segments, pin/complete protocol); `Message::{AdoptKv, AdoptKvComplete}` |
+| WIT/SDK | `adopt-kv` on the context resource (source + 2 vendored copies); SDK `Context::adopt_kv` with counter resync |
+| inferlet | `join_mode: "adopt"` — adopts each sibling's KV-resident tokens, refills only its staged buffer tail (typically the `</step>` token), falls back to refill per sibling; stats `tokens_adopted` / `adopt_fallbacks` |
+
+Adopted tokens are not billed against the token budget (no forward compute
+was spent), and the api layer invalidates staged speculation on dst before
+the graft, same as suspend/destroy.
+
+### Validation (M5 Pro, Metal, NPR-4B)
+
+Selftest gained two arms. `adopt`: fill B[..n−1] causally in a branch fork,
+adopt into a fresh fork of the prefix, refill only B's last token with hole
+rows, probe — must match the straight-line distribution. `adopt_control`:
+same geometry, *reversed* content in the copied region — must diverge (the
+discriminating content lives solely in the copied rows, so a silently
+failed or stale copy cannot pass; earlier probe designs that can't fail are
+worthless).
+
+```
+TV(reference, adopt)         = 0.0008   (refill arm: 0.0003)
+TV(reference, adopt_control) = 0.6446   (causal control: 0.5571)
+```
+
+All pre-existing arms unchanged. Unit tests cover the canonical-mask shape,
+causal-equivalence acceptance, and dual-grid segment splitting.
+
+The full pipeline then ran AIME 2025 I/1 end-to-end with
+`join_mode: "adopt"` → **70 (correct)**: 2 parallel blocks, 5 branches,
+**3,790 tokens adopted with 0 refill fallbacks** — the only refill chunks in
+the whole run are the five 1-token `</step>` tails, at the expected
+decoupled slot/position pairs (e.g. slot 1738 carrying position 1616). The
+second parallel block matters here: its branches decoded with explicit
+slot-causal rows (post-join `delta ≠ 0`), so it exercises the
+causal-equivalence acceptance and prefix agreement across already-adopted
+history, not just the clean depth-1 case. 4,347 tokens generated in 368 s
+(the box was shared with other Metal workloads; not a clean speed number).
+
+**CUDA is compile-checked only** — the row-copy kernel path and the full
+sweep with `join_mode: "adopt"` need a GPU pod (next session: verify
+alongside the bug-12 chunking fix).
+
+Two operational notes from the validation session, so their signatures are
+recognizable: (a) two runs died to an unrelated cross-worktree `pkill`
+pattern in another session's boot script (now fixed on their side) — an
+externally SIGTERMed server logs `received SIGTERM` before the batch
+failures; (b) one run and its refill control both hit ggml
+`sched_graph_compute status=-1` (Metal command-buffer failure, most likely
+memory pressure from co-tenant sessions) *before any adopt executed* — the
+failure reproduced identically under `join_mode: "refill"`, so it is not an
+adopt regression.
+
+### A note on other branches' native Metal driver
+
+This branch's Metal path is the ggml portable driver, which the row copy
+covers. A separate native `driver/metal` exists on other working branches
+whose `pie_metal_copy_kv` refuses KV copies for pure-attention checkpoints
+(`PIE_STATUS_UNSUPPORTED` unless linear-attention geometry). If that driver
+ever lands here, adopt_kv on it will fail loudly and fall back to refill —
+but the refusal is worth knowing about before wondering why
+`tokens_adopted` is zero on Metal.
+
+### RatioThink "APC" assessment (asked-for)
+
+`shsym/RatioThink`'s chat-apc prefix cache is guest-side content-addressed
+snapshot reuse over pie's existing `save`/`open`: names are
+`apc/{key}/{compat}/{hash(model ‖ template ‖ prefix_tokens)}`, a hit forks
+the snapshot and appends only the suffix. Since `open` forks an *immutable*
+snapshot, the technique cannot merge divergent sibling lineages and is not
+a substitute for the join primitive. What it is good for here: the eval's
+avg@8 repeats re-prefill the same prompt 8×; a content-addressed
+`save`/`open` of the post-prompt context (flush first — the SDK buffer is
+not captured) would skip 7 of those prefills. Optional harness follow-up,
+not wired in.

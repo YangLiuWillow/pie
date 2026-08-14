@@ -53,8 +53,13 @@ lives in `inferlets/npr/DESIGN.md` instead of only on one machine.
 
 ## 3. Status: what works
 
-Phases 1 (control loop) and 2 (faithful refill join) are **done and validated on
-real GPU hardware**.
+Phases 1 (control loop), 2 (faithful refill join), and 3 (`adopt_kv` — the
+faithful join as a device-side KV row copy instead of recomputation) are done.
+Phases 1–2 are validated on real GPU hardware; phase 3 is validated on Metal
+(selftest TV 0.0008 + AIME 2025 I/1 → 70 correct with 3,790 tokens adopted,
+0 fallbacks) and **compile-checked only on CUDA** — see DESIGN.md §13.
+Important: §13 also records why the §4 `adopt_pages` refcount-graft proposal
+is structurally infeasible; don't resurrect it without reading that analysis.
 
 - **Numeric correctness**: `--input '{"selftest": true}'` runs an isolation-matrix
   oracle proving the refill join reproduces the exact next-token distribution of
@@ -206,8 +211,11 @@ assumption. (`write_kv_kernel` in the CUDA driver was already slot-correct.)
    Accuracy runs at high concurrency, the speed pass must run at concurrency 1.
    This is the headline result: *does the user-space inferlet reproduce NPR
    Engine quality and speed?*
-2. **Phase 3 — `context.adopt_pages`**: the O(1) KV page-graft op (DESIGN.md §4)
-   that replaces refill recomputation and closes the last efficiency gap.
+2. **Verify phase 3 on CUDA** (done on Metal): the row-copy path
+   (`SwapPool::copy_rows_d2d`) compiles but has never executed on a GPU;
+   run the selftest (adopt + adopt_control arms) and an
+   `--arms adopt,refill` A/B on the pod. The sweep now has an `adopt` arm;
+   check `adopt_fallbacks == 0` in results.
 3. **Upstream the four independent pie fixes** as PRs (§4).
 4. **Nested (depth ≥ 2) refill joins** — currently refill mode forks at depth 1
    only; needs per-token position/visibility records through `run_branch`.
