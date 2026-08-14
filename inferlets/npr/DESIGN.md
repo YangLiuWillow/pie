@@ -818,3 +818,68 @@ avg@8 repeats re-prefill the same prompt 8×; a content-addressed
 `save`/`open` of the post-prompt context (flush first — the SDK buffer is
 not captured) would skip 7 of those prefills. Optional harness follow-up,
 not wired in.
+
+### Engine bug 13 — one Metal command-buffer failure wedged the engine forever
+
+Found on this Mac while validating phase 3; almost certainly relevant to (but
+not yet confirmed as) the H100 run-200 cliff, and root-caused end-to-end
+locally in one afternoon because it reproduces at desk speed.
+
+**Symptom.** A run fails mid-decode with the guest-visible §7.1 signature;
+every later run then fails its *first* forward the same way
+(`sched_graph_compute status=-1`) until the server process is restarted. An
+idle box does not heal it.
+
+**Why it was undiagnosable at first**: `quiet_ggml_log` (non-verbose default)
+swallowed *every* ggml log line including errors, leaving only the bare
+status code. Fixed — WARN/ERROR now pass through in quiet mode. With logs on,
+ggml states both halves of the bug verbatim:
+
+```
+error: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)
+ggml_metal_synchronize: error: command buffer 0 failed with status 5
+ggml_metal_graph_compute: backend is in error state from a previous command
+  buffer failure - recreate the backend to recover
+```
+
+- **Trigger**: a genuine, transient device OOM — this box was sharing Metal
+  with ~20 GB of co-tenant inference workloads. Environmental, not a pie bug.
+- **Persistence**: ggml-metal latches a private `has_error` flag on any
+  command-buffer failure and refuses every subsequent graph compute; there is
+  no reset API — recovery *is* backend recreation, and the portable driver
+  never recreated it. Exactly the dead-latch shape §12's cliff note
+  describes: a failure-latched signal whose only recovery action lives in a
+  layer that never takes it.
+
+**Engine-side recovery was verified clean first** (this scopes the bug): a
+new `PIE_PORTABLE_FAIL_FORWARD_AT=N` fault hook throws one synthetic compute
+failure; pie's scheduler/context machinery recovered perfectly — errors
+propagated, contexts unpinned, the next two runs generated normally. The
+latch was therefore ggml-side only.
+
+**Fixed** (`driver/portable`): on compute failure the executor now releases
+the cached graph, frees the sched, has the Model recreate the primary
+backend (`Model::recreate_primary_backend` — weights/KV live in
+device-scoped buffers that survive backend recreation), rebuilds the sched,
+and **retries the failed batch once**. The retry is idempotent for
+pure-attention models (the same plan rewrites the same KV rows with the same
+values); recurrent-state archs refuse the retry (the state fold is not
+idempotent) and only surface the error. If the retry fails too, the fresh
+backend still un-wedges all subsequent requests — the engine degrades to
+per-batch errors under sustained pressure instead of dying at the first
+transient one.
+
+**Validated under real fire**: immediately after the fix, a Metal AIME run
+happened to land during a co-tenant memory storm — the server log recorded
+**411 genuine `Insufficient Memory` command-buffer failures**, and the
+recovery path executed **46 backend recreations with 46 successful retries
+and 0 failures**, generation continuing correctly each time. The same
+conditions previously wedged the engine permanently at the first event.
+(The recreation preserving weight/KV buffers is thereby also confirmed —
+46 consecutive post-recreation forwards produced coherent continuations.)
+
+**For the H100 cliff**: the fault-injection result exonerates pie's core
+recovery path for *thrown* driver failures on the portable path. The CUDA
+driver has no ggml latch, so the cliff — if real — has a different
+persistence mechanism; the injection hook and the "which flag latches ahead
+of its own recovery?" question are the tools to take to the pod.
