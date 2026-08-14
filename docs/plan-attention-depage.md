@@ -283,7 +283,67 @@ building; not close enough to promise parity.
 `Ks = KV_smem; Vs = KV_smem` -- because V is not needed until after S is
 computed and masked. That is what lets BK reach 64 at D=128 at all.
 
-### OPEN before writing a line: the threadgroup memory budget
+### ANSWERED: the cap is 32 KB, so BK = 32
+
+`tools/rawmetal/device_caps.mm` (framework-only, no driver dependency) asks the
+device instead of assuming. Apple M5 Pro, families Apple7/8/9 + Metal3:
+
+    maxThreadgroupMemoryLength = 32768 bytes   -- the comment was right
+
+With K and V aliased onto one buffer and MLX's 16-byte pad, at D=128 bf16:
+
+    BQ=32 BK=16   8.5 + 6.0  = 14.5 KB   FITS   (pie today, 8x8 fragment)
+    BQ=64 BK=16  17.0 + 6.0  = 23.0 KB   FITS
+    BQ=64 BK=32  17.0 + 10.0 = 27.0 KB   FITS   <-- the target
+    BQ=64 BK=64  17.0 + 18.0 = 35.0 KB   OVER
+
+**So BK=32, and that is a shipped MLX configuration (`bq64_bk32_bd128`)** --
+useful corroboration that the tile is real and not a guess. MLX's `bq64_bk64`
+cannot fit this budget with Q staged, so if it dispatches here it must be
+loading Q some other way.
+
+**The occupancy risk, named up front:** 27 KB of 32 leaves room for ONE
+resident threadgroup where pie's 14.5 KB leaves two. That is precisely the
+trap `KT 16 -> 32` fell into. The mitigating difference is that BQ=64 halves
+the number of threadgroups AND halves staged bytes, where KT only traded
+barriers for occupancy -- but it is a risk, not a certainty, and the first
+measurement must check it.
+
+The lever if it bites: **do not stage Q at all.** Loading Q fragments straight
+from device memory drops the tile to 10 KB and restores two or three resident
+groups. pie's 8x8 kernel tried that and LOST (818.7 -> 799.7 tok/s), but at
+BQ=64 the tile is twice as expensive to stage and the trade may invert.
+
+### The fragment layout changes, and pie's central invariant SURVIVES
+
+This was the real risk to the port and it needed checking before any code.
+pie's kernel header rests on one property:
+
+> A lane's two elements are always in the SAME ROW ... so the online softmax --
+> row max, row sum, the rescale factor -- is per-lane state, never a
+> threadgroup round trip. This one does not store S at all.
+
+The NAX fragment is 16x16 with `kElemRows = 2`, `kElemCols = 4`,
+`kElemRowsJump = 8`, against the 8x8's `kElemRows = 1, kElemCols = 2`. A lane
+now holds EIGHT elements spanning TWO rows (`fm` and `fm+8`), four columns
+each. That looks like it breaks the invariant. It does not:
+
+    fm = (qid & 4) | ((lane >> 1) & 3)     depends on lane bits {4, 2, 1}
+    fn = ((qid & 2) | (lane & 1)) * 4      depends on lane bits {3, 0}
+
+`fm` and `fn` depend on DISJOINT bits, so the lanes sharing a row are those
+varying bits 3 and 0 -- `{l, l^1, l^8, l^9}`, exactly as at 8x8. Verified
+exhaustively over all 32 lanes for all 8 values of `fm`.
+
+**So the two `simd_shuffle_xor` row reduction ports unchanged, and S still
+never touches threadgroup memory.** What changes is bookkeeping, not design:
+
+  * per-lane softmax state DOUBLES -- `max_score[2]`, `sum_exp[2]`, one per row
+    half (this is MLX's `kRowsPerThread = 2`);
+  * the per-fragment column loop is 4 wide, not 2;
+  * masking indexes `fn..fn+3` and both `fm` and `fm+8`.
+
+### Remaining before code
 
 pie's kernel assumes "the 32 KB a threadgroup gets". **That number is a comment;
 nothing in this driver ever queries the device.** At BQ=64, BK=64, D=128 with

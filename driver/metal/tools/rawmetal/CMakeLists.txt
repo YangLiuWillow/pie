@@ -52,6 +52,12 @@ add_rawmetal_tool(
   gemma4_encode_probe.cpp
   gemma4_encode.cpp)
 
+# The threadgroup-memory cap the attention kernels reason about but never ask
+# for. Framework-only and standalone, so it stays answerable without the driver.
+add_executable(device_caps device_caps.mm)
+set_source_files_properties(device_caps.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_link_libraries(device_caps PRIVATE "-framework Metal" "-framework Foundation")
+
 add_executable(dvfs_probe dvfs_probe.mm)
 set_source_files_properties(dvfs_probe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(dvfs_probe PRIVATE
