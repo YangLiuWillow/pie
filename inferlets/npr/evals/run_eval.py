@@ -14,6 +14,9 @@ server-side.
 
 Arms (see `--arms`):
   refill      join_mode=refill    — the faithful KV-equivalent join (default)
+  adopt       join_mode=adopt     — phase-3 faithful join via adopt_kv KV graft
+                                    (no recomputation; falls back to refill per
+                                    sibling — check `adopt_fallbacks` in results)
   textual     join_mode=textual   — phase-1 baseline, steps concatenated causally
   sequential  max_plans=0         — never forks; the model emits the same
                                     <guideline>/<step> schema but decodes it in
@@ -49,6 +52,7 @@ INFERLET = HERE.parent
 
 ARMS = {
     "refill": {"join_mode": "refill"},
+    "adopt": {"join_mode": "adopt"},
     "textual": {"join_mode": "textual"},
     "sequential": {"join_mode": "refill", "max_plans": 0},
 }

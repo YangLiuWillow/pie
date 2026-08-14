@@ -16,3 +16,4 @@ max_depth = { type = "int", optional = true, description = "Max nesting depth of
 min_fork_budget = { type = "int", optional = true, description = "Minimum remaining budget required to fork (default: 1024)" }
 temperature = { type = "float", optional = true, description = "Sampling temperature (default: 1.0)" }
 top_p = { type = "float", optional = true, description = "Nucleus sampling p (default: 0.7)" }
+join_mode = { type = "string", optional = true, description = "Branch join: 'refill' (default, faithful recompute), 'adopt' (faithful KV graft via adopt_kv, falls back to refill), or 'textual' (causal append baseline)" }

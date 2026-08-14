@@ -13,8 +13,15 @@
 //! - Join the branches and continue decoding the `<takeaway>` Reduce stage;
 //!   rounds repeat until the final answer.
 //!
-//! Two join modes (`join_mode` input):
+//! Three join modes (`join_mode` input):
 //!
+//! - `"adopt"` (phase 3, faithful + no recomputation): identical layout and
+//!   metadata to `"refill"`, but the sibling KV is grafted by a device-side
+//!   row copy (`Context::adopt_kv`) instead of being recomputed — the host
+//!   derives tokens/positions from the sibling's lineage and synthesizes
+//!   the same hole masks the refill would carry. Only the sibling's staged
+//!   buffer tail (typically its `</step>` token) is refilled. Falls back to
+//!   refill per sibling on any host refusal.
 //! - `"refill"` (default, faithful — NPR Algorithm 2 semantics): sibling
 //!   step tokens are re-filled into branch 1's context at **overlapped
 //!   position ids** (every sibling restarts at the position right after
@@ -157,10 +164,18 @@ struct Stats {
     max_depth_seen: usize,
     sequential_fallbacks: usize,
     tokens_generated: usize,
+    /// Sibling tokens grafted via adopt_kv instead of refill recomputation.
+    tokens_adopted: usize,
+    /// Siblings that fell back to refill after an adopt_kv refusal.
+    adopt_fallbacks: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum JoinMode {
+    /// Phase 3: graft sibling KV via `Context::adopt_kv` (device row copy,
+    /// no recomputation); falls back to refill per sibling on any host
+    /// refusal. Join layout and metadata are identical to refill.
+    Adopt,
     Refill,
     Textual,
 }
@@ -204,6 +219,7 @@ impl Shared {
             special_ids.insert(bytes, *id);
         }
         let join_mode = match input.join_mode.as_str() {
+            "adopt" => JoinMode::Adopt,
             "refill" => JoinMode::Refill,
             "textual" => JoinMode::Textual,
             other => return Err(format!("unknown join_mode: {other}")),
@@ -502,7 +518,7 @@ fn try_fork<'a>(
         // Refill mode forks only at depth 1: exact nested refill needs
         // per-token position/visibility records (see module docs).
         let depth_cap = match sh.join_mode {
-            JoinMode::Refill => 1,
+            JoinMode::Refill | JoinMode::Adopt => 1,
             JoinMode::Textual => sh.max_depth,
         };
         if plans.is_empty() || plans.len() > sh.max_plans || depth > depth_cap || !affordable {
@@ -542,6 +558,7 @@ fn try_fork<'a>(
             "[npr] depth {depth}: all {degree} branches done ({} tokens total), joining ({})",
             branches.iter().map(|b| b.tokens.len()).sum::<usize>(),
             match sh.join_mode {
+                JoinMode::Adopt => "adopt",
                 JoinMode::Refill => "refill",
                 JoinMode::Textual => "textual",
             }
@@ -570,8 +587,11 @@ fn try_fork<'a>(
                 tokens.extend_from_slice(&takeaway);
                 bytes.extend_from_slice(b"<takeaway>\n");
             }
-            JoinMode::Refill => {
-                // Faithful join (NPR Algorithm 2 realized as recomputation):
+            JoinMode::Refill | JoinMode::Adopt => {
+                // Faithful join (NPR Algorithm 2). Refill realizes it as
+                // recomputation; adopt grafts the sibling's KV rows via
+                // `Context::adopt_kv` (identical layout and metadata, no
+                // recomputation) and falls back to refill per sibling.
                 //
                 // 1. Drain base's pending tail (its `</step>` tag) into KV at
                 //    its own positions so the whole base branch is resident.
@@ -586,26 +606,41 @@ fn try_fork<'a>(
                         refill(&mut base, &pend, &positions, &rows).await?;
                     }
                 }
-                // 2. Refill each sibling's tokens at positions restarting at
-                //    p_fork, masked to see only [0, fork_slots) plus its own
-                //    tokens — reproducing the KV each branch computed in its
-                //    own context (bit-equivalent up to kernel batching).
+                // 2. Bring each sibling's tokens into base at positions
+                //    restarting at p_fork, visible only to [0, fork_slots)
+                //    plus its own tokens — the KV each branch computed in
+                //    its own context (bit-identical when adopted,
+                //    kernel-noise-equal when refilled).
                 for sibling in iter {
                     let n = sibling.tokens.len();
                     max_extent = max_extent.max(n as u32);
-                    let sib_start_slot = base.ctx.seq_len();
-                    let positions: Vec<u32> = (p_fork..p_fork + n as u32).collect();
-                    let rows: Vec<Vec<u32>> = (0..n)
-                        .map(|i| {
-                            vec![
-                                0,
-                                fork_slots,
-                                sib_start_slot - fork_slots,
-                                i as u32 + 1,
-                            ]
-                        })
-                        .collect();
-                    refill(&mut base, &sibling.tokens, &positions, &rows).await?;
+                    let mut adopted = false;
+                    if sh.join_mode == JoinMode::Adopt {
+                        match adopt_sibling(&mut base, &sibling, fork_slots, p_fork).await? {
+                            Some(n_adopted) => {
+                                sh.stats.borrow_mut().tokens_adopted += n_adopted;
+                                adopted = true;
+                            }
+                            None => {
+                                sh.stats.borrow_mut().adopt_fallbacks += 1;
+                            }
+                        }
+                    }
+                    if !adopted {
+                        let sib_start_slot = base.ctx.seq_len();
+                        let positions: Vec<u32> = (p_fork..p_fork + n as u32).collect();
+                        let rows: Vec<Vec<u32>> = (0..n)
+                            .map(|i| {
+                                vec![
+                                    0,
+                                    fork_slots,
+                                    sib_start_slot - fork_slots,
+                                    i as u32 + 1,
+                                ]
+                            })
+                            .collect();
+                        refill(&mut base, &sibling.tokens, &positions, &rows).await?;
+                    }
                     tokens.extend_from_slice(&sibling.tokens);
                     bytes.extend_from_slice(&sibling.bytes);
                     terminal |= sibling.terminal;
@@ -643,6 +678,62 @@ fn try_fork<'a>(
             terminal,
         })
     })
+}
+
+/// Graft one sibling's KV into `base` via `Context::adopt_kv`, then refill
+/// only its pending buffer tail (typically the `</step>` token that is
+/// staged as the next generator input but not yet in KV).
+///
+/// Returns `Ok(Some(n))` on success, `Ok(None)` when the adopt was refused
+/// **before anything landed in base** — the caller falls back to a full
+/// refill — and `Err` only for failures after the graft, where a fallback
+/// refill would duplicate the adopted tokens.
+async fn adopt_sibling(
+    base: &mut PCtx,
+    sibling: &BranchResult,
+    fork_slots: u32,
+    p_fork: u32,
+) -> Result<Option<usize>> {
+    let sib = &sibling.p;
+    let pend = sib.ctx.buffer().to_vec();
+    let n_adopt = sib.ctx.seq_len().saturating_sub(fork_slots);
+    // The KV-resident tokens plus the staged tail must reproduce the branch
+    // transcript exactly — anything else means our slot accounting is off
+    // and the copy would graft the wrong range.
+    if n_adopt as usize + pend.len() != sibling.tokens.len() {
+        println!(
+            "[npr] adopt: kv accounting mismatch ({} resident + {} pending != {} transcript)",
+            n_adopt,
+            pend.len(),
+            sibling.tokens.len()
+        );
+        return Ok(None);
+    }
+    let dst_start = match base.ctx.adopt_kv(&sib.ctx, fork_slots, n_adopt) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("[npr] adopt_kv refused: {e}");
+            return Ok(None);
+        }
+    };
+    if !pend.is_empty() {
+        // Tail continues the sibling's stream: positions after its adopted
+        // tokens, visible to [0, fork_slots) plus the whole sibling range.
+        let start = p_fork + n_adopt;
+        let positions: Vec<u32> = (start..start + pend.len() as u32).collect();
+        let rows: Vec<Vec<u32>> = (0..pend.len())
+            .map(|i| {
+                vec![
+                    0,
+                    fork_slots,
+                    dst_start - fork_slots,
+                    n_adopt + i as u32 + 1,
+                ]
+            })
+            .collect();
+        refill(base, &pend, &positions, &rows).await?;
+    }
+    Ok(Some(n_adopt as usize))
 }
 
 /// Decode one `<step>` branch to its `</step>`. In textual mode nested
@@ -815,6 +906,50 @@ async fn fill_and_probe(
     Ok((ids.to_vec(), probs.to_vec()))
 }
 
+/// Adopt-join oracle: fill `sib_content` causally in a fork of `base` (the
+/// "branch"), adopt its KV into a fresh fork of `base` via `adopt_kv`,
+/// refill only `tail` with hole rows, and probe the next-token distribution
+/// at the tail. With `sib_content = B[..n-1]`, `tail = B[n-1..]` this must
+/// reproduce the straight-line distribution after B. With wrong
+/// `sib_content` of the same length (the negative control) it must NOT:
+/// the discriminating content lives solely in the copied region, so a
+/// silently failed or stale copy cannot produce a passing result.
+async fn adopt_and_probe(
+    base: &Context,
+    fork_slots: u32,
+    sib_content: &[u32],
+    tail: &[u32],
+    p_fork: u32,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    let mut sib = base.fork()?;
+    let mut pass = sib.forward();
+    pass.input(sib_content);
+    pass.execute().await?;
+
+    let mut dst = base.fork()?;
+    let n_adopt = sib_content.len() as u32;
+    let dst_start = dst.adopt_kv(&sib, fork_slots, n_adopt)?;
+
+    let positions: Vec<u32> = (0..tail.len() as u32).map(|i| p_fork + n_adopt + i).collect();
+    let rows: Vec<Vec<u32>> = (0..tail.len())
+        .map(|i| vec![0, fork_slots, dst_start - fork_slots, n_adopt + i as u32 + 1])
+        .collect();
+    let mut pass = dst.forward();
+    pass.input(tail);
+    pass.positions(&positions);
+    pass.attention_mask(&rows);
+    let h = pass.probe(
+        tail.len() as u32 - 1,
+        Distribution {
+            temperature: 1.0,
+            k: 10,
+        },
+    );
+    let out = pass.execute().await?;
+    let (ids, probs) = out.distribution(h).ok_or("selftest: adopt probe missing")?;
+    Ok((ids.to_vec(), probs.to_vec()))
+}
+
 /// Total variation distance over the union of two top-k supports.
 fn tv(a: &(Vec<u32>, Vec<f32>), b: &(Vec<u32>, Vec<f32>)) -> f32 {
     let mut m: HashMap<u32, (f32, f32)> = HashMap::new();
@@ -925,6 +1060,17 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
         Some(holes(toks_a.len() as u32)),
     )
     .await?;
+    println!("[npr selftest] e_adopt...");
+    // Adopt all but B's last token from a causal branch fill, refill only
+    // the last token — the real join's shape with a 1-token tail.
+    let e_adopt =
+        adopt_and_probe(&base, fork_slots, &toks_b[..nb - 1], &toks_b[nb - 1..], p_fork).await?;
+    println!("[npr selftest] e_adopt_ctl...");
+    // Same geometry, wrong content: the reversed B-prefix. Only the copied
+    // region differs, so this must diverge from the reference.
+    let wrong: Vec<u32> = toks_b[..nb - 1].iter().rev().copied().collect();
+    let e_adopt_ctl =
+        adopt_and_probe(&base, fork_slots, &wrong, &toks_b[nb - 1..], p_fork).await?;
     println!("[npr selftest] e_ctl...");
     let e_ctl = fill_and_probe(&base, Some(&toks_a), &toks_b, None, None).await?;
 
@@ -935,6 +1081,8 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
         ("hole_natural", tv(&r_shift, &m_hole_nat)),
         ("refill_short", tv(&e_ref, &e_short)),
         ("refill", tv(&e_ref, &e_refill)),
+        ("adopt", tv(&e_ref, &e_adopt)),
+        ("adopt_control", tv(&e_ref, &e_adopt_ctl)),
         ("control", tv(&e_ref, &e_ctl)),
     ];
     println!("[npr selftest] reference top-3: {:?}", &e_ref.0[..3.min(e_ref.0.len())]);
@@ -950,7 +1098,9 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
         &e_ctl.0[..3.min(e_ctl.0.len())],
     );
 
-    let pass = tvs[..6].iter().all(|(_, v)| *v < 0.05) && tvs[6].1 > 0.05;
+    let pass = tvs[..7].iter().all(|(_, v)| *v < 0.05)
+        && tvs[7].1 > 0.05
+        && tvs[8].1 > 0.05;
     Ok(inferlet::serde_json::json!({
         "selftest_pass": pass,
         "tv": tvs.iter().map(|(n, v)| (n.to_string(), *v)).collect::<HashMap<_, _>>(),
@@ -1051,6 +1201,8 @@ async fn main(input: Input) -> Result<String> {
         "max_depth": stats.max_depth_seen,
         "sequential_fallbacks": stats.sequential_fallbacks,
         "tokens_generated": stats.tokens_generated,
+        "tokens_adopted": stats.tokens_adopted,
+        "adopt_fallbacks": stats.adopt_fallbacks,
         "tokens_charged": ledger.charged,
         "token_budget": ledger.budget,
         "elapsed_ms": start.elapsed().as_millis() as u64,
