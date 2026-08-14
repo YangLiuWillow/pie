@@ -135,9 +135,14 @@ std::vector<std::uint64_t> seq_ctx_ids(std::size_t count) {
     return v;
 }
 
+// Quiet mode drops ggml's INFO/DEBUG chatter but must never swallow
+// errors: a Metal command-buffer failure's only diagnostic is the ggml
+// error line, and discarding it turns a debuggable fault into a bare
+// `sched_graph_compute status=-1`.
 void quiet_ggml_log(enum ggml_log_level level, const char* text, void*) {
-    (void)level;
-    (void)text;
+    if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
+        std::cerr << text;
+    }
 }
 
 enum class OfflineTestMode {

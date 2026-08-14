@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -754,6 +756,23 @@ Executor::BatchPlan Executor::plan_test_simple_(
 // -----------------------------------------------------------------------------
 
 std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
+    // Fault injection for wedge/recovery testing: with
+    // PIE_PORTABLE_FAIL_FORWARD_AT=N set, the N-th compute_() call in this
+    // process throws exactly once, mimicking a transient backend compute
+    // failure (e.g. a failed Metal command buffer). Everything after the
+    // throw exercises the engine's recovery path. Not a production knob.
+    {
+        static const long fail_at = [] {
+            const char* v = std::getenv("PIE_PORTABLE_FAIL_FORWARD_AT");
+            return v ? std::atol(v) : -1;
+        }();
+        static std::atomic<long> call_no{0};
+        if (fail_at > 0 && call_no.fetch_add(1) + 1 == fail_at) {
+            throw std::runtime_error(
+                "compute: injected fault (PIE_PORTABLE_FAIL_FORWARD_AT)");
+        }
+    }
+
     using clock = std::chrono::steady_clock;
     const auto t_compute_start = clock::now();
     auto stage_start = t_compute_start;
