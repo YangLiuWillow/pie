@@ -938,3 +938,38 @@ A discriminating diagnostic is running: the `adopt` arm re-run at a 90,000
 charged-token budget. Finish-rate ↑ with avg@8 → 40s ⇒ mostly accounting;
 finish-rate ↑ with avg@8 stalling ⇒ the repetition penalty's share is large.
 Partial sweep rows: `evals/results/aime25-a40.jsonl`.
+
+### Engine bug 16 — silent whole-engine deadlock under sustained page oversubscription
+
+Found by the 90k-budget diagnostic (A40, ~6,700-page pool ≈ 214k tokens):
+24 concurrent runs each growing toward ~28k generated tokens stalled the
+engine completely ~40 minutes in. Signature — and it is the worst of the
+wedge family because it is *silent*:
+
+- GPU utilization 0%, harness alive, **zero** errors, panics, warns, or
+  rejections anywhere;
+- gateway RPC heartbeats keep flowing (the server looks healthy from
+  outside);
+- a fresh 1-page, 5-token request on a brand-new context **hangs forever**
+  — head-of-line blocking, not per-context starvation.
+
+Prime suspect (unconfirmed): the context actor's allocation path.
+`drain_queues` serves `alloc_queue` strictly FIFO and `break`s when the
+head's demand exceeds free pages; if every page-holder is itself parked in
+the queue (holding thousands of pages while waiting for hundreds more, pool
+empty), no one releases, eviction finds no admissible victim, and the queue
+— including trivial 1-page requests behind the head — never moves again.
+Classic allocation deadlock; the eviction economics are supposed to break
+it and evidently do not in this regime.
+
+Reproduction is cheap and CPU-portable: a small `total_pages` pool plus a
+few concurrent long-budget runs should reproduce locally on the portable
+driver — this one does not need GPU dollars to root-cause. Evidence
+snapshot: `/workspace/serve-deadlock-evidence.log` on the pod. Symptom
+overlap with the H100 cliff is partial (the cliff produced fast
+empty-success *errors*, this produces silent hangs), so they remain
+separate open items; under a client-side timeout harness, though, this
+deadlock would *look* like a 100%-failure cliff.
+
+Workaround until fixed: keep peak concurrent KV demand under the pool
+(the diagnostic re-ran at concurrency 8 without issue).
