@@ -35,8 +35,11 @@ def post(path: str, body: dict, raw: bool = False):
 
 def main() -> int:
     with urllib.request.urlopen(f"{BASE}/health", timeout=10) as r:
-        assert r.status == 200 and r.read() == b"ok"
-    print("1. /health ok")
+        assert r.status == 200
+        health = json.loads(r.read())
+        assert health["status"] == "ok", health
+        assert isinstance(health["weight_version"], int), health
+    print(f"1. /health ok (weight_version {health['weight_version']})")
 
     body = {"prompt": P, "max_tokens": 12, "temperature": 0.0,
             "logprobs": True, "return_token_ids": True}
@@ -73,6 +76,22 @@ def main() -> int:
     usage_events = [e for e in events if e.get("usage")]
     assert usage_events and usage_events[-1]["usage"]["completion_tokens"] == len(delta_ids)
     print(f"4. streaming form ok ({len(events)} chunks, {len(delta_ids)} tokens)")
+
+    # R-G3: the response body's weight_version overrides the gateway's, so the
+    # bridge is the one that has to tell the truth about which weights served.
+    baseline = health["weight_version"]
+    try:
+        assert post("/admin/weight_version", {"weight_version": 7})["weight_version"] == 7
+        # First request after the flush, so no hint of this lineage can have
+        # been re-recorded: a version change must invalidate the boundaries
+        # taken under the old weights, and this same prompt hit above.
+        r5 = post("/v1/completions", {**body, "prompt": p2})
+        assert r5["weight_version"] == 7, r5["weight_version"]
+        assert r5["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, (
+            "KV hints survived a weight-version change")
+    finally:
+        post("/admin/weight_version", {"weight_version": baseline})
+    print("5. weight_version advance ok (stamped + hints flushed)")
 
     print("BRIDGE_CONTRACT_TEST_PASSED")
     return 0

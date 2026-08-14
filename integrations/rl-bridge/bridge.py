@@ -13,7 +13,11 @@ Serves (the training-relevant subset):
                          prompt_tokens_details.cached_tokens. `stream` gives
                          the SSE form (buffered server-side: first chunk
                          prompt_token_ids, one delta chunk, usage, [DONE]).
-  GET  /health           200 "ok" (gateway router polls every 10 s).
+  GET  /health           200 {"status": "ok", "weight_version": n}
+                         (gateway router polls every 10 s).
+  GET/POST /admin/weight_version
+                         read / advance the version stamped on responses,
+                         after the trainer swaps pie's weights (R-G2/R-G3).
 
 KV reuse: the bridge remembers each response's saved boundary length, keyed by
 a fingerprint of the prompt head (all turns of a lineage share it, cumulative
@@ -72,14 +76,31 @@ class PrefixHints:
             lens.append(saved_len)
             del lens[:-MAX_HINTS]
 
+    def clear(self) -> None:
+        self._lens.clear()
+
 
 class Bridge:
-    def __init__(self, pie_uri: str, inferlet: str) -> None:
+    def __init__(self, pie_uri: str, inferlet: str, weight_version: int = 0) -> None:
         self.pie_uri = pie_uri
         self.inferlet = inferlet
         self.client: PieClient | None = None
         self.hints = PrefixHints()
-        self.weight_version = 0
+        # Stamped onto every response. The gateway's own weight_version is
+        # OVERRIDDEN by whatever the response body carries
+        # (rllm_model_gateway.data_process.extract_weight_version), so this
+        # number — not the trainer's — is what reaches the traces. It has to be
+        # advanced whenever the served weights change.
+        self.weight_version = weight_version
+
+    def set_weight_version(self, weight_version: int) -> None:
+        """Adopt new weights' version and drop every KV hint taken under the old
+        ones. The hints name snapshot boundaries in a pie engine that a weight
+        swap has restarted, so keeping them would send the inferlet looking for
+        indices that no longer exist — and, worse, would be silent if a key
+        happened to survive."""
+        self.weight_version = weight_version
+        self.hints.clear()
 
     async def connect(self, wasm: str | None, manifest: str | None) -> None:
         self.client = PieClient(self.pie_uri)
@@ -399,8 +420,27 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     return resp
 
 
-async def handle_health(_: web.Request) -> web.Response:
-    return web.Response(text="ok")
+async def handle_health(request: web.Request) -> web.Response:
+    bridge: Bridge = request.app["bridge"]
+    return web.json_response({"status": "ok", "weight_version": bridge.weight_version})
+
+
+async def handle_weight_version(request: web.Request) -> web.Response:
+    """GET reports the served version; POST adopts a new one (R-G2/R-G3).
+
+    The trainer calls POST after a weight swap. Restarting the bridge with
+    ``--weight-version`` does the same thing; this endpoint exists so the swap
+    can also be done without dropping the connection to pie."""
+    bridge: Bridge = request.app["bridge"]
+    if request.method == "POST":
+        body = await request.json()
+        try:
+            version = int(body["weight_version"])
+        except (KeyError, TypeError, ValueError):
+            raise web.HTTPBadRequest(reason="weight_version must be an int")
+        bridge.set_weight_version(version)
+        log.info("weight_version -> %d (KV hints flushed)", version)
+    return web.json_response({"weight_version": bridge.weight_version})
 
 
 def main() -> None:
@@ -411,10 +451,13 @@ def main() -> None:
     ap.add_argument("--inferlet", default="rl-rollout@0.1.0")
     ap.add_argument("--wasm")
     ap.add_argument("--manifest")
+    ap.add_argument("--weight-version", type=int, default=0,
+                    help="version of the weights pie is serving; stamped onto "
+                         "every response and onto the trainer's traces")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    bridge = Bridge(args.pie, args.inferlet)
+    bridge = Bridge(args.pie, args.inferlet, weight_version=args.weight_version)
     app = web.Application()
     app["bridge"] = bridge
     app.router.add_post("/v1/completions", handle_completions)
@@ -422,6 +465,8 @@ def main() -> None:
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post("/chat/completions", handle_chat)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/admin/weight_version", handle_weight_version)
+    app.router.add_post("/admin/weight_version", handle_weight_version)
 
     async def on_startup(_: web.Application) -> None:
         await bridge.connect(args.wasm, args.manifest)
