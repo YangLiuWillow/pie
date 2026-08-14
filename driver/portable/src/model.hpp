@@ -236,6 +236,18 @@ public:
     ggml_backend_t       backend() const noexcept { return backend_; }
     std::string          backend_name() const noexcept;
 
+    // Recovery hook: destroy and re-initialize the primary GPU backend
+    // instance. ggml-metal latches an internal error flag after any
+    // command-buffer failure (e.g. transient device OOM) and refuses every
+    // subsequent graph compute until "the backend is recreated" (its own
+    // words) — without this, one transient fault wedges the process
+    // permanently. Weights/KV live in device-scoped buffers that outlive
+    // the backend instance, so recreation preserves them. Returns false
+    // (and does nothing) when the primary is the CPU backend, which has no
+    // such latch. Callers must rebuild anything holding the old handle
+    // (the Executor's ggml_backend_sched and cached graph).
+    bool                 recreate_primary_backend();
+
     // CPU-side companion backend, used by `Executor`'s
     // `ggml_backend_sched` as the fallback when the primary backend
     // (e.g. ggml-vulkan, ggml-metal) doesn't implement an op the graph

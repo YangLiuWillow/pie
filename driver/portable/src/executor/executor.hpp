@@ -207,6 +207,20 @@ public:
     void log_timings(const char* label) const;
 
 private:
+    // (Re)create sched_ over [primary, cpu_fallback]. Used at construction
+    // and by recover_from_compute_failure_() after backend recreation.
+    void rebuild_sched_();
+
+    // ggml-metal latches an error flag after a command-buffer failure and
+    // refuses all further computes until the backend is recreated. Recover
+    // by dropping the cached graph, freeing the sched, recreating the
+    // primary backend, and rebuilding the sched. Returns true when the
+    // caller may retry the failed batch: safe for pure-attention models
+    // (recomputing a plan rewrites the same KV rows with the same values),
+    // refused when a recurrent-state cache exists (the state fold is not
+    // idempotent).
+    bool recover_from_compute_failure_();
+
     BatchPlan plan_(const pie_driver::PieForwardRequestView& req);
     BatchPlan plan_test_simple_(std::span<const std::uint32_t> token_ids,
                                 std::span<const std::uint32_t> position_ids,

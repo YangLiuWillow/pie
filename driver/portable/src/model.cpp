@@ -646,6 +646,26 @@ std::string Model::backend_name() const noexcept {
     return desc ? std::string(desc) : ggml_backend_name(backend_);
 }
 
+bool Model::recreate_primary_backend() {
+    // `cpu_fallback_ == nullptr` means the primary already IS the CPU
+    // backend (see cpu_fallback() doc) — nothing to recreate.
+    if (!cpu_fallback_) return false;
+
+    std::cerr << "[model] recreating primary backend after compute failure ("
+              << backend_name() << ")\n";
+    ggml_backend_free(backend_);
+    backend_ = ggml_backend_init_best();
+    if (!backend_) {
+        // Last resort: a CPU primary keeps the process serving (slowly)
+        // rather than wedged. The old cpu_fallback_ stays as the sched's
+        // second backend; a duplicate CPU entry would be harmless but
+        // pointless, so callers still get a usable pair.
+        std::cerr << "[model] backend re-init failed; falling back to CPU\n";
+        backend_ = ggml_backend_cpu_init();
+    }
+    return backend_ != nullptr;
+}
+
 std::string Model::activation_dtype_str() const {
     // HF's torch_dtype is the ground truth for the stored weight dtype.
     // (Pie's runtime treats this field as informational.)

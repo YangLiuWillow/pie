@@ -408,6 +408,10 @@ Executor::Executor(Model& model,
             conv_dim,
             h.qwen35_linear_conv_kernel);
     }
+    rebuild_sched_();
+}
+
+void Executor::rebuild_sched_() {
     // Build the backend list for the multi-backend scheduler. Order
     // matters: sched picks the FIRST backend in the list that supports
     // each op, so the primary GPU backend gets first dibs and CPU is
@@ -415,8 +419,8 @@ Executor::Executor(Model& model,
     // missing CPY pipelines). When the primary is already CPU, the
     // sched is single-backend and acts as a direct executor.
     std::vector<ggml_backend_t> backends;
-    backends.push_back(model.backend());
-    if (auto* cpu_fb = model.cpu_fallback()) {
+    backends.push_back(model_.backend());
+    if (auto* cpu_fb = model_.cpu_fallback()) {
         backends.push_back(cpu_fb);
     }
     // op_offload=false: sched only splits graphs when an op is genuinely
@@ -435,6 +439,32 @@ Executor::Executor(Model& model,
     if (!sched_) {
         throw std::runtime_error("forward: ggml_backend_sched_new failed");
     }
+}
+
+bool Executor::recover_from_compute_failure_() {
+    if (state_) {
+        // Recurrent-state archs advance the state fold inside the graph;
+        // recomputing a failed batch is not idempotent there. Leave the
+        // failure to surface and the operator to restart.
+        return false;
+    }
+    // Order matters: the cached graph's tensors live in sched-owned
+    // buffers, and the sched references the old backend — release the
+    // cache, then the sched, then recreate the backend.
+    if (cache_) cache_->release();
+    if (sched_) {
+        ggml_backend_sched_free(sched_);
+        sched_ = nullptr;
+    }
+    if (!model_.recreate_primary_backend()) {
+        // CPU primary (no error latch) or unrecoverable init failure —
+        // rebuild the sched over whatever backend the model still has so
+        // the executor stays consistent, but tell the caller not to retry.
+        rebuild_sched_();
+        return false;
+    }
+    rebuild_sched_();
+    return true;
 }
 
 Executor::~Executor() {
@@ -950,8 +980,28 @@ void Executor::run(const pie_driver::PieForwardRequestView& req,
         sampled = compute_(plan);
     } catch (const std::exception& e) {
         std::cerr << "[forward] compute failed: " << e.what() << "\n";
-        out = pie_driver::PieForwardResponseView{};
-        return;
+        // A failed Metal command buffer latches ggml's backend error flag,
+        // after which EVERY compute fails until the backend is recreated —
+        // one transient device OOM would otherwise wedge the process
+        // permanently. Recreate and retry the batch once (idempotent for
+        // pure-attention: same plan rewrites the same KV rows). If the
+        // retry also fails, the fresh backend still un-wedges subsequent
+        // requests.
+        bool recovered = false;
+        if (recover_from_compute_failure_()) {
+            std::cerr << "[forward] primary backend recreated; retrying batch once\n";
+            try {
+                sampled = compute_(plan);
+                recovered = true;
+                std::cerr << "[forward] retry succeeded\n";
+            } catch (const std::exception& e2) {
+                std::cerr << "[forward] retry failed: " << e2.what() << "\n";
+            }
+        }
+        if (!recovered) {
+            out = pie_driver::PieForwardResponseView{};
+            return;
+        }
     }
     // compute_() credits its own sub-buckets + total + n_calls.
     t_stage = clock::now();
