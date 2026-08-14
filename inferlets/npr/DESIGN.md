@@ -893,3 +893,48 @@ recovery path for *thrown* driver failures on the portable path. The CUDA
 driver has no ggml latch, so the cliff — if real — has a different
 persistence mechanism; the injection hook and the "which flag latches ahead
 of its own recovery?" question are the tools to take to the pod.
+
+## 14. First A40 sweep (2026-08-14): quality gap = token starvation, not the port
+
+The first post-hardening sweep ran clean — zero errors, panics, or aborts
+across 275 runs before being intentionally stopped early — and produced the
+first quality comparison against the paper. The headline number looks bad
+and the decomposition says otherwise:
+
+| | AIME25 avg@8 |
+|---|---|
+| this port, `adopt` arm (30 problems × 8, complete) | **20.4%** (pass@8 33.3%) |
+| this port, `refill` arm (partial, n=35) | 22.9% — indistinguishable from adopt |
+| paper, NPR (Instruct base / non-thinking base) | 50.4 / 53.8 |
+| paper, base Qwen3-4B-Instruct | 47.4 |
+
+Decomposition of the gap:
+
+- **78% of runs never emit `\boxed{}`** — and *every single one* of those 187
+  runs charged ≥97% of the 30,000-token ledger. Zero no-answer runs from any
+  other cause.
+- **Answered runs are ~94% correct** (48/51). The engine executes the
+  reasoning correctly; trajectories are dying of token starvation before the
+  final answer.
+- Parallelism is healthy: 100% fork rate, mean 3.5 branches — which under
+  the engine-faithful ×degree ledger leaves only ~9k *generated* tokens
+  inside a 30k *charged* budget.
+- `adopt` ≈ `refill` on every statistic (accuracy, format failures, branch
+  profile) — the phase-3 join introduces no quality drift, which was the
+  within-port parity question. 993k tokens adopted across the arm with zero
+  fallbacks.
+
+Two suspects for the starvation, both flagged before the sweep:
+
+1. **The missing per-`<step>` repetition penalty (1.02)** — the paper added
+   it precisely because steps repeat locally; repetition inflates branch
+   length and burns the multiplied ledger.
+2. **Budget-accounting parity** — whether the paper's evaluation budget of
+   30,000 is ledger-charged (×degree, as the rollout engine's
+   `schedule_batch.py` does and we replicate) or effectively per-sequence in
+   their eval path. If per-sequence, their effective budget is ~3.5× ours.
+
+A discriminating diagnostic is running: the `adopt` arm re-run at a 90,000
+charged-token budget. Finish-rate ↑ with avg@8 → 40s ⇒ mostly accounting;
+finish-rate ↑ with avg@8 stalling ⇒ the repetition penalty's share is large.
+Partial sweep rows: `evals/results/aime25-a40.jsonl`.
