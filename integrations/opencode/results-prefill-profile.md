@@ -23,11 +23,41 @@ Read what each stack *actually booted with*, not what you asked for.
 | KV block | `block_size=16` | `kv_page_size=32` | (immaterial — tested) |
 | **KV pool** | **193,536 tokens** | **65,536 tokens** | ✗ **16,384** |
 
-`total_pages = 512` was this repo's inherited default and it is **KV-starved**:
-raising it to 2048 is worth **1.73× on prefill for free**. It was never
-memory-forced — pie's activation pool sat at 24 MB of a 1024 MB budget.
+`total_pages = 512` was this repo's inherited default.
 `run_pie_opencode.sh` now generates the matched values by default
 (`PIE_TOTAL_PAGES`, `PIE_MAX_FORWARD_TOKENS`).
+
+> **Correction, 2026-08-13 — the KV pool is not worth 1.73×, and probably is
+> not worth anything here.** This paragraph used to read "raising it to 2048 is
+> worth **1.73× on prefill for free**". That attributed a *joint* result to one
+> of the two knobs in the table above: the chunk size (`max_forward_tokens`
+> 1024 → 2048) and the pool (512 → 2048 pages) were fixed in the same change,
+> and only their combined effect was measured.
+>
+> Measured since, with the chunk held at 2048 and **only** `max_model_len`
+> moved — which is what actually sizes the pool (`context.cpp:245`) — on
+> Coder-30B, `--repeat 3`, pool read from `PIE_KV_TRACE` rather than derived:
+>
+> | `max_model_len` | pool | marginal prefill | naive @5055 tok |
+> |---:|---:|---:|---:|
+> | 65536 | 2048 pages (65,536 tok) | 597.2 tok/s | 737.4 |
+> | 32768 | 1024 pages (32,768 tok) | 593.9 tok/s | 738.5 |
+> | 16384 | 512 pages (16,384 tok) | **598.0 tok/s** | **739.6** |
+>
+> **A 4× pool difference is a 0.7% spread, and it is not monotonic** — the
+> "KV-starved" arm is nominally the fastest. So the pool did not produce the
+> 1.73×.
+>
+> **Scope**: concurrency 1, prompts ≤ 5,055 tokens = 159 pages, which fits even
+> the 512-page arm. This is precisely the regime where a pool should not bind,
+> and it is also the regime the original measurement was taken in. It says
+> nothing about concurrency, or about strategy B, where retained KV and the
+> live turn must coexist in the pool.
+>
+> **What produced the 1.73× is now open.** The chunk fix is separately recorded
+> below as worth ~18% at mid lengths, which does not add up to 73% either.
+> Either something else moved in that change, or the number is wrong. Do not
+> re-quote it until someone re-derives it one knob at a time.
 
 ## Method: fit a line, don't divide an aggregate
 

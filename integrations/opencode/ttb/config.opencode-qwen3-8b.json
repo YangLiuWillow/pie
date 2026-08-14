@@ -1,0 +1,75 @@
+{
+  "schema": "test-time-bench/benchmark-config.v3-local-profile",
+  "schema_note": "Mirrors TTB's benchmark-config.v3 SHAPE and is consumed by this repo's runner. It is deliberately NOT claimed to be a valid v3 document: it has never been validated by TTB's backend, and `execution.agent` here is an external agent process rather than TTB's `agent_loop.rs`. Validating against the real schema is the upstream-port step.",
+  "identity": {
+    "suite_slug": "swe-bench-lite-first-20-opencode",
+    "version": "local-v1",
+    "task_id": "swe-bench-lite-first-20-opencode-qwen3-8b"
+  },
+  "metric": {
+    "unit": "resolved",
+    "direction": "higher_is_better"
+  },
+  "dataset": {
+    "source": "shsym/test-time-bench:benchmarks/swe-bench-lite-first-20/dataset.json",
+    "schema": "test-time-bench/dataset-snapshot.v2",
+    "cases": 20,
+    "note": "Fetched, not vendored \u2014 the snapshot lives in a private repo and carries its own LICENSE-DATA. It pins the rendered prompt alongside repo/base_commit, so a prompt change is a dataset version change rather than a silent harness edit. That is the property this repo's own PROMPT constant lacks."
+  },
+  "execution": {
+    "mode": "agentic",
+    "environment": {
+      "kind": "swe_bench_repo"
+    },
+    "agent": {
+      "kind": "opencode",
+      "version": "1.18.18",
+      "finish_artifact": "git_diff",
+      "note": "opencode owns its own system prompt, plan discipline and tool set. TTB's agent stanza (system_prompt / user_prompt_template) does not apply: layering a second workflow over a black-box CLI would measure the emulation rather than the agent."
+    },
+    "decoder": {
+      "model_ref": "models/qwen3-8b.toml",
+      "execution_profile_ref": "execution-profiles/local-metal-48gb.toml",
+      "note": "Identity and hardware are split the way TTB splits them (configs/models vs configs/execution-profiles) 'so model comparisons do not absorb hardware'. Deltas from TTB's registration and engine cell are recorded in those two files, including that this box serves the MLX bf16 repack rather than TTB's pinned Qwen/Qwen3-8B safetensors.",
+      "comparability": "A run under this profile is comparable to another run under this profile. It is NOT comparable to a TTB leaderboard row for qwen3-8b: different artifact, different hardware, and an external agent in place of TTB's agent_loop.rs."
+    }
+  },
+  "budgets": {
+    "max_wall_time_s": {
+      "value": 1800,
+      "enforced": true,
+      "mechanism": "subprocess timeout in run_swebench.py; on expiry whatever the agent has written to disk is still captured and graded"
+    },
+    "max_agent_steps": {
+      "value": null,
+      "enforced": false,
+      "reason": "opencode exposes no step cap (`opencode run --help`: no such flag). Declared null rather than aspirationally \u2014 TTB's own H1 audit is a config declaring max_steps: 1 while runs used a hardcoded 64."
+    },
+    "max_model_calls": {
+      "value": null,
+      "enforced": false,
+      "reason": "not exposed by opencode; measured after the fact from opencode's session store instead of bounded"
+    },
+    "max_output_tokens": {
+      "value": 4096,
+      "enforced": true,
+      "scope": "per model call, not per run",
+      "mechanism": "`limit.output` in integrations/opencode/opencode.json; there is no run-level token budget"
+    }
+  },
+  "scoring": {
+    "policy": "harness",
+    "harness": {
+      "kind": "official-swebench",
+      "dataset_name": "SWE-bench/SWE-bench_Lite",
+      "dataset_name_note": "Lite, NOT Verified \u2014 verified by lookup: all 20 of these ids are in SWE-bench_Lite and only 8 are in SWE-bench_Verified. The rest of this repo grades against Verified, so the grader dataset travels with the instance set rather than being a harness-wide constant.",
+      "note": "TTB pins its scorer as an image DIGEST (sslee0cs/ttb-swe-bench-scorer@sha256:ca4bd811...). This profile runs the official harness locally; the analogous pinning is images/digests.json, written by pin_images.sh from what was actually pulled. `:latest` is not reproducible and is not used for a recorded run.",
+      "images_note": "images/digests.json pins all 31 grader images present: the 20 for this lite-20 set plus the 11 for the Verified known-solvable set used elsewhere in this repo. pin_images.sh verify passes. Re-pin only deliberately \u2014 a silent change there changes what a recorded number means."
+    }
+  },
+  "reporting": {
+    "artifact": "inferletbench.run_summary.v2",
+    "emitter": "integrations/opencode/ttb_summary.py",
+    "telemetry_source": "opencode.db (agent-side accounting: tokens_input/tokens_output/assistant-message count per directory-scoped session)"
+  }
+}

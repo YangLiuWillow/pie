@@ -44,6 +44,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -55,7 +56,19 @@ import tempfile
 import time
 from pathlib import Path
 
+# Two copies of the same benchmark, and they are not interchangeable.
+#
+# DATASET drives. It stays on `princeton-nlp/…` because the seeded subset is
+# defined by ROW INDEX into this copy (`load_problems`), so switching it would
+# silently redefine what `--n 5` means and break the "same 5 next week"
+# guarantee this harness is built on.
+#
+# SCORING_DATASET grades. SWE-bench 5.0's harness reads an `image` column that
+# the princeton-nlp copy does not have, so passing DATASET to the grader fails
+# outright. Driving needs only problem_statement/repo/base_commit, which both
+# copies carry identically, so the split costs nothing.
 DATASET = "princeton-nlp/SWE-bench_Verified"
+SCORING_DATASET = "SWE-bench/SWE-bench_Verified"
 SPLIT = "test"
 SUBSET_SEED = 1234
 
@@ -141,6 +154,36 @@ def load_problems(n: int, seed: int = SUBSET_SEED, instances: list[str] | None =
     return [ds[i] for i in idx]
 
 
+def load_snapshot(path: Path, n: int | None = None):
+    """Cases from a `test-time-bench/dataset-snapshot.v2` file.
+
+    The snapshot is the source of truth for the PROMPT, not merely the case
+    list: each case carries a fully rendered `input`, so changing the prompt
+    means publishing a new dataset version. `PROMPT` in this module has no such
+    property — it can be edited between two runs that then get compared.
+
+    Returned rows are shaped like the HuggingFace rows the rest of this file
+    consumes, plus `_prompt`, which `main` uses verbatim when present.
+    """
+    d = json.loads(path.read_text())
+    if d.get("schema") != "test-time-bench/dataset-snapshot.v2":
+        raise SystemExit(f"unexpected snapshot schema: {d.get('schema')}")
+    rows = []
+    for c in d["cases"][: n or len(d["cases"])]:
+        g = c.get("grading") or {}
+        rows.append({
+            "instance_id": c["id"],
+            "repo": g.get("repo"),
+            "base_commit": g.get("base_commit"),
+            "problem_statement": "",   # unused: `_prompt` is authoritative here
+            "_prompt": c["input"],
+        })
+    missing = [r["instance_id"] for r in rows if not (r["repo"] and r["base_commit"])]
+    if missing:
+        raise SystemExit(f"snapshot cases lack repo/base_commit: {missing}")
+    return rows
+
+
 def prepare_workspace(row: dict, root: Path) -> Path:
     """A clean checkout of `repo` at `base_commit`.
 
@@ -159,8 +202,22 @@ def prepare_workspace(row: dict, root: Path) -> Path:
     return ws
 
 
-def capture_patch(ws: Path) -> str:
-    """The agent's diff, staged first so created files are included.
+def capture_patch(ws: Path, base: str = "HEAD") -> str:
+    """The agent's diff against the BASE COMMIT, staged first so created files
+    are included.
+
+    Against `base`, not `HEAD`, and that distinction silently discarded real
+    work: opencode's agent finishes by *committing*. `git add -A` then
+    `diff --cached HEAD` compares the index to HEAD, so once the agent commits,
+    HEAD already contains the fix, index == HEAD, and the diff is EMPTY. The
+    harness then records a 0-byte patch for a case the model actually solved,
+    and it looks exactly like an agent that did nothing.
+
+    Measured: two Qwen3-8B cases each ran `edit` → `git add` → `git commit`
+    ("1 file changed, 4 insertions(+)") and both were captured as empty.
+    Diffing against the base commit captures committed and uncommitted work
+    alike. (The earlier Coder-30B runs were checked and have 0 commits past
+    base, so their recorded patches are unaffected.)
 
     See the module docstring: a plain `git diff HEAD` loses every new file,
     which on this benchmark means losing reproduction scripts and sometimes
@@ -175,7 +232,7 @@ def capture_patch(ws: Path) -> str:
     (ws / "opencode.json").unlink(missing_ok=True)
     subprocess.run(["git", "add", "-A"], cwd=ws, capture_output=True, text=True)
     res = subprocess.run(
-        ["git", "--no-pager", "diff", "--no-color", "--cached", "HEAD"],
+        ["git", "--no-pager", "diff", "--no-color", "--cached", base],
         cwd=ws, capture_output=True, text=True,
     )
     return res.stdout
@@ -213,11 +270,23 @@ def run_agent(ws: Path, prompt: str, model: str, opencode: str, timeout: int, tr
         # it is also how a person runs this, so it is the faithful invocation
         # rather than merely the lucky one.
         cmd = " ".join(shlex.quote(a) for a in [opencode, "run", "-m", model, prompt])
+        # Output goes to a FILE, not a pipe, and this is not a style choice.
+        # `capture_output=True` hands every descendant an inheritable pipe, and
+        # opencode starts a local server: when that server outlives the CLI,
+        # `communicate()` blocks waiting for EOF that never comes — *including
+        # after* the timeout fires and kills the child, because the pipe still
+        # has a writer. Observed directly: opencode logged `init`, exited, and
+        # the driver sat in `poll()` for 21 minutes with no child process at
+        # all. A file has no such lifetime coupling, and it leaves a per-case
+        # log worth reading afterwards.
+        log_path = ws.parent / f"{ws.name}.opencode.log"
         try:
-            p = subprocess.run(
-                ["/bin/zsh", "-c", cmd],
-                cwd=ws, capture_output=True, text=True, timeout=timeout,
-            )
+            with open(log_path, "ab") as logf:
+                p = subprocess.run(
+                    ["/bin/zsh", "-c", cmd],
+                    cwd=ws, stdout=logf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, text=False, timeout=timeout,
+                )
         except subprocess.TimeoutExpired:
             # A timeout is a result: whatever the agent had written to disk by
             # then is still its answer, and is captured by the caller.
@@ -225,7 +294,12 @@ def run_agent(ws: Path, prompt: str, model: str, opencode: str, timeout: int, tr
         if p.returncode == 0:
             return True, time.time() - t0, ""
         elapsed = time.time() - start
-        note = f"exit {p.returncode}: {p.stderr.strip()[:200]}"
+        tail = ""
+        try:
+            tail = log_path.read_text(errors="replace")[-200:].strip()
+        except OSError:
+            pass
+        note = f"exit {p.returncode}: {tail}"
         if elapsed > 10 or attempt == tries:
             return False, time.time() - t0, note
         print(f"    startup failure in {elapsed:.0f}s, retrying ({attempt}/{tries - 1})")
@@ -246,6 +320,11 @@ def main() -> int:
                     help="use instances this model family has already solved "
                          "(see KNOWN_SOLVABLE_BOTH) instead of a seeded subset")
     ap.add_argument("--instances", nargs="+", help="explicit instance ids")
+    ap.add_argument("--dataset-snapshot",
+                    help="a test-time-bench dataset-snapshot.v2 file. Drives from ITS "
+                         "cases and ITS rendered prompts instead of the HF dataset and "
+                         "this module's PROMPT constant, so the prompt is pinned by a "
+                         "dataset version rather than by an editable string here.")
     ap.add_argument("--restart-cmd",
                     help="shell command run BEFORE each instance, e.g. a fresh "
                          "`pie serve`. Isolates the server-wear defect so an "
@@ -256,16 +335,32 @@ def main() -> int:
     label = args.label or args.model.replace("/", "-")
     root = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="swebench-"))
     root.mkdir(parents=True, exist_ok=True)
+    # RESOLVED once, here, so every consumer agrees on one spelling of the path.
+    # On macOS `/tmp` is a symlink to `/private/tmp`, and opencode's permission
+    # gate compares the tool's target against the project directory TEXTUALLY:
+    # a tool call naming `/tmp/...` inside a project opencode knows as
+    # `/private/tmp/...` reads as outside the workspace, so it is auto-rejected
+    # with no TTY to approve it. Measured across two cases of one run: the case
+    # whose model happened to emit `/private/tmp/...` completed 19 tool calls,
+    # while the case that copied the prompt's `/tmp/...` had its FIRST call
+    # rejected and stopped. Same harness, same model — the difference was which
+    # spelling the model echoed, which also makes the failure intermittent.
+    root = root.resolve()
     print(f"workspaces: {root}")
 
-    chosen = args.instances or (KNOWN_SOLVABLE_BOTH[: args.n] if args.known_solvable else None)
-    problems = load_problems(args.n, instances=chosen)
+    if args.dataset_snapshot:
+        problems = load_snapshot(Path(args.dataset_snapshot), args.n if args.n else None)
+        print(f"driving from snapshot {args.dataset_snapshot} "
+              f"(sha256 {hashlib.sha256(Path(args.dataset_snapshot).read_bytes()).hexdigest()[:16]}…)")
+    else:
+        chosen = args.instances or (KNOWN_SOLVABLE_BOTH[: args.n] if args.known_solvable else None)
+        problems = load_problems(args.n, instances=chosen)
     if args.restart_cmd:
         print("restarting the server before each instance — the wear defect is "
               "being ISOLATED, not fixed\n")
     print(f"{len(problems)} instances: {[p['instance_id'] for p in problems]}\n")
 
-    rows, summary = [], []
+    rows, summary, substitutions = [], [], []
     for i, row in enumerate(problems, 1):
         iid = row["instance_id"]
         print(f"[{i}/{len(problems)}] {iid} ({row['repo']}) …", flush=True)
@@ -273,7 +368,19 @@ def main() -> int:
             r = subprocess.run(["/bin/zsh", "-c", args.restart_cmd],
                                capture_output=True, text=True)
             if r.returncode != 0:
-                print(f"    restart FAILED: {r.stderr.strip()[:200]}")
+                # FATAL. A failed restart leaves the agent talking to a dead or
+                # stale server, and every downstream signal then lies: the agent
+                # errors out in ~60 s, the patch is 0 bytes, and the row is
+                # indistinguishable from a model that tried and failed. Observed
+                # exactly once, and it cost a run: the reboot hit
+                # "does not fit the memory this machine has left" while a 14 GB
+                # grader VM was resident, and the case was recorded as
+                # `agent-error` with an empty patch.
+                raise SystemExit(
+                    f"FATAL: restart-cmd failed before {iid} "
+                    f"(exit {r.returncode}). Refusing to drive against a server "
+                    f"this run did not start.\n"
+                    f"{(r.stderr or r.stdout).strip()[-400:]}")
         try:
             ws = prepare_workspace(row, root)
         except subprocess.CalledProcessError as e:
@@ -282,27 +389,88 @@ def main() -> int:
             rows.append({"instance_id": iid, "model_name_or_path": label, "model_patch": ""})
             continue
 
-        prompt = PROMPT.format(repo=row["repo"], problem_statement=row["problem_statement"])
+        # A snapshot's rendered prompt wins: re-wrapping it in this module's
+        # template would measure our re-rendering, not the pinned benchmark.
+        #
+        # ONE substitution is applied, and it is not optional: TTB's snapshot
+        # prompts hardcode `Worktree: /workspace/<repo>`, which is the layout
+        # of TTB's own eval-worker CONTAINER. Outside that container the path
+        # does not exist, and the observed failure is silent rather than loud —
+        # the agent obediently globs `/workspace/...`, opencode's permission
+        # gate fires because it is outside the workspace, the call is
+        # auto-rejected with no TTY to approve it, and the agent stops after
+        # one model call having done nothing. Measured: 1 model call, ~30
+        # output tokens, 0-byte patch, `state: ok`.
+        case_started_ms = int(time.time() * 1000)
+        prompt = row.get("_prompt")
+        if prompt:
+            container = f"/workspace/{row['repo'].split('/')[-1]}"
+            prompt, subs = prompt.replace(container, str(ws)), prompt.count(container)
+            if subs == 0:
+                # Loud, because a snapshot whose worktree convention changed
+                # would otherwise reintroduce the silent failure above.
+                raise SystemExit(
+                    f"{iid}: snapshot prompt names no worktree matching {container!r}; "
+                    "the container-path rebind found nothing to rebind")
+            substitutions.append({"case_id": iid, "from": container,
+                                  "to": str(ws), "count": subs})
+        else:
+            prompt = PROMPT.format(repo=row["repo"],
+                                   problem_statement=row["problem_statement"])
         ok, secs, note = run_agent(ws, prompt, args.model, args.opencode, args.timeout)
-        patch = capture_patch(ws)
+        patch = capture_patch(ws, row.get("base_commit") or "HEAD")
         # The patch is what counts, not the exit code: an agent that timed out
         # having already written a correct fix is still graded on the fix.
         state = "ok" if ok else ("timeout" if "timeout" in note else "agent-error")
         print(f"    {state} in {secs:.0f}s, patch {len(patch)} bytes"
               + (f" — {note}" if note and state != "ok" else ""))
-        summary.append((iid, state, secs, len(patch)))
+        summary.append((iid, state, secs, len(patch), case_started_ms))
         rows.append({"instance_id": iid, "model_name_or_path": label, "model_patch": patch})
 
     Path(args.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
     print(f"\nwrote {args.out}")
+
+    # Per-case record for `ttb_summary.py`, which joins it against opencode's
+    # own token accounting to produce a `test-time-bench`-shaped run summary.
+    # Emitted always, not behind a flag: it is three fields the loop already
+    # has, and the runs that most needed it are the ones nobody thought to ask
+    # for it on. `workspace` is the join key — opencode sessions are
+    # directory-scoped, so it is what links a case to its telemetry.
+    if substitutions:
+        subs_path = Path(args.out).with_suffix(".prompt-rebind.json")
+        subs_path.write_text(json.dumps(
+            {"note": "TTB snapshot prompts hardcode the container worktree "
+                     "`/workspace/<repo>`; each case's prompt had it rebound to the "
+                     "real checkout. Without this the agent is permission-blocked "
+                     "on a path that does not exist and stops after one call.",
+             "substitutions": substitutions}, indent=2) + "\n")
+        print(f"wrote {subs_path} ({len(substitutions)} prompts rebound)")
+
+    cases_path = Path(args.out).with_suffix(".cases.jsonl")
+    cases_path.write_text("".join(
+        json.dumps({"case_id": iid, "state": state, "seconds": round(secs, 1),
+                    # When this case started, so telemetry joins to THIS run.
+                    # A re-run into the same TTB_OUT_DIR leaves the previous
+                    # run's sessions at the identical workspace path, and a
+                    # directory-only join silently sums both — observed: 6
+                    # model calls and 490 s reported for a 5-call, 426 s run.
+                    "started_ms": started_ms,
+                    "patch_bytes": nbytes,
+                    # RESOLVED: on macOS /tmp is a symlink to /private/tmp, and
+                    # opencode stores the resolved path. Recording the symlink
+                    # made every telemetry join miss silently — 0 tokens, 0
+                    # model calls, on cases that had really run.
+                    "workspace": str((root / iid).resolve())}) + "\n"
+        for iid, state, secs, nbytes, started_ms in summary))
+    print(f"wrote {cases_path}")
     print(f"{'instance':<34} {'state':<14} {'secs':>7} {'patch B':>8}")
-    for iid, state, secs, n in summary:
+    for iid, state, secs, n, _ in summary:
         print(f"{iid:<34} {state:<14} {secs:>7.0f} {n:>8}")
-    nonempty = sum(1 for _, _, _, n in summary if n > 0)
+    nonempty = sum(1 for _, _, _, n, _ in summary if n > 0)
     print(f"\n{nonempty}/{len(summary)} produced a non-empty patch.")
     print("Scoring needs Docker:\n"
           f"  python -m swebench.harness.run_evaluation \\\n"
-          f"      --dataset_name {DATASET} --predictions_path {args.out} \\\n"
+          f"      --dataset_name {SCORING_DATASET} --predictions_path {args.out} \\\n"
           f"      --max_workers 4 --run_id pie-opencode")
     return 0
 

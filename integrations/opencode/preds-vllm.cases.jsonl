@@ -1,0 +1,2 @@
+{"case_id": "django__django-12276", "state": "agent-error", "seconds": 79.7, "started_ms": 1786720697771, "patch_bytes": 0, "workspace": "/private/var/folders/_q/mhz4yy950wq7jjbvvvm6g_bw0000gn/T/swebench-6x_04sao/django__django-12276"}
+{"case_id": "django__django-13028", "state": "agent-error", "seconds": 64.6, "started_ms": 1786720780953, "patch_bytes": 0, "workspace": "/private/var/folders/_q/mhz4yy950wq7jjbvvvm6g_bw0000gn/T/swebench-6x_04sao/django__django-13028"}

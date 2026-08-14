@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, bail};
 use pie_model_common::instruct::Instruct;
-use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
+use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolDialect};
 use pie_openai_serving::render::{RenderOp, plan_render};
 use pie_openai_serving::types::ChatCompletionRequest;
 use pie_tokenizer::Tokenizer;
@@ -49,12 +49,29 @@ fn main() -> Result<()> {
     let request: ChatCompletionRequest =
         serde_json::from_value(value).context("deserializing ChatCompletionRequest")?;
 
-    // The exact config `model/src/instruct.rs::create` binds for "qwen3".
+    // The exact config `model/src/instruct.rs::create` binds for "qwen3" —
+    // including the tool dialect, which is decided by that module's OWN
+    // predicate rather than a copy of it. Rendering Coder's XML dialect as
+    // Hermes JSON (or the reverse) produces a prompt the server never sends,
+    // and this harness would then certify parity against a fiction. The model
+    // name is taken from the tokenizer path, which names the checkpoint;
+    // `PARITY_MODEL_NAME` overrides it when the path does not.
+    let model_name = std::env::var("PARITY_MODEL_NAME").unwrap_or_else(|_| args[1].clone());
+    let coder = pie_model::instruct::is_coder_lineage("qwen3", &model_name);
+    // ONE predicate drives both halves, because that is how the server binds
+    // them: "a checkpoint with no thinking channel is the Coder release, and
+    // the Coder release speaks XML tool calls." `has_thinking` was hardcoded
+    // `true` here, so a Coder render carried an empty `<think></think>` cue
+    // the server never emits — 4 tokens of pure harness artifact, reported as
+    // a pie-vs-vLLM divergence.
+    let tool_dialect = if coder { ToolDialect::Coder } else { ToolDialect::Hermes };
+    eprintln!("[render-tokens] coder={coder} tool_dialect={tool_dialect:?} (from {model_name})");
     let instruct = QwenInstruct::new(
         tokenizer.clone(),
         ChatMLConfig {
-            has_thinking: true,
+            has_thinking: !coder,
             has_tools: true,
+            tool_dialect,
             generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },

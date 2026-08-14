@@ -1,0 +1,76 @@
+{
+  "schema": "test-time-bench/benchmark-config.v3-local-profile",
+  "schema_note": "Mirrors TTB's benchmark-config.v3 SHAPE and is consumed by this repo's runner. It is deliberately NOT claimed to be a valid v3 document: it has never been validated by TTB's backend, and `execution.agent` here is an external agent process rather than TTB's `agent_loop.rs`. Validating against the real schema is the upstream-port step.",
+  "identity": {
+    "suite_slug": "swe-bench-verified-known-solvable",
+    "version": "fair-rerun-v1",
+    "task_id": "swe-bench-known-solvable-opencode-qwen3-coder-30b"
+  },
+  "metric": {
+    "unit": "resolved",
+    "direction": "higher_is_better"
+  },
+  "dataset": {
+    "source": "run_swebench.py:KNOWN_SOLVABLE_BOTH (11 instances)",
+    "provenance": "the resolved_ids of litellm+qwen3-coder-30b-a3b-t0 on a neutral 50, scored by the official grader on the OpenHands branch",
+    "note": "A DEBUGGING INSTRUMENT, not a resolve rate: on instances this model family has already solved, a zero is attributable to the stack. It is model-specific by construction \u2014 valid for Coder-30B, meaningless for a weaker model.",
+    "prompt_source": "run_swebench.py PROMPT constant (NOT a pinned dataset snapshot \u2014 this set has no snapshot, so the prompt is not version-pinned here)"
+  },
+  "execution": {
+    "mode": "agentic",
+    "environment": {
+      "kind": "swe_bench_repo"
+    },
+    "agent": {
+      "kind": "opencode",
+      "version": "1.18.18",
+      "finish_artifact": "git_diff",
+      "note": "opencode owns its own system prompt, plan discipline and tool set. TTB's agent stanza (system_prompt / user_prompt_template) does not apply: layering a second workflow over a black-box CLI would measure the emulation rather than the agent. Both arms restart the server per instance; asymmetric restarts produced a flattering number here once already."
+    },
+    "decoder": {
+      "model_id": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+      "artifact": "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit",
+      "execution_profile_ref": "execution-profiles/local-metal-48gb.toml",
+      "quantization": "int4 (affine-U4, mlx-community conversion)",
+      "note": "Both arms serve this same file. Not a TTB-registered model: TTB's configs/models has no Coder-30B entry, so there is no upstream pin to match and no TTB row to compare against."
+    }
+  },
+  "budgets": {
+    "max_wall_time_s": {
+      "value": 1800,
+      "enforced": true,
+      "mechanism": "subprocess timeout in run_swebench.py; on expiry whatever the agent has written to disk is still captured and graded"
+    },
+    "max_agent_steps": {
+      "value": null,
+      "enforced": false,
+      "reason": "opencode exposes no step cap (`opencode run --help`: no such flag). Declared null rather than aspirationally \u2014 TTB's own H1 audit is a config declaring max_steps: 1 while runs used a hardcoded 64."
+    },
+    "max_model_calls": {
+      "value": null,
+      "enforced": false,
+      "reason": "not exposed by opencode; measured after the fact from opencode's session store instead of bounded"
+    },
+    "max_output_tokens": {
+      "value": 4096,
+      "enforced": true,
+      "scope": "per model call, not per run",
+      "mechanism": "`limit.output` in integrations/opencode/opencode.json; there is no run-level token budget"
+    }
+  },
+  "scoring": {
+    "policy": "harness",
+    "harness": {
+      "kind": "official-swebench",
+      "dataset_name": "SWE-bench/SWE-bench_Verified",
+      "dataset_name_note": "Verified, because KNOWN_SOLVABLE_BOTH is defined over Verified.",
+      "note": "TTB pins its scorer as an image DIGEST (sslee0cs/ttb-swe-bench-scorer@sha256:ca4bd811...). This profile runs the official harness locally; the analogous pinning is images/digests.json, written by pin_images.sh from what was actually pulled. `:latest` is not reproducible and is not used for a recorded run.",
+      "images_note": "images/digests.json pins all 31 grader images present: the 20 for this lite-20 set plus the 11 for the Verified known-solvable set used elsewhere in this repo. pin_images.sh verify passes. Re-pin only deliberately \u2014 a silent change there changes what a recorded number means."
+    }
+  },
+  "reporting": {
+    "artifact": "inferletbench.run_summary.v2",
+    "emitter": "integrations/opencode/ttb_summary.py",
+    "telemetry_source": "opencode.db (agent-side accounting: tokens_input/tokens_output/assistant-message count per directory-scoped session)"
+  }
+}

@@ -1,0 +1,5 @@
+# The dataset snapshot is FETCHED, never committed: it belongs to the private
+# `shsym/test-time-bench` and carries its own LICENSE-DATA. `fetch_dataset.sh`
+# writes it here for convenience; committing it would relicense private
+# benchmark data by accident.
+dataset.*.json

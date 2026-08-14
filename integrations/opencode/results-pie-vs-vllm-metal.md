@@ -207,3 +207,12 @@ grep -oE "Prefix cache hit rate: [0-9.]+%" <server log> | tail -1   # NOT usage.
 Tool calling needs `--enable-auto-tool-choice --tool-call-parser <hermes|qwen3_coder>`
 on vLLM or every request with `tools` 400s; pie has it built in. Qwen3.6 takes
 `hermes`, Qwen3-Coder takes `qwen3_coder`.
+
+> **This block is the A/B bench's config, not the agent arm's.** `coder30b` is
+> the name `bench_ab.py` and `parity/check_render_vllm.py` pass; **opencode
+> sends `qwen3-coder-30b`** and fails with an unrelated-looking
+> `UnknownError` if the server does not answer to it. `--max-model-len 16384`
+> is likewise the number matched for *this* measurement; the agent arm runs at
+> 32768. For driving opencode, use the boot command in
+> `results-swebench.md` — `--served-model-name` takes a list, so one server can
+> answer to both names.

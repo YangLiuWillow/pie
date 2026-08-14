@@ -1,0 +1,2 @@
+{"case_id": "django__django-12276", "state": "ok", "seconds": 47.3, "started_ms": 1786720859583, "patch_bytes": 411, "workspace": "/private/var/folders/_q/mhz4yy950wq7jjbvvvm6g_bw0000gn/T/swebench-1n_96k3x/django__django-12276"}
+{"case_id": "django__django-13028", "state": "timeout", "seconds": 1800.0, "started_ms": 1786720910418, "patch_bytes": 0, "workspace": "/private/var/folders/_q/mhz4yy950wq7jjbvvvm6g_bw0000gn/T/swebench-1n_96k3x/django__django-13028"}

@@ -1,0 +1,238 @@
+{
+  "summary": {
+    "arm": "pie-b",
+    "concurrency": 8,
+    "requests": 32,
+    "completed": 6,
+    "failed": 26,
+    "wall_s": 12.758,
+    "output_tokens": 768,
+    "prompt_tokens": 469,
+    "output_tok_per_s": 60.2,
+    "prompt_tok_per_s": 36.8,
+    "req_per_s": 0.47,
+    "latency_mean_s": 7.3,
+    "latency_p50_s": 8.98,
+    "latency_p95_s": 12.75
+  },
+  "requests": [
+    {
+      "ok": true,
+      "latency": 1.8945409580000003,
+      "completion_tokens": 128,
+      "prompt_tokens": 75
+    },
+    {
+      "ok": true,
+      "latency": 10.862433667,
+      "completion_tokens": 128,
+      "prompt_tokens": 78
+    },
+    {
+      "ok": true,
+      "latency": 12.752384417,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": false,
+      "latency": 12.753221834,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": true,
+      "latency": 3.7424710000000005,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 5.553567833,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": false,
+      "latency": 12.752318500000001,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": true,
+      "latency": 8.977853041,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": false,
+      "latency": 10.8590865,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 9.010935499999999,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 7.199769791000001,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 3.775250583,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 1.8918565000000012,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0016152910000002407,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010460410000003861,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010487919999988549,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0013547500000008483,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.001394332999998582,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010422500000011325,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.00109491699999964,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0013254160000002457,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.00109437500000098,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0019079170000004808,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010984999999994471,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010546250000000867,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010966250000006283,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010121249999990312,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010305000000006004,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0010235830000002721,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.000968624999998724,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0006944579999998979,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    },
+    {
+      "ok": false,
+      "latency": 0.0005372920000006332,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 500: Error"
+    }
+  ]
+}

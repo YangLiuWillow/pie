@@ -1,0 +1,51 @@
+# Execution profile: this laptop. Mirrors the role of TTB's
+# configs/execution-profiles/runpod-*.toml — hardware and execution settings,
+# held apart from model identity so a model comparison does not absorb hardware.
+#
+# TTB's profiles are all RunPod GPU pods; this is the local analogue, and it is
+# NOT one of theirs. A run produced under this profile is comparable to another
+# run under this profile, and is not comparable to a TTB leaderboard row.
+
+profile_id = "local-metal-48gb"
+provider = "local"
+hardware_class = "Apple M-series, 48 GB unified memory"
+device_count = 1
+tensor_parallel_size = 1
+
+# Allowed modes, in TTB's vocabulary. `agentic` only: the whole point of this
+# integration is an external coding agent driving a real repository, and
+# `one_shot` would measure a different thing entirely.
+execution_modes = ["agentic"]
+
+# ── Engine settings, and the deltas from TTB's qwen3-8b-cuda0.toml ───────────
+# Upstream cell (quoted):
+#   tensor_parallel_size = 1        -> matched
+#   activation_dtype = "bfloat16"   -> matched (this is why the bf16 repack was
+#                                      chosen over the 4-bit one)
+#   gpu_mem_utilization = 0.85      -> NOT APPLICABLE. The Metal driver does not
+#                                      size its KV pool from a utilization
+#                                      fraction; it derives it from
+#                                      max_model_len and clamps total_pages to
+#                                      it (driver/metal/src/context.cpp:245).
+#                                      See results-swebench.md.
+#   device = ["cuda:0"]             -> metal:0
+activation_dtype = "bfloat16"
+device = ["metal:0"]
+
+# 32768 matches the model's registered context_length and TTB's note that the
+# native 32K context "leaves ample headroom while avoiding model-specific
+# context tuning". On this driver it ALSO sizes the KV pool — one number for
+# both the per-sequence ceiling and the fleet-wide ring — so the pool below is
+# a consequence of this line, not an independent knob.
+max_model_len = 32768
+kv_page_size = 32
+# Derived: 32768/32. Recorded for review only. The value that goes into a run
+# summary is READ from PIE_KV_TRACE at boot, never computed here — three layers
+# own a `total_pages` and the one you would edit is not the one that decides.
+expected_kv_pool_pages = 1024
+
+# Both arms of a comparison boot through their helper, which proves the live
+# process is the one it started. Asymmetric restarts produced a flattering
+# number here once already.
+boot_pie = "integrations/opencode/tools/boot_pie.sh"
+boot_vllm = "integrations/opencode/tools/boot_vllm.sh"

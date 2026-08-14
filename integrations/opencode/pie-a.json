@@ -1,0 +1,236 @@
+{
+  "summary": {
+    "arm": "pie-a",
+    "concurrency": 8,
+    "requests": 32,
+    "completed": 8,
+    "failed": 24,
+    "wall_s": 2.673,
+    "output_tokens": 16,
+    "prompt_tokens": 627,
+    "output_tok_per_s": 6.0,
+    "prompt_tok_per_s": 234.6,
+    "req_per_s": 2.993,
+    "latency_mean_s": 2.65,
+    "latency_p50_s": 2.67,
+    "latency_p95_s": 2.67
+  },
+  "requests": [
+    {
+      "ok": true,
+      "latency": 2.6234825829999995,
+      "completion_tokens": 1,
+      "prompt_tokens": 75
+    },
+    {
+      "ok": true,
+      "latency": 2.6237435419999997,
+      "completion_tokens": 5,
+      "prompt_tokens": 78
+    },
+    {
+      "ok": true,
+      "latency": 2.6234393330000003,
+      "completion_tokens": 1,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 2.6721031670000004,
+      "completion_tokens": 1,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 2.6722752089999995,
+      "completion_tokens": 5,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 2.6721165829999993,
+      "completion_tokens": 1,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 2.6718301669999995,
+      "completion_tokens": 1,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 2.671883874999999,
+      "completion_tokens": 1,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": false,
+      "latency": 0.0007762919999994011,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00045820800000129225,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0004500830000004896,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0007520420000002304,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00042654100000127926,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0005734579999998601,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0007916669999996628,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00044754100000155006,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0004769580000001383,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.000472458999999148,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0006833749999994865,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0004243749999996993,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00025270899999974006,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00044774999999930287,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0004923330000004,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0003262080000006051,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0004168339999992554,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00040512500000033924,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.00034866700000080186,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0003676670000007931,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0003384999999997973,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0003577089999993177,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0003346249999989226,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    },
+    {
+      "ok": false,
+      "latency": 0.0002438329999989719,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "error": "HTTPError: HTTP Error 503: Service Unavailable"
+    }
+  ]
+}

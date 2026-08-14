@@ -14,6 +14,9 @@ path = "src/main.rs"
 pie-openai-serving = { path = "../../../../inferlets/openai-serving" }
 pie-model-qwen-3 = { path = "../../../../model/qwen_3", features = ["chat"] }
 pie-model-common = { path = "../../../../model/common", features = ["chat"] }
+# For `is_coder_lineage` — the dialect predicate the SERVER uses. Linked so
+# this harness cannot drift from it.
+pie-model = { path = "../../../../model", features = ["chat"] }
 pie-tokenizer = { path = "../../../../runtime/tokenizer" }
 serde_json = "1.0"
 anyhow = "1.0"

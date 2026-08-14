@@ -1,0 +1,58 @@
+# Identity-only model registry config, in test-time-bench's format. Execution
+# settings live under ../execution-profiles/ so model comparisons do not absorb
+# hardware — TTB's principle, adopted verbatim because the mistake it prevents
+# (a "model comparison" that is really a hardware comparison) is one this repo
+# has already made once, when a KV-pool difference was read as a kernel result.
+#
+# ── Upstream registration, quoted ────────────────────────────────────────────
+# TTB registers this model as `configs/models/qwen3-8b.toml`:
+#
+#   model_id   = "Qwen/Qwen3-8B"
+#   revision   = "b968826d9c46dd6066d109eabc6255188de91218"
+#   sha256     = "sha256:d11fc503fc1e888f1d32060c37f2c517836adc5b7c37a815decbeef9bad98a4a"
+#   engine_config_ref = "configs/engine/qwen3-8b-cuda0.toml"
+#   context_length = 32768
+#
+# That digest is REPRODUCIBLE and was reproduced here before being trusted:
+# sha256 over the sorted "<file> <lfs-sha256>\n" manifest of every *.safetensors
+# shard at the pinned revision (5 shards), read from the HF API without
+# downloading the weights. It matches to the character.
+
+upstream_model_id = "Qwen/Qwen3-8B"
+upstream_revision = "b968826d9c46dd6066d109eabc6255188de91218"
+upstream_sha256 = "sha256:d11fc503fc1e888f1d32060c37f2c517836adc5b7c37a815decbeef9bad98a4a"
+
+# ── What is actually served here, and why it differs ─────────────────────────
+# TTB registers `quantization = ""` — UNQUANTIZED weights, bf16 activations, on
+# CUDA. **That is not reproducible on this hardware at all**, and the attempt
+# is recorded here because the reason is structural rather than a config slip:
+#
+#   [pie-driver-metal] Metal llama needs quantized weights: this checkpoint
+#   carries no `.scales` tensors, so it is unquantized (bf16/fp16), and the
+#   Metal driver binds every projection through its affine-U4 path.
+#
+# `mlx-community/Qwen3-8B-bf16` was imported (15.3 GiB) and pie refused to load
+# it. The Metal llama path has no unquantized route, so matching TTB's weight
+# precision here is impossible, not merely inconvenient. `activation_dtype =
+# "bfloat16"` in TTB's engine cell IS matched — that knob is activations, and
+# the Metal driver runs bf16 activations over int4 weights — but conflating the
+# two is what produced the wasted download, so both are stated separately.
+#
+# So: the 4-bit conversion the driver is built for, which vLLM-metal also
+# serves, keeping the two arms on the SAME file. Pinned by the same recipe as
+# upstream so the claim is checkable:
+model_id = "mlx-community/Qwen3-8B-4bit"
+revision = "545dc4251c05440727734bcd94334791f6ab0192"
+sha256 = "sha256:690df13bc9ffdbf8b6546072d594b9b9548183570f481d456ef195a1836c5692"
+artifact = "mlx-community--Qwen3-8B-4bit"   # the .zt in ~/.pie/models
+
+display_name = "Qwen3 8B (4-bit MLX)"
+provider = "huggingface"
+# THE headline delta from upstream: 4-bit weights against TTB's unquantized.
+# A resolve-rate difference against a TTB row for `qwen3-8b` is at least as
+# likely to be quantization as anything this integration changed.
+quantization = "int4 (affine-U4, mlx-community conversion)"
+size = "8B"
+engine_support = "pie, vllm-metal"
+context_length = 32768
+execution_profile_ref = "../execution-profiles/local-metal-48gb.toml"

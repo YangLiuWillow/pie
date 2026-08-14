@@ -1,0 +1,212 @@
+{
+  "summary": {
+    "arm": "mlx",
+    "concurrency": 8,
+    "requests": 32,
+    "completed": 32,
+    "failed": 0,
+    "wall_s": 20.099,
+    "output_tokens": 4096,
+    "prompt_tokens": 2565,
+    "output_tok_per_s": 203.8,
+    "prompt_tok_per_s": 127.6,
+    "req_per_s": 1.592,
+    "latency_mean_s": 5.02,
+    "latency_p50_s": 5.05,
+    "latency_p95_s": 5.08
+  },
+  "requests": [
+    {
+      "ok": true,
+      "latency": 5.062363625,
+      "completion_tokens": 128,
+      "prompt_tokens": 75
+    },
+    {
+      "ok": true,
+      "latency": 5.059319625,
+      "completion_tokens": 128,
+      "prompt_tokens": 78
+    },
+    {
+      "ok": true,
+      "latency": 5.065124833,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 5.071299916,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 5.074433959,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 5.067955042,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 5.0774550000000005,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 5.0778342499999995,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 4.987989708000001,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 4.988219499999999,
+      "completion_tokens": 128,
+      "prompt_tokens": 79
+    },
+    {
+      "ok": true,
+      "latency": 4.9884383329999995,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.988482791000001,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.988555834,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.9884640000000005,
+      "completion_tokens": 128,
+      "prompt_tokens": 80
+    },
+    {
+      "ok": true,
+      "latency": 4.988315709,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.9883355,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.984548083,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.9843835,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.984248375,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.984937375000001,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.9850748750000005,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.985204542,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.985433625000001,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 4.985470166999999,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.045595833,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.046059458,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.046526625,
+      "completion_tokens": 128,
+      "prompt_tokens": 80
+    },
+    {
+      "ok": true,
+      "latency": 5.046156417000001,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.046351792000001,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.046543416999999,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.046600041,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    },
+    {
+      "ok": true,
+      "latency": 5.046540624999999,
+      "completion_tokens": 128,
+      "prompt_tokens": 81
+    }
+  ]
+}

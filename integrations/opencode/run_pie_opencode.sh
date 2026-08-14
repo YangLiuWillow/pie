@@ -137,15 +137,37 @@ done
 #   vLLM: max_num_batched_tokens=2048, KV pool 193,536 tokens, dtype bfloat16
 #   pie:  max_forward_tokens=2048,     KV pool total_pages*kv_page_size
 #
-# `total_pages = 512` (16,384 tokens) was this repo's inherited default and it
-# is a KV-STARVED setting: raising it to 2048 is worth **1.73x on prefill** at
-# no memory pressure on this box (measured, `results-prefill-profile.md`). It
-# was never memory-forced — the activation pool sat at 24 MB of a 1024 MB
-# budget. Lower it again only if a model will not admit.
+# `total_pages = 512` (16,384 tokens) was this repo's inherited default.
+#
+# ⚠ THIS KNOB DOES NOT SET THE POOL. `driver/metal/src/context.cpp:245` returns
+# `min(total_pages, ceil(max_model_len / kv_page_size))`, so it can only ever
+# LOWER the pool, never raise it past the context ring. The 2048 here has been
+# clamped to 512 since `max_model_len` was added below — see there.
+#
+# It also does not buy prefill. This comment used to claim raising 512→2048 was
+# "worth 1.73x on prefill"; that change moved `max_forward_tokens` 1024→2048 at
+# the same time and only the pair was measured. Isolated since (Coder-30B,
+# chunk held at 2048, only `max_model_len` moved, pool read from
+# `PIE_KV_TRACE`): 2048/1024/512 pages give 597.2/593.9/598.0 tok/s marginal —
+# a 4x pool for a 0.7% spread, non-monotonic. See `results-prefill-profile.md`.
 PIE_TOTAL_PAGES="${PIE_TOTAL_PAGES:-2048}"
 # Context ceiling. A prompt longer than this is REFUSED by the Metal driver,
 # not chunked, so an agent benchmark that explores a real repo needs headroom
 # that a chat replay does not.
+#
+# It is ALSO the KV pool, and that is not obvious: this one number sizes both
+# the per-sequence ceiling and the fleet-wide ring, and the pool is clamped to
+# the ring, so `pool == exactly one max-length sequence`. Effective pool here,
+# with `total_pages` 2048 and `kv_page_size` 32 (each verified against
+# `PIE_KV_TRACE=1`'s `avail=`):
+#
+#   max_model_len 16384 ->  512 pages ( 16,384 tokens)  <- the KV-STARVED value
+#   max_model_len 32768 -> 1024 pages ( 32,768 tokens)     the agent runs' value
+#   max_model_len 65536 -> 2048 pages ( 65,536 tokens)     what 2048 asks for
+#
+# So adding this knob for agent headroom silently reverted the 1.73x raise
+# above, back to the exact setting it was measured against. Nothing warned.
+# 65536 boots and serves the Coder-30B on this box (17.18 GB of weights, 2026-08-13).
 PIE_MAX_MODEL_LEN="${PIE_MAX_MODEL_LEN:-16384}"
 PIE_KV_PAGE_SIZE="${PIE_KV_PAGE_SIZE:-32}"
 PIE_MAX_FORWARD_TOKENS="${PIE_MAX_FORWARD_TOKENS:-2048}"
@@ -154,6 +176,15 @@ PIE_MODEL="${PIE_MODEL:-qwen3-0.6b}"
 case "$PIE_MODEL" in
     qwen3-0.6b)       ARTIFACT="Qwen--Qwen3-0.6B-optimized" ;;
     qwen3.6-35b-a3b)  ARTIFACT="mlx-community--Qwen3.6-35B-A3B-4bit" ;;
+    # Both of these are declared in opencode.json and were missing here, so the
+    # documented contract above ("PIE_MODEL=x and `opencode run -m pie/x` name
+    # the same thing") did not hold for them. Strategy A never noticed — the
+    # gateway ingress ignores the model id — but strategy B's shim advertises
+    # $PIE_MODEL as the id on /v1/models, and opencode matches its config
+    # against that. Serving the artifact name there makes every request miss
+    # with a model-not-found that looks like a server fault.
+    qwen3-coder-30b)  ARTIFACT="mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit" ;;
+    qwen3-8b)         ARTIFACT="mlx-community--Qwen3-8B-4bit" ;;
     *)                ARTIFACT="$PIE_MODEL" ;;
 esac
 
@@ -230,11 +261,22 @@ fi
 # with IDENTICAL package names but different content, so a target dir shared
 # across them collides; a per-worktree dir is the safe default. Falls back to
 # the crate-local target, then the old shared path.
+#
+# NEWEST wins, not first. Preferring the first live candidate assumed
+# CARGO_TARGET_DIR is set the same way in the build shell and here, and it is
+# not: `cargo build` with an explicit CARGO_TARGET_DIR writes one tree while
+# this script, launched without it, finds and installs the OTHER — a build ten
+# hours old, with no complaint anywhere. That cost a full boot and a probe run
+# that measured code which was never compiled. Same failure this script's
+# server-identity proof exists to prevent, one layer down.
+WASM_SRC=""
 for CAND in \
     "${CARGO_TARGET_DIR:-}/wasm32-wasip2/release/chat_completions.wasm" \
+    "$REPO/target/wasm32-wasip2/release/chat_completions.wasm" \
     "$REPO/inferlets/chat-completions/target/wasm32-wasip2/release/chat_completions.wasm" \
     "$REPO/../pie/target/wasm32-wasip2/release/chat_completions.wasm"; do
-    if [ -n "${CAND#/wasm32*}" ] && [ -f "$CAND" ]; then WASM_SRC="$CAND"; break; fi
+    [ -n "${CAND#/wasm32*}" ] && [ -f "$CAND" ] || continue
+    if [ -z "$WASM_SRC" ] || [ "$CAND" -nt "$WASM_SRC" ]; then WASM_SRC="$CAND"; fi
 done
 WASM_SRC="${WASM_SRC:-$REPO/inferlets/chat-completions/target/wasm32-wasip2/release/chat_completions.wasm}"
 MANIFEST_SRC="$REPO/inferlets/chat-completions/Pie.toml"
@@ -244,25 +286,41 @@ PROG_DIR="$PIE_HOME/programs/chat-completions"
 # the shim pushes it over the WebSocket with `install_program`, which is
 # atomic server-side and needs no $PIE_HOME write from this script.
 if [ "$PIE_STRATEGY" = b ]; then
+    # NEWEST wins, same reasoning as the chat-completions lookup above: taking
+    # the first live candidate assumes CARGO_TARGET_DIR is set identically in the
+    # build shell and here, and it is not. Strategy A served a ten-hour-old build
+    # that way today, silently.
+    SESSION_WASM=""
     for CAND in \
         "${CARGO_TARGET_DIR:-}/wasm32-wasip2/release/opencode_session.wasm" \
+        "$REPO/target/wasm32-wasip2/release/opencode_session.wasm" \
         "$REPO/inferlets/opencode-session/target/wasm32-wasip2/release/opencode_session.wasm"; do
-        if [ -n "${CAND#/wasm32*}" ] && [ -f "$CAND" ]; then SESSION_WASM="$CAND"; break; fi
+        [ -n "${CAND#/wasm32*}" ] && [ -f "$CAND" ] || continue
+        if [ -z "$SESSION_WASM" ] || [ "$CAND" -nt "$SESSION_WASM" ]; then SESSION_WASM="$CAND"; fi
     done
-    SESSION_WASM="${SESSION_WASM:-}"
     if [ -z "$SESSION_WASM" ]; then
         echo "no built opencode-session wasm found. Build it:" >&2
         echo "  (cd $REPO/inferlets/opencode-session && cargo build --target wasm32-wasip2 --release)" >&2
         exit 1
     fi
     SESSION_MANIFEST="$REPO/inferlets/opencode-session/Pie.toml"
-    # KV residency budget for the guest, derived from the config THIS script
-    # generated: total_pages * kv_page_size is the whole pool, and the live
-    # turn needs its own scratch inside it, so hand over about half. The guest
-    # cannot work this out for itself — no pool capacity is reported on the
-    # pie:inferlet surface — and over-committing kills the process rather than
-    # evicting.
-    PIE_RETAIN_TOKENS="${PIE_RETAIN_TOKENS:-$(( PIE_TOTAL_PAGES * PIE_KV_PAGE_SIZE / 2 ))}"
+    # KV residency budget for the guest: the live turn needs its own scratch
+    # inside the pool, so hand over about half. The guest cannot work this out
+    # for itself — no pool capacity is reported on the pie:inferlet surface —
+    # and over-committing kills the process rather than evicting.
+    #
+    # HALF OF THE EFFECTIVE POOL, not of `PIE_TOTAL_PAGES`. This used to read
+    # `PIE_TOTAL_PAGES * PIE_KV_PAGE_SIZE / 2`, which is half of a number the
+    # driver does not use: `driver/metal/src/context.cpp:245` clamps the pool to
+    # `min(total_pages, ceil(max_model_len / kv_page_size))`. With the shipped
+    # 2048 pages that made the "half" budget 32,768 tokens — **100% of the real
+    # pool at max_model_len 32768 and 200% of it at 16384** — i.e. a guaranteed
+    # over-commit of exactly the resource whose over-commit kills the process.
+    # Verified against `PIE_KV_TRACE=1`: the pool reads 1024 pages at 32768 and
+    # 512 at 16384, never 2048.
+    _ctx_pages=$(( (PIE_MAX_MODEL_LEN + PIE_KV_PAGE_SIZE - 1) / PIE_KV_PAGE_SIZE ))
+    _eff_pages=$(( PIE_TOTAL_PAGES < _ctx_pages ? PIE_TOTAL_PAGES : _ctx_pages ))
+    PIE_RETAIN_TOKENS="${PIE_RETAIN_TOKENS:-$(( _eff_pages * PIE_KV_PAGE_SIZE / 2 ))}"
     echo "── strategy b: session inferlet $SESSION_WASM ($(wc -c <"$SESSION_WASM" | tr -d ' ') bytes), retain_tokens=$PIE_RETAIN_TOKENS"
 fi
 
@@ -293,6 +351,26 @@ if [ "$PIE_STRATEGY" = a ] && [ -f "$WASM_SRC" ]; then
         echo "── refreshed $PROG_DIR/0.1.0.{wasm,toml} from $(dirname "$WASM_SRC")" \
              "($(wc -c <"$PROG_DIR/0.1.0.wasm" | tr -d ' ') bytes)"
     fi
+    # Verify the ARTIFACT, not the action. Every step above can report success
+    # while leaving the wrong bytes installed: `cargo` says `Finished` after
+    # writing to a target dir you are not reading, `cp` succeeds on a source
+    # that is mid-write, and the mtime guard skips the copy whenever the two
+    # files happen to share a timestamp. All three have happened here today —
+    # one of them installed a build from ten hours earlier, and the server
+    # served it without a murmur. A byte-compare is the only check that
+    # survives all of them, and it costs milliseconds.
+    if ! cmp -s "$WASM_SRC" "$PROG_DIR/0.1.0.wasm"; then
+        echo "FATAL: installed inferlet does not match its source." >&2
+        echo "  source:    $WASM_SRC ($(wc -c <"$WASM_SRC" | tr -d ' ') bytes)" >&2
+        echo "  installed: $PROG_DIR/0.1.0.wasm ($(wc -c <"$PROG_DIR/0.1.0.wasm" | tr -d ' ') bytes)" >&2
+        echo "  Refusing to serve code that was not built from this tree." >&2
+        exit 1
+    fi
+    # Printed on EVERY boot, including the no-op refresh — the one case where
+    # you cannot otherwise tell which build is about to serve, and the case a
+    # stale pick hides in.
+    echo "── serving inferlet built $(date -r "$PROG_DIR/0.1.0.wasm" '+%Y-%m-%d %H:%M:%S')" \
+         "from $WASM_SRC"
 elif [ "$PIE_STRATEGY" = a ]; then
     echo "── warning: no built wasm at $WASM_SRC — using whatever is installed" >&2
 fi
@@ -305,8 +383,28 @@ echo "── pie doctor (config parse + driver preflight)"
 }
 
 # ── boot ─────────────────────────────────────────────────────────────────────
-echo "── pie serve on :$SERVE_PORT (config: $CFG, log: $LOG)"
-"$PIE_BIN" -c "$CFG" serve >"$LOG" 2>&1 &
+# PIE_METRICS_ADDR turns on the Prometheus endpoint. Worth having as a knob
+# rather than a one-off flag: the gateway can reject a request outright with
+# `cluster saturated: no healthy worker has KV/seq headroom`, and that message
+# names neither the pool occupancy nor which of the three inputs to
+# `kv_pressure_bucket` tripped it (occupancy ratio, a nonresident page, or a
+# queued allocation waiter). Without the endpoint the only way to tell them
+# apart is to read planner.rs and guess.
+METRICS_ARG=()
+[ -n "${PIE_METRICS_ADDR:-}" ] && METRICS_ARG=(--metrics-addr "$PIE_METRICS_ADDR")
+echo "── pie serve on :$SERVE_PORT (config: $CFG, log: $LOG)${PIE_METRICS_ADDR:+, metrics: $PIE_METRICS_ADDR}"
+# Flag order is LOAD-BEARING: `-c "$CFG"` stays adjacent to the binary because
+# `tools/boot_pie.sh` finds and kills servers by matching `release/pie -c`.
+# Putting --metrics-addr in front of it made the pattern stop matching, the kill
+# silently no-op, and the next boot die with ":8080 still held by something
+# else" — which is a good outcome only because that script proves the live
+# server is the one it started. This is the same argv-shape trap that made
+# `pkill -f "pie serve"` useless (see the header of boot_pie.sh); any new flag
+# belongs after the subcommand, not before the config.
+# `${a[@]+"${a[@]}"}` and not `"${a[@]}"`: macOS ships bash 3.2, where
+# expanding an EMPTY array under `set -u` is an unbound-variable error, so
+# the plain form breaks every boot that does not ask for metrics.
+"$PIE_BIN" -c "$CFG" serve ${METRICS_ARG[@]+"${METRICS_ARG[@]}"} >"$LOG" 2>&1 &
 PIE_PID=$!
 SHIM_PID=""
 cleanup() {

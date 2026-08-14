@@ -139,17 +139,49 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=96,
                     help="capped so the comparison is dominated by prefill, which is "
                          "what the strategies differ in; decode rate is already known")
+    ap.add_argument("--decode-probe", action="store_true",
+                    help="Append a request for a long answer and drop the tool "
+                         "definitions, so the turn is dominated by DECODE rather "
+                         "than prefill. Without this the canned transcript ends in "
+                         "a tool result and the model replies with a ~10-token tool "
+                         "call — which is the right shape for comparing prefill "
+                         "reuse and the wrong one for anything about decoding, "
+                         "speculative or otherwise. The appended text is identical "
+                         "on every arm, so it cannot favour one.")
+    ap.add_argument("--decode-tail", default=None,
+                    help="Override the --decode-probe request. Use to set the "
+                         "DRAFTABILITY of the output deliberately: an answer that "
+                         "copies text already in the context is the best case for "
+                         "prompt-lookup drafting, and free-form prose is the "
+                         "worst. Reporting only one of them describes a workload, "
+                         "not an engine.")
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     seqs, tools = build_conversation(args.turns)
 
+    # A long answer that an agent turn would plausibly ask for, and that leans on
+    # text already in the context (file paths, identifiers) — which is exactly
+    # the condition prompt-lookup drafting needs. Making it easy to draft is
+    # deliberate: a speculation comparison on text nothing can draft measures the
+    # fallback path on both sides and reports a tie that means nothing.
+    DECODE_TAIL = (
+        "Now, without calling any tools, write out a numbered plan for this task. "
+        "For each step give the file path it touches and one sentence on why. "
+        "Then repeat the same list as a checklist. Be thorough and specific."
+    )
+    if args.decode_probe:
+        tail = args.decode_tail or DECODE_TAIL
+        seqs = [m + [{"role": "user", "content": tail}] for m in seqs]
+
     def body_for(msgs):
         return {
             "model": args.model,
             "messages": msgs,
-            "tools": tools,
+            # Tools steer the model into a short tool call. The decode probe
+            # wants prose, so it asks for the same turn without them.
+            **({} if args.decode_probe else {"tools": tools}),
             "max_tokens": args.max_tokens,
             # Greedy: with identical prompts the two arms should generate the
             # same tokens, which makes completion_tokens a cross-check rather
@@ -195,6 +227,14 @@ def main():
             return 1
         u = usage or {}
         cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        gen = u.get("completion_tokens", 0)
+        # Decode rate over the tokens AFTER the first: everything before first
+        # content is prefill, and charging it to decode would make a fast prefill
+        # look like fast decoding. Undefined below two tokens rather than
+        # reported as a number that is really a prefill measurement.
+        dec_tps = None
+        if ttfc is not None and gen > 1 and secs > ttfc:
+            dec_tps = round((gen - 1) / (secs - ttfc), 1)
         row = {
             "turn": i,
             "messages": len(msgs),
@@ -202,7 +242,8 @@ def main():
             "ttfc": round(ttfc, 3) if ttfc is not None else None,
             "prompt_tokens": u.get("prompt_tokens", 0),
             "cached_tokens": cached,
-            "completion_tokens": u.get("completion_tokens", 0),
+            "completion_tokens": gen,
+            "decode_tps": dec_tps,
             "content_chars": nchars,
         }
         rows.append(row)
@@ -210,7 +251,7 @@ def main():
         print(
             f"  turn {i}: {secs:7.2f}s  ttfc={row['ttfc']}  "
             f"prompt={row['prompt_tokens']} cached={cached} "
-            f"gen={row['completion_tokens']}",
+            f"gen={gen} dec_tps={dec_tps}",
             flush=True,
         )
 
