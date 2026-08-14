@@ -112,6 +112,13 @@ struct Input {
     /// never emit `</step>` — leave budget for the post-join stages.
     #[serde(default)]
     max_step_tokens: Option<usize>,
+    /// Reuse the prompt prefill across runs of the same question via a
+    /// content-addressed context snapshot (RatioThink-style save/open).
+    /// A hit forks the saved post-prompt context instead of re-prefilling;
+    /// a miss builds it and saves. Snapshots are cut at the render
+    /// boundary — the generation cue is never captured. Off by default.
+    #[serde(default)]
+    prompt_cache: bool,
 }
 
 fn default_question() -> String {
@@ -168,6 +175,10 @@ struct Stats {
     tokens_adopted: usize,
     /// Siblings that fell back to refill after an adopt_kv refusal.
     adopt_fallbacks: usize,
+    /// Wall-clock spent in join phases (sibling refill/adopt + takeaway
+    /// cue fill), across all parallel blocks. The number the join
+    /// mechanism (refill vs adopt) actually moves.
+    join_ms: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -571,6 +582,7 @@ fn try_fork<'a>(
         let mut bytes = first.bytes;
         let mut terminal = first.terminal;
 
+        let join_start = Instant::now();
         match sh.join_mode {
             JoinMode::Textual => {
                 // Phase-1 join: append sibling tokens causally in plan order
@@ -666,6 +678,8 @@ fn try_fork<'a>(
                 bytes.extend_from_slice(b"<takeaway>\n");
             }
         }
+
+        sh.stats.borrow_mut().join_ms += join_start.elapsed().as_millis() as u64;
 
         // The pre-fork parent context is superseded by the merged branch.
         let merged = std::mem::replace(p, base);
@@ -1109,6 +1123,35 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
 }
 
 // =============================================================================
+// Prompt prefix cache
+// =============================================================================
+
+/// FNV-1a over a byte stream; enough for a content-addressed snapshot name
+/// (a collision requires two *distinct* questions the same user actually
+/// runs against the same model and inferlet version).
+fn fnv64(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Content-addressed snapshot name for the post-prompt context. Keyed on
+/// the model (the chat template lives there), the exact question text (the
+/// instruction is compiled in), and this crate's version (template or
+/// prompt-construction drift must miss, never false-hit). 0xFF separators
+/// cannot appear inside UTF-8 strings, preventing field-shift collisions.
+fn prompt_cache_name(model_name: &str, question: &str) -> String {
+    let mut h = fnv64(0xcbf2_9ce4_8422_2325, model_name.as_bytes());
+    h = fnv64(h, &[0xFF]);
+    h = fnv64(h, question.as_bytes());
+    h = fnv64(h, &[0xFF]);
+    h = fnv64(h, env!("CARGO_PKG_VERSION").as_bytes());
+    format!("npr-prompt/{h:016x}")
+}
+
+// =============================================================================
 // Entry point
 // =============================================================================
 
@@ -1130,10 +1173,46 @@ async fn main(input: Input) -> Result<String> {
     // format instruction, then the generation cue. The user turn is flushed
     // (committing the shared prefix); the cue tokens stay buffered so the
     // first Generator step has input to sample from.
-    let mut p = PCtx::new(Context::new(&model)?);
-    p.ctx
-        .user(&format!("{}\n\n{}", input.question, INSTRUCTION));
-    p.ctx.flush().await?;
+    //
+    // With `prompt_cache` the flushed post-prompt context is snapshotted
+    // under a content-addressed name and reused by later runs of the same
+    // question (avg@k repeats): a hit forks the snapshot and skips the
+    // prompt prefill entirely. The snapshot is cut BEFORE the cue — the cue
+    // is appended fresh on both paths, so the reused KV is exactly the
+    // canonical prompt rendering. Saves race benignly across concurrent
+    // repeats: the name is content-addressed, so AlreadyExists means an
+    // identical snapshot is already in place.
+    let mut prompt_cache_state = "off";
+    let mut p = if input.prompt_cache {
+        let name = prompt_cache_name(model_name, &input.question);
+        match Context::open(&model, &name) {
+            Ok(ctx) if ctx.seq_len() > 0 => {
+                prompt_cache_state = "hit";
+                PCtx::new(ctx)
+            }
+            _ => {
+                let mut ctx = Context::new(&model)?;
+                ctx.user(&format!("{}\n\n{}", input.question, INSTRUCTION));
+                ctx.flush().await?;
+                match ctx.save(&name) {
+                    Ok(()) => prompt_cache_state = "miss_saved",
+                    Err(e) if e.starts_with("Snapshot name already exists:") => {
+                        prompt_cache_state = "miss_exists"
+                    }
+                    Err(e) => {
+                        println!("[npr] prompt cache save failed (continuing): {e}");
+                        prompt_cache_state = "miss_save_failed";
+                    }
+                }
+                PCtx::new(ctx)
+            }
+        }
+    } else {
+        let mut ctx = Context::new(&model)?;
+        ctx.user(&format!("{}\n\n{}", input.question, INSTRUCTION));
+        ctx.flush().await?;
+        PCtx::new(ctx)
+    };
     p.ctx.cue();
 
     let mut trajectory_bytes: Vec<u8> = Vec::new();
@@ -1203,6 +1282,8 @@ async fn main(input: Input) -> Result<String> {
         "tokens_generated": stats.tokens_generated,
         "tokens_adopted": stats.tokens_adopted,
         "adopt_fallbacks": stats.adopt_fallbacks,
+        "join_ms": stats.join_ms,
+        "prompt_cache": prompt_cache_state,
         "tokens_charged": ledger.charged,
         "token_budget": ledger.budget,
         "elapsed_ms": start.elapsed().as_millis() as u64,

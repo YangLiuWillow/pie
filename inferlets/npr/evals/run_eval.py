@@ -150,6 +150,8 @@ async def worker(name: int, queue: asyncio.Queue, args, out_lock, out_file, stat
             payload["temperature"] = args.temperature
         if args.top_p is not None:
             payload["top_p"] = args.top_p
+        if args.prompt_cache:
+            payload["prompt_cache"] = True
 
         record = None
         for attempt in range(args.retries + 1):
@@ -269,6 +271,14 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=30000)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument(
+        "--prompt-cache",
+        action="store_true",
+        help="reuse the prompt prefill across repeats of a problem via a "
+        "content-addressed context snapshot (one snapshot per problem is "
+        "retained server-side for the life of the server; check the "
+        "prompt_cache field in results for hit/miss)",
+    )
     ap.add_argument("--out", default=str(HERE / "results/aime25.jsonl"))
     ap.add_argument("--resume", action="store_true", default=True)
     ap.add_argument("--no-resume", dest="resume", action="store_false")
