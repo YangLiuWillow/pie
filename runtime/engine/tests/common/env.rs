@@ -203,6 +203,13 @@ impl MockEnv {
             },
             model: ModelConfig {
                 name: self.model_name.clone(),
+                // `checkpoint` names what is actually SERVED, as distinct from
+                // `name`, which names the deployment. This fixture serves a
+                // tokenizer snapshot rather than a real artifact, so the two
+                // coincide. Added when the field appeared and left this harness
+                // uncompilable — the e2e suite has not built on this branch
+                // since.
+                checkpoint: self.model_name.clone(),
                 arch_name: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,

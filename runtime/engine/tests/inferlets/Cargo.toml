@@ -37,6 +37,8 @@ members = [
     "mtp-grammar",
     "ptir-prefill-e2e",
     "prefix-cache-e2e",
+    "apc-graft-probe",
+    "decode-rows-probe",
     "selfspec",
 ]
 

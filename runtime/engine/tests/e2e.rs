@@ -208,6 +208,72 @@ fn explicit_prefix_index_submits_only_the_suffix() {
     );
 }
 
+/// Does a WorkingSet published by one inferlet INSTANCE survive for the next?
+///
+/// `explicit_prefix_index_submits_only_the_suffix` publishes and looks up
+/// inside a single invocation, so it cannot answer this. A per-request prefix
+/// cache — one wasm instance per HTTP request, the shape RatioThink's chat-apc
+/// uses and the shape `inferlets/chat-completions` marks as a SEAM — is only
+/// possible if the index outlives the instance that wrote it.
+#[test]
+fn explicit_prefix_index_survives_across_inferlet_instances() {
+    let s = state();
+    let published = spawn_and_capture(s, "prefix-cache-e2e", "\"publish-only\"".into());
+    assert!(
+        published.as_deref().is_ok_and(|r| r.contains("published")),
+        "the publishing instance should complete (got {published:?})"
+    );
+    // A SECOND instance, with no shared guest state, looking up the same key.
+    let found = spawn_and_capture(s, "prefix-cache-e2e", "\"lookup-only\"".into());
+    assert!(
+        found.as_deref().is_ok_and(|r| r.contains("cross_instance_hit")),
+        "a later instance must find the published prefix; a miss here means the \
+         index is process-local and a per-request APC cannot work (got {found:?})"
+    );
+}
+
+/// Can an instance park a prefix it RESUMED, for the instance after it?
+///
+/// This is the shape a per-request prefix cache actually runs
+/// (`inferlets/chat-completions`): every turn but the first loads a parked
+/// prefix, grafts its delta on, and parks a deeper prefix. The slice it parks
+/// therefore spans inherited pages — structurally shared with every other
+/// holder of that key — and pages it just wrote. `explicit_prefix_index_
+/// survives_across_inferlet_instances` stops one step short of that: its
+/// publisher always starts cold.
+///
+/// The failure this catches is silent. A graft onto a prefix that ends in the
+/// wrong place still decodes fluent text, so nothing downstream would report it.
+#[test]
+fn a_resumed_prefix_can_be_republished_deeper() {
+    let s = state();
+    // Three separate instances, no shared guest state: cold → resume 16 and
+    // park 32 → resume 32.
+    let mut fired = Vec::new();
+    for step in 0..3 {
+        let out = spawn_and_capture(s, "prefix-cache-e2e", format!("\"chain-{step}\""));
+        let out = out.unwrap_or_else(|e| {
+            panic!("chain step {step} should complete, got {e:?} (a miss here means the \
+                    previous step could not park a prefix built on inherited pages)")
+        });
+        assert!(
+            out.contains(&format!("chain step={step}")),
+            "chain step {step} reported {out:?}"
+        );
+        fired.push(out);
+    }
+    // The whole point is that each step prefills only its delta. A step that
+    // silently fell back to a cold rebuild would still answer — and still pass
+    // a hit/miss assertion — so assert the DEPTH.
+    for (step, expect) in [(0usize, "cached=0 fired=24"), (1, "cached=16 fired=24"), (2, "cached=32 fired=16")] {
+        assert!(
+            fired[step].contains(expect),
+            "chain step {step} should report {expect}, got {:?}",
+            fired[step]
+        );
+    }
+}
+
 #[test]
 fn spawn_after_termination() {
     let s = state();

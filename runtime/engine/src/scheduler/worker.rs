@@ -469,7 +469,38 @@ impl LaunchGrouping {
                 || wire_mask_on_device_geometry
                 || (self.has_user_mask && self.has_device_geometry)
                 || (request.request.has_user_mask && self.has_device_geometry)
-                || (request.request.device_resolved_geometry && self.has_user_mask))
+                || (request.request.device_resolved_geometry && self.has_user_mask)
+                // TWO DEVICE-GEOMETRY PROGRAMS CANNOT SHARE A BATCH, mask or
+                // no mask. Every clause above pairs device geometry with a
+                // user mask, so the plain case -- two unmasked device-geometry
+                // fires from two concurrent instances -- fell through and was
+                // composed. The Metal driver refuses that batch outright:
+                //
+                //   [pie-driver-metal] launch: 2 device-geometry programs in
+                //   one batch (at most one is supported)
+                //
+                // and its comment says the constraint is "the same structural
+                // constraint the runtime's scheduler already upholds ... a
+                // defensive re-check here so a scheduling bug fails the launch
+                // loudly". This is that scheduling bug: the driver's re-check
+                // was the only thing enforcing it.
+                //
+                // The failure was NOT loud in practice. The refusal poisons the
+                // fire's channel, `take_host` errors, and
+                // `inferlets/chat-completions` degrades any decode error to
+                // `finish_reason:"length"` -- so the client saw HTTP 200 with
+                // ONE token of a 64-token budget and no error at all. Measured
+                // 2026-08-14: at concurrency 1 every request returned 64
+                // tokens; at concurrency 2 they returned 1 and 5; at 4 they
+                // returned 0, 1, 1, 3. vLLM-metal and mlx-lm on the same box,
+                // same weights and same prompts returned 64 at every level, so
+                // the defect was pie's alone.
+                //
+                // Deferring is the right remedy rather than rejecting: an
+                // incompatible member goes to the wave's NEXT step, which is
+                // what this grouping loop already does for solo submissions
+                // and dense device masks.
+                || (request.request.device_resolved_geometry && self.has_device_geometry))
         {
             return false;
         }

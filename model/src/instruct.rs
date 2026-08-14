@@ -39,7 +39,12 @@ use std::sync::Arc;
 /// drops the underscores an HF `model_type` would have, and keying on that
 /// spelling is exactly how this registry once dropped every tool schema for Qwen
 /// MoE models.
-fn is_coder_lineage(arch_name: &str, model_name: &str) -> bool {
+/// `pub` so the renderer-parity harness
+/// (`integrations/opencode/parity/render-tokens`) decides the dialect with
+/// THIS predicate rather than its own copy. A parity check that guesses the
+/// dialect independently validates a prompt the server never renders — which
+/// is the exact failure it exists to catch.
+pub fn is_coder_lineage(arch_name: &str, model_name: &str) -> bool {
     let hay = format!("{model_name} {arch_name}").to_lowercase();
     let squashed: String = hay.chars().filter(|c| !matches!(c, '_' | '.' | '-')).collect();
     if squashed.contains("qwen35") || squashed.contains("qwen36") || squashed.contains("qwen3next")

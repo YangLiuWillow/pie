@@ -72,6 +72,109 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     Ok(g)
 }
 
+// ── The per-request APC chain ────────────────────────────────────────────────
+//
+// `round` covers ONE resume: publish a prefix, load it, graft a suffix. A
+// serving arm does that on every turn, and turn 2 onwards differs in a way
+// nothing above exercises — it parks a prefix built from a set it RESUMED,
+// so the slice it publishes spans both inherited pages (structurally shared
+// with whoever else loaded that key) and pages this instance just wrote.
+//
+// That is the growth boundary, and it is where a per-request cache would fail
+// silently rather than loudly: a bad graft still decodes fluent text.
+const CHAIN_N: u32 = 48; // three pages
+const CHAIN_KEYS: [&[u8]; 2] = [
+    b"prefix-cache-e2e/chain-1p",
+    b"prefix-cache-e2e/chain-2p",
+];
+
+/// One turn: resume at `cached` tokens, prefill only `cached..total`, then park
+/// `publish_pages` pages for the next instance. `cached == 0` is turn one.
+async fn chain_step(
+    tokens: &[i32],
+    cached: u32,
+    total: u32,
+    publish_pages: u32,
+) -> std::result::Result<i32, String> {
+    let tag = format!("chain@{cached}");
+    let ws = if cached == 0 {
+        WorkingSet::new()
+    } else {
+        let key = CHAIN_KEYS[(cached / PAGE_T - 1) as usize];
+        WorkingSet::from_index(key)?
+            .ok_or_else(|| format!("{tag}: chain index miss — the previous step did not park"))?
+    };
+    // The parked set must be exactly its prefix, or the graft lands wrong.
+    if ws.page_len() != cached / PAGE_T {
+        return Err(format!(
+            "{tag}: parked set holds {} page(s), expected {}",
+            ws.page_len(),
+            cached / PAGE_T
+        ));
+    }
+
+    let pool_pages = total.div_ceil(PAGE_T);
+    ws.reserve(pool_pages - ws.page_len())
+        .with_context(|| format!("{tag} ws.reserve"))?;
+
+    let input = &tokens[cached as usize..total as usize];
+    let toks = Channel::from(input).named("toks");
+    let input_len = input.len() as u32;
+    let embed_indptr = Channel::from([0u32, input_len]).named("embed_indptr");
+    let positions = Channel::from_iter(cached..total).named("positions");
+    let pages = Channel::from_iter(0..pool_pages).named("pages");
+    let page_indptr = Channel::from([0u32, pool_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((cached..total).map(|p| p / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((cached..total).map(|p| p % PAGE_T)).named("w_off");
+    let kv_len = Channel::from([total]).named("kv_len");
+    let out = Channel::new([1], dtype::i32).named("out");
+
+    let fwd: ForwardPass = ForwardPass::new();
+    fwd.embed(&toks, &embed_indptr)?;
+    fwd.attention(
+        &ws,
+        KvGeometry {
+            readable_pages: ..,
+            // The inherited pages are shared; writing into them would corrupt
+            // every other holder of that key.
+            writable_pages: (cached / PAGE_T)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
+    )?;
+    fwd.epilogue(move || {
+        let tok = reduce_argmax(intrinsics::logits());
+        out.put(&tok);
+    });
+
+    let pipe = Pipeline::new();
+    fwd.submit(&pipe)
+        .with_context(|| format!("{tag} submit"))?;
+    let g = out
+        .take_host::<i32>()
+        .await
+        .with_context(|| format!("{tag} out.take"))?;
+
+    // Park AFTER the fire is awaited (its KV writes have executed) and BEFORE
+    // the pipeline closes (`slice` is ordered on one). This is the step that
+    // spans the growth boundary when `cached > 0`.
+    if publish_pages > 0 {
+        let prefix = ws
+            .slice(&pipe, 0, publish_pages)
+            .with_context(|| format!("{tag} slice(0,{publish_pages})"))?;
+        prefix
+            .update_index(CHAIN_KEYS[(publish_pages - 1) as usize])
+            .with_context(|| format!("{tag} update_index"))?;
+    }
+    pipe.close();
+    Ok(g)
+}
+
 /// Honest CHUNKED continuation over one working set (no cache): a first
 /// canonical pass commits the 16-token prefix, a second appends the 8-token
 /// suffix. Its read-out row is the same absolute position as `round`'s, so
@@ -167,6 +270,50 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let tokens: Vec<i32> = (0..N as i32).map(|i| (i % 31) + 1).collect();
+
+    // `publish-only` / `lookup-only` split the two rounds across two SEPARATE
+    // inferlet instances. The default path runs both in one process, which
+    // proves the index works within a process and says nothing about whether a
+    // later instance can find what an earlier one published — the property a
+    // per-request APC depends on entirely.
+    if input.contains("publish-only") {
+        let g0 = round(&tokens, "publish-only", false).await?;
+        let result = format!("PREFIX_CACHE_E2E published g0={g0}");
+        println!("{result}");
+        return Ok(result);
+    }
+    if input.contains("lookup-only") {
+        let g1 = round(&tokens, "lookup-only", true).await?;
+        let result = format!("PREFIX_CACHE_E2E cross_instance_hit g1={g1}");
+        println!("{result}");
+        return Ok(result);
+    }
+
+    // `chain-0/1/2`: three SEPARATE instances walking the same conversation,
+    // each resuming where the last parked and parking deeper for the next.
+    // Steps 1 and 2 are the ones no other mode reaches — they publish a prefix
+    // assembled from inherited pages plus their own.
+    if let Some(step) = input
+        .find("chain-")
+        .and_then(|i| input[i + 6..].chars().next())
+        .and_then(|c| c.to_digit(10))
+    {
+        let chain: Vec<i32> = (0..CHAIN_N as i32).map(|i| (i % 31) + 1).collect();
+        // (resume at, prefill through, pages to park)
+        let plan: [(u32, u32, u32); 3] = [
+            (0, 24, 1),           // cold: park page 0
+            (PAGE_T, 40, 2),      // resume 1 page, park 2 — spans the boundary
+            (2 * PAGE_T, CHAIN_N, 0), // resume 2 pages, park nothing
+        ];
+        let (cached, total, park) = plan[step as usize % plan.len()];
+        let g = chain_step(&chain, cached, total, park).await?;
+        let result = format!(
+            "PREFIX_CACHE_E2E chain step={step} cached={cached} fired={} parked={park} g={g}",
+            total - cached
+        );
+        println!("{result}");
+        return Ok(result);
+    }
 
     let g0 = round(&tokens, "round0", false).await?;
     println!("[prefix-cache] round 0 (cold) done: g0={g0}");

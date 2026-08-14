@@ -66,16 +66,32 @@ pub fn read_inferlet_manifest(name: &str) -> pie_engine::inferlet::program::Mani
 }
 
 /// Add and install a test inferlet in one step (async).
+/// Programs already added+installed in THIS test process.
+///
+/// `program::add(.., replace = true)` re-registers the component, and the e2e
+/// suite shares one engine across tests that run concurrently — so a second
+/// test adding a program a first test is spawning makes the lookup fail with
+/// `Component not found for program: <name>`. Two tests using the same inferlet
+/// were already enough to make that intermittent; a third made it every run.
+///
+/// The lock is held ACROSS the awaits deliberately: serialising installs is the
+/// point, and they are fast.
+static INSTALLED: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
 pub async fn add_and_install(name: &str) -> ProgramName {
-    let wasm = read_inferlet_wasm(name);
-    let manifest = read_inferlet_manifest(name);
     let program_name = ProgramName::parse(&format!("{name}@0.1.0")).unwrap();
-    pie_engine::inferlet::program::add(wasm, manifest, true)
-        .await
-        .unwrap();
-    pie_engine::inferlet::program::install(&program_name)
-        .await
-        .unwrap();
+    let mut installed = INSTALLED.lock().await;
+    if installed.insert(name.to_string()) {
+        let wasm = read_inferlet_wasm(name);
+        let manifest = read_inferlet_manifest(name);
+        pie_engine::inferlet::program::add(wasm, manifest, true)
+            .await
+            .unwrap();
+        pie_engine::inferlet::program::install(&program_name)
+            .await
+            .unwrap();
+    }
     program_name
 }
 

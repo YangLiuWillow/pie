@@ -1,0 +1,10 @@
+[package]
+name = "decode-rows-probe"
+version = "0.1.0"
+description = "Does a k-row decode fire cost one KV read or k? The number that decides whether speculative decoding can pay."
+authors = ["Liu Yang <liu@liszt.ai>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

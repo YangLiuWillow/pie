@@ -1,0 +1,10 @@
+[package]
+name = "apc-graft-probe"
+version = "0.1.0"
+description = "Is a grafted prefill the honest chunked continuation? Same fire shapes, same KV bytes, at serving scale"
+authors = ["Liu Yang <liu@liszt.ai>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
