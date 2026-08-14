@@ -166,6 +166,33 @@ impl Context {
         })
     }
 
+    /// Adopt KV from another same-model context: copies the KV rows for
+    /// `src` token-slots `[src_token_start, src_token_start + num_tokens)`
+    /// into this context's next free working slots without a forward pass.
+    ///
+    /// Requires that both contexts share an identical token history over
+    /// `[0, src_token_start)` (fork siblings do) and that the adopted range
+    /// is plain-causal in `src` (no explicit masks, no adapter). The host
+    /// derives token/position metadata from `src`'s lineage and synthesizes
+    /// shared-prefix + own-tokens hole masks, so the adopted tokens behave
+    /// exactly like an explicit-mask refill for commit and replay purposes.
+    ///
+    /// Only tokens already in `src`'s KV are adoptable — flush `src` first
+    /// if it has buffered tokens. Returns the slot index in this context
+    /// where the adopted tokens begin.
+    pub fn adopt_kv(&mut self, src: &Context, src_token_start: u32, num_tokens: u32) -> Result<u32> {
+        let dst_start = self
+            .inner
+            .adopt_kv(src.inner(), src_token_start, num_tokens)?;
+        // Re-sync from the host: the adopt attached working pages and
+        // appended working tokens.
+        self.committed_pages = self.inner.committed_page_count();
+        self.working_pages = self.inner.working_page_count();
+        self.working_tokens = self.inner.working_page_token_count();
+        self.seq_len = self.committed_pages * self.page_size + self.working_tokens;
+        Ok(dst_start)
+    }
+
     /// Save the context under a user-chosen name.
     pub fn save(&self, name: &str) -> Result<()> {
         self.inner.save(name)

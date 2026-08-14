@@ -76,6 +76,7 @@
 //! it sends Ok and the process resumes, already Running.
 // Radix Trie with path-inclusive refcounting — handles incremental
 // commits and dedup correctly, all operations O(depth).
+mod adopt;
 pub mod pagestore;
 mod restore;
 mod rs_cache;
@@ -470,6 +471,32 @@ pub async fn fork(model_idx: usize, id: ContextId, owner: ProcessId) -> Result<C
         },
     )?;
     rx.await.context("context::fork: actor dropped response")?
+}
+
+/// Adopt KV rows from a sibling context: copy the KV for src token-slots
+/// `[src_token_start, src_token_start + num_tokens)` into dst's next free
+/// working slots without a forward pass (see `context::adopt`). Returns
+/// the dst slot index where the adopted tokens begin.
+pub async fn adopt_kv(
+    model_idx: usize,
+    dst_id: ContextId,
+    src_id: ContextId,
+    src_token_start: usize,
+    num_tokens: usize,
+) -> Result<u32> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(
+        model_idx,
+        Message::AdoptKv {
+            dst_id,
+            src_id,
+            src_token_start,
+            num_tokens,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::adopt_kv: actor dropped response")?
 }
 
 pub async fn commit_working_pages(model_idx: usize, id: ContextId, num_pages: usize) -> Result<()> {
@@ -2347,6 +2374,25 @@ pub(crate) enum Message {
         owner: ProcessId,
         response: oneshot::Sender<Result<ContextId>>,
     },
+    AdoptKv {
+        dst_id: ContextId,
+        src_id: ContextId,
+        src_token_start: usize,
+        num_tokens: usize,
+        response: oneshot::Sender<Result<u32>>,
+    },
+    /// Driver confirmation for an in-flight adopt_kv copy (see
+    /// `context::adopt`). Sent by the background task that awaited the
+    /// device copy; carries everything needed to finish or roll back.
+    AdoptKvComplete {
+        dst_id: ContextId,
+        src_id: ContextId,
+        copy_result: std::result::Result<(), String>,
+        src_range: Vec<(u32, u32)>,
+        prefix_slots: u32,
+        dst_start: u32,
+        response: oneshot::Sender<Result<u32>>,
+    },
     CommitWorkingPages {
         id: ContextId,
         num_pages: usize,
@@ -2489,6 +2535,34 @@ impl ServiceHandler for ContextManager {
                 response,
             } => {
                 self.fork(id, owner, response);
+            }
+            Message::AdoptKv {
+                dst_id,
+                src_id,
+                src_token_start,
+                num_tokens,
+                response,
+            } => {
+                self.adopt_kv(dst_id, src_id, src_token_start, num_tokens, response);
+            }
+            Message::AdoptKvComplete {
+                dst_id,
+                src_id,
+                copy_result,
+                src_range,
+                prefix_slots,
+                dst_start,
+                response,
+            } => {
+                self.adopt_kv_complete(
+                    dst_id,
+                    src_id,
+                    copy_result,
+                    src_range,
+                    prefix_slots,
+                    dst_start,
+                    response,
+                );
             }
             Message::CommitWorkingPages {
                 id,

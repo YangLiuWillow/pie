@@ -23,6 +23,18 @@ interface context {
         // Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
         fork: func() -> result<context, error>;
 
+        // Adopts KV from another same-model context of this process: copies the
+        // KV rows for src token-slots [src-token-start, src-token-start + num-tokens)
+        // into this context's next free working slots, without a forward pass.
+        // Requires: both contexts share an identical (token, position) history over
+        // [0, src-token-start), and the adopted source range is plain-causal
+        // (default masks, consecutive positions). Token/position metadata is
+        // derived from the source's lineage; per-token attention masks are
+        // synthesized as shared-prefix + own-tokens hole masks, so the adopted
+        // tokens replay/commit exactly like an equivalent explicit-mask refill.
+        // Returns the destination slot index where the adopted tokens begin.
+        adopt-kv: func(src: borrow<context>, src-token-start: u32, num-tokens: u32) -> result<u32, error>;
+
         // Named save — snapshots committed chain + working pages under a user-chosen name
         save: func(name: string) -> result<_, error>;
 

@@ -131,6 +131,47 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
+    async fn adopt_kv(
+        &mut self,
+        this: Resource<Context>,
+        src: Resource<Context>,
+        src_token_start: u32,
+        num_tokens: u32,
+    ) -> Result<Result<u32, String>> {
+        // Copy scalars out before touching the second handle (both borrow
+        // the same resource table).
+        let (dst_model, dst_id) = {
+            let ctx = self.ctx().table.get(&this)?;
+            (ctx.model_id, ctx.context_id)
+        };
+        let (src_model, src_id) = {
+            let ctx = self.ctx().table.get(&src)?;
+            (ctx.model_id, ctx.context_id)
+        };
+        if dst_model != src_model {
+            return Ok(Err(
+                "adopt_kv: contexts belong to different models".to_string()
+            ));
+        }
+        // Staged run-ahead passes assume plain causal continuation of dst;
+        // the adopted tokens invalidate that assumption (same discipline as
+        // suspend/destroy).
+        crate::inference::invalidate_speculation_for_ctx(dst_model, dst_id);
+
+        match context::adopt_kv(
+            dst_model,
+            dst_id,
+            src_id,
+            src_token_start as usize,
+            num_tokens as usize,
+        )
+        .await
+        {
+            Ok(dst_start) => Ok(Ok(dst_start)),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
     async fn save(&mut self, this: Resource<Context>, name: String) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
