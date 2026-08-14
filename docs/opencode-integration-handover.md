@@ -119,6 +119,11 @@ Models (`~/.pie/models/`):
 Knobs added this session: `PIE_MAX_MODEL_LEN` (default 16384; agents need
 32768 — an over-long prompt is **refused**, not chunked) and `PIE_KV_TRACE=1`.
 
+`PIE_MAX_MODEL_LEN` **also sizes the KV pool** — one number for both the
+per-sequence ceiling and the ring, so the pool is exactly one max-length
+sequence and `PIE_TOTAL_PAGES` cannot raise it past that. §5.2. Read the pool
+out of `PIE_KV_TRACE=1`'s `avail=`; do not compute it.
+
 ---
 
 ## 4. Environment that is now set up
@@ -133,7 +138,12 @@ Knobs added this session: `PIE_MAX_MODEL_LEN` (default 16384; agents need
 - **Python**: `<scratchpad>/venv-shim` (3.12) has `msgpack blake3 websockets
   cryptography typer toml datasets swebench`. The system `python3` is 3.9 and
   **cannot** run the shim (`str | Path` annotations).
-- **vLLM-metal**: `~/.venv-vllm-metal/bin/vllm`.
+- **vLLM-metal**: `~/.venv-vllm-metal/bin/vllm`. The boot command for the
+  **agent** arm is in `results-swebench.md` ("Booting the vLLM arm") and is
+  *not* the one in `results-pie-vs-vllm-metal.md`: opencode sends the model id
+  `qwen3-coder-30b` (from `opencode.json`), not `coder30b`, and the agent arm
+  runs at `--max-model-len 32768` to match pie, not the A/B bench's 16384.
+  `--served-model-name` takes a list, so serve both names.
 
 ### SWE-bench scoring on Apple Silicon
 
@@ -158,23 +168,129 @@ Four graded instances ran in **2 min 4 s**. `--cache_level` no longer exists.
    tested and refuted** (§7): with `PIE_KV_TRACE=1`, `live_ws` returns to 0 and
    the pool returns to full between requests. Cause is open. Two attempts to
    reproduce it under tracing failed — reproducing it reliably is step one.
-2. **`total_pages` is a knob that lies.** `simple_family.cpp:313` computes
-   `g_.total_pages = kv_max_ctx / kv_page_size`, overwriting the configured
-   value. The pool is exactly one max-length sequence (1024 pages at 32k, 512
-   at 16k, verified both ways). Not the wear defect, but wrong.
+2. **The KV pool follows `max_model_len`, and the SWE-bench config halved it.**
+   *(Rewritten 2026-08-13 — the earlier text blamed `simple_family.cpp:313`
+   "overwriting the configured value". That line is `Gemma4Engine`'s geometry;
+   `LlamaEngine`, which serves Qwen3-Coder, has its own copy at `:1371`; and
+   neither is the policy. The measured pool sizes were right, the mechanism was
+   wrong.)*
+
+   The policy is `driver/metal/src/context.cpp:245`:
+
+   ```cpp
+   ctx_pages = ceil(effective_max_ctx_tokens(cfg) / kv_page_size);
+   return rs_cache_required ? ctx_pages : min(cfg.batching.total_pages, ctx_pages);
+   ```
+
+   It is **deliberate** — the pool is what the runtime's physical page ids
+   index, so a pool bigger than the ring means addressing unallocated pages.
+   Three consequences, in increasing order of how much they cost us:
+
+   - `total_pages` can only ever **lower** the pool, never raise it past the
+     ring. `worker/src/config.rs:1128-1140` says so tree-wide: "`total_pages`
+     is NOT that knob and never was." (Metal clamps rather than discards, so a
+     `total_pages` *below* `ctx_pages` is still honoured.)
+   - `max_model_len` sizes **both** the per-sequence ceiling and the fleet-wide
+     ring, so **pool == exactly one max-length sequence**, always. Nothing
+     expresses "one sequence may reach 32k, and give me six sequences of pool."
+   - **The pool was quartered without notice, and it costs nothing.**
+     `a878d5e16` (08-13) added `max_model_len = 16384`, taking the pool from
+     2048 pages to 512 (1024 at the agent runs' 32768). Measured with the chunk
+     held at 2048 and only `max_model_len` moved — Coder-30B, `--repeat 3`,
+     pool read from the trace: **597.2 / 593.9 / 598.0 tok/s** marginal at
+     2048 / 1024 / 512 pages. A 4× pool, 0.7% spread, non-monotonic. So keep
+     32768 for the fair re-run and do not raise it for throughput.
+
+     This retires a claim: `results-prefill-profile.md` attributed **1.73× on
+     prefill** to that pool raise, but the change moved chunk (1024→2048) *and*
+     pool together and only the pair was measured. The pool half is worth
+     nothing here. Corrected there; do not re-quote 1.73× until someone
+     re-derives it one knob at a time. Scope of the null: concurrency 1,
+     prompts ≤5k tokens, which fits even the 512-page pool — it says nothing
+     about concurrency or about strategy B.
+
+   `executor.max_clients` (default 4, `worker/src/executor/mod.rs:1410`) looks
+   like a further divisor and **is not**: it is the remote scratch-lease
+   handshake, and the in-process inferlet path takes no lease. See
+   `results-swebench.md` for the four counts against it.
+
+   **Rule that came out of this: don't derive the pool, read it.** Three layers
+   each own a `total_pages` and the one you would naturally edit is not the one
+   that decides. Read `PIE_KV_TRACE=1`'s `avail=` at boot into the artifact,
+   per instance.
 3. **The quantized GEMM** — still ~2.4× behind MLX's `quantized_matmul` on
    these shapes. Largest remaining prefill item now that attention is fixed.
 4. **`llama_numerics_test`'s 18 failures** — mostly MoE, one at `rel_l2 14.0`.
    Either real or the test is over-tight; nobody has determined which.
-5. **Prompt parity with vLLM** — `parity/check_render_vllm.py` exists and has
-   not been re-run since the dialect fix. Do this before any trajectory claim.
-6. **Possible opencode session bleed** — during one repro the model referenced
-   a path from a *different* workspace with a corrupted UUID. opencode keys
-   projects by git remote, so same-repo workspaces may share state. **If true
-   it contaminates both benchmark arms.** Unconfirmed: my tee proxy truncates
-   payloads at 12 KB and hid the evidence. Raise the limit and re-check.
+5. **Prompt parity with vLLM — RUN, and it passes.** *(2026-08-13, both
+   servers on the same `mlx-community` Coder-30B artifact.)*
+   **2 of 5 fixtures byte-identical; the other 3 differ only by JSON separator
+   whitespace** inside the embedded schema blobs of the XML tool definitions —
+   pie emits `{"type":"object",…}`, vLLM `{"type": "object", …}`. Same fields,
+   same order, same dialect; +21 to +22 tokens on ~7,200, i.e. 0.3%. No
+   structural divergence, so **the arms see the same prompt** and a trajectory
+   claim is not blocked on this. Whether pie should match the reference
+   template's spacing is a real but separate fidelity question — do not touch
+   the renderer between benchmark arms.
+
+   Getting there required fixing the harness twice, both the same drift:
+   `render-tokens` hardcoded `ChatMLConfig` instead of deriving it the way the
+   server does. It would not compile against the new `tool_dialect` field, and
+   its `has_thinking: true` made every Coder render carry an empty
+   `<think></think>` cue the server never emits — reported as a 4-token
+   pie-vs-vLLM divergence that was purely the harness. Both now come from
+   `pie_model::instruct::is_coder_lineage`, the server's own predicate (made
+   `pub` for this). A parity harness that guesses independently certifies
+   parity against a fiction.
+6. **opencode session bleed — REFUTED.** *(2026-08-13, from the previous runs'
+   own `~/.local/share/opencode/opencode.db`.)*
+
+   The project row **is** shared: one `project` groups every django workspace
+   from *both* arms and every earlier run, keyed off the git remote. But
+   nothing from it reaches the model:
+
+   - **Sessions are per-invocation and directory-scoped.** Each instance got
+     its own `ses_…` with its own `directory`. No history is shared.
+   - **No foreign workspace path appears in any user or system part** — the
+     only cross-workspace references are `role=assistant, part.type=tool`,
+     i.e. the model's own tool-call arguments.
+   - Those paths are **token-corrupted mid-string** in ways only a decoder
+     produces: `Lis另一边-ai`, `claudeETwitter-501`, `4d93ustralian-501`,
+     `/private entrevista-501/`, `claude-501 ADHD-ai`. The "different
+     workspace with a corrupted UUID" from the original report is
+     `swe-vllm-10318`, a garbled `swe-vllm-103910` — not another directory.
+
+   **The real mechanism, and it is an arm asymmetry**: a corrupted path points
+   outside the workspace → opencode's permission gate fires → unattended, it
+   auto-rejects → the tool call fails. Measured over the graded runs:
+
+   | arm | tool calls | errored | permission-rejected |
+   |---|---:|---:|---:|
+   | pie (known5) | 32 | 1 | **0** |
+   | vLLM (103910) | 45 | 15 | **10** |
+
+   All 10 rejections were out-of-workspace; **zero** in-workspace calls were
+   ever gated, so the gate is a *consequence* of the corruption, not an
+   independent confound, and does not need disabling. This is the same
+   tool-call defect already documented for the vLLM arm, one layer further
+   out: not just schema-invalid arguments but corrupted path arguments.
+   n = 1 run per arm — worth re-counting in the fair re-run as a diagnostic.
 
 ---
+
+## 5b. test-time-bench methods (2026-08-13)
+
+`integrations/opencode/ttb/` adopts the reporting contract from the private
+`shsym/test-time-bench`: an `inferletbench.run_summary.v2` artifact per run,
+budgets that are declared only where enforced, exhaustion counters, grader
+images pinned by digest, and a dataset snapshot that pins the prompt. Read
+`ttb/README.md` first.
+
+The immediate payoff, recomputed over the two already-graded arms from
+opencode's own session store: **mean 8.2 model calls per case on pie against
+2.8 on vLLM** (15.7k vs 6.0k output tokens). §6's "the vLLM arm gave up" was an
+inference from wall-clock; this is the measurement. `resolved` reproduces the
+official grader exactly (4 and 1), which is what validates the join.
 
 ## 6. How to read the SWE-bench number
 
@@ -204,12 +320,38 @@ carried 5/5 on the same five.
 
 Read this section. Every item below was paid for.
 
-- **`pkill -f "pie serve"` matches nothing.** The process is
-  `pie -c <config> serve`. Three "restarts" silently lost the port to the first
-  server, `/health` answered `ok` throughout, and **both arms of an A/B ran
-  against one process**, producing the entirely reasonable conclusion "the new
-  kernel is no faster". Kill by `release/pie -c`, and verify the live process
-  is *yours*.
+- **Process-matching patterns rot, and every rot is silent.** This one trap has
+  now bitten three times, in three different shapes:
+  1. `pkill -f "pie serve"` matches nothing — the argv is `pie -c <config>
+     serve`. Three "restarts" silently lost the port to the first server,
+     `/health` answered `ok` throughout, and **both arms of an A/B ran against
+     one process**, producing the reasonable conclusion "the new kernel is no
+     faster".
+  2. `release/pie -c` then broke the first time a flag was added AHEAD of the
+     config (`--metrics-addr`). Same silent no-op, one flag later. Flag order in
+     `run_pie_opencode.sh` is therefore load-bearing: new flags go after the
+     subcommand.
+  3. Broadening to `release/pie .*serve` fixed the matching and **SIGTERMed a
+     peer session's unrelated server in a sibling worktree three times in
+     fifteen minutes, twice mid-run.**
+  The pattern now in `boot_pie.sh` is `"$REPO/target/release/pie .*serve"`:
+  anchored to this checkout so it cannot reach other worktrees, and
+  order-independent so a new flag cannot silently disable it. **Verify the live
+  process is yours, and verify your kill cannot reach anyone else's.**
+- **A permanently refusing engine can look exactly like a full one.** A single
+  Metal forward that misses its completion fence makes the driver publish a
+  poison epoch; the planner's pressure bucket then pins at its floor
+  (`kv_pressure_bucket` forces ≥240 when `waiters != 0`), and the gateway
+  refuses **every** later request with `admission rejected: cluster saturated:
+  no healthy worker has KV/seq headroom`. It does not recover: admission
+  (`gateway/src/admission.rs`) reads the pushed routing table and rejects
+  *before* the planner is asked for a page, while the reclaim that would clear
+  the condition only runs *inside* an allocation attempt. Confirmed by leaving
+  the box idle and sending one 8-token request — still refused. If you see
+  "saturated" on an idle machine, look upstream for a driver fault; occupancy
+  is not the story. Two diagnoses were wrong before that one (parked pages
+  exhausting the pool: ~11% occupancy, nowhere near the threshold; a stuck
+  waiter: real, but still a symptom).
 - **A throughput number cannot distinguish "no faster" from "never ran".**
   Hence `PIE_METAL_SDPA_TRACE=1`, which prints which attention was chosen and
   which clause decided. Use it whenever a kernel change appears to do nothing.
