@@ -343,7 +343,69 @@ never touches threadgroup memory.** What changes is bookkeeping, not design:
   * the per-fragment column loop is 4 wide, not 2;
   * masking indexes `fn..fn+3` and both `fm` and `fm+8`.
 
-### Remaining before code
+### BUILD ORDER — start here
+
+Five stages. Each ends in a measurement or a test, and **none of them touches
+`driver/metal/src/model/` until stage 4.** Do not write the whole kernel and
+then debug it; the probe loop is seconds and the serving loop is minutes.
+
+**Stage 1 — the multiply, alone.** A NAX twin computing only `S = Q K^T` over
+the real shapes, timed in `sdpa_paged_probe` against the existing MMA kernel's
+multiply half. No softmax, no PV, no correctness. This answers the only
+question that can still kill the plan: does NAX's 6x hold at attention shapes
+and tile sizes, or does the operand-fill cost (8 elements per lane in and 16
+out, through cooperative tensors) eat it?
+**Decision rule, written first:** if the multiply half does not fall by at
+least 3x, stop and re-plan -- the arithmetic in this document assumed 6x.
+
+**Stage 2 — the full kernel, probe-only.** Add online softmax and `O += P V`.
+Per-lane state is `max_score[2]` / `sum_exp[2]`, one per row half; the row
+reduction is still `simd_shuffle_xor` by 1 then 8. Mask indexes `fn..fn+3` at
+both `fm` and `fm+8`. Still timed, still not wired.
+
+**Stage 3 — numerics.** Compare against the shipped kernel on the SAME inputs.
+The probe's buffers are zeroed and cannot validate anything, so this needs real
+data: `llama_numerics_test` is the gate, and it must dispatch the new kernel --
+verify with `PIE_METAL_SDPA_TRACE=1` that it prints `-> MMA` at `hd=128`,
+because the suite's headline cases are "40 rows over 2 requests" and the matrix
+path needs 32 rows PER REQUEST. A byte-identical diff means nothing if the
+kernel never ran.
+
+**Stage 4 — wire it.** Behind `PIE_METAL_NAX_ATTN=1` in
+`model/llama/encode.cpp` where `llama_sdpa_mma_this_fire` selects. Gate on
+EXACT hardware support, never inferred -- follow the `_p32` precedent
+(`kv_page_size == 32`), not a family check that happens to be true today.
+Remember `launch_shape` is asked separately from `pso_for` and is not handed a
+`LlamaPsos`: if the two disagree the grid describes a different kernel than the
+one that runs, which is wrong numbers rather than a crash.
+
+**Stage 5 — end to end.** `integrations/opencode/bench_ab.py` 6-turn replay and
+the SWE-bench known-5. Only here does the 17.0 s number move.
+
+### Things a fresh session will not guess
+
+- **MLX's Metal sources ship in the installed wheel.** No upstream branch, no
+  Xcode.
+  `~/.venv-vllm-metal/lib/python3.12/site-packages/mlx/include/mlx/backend/metal/kernels/steel/attn/`
+  -- `nax.h` is the operand protocol, `kernels/steel_attention_nax.h` the loop.
+  Compiled entry points are readable with `strings .../lib/mlx.metallib`.
+- **The operand protocol** is `get_left_input_cooperative_tensor<A,B,C>()`,
+  `get_right_...`, `get_destination_...`, fill by element, then
+  `gemm_op.run(ct_a, ct_b, ct_c)`. Descriptor:
+  `matmul2d_descriptor(16, 32, 16, transpose_a, transpose_b, true,
+  mode::multiply_accumulate)`.
+- **Probe twins are one `#define` and one `#include`** of the shipped kernel --
+  never a copy, or the A/B measures the drift between them.
+- **Build:** `cmake -S driver/metal -B /tmp/metaltools -DPIE_METAL_BUILD_TOOLS=ON
+  -DCMAKE_BUILD_TYPE=Release` then `cmake --build /tmp/metaltools --target
+  sdpa_paged_probe -j 8`. The `metal` CLI is NOT installed and is not needed;
+  compilation goes through `newLibraryWithSource:` at MTLLanguageVersion4_0.
+- **`source integrations/opencode/tools/require_quiet_gpu.sh && require_quiet_gpu 2`
+  before every timing run.** A ~14 GB python job in `~/boN` cycles on this
+  machine and halves DRAM bandwidth without touching compute. The gate now
+  refuses on it. Absolute ms from different invocations are NOT comparable.
+
+### Remaining after that
 
 pie's kernel assumes "the 32 KB a threadgroup gets". **That number is a comment;
 nothing in this driver ever queries the device.** At BQ=64, BK=64, D=128 with
