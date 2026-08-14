@@ -29,14 +29,16 @@
 //! orchestration (tool decode, fencing, stop policy, chunk emission). All
 //! wire JSON comes from `pie-openai-serving`'s builders.
 //!
+//! ## Prefix cache
+//!
+//! One request per process does NOT mean one prefill per turn. [`apc`] parks
+//! the rendered history's KV in the engine's own index, which outlives the
+//! instance, so the next request resumes at the deepest cut it can find and
+//! prefills only the delta. `usage.prompt_tokens_details.cached_tokens` reports
+//! the depth actually reached, not the depth planned.
+//!
 //! ## Open seams (deliberately out of scope this milestone)
 //!
-//! - **KV snapshot sessions**: content-addressed resume via
-//!   `pie_openai_serving::session` (canon/snapshot_address/split_resume_point
-//!   — already ported and tested) + `working-set update-index/from-index`.
-//!   Attach in [`build_prompt`] (resume = render only the suffix past the
-//!   split point) and after generation (save under the next turn's address).
-//!   `usage.prompt_tokens_details.cached_tokens` stays 0 until then.
 //! - **Grammar-constrained tool calls**: no grammar-forced phase-2 call, on
 //!   the old handler's evidence — constraining suppressed reasoning text and
 //!   collapsed t=0 trajectories, and constrained decoding traps the guest on
@@ -46,6 +48,7 @@
 //!   parsing): salvage seam marked in `turn::TurnState::salvage`; the
 //!   decoder/template halves live model-side.
 
+mod apc;
 mod engine;
 mod turn;
 
@@ -95,46 +98,94 @@ fn reject(status: u16, error_type: &str, message: &str) -> inferlet::Result<Stri
     Ok(String::new())
 }
 
-/// Map the engine-free render plan 1:1 onto the WIT template surface.
+/// Map one engine-free render op onto the WIT template surface.
+///
 /// `Cue` renders through `chat::cue_no_think` — decision D1: this milestone
 /// always serves the no-think channel (matches the token-exact parity
 /// verdict against HF `enable_thinking=False`); a thinking channel would
 /// branch here on `req.no_think()` and route reasoning to
 /// `reasoning_content`, which nothing client-side needs yet.
+fn render_one(op: &RenderOp, out: &mut Vec<u32>) -> Result<(), String> {
+    match op {
+        RenderOp::EquipAfterSystem { system, tools: schemas } => {
+            out.extend(tools::equip_after_system(system.as_deref(), schemas)?);
+        }
+        RenderOp::User(t) => out.extend(chat::user(t)),
+        RenderOp::Assistant(t) => out.extend(chat::assistant(t)),
+        RenderOp::AssistantWithToolCalls { content, calls } => {
+            let wit_calls: Vec<tools::ToolCall> = calls
+                .iter()
+                .map(|(name, args)| tools::ToolCall {
+                    name: name.clone(),
+                    arguments_json: args.clone(),
+                })
+                .collect();
+            out.extend(tools::assistant_with_tool_calls(content.as_deref(), &wit_calls));
+        }
+        RenderOp::AnswerBatch(batch) => out.extend(tools::answer_batch(batch)),
+        RenderOp::Cue => out.extend(chat::cue_no_think()),
+    }
+    Ok(())
+}
+
 fn render_ops(ops: &[RenderOp]) -> Result<Vec<u32>, String> {
     let mut out = Vec::new();
     for op in ops {
-        match op {
-            RenderOp::EquipAfterSystem { system, tools: schemas } => {
-                out.extend(tools::equip_after_system(system.as_deref(), schemas)?);
-            }
-            RenderOp::User(t) => out.extend(chat::user(t)),
-            RenderOp::Assistant(t) => out.extend(chat::assistant(t)),
-            RenderOp::AssistantWithToolCalls { content, calls } => {
-                let wit_calls: Vec<tools::ToolCall> = calls
-                    .iter()
-                    .map(|(name, args)| tools::ToolCall {
-                        name: name.clone(),
-                        arguments_json: args.clone(),
-                    })
-                    .collect();
-                out.extend(tools::assistant_with_tool_calls(content.as_deref(), &wit_calls));
-            }
-            RenderOp::AnswerBatch(batch) => out.extend(tools::answer_batch(batch)),
-            RenderOp::Cue => out.extend(chat::cue_no_think()),
-        }
+        render_one(op, &mut out)?;
     }
     Ok(out)
 }
 
-/// Sanitize → plan → render the full conversation to prompt tokens.
+/// Render the history ops, recording the token length after each one plus
+/// stride points inside the long ones.
 ///
-/// SEAM (KV snapshot sessions): the resume path replaces this whole-history
-/// render — `split_resume_point` on the sanitized messages, hash the prefix
-/// with `snapshot_address`, `working-set from-index` on hit, then render
-/// only the suffix via `plan_render_messages`. Response/save unification:
-/// sanitization runs before BOTH rendering and canonicalization.
-fn build_prompt(req: &mut pie_openai_serving::ChatCompletionRequest) -> Result<Vec<u32>, BuildError> {
+/// The boundaries are the safe resume points: a unit edge lands between two
+/// render ops and a stride point lands inside one, and BOTH are literal token
+/// prefixes of this render by construction — the address is computed over the
+/// tokens, so a cut cannot name a prefix the render does not have. Ascending
+/// and duplicate-free, which `prefix_addresses` requires.
+///
+/// Identical to `opencode-session`'s `render_history`, deliberately: the two
+/// arms must cut the same conversation the same way, or an A/B measures the cut
+/// policy instead of where the KV lives.
+fn render_history(ops: &[RenderOp]) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let mut out = Vec::new();
+    let mut bounds: Vec<u32> = Vec::with_capacity(ops.len() * 4);
+    for op in ops {
+        let before = out.len() as u32;
+        render_one(op, &mut out)?;
+        let after = out.len() as u32;
+        let mut at = before.next_multiple_of(apc::BOUNDARY_STRIDE);
+        while at < after {
+            if at > before {
+                bounds.push(at);
+            }
+            at += apc::BOUNDARY_STRIDE;
+        }
+        if bounds.last() != Some(&after) {
+            bounds.push(after);
+        }
+    }
+    Ok((out, bounds))
+}
+
+/// The rendered prompt, split where the prefix cache can address it.
+struct Prompt {
+    /// `history ‖ cue` — what actually gets prefilled.
+    tokens: Vec<u32>,
+    /// Where the history ends. Nothing past this is addressable: replaying this
+    /// turn as history renders no cue at all, so KV covering the cue sits under
+    /// an address no future render produces.
+    history_len: u32,
+    /// Ascending cut candidates within the history.
+    boundaries: Vec<u32>,
+}
+
+/// Sanitize → plan → render the full conversation to prompt tokens, split at
+/// the trailing cue and marked with cut candidates for [`apc`].
+fn build_prompt(
+    req: &mut pie_openai_serving::ChatCompletionRequest,
+) -> Result<Prompt, BuildError> {
     let specials: Vec<String> = model::special_tokens()
         .into_iter()
         .filter_map(|t| String::from_utf8(t.bytes).ok())
@@ -143,7 +194,20 @@ fn build_prompt(req: &mut pie_openai_serving::ChatCompletionRequest) -> Result<V
     sanitize_messages(&mut req.messages, &specials);
 
     let ops = plan_render(req).map_err(|e| BuildError::Invalid(e.to_string()))?;
-    render_ops(&ops).map_err(BuildError::Fault)
+    // Split the plan at its trailing `Cue`: the history is what gets addressed,
+    // the cue is generation scaffolding and must not be.
+    let (history_ops, cue_ops) = match ops.split_last() {
+        Some((RenderOp::Cue, head)) => (head, &ops[ops.len() - 1..]),
+        _ => return Err(BuildError::Fault("render plan did not end with a cue".into())),
+    };
+    let (mut tokens, boundaries) = render_history(history_ops).map_err(BuildError::Fault)?;
+    let history_len = tokens.len() as u32;
+    tokens.extend(render_ops(cue_ops).map_err(BuildError::Fault)?);
+    Ok(Prompt {
+        tokens,
+        history_len,
+        boundaries,
+    })
 }
 
 enum BuildError {
@@ -186,7 +250,21 @@ async fn main(input: String) -> inferlet::Result<String> {
             return reject(500, SERVER_ERROR, "internal error while rendering the prompt");
         }
     };
-    let prompt_tokens = prompt.len() as u32;
+    let prompt_tokens = prompt.tokens.len() as u32;
+
+    // ── Prefix cache. Both halves are planned here, before the envelope is
+    // committed, because both are pure token arithmetic plus index lookups —
+    // no fire, nothing that can fail the turn. `resume` is `None` on the first
+    // request of a conversation and on any miss, and the engine then runs
+    // exactly the cold path.
+    let plan = apc::Plan::build(
+        &model::name(),
+        &prompt.tokens[..prompt.history_len as usize],
+        &prompt.boundaries,
+        inferlet::ptir::attention::prelude::kv_page_size(),
+    );
+    let resume = plan.resume();
+    let publish = plan.publish_set();
 
     // Stop set: the model's chat stop tokens, plus the turn-START marker —
     // at t=0 a looping model starts simulating the next turn instead of
@@ -200,6 +278,8 @@ async fn main(input: String) -> inferlet::Result<String> {
     }
 
     let uniq = uniq_fragment();
+    // Kept for the [apc] log line below, which `uniq` is moved into TurnState before.
+    let tag = uniq.clone();
     let meta = ChunkMeta {
         id: format!("chatcmpl-{uniq}"),
         model: model::name(),
@@ -221,15 +301,37 @@ async fn main(input: String) -> inferlet::Result<String> {
 
     // ── Generate. Per-token policy (tool decode → stop set → filtered
     // content deltas → stop strings) lives in `TurnState::on_token`.
-    let gen_error = engine::generate(
-        &prompt,
+    let run = engine::generate(
+        &prompt.tokens,
         &engine::GenConfig { temperature, top_p, max_tokens },
+        engine::Apc { resume, publish },
         |t| state.on_token(t),
     )
     .await;
+    let gen_error = run.error;
     if let Some(e) = &gen_error {
         eprintln!("[chat-completions] generation degraded to length-finish: {e}");
     }
+    // Reuse FRACTION, not a hit flag: a resume that lands on a shallow cut and
+    // re-prefills most of the history still reports a hit, and that is exactly
+    // how a prefix-cache regression hides behind a green check.
+    //
+    // Formatted into ONE string and emitted with ONE write. `eprintln!` reaches
+    // the host one format ARGUMENT at a time, each logged as its own record and
+    // interleaved with other threads' — and, under opencode, with the other
+    // concurrent request's. Reading "reuse " and taking the next log line gives
+    // whichever thread logged next, so the first monitor built on this line
+    // reported a reuse percentage with no number in it. The `uniq` fragment
+    // tags the line because two requests really are in flight at once.
+    let line = format!(
+        "[apc] {tag} reuse {:.1}% ({}/{} prompt tokens) from {} ladder cut(s); parked {}\n",
+        100.0 * apc::reuse_fraction(run.cached_tokens, prompt_tokens),
+        run.cached_tokens,
+        prompt_tokens,
+        plan.len(),
+        run.published,
+    );
+    eprint!("{line}");
 
     // Flush the filter's held-back tail, then salvage tool calls the native
     // decoder missed (fenced JSON in visible text; unclosed hermes blocks in
@@ -251,17 +353,22 @@ async fn main(input: String) -> inferlet::Result<String> {
             state.emit(&chunk);
         }
 
-        // SEAM (KV snapshot sessions): save the post-generation working set
-        // under the next turn's address HERE — before the finish chunk, so
-        // the snapshot exists when the client fires its follow-up request.
+        // The prefix for the NEXT request was parked back in `engine`, right
+        // after prefill — it is pure history, so it does not wait on this turn's
+        // outcome, and the pipeline it needs to order on is closed by the time
+        // decode ends.
 
         let finish = state.meta.finish_chunk(finish_reason);
         state.emit(&finish);
         if include_usage {
-            // cached_tokens: 0 until the session seam lands (then: resumed
-            // prefix depth; must stay ≤ prompt_tokens).
-            let usage =
-                state.meta.usage_chunk(prompt_tokens, state.generated.len() as u32, 0);
+            // The depth the engine ACTUALLY resumed at, which is 0 when it
+            // refused a resume and rebuilt. Always ≤ prompt_tokens: cuts are
+            // bounded by the history, and the history is a prefix of the render.
+            let usage = state.meta.usage_chunk(
+                prompt_tokens,
+                state.generated.len() as u32,
+                run.cached_tokens,
+            );
             state.emit(&usage);
         }
         // The gateway appends `data: [DONE]` on clean Eos.
@@ -288,14 +395,15 @@ async fn main(input: String) -> inferlet::Result<String> {
             finish_reason,
             prompt_tokens,
             state.generated.len() as u32,
-            0,
+            run.cached_tokens,
         ));
     }
 
     // The return value is instrumentation, not wire data (the envelope
     // carries the response); a summary aids `pie run` debugging.
     Ok(format!(
-        "finish={finish_reason} prompt={prompt_tokens} generated={} calls={}{}",
+        "finish={finish_reason} prompt={prompt_tokens} cached={} generated={} calls={}{}",
+        run.cached_tokens,
         state.generated.len(),
         state.calls.len(),
         gen_error.map(|e| format!(" degraded: {e}")).unwrap_or_default(),

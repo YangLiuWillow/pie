@@ -48,6 +48,7 @@
 //! logic come from `pie-openai-serving`, shared with Strategy A so the A/B
 //! compares servers rather than renderers.
 
+mod draft;
 mod engine;
 mod handler;
 mod turn;

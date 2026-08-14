@@ -225,6 +225,13 @@ impl Daemon {
     }
 
     async fn run_turn(&mut self, req_id: &str, env: Envelope) {
+        // Phase clock. A turn's wall time is the only number the client can see,
+        // and on the 7.4k-token replay it is ~1.5 s of which the model accounts
+        // for ~0.25 s. Naming where the rest goes needs the guest to say so:
+        // nothing outside it can distinguish rendering from addressing from
+        // waiting on a fire. Cheap enough to leave in — five `Instant::now()`
+        // against a turn that runs for a second.
+        let t_entry = std::time::Instant::now();
         let sink = Sink::new(req_id);
 
         let body = match serde_json::to_vec(&env.body) {
@@ -317,8 +324,10 @@ impl Daemon {
         // Address every boundary in one streaming pass. The LAST entry is this
         // turn's own render — the address we will retain under. The rest are
         // resume candidates.
+        let t_render = t_entry.elapsed();
         let model_id = model::name();
         let addressed = prefix_addresses(&model_id, TEMPLATE_MARKER, &full, &bounds);
+        let t_address = t_entry.elapsed();
         let _save_address = match addressed.last() {
             Some((_, a)) => a.clone(),
             None => {
@@ -369,6 +378,7 @@ impl Daemon {
             }
         }
 
+        let t_resume = t_entry.elapsed();
         let cached_tokens = resume_at.map(|(_, b)| b).unwrap_or(0);
         let delta = &full[cached_tokens as usize..];
         let prompt_tokens = cached_tokens + (delta.len() + cue.len()) as u32;
@@ -452,6 +462,7 @@ impl Daemon {
             )
             .await
         };
+        let t_gen = t_entry.elapsed();
 
         // A setup failure (no prefill, unsupported pass kind, a fork the driver
         // refused) still has to answer as a turn, not as a fault.
@@ -504,6 +515,7 @@ impl Daemon {
         // into one client message PER FRAGMENT, so the interpolated form
         // arrives at the shim as a dozen separate lines and the measurement is
         // unreadable exactly where it matters.
+        let t_retain = t_entry.elapsed();
         let line = format!(
             "[opencode-session] turn {} cached={cached_tokens} delta={} cue={} gen={accepted} {retained}\n",
             self.counter,
@@ -511,6 +523,22 @@ impl Daemon {
             cue.len()
         );
         eprint!("{}", line);
+        // Cumulative from turn entry, so each field is "everything up to here"
+        // and the differences are the phases. Printed cumulatively rather than
+        // as durations because a missing phase then shows up as a flat segment
+        // instead of silently vanishing into its neighbour.
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let phases = format!(
+            "[opencode-session] phases_ms turn={} render={:.1} address={:.1} \
+             resume={:.1} generate={:.1} retain={:.1} (cumulative from turn entry)\n",
+            self.counter,
+            ms(t_render),
+            ms(t_address),
+            ms(t_resume),
+            ms(t_gen),
+            ms(t_retain)
+        );
+        eprint!("{}", phases);
 
         let n_generated = state.generated.len() as u32;
         if streaming {

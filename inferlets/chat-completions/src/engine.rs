@@ -82,6 +82,36 @@ pub struct GenConfig {
     pub max_tokens: usize,
 }
 
+/// What the prefix cache asks of one turn: where to start, and what to park.
+///
+/// `resume` is `None` on a miss (and on the first turn of a conversation), in
+/// which case this is exactly the cold path that shipped before — same page
+/// pool, same `writable_pages: ..`, same spans.
+pub struct Apc {
+    /// KV already parked for a page-aligned prefix of `prompt`.
+    pub resume: Option<crate::apc::Resume>,
+    /// `(page-aligned cut, address)` pairs to park once prefill has written
+    /// them. Every cut must be within the history — never the cue.
+    pub publish: Vec<(u32, String)>,
+}
+
+/// What actually happened, as opposed to what was planned.
+///
+/// `cached_tokens` is read back from the generator rather than assumed from the
+/// plan, because the generator REFUSES a resume whose bookkeeping disagrees
+/// with its working set (see `define_generate!`) and rebuilds instead. Reporting
+/// the planned depth would then overstate `usage.cached_tokens` on exactly the
+/// turns that paid full price — the shape of prefix-cache defect that hides
+/// behind a green hit flag.
+pub struct Outcome {
+    /// First engine error, if any. Tokens already delivered stand regardless.
+    pub error: Option<String>,
+    /// Prompt tokens served from parked KV. Zero on a cold or refused resume.
+    pub cached_tokens: u32,
+    /// Cuts successfully parked for later turns.
+    pub published: usize,
+}
+
 /// In-graph top-p + temperature sampler over the read-out row logits
 /// `[1,vocab]`. `r` is the taken `[2]` u32 rng state (`[key, ctr]`) driving
 /// the Gumbel noise. Returns the sampled token `[1]` i32. Zero temperature
@@ -163,21 +193,33 @@ impl BindState for inferlet::ptir::hybrid::ForwardPass {
 pub async fn generate(
     prompt: &[u32],
     cfg: &GenConfig,
+    apc: Apc,
     mut on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
-) -> Option<String> {
+) -> Outcome {
+    let mut out = Outcome {
+        error: None,
+        cached_tokens: 0,
+        published: 0,
+    };
     if cfg.max_tokens == 0 {
-        return None;
+        return out;
     }
-    match model::pass_kind() {
-        model::ForwardKind::Attention => generate_attention(prompt, cfg, &mut on_token).await.err(),
-        model::ForwardKind::Hybrid => generate_hybrid(prompt, cfg, &mut on_token).await.err(),
+    let result = match model::pass_kind() {
+        model::ForwardKind::Attention => {
+            generate_attention(prompt, cfg, apc, &mut out, &mut on_token).await
+        }
+        model::ForwardKind::Hybrid => {
+            generate_hybrid(prompt, cfg, apc, &mut out, &mut on_token).await
+        }
         // No registered model reports recurrent-only, and this loop's paged
         // prompt geometry has nothing to bind on a pass with no KV at all —
         // so it degrades the turn rather than pretending.
-        model::ForwardKind::Recurrent => Some(
+        model::ForwardKind::Recurrent => Err(
             "this model is recurrent-only; the serving inferlet has no KV-free path".to_string(),
         ),
-    }
+    };
+    out.error = result.err();
+    out
 }
 
 macro_rules! define_generate {
@@ -185,6 +227,8 @@ macro_rules! define_generate {
         async fn $name(
             prompt: &[u32],
             cfg: &GenConfig,
+            apc: Apc,
+            outcome: &mut Outcome,
             on_token: &mut impl FnMut(u32) -> std::ops::ControlFlow<()>,
         ) -> Result<()> {
             use inferlet::ptir::$kind::{ForwardPass, run_ahead, submit_frame};
@@ -204,14 +248,129 @@ macro_rules! define_generate {
             // reads both back at ITS page size (see the reference inferlet's note).
             let page_t = kv_page_size();
 
+            // ── RESUME, or the cold path ─────────────────────────────────────
+            // A resumed working set holds a page-aligned prefix of THIS prompt,
+            // parked by an earlier request's instance. Three things have to hold
+            // before its geometry is sound, and none of them is guaranteed by
+            // the address alone:
+            //
+            //   cached < n            — else this fire has nothing to write, and
+            //                           the engine refuses an empty writable
+            //                           declaration outright;
+            //   cached % page_t == 0  — else `slice` parked fewer tokens than the
+            //                           address names, and the suffix would graft
+            //                           onto a prefix ending in the wrong place;
+            //   page_len == cached/page_t
+            //                         — the parked set is exactly its prefix, so
+            //                           anything else means the entry was built by
+            //                           a different publisher than this module.
+            //
+            // Disagreement DROPS the resume and rebuilds, the session arm's
+            // `kv_verify` discipline: a rebuild is slow, a wrong prefix is silent.
+            // Not an error — a correct turn at full price is still a correct turn.
+            let (ws, cached) = match apc.resume {
+                Some(r) => {
+                    let have = r.ws.page_len();
+                    if r.cached_tokens < n
+                        && r.cached_tokens % page_t == 0
+                        && have == r.cached_tokens / page_t
+                    {
+                        (r.ws, r.cached_tokens)
+                    } else {
+                        eprintln!(
+                            "[apc] refusing a resume at {} tokens (prompt {n}, page {page_t}, \
+                             parked pages {have}); rebuilding",
+                            r.cached_tokens
+                        );
+                        (WorkingSet::new(), 0)
+                    }
+                }
+                None => (WorkingSet::new(), 0),
+            };
+            outcome.cached_tokens = cached;
+
             // Shared logical page pool: prompt + decode headroom, page-rounded.
             // `reserve` is purely logical (no memory held until a forward writes),
             // so the real capacity bound surfaces as a fire failure mid-turn — which
             // the caller degrades to finish_reason "length", never an error status.
-            let pool_pages = (n + max_tokens as u32 + 2).div_ceil(page_t);
-            let ws = WorkingSet::new();
-            let slots = ws.reserve(pool_pages).context("ws.reserve")?;
-            let pool_ids = slots.ids().to_vec();
+            //
+            // On a resume the pool already contains the parked pages, so only the
+            // shortfall is reserved. `pool_ids` is built as `[already there] ++
+            // [granted]` rather than `0..pool_pages`, so the page table stays
+            // correct even if a grant ever comes back non-adjacent — the one
+            // assumption in this geometry that costs nothing to avoid making.
+            let have = ws.page_len();
+            // QUANTISED, and this is not a micro-optimisation — it is what keeps
+            // the driver's program cache from filling.
+            //
+            // `pool_pages` reaches the traced graph as a SHAPE CONSTANT (the
+            // decode epilogue's `reshape(&pids, [pool_pages_total])`), so every
+            // distinct value compiles a distinct program. Computed exactly, it
+            // changes with every prompt length — one new program per turn. The
+            // Metal driver caches 64 (`m1_runtime.cpp` `kMaxProgramCacheEntries`),
+            // and past that `register_program` answers "executable cache is full"
+            // and every later turn degrades to `finish_reason:"length"`.
+            //
+            // Measured: with the context ring at 16,384 nothing reached it,
+            // because trajectories died on the ring first. Raising the ring to
+            // 65,536 let two instances run 6-10x longer, they compiled ~36
+            // programs between them, and the three instances after them failed in
+            // 2 s, 2 s and 21 s against a server that could no longer register
+            // anything. One wall traded for another.
+            //
+            // Rounding to `POOL_GRANULARITY` pages collapses that to a handful of
+            // shapes. It costs nothing real: `reserve` is purely logical — no
+            // memory is held until a forward writes — so an over-reservation is a
+            // longer page-id list and nothing else.
+            //
+            // This is ONE source, not provably the only one: a prefill chunk's
+            // token count also reaches the trace, and a resumed turn's delta is a
+            // different length every turn. Whether that alone can still fill the
+            // cache is a measurement, not an argument, so the next run counts
+            // `executable cache is full` rather than assuming this fixed it.
+            //
+            // The durable fix is not here. A cache that REJECTS when full instead
+            // of evicting turns a capacity limit into a dead server, and no guest
+            // can be written that never needs a 65th shape.
+            // POWER-OF-TWO, not a fixed 256-page step, and the difference is
+            // the server's concurrency ceiling.
+            //
+            // A fixed 256-page granularity reserves 8192 tokens for EVERY
+            // request no matter how short. `reserve` is logical, but the
+            // cluster admission gate is not: with `total_pages = 2048` that is
+            // 2048/256 = exactly 8 concurrent requests, and the ninth is
+            // refused with
+            //
+            //   admission rejected: cluster saturated: no healthy worker has
+            //   KV/seq headroom
+            //
+            // Measured 2026-08-14: 8 of 32 concurrent requests completed, 24
+            // were rejected at 0.0 s. The comment this replaces claimed
+            // rounding "costs nothing real ... an over-reservation is a longer
+            // page-id list and nothing else". That was wrong: it costs the
+            // concurrency ceiling, and it cost it silently because the
+            // rejection surfaces as a 503 rather than anywhere near this code.
+            //
+            // Powers of two keep the property the rounding existed for -- the
+            // pool size is a CHANNEL SHAPE, and shape churn compiles a new
+            // program (~600 ms) -- while making the waste proportional. A
+            // 12-shape ladder (8, 16, ... 2048 pages) sits far inside the
+            // 64-entry program cache, and over-reservation is now at most 2x
+            // the request's own need instead of a flat 8192 tokens. A short
+            // request reserves 512 tokens rather than 8192, so the same pool
+            // holds 64+ of them; a long conversation still lands on 256 or 512
+            // and is unaffected.
+            const POOL_FLOOR_PAGES: u32 = 8;
+            let pool_pages = (n + max_tokens as u32 + 2)
+                .div_ceil(page_t)
+                .max(POOL_FLOOR_PAGES)
+                .next_power_of_two()
+                .max(have);
+            let mut pool_ids: Vec<u32> = (0..have).collect();
+            if pool_pages > have {
+                let slots = ws.reserve(pool_pages - have).context("ws.reserve")?;
+                pool_ids.extend_from_slice(slots.ids());
+            }
 
             // The folded recurrent state, on the kinds that have one: one set
             // per request row (this loop is one row), shared by the prefill
@@ -231,10 +390,19 @@ macro_rules! define_generate {
             // ───────────────── 1. PREFILL (chunked, C = max_embed_length) ─────────
             // Every chunk's epilogue samples (an epilogue put has to be drained or
             // the channel fills); only the LAST chunk's token continues the prompt.
+            //
+            // On a resume only the SUFFIX is submitted: `cached..n` instead of
+            // `0..n`. That is the whole saving — the parked pages are read by
+            // attention (they are inside `readable_pages`) but never re-embedded,
+            // never re-projected, and never rewritten.
             let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-            let spans = prefill_chunks(n, None);
+            let spans = prefill_chunks(n - cached, None);
             let mut g0 = 0i32;
-            for &(base, end) in &spans {
+            for &(span_base, span_end) in &spans {
+                // `prefill_chunks` splits a LENGTH evenly; these are absolute
+                // positions in the prompt, which is what every channel below
+                // (tokens, positions, write descriptors) is indexed by.
+                let (base, end) = (span_base + cached, span_end + cached);
                 let len = end - base;
                 let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
                 let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
@@ -261,8 +429,19 @@ macro_rules! define_generate {
                 fwd_p.bind_state(
                     &ws,
                     KvGeometry {
+                        // Everything parked plus everything this turn writes is
+                        // readable; only the pages at or past the resume point are
+                        // writable. The parked pages are structurally SHARED with
+                        // whatever else resumed from the same address, so a write
+                        // into them would corrupt another request's prefix. The
+                        // bound is enforced device-side as `kv_write_lower_bounds`
+                        // (`runtime/engine/src/pipeline/fire.rs:1520`), not merely
+                        // asserted here.
+                        //
+                        // `cached == 0` makes this `0..`, which is `..` — the cold
+                        // path is unchanged, not a special case.
                         readable_pages: ..,
-                        writable_pages: ..,
+                        writable_pages: (cached / page_t)..,
                         kv_len: &klen_p,
                         pages: &pages_p,
                         page_indptr: &page_indptr_p,
@@ -293,7 +472,29 @@ macro_rules! define_generate {
             // First sampled token — the caller decides whether it ends the turn.
             let done = matches!(on_token(g0 as u32), std::ops::ControlFlow::Break(()));
 
+
             // ───────────────── 2. DECODE LOOP (1-wide, run-ahead) ─────────────────
+            // Held rather than propagated, so a turn that dies mid-DECODE still
+            // parks its history below. What gets parked is prefill's output, and
+            // by here prefill has succeeded — dropping it because generation
+            // failed would make the NEXT turn pay full price too, on a
+            // conversation that is evidently already near a limit.
+            //
+            // A prefill failure is the opposite case and must NOT reach the
+            // parking block: it still returns early through `?` above, on
+            // purpose. `publish` can only check `ws.page_len()`, which is the
+            // RESERVED extent, not the WRITTEN one — so after a prefill that
+            // died on chunk 3 of 5 the guard would happily park pages 0..cut
+            // that no forward ever wrote, under an address claiming they hold
+            // that prefix. Every later turn would then resume onto uninitialised
+            // KV and generate fluently from nothing.
+            //
+            // Observed live rather than reasoned about: on the 5-instance soak
+            // two turns hit `20061` prompt tokens against a 16,384-token context
+            // ring (`max_model_len / kv_page_size`, the clamp in
+            // `context.cpp:245 effective_total_pages()`), degraded to
+            // `finish_reason:"length"`, and correctly logged `parked 0`.
+            let mut decode_error: Option<String> = None;
             let budget = if done {
                 0
             } else {
@@ -395,16 +596,26 @@ macro_rules! define_generate {
                 // to discover.
                 const SEQUENTIAL_DECODE: bool = false;
                 if !SEQUENTIAL_DECODE {
-                    run_ahead(&pipe, &fwd, budget, async || {
+                    decode_error = run_ahead(&pipe, &fwd, budget, async || {
                         let t = out.take_host::<Vec<i32>>().await?;
                         let token = *t.first().unwrap_or(&0) as u32;
                         Ok(on_token(token))
                     })
-                    .await?;
+                    .await
+                    .err();
                 } else {
                     for _ in 0..budget {
-                        submit_frame(&pipe, &[Some(&fwd)])?;
-                        let t = out.take_host::<Vec<i32>>().await?;
+                        if let Err(e) = submit_frame(&pipe, &[Some(&fwd)]) {
+                            decode_error = Some(e);
+                            break;
+                        }
+                        let t = match out.take_host::<Vec<i32>>().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                decode_error = Some(e.to_string());
+                                break;
+                            }
+                        };
                         let token = *t.first().unwrap_or(&0) as u32;
                         if on_token(token).is_break() {
                             break;
@@ -418,7 +629,40 @@ macro_rules! define_generate {
             // releases the scheduler wait-set, reclaims them, and rejects further
             // submissions.
             pipe.close();
-            Ok(())
+
+            // ───────────────── 3. PARK THE PREFIX ─────────────────────────────
+            // AFTER every write, and this ordering is forced, not stylistic.
+            //
+            // `slice` makes the parent's pages structurally shared, so the next
+            // fire that writes near them needs a copy-on-write KV copy — and on
+            // the Metal driver `copy_kv` answers PIE_STATUS_UNSUPPORTED for any
+            // checkpoint that is not a GDN hybrid (`driver/metal/src/context.cpp`,
+            // `copy_kv_impl`: "this increment only supports the qwen3.6
+            // (GDN-hybrid) checkpoint geometry"). Qwen3-Coder-30B is pure
+            // attention, so parking before decode poisoned the decode channel
+            // with `pre-launch KV copy rejected: pie_metal_copy_kv failed with
+            // status -3` and the turn returned its FIRST TOKEN ONLY — a fluent,
+            // plausible, truncated answer that no wire-level check would flag.
+            //
+            // Parking last leaves no fire after the sharing is introduced, so no
+            // copy is ever planned. A fresh pipeline is needed because `slice` is
+            // ordered on one and `run_ahead` closed the turn's: the history pages
+            // settled during prefill, whose takes were awaited, so there is
+            // nothing left for the ordering to protect.
+            if !apc.publish.is_empty() {
+                let park = Pipeline::new();
+                for (cut, address) in &apc.publish {
+                    if crate::apc::publish(&park, &ws, *cut, address, page_t) {
+                        outcome.published += 1;
+                    }
+                }
+                park.close();
+            }
+
+            match decode_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
     };
 }
