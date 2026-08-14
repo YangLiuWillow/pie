@@ -85,6 +85,9 @@ class Bridge:
         self.pie_uri = pie_uri
         self.inferlet = inferlet
         self.client: PieClient | None = None
+        self.connected = False
+        self._wasm: str | None = None
+        self._manifest: str | None = None
         self.hints = PrefixHints()
         # Stamped onto every response. The gateway's own weight_version is
         # OVERRIDDEN by whatever the response body carries
@@ -103,13 +106,49 @@ class Bridge:
         self.hints.clear()
 
     async def connect(self, wasm: str | None, manifest: str | None) -> None:
+        self._wasm, self._manifest = wasm, manifest
+        await self._dial()
+
+    async def _dial(self) -> None:
         self.client = PieClient(self.pie_uri)
         await self.client.connect()
-        if wasm and manifest:
-            await self.client.install_program(wasm, manifest, force_overwrite=True)
-            log.info("installed %s from %s", self.inferlet, wasm)
+        if self._wasm and self._manifest:
+            await self.client.install_program(self._wasm, self._manifest, force_overwrite=True)
+            log.info("installed %s from %s", self.inferlet, self._wasm)
+        self.connected = True
+
+    async def _redial(self) -> None:
+        """Re-establish the WebSocket to pie after it drops.
+
+        One connection was opened at startup and never renewed, so a single
+        dropped socket bricked the bridge for its whole lifetime: every rollout
+        failed instantly with "no close frame received or sent" while /health
+        went on returning 200. A training run logged 784 such failures and a
+        solve-rate probe measured three task sets as unsolvable — all of it
+        against a connection that had been dead since the ninth request.
+        """
+        self.connected = False
+        self.hints.clear()   # snapshots do not survive a pie restart
+        try:
+            if self.client is not None:
+                await self.client.close()
+        except Exception:
+            pass
+        await self._dial()
+        log.warning("reconnected to pie at %s", self.pie_uri)
 
     async def rollout(self, inp: dict) -> dict:
+        try:
+            return await self._rollout_once(inp)
+        except Exception as first:
+            # Distinguishing a dropped socket from an inferlet error is not
+            # worth guessing at: redial and retry once. A genuine inferlet
+            # failure simply fails again, with its own message.
+            log.warning("rollout failed (%s); redialing pie and retrying once", first)
+            await self._redial()
+            return await self._rollout_once(inp)
+
+    async def _rollout_once(self, inp: dict) -> dict:
         proc = await self.client.launch_process(self.inferlet, input=inp)
         last = None
         while True:
@@ -421,8 +460,20 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
 
 
 async def handle_health(request: web.Request) -> web.Response:
+    """Health means "I can serve", not "my process is running".
+
+    Reporting ok while the link to pie was dead is what let three probe runs
+    and part of a training run burn against a bridge that could not serve a
+    single token — the router kept it in the fleet because /health said 200.
+    """
     bridge: Bridge = request.app["bridge"]
-    return web.json_response({"status": "ok", "weight_version": bridge.weight_version})
+    body = {
+        "status": "ok" if bridge.connected else "degraded",
+        "weight_version": bridge.weight_version,
+        "pie": bridge.pie_uri,
+        "connected": bridge.connected,
+    }
+    return web.json_response(body, status=200 if bridge.connected else 503)
 
 
 async def handle_weight_version(request: web.Request) -> web.Response:
