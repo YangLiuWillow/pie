@@ -101,8 +101,25 @@ impl PendingRequest {
             physical_page_ids,
             last_page_len,
         } = self;
-        let Completion::Direct(response_tx) = completion else {
-            unreachable!("chunk continuations returned above");
+        let response_tx = match completion {
+            Completion::Direct(tx) => tx,
+            // A speculation-chain first fire carries the whole fill (the
+            // chain is the universal cold-submit path even with pass
+            // speculation disabled), so it can exceed the row caps like any
+            // Direct fill. Chunk it by adopting the chain's response
+            // channel; the chain-extension state is dropped — staged
+            // run-ahead cannot span a chunked fill, and the inferlet's next
+            // submit simply starts a fresh chain. Panicking here instead
+            // killed the scheduler thread and wedged the whole engine on
+            // the first oversized textual-join flush.
+            Completion::Chain { state } => {
+                tracing::debug!(
+                    "chunking a chain first fire ({} tokens); run-ahead forfeited for this fire",
+                    request.token_ids.len()
+                );
+                state.response
+            }
+            Completion::Chunk { .. } => unreachable!("chunk continuations returned above"),
         };
         let response_accumulator = ChunkResponseAccumulator::new(request.n_samplers());
 
