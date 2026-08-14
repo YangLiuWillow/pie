@@ -2086,7 +2086,20 @@ ForwardDispatchResult run_forward_dispatch(
         fwd_in.is_fresh_h          = in.use_slots ? in.is_fresh_h_data : nullptr;
         fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
         fwd_in.logit_row_indices_d = in.compact_logit_rows ? pi.sample_idx.data() : nullptr;
-        fwd_in.num_logit_rows      = in.compact_logit_rows ? in.num_sampling : 0;
+        // num_logit_rows semantics at the model forward: >0 = compact
+        // gathered rows, -1 = full logits over every row, 0 = "no logits
+        // consumer" — which (outside pure decode) SKIPS the lm_head
+        // entirely. A sampler-carrying fill with the compact path disabled
+        // (probes/msgpack slots, top-k/top-p, custom masks) therefore must
+        // say -1, not 0: saying 0 zeroed every fill-pass Distribution probe
+        // on CUDA (the §12 "selftest gap" — degenerate all-zero
+        // distributions with tops [0,1,2]). The full-row write is bounded
+        // by the runtime's row-cap chunking (bug 12), which keeps
+        // sampler-carrying fills at N <= max_logit_rows.
+        fwd_in.num_logit_rows =
+            in.compact_logit_rows                     ? in.num_sampling
+            : (in.num_sampling > 0 && !in.is_pure_decode) ? -1
+                                                      : 0;
         fwd_in.emit_logits         = in.num_sampling > 0;
         fwd_in.tp_greedy_argmax    = in.tp_greedy_argmax;
         // Multimodal: image data for the encode+scatter (no-op if none). Only
