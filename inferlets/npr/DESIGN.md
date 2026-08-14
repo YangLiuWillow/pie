@@ -878,6 +878,16 @@ conditions previously wedged the engine permanently at the first event.
 (The recreation preserving weight/KV buffers is thereby also confirmed —
 46 consecutive post-recreation forwards produced coherent continuations.)
 
+**The pattern is engine-independent.** The same storm killed a co-tenant
+vLLM-metal server on this box with the identical signature under a
+different name: one `Insufficient Memory` command-buffer failure, then
+`EngineDeadError` and instant 500s with no further OOM lines. Stated
+generally: *the first failure is pressure; everything after it is a latch* —
+and the benchmarking corollary is that a run of identical fast failures
+must never be read as a model result (it nearly was, twice, on this
+machine in one week). The eval harness's consecutive-failure circuit
+breaker and end-of-sweep canary exist because of exactly this.
+
 **For the H100 cliff**: the fault-injection result exonerates pie's core
 recovery path for *thrown* driver failures on the portable path. The CUDA
 driver has no ggml latch, so the cliff — if real — has a different
