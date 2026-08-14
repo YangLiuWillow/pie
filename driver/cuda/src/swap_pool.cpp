@@ -195,6 +195,46 @@ void SwapPool::copy_d2d(KvCache& cache,
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
+void SwapPool::copy_rows_d2d(KvCache& cache,
+                             std::span<const std::uint32_t> src_gpu,
+                             std::span<const std::uint32_t> dst_gpu,
+                             std::span<const std::uint32_t> src_rows,
+                             std::span<const std::uint32_t> dst_rows,
+                             std::span<const std::uint32_t> row_counts)
+{
+    check_pairs(src_gpu.size(), dst_gpu.size());
+    check_pairs(src_gpu.size(), src_rows.size());
+    check_pairs(src_gpu.size(), dst_rows.size());
+    check_pairs(src_gpu.size(), row_counts.size());
+    if (cache.hnd_layout()) {
+        throw std::runtime_error(
+            "swap_pool: copy_rows_d2d is not supported under the HND KV layout");
+    }
+    const std::size_t ps = static_cast<std::size_t>(page_size_);
+    for (int layer = 0; layer < num_layers_; ++layer) {
+        auto dev_buffers = cache.page_buffers(layer);
+        for (std::size_t i = 0; i < src_gpu.size(); ++i) {
+            const std::size_t n = row_counts[i];
+            if (n == 0) continue;
+            if (src_rows[i] + n > ps || dst_rows[i] + n > ps) {
+                throw std::runtime_error(
+                    "swap_pool: copy_rows_d2d segment exceeds page_size");
+            }
+            for (const auto& db : dev_buffers) {
+                // NHD: token slot is the outermost within-page axis in every
+                // plane (K, V, per-token scales), so rows are contiguous.
+                const std::size_t row_bytes = db.page_bytes / ps;
+                auto* base = static_cast<std::uint8_t*>(db.data);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    base + (static_cast<std::size_t>(dst_gpu[i]) * ps + dst_rows[i]) * row_bytes,
+                    base + (static_cast<std::size_t>(src_gpu[i]) * ps + src_rows[i]) * row_bytes,
+                    n * row_bytes, cudaMemcpyDeviceToDevice, stream_));
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
 void SwapPool::copy_h2h(std::span<const std::uint32_t> src_host,
                         std::span<const std::uint32_t> dst_host)
 {

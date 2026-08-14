@@ -28,8 +28,23 @@ fn copy_request(
             srcs,
             dsts,
             resource,
+            src_rows: Vec::new(),
+            dst_rows: Vec::new(),
+            row_counts: Vec::new(),
         }),
     }
+}
+
+/// One sub-page KV row-range copy: `row_count` token-slot rows from
+/// `src_page` starting at row `src_row` into `dst_page` starting at row
+/// `dst_row`, across every (layer, K/V) plane.
+#[derive(Debug, Clone, Copy)]
+pub struct KvRowCopySegment {
+    pub src_page: u32,
+    pub src_row: u32,
+    pub dst_page: u32,
+    pub dst_row: u32,
+    pub row_count: u32,
 }
 
 fn adapter_request(
@@ -98,6 +113,53 @@ pub fn copy_h2h(driver_idx: DriverId, src_slots: &[u32], dst_slots: &[u32]) -> R
             dst_slots.to_vec(),
         ))
     })
+}
+
+/// GPU → GPU sub-page KV row-range copy. Segments may address any mix of
+/// committed and working physical pages; the driver copies `row_count` slot
+/// rows per segment across every (layer, K/V) plane.
+///
+/// Unlike the whole-page copies this **awaits the driver's status**: a
+/// failed row copy (unsupported layout, backend error) must surface to the
+/// caller — the adopted KV would otherwise be silently stale garbage that
+/// nothing downstream can detect.
+pub async fn copy_kv_rows_d2d(driver_idx: DriverId, segments: &[KvRowCopySegment]) -> Result<()> {
+    let mut srcs = Vec::with_capacity(segments.len());
+    let mut dsts = Vec::with_capacity(segments.len());
+    let mut src_rows = Vec::with_capacity(segments.len());
+    let mut dst_rows = Vec::with_capacity(segments.len());
+    let mut row_counts = Vec::with_capacity(segments.len());
+    for seg in segments {
+        srcs.push(seg.src_page);
+        dsts.push(seg.dst_page);
+        src_rows.push(seg.src_row);
+        dst_rows.push(seg.dst_row);
+        row_counts.push(seg.row_count);
+    }
+    let req = DriverRequest {
+        driver_id: driver_idx,
+        payload: RequestPayload::Copy(CopyRequest {
+            dir: CopyDir::D2D,
+            srcs,
+            dsts,
+            resource: CopyResource::Kv,
+            src_rows,
+            dst_rows,
+            row_counts,
+        }),
+    };
+    let ch = super::channel::get_channel(driver_idx)?;
+    let resp = ch.submit(req).await?;
+    match resp.payload {
+        ResponsePayload::Status(s) if s.status == 0 => Ok(()),
+        ResponsePayload::Status(s) => Err(anyhow::anyhow!(
+            "copy_kv_rows_d2d returned status {} (driver refused or failed the row copy)",
+            s.status
+        )),
+        ResponsePayload::Forward(_) => Err(anyhow::anyhow!(
+            "copy_kv_rows_d2d received forward response (driver bug)"
+        )),
+    }
 }
 
 /// GPU → GPU recurrent-state slot copy (fire-and-forget).

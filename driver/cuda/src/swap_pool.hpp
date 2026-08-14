@@ -63,6 +63,20 @@ public:
                   std::span<const std::uint32_t> src_gpu_pages,
                   std::span<const std::uint32_t> dst_gpu_pages);
 
+    // Sub-page KV row-range copy (device-to-device). Segment i copies
+    // `row_counts[i]` token-slot rows starting at row `src_rows[i]` of page
+    // `src_gpu_pages[i]` into rows starting at `dst_rows[i]` of page
+    // `dst_gpu_pages[i]`, across every (layer, plane). In the default NHD
+    // layout the slot axis is outermost within a page, so each plane segment
+    // is one contiguous `cudaMemcpyAsync`; the opt-in HND layout is not
+    // supported and throws.
+    void copy_rows_d2d(KvCache& cache,
+                       std::span<const std::uint32_t> src_gpu_pages,
+                       std::span<const std::uint32_t> dst_gpu_pages,
+                       std::span<const std::uint32_t> src_rows,
+                       std::span<const std::uint32_t> dst_rows,
+                       std::span<const std::uint32_t> row_counts);
+
     void copy_h2h(std::span<const std::uint32_t> src_host_slots,
                   std::span<const std::uint32_t> dst_host_slots);
 

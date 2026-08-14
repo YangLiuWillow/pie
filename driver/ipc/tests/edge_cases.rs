@@ -88,6 +88,9 @@ fn copy_request_zero_length_lists_desc() {
             srcs: vec![],
             dsts: vec![],
             resource: CopyResource::Kv,
+            src_rows: vec![],
+            dst_rows: vec![],
+            row_counts: vec![],
         }),
     };
     let view = frame.as_desc();

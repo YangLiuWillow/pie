@@ -85,6 +85,72 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                         out.status = 5;
                         break;
                     }
+                    const auto src_rows = req.copy_src_rows.as<std::uint32_t>();
+                    const auto dst_rows = req.copy_dst_rows.as<std::uint32_t>();
+                    const auto row_counts = req.copy_row_counts.as<std::uint32_t>();
+                    if (!src_rows.empty()) {
+                        // Sub-page row-range segments: D2D only.
+                        if (req.method != pie_driver::PIE_METHOD_COPY_D2D ||
+                            src_rows.size() != srcs.size() ||
+                            dst_rows.size() != srcs.size() ||
+                            row_counts.size() != srcs.size()) {
+                            out.status = 5;
+                            break;
+                        }
+                        auto& kv = executor_.kv();
+                        const std::uint32_t ps =
+                            static_cast<std::uint32_t>(kv.page_size());
+                        const std::uint32_t total_dev =
+                            static_cast<std::uint32_t>(kv.total_pages());
+                        bool ok = true;
+                        try {
+                            for (std::size_t i = 0; i < srcs.size() && ok; ++i) {
+                                const std::uint32_t n = row_counts[i];
+                                if (n == 0) continue;
+                                if (srcs[i] >= total_dev || dsts[i] >= total_dev ||
+                                    src_rows[i] + n > ps || dst_rows[i] + n > ps) {
+                                    out.status = 3;
+                                    ok = false;
+                                    break;
+                                }
+                                for (std::int32_t il = 0; il < kv.n_layers(); ++il) {
+                                    // nb[1] = bytes per token-slot row for this
+                                    // layer's dtype (exact for quantized types
+                                    // and per-layer head counts alike).
+                                    const std::size_t krow = kv.k(il)->nb[1];
+                                    const std::size_t vrow = kv.v(il)->nb[1];
+                                    const std::size_t ks =
+                                        (static_cast<std::size_t>(srcs[i]) * ps +
+                                         src_rows[i]) * krow;
+                                    const std::size_t kd =
+                                        (static_cast<std::size_t>(dsts[i]) * ps +
+                                         dst_rows[i]) * krow;
+                                    const std::size_t vs =
+                                        (static_cast<std::size_t>(srcs[i]) * ps +
+                                         src_rows[i]) * vrow;
+                                    const std::size_t vd =
+                                        (static_cast<std::size_t>(dsts[i]) * ps +
+                                         dst_rows[i]) * vrow;
+                                    std::vector<std::uint8_t> tmp(n * krow);
+                                    ggml_backend_tensor_get(
+                                        kv.k(il), tmp.data(), ks, n * krow);
+                                    ggml_backend_tensor_set(
+                                        kv.k(il), tmp.data(), kd, n * krow);
+                                    tmp.resize(n * vrow);
+                                    ggml_backend_tensor_get(
+                                        kv.v(il), tmp.data(), vs, n * vrow);
+                                    ggml_backend_tensor_set(
+                                        kv.v(il), tmp.data(), vd, n * vrow);
+                                }
+                            }
+                            if (ok) out.status = 0;
+                        } catch (const std::exception& e) {
+                            std::cerr << "[pie-driver-portable] row copy failed: "
+                                      << e.what() << "\n";
+                            out.status = 5;
+                        }
+                        break;
+                    }
                     auto& kv = executor_.kv();
                     const std::size_t per_page = page_bytes_of(kv);
                     const int total_dev = kv.total_pages();

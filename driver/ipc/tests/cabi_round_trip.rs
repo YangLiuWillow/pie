@@ -84,6 +84,9 @@ fn copy_request_desc_pod_enums_by_value() {
             srcs: vec![1, 2, 3],
             dsts: vec![10, 20, 30],
             resource: CopyResource::Kv,
+            src_rows: vec![],
+            dst_rows: vec![],
+            row_counts: vec![],
         }),
     };
     let view = frame.as_desc();

@@ -260,6 +260,13 @@ struct PieInProcRequestView {
     // COPY_D2D, COPY_H2H}.
     PieSlice<std::uint32_t> copy_srcs;
     PieSlice<std::uint32_t> copy_dsts;
+    // Sub-page row-range segments (empty ⇒ whole-page copy). When non-empty,
+    // all three have the same length as copy_srcs/copy_dsts: segment i copies
+    // copy_row_counts[i] slot rows from row copy_src_rows[i] of page
+    // copy_srcs[i] to row copy_dst_rows[i] of page copy_dsts[i].
+    PieSlice<std::uint32_t> copy_src_rows;
+    PieSlice<std::uint32_t> copy_dst_rows;
+    PieSlice<std::uint32_t> copy_row_counts;
 
     // Adapter variant — populated when method ∈ {LOAD/SAVE/ZO_INIT/
     // ZO_UPDATE}. Path is bytes (UTF-8); empty when absent.
@@ -519,6 +526,9 @@ inline void build_request_view(const PieFrameDesc& frame,
             out.method = (rs ? PIE_METHOD_RS_COPY_D2H : PIE_METHOD_COPY_D2H) + c.dir;
             out.copy_srcs = slice_from(c.srcs_ptr, c.srcs_len);
             out.copy_dsts = slice_from(c.dsts_ptr, c.dsts_len);
+            out.copy_src_rows = slice_from(c.src_rows_ptr, c.src_rows_len);
+            out.copy_dst_rows = slice_from(c.dst_rows_ptr, c.dst_rows_len);
+            out.copy_row_counts = slice_from(c.row_counts_ptr, c.row_counts_len);
             break;
         }
         case PIE_REQUEST_PAYLOAD_ADAPTER: {

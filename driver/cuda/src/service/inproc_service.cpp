@@ -42,6 +42,12 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     break;
                 }
                 case pie_driver::PIE_METHOD_COPY_D2H: {
+                    if (!req.copy_src_rows.empty()) {
+                        // Row segments are D2D-only; a silent whole-page
+                        // fallback would copy the wrong bytes.
+                        out.status = 5;
+                        break;
+                    }
                     try {
                         swap_pool_.copy_d2h(
                             kv_cache_,
@@ -56,6 +62,10 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     break;
                 }
                 case pie_driver::PIE_METHOD_COPY_H2D: {
+                    if (!req.copy_src_rows.empty()) {
+                        out.status = 5;
+                        break;
+                    }
                     try {
                         swap_pool_.copy_h2d(
                             kv_cache_,
@@ -71,10 +81,20 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                 }
                 case pie_driver::PIE_METHOD_COPY_D2D: {
                     try {
-                        swap_pool_.copy_d2d(
-                            kv_cache_,
-                            req.copy_srcs.as<std::uint32_t>(),
-                            req.copy_dsts.as<std::uint32_t>());
+                        if (!req.copy_src_rows.empty()) {
+                            swap_pool_.copy_rows_d2d(
+                                kv_cache_,
+                                req.copy_srcs.as<std::uint32_t>(),
+                                req.copy_dsts.as<std::uint32_t>(),
+                                req.copy_src_rows.as<std::uint32_t>(),
+                                req.copy_dst_rows.as<std::uint32_t>(),
+                                req.copy_row_counts.as<std::uint32_t>());
+                        } else {
+                            swap_pool_.copy_d2d(
+                                kv_cache_,
+                                req.copy_srcs.as<std::uint32_t>(),
+                                req.copy_dsts.as<std::uint32_t>());
+                        }
                         out.status = 0;
                     } catch (const std::exception& e) {
                         std::cerr << "[pie-driver-cuda] copy_d2d: "
@@ -84,6 +104,10 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     break;
                 }
                 case pie_driver::PIE_METHOD_COPY_H2H: {
+                    if (!req.copy_src_rows.empty()) {
+                        out.status = 5;
+                        break;
+                    }
                     try {
                         swap_pool_.copy_h2h(
                             req.copy_srcs.as<std::uint32_t>(),

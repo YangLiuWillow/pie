@@ -181,6 +181,12 @@ struct PieCopyRequestDesc {
   const uint32_t *dsts_ptr;
   size_t dsts_len;
   PieCopyResource resource;
+  const uint32_t *src_rows_ptr;
+  size_t src_rows_len;
+  const uint32_t *dst_rows_ptr;
+  size_t dst_rows_len;
+  const uint32_t *row_counts_ptr;
+  size_t row_counts_len;
 };
 
 struct PieAdapterRequestDesc {

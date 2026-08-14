@@ -193,6 +193,9 @@ fn copy_request_round_trip() {
             srcs: vec![1, 2, 3],
             dsts: vec![10, 20, 30],
             resource: CopyResource::Kv,
+            src_rows: vec![],
+            dst_rows: vec![],
+            row_counts: vec![],
         }),
     };
     let bytes = encode_request(&f).unwrap();

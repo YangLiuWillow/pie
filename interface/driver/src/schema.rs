@@ -476,6 +476,16 @@ pub struct CopyRequest {
     pub dsts: Vec<u32>,
     #[schema(pod)]
     pub resource: CopyResource,
+    /// Sub-page row-range copy (append-only extension). When non-empty, the
+    /// three vectors have equal length N and describe N segments: segment i
+    /// copies `row_counts[i]` token-slot rows starting at row `src_rows[i]`
+    /// of page `srcs[i]` into rows starting at `dst_rows[i]` of page
+    /// `dsts[i]`, for every (layer, K/V) plane. `srcs`/`dsts` then also have
+    /// length N (one page id per segment; a page may repeat). Empty vectors
+    /// keep the original whole-page semantics. Kv resource only.
+    pub src_rows: Vec<u32>,
+    pub dst_rows: Vec<u32>,
+    pub row_counts: Vec<u32>,
 }
 
 #[schema]

@@ -101,6 +101,9 @@ fn copy_request_view_unit_enum_field() {
         srcs: vec![1, 2, 3],
         dsts: vec![10, 20, 30],
         resource: CopyResource::Kv,
+        src_rows: vec![],
+        dst_rows: vec![],
+        row_counts: vec![],
     };
     let view = pie_copy_request_view(&cr);
     // Flat-POD enum field embedded by value (the desc holds a `CopyDir`).
