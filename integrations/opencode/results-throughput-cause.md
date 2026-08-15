@@ -127,3 +127,57 @@ a source trace. The serialization hypothesis predicts 106 ms per token per
 stream against 90 measured — close, but 15% off, so something else is also
 moving. Confirming it needs `PIE_METAL_DISPATCH_TRACE` on a concurrent run to
 count rows per fire directly, which needs a quiet machine.
+
+---
+
+# A k-row decode that shares the KV read: measured
+
+`driver/metal/tools/rawmetal/kernels/sdpa_krow_decode.metal`. Keeps the decode
+kernel's key-parallel decomposition -- 32 simdgroups splitting the KEYS, 32
+lanes splitting the head dim -- and gives each simdgroup all k query rows, so a
+key loaded once is used k times.
+
+Correct at every k tested against a CPU reference (0 wrong at k=1,2,4,8).
+16k context, 32 heads, KROWS=1 is the same kernel doing what
+`sdpa_paged_decode` does, so the ratio isolates the sharing:
+
+| k rows | this kernel | shipped per-row | |
+|---:|---:|---:|---|
+| 1 | 1.00x | 1.00x | |
+| 2 | **1.26x** | 1.54x | 18% faster |
+| 3 | **1.54x** | — | |
+| 4 | **1.79x** | 2.39x | 25% faster |
+| 5 | **2.04x** | 2.82x | **28% faster** |
+| 6 | 4.44x | — | **cliff** |
+| 8 | 6.44x | 4.08x | 58% SLOWER |
+
+**Two clean regimes, and the boundary is sharp.** From k=1 to k=5 the cost is
+linear at **0.26x per extra row** (1.00, 1.26, 1.54, 1.79, 2.04) against the
+shipped kernel's ~0.46x. The sharing works exactly as intended. Between k=5 and
+k=6 it jumps by 2.40x for ONE more row, and stays broken at 8.
+
+That is register spill, not a bandwidth effect: per lane the kernel holds
+`q[k][4] + o[k][4]` floats, so 40 at k=5 and 48 at k=6. The same wall the NAX
+Q-hoist hit. It is measured here rather than asserted, and the cliff's position
+is what makes it unambiguous -- bandwidth effects do not step 2.4x on one row.
+
+## What this is worth
+
+**Speculation is the exact fit.** `results-speculation.md` describes a 5-row
+verify fire falling to the per-row kernel and reading the cache five times. At
+k=5 this kernel is 28% faster than what that fire runs today, and speculation
+is already implemented and waiting.
+
+**Concurrent batching needs one more step.** Eight co-batched decodes would
+spill. Chunking into groups of <=5 gives two KV reads instead of eight -- still
+4x better than today -- and the chunk boundary is now known rather than guessed.
+That work only pays once the scheduler ceiling above is lifted, since today two
+concurrent decodes cannot share a fire at all.
+
+## Not yet done
+
+Not wired into the driver: this is a probe kernel with its own harness, not a
+`sdpa_should_tile` branch. Landing it means a third launch shape and a
+selection rule, and `llama_sdpa_mma_this_fire`'s comment is the warning -- if
+`pso_for` and `launch_shape` disagree the grid describes a different kernel
+than the one that runs, which is wrong numbers rather than a crash.

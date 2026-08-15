@@ -32,6 +32,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -265,6 +266,95 @@ double depage_cost(RawMetalContext& ctx, Pso pso, int ctx_len, int layer) {
 
 }  // namespace
 
+// One k-row decode fire: correctness against a CPU reference, then its cost.
+// KROWS=1 is the baseline -- the same kernel doing what `sdpa_paged_decode`
+// does -- so the k/1 ratio isolates the KV sharing and nothing else.
+double krow_run(RawMetalContext& ctx, Pso pso, int krows, int ctx_len, int ordinal,
+                bool check) {
+    constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
+    const int pages = (ctx_len + krows + kPage - 1) / kPage;
+    auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+
+    SlotHandle q = ctx.heap_alloc(size_t(krows) * kHeads * kD * 2);
+    SlotHandle kp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle vp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle o  = ctx.heap_alloc(size_t(krows) * kHeads * kD * 2);
+    SlotHandle pos = ctx.heap_alloc(size_t(krows) * sizeof(int));
+    SlotHandle pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    auto* qz = static_cast<uint16_t*>(q.contents());
+    auto* kz = static_cast<uint16_t*>(kp.contents());
+    auto* vz = static_cast<uint16_t*>(vp.contents());
+    std::memset(kz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(vz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(o.contents(), 0, size_t(krows) * kHeads * kD * 2);
+    for (int p2 = 0; p2 < pages; ++p2) static_cast<uint32_t*>(pidx.contents())[p2] = uint32_t(p2);
+    for (int r = 0; r < krows; ++r) static_cast<int*>(pos.contents())[r] = ctx_len + r;
+
+    std::vector<float> qf(size_t(krows) * kD), kf(size_t(ctx_len + krows) * kD), vf(kf.size());
+    for (int r = 0; r < krows; ++r)
+      for (int d = 0; d < kD; ++d) {
+        qf[size_t(r)*kD+d] = float((r + d) % 5) * 0.125f;
+        for (int h = 0; h < kHeads; ++h) qz[(size_t(r)*kHeads + h)*kD + d] = bf(qf[size_t(r)*kD+d]);
+      }
+    for (int c = 0; c < ctx_len + krows; ++c)
+      for (int d = 0; d < kD; ++d) {
+        kf[size_t(c)*kD+d] = float((c + 2*d) % 4) * 0.125f;
+        vf[size_t(c)*kD+d] = float((3*c + d) % 6) * 0.25f;
+        for (int h = 0; h < kKv; ++h) {
+            kz[(size_t(c)*kKv + h)*kD + d] = bf(kf[size_t(c)*kD+d]);
+            vz[(size_t(c)*kKv + h)*kD + d] = bf(vf[size_t(c)*kD+d]);
+        }
+      }
+
+    const float scale = 1.0f / 11.3137085f;
+    const Kernel kind = Kernel::Sdpa;
+    ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
+    ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, o);
+    ctx.arg_bind(kind, ordinal, 4, scalar<int>(ctx, kHeads / kKv));
+    ctx.arg_bind(kind, ordinal, 5, pos); ctx.arg_bind(kind, ordinal, 6, pidx);
+    ctx.arg_bind(kind, ordinal, 7, scalar<int>(ctx, kPage));
+    ctx.arg_bind(kind, ordinal, 8, scalar<int>(ctx, kKv));
+    ctx.arg_bind(kind, ordinal, 9, scalar<float>(ctx, scale));
+    ctx.make_resident();
+
+    Grid grid{uint32_t(kHeads) * 1024u, 1, 1};
+    Threadgroup tg{1024, 1, 1};
+    LatencyHarness h(ctx);
+    auto enc = [&](StepEncoder& se) {
+        se.set_pso(pso); se.set_argtable(kind, ordinal); se.dispatch(grid, tg);
+    };
+    BenchResult r = h.time_step("krow", enc, check ? 1 : 30, check ? 0 : 8);
+
+    if (check) {
+        const uint16_t* og = static_cast<const uint16_t*>(o.contents());
+        int bad = 0; double worst = 0;
+        for (int rr = 0; rr < krows; ++rr) {
+            const int hi = ctx_len + rr;
+            std::vector<double> sc(size_t(hi) + 1); double mx = -1e30;
+            for (int c = 0; c <= hi; ++c) {
+                double a2 = 0;
+                for (int d = 0; d < kD; ++d) a2 += double(qf[size_t(rr)*kD+d]) * double(kf[size_t(c)*kD+d]);
+                sc[c] = a2 * double(scale); if (sc[c] > mx) mx = sc[c];
+            }
+            double sm = 0;
+            for (int c = 0; c <= hi; ++c) { sc[c] = std::exp(sc[c] - mx); sm += sc[c]; }
+            for (int d = 0; d < kD; ++d) {
+                double ref = 0;
+                for (int c = 0; c <= hi; ++c) ref += sc[c] * double(vf[size_t(c)*kD+d]);
+                ref /= sm;
+                uint32_t bits = uint32_t(og[(size_t(rr)*kHeads + 0)*kD + d]) << 16;
+                float got; std::memcpy(&got, &bits, 4);
+                const double e = std::abs(double(got) - ref) / (std::abs(ref) + 1e-6);
+                if (e > 3e-2) { ++bad; worst = e > worst ? e : worst; }
+            }
+        }
+        printf("  KROWS=%d correctness: %d of %d wrong%s", krows, bad, krows * kD,
+               bad == 0 ? "  \xe2\x80\x94 CORRECT\n" : "");
+        if (bad) printf("   (worst %.4f)\n", worst);
+    }
+    return r.median.gpu_exec_ms;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -299,6 +389,26 @@ int main(int argc, char** argv) {
         {184, 2048, "184 rows @ 2048 ctx"},   // shorter cache, same width
         {512, 7424, "512 rows @ 7424 ctx"},   // wider fire, same cache
     };
+
+    // ── k-row decode: does it read the cache once, or k times? ──
+    {
+        printf("k-row decode, shared KV read (KROWS=1 is the per-row baseline):\n");
+        const std::string ld = PIE_METAL_TOOL_LOCAL_KERNELS_DIR;
+        double base = 0;
+        for (int k : {1, 2, 3, 4, 5, 6, 8}) {
+            std::string ek;
+            char f[64]; snprintf(f, sizeof f, "/sdpa_krow_%d.metal", k);
+            Pso p = ctx->compile_pso_from_file(ld + f, "sdpa_krow_decode", &ek);
+            if (!p.valid()) { printf("  KROWS=%d compile fail: %s\n", k, ek.c_str()); continue; }
+            if (k <= 4 || k == 8) krow_run(*ctx, p, k, 2048, 200 + k, /*check=*/true);
+            const double t = krow_run(*ctx, p, k, 16384, 220 + k, /*check=*/false);
+            if (k == 1) base = t;
+            printf("    16k ctx: %7.3f ms   %.2fx the 1-row fire   (per-row kernel: %.2fx)\n",
+                   t, base > 0 ? t / base : 1.0,
+                   k == 1 ? 1.00 : (k == 2 ? 1.54 : (k == 4 ? 2.39 : (k == 5 ? 2.82 : (k == 8 ? 4.08 : 0.0)))));
+        }
+        printf("  (measured for the shipped per-row kernel: 1.54x / 2.39x / 4.08x)\n\n");
+    }
 
     printf("MMA path (what a >=32-row prefill dispatches):\n");
     int layer = 0;
