@@ -298,6 +298,10 @@ int main(int argc, char** argv) {
                 const int fm = (qid & 4) | ((lane >> 1) & 3);
                 const int fn = ((qid & 2) | (lane & 1)) * 4;
                 for (int e = 0; e < 16; ++e) {
+                    // Two 16x16 fragments side by side, each 2 rows x 4 cols.
+                    // The alternative -- one 2 rows x 8 consecutive columns
+                    // layout -- was TESTED and is worse: 1163 of 2048 wrong
+                    // against this mapping's 128. See the plan.
                     const int nf = e / 8, i = (e % 8) / 4, j = e % 4;
                     const int row = sg * 16 + fm + i * 8;
                     const int col = nf * 16 + fn + j;
@@ -343,6 +347,71 @@ int main(int argc, char** argv) {
                 printf("\n  wrong by row%%16         :");
                 for (int i = 0; i < 16; ++i) printf(" %d", by_rowmod[i]);
                 printf("\n");
+            }
+        }
+    }
+
+    // ── WHICH lane layout? A one-hot probe that NAMES it. ──
+    //
+    // K is an identity (K[c][d] = 1 iff d == c), so S[row][col] must equal
+    // Q[row][col] exactly. Run it twice -- once with Q[r][d] = r, once with
+    // Q[r][d] = d -- and every output element reports the row and the dim it
+    // was actually built from. That names the mapping instead of permuting
+    // indices until the error count falls, which finds something that fits
+    // rather than something that is right.
+    {
+        std::string ec2;
+        Pso chk = ctx->compile_pso_from_file(dir + "/sdpa_nax_check.metal",
+                                             "sdpa_nax_qk", &ec2);
+        if (chk.valid()) {
+            const int BQ = 64, BK = 32, D = 128;
+            auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+            printf("\nLANE LAYOUT — one-hot probe (K = identity, so S == Q):\n");
+            for (int mode = 0; mode < 2; ++mode) {
+                SlotHandle o = ctx->heap_alloc(4 * 32 * 16 * sizeof(float));
+                SlotHandle c = ctx->heap_alloc(sizeof(int));
+                SlotHandle qd = ctx->heap_alloc(size_t(3) * BQ * D * sizeof(uint16_t));
+                SlotHandle kd = ctx->heap_alloc(size_t(BK) * D * sizeof(uint16_t));
+                SlotHandle vd = ctx->heap_alloc(size_t(BK) * D * sizeof(uint16_t));
+                *static_cast<int*>(c.contents()) = BK;
+                auto* qp = static_cast<uint16_t*>(qd.contents());
+                auto* kp = static_cast<uint16_t*>(kd.contents());
+                std::memset(qp, 0, size_t(3) * BQ * D * 2);
+                std::memset(kp, 0, size_t(BK) * D * 2);
+                std::memset(vd.contents(), 0, size_t(BK) * D * 2);
+                for (int r = 0; r < BQ; ++r)
+                    for (int d = 0; d < D; ++d)
+                        qp[size_t(r) * D + d] = bf(float(mode == 0 ? r : d));
+                for (int cc = 0; cc < BK; ++cc) kp[size_t(cc) * D + cc] = bf(1.0f);
+                const Kernel kk2 = Kernel::Sdpa;
+                const int od = 50 + mode;
+                ctx->arg_bind(kk2, od, 0, o); ctx->arg_bind(kk2, od, 1, c);
+                ctx->arg_bind(kk2, od, 2, qd); ctx->arg_bind(kk2, od, 3, kd);
+                ctx->arg_bind(kk2, od, 4, vd);
+                ctx->make_resident();
+                LatencyHarness h2(*ctx);
+                auto enc2 = [&](StepEncoder& se) {
+                    se.set_pso(chk); se.set_argtable(kk2, od);
+                    se.dispatch(Grid{128, 1, 1}, Threadgroup{128, 1, 1});
+                };
+                h2.time_step("onehot", enc2, 1, 0);
+                const float* g = static_cast<const float*>(o.contents());
+                printf("  Q[r][d] = %s   (element -> value; expect %s)\n",
+                       mode == 0 ? "r" : "d", mode == 0 ? "row" : "col");
+                // simdgroup 0, the four lanes that were WRONG (0..3) and one
+                // that was right (8), first four elements each.
+                for (int lane : {0, 1, 2, 3, 8}) {
+                    const int qid = lane >> 2;
+                    const int fm = (qid & 4) | ((lane >> 1) & 3);
+                    const int fn = ((qid & 2) | (lane & 1)) * 4;
+                    printf("    lane %2d (fm=%d fn=%2d):", lane, fm, fn);
+                    for (int e = 0; e < 8; ++e) {
+                        const int nf = e / 8, i = (e % 8) / 4, j = e % 4;
+                        printf(" e%d[r%d,c%2d]=%.0f", e, fm + i * 8,
+                               nf * 16 + fn + j, double(g[(size_t(0) * 32 + lane) * 16 + e]));
+                    }
+                    printf("\n");
+                }
             }
         }
     }

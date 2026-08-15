@@ -424,6 +424,33 @@ right and destination are 16x32; 8 elements a lane in the left could be arranged
 2 rows x 4 cols (what the code assumes), or 4x2, or 8x1, and MLX's
 `BaseNAXFrag::get_coord` describes only ONE of the layouts in play.
 
+**The one-hot probe has been RUN.** K set to an identity so `S[row][col]` must
+equal `Q[row][col]` exactly, then twice: `Q[r][d] = r` and `Q[r][d] = d`, so
+every output element reports the row and the dim it was built from.
+
+    lane 8 (fm=0 fn=8): 0 0 0 0 8 8 8 8   /  8 9 10 11 8 9 10 11   BOTH CORRECT
+    lane 0 (fm=0 fn=0): 64 64 80 80 ...   /  152 216 152 216        WRONG
+
+**Lanes with `fn >= 8` are exactly right; lanes with `fn < 8` are wrong.** That
+splits on lane bit 3 and on nothing else.
+
+The sharpest clue is in the second mode: 152 is `sum(d = 2..17)` and 216 is
+`sum(d = 6..21)` -- sixteen consecutive dims each, but NOT aligned to a
+16-block. So a destination element that should hold a single `Q[row][col]`
+instead holds a full 16-wide contraction taken at a SHIFTED offset in the head
+dimension. The contraction length is right; where it starts is not.
+
+**REFUTED, so nobody re-runs it:** that the 16 destination elements are 2 rows x
+8 CONSECUTIVE columns (`col = fn*2 + j`) rather than two 4-column fragments.
+Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
+the two-fragment read-back is closer to right and the fault is elsewhere.
+
+**Still open, and the next thing to try:** the left operand is 16x16 while the
+right and destination are 16x32, and only the left's `k` axis is implicated by
+the shifted-contraction evidence. Probe the LEFT operand's layout on its own --
+one-hot in `ct_a` rather than in Q -- instead of inferring it through a full
+matmul. Original note follows.
+
 **How to settle it without guessing:** drive the kernel with a one-hot Q --
 a single 1 at a known (row, dim) and zeros elsewhere -- and read which output
 elements light up. That names the left operand's layout directly instead of
