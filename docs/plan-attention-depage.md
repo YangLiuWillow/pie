@@ -349,6 +349,41 @@ Five stages. Each ends in a measurement or a test, and **none of them touches
 `driver/metal/src/model/` until stage 4.** Do not write the whole kernel and
 then debug it; the probe loop is seconds and the serving loop is minutes.
 
+### STAGE 1 RESULT: passes, but the plan's 6x was wrong — it is 3.07x
+
+NAX Q.K^T at the real serving shape, BQ=64 BK=32 d=128, operand fill included:
+
+    0.695 ms   16.81 TFLOP/s   (11.7 GFLOP)
+      vs 5.48 simdgroup ceiling      -> 3.07x   (rule was >= 3x: PASSES)
+      vs 32.46 NAX ceiling, fill-free -> 52% of it
+
+**Half the instruction's throughput goes to filling its operands.** The
+microbenchmark's 6x was measured filling once and looping; an attention kernel
+refills every pass, and that costs half. The rule passes, barely, so stage 2
+proceeds -- but every projection in this document that used 6x must be redone
+at 3.07x:
+
+    multiply  3.38 / 3.07 = 1.10 ms   (not 0.56)
+    staging   halved by BQ=64 ~1.35 ms
+    total     ~2.45 ms    against MLX's 1.31   ->  still ~1.9x behind
+
+So NAX takes pie's attention from 6.87 to roughly 2.5 ms -- a **2.8x win worth
+having, and not parity.** Say that plainly rather than letting the earlier 6x
+arithmetic stand.
+
+The remaining 48% is the target for a stage-1b if anyone wants it: the fill is
+24 scalar threadgroup loads per matmul against a `simdgroup_load` that fetches
+a whole fragment as one instruction. MLX pays the same tax, which is some
+evidence it is inherent to the cooperative-tensor path rather than a mistake
+here.
+
+**DO NOT RETRY: hoisting Q out of the pass loop.** Q is genuinely
+loop-invariant and caching its eight A-fragments as `bfloat qfrag[TD][8]`
+measured **7.88 TFLOP/s against 16.81** -- less than half. Sixty-four bfloats a
+lane, indexed by a loop variable, spill to the stack, and a spilled operand
+costs more than the threadgroup re-read it replaces. Same shape as the
+accumulator-array trap in `matrix_rate.metal`.
+
 **Stage 1 — the multiply, alone.** A NAX twin computing only `S = Q K^T` over
 the real shapes, timed in `sdpa_paged_probe` against the existing MMA kernel's
 multiply half. No softmax, no PV, no correctness. This answers the only

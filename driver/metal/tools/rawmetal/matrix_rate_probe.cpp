@@ -138,6 +138,49 @@ int main(int argc, char** argv) {
              ? "sufficient on its own; a NAX attention kernel is the rewrite"
              : "NOT sufficient on its own; necessary but not the whole story");
 
+    // ── STEP 3 STAGE 1: NAX at attention shapes, operand fill included ──
+    {
+        std::string e2;
+        Pso qk = ctx->compile_pso_from_file(dir + "/sdpa_nax_qk.metal",
+                                            "sdpa_nax_qk", &e2);
+        if (!qk.valid()) {
+            printf("\n(sdpa_nax_qk did not compile: %s)\n", e2.c_str());
+        } else {
+            const int kCtx = 7424, kRows = 184, kHeads = 32, kBQ = 64, kBK = 32, kD = 128;
+            const int tiles = (kRows + kBQ - 1) / kBQ;          // 3
+            const int tgs = kHeads * tiles;                     // 96
+            SlotHandle o = ctx.get()->heap_alloc(size_t(tgs) * 128 * sizeof(float));
+            SlotHandle c = ctx.get()->heap_alloc(sizeof(int));
+            *static_cast<int*>(c.contents()) = kCtx;
+            const Kernel k = Kernel::Sdpa;
+            ctx->arg_bind(k, 9, 0, o);
+            ctx->arg_bind(k, 9, 1, c);
+            ctx->make_resident();
+            Grid g{uint32_t(tgs) * 128u, 1, 1};
+            Threadgroup t{128, 1, 1};
+            LatencyHarness h(*ctx);
+            auto enc = [&](StepEncoder& se) {
+                se.set_pso(qk);
+                se.set_argtable(k, 9);
+                se.dispatch(g, t);
+            };
+            BenchResult r = h.time_step("nax_qk", enc, 40, 10);
+            // Q K^T only: rows x heads x ctx x D x 2. Padded rows (3 tiles of
+            // 64 = 192) are what the kernel actually issues, so count those.
+            const double flops = double(tiles * kBQ) * kHeads * kCtx * kD * 2.0;
+            const double tf = flops / (r.median.gpu_exec_ms / 1000.0) / 1e12;
+            printf("\nSTAGE 1 — NAX Q.K^T at the serving shape (BQ=64 BK=32 d=128):\n");
+            printf("  %8.3f ms   %7.2f TFLOP/s   (%.1f GFLOP)\n",
+                   r.median.gpu_exec_ms, tf, flops / 1e9);
+            printf("  vs %.2f TFLOP/s simdgroup ceiling  -> %.2fx\n", s, tf / s);
+            printf("  vs %.2f TFLOP/s NAX ceiling (fill-free) -> %.0f%% of it\n",
+                   n, 100.0 * tf / n);
+            printf("  DECISION: %s\n", (tf / s) >= 3.0
+                     ? ">= 3x, the plan holds — proceed to stage 2"
+                     : "< 3x, the operand fill eats it — STOP and re-plan");
+        }
+    }
+
     // ── Does the rate depend on how long the kernel runs? ──
     //
     // The remaining explanation for the arm reading below pie's achieved rate.
