@@ -393,7 +393,44 @@ out, through cooperative tensors) eat it?
 **Decision rule, written first:** if the multiply half does not fall by at
 least 3x, stop and re-plan -- the arithmetic in this document assumed 6x.
 
-### STAGE 2 RESULT: the full pass computes in 1.65 ms/layer
+### CORRECTION FIRST: the stage-2 kernel does NOT compute attention
+
+Written before the timings below, because they must be read through it.
+
+A CPU reference over one threadgroup and one key block, with values chosen exact
+in bf16 so any mismatch is a mapping error and never rounding:
+
+    128 of 2048 scores WRONG   (worst relative error 15.55)
+
+**So "the full attention pass computes in 1.652 ms" is not a claim I can make.**
+A timing cannot distinguish correct attention from a wrong operand orientation:
+both issue the same matmuls over the same bytes at the same rate. The figures
+below are a sound measure of the WORK -- matmul count, staging traffic, register
+behaviour -- and they are what the projections rest on. They are not evidence of
+a correct kernel, and the correctness gate had to be built to discover that.
+
+The error pattern is structured and points at the cause:
+
+    wrong by element index e : 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8   (uniform)
+    wrong by column          : cols 0-7 and 16-23 only  -> fn in {0,4}
+    wrong by row%16          : rows 0-3 and 8-11 only   -> fm in {0,1,2,3}
+
+`fm` and `fn` are the two halves of the fragment coordinate, and both predicates
+are on lane bits -- so this is a LANE LAYOUT mismatch, not an index slip.
+
+**Leading hypothesis, untested:** the kernel assumes all three cooperative
+tensors share one lane layout. They need not. The left operand is 16x16 and the
+right and destination are 16x32; 8 elements a lane in the left could be arranged
+2 rows x 4 cols (what the code assumes), or 4x2, or 8x1, and MLX's
+`BaseNAXFrag::get_coord` describes only ONE of the layouts in play.
+
+**How to settle it without guessing:** drive the kernel with a one-hot Q --
+a single 1 at a known (row, dim) and zeros elsewhere -- and read which output
+elements light up. That names the left operand's layout directly instead of
+permuting indices until the count drops. The correctness harness in
+`matrix_rate_probe` already prints the three histograms; it needs one more mode.
+
+### STAGE 2 TIMINGS (of work done, not of correct attention)
 
 BQ=64 BK=32 d=128, serving shape, reproduced across three runs to three
 decimals. Each row adds exactly one thing to the row above it:

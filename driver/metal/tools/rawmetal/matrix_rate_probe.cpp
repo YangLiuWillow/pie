@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <vector>
 #include <string>
 
 #include "harness.hpp"
@@ -230,6 +232,118 @@ int main(int argc, char** argv) {
             printf("  DECISION: %s\n", (tf / s) >= 3.0
                      ? ">= 3x, the plan holds — proceed to stage 2"
                      : "< 3x, the operand fill eats it — STOP and re-plan");
+        }
+    }
+
+    // ── CORRECTNESS: does the kernel compute attention, or just FLOPs? ──
+    //
+    // Every number above is a timing, and a timing cannot tell a correct
+    // Q.K^T from one whose B operand is transposed -- both issue the same
+    // matmuls at the same rate. This runs ONE threadgroup over ONE key block
+    // with deterministic inputs and checks all 2048 scores against a CPU
+    // reference, which is what validates the 16x16 fragment lane mapping and
+    // the two-fragment column split.
+    {
+        std::string ec;
+        Pso chk = ctx->compile_pso_from_file(dir + "/sdpa_nax_check.metal",
+                                             "sdpa_nax_qk", &ec);
+        printf("\nCORRECTNESS — NAX Q.K^T against a CPU reference:\n");
+        if (!chk.valid()) { printf("  compile failed: %s\n", ec.c_str()); }
+        else {
+            const int BQ = 64, BK = 32, D = 128;
+            SlotHandle o = ctx->heap_alloc(4 * 32 * 16 * sizeof(float));
+            SlotHandle c = ctx->heap_alloc(sizeof(int));
+            SlotHandle qd = ctx->heap_alloc(size_t(3) * BQ * D * sizeof(uint16_t));
+            SlotHandle kd = ctx->heap_alloc(size_t(BK) * D * sizeof(uint16_t));
+            SlotHandle vd = ctx->heap_alloc(size_t(BK) * D * sizeof(uint16_t));
+            *static_cast<int*>(c.contents()) = BK;   // exactly one pass
+            // bfloat16 by truncation: small exact-in-bf16 values, so the
+            // reference is exact and a mismatch is a MAPPING error, never
+            // rounding.
+            auto bf = [](float f) {
+                uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16);
+            };
+            auto* qp = static_cast<uint16_t*>(qd.contents());
+            auto* kp = static_cast<uint16_t*>(kd.contents());
+            std::memset(qp, 0, size_t(3) * BQ * D * 2);
+            std::memset(vd.contents(), 0, size_t(BK) * D * 2);
+            std::vector<float> qf(size_t(BQ) * D), kf(size_t(BK) * D);
+            for (int r = 0; r < BQ; ++r)
+                for (int d = 0; d < D; ++d) {
+                    qf[size_t(r) * D + d] = float((r + 2 * d) % 7) * 0.25f;
+                    qp[size_t(r) * D + d] = bf(qf[size_t(r) * D + d]);
+                }
+            for (int k = 0; k < BK; ++k)
+                for (int d = 0; d < D; ++d) {
+                    kf[size_t(k) * D + d] = float((3 * k + d) % 5) * 0.5f;
+                    kp[size_t(k) * D + d] = bf(kf[size_t(k) * D + d]);
+                }
+            const Kernel kk = Kernel::Sdpa;
+            ctx->arg_bind(kk, 40, 0, o); ctx->arg_bind(kk, 40, 1, c);
+            ctx->arg_bind(kk, 40, 2, qd); ctx->arg_bind(kk, 40, 3, kd);
+            ctx->arg_bind(kk, 40, 4, vd);
+            ctx->make_resident();
+            LatencyHarness h(*ctx);
+            auto enc = [&](StepEncoder& se) {
+                se.set_pso(chk); se.set_argtable(kk, 40);
+                se.dispatch(Grid{128, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            h.time_step("check", enc, 1, 0);
+
+            const float* got = static_cast<const float*>(o.contents());
+            int bad = 0; double worst = 0; int wr = -1, wc = -1;
+            for (int sg = 0; sg < 4; ++sg)
+              for (int lane = 0; lane < 32; ++lane) {
+                const int qid = lane >> 2;
+                const int fm = (qid & 4) | ((lane >> 1) & 3);
+                const int fn = ((qid & 2) | (lane & 1)) * 4;
+                for (int e = 0; e < 16; ++e) {
+                    const int nf = e / 8, i = (e % 8) / 4, j = e % 4;
+                    const int row = sg * 16 + fm + i * 8;
+                    const int col = nf * 16 + fn + j;
+                    double ref = 0;
+                    for (int d = 0; d < D; ++d)
+                        ref += double(qf[size_t(row) * D + d]) * double(kf[size_t(col) * D + d]);
+                    const double g = got[(size_t(sg) * 32 + lane) * 16 + e];
+                    const double err = std::abs(g - ref) / (std::abs(ref) + 1e-6);
+                    if (err > 1e-2) { ++bad; if (err > worst) { worst = err; wr = row; wc = col; } }
+                }
+              }
+            if (bad == 0) {
+                printf("  all 2048 scores match — fragment mapping and operand\n");
+                printf("  orientation are CORRECT. The 1.652 ms is attention.\n");
+            } else {
+                printf("  %d of 2048 scores WRONG (worst rel %.3f at row %d col %d)\n",
+                       bad, worst, wr, wc);
+                // The PATTERN is the diagnostic, not the count. A wrong operand
+                // orientation, a wrong fragment mapping and a wrong column
+                // split each produce a different one.
+                int by_e[16] = {0}, by_col[32] = {0}, by_rowmod[16] = {0};
+                for (int sg = 0; sg < 4; ++sg)
+                  for (int lane = 0; lane < 32; ++lane) {
+                    const int qid = lane >> 2;
+                    const int fm = (qid & 4) | ((lane >> 1) & 3);
+                    const int fn = ((qid & 2) | (lane & 1)) * 4;
+                    for (int e = 0; e < 16; ++e) {
+                        const int nf = e / 8, i = (e % 8) / 4, j = e % 4;
+                        const int row = sg * 16 + fm + i * 8, col = nf * 16 + fn + j;
+                        double ref = 0;
+                        for (int d = 0; d < D; ++d)
+                            ref += double(qf[size_t(row) * D + d]) * double(kf[size_t(col) * D + d]);
+                        const double g = got[(size_t(sg) * 32 + lane) * 16 + e];
+                        if (std::abs(g - ref) / (std::abs(ref) + 1e-6) > 1e-2) {
+                            by_e[e]++; by_col[col]++; by_rowmod[row % 16]++;
+                        }
+                    }
+                  }
+                printf("  wrong by element index e :");
+                for (int i = 0; i < 16; ++i) printf(" %d", by_e[i]);
+                printf("\n  wrong by column         :");
+                for (int i = 0; i < 32; ++i) printf(" %d", by_col[i]);
+                printf("\n  wrong by row%%16         :");
+                for (int i = 0; i < 16; ++i) printf(" %d", by_rowmod[i]);
+                printf("\n");
+            }
         }
     }
 

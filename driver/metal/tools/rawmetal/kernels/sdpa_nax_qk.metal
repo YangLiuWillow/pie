@@ -72,7 +72,7 @@ kernel void sdpa_nax_qk(
   const short fm  = (qid & 4) | ((short(simd_lid) >> 1) & 3);
   const short fn  = ((qid & 2) | (short(simd_lid) & 1)) * 4;
 
-#if PIE_NAX_STAGE >= 4 || PIE_NAX_STAGE == 5
+#if PIE_NAX_STAGE >= 4 || PIE_NAX_STAGE == 5 || PIE_NAX_STAGE == 6
   // Q staged once from device: [row][dim] -> padded [row][dim].
   for (uint e = lid; e < uint(BQ * D); e += 128u) {
     const int r = int(e) / D, d = int(e) - r * D;
@@ -108,12 +108,12 @@ kernel void sdpa_nax_qk(
   // This simdgroup's 16 query rows of the threadgroup's 64.
   const int q_row = int(simd_gid) * 16;
   float acc = 0.0f;
-#if PIE_NAX_STAGE >= 2 && PIE_NAX_STAGE != 5
+#if PIE_NAX_STAGE >= 2 && PIE_NAX_STAGE != 5 && PIE_NAX_STAGE != 6
   float ov[4][16];
   for (short n = 0; n < 4; ++n)
     for (short i = 0; i < 16; ++i) ov[n][i] = 0.0f;
 #endif
-#if PIE_NAX_STAGE >= 3 && PIE_NAX_STAGE != 5
+#if PIE_NAX_STAGE >= 3 && PIE_NAX_STAGE != 5 && PIE_NAX_STAGE != 6
   float row_max[2] = {-3.0e38f, -3.0e38f};
   float row_sum[2] = {0.0f, 0.0f};
 #endif
@@ -129,7 +129,7 @@ kernel void sdpa_nax_qk(
   const int passes = ctx_len / BK;
   for (int kb = 0; kb < passes; ++kb) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-#if PIE_NAX_STAGE >= 4 || PIE_NAX_STAGE == 5
+#if PIE_NAX_STAGE >= 4 || PIE_NAX_STAGE == 5 || PIE_NAX_STAGE == 6
     // K staged TRANSPOSED, [dim][key], so the Q.K^T operand fill is a
     // contiguous read. 32 keys x 128 dims by 128 threads: 32 elements each.
     for (uint e = lid; e < uint(BK * D); e += 128u) {
@@ -148,7 +148,7 @@ kernel void sdpa_nax_qk(
 
     for (short i = 0; i < 16; ++i) ct_c[i] = 0.0f;
 
-#if PIE_NAX_STAGE == 5
+#if PIE_NAX_STAGE == 5 && PIE_NAX_STAGE != 6
     // Staging only. The tiles must be CONSUMED or the writes above are dead
     // and the compiler deletes the thing being timed -- the same trap that
     // priced the shipped kernel's multiply above its own unit's ceiling.
@@ -181,7 +181,7 @@ kernel void sdpa_nax_qk(
       op.run(ct_a, ct_b, ct_c);
     }
 #endif
-#if PIE_NAX_STAGE >= 3 && PIE_NAX_STAGE != 5
+#if PIE_NAX_STAGE >= 3 && PIE_NAX_STAGE != 5 && PIE_NAX_STAGE != 6
     // ── Online softmax, per lane, no threadgroup round trip ──
     //
     // A lane holds two rows (fm and fm+8), four columns in each of the two
@@ -219,7 +219,7 @@ kernel void sdpa_nax_qk(
     }
 #endif
 
-#if PIE_NAX_STAGE >= 2 && PIE_NAX_STAGE != 5
+#if PIE_NAX_STAGE >= 2 && PIE_NAX_STAGE != 5 && PIE_NAX_STAGE != 6
     // ── O += P V ──
     //
     // O is 16 rows x 128 dims per simdgroup: FOUR 16x32 accumulators, 64
@@ -260,13 +260,24 @@ kernel void sdpa_nax_qk(
     // Stage 1 only: consume S so the pass is not dead code.
     for (short i = 0; i < 16; ++i) acc += ct_c[i];
 #endif
+#if PIE_NAX_STAGE == 6
+    // CORRECTNESS MODE. Write this lane's sixteen S elements out raw, so a CPU
+    // reference can check the fragment mapping and the operand orientation --
+    // neither of which any timing number can validate. A kernel with a
+    // transposed B operand computes the same FLOPs at the same speed and is
+    // simply wrong.
+    if (kb == 0) {
+      const uint slot = ((tid.x * 4u + simd_gid) * 32u + simd_lid) * 16u;
+      for (short i = 0; i < 16; ++i) out[slot + uint(i)] = ct_c[i];
+    }
+#endif
   }
 
-#if PIE_NAX_STAGE >= 2 && PIE_NAX_STAGE != 5
+#if PIE_NAX_STAGE >= 2 && PIE_NAX_STAGE != 5 && PIE_NAX_STAGE != 6
   for (short n = 0; n < 4; ++n)
     for (short i = 0; i < 16; ++i) acc += ov[n][i];
 #endif
-#if PIE_NAX_STAGE >= 3 && PIE_NAX_STAGE != 5
+#if PIE_NAX_STAGE >= 3 && PIE_NAX_STAGE != 5 && PIE_NAX_STAGE != 6
   acc = acc / (row_sum[0] + row_sum[1] + 1.0f) + row_max[0];
 #endif
   out[tid.x * 128u + lid] = acc;
