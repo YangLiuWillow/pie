@@ -622,14 +622,15 @@ impl Instruct for QwenInstruct {
 /// Unparseable values degrade to the raw string rather than dropping the call,
 /// which is also what the reference does: a tool call with one odd argument is
 /// worth more to an agent than no call at all.
-/// Whether a captured `<parameter=...>` name could plausibly be one.
+/// Whether a captured name -- of a function or of a parameter -- could
+/// plausibly be one.
 ///
 /// A blocklist rather than an allowlist, deliberately: tool schemas are written
 /// by whoever ships the tool, and a stricter rule than the defect requires
 /// would silently refuse valid calls. These are the characters that only appear
 /// when the name scan has run past its parameter and into the document --
 /// whitespace, quotes, and the angle brackets and `=` of the markup itself.
-fn is_plausible_param_name(s: &str) -> bool {
+fn is_plausible_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.chars().any(|c| {
@@ -640,6 +641,15 @@ fn is_plausible_param_name(s: &str) -> bool {
 fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
     let gt = body.find('>')?;
     let name = body[..gt].trim().to_string();
+    // Same unbounded scan, same failure, one level up. A model that writes
+    // `<function=bash` and forgets the `>` sends this hunting to the `>` of the
+    // NEXT tag, and the tool name becomes `bash\n<parameter=command`; one that
+    // writes `<function<bash>` yields `<bash`. Both were emitted confidently
+    // by this parser, with no error, before the screen. Upstream `dev-sslee`
+    // fixed the same thing in b9ca2d050.
+    if !is_plausible_name(&name) {
+        return None;
+    }
     let rest = &body[gt + 1..];
 
     // The declared type of each parameter of THIS function, if we were told.
@@ -683,7 +693,7 @@ fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, 
         // The screen is on the NAME only. A redirect inside a parameter VALUE
         // is ordinary shell and must still parse -- there is a test for exactly
         // that, so this cannot be mistaken for a fix that rejects shell syntax.
-        if !is_plausible_param_name(&pname) {
+        if !is_plausible_name(&pname) {
             return None;
         }
         let vstart = &after[gt + 1..];
@@ -1297,5 +1307,38 @@ mod parameter_name_screen {
     #[test]
     fn an_empty_parameter_name_is_refused() {
         assert_eq!(parse_coder_function_call("read>\n<parameter=>\nx\n</parameter>\n</function>", &[]), None);
+    }
+}
+
+
+#[cfg(test)]
+mod function_name_screen {
+    use super::*;
+
+    /// A missing `>` after the function name sends the scan to the `>` of the
+    /// next tag. Before the screen this parser returned the tool name
+    /// `bash\n<parameter=command` -- confidently, with no error.
+    #[test]
+    fn a_missing_closing_angle_does_not_invent_a_tool_name() {
+        let body = "bash\n<parameter=command>\nls\n</parameter>\n</function>";
+        assert_eq!(parse_coder_function_call(body, &[]), None);
+    }
+
+    /// `<function<bash>` rather than `<function=bash>`. Returned `<bash`.
+    #[test]
+    fn an_angle_where_the_equals_belongs_does_not_invent_a_tool_name() {
+        let body = "<bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+        assert_eq!(parse_coder_function_call(body, &[]), None);
+    }
+
+    /// THE GUARD ON THE GUARD, again: an ordinary well-formed call must still
+    /// parse, or the two tests above are satisfied by a parser that refuses
+    /// everything.
+    #[test]
+    fn a_well_formed_call_still_parses() {
+        let body = "bash>\n<parameter=command>\nls -la\n</parameter>\n</function>";
+        let (name, args) = parse_coder_function_call(body, &[]).expect("must parse");
+        assert_eq!(name, "bash");
+        assert!(args.contains("ls -la"), "{args}");
     }
 }
