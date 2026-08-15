@@ -727,3 +727,35 @@ gap and compete on the agentic axis where pie already wins (4/5 vs 2/5 on
 SWE-bench), (b) profile with a Metal GPU capture rather than more constant
 sweeps, or (c) close the ~1 s per-turn gap elsewhere — prefill is 71% of a
 steady turn and attention is only part of it.
+
+---
+
+## Ported from upstream `dev-sslee`, and one claim corrected
+
+Two Qwen3 tool-call parsing defects, both present in our diverged copy of
+`model/qwen_3/src/chat.rs`, both reproduced here before fixing:
+
+- a parameter name scan running past its parameter into a shell redirect,
+  yielding a ninety-character argument KEY and no error;
+- a function name scan doing the same one level up, yielding tool names like
+  `bash\n<parameter=command` and `<bash>`, dispatched confidently.
+
+**CORRECTION to the first commit message.** It says these are "on the measured
+path, not a hypothetical". That overstates what is known. Upstream captured the
+parameter bug live on `django__django-10914`, which is NOT in our known-5
+(`django-12276`, `13028`, `13089`, `14373`, `15569`). Our five are all django
+instances run with the same model and the same tool dialect, so the same
+failure mode is entirely plausible on them -- but no agent output was retained
+from those runs, so there is NO evidence it actually fired. The fixes are
+justified by reproduction against our parser; they are not justified by our
+benchmark results, and nothing in the 4/5 should be attributed to them.
+
+Worth fixing for the next run: the SWE-bench harness keeps predictions and
+grades but discards the agent transcript, which is why this cannot be checked
+retrospectively. Upstream found their bug "by reading the captured bytes rather
+than the divergence counts" -- we cannot do that yet.
+
+The CUDA partial-RoPE fix in the same branch needs no port: it cites our Metal
+`rope.metal` as one of three references proving the CUDA form wrong, and that
+is accurate -- ours uses `half = rope_dims/2` with `[rope_dims, head_dim)`
+pass-through.
