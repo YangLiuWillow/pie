@@ -393,6 +393,52 @@ out, through cooperative tensors) eat it?
 **Decision rule, written first:** if the multiply half does not fall by at
 least 3x, stop and re-plan -- the arithmetic in this document assumed 6x.
 
+### STAGE 2 RESULT: the full pass computes in 1.65 ms/layer
+
+BQ=64 BK=32 d=128, serving shape, reproduced across three runs to three
+decimals. Each row adds exactly one thing to the row above it:
+
+    Q.K^T only            0.701 ms   16.65 TFLOP/s   3.05x simdgroup
+    + P.V                 1.490 ms   15.68 TFLOP/s   2.87x
+    + online softmax      1.652 ms   14.14 TFLOP/s   2.59x
+                                     (shipped 8x8 whole pass: 6.87; MLX: 1.31)
+
+**The output accumulator does not spill** -- the single most likely way for
+this design to die. At d=128 a NAX simdgroup owns 16 rows x 128 dims = 64
+floats a lane, double the 8x8 kernel's 32, and the Q-hoist failure had just
+shown 64 bfloats spilling. P.V costs 0.794 ms against Q.K^T's 0.698: near
+perfect scaling, so it stayed in registers.
+
+**The softmax is nearly free** -- 0.158 ms, 10% of the pass. pie's per-lane row
+reduction ports to the 16x16 fragment intact, exactly as the lane algebra
+predicted. One max and one sum per ROW HALF instead of one each; everything
+else unchanged; S still never touches threadgroup memory.
+
+K and V now alias one threadgroup buffer. Without it the tile is 36.3 KB
+against the measured 32 KB cap.
+
+### PENDING: the staging half, and why its first number is not quoted
+
+Stage 2c (real staging from device) and stage 5 (staging alone) give the NAX
+kernel the same two-sided ablation the shipped one got. Both are DRAM-bound,
+and both were first measured while a 14.2 GB `pie-boN` process was resident --
+the exact condition under which a memory-bound arm inflates and a
+register-bound one does not. The compute rows above were unaffected (they
+reproduce to three decimals); the staging row was not, and is deliberately not
+recorded here.
+
+A clean re-run is queued behind `require_quiet_gpu`, with `roofline_probe`'s
+streaming roof captured alongside as the bandwidth ground truth. Do not accept
+a staging number taken while the roof is below ~200 GB/s.
+
+**Prepared, ready to run with it:** `sdpa_nax_straightk.metal`. The current
+staging writes K transposed, putting consecutive lanes `BK+PAD = 40` halves
+apart -- 20 words, `gcd(20,32) = 4`, so 32 lanes reach 8 banks. The variant
+stages K straight (like V, contiguous write) and sets the descriptor's
+`transpose_b` so the instruction does the transposing. It changes ONLY the
+write; the padding experiment that failed on the 8x8 kernel moved the fragment
+load as well, which is why that result does not settle this one.
+
 **Stage 2 — the full kernel, probe-only.** Add online softmax and `O += P V`.
 Per-lane state is `max_score[2]` / `sum_exp[2]`, one per row half; the row
 reduction is still `simd_shuffle_xor` by 1 then 8. Mask indexes `fn..fn+3` at

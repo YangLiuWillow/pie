@@ -150,6 +150,7 @@ int main(int argc, char** argv) {
             {"/sdpa_nax_full.metal", "stage 2: + softmax (full pass)", 2.0},
             {"/sdpa_nax_staged.metal", "stage 2c: + REAL staging",       2.0},
             {"/sdpa_nax_stageonly.metal", "  ...of which: staging alone",  2.0},
+            {"/sdpa_nax_straightk.metal", "stage 2c: K straight, instr transpose", 2.0},
         };
         printf("\nSTEP 3 — NAX attention at the serving shape (BQ=64 BK=32 d=128):\n");
         for (const auto& v : vs) {

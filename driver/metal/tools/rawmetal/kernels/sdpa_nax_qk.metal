@@ -32,6 +32,9 @@ using namespace metal;
 #ifndef PIE_NAX_STAGE
 #define PIE_NAX_STAGE 1
 #endif
+#ifndef PIE_NAX_KT_STRAIGHT
+#define PIE_NAX_KT_STRAIGHT 0
+#endif
 
 kernel void sdpa_nax_qk(
     device float* out            [[buffer(0)]],
@@ -81,9 +84,20 @@ kernel void sdpa_nax_qk(
   for (uint e = lid; e < uint(KV_ELEMS); e += 128u) ktile[e] = bfloat(0.5h);
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  // PIE_NAX_KT_STRAIGHT: stage K in [key][dim] like V and let the descriptor
+  // transpose it, instead of writing K transposed into threadgroup memory.
+  // The transposed write puts consecutive lanes (BK+PAD)=40 halves apart --
+  // 20 words, gcd(20,32)=4, so 32 lanes reach 8 banks. The straight write is
+  // contiguous. This is the same bank-conflict question the 8x8 kernel lost on
+  // when padded, but that experiment moved the fragment LOAD too; this one
+  // moves only the write, with the transpose handled by the instruction.
   constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
       16, 32, 16,
+#if PIE_NAX_KT_STRAIGHT
+      /*transpose_a=*/false, /*transpose_b=*/true, /*relaxed=*/true,
+#else
       /*transpose_a=*/false, /*transpose_b=*/false, /*relaxed=*/true,
+#endif
       mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
 
@@ -120,7 +134,11 @@ kernel void sdpa_nax_qk(
     // contiguous read. 32 keys x 128 dims by 128 threads: 32 elements each.
     for (uint e = lid; e < uint(BK * D); e += 128u) {
       const int kk = int(e) / D, d = int(e) - kk * D;
+#if PIE_NAX_KT_STRAIGHT
+      ktile[kk * (D + PAD) + d] = k_dev[(size_t(kb) * BK + kk) * D + d];
+#else
       ktile[d * (BK + PAD) + kk] = k_dev[(size_t(kb) * BK + kk) * D + d];
+#endif
     }
 #else
     // One write per thread. See the header: without it the loads hoist.
@@ -148,8 +166,15 @@ kernel void sdpa_nax_qk(
       for (short nf = 0; nf < 2; ++nf) {
         for (short i = 0; i < 2; ++i) {
           for (short j = 0; j < 4; ++j) {
+#if PIE_NAX_KT_STRAIGHT
+            // B is K in [key][dim]; the descriptor's transpose_b handles the
+            // orientation, so the fill reads along the contiguous axis.
+            ct_b[nf * 8 + i * 4 + j] =
+                ktile[(nf * 16 + int(fm) + i * 8) * (D + PAD) + dd * 16 + int(fn) + j];
+#else
             ct_b[nf * 8 + i * 4 + j] =
                 ktile[(dd * 16 + int(fm) + i * 8) * (BK + PAD) + nf * 16 + int(fn) + j];
+#endif
           }
         }
       }
