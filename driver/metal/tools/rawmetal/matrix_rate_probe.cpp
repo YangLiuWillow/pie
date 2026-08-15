@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 #include "harness.hpp"
@@ -141,6 +142,56 @@ int main(int argc, char** argv) {
     // ── STEP 3 STAGE 1: NAX at attention shapes, operand fill included ──
     {
         std::string e2;
+        // Three variants of one kernel, each adding exactly one thing, so a
+        // regression can be attributed instead of guessed at.
+        const struct { const char* file; const char* label; double flop_mul; } vs[] = {
+            {"/sdpa_nax_qk.metal",   "stage 1: Q.K^T only",            1.0},
+            {"/sdpa_nax_qkpv.metal", "stage 2: + P.V (no softmax)",    2.0},
+            {"/sdpa_nax_full.metal", "stage 2: + softmax (full pass)", 2.0},
+            {"/sdpa_nax_staged.metal", "stage 2c: + REAL staging",       2.0},
+            {"/sdpa_nax_stageonly.metal", "  ...of which: staging alone",  2.0},
+        };
+        printf("\nSTEP 3 — NAX attention at the serving shape (BQ=64 BK=32 d=128):\n");
+        for (const auto& v : vs) {
+            std::string ev;
+            Pso p = ctx->compile_pso_from_file(dir + v.file, "sdpa_nax_qk", &ev);
+            if (!p.valid()) { printf("  %-32s COMPILE FAIL: %s\n", v.label, ev.c_str()); continue; }
+            const int kCtx = 7424, kRows = 184, kHeads = 32, kBQ = 64, kD = 128;
+            const int tiles = (kRows + kBQ - 1) / kBQ;
+            const int tgs = kHeads * tiles;
+            SlotHandle o = ctx->heap_alloc(size_t(tgs) * 128 * sizeof(float));
+            SlotHandle c = ctx->heap_alloc(sizeof(int));
+            *static_cast<int*>(c.contents()) = kCtx;
+            static int ord = 20;
+            const Kernel kk = Kernel::Sdpa;
+            SlotHandle qd = ctx->heap_alloc(size_t(3) * 64 * 128 * sizeof(uint16_t));
+            SlotHandle kd = ctx->heap_alloc(size_t(kCtx) * kD * sizeof(uint16_t));
+            SlotHandle vd = ctx->heap_alloc(size_t(kCtx) * kD * sizeof(uint16_t));
+            std::memset(qd.contents(), 0, size_t(3) * 64 * 128 * 2);
+            std::memset(kd.contents(), 0, size_t(kCtx) * kD * 2);
+            std::memset(vd.contents(), 0, size_t(kCtx) * kD * 2);
+            ctx->arg_bind(kk, ++ord, 0, o);
+            ctx->arg_bind(kk, ord, 1, c);
+            ctx->arg_bind(kk, ord, 2, qd);
+            ctx->arg_bind(kk, ord, 3, kd);
+            ctx->arg_bind(kk, ord, 4, vd);
+            ctx->make_resident();
+            Grid g{uint32_t(tgs) * 128u, 1, 1};
+            Threadgroup t{128, 1, 1};
+            LatencyHarness h(*ctx);
+            const int myord = ord;
+            auto enc = [&](StepEncoder& se) {
+                se.set_pso(p); se.set_argtable(kk, myord); se.dispatch(g, t);
+            };
+            BenchResult r = h.time_step(v.label, enc, 40, 10);
+            const double fl = double(tiles * kBQ) * kHeads * kCtx * kD * 2.0 * v.flop_mul;
+            const double tf = fl / (r.median.gpu_exec_ms / 1000.0) / 1e12;
+            printf("  %-32s %8.3f ms  %6.2f TFLOP/s  %5.2fx simdgroup  x48 = %6.1f ms\n",
+                   v.label, r.median.gpu_exec_ms, tf, tf / s,
+                   r.median.gpu_exec_ms * 48.0);
+        }
+        printf("  (shipped 8x8 kernel, whole pass: 6.87 ms/layer; MLX 1.31)\n");
+
         Pso qk = ctx->compile_pso_from_file(dir + "/sdpa_nax_qk.metal",
                                             "sdpa_nax_qk", &e2);
         if (!qk.valid()) {
