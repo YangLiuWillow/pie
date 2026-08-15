@@ -445,7 +445,36 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
-**Still open, and the next thing to try:** the left operand is 16x16 while the
+### THE APPROACH IS WRONG, not just the indices
+
+Read from the real header,
+`/System/Library/Frameworks/MetalPerformancePrimitives.framework/Versions/A/Headers/MPPTensorOpsMatMul2d.h`
+(the `metal` CLI is absent but the framework headers are on disk):
+
+- the descriptor's 6th argument is `relaxed_precision`, so that label was right;
+- **the documented primary API is `op.run(tA, tB, tC)` over TENSOR SLICES**, e.g.
+  `A.static_slice<dynamic_extent, 64>(0, tgid.y*64)`. The library performs the
+  memory-to-register mapping itself.
+
+Hand-filling `get_left_input_cooperative_tensor()` element by element -- which
+this kernel copies from MLX -- is a secondary path, and **the lane-to-element
+mapping of a cooperative tensor is documented NOWHERE**. MLX can use it because
+it fuses softmax between the two matmuls and has evidently derived the mapping
+empirically; we adopted the hard path without needing to.
+
+Both operand fills were checked against `BaseNAXFrag::load` line by line and
+they match it exactly (`dst[i*kElemCols + j] = src[(fm + i*8)*str_x + fn + j]`,
+fragment `nf` at `ct_b[nf*8 + ...]`). So the fills are faithful to MLX and the
+kernel is still wrong -- which is the evidence that the cooperative tensor's
+layout is not `BaseNAXFrag`'s, at least not in the way assumed.
+
+**So the next step is not another index permutation.** Rewrite the matmul on the
+tensor-slice API, where there is no mapping to get wrong, and get a CORRECT
+kernel first. Only then consider hand-filled cooperative tensors, and only if
+the fused softmax actually needs them -- with the correct kernel available as
+the reference that would have caught this in an afternoon.
+
+**Still open if the slice API is somehow unusable:** the left operand is 16x16 while the
 right and destination are 16x32, and only the left's `k` axis is implicated by
 the shifted-contraction evidence. Probe the LEFT operand's layout on its own --
 one-hot in `ct_a` rather than in Q -- instead of inferring it through a full
