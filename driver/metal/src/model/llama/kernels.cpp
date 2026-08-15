@@ -38,6 +38,16 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         specs.push_back(
             {"sdpa_paged.metal", paged_name + "_sg8", &out.sdpa_paged_sg8});
     }
+    // The head-sharing decode, when this checkpoint's geometry is one the
+    // kernel is instantiated for. Asked through the same predicate `pso_for`
+    // and `launch_shape` use, so a geometry can never be compiled-for and then
+    // not selected, or selected and not compiled.
+    if (sdpa_head_share_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                  g.n_kv_heads, g.paged_kv_enabled)) {
+        specs.push_back({"sdpa_paged.metal",
+                         paged_name + "_h" + std::to_string(kSdpaHeadShare),
+                         &out.sdpa_paged_hshare});
+    }
     if (g.rope_freq_table) {
         specs.push_back({"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs});
         specs.push_back({"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb});

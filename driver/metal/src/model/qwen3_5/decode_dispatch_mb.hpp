@@ -410,6 +410,44 @@ inline void sdpa_paged_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) 
     tg = Threadgroup{1024, 1, 1};
 }
 
+// Query heads per threadgroup in `sdpa_paged_decode_hshare`. It is the factor
+// by which that kernel divides the KV traffic, and it MUST equal the kernel's
+// own QH template argument -- the grid is `n_q_heads / kSdpaHeadShare`
+// threadgroups tall, so a disagreement launches a fraction of the heads and
+// leaves the rest of the output buffer holding whatever was there before. No
+// crash, no error, just wrong logits. Same hazard `kSdpaQueryTile` carries
+// below, for the same structural reason.
+inline constexpr int kSdpaHeadShare = 2;
+
+// Whether this fire should share one KV read across a pair of query heads.
+//
+// Asked by `pso_for` AND by `launch_shape`, from this one place, because the
+// two must give the same answer -- see the note on `llama_sdpa_mma_this_fire`.
+//
+// The conditions are what the kernel is instantiated for, not preferences:
+//   * paged KV with page size exactly 32 (the kernel shifts and masks);
+//   * head_dim 128, the only width instantiated;
+//   * at least `kSdpaHeadShare` query heads per KV head, or a threadgroup would
+//     span two KV heads and read the wrong one for half its work;
+//   * the per-row shape is the one being replaced, so this is only reached when
+//     the fire is neither tiled nor on the matrix unit.
+inline bool sdpa_head_share_this_fire(int head_dim, int kv_page_size, int n_q_heads,
+                                      int n_kv_heads, bool paged) {
+    // `PIE_METAL_SDPA_HSHARE=0` is the complete way back. Asked here, in the
+    // one function the compile site and both selection sites share, so the
+    // switch cannot half-apply -- an off that removed the dispatch but left the
+    // grid, or vice versa, would be wrong numbers rather than a slower kernel.
+    if (!sdpa_head_share()) return false;
+    if (!paged || kv_page_size != 32 || head_dim != 128) return false;
+    if (n_kv_heads <= 0 || n_q_heads % kSdpaHeadShare != 0) return false;
+    return (n_q_heads / n_kv_heads) % kSdpaHeadShare == 0;
+}
+
+inline void sdpa_paged_hshare_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(n_q_heads / kSdpaHeadShare) * 1024u, uint32_t(N), 1};
+    tg = Threadgroup{1024, 1, 1};
+}
+
 // Query rows per threadgroup in `sdpa_paged_tiled` -- one per simdgroup, and a
 // threadgroup is 1024 threads. It is the factor by which that kernel divides
 // the K/V traffic, and it must equal the kernel's own QT.

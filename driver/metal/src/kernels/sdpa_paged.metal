@@ -667,6 +667,169 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 512, 512, fals
 // one, because the family that has sinks was not tiling.
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, true, true)
 
+// ── the same decode, with the GQA group sharing one KV read ──
+//
+// `sdpa_paged_decode` above gives one QUERY head a whole threadgroup. Qwen3
+// class checkpoints have 32 query heads over 4 KV heads, so eight threadgroups
+// walk the same K and V — eight times the traffic on the one thing a decode
+// step is bandwidth-bound on. Measured on the serving workload rather than a
+// synthetic one: at 23k context `PIE_METAL_DISPATCH_TRACE` puts
+// `sdpa_paged_decode_bfloat16_d_128_p32` at 75–77% of a decode fire.
+//
+// This gives a threadgroup QH query heads that share a KV head, so a key read
+// once serves all of them. Decode is bandwidth-bound here, so the extra
+// arithmetic is close to free — that is the bet, and `sdpa_paged_probe`'s
+// head-sharing arm measures it rather than assuming it:
+//
+//     ctx        2k     8k    12k    16k     (ms/layer, 32 heads over 4 KV)
+//     QH=1    0.205  0.376  0.512  0.622     the shape above
+//     QH=2    0.192  0.307  0.369  0.430     0.93x 0.82x 0.72x 0.69x
+//     QH=4    0.227  0.394  0.508  0.662     loses
+//     QH=8    0.403  1.029  1.459  1.892     loses badly
+//
+// **QH=2 is the setting, and the reason QH=4 and QH=8 lose is occupancy, not
+// registers.** The grid is `n_q_heads / QH` threadgroups tall: 32, 16, 8, 4.
+// This device stops being filled somewhere below 16, and a kernel that reads a
+// quarter of the bytes on a quarter-idle GPU is slower than one that reads all
+// of them on a busy one. Going wider than 2 needs the key range split across
+// threadgroups as well (flash-decoding) so the grid stays tall — which is a
+// different kernel, not a different constant, and is not attempted here.
+//
+// WHY THIS IS A SEPARATE KERNEL rather than a template parameter on the one
+// above. This form needs none of that kernel's generality — no sliding window,
+// no user mask, no learned sink, page size fixed at 32, BN fixed at 32 — and
+// every one of those is a `constexpr` branch that would have to be threaded
+// through a second index. The buffer signature is IDENTICAL, deliberately, so
+// the existing `bind::SdpaPaged` argument table serves it with no binder
+// change; only the grid's x extent differs.
+//
+// The causal bound, the CSR page walk and the online softmax are the same
+// arithmetic as above and must stay that way. `sdpa_online_update` is shared,
+// which is what keeps the softmax itself from being a second thing to keep true.
+template <typename T, int D, int V, int QH>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode_hshare(
+    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],   // [N, n_q_heads, V]
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],   // unused: FAST_FULL
+    const device uint& attention_mask_stride[[buffer(13)]],   // unused
+    const device uchar* attention_mask_enabled [[buffer(14)]],// unused
+    const constant int& window                 [[buffer(15)]],// unused: full attn
+    const device T* sinks                      [[buffer(16)]],// unused: no sink
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  (void)page_size; (void)attention_mask; (void)attention_mask_stride;
+  (void)attention_mask_enabled; (void)window; (void)sinks;
+  constexpr int BN = 32, BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+  constexpr float NEG_INF = -3.0e38f;
+
+  typedef float U;
+  // tid.x indexes a GROUP of QH query heads, so the grid is QH times shorter
+  // than the shipped kernel's. `launch_shape` and `pso_for` must agree on that
+  // or the fire computes a fraction of the heads and reports no error.
+  const int group     = int(tid.x);
+  const int row       = int(tid.y);
+  const int n_q_heads = int(tpg.x) * QH;
+  const int head_base = group * QH;
+  const int kv_head   = head_base / gqa_factor;
+
+  threadgroup U red[BN * BD];
+  threadgroup U tg_max[BN];
+  threadgroup U tg_sum[BN];
+
+  U q[QH][qk_per_thread];
+  U o[QH][v_per_thread];
+  U row_max[QH], row_sum[QH];
+
+  for (int h = 0; h < QH; ++h) {
+    const device T* qp =
+        queries + (size_t(row) * n_q_heads + head_base + h) * D + simd_lid * qk_per_thread;
+    for (int j = 0; j < qk_per_thread; ++j) q[h][j] = U(scale) * U(qp[j]);
+    for (int j = 0; j < v_per_thread; ++j) o[h][j] = 0;
+    row_max[h] = NEG_INF;
+    row_sum[h] = 0;
+  }
+
+  const int r         = req_of_token[row];
+  const int q_pos     = position_ids[row];
+  const int page_base = int(kv_page_indptr[r]);
+
+  // PAGE_SIZE is 32 here by construction, so the divide and modulo are a shift
+  // and a mask -- the same specialization the `_p32` instantiation above earns.
+  for (int kp = int(simd_gid); kp <= q_pos; kp += BN) {
+    const int page = int(kv_page_indices[page_base + (kp >> 5)]);
+    const size_t slot = size_t(page) * 32 + size_t(kp & 31);
+    const device T* kptr =
+        k_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * qk_per_thread;
+    const device T* vptr =
+        v_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * v_per_thread;
+
+    // ONE read of this key and value, reused by every head in the group.
+    U kv[qk_per_thread], vv[v_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) kv[j] = U(kptr[j]);
+    for (int j = 0; j < v_per_thread; ++j) vv[j] = U(vptr[j]);
+
+    for (int h = 0; h < QH; ++h) {
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; ++j) score += q[h][j] * kv[j];
+      score = simd_sum(score);
+      U factor, exp_score;
+      sdpa_online_update(score, row_max[h], row_sum[h], factor, exp_score);
+      for (int j = 0; j < v_per_thread; ++j) o[h][j] = o[h][j] * factor + exp_score * vv[j];
+    }
+  }
+
+  // Cross-simdgroup reduction, once per head. `red` is reused between heads, so
+  // threadgroup memory does not grow with QH -- 32 KB is the whole budget on
+  // this device (queried in device_caps, not assumed).
+  for (int h = 0; h < QH; ++h) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lid == 0) { tg_max[simd_gid] = row_max[h]; tg_sum[simd_gid] = row_sum[h]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    U m = tg_max[simd_lid];
+    U new_max = simd_max(m);
+    U fac = fast::exp(m - new_max);
+    U tot = simd_sum(tg_sum[simd_lid] * fac);
+    for (int i = 0; i < v_per_thread; ++i) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      red[simd_lid * BD + simd_gid] = o[h][i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      U acc = simd_sum(red[simd_gid * BD + simd_lid] * fac);
+      if (simd_lid == 0) {
+        device T* op = out + (size_t(row) * n_q_heads + head_base + h) * V
+                     + simd_gid * v_per_thread;
+        op[i] = T(tot == 0 ? acc : acc / tot);
+      }
+    }
+  }
+}
+
+#define instantiate_sdpa_paged_hshare(name, itype, d, v, qh)                 \
+  template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32_h" #qh)]]   \
+  [[kernel]] void sdpa_paged_decode_hshare<itype, d, v, qh>(                 \
+      const device itype*, const device itype*, const device itype*,         \
+      device itype*, const constant int&, const device int*,                 \
+      const device int*, const device uint*, const device uint*,             \
+      const constant int&, const constant int&, const constant float&,       \
+      const device uchar*, const device uint&, const device uchar*,          \
+      const constant int&, const device itype*,                              \
+      uint3, uint3, uint, uint);
+
+instantiate_sdpa_paged_hshare(bfloat16, bfloat, 128, 128, 2)  // llama / qwen
+
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
   [[kernel]] void sdpa_paged_decode<itype, d, v, sink, 0, false, 32>(      \

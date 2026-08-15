@@ -59,6 +59,12 @@ struct LlamaPsos {
     Pso sdpa{};
     Pso sdpa_paged{};
     Pso sdpa_paged_sg8{};
+    /// The same paged decode with a PAIR of query heads per threadgroup, so the
+    /// KV head they share is read once instead of twice. Only compiled when the
+    /// geometry qualifies (`sdpa_head_share_this_fire`), and left invalid
+    /// otherwise -- `pso_for` falls back to `sdpa_paged`, which is what every
+    /// checkpoint did before this existed.
+    Pso sdpa_paged_hshare{};
     /// The same paged attention with the query rows tiled -- one row per
     /// simdgroup, K/V staged per threadgroup. Chosen by row count, not by
     /// model: see `sdpa_should_tile`.

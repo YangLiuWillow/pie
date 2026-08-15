@@ -281,6 +281,14 @@ struct DeviceTuning {
     /// wrong numbers rather than slow ones. `PIE_METAL_SDPA_MMA=0` is the way
     /// back, and the greedy gate in `llama_bench` is what would catch it.
     bool sdpa_mma = true;
+    /// Share one KV read between a pair of query heads in the per-row decode
+    /// (`sdpa_paged_decode_hshare`). Off restores the one-threadgroup-per-query
+    /// -head shape exactly, and restores it COMPLETELY: the pipeline is not
+    /// compiled and neither selection site can choose it, so the switch cannot
+    /// half-apply. Same property `sdpa_mma` has, for the same reason -- the
+    /// grid differs between the two shapes, so a partial revert is wrong
+    /// numbers rather than a slower kernel.
+    bool sdpa_head_share = true;
 
     /// Lanes that share one value row of the gated-delta scan.
     ///
@@ -534,6 +542,7 @@ int sdpa_tile_min_rows_per_request();
 
 /// Whether a tiled prefill attention runs on the simdgroup matrix unit.
 bool sdpa_mma();
+bool sdpa_head_share();
 int gdn_scan_lanes();
 int gdn_scan_rows();
 

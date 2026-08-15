@@ -53,6 +53,38 @@
         }
       }
     },
+    "probe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "through tools/turnlog.py",
+      "options": {
+        "baseURL": "http://127.0.0.1:8099/v1",
+        "apiKey": "probe-local"
+      },
+      "models": {
+        "qwen3-coder-30b": {
+          "name": "Qwen3-Coder 30B-A3B (pie or vLLM, via turnlog)",
+          "tool_call": true,
+          "limit": {
+            "context": 61440,
+            "output": 4096
+          },
+          "options": {
+            "temperature": 0
+          }
+        },
+        "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit": {
+          "name": "Qwen3-Coder 30B-A3B (mlx-lm, via turnlog)",
+          "tool_call": true,
+          "limit": {
+            "context": 61440,
+            "output": 4096
+          },
+          "options": {
+            "temperature": 0
+          }
+        }
+      }
+    },
     "vllm": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "vLLM-metal",

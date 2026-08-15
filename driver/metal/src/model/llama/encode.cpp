@@ -338,6 +338,17 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             if (sdpa_should_tile(R, requests)) return ll.sdpa_paged_tiled;
             if (llama_sdpa_simdgroups(g) == 8 && ll.sdpa_paged_sg8.valid())
                 return ll.sdpa_paged_sg8;
+            // A pair of query heads per threadgroup, sharing one KV read.
+            // Deliberately NOT guarded on `.valid()`: `launch_shape` cannot ask
+            // that question (it is handed no `LlamaPsos`), so guarding here
+            // would let the two sites disagree -- a half-height grid over the
+            // per-head kernel, which computes half the heads and reports
+            // nothing. `build_llama_psos` puts this pipeline in the fatal spec
+            // list under exactly this predicate, so validity is implied by
+            // having loaded at all.
+            if (sdpa_head_share_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                          g.n_kv_heads, g.paged_kv_enabled))
+                return ll.sdpa_paged_hshare;
             return ll.sdpa_paged;
         // The append follows attention. Both KV kinds must agree on the ABI:
         // the binder writes page tables into slots the ring kernel reads as a
@@ -723,6 +734,14 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
                 grid = Grid{std::uint32_t(g.n_q_heads) * threads,
                             std::uint32_t(R), 1};
                 tg = Threadgroup{threads, 1, 1};
+                return;
+            }
+            // Same predicate `pso_for` uses, from the same function. This grid
+            // is `kSdpaHeadShare` times SHORTER than the one below, so the two
+            // sites agreeing is the whole correctness condition here.
+            if (sdpa_head_share_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                          g.n_kv_heads, g.paged_kv_enabled)) {
+                sdpa_paged_hshare_dispatch(g.n_q_heads, R, grid, tg);
                 return;
             }
             sdpa_paged_dispatch(g.n_q_heads, R, grid, tg);

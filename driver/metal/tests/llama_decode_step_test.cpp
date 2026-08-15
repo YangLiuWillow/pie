@@ -841,6 +841,78 @@ void check_the_tiled_attention_is_told_its_row_count() {
     }
 }
 
+/// The head-sharing decode's grid must be exactly as short as its kernel is wide.
+///
+/// `sdpa_paged_decode_hshare` takes `kSdpaHeadShare` query heads per
+/// threadgroup, so its grid is that many times SHORTER in x than the per-head
+/// kernel's. `pso_for` and `launch_shape` decide independently, and if they
+/// disagree the fire computes `1/kSdpaHeadShare` of the heads and leaves the
+/// rest of the output holding whatever was there before -- no crash, no error,
+/// just wrong logits. Exactly the hazard `llama_sdpa_mma_this_fire` documents,
+/// so it gets the same treatment: the predicate is pinned, and the grid is
+/// checked against it.
+void check_the_head_sharing_grid_matches_its_kernel() {
+    using pie::metal::Grid;
+    using pie::metal::Threadgroup;
+    using pie::metal::kSdpaHeadShare;
+    using pie::metal::sdpa_head_share_this_fire;
+    using pie::metal::llama::launch_shape;
+
+    // The geometry conditions, each one the reason the kernel would be wrong.
+    expect(!sdpa_head_share_this_fire(128, 32, 16, 4, /*paged=*/false),
+           "no head sharing without paged KV: the kernel is page-addressed");
+    expect(!sdpa_head_share_this_fire(128, 64, 16, 4, true),
+           "nor at page size 64: the kernel shifts and masks by 32");
+    expect(!sdpa_head_share_this_fire(64, 32, 16, 4, true),
+           "nor at head_dim 64: only d=128 is instantiated");
+    expect(!sdpa_head_share_this_fire(128, 32, 4, 4, true),
+           "nor at gqa 1, where a threadgroup would span two KV heads");
+
+    // Everything below depends on which way `PIE_METAL_SDPA_HSHARE` is set, and
+    // BOTH ways are asserted -- the off state is the documented way back, and a
+    // test that only holds in the default would not notice a revert that
+    // removed the dispatch while leaving the grid.
+    const bool on = pie::metal::sdpa_head_share();
+    expect(sdpa_head_share_this_fire(128, 32, 16, 4, true) == on,
+           on ? "at gqa 4, page 32, d=128, paged: shared"
+              : "PIE_METAL_SDPA_HSHARE=0 refuses a geometry it otherwise serves");
+    expect(sdpa_head_share_this_fire(128, 32, 32, 4, true) == on,
+           "Qwen3-Coder-30B's own 32 heads over 4 follow the switch");
+
+    // And the grid that goes with it. A decode is one row per request; the x
+    // extent is the whole question.
+    LlamaGeometry g = base();
+    g.paged_kv_enabled = true;
+    const int per_tg =
+        sdpa_head_share_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                  g.n_kv_heads, g.paged_kv_enabled)
+            ? kSdpaHeadShare
+            : 1;
+    expect(per_tg == (on ? kSdpaHeadShare : 1),
+           "the geometry's heads-per-threadgroup follows the switch");
+    const auto dag = build_llama_dag(g, true);
+    bool seen = false;
+    for (const auto& d : dag) {
+        if (d.kind != Kind::Sdpa) continue;
+        Grid grid{};
+        Threadgroup tg{};
+        launch_shape(d, g, grid, tg, /*rows=*/1, /*head_rows=*/1, /*requests=*/1);
+        seen = true;
+        expect(tg.x == 1024, "the decode shape is 1024 threads either way");
+        expect(grid.x == std::uint32_t(g.n_q_heads / per_tg) * 1024u,
+               "the grid is n_q_heads/heads-per-threadgroup wide");
+        // The load-bearing one, and the reason this test exists: whatever the
+        // switch says, every query head is covered exactly once. Too few
+        // threadgroups leaves heads uncomputed and reports nothing.
+        const long long heads_covered =
+            static_cast<long long>(grid.x / 1024u) * per_tg;
+        expect(heads_covered == g.n_q_heads,
+               "the grid covers every query head exactly once, no more and no less");
+        break;
+    }
+    expect(seen, "the llama DAG has an Sdpa dispatch to shape");
+}
+
 int main() {
     std::printf("llama_decode_step_test — one family, four configurations\n");
 
@@ -902,6 +974,7 @@ int main() {
     check_refusals();
     check_streaming_covers_both_ffn_shapes();
     check_the_tiled_attention_is_told_its_row_count();
+    check_the_head_sharing_grid_matches_its_kernel();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -355,6 +355,111 @@ double krow_run(RawMetalContext& ctx, Pso pso, int krows, int ctx_len, int ordin
     return r.median.gpu_exec_ms;
 }
 
+// One head-sharing decode fire: correctness against a CPU reference, then cost.
+//
+// The data here is DISTINCT PER HEAD, deliberately, and that is the difference
+// between this and `krow_run` above. `krow_run` writes the same q to all 32
+// query heads and the same k/v to all 4 kv heads, which is fine for what it
+// tests -- but under that data a kernel that computed head 3 and stored it as
+// head 5 would be byte-perfect. The whole hazard of a head-sharing kernel is
+// exactly that mix-up, so the reference has to be able to see it: every query
+// head gets its own q, every kv head its own k/v, and every head is checked.
+double hshare_run(RawMetalContext& ctx, Pso pso, int heads, int ctx_len, int ordinal,
+                  bool check) {
+    constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
+    const int gqa = kHeads / kKv;                 // 8
+    const int pages = (ctx_len + kPage) / kPage + 1;
+    auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+
+    SlotHandle q = ctx.heap_alloc(size_t(kHeads) * kD * 2);
+    SlotHandle kp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle vp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle o  = ctx.heap_alloc(size_t(kHeads) * kD * 2);
+    SlotHandle pos = ctx.heap_alloc(sizeof(int));
+    SlotHandle pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    auto* qz = static_cast<uint16_t*>(q.contents());
+    auto* kz = static_cast<uint16_t*>(kp.contents());
+    auto* vz = static_cast<uint16_t*>(vp.contents());
+    std::memset(kz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(vz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(o.contents(), 0, size_t(kHeads) * kD * 2);
+    for (int p2 = 0; p2 < pages; ++p2) static_cast<uint32_t*>(pidx.contents())[p2] = uint32_t(p2);
+    *static_cast<int*>(pos.contents()) = ctx_len;
+
+    // qf[h][d] and kf[kvh][c][d] -- head-dependent, so a swap shows up.
+    std::vector<float> qf(size_t(kHeads) * kD);
+    std::vector<float> kf(size_t(kKv) * (ctx_len + 1) * kD), vf(kf.size());
+    for (int h = 0; h < kHeads; ++h)
+      for (int d = 0; d < kD; ++d) {
+        qf[size_t(h) * kD + d] = float((h * 3 + d * 2) % 7) * 0.125f;
+        qz[size_t(h) * kD + d] = bf(qf[size_t(h) * kD + d]);
+      }
+    for (int c = 0; c <= ctx_len; ++c)
+      for (int h = 0; h < kKv; ++h)
+        for (int d = 0; d < kD; ++d) {
+          const float kk = float((c + 2 * d + 5 * h) % 4) * 0.125f;
+          const float vv = float((3 * c + d + 11 * h) % 6) * 0.25f;
+          kf[(size_t(h) * (ctx_len + 1) + c) * kD + d] = kk;
+          vf[(size_t(h) * (ctx_len + 1) + c) * kD + d] = vv;
+          kz[(size_t(c) * kKv + h) * kD + d] = bf(kk);
+          vz[(size_t(c) * kKv + h) * kD + d] = bf(vv);
+        }
+
+    const float scale = 1.0f / 11.3137085f;
+    const Kernel kind = Kernel::Sdpa;
+    ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
+    ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, o);
+    ctx.arg_bind(kind, ordinal, 4, scalar<int>(ctx, gqa));
+    ctx.arg_bind(kind, ordinal, 5, pos); ctx.arg_bind(kind, ordinal, 6, pidx);
+    ctx.arg_bind(kind, ordinal, 7, scalar<int>(ctx, kPage));
+    ctx.arg_bind(kind, ordinal, 8, scalar<int>(ctx, kKv));
+    ctx.arg_bind(kind, ordinal, 9, scalar<float>(ctx, scale));
+    ctx.make_resident();
+
+    // One threadgroup per GROUP of `heads` query heads. The grid shrinks as the
+    // sharing widens -- which is the saving, and also the risk: fewer, fatter
+    // threadgroups can under-occupy the device. That is why this is measured.
+    Grid grid{uint32_t(kHeads / heads) * 1024u, 1, 1};
+    Threadgroup tg{1024, 1, 1};
+    LatencyHarness h(ctx);
+    auto enc = [&](StepEncoder& se) {
+        se.set_pso(pso); se.set_argtable(kind, ordinal); se.dispatch(grid, tg);
+    };
+    BenchResult r = h.time_step("hshare", enc, check ? 1 : 30, check ? 0 : 8);
+
+    if (check) {
+        const uint16_t* og = static_cast<const uint16_t*>(o.contents());
+        int bad = 0; double worst = 0; int worst_head = -1;
+        for (int hd = 0; hd < kHeads; ++hd) {
+            const int kvh = hd / gqa;
+            const float* kk = &kf[size_t(kvh) * (ctx_len + 1) * kD];
+            const float* vv = &vf[size_t(kvh) * (ctx_len + 1) * kD];
+            std::vector<double> sc(size_t(ctx_len) + 1); double mx = -1e30;
+            for (int c = 0; c <= ctx_len; ++c) {
+                double a2 = 0;
+                for (int d = 0; d < kD; ++d)
+                    a2 += double(qf[size_t(hd) * kD + d]) * double(kk[size_t(c) * kD + d]);
+                sc[c] = a2 * double(scale); if (sc[c] > mx) mx = sc[c];
+            }
+            double sm = 0;
+            for (int c = 0; c <= ctx_len; ++c) { sc[c] = std::exp(sc[c] - mx); sm += sc[c]; }
+            for (int d = 0; d < kD; ++d) {
+                double ref = 0;
+                for (int c = 0; c <= ctx_len; ++c) ref += sc[c] * double(vv[size_t(c) * kD + d]);
+                ref /= sm;
+                uint32_t bits = uint32_t(og[size_t(hd) * kD + d]) << 16;
+                float got; std::memcpy(&got, &bits, 4);
+                const double e = std::abs(double(got) - ref) / (std::abs(ref) + 1e-6);
+                if (e > 3e-2) { ++bad; if (e > worst) { worst = e; worst_head = hd; } }
+            }
+        }
+        printf("  HEADS=%d correctness: %d of %d wrong%s", heads, bad, kHeads * kD,
+               bad == 0 ? "  \xe2\x80\x94 CORRECT (all 32 heads)\n" : "");
+        if (bad) printf("   (worst %.4f at head %d)\n", worst, worst_head);
+    }
+    return r.median.gpu_exec_ms;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -408,6 +513,40 @@ int main(int argc, char** argv) {
                    k == 1 ? 1.00 : (k == 2 ? 1.54 : (k == 4 ? 2.39 : (k == 5 ? 2.82 : (k == 8 ? 4.08 : 0.0)))));
         }
         printf("  (measured for the shipped per-row kernel: 1.54x / 2.39x / 4.08x)\n\n");
+    }
+
+    // ── head-sharing decode: the axis a single-stream agent decode actually
+    // has. k-row sharing needs k>1 and an agent turn decodes one token at a
+    // time; the GQA group is 8 wide regardless. HEADS=1 is the shipped shape,
+    // so every ratio below is head sharing and nothing else.
+    {
+        printf("head-sharing decode, one KV read per GQA group (HEADS=1 is the shipped shape):\n");
+        const std::string ld = PIE_METAL_TOOL_LOCAL_KERNELS_DIR;
+        double base16 = 0, base2 = 0, base8 = 0, base12 = 0;
+        for (int hh : {1, 2, 4, 8}) {
+            std::string ek;
+            char f[64]; snprintf(f, sizeof f, "/sdpa_hshare_%d.metal", hh);
+            Pso p = ctx->compile_pso_from_file(ld + f, "sdpa_hshare_decode", &ek);
+            if (!p.valid()) { printf("  HEADS=%d compile fail: %s\n", hh, ek.c_str()); continue; }
+            hshare_run(*ctx, p, hh, 2047, 300 + hh, /*check=*/true);
+            // 8k and 12k are where this workload's turns actually sit
+            // (results-e2e-one-instance.md: prompts of 7.4k rising to 12.0k).
+            // 16k is kept because the k-row arm above reports there and the two
+            // must be readable against each other.
+            const double t2 = hshare_run(*ctx, p, hh, 2047, 320 + hh, /*check=*/false);
+            const double t8 = hshare_run(*ctx, p, hh, 8191, 360 + hh, /*check=*/false);
+            const double t12 = hshare_run(*ctx, p, hh, 12287, 380 + hh, /*check=*/false);
+            const double t16 = hshare_run(*ctx, p, hh, 16383, 340 + hh, /*check=*/false);
+            if (hh == 1) { base16 = t16; base2 = t2; base8 = t8; base12 = t12; }
+            printf("     2k %6.3f %.2fx | 8k %6.3f %.2fx | 12k %6.3f %.2fx | "
+                   "16k %6.3f %.2fx   (12k x48 = %5.1f ms)\n",
+                   t2, base2 > 0 ? t2 / base2 : 1.0,
+                   t8, base8 > 0 ? t8 / base8 : 1.0,
+                   t12, base12 > 0 ? t12 / base12 : 1.0,
+                   t16, base16 > 0 ? t16 / base16 : 1.0, t12 * 48.0);
+        }
+        printf("  A decode step's whole attention is the 16k column x48. The\n"
+               "  dispatch trace puts attention at 75-77%% of a decode fire at 23k.\n\n");
     }
 
     printf("MMA path (what a >=32-row prefill dispatches):\n");
