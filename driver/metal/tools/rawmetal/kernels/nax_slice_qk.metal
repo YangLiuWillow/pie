@@ -7,6 +7,13 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 
+#ifndef NAX_BQ
+#define NAX_BQ 64
+#endif
+#ifndef NAX_BK
+#define NAX_BK 32
+#endif
+
 kernel void nax_slice_qk(
     // NOT const: `tensor_inline`'s constructor takes a mutable
     // `data_handle_type`, and a const pointer loses the qualifier.
@@ -15,7 +22,7 @@ kernel void nax_slice_qk(
     device float* sp        [[buffer(2)]],
     const constant int& reps [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]) {
-  constexpr int BQ = 64, BK = 32, D = 128;
+  constexpr int BQ = NAX_BQ, BK = NAX_BK, D = 128;
 
   // `tensor_inline` is the DESCRIPTOR tag for a tensor built in-kernel from a
   // pointer, as against `tensor_handle` which must be bound host-side. pie's

@@ -430,6 +430,46 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Tile sweep on the CORRECT kernel. 2.30x failed the stage-1 rule; this
+    // asks whether that verdict is about the API or about one tile choice.
+    {
+        printf("\nTILE SWEEP (correct slice kernel, matched occupancy):\n");
+        const struct { const char* f; int bq, bk; } ts[] = {
+            {"/nax_slice_qk.metal",    64, 32}, {"/nax_slice_128x32.metal", 128, 32},
+            {"/nax_slice_64x64.metal", 64, 64}, {"/nax_slice_128x64.metal", 128, 64},
+        };
+        for (const auto& t : ts) {
+            std::string e3;
+            Pso p3 = ctx->compile_pso_from_file(dir + t.f, "nax_slice_qk", &e3);
+            if (!p3.valid()) { printf("  BQ=%-4d BK=%-3d  compile fail\n", t.bq, t.bk); continue; }
+            const int D3 = 128, reps = 7424 / t.bk, tg3 = 32 * ((184 + t.bq - 1) / t.bq);
+            SlotHandle q3 = ctx->heap_alloc(size_t(t.bq) * D3 * 2);
+            SlotHandle k3 = ctx->heap_alloc(size_t(D3) * t.bk * 2);
+            SlotHandle s3 = ctx->heap_alloc(size_t(t.bq) * t.bk * 4);
+            SlotHandle r3 = ctx->heap_alloc(sizeof(int));
+            std::memset(q3.contents(), 0, size_t(t.bq) * D3 * 2);
+            std::memset(k3.contents(), 0, size_t(D3) * t.bk * 2);
+            *static_cast<int*>(r3.contents()) = reps;
+            static int o3 = 70;
+            ++o3;
+            const Kernel k3k = Kernel::Sdpa;
+            ctx->arg_bind(k3k, o3, 0, q3); ctx->arg_bind(k3k, o3, 1, k3);
+            ctx->arg_bind(k3k, o3, 2, s3); ctx->arg_bind(k3k, o3, 3, r3);
+            ctx->make_resident();
+            LatencyHarness h3(*ctx);
+            const int myo = o3;
+            auto e3f = [&](StepEncoder& se) {
+                se.set_pso(p3); se.set_argtable(k3k, myo);
+                se.dispatch(Grid{uint32_t(tg3) * 128u, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            BenchResult r = h3.time_step("tile", e3f, 30, 8);
+            const double fl = double(tg3) * reps * 2.0 * t.bq * t.bk * D3;
+            const double tf = fl / (r.median.gpu_exec_ms / 1000.0) / 1e12;
+            printf("  BQ=%-4d BK=%-3d  %7.3f ms  %6.2f TFLOP/s  %.2fx simdgroup  (%d tgs)\n",
+                   t.bq, t.bk, r.median.gpu_exec_ms, tf, tf / s, tg3);
+        }
+    }
+
     // ── WHICH lane layout? A one-hot probe that NAMES it. ──
     //
     // K is an identity (K[c][d] = 1 iff d == c), so S[row][col] must equal

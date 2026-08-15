@@ -445,7 +445,48 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
-### RESOLVED — and the decision rule now FAILS
+### THE RULE PASSES AFTER ALL — 2.30x was the TILE, not the API
+
+Recorded after the "fails" section below, which is left standing because the
+reasoning that produced it was right and only its input was wrong.
+
+The tile sweep, correct kernel, matched occupancy:
+
+    BQ=64   BK=32    12.17 TFLOP/s   2.22x     <- the tile I had picked
+    BQ=128  BK=32    19.31           3.53x
+    BQ=64   BK=64    20.11           3.67x     <- best
+    BQ=128  BK=64    19.89           3.63x
+
+**3.67x passes the >= 3x rule.** The 2.30x that failed it was one tile choice,
+not a property of the API, and the sweep cost ten minutes.
+
+The reason is worth understanding rather than filing: **BK=64 was IMPOSSIBLE on
+the hand-filled kernel.** `device_caps` measured a 32 KB threadgroup cap, and
+BQ=64/BK=64 needs 35 KB with Q staged, so the plan concluded "BK=32 it is". That
+constraint is real -- for a kernel that stages into threadgroup memory by hand.
+The slice API never touches threadgroup memory; the library manages its own. So
+the correct API did not merely remove the lane-layout bug class, **it removed
+the memory constraint that had capped the tile**, and the tile was where the
+throughput was.
+
+Redone at 3.67x:
+
+    multiply  3.38 / 3.67 = 0.92 ms
+
+and the staging term needs rethinking rather than reusing: this kernel does not
+stage, so the ~1.35 ms projection describes a design that no longer exists. The
+whole-kernel number has to be measured, not composed.
+
+**Two general lessons, both of which cost real time tonight:**
+
+1. A tile that a memory cap forces is a tile chosen by a constraint, and when
+   the constraint goes the choice must be revisited. It was carried forward
+   silently into a completely different implementation.
+2. A decision rule is only as good as the configuration it is evaluated on.
+   "2.30x, the rule fails" was honest and premature -- ten minutes of sweeping
+   the one free parameter moved it to 3.67x. Sweep before concluding, not after.
+
+### The earlier verdict, kept because its reasoning was sound
 
 A correct NAX Q.K^T exists, on the documented tensor-slice API:
 
