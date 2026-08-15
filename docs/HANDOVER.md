@@ -1,7 +1,9 @@
 # Handover — pie on Apple Silicon, opencode integration
 
-**Written 2026-08-15.** Branch `liu/opencode-integration`, 34 commits ahead of
-`fork/liu/opencode-integration`, **nothing pushed**, working tree clean.
+**Written 2026-08-15.** Branch `liu/opencode-integration`: **34 commits from this
+session**, **71 ahead of `fork/liu/opencode-integration`** (the branch was
+already ahead of the remote before this session began). **Nothing pushed**,
+working tree clean.
 
 Every number below was re-measured on **2026-08-15 on an idle machine**
 (`roofline_probe` streaming roof 298.3 GB/s) unless the line says otherwise.
