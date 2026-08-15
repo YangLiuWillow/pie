@@ -445,7 +445,45 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
-### FUSED KERNEL: compiles, runs, WRONG — and the fault is isolated
+### ISOLATED: a cooperative tensor does NOT carry across `run()` calls
+
+    P.V twice into one cooperative O, no softmax, reference = 2*(P.V)
+    7316 of 8192 wrong, worst relative 1.0000
+
+A relative error of exactly 1.0 means the value is ZERO where the reference is
+not, so the accumulation is not surviving between calls -- not a layout
+mistake, a lifetime one. That kills the design the fused kernel was built on.
+
+**And it explains MLX.** `steel_attention_nax.h` keeps O in `NAXTile<AccumType,
+TQ, TD>` -- its OWN register array -- and materializes cooperative tensors
+transiently INSIDE each matmul, copying in and out around every `run()`. It
+never carries one across calls, which had looked like incidental style and is
+in fact the only thing that works.
+
+**So the correct design is MLX's after all, and the earlier attempt failed for
+one reason only: the layout.** Which is now queryable rather than guessable.
+The fused kernel becomes:
+
+    float ov[...]                       O in a plain register array
+    per key block:
+      S = Q.K^T  -> threadgroup C       (verified: 0/2048 wrong)
+      softmax in threadgroup            (no lane algebra needed)
+      ct_o = fresh cooperative tensor
+      copy ov -> ct_o                   using get_multidimensional_index
+      run(P, V, ct_o)
+      copy ct_o -> ov, rescaling per row
+
+with the copy indices HOISTED: the mapping is constant per lane, so
+`get_multidimensional_index` is called once at kernel entry, not per element
+per block.
+
+**What this costs, honestly:** two register-array copies per key block that a
+carried cooperative tensor would not need. Whether that gives back the margin
+between 1.338 ms of matmuls and MLX's 1.31 ms whole pass is the open question,
+and it is now the ONLY one -- every other unknown in this plan has been
+measured.
+
+### The dead fused attempt, kept for its isolation trail
 
     7780 of 8192 wrong, worst relative 95.06
 

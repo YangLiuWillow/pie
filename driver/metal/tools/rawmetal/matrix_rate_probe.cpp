@@ -505,6 +505,47 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Isolation: does a cooperative tensor carry across two run() calls?
+    {
+        std::string ec4;
+        Pso tw = ctx->compile_pso_from_file(dir + "/nax_coop_twice.metal", "nax_coop_twice", &ec4);
+        printf("\nISOLATION — cooperative O across two run() calls:\n");
+        if (!tw.valid()) printf("  compile failed: %s\n", ec4.c_str());
+        else {
+            const int BQ = 64, BK = 64, D = 128;
+            auto bf = [](float f){ uint32_t u; std::memcpy(&u,&f,4); return uint16_t(u>>16); };
+            SlotHandle ph2 = ctx->heap_alloc(size_t(BQ)*BK*2), vh2 = ctx->heap_alloc(size_t(BK)*D*2);
+            SlotHandle oh4 = ctx->heap_alloc(size_t(BQ)*D*4);
+            auto* pz = static_cast<uint16_t*>(ph2.contents());
+            auto* vz = static_cast<uint16_t*>(vh2.contents());
+            std::memset(oh4.contents(), 0, size_t(BQ)*D*4);
+            std::vector<float> pf2(size_t(BQ)*BK), vf2(size_t(BK)*D);
+            for (int r=0;r<BQ;++r) for (int c=0;c<BK;++c) {
+                pf2[size_t(r)*BK+c]=float((r+c)%5)*0.25f; pz[size_t(r)*BK+c]=bf(pf2[size_t(r)*BK+c]); }
+            for (int c=0;c<BK;++c) for (int d=0;d<D;++d) {
+                vf2[size_t(c)*D+d]=float((2*c+d)%7)*0.5f; vz[size_t(c)*D+d]=bf(vf2[size_t(c)*D+d]); }
+            const Kernel kw = Kernel::Sdpa;
+            ctx->arg_bind(kw,130,0,ph2); ctx->arg_bind(kw,130,1,vh2); ctx->arg_bind(kw,130,2,oh4);
+            ctx->make_resident();
+            LatencyHarness hw(*ctx);
+            auto enw = [&](StepEncoder& se){ se.set_pso(tw); se.set_argtable(kw,130);
+                se.dispatch(Grid{128,1,1}, Threadgroup{128,1,1}); };
+            hw.time_step("cooptwice", enw, 1, 0);
+            const float* g = static_cast<const float*>(oh4.contents());
+            int bw = 0; double worstw = 0;
+            for (int r=0;r<BQ;++r) for (int d=0;d<D;++d) {
+                double ref = 0;
+                for (int c=0;c<BK;++c) ref += double(pf2[size_t(r)*BK+c])*double(vf2[size_t(c)*D+d]);
+                ref *= 2.0;   // two accumulating runs
+                const double e = std::abs(g[size_t(r)*D+d]-ref)/(std::abs(ref)+1e-6);
+                if (e > 1e-2) { ++bw; worstw = e>worstw?e:worstw; } }
+            printf("  %d of %d wrong%s\n", bw, BQ*D,
+                   bw==0 ? "  — carries fine; the fault is the SOFTMAX path"
+                         : "  — a cooperative tensor does NOT carry across run() calls");
+            if (bw) printf("  worst relative %.4f\n", worstw);
+        }
+    }
+
     // Isolation: threadgroup DESTINATION alone, everything else verified.
     {
         std::string et;
