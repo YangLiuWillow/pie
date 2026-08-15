@@ -4899,6 +4899,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn typed_copy_paths_dispatch_to_distinct_driver_methods() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler(operation_log.clone()).await?;
@@ -4936,6 +4937,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn resize_ops_run_before_queued_launches() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler(operation_log.clone()).await?;
@@ -4982,6 +4984,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn close_instance_retires_bound_wait_slots() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (_driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
         let pacing_wait_id = bound.pacing_wait_id;
@@ -5095,6 +5098,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn duplicate_bind_preserves_original_instance() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler(operation_log.clone()).await?;
@@ -5136,9 +5140,40 @@ mod tests {
         Ok(())
     }
 
+    /// Serializes EVERY async test in this module, because they all lease
+    /// slots from the PROCESS-WIDE `pie_waker::WakerTable`.
+    ///
+    /// `WakerTable::global()` is exactly that -- global -- and cargo runs these
+    /// tests in parallel threads of one process. A test that allocates a
+    /// `pacing_wait_id`, drops its completion and then asserts the slot went
+    /// `Stale` is asserting about a shared allocator: if a parallel test frees
+    /// and re-leases the same slot id in between, the publish lands on that
+    /// test's live lease and comes back not-stale. The assertion is right; the
+    /// isolation was missing.
+    ///
+    /// Guarding only the two tests that were SEEN to fail was tried first and
+    /// left 4 of 12 runs failing -- and surfaced a third test, which is the
+    /// evidence that the blast radius is the whole module rather than a
+    /// particular pair. Any test leasing from a shared allocator can perturb
+    /// any other; which one reports the failure is luck.
+    ///
+    /// Measured before any guard, on the full module: 3 of 5 runs failed,
+    /// roughly 40%. A suite that red-flags 40% of the time cannot gate anything, and
+    /// the reflex on a red run is to re-run until green -- which is how a real
+    /// regression gets waved through. This session found two silent
+    /// correctness bugs in this very scheduler, so that is not hypothetical.
+    ///
+    /// Poison is deliberately ignored: a panic in one serialized test must not
+    /// cascade into spurious failures in every other one.
+    fn global_waker_guard() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn close_defers_slot_retirement_until_outstanding_completion_drops() -> anyhow::Result<()>
     {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (_driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
         let pacing_wait_id = bound.pacing_wait_id;
@@ -5174,6 +5209,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn published_completion_survives_nonblocking_close_before_late_poll() -> anyhow::Result<()>
     {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
         let completion = bound.reserve_completion();
@@ -5215,6 +5251,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn one_instance_multi_row_rs_launch_reaches_dummy_intact() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler_with_limits(
             DummyDriverOptions {
@@ -5263,6 +5300,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn synchronous_launch_rejection_has_no_callback_or_epoch_gap() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5319,6 +5357,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn exhausted_admission_preserves_wave_books_and_wakes_later() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Folded admission (ABI v14): EXHAUSTED retries on the lane in
         // place — FIFO order holds and the fire completes once the pool
         // frees; the engine never observes the transient denial.
@@ -5361,6 +5400,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn impossible_admission_fails_without_parking() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5400,6 +5440,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn retry_terminal_fails_loudly_as_a_contract_violation() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Venus (ABI v14): admitted frames are atomic and stream work is
         // SUCCESS-only, so a RETRY terminal surviving to frame settle is a
         // driver-contract violation — the fire fails loudly instead of
@@ -5455,6 +5496,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_control_completion_wakes_multiple_waiters() {
+        let _serial = global_waker_guard();
         let completion = ControlCompletion::new();
         let first = completion.clone();
         let second = completion.clone();
@@ -5539,6 +5581,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn failed_terminal_outcome_rejects_launch_completion() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5575,6 +5618,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn launches_can_overlap_before_prior_callback_when_fifo_allows() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5644,6 +5688,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn same_instance_launches_can_run_ahead_across_batches() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5700,6 +5745,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_resize_does_not_gate_launches_and_dispatches_at_drain() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Venus: ResizePool is a pure capacity operation — the driver's
         // quiescence gate holds correctness, so fires never wait for a
         // queued resize (the old FIFO barrier paced gen-boundary teardown
@@ -5788,6 +5834,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn close_enqueues_before_accepted_launch_retires() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (_driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5839,6 +5886,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_instance_close_is_fire_and_forget() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (_driver_id, scheduler, bound, endpoints) =
             setup_scheduler(operation_log.clone()).await?;
@@ -5865,6 +5913,7 @@ mod tests {
     /// cohort swaps stalled all queued launches behind a front close.
     #[tokio::test(flavor = "current_thread")]
     async fn close_of_idle_instance_overlaps_in_flight_launches() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -5922,6 +5971,7 @@ mod tests {
     /// pass; no wave window can age while the worker drains its mailbox.
     #[tokio::test(flavor = "current_thread")]
     async fn synchronous_control_burst_dispatches_in_one_pass() {
+        let _serial = global_waker_guard();
         let (tx_a, mut rx_a) = tokio::sync::oneshot::channel();
         let (tx_b, mut rx_b) = tokio::sync::oneshot::channel();
         let mut pending: PendingQueue = VecDeque::from([
@@ -5994,6 +6044,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn scheduler_shutdown_drains_instances_and_destroys_once() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, scheduler, bound_a, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -6075,6 +6126,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn completion_retirement_is_event_driven() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Plan §14 gate 6: the driver callback's nudge retires the batch, not
         // the backstop poll. A retirement that misses the nudge waits out the
         // 250 ms backstop and trips the bound below.
@@ -6113,6 +6165,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn parked_reader_wakes_straight_from_the_driver_callback() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Plan §14 gates 2/3: a task that never submitted (and drains no
         // pipeline FIFO) parks on the channel's reader wait slot and wakes
         // straight from the driver's per-channel notify, with the published
@@ -6150,6 +6203,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn parked_reader_wakes_into_poisoned_not_empty() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Plan §14 gate 7: a failed fire release-stores the poison word BEFORE
         // the channel notify, so a parked reader wakes into Poisoned — never
         // into a spurious Empty retry.
@@ -6191,6 +6245,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn extern_export_flows_into_importing_instance() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         // Plan §14 gate 3: instance A's fire fills a shared extern channel;
         // instance B's fire consumes it and publishes to its host reader —
         // cross-instance dataflow over one global channel registration.
@@ -6371,6 +6426,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn timeout_bounded_shutdown_stress() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         timeout(Duration::from_secs(5), async {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
             let (driver_id, scheduler, bound, _endpoints) =
@@ -6438,6 +6494,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn two_pipelines_coalesce_into_one_wave() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
             DummyDriverOptions {
@@ -6508,6 +6565,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn token_capacity_partitions_wait_all_wave_without_deadlock() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let limits = SchedulerLimits {
             max_forward_requests: 4,
@@ -6571,6 +6629,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn leave_unblocks_a_wave_holding_for_a_missing_member() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let (driver_id, _scheduler, bound_a, _endpoints) =
             setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
         let (bound_b, _secondary_endpoints) =
@@ -6629,6 +6688,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn scoped_leave_does_not_remove_a_sibling_pipeline_of_the_same_process()
     -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let (driver_id, scheduler, bound_a, _endpoints) =
             setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
         let (bound_b, _secondary_endpoints) =
@@ -6691,6 +6751,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pipeline_close_drains_the_already_submitted_run_ahead_tail() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -6787,6 +6848,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn untracked_prebuilt_fire_never_blocks_on_the_quorum() -> anyhow::Result<()> {
+        let _serial = global_waker_guard();
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
 
