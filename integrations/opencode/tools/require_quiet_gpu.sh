@@ -85,8 +85,15 @@ require_quiet_gpu() {
     fi
     # Low swap on top of ample free memory is not dangerous, but low swap while
     # free memory is merely adequate is exactly the OOM condition. Only then.
+    # The swap tie-breaker needs an ABSOLUTE headroom test as well as a ratio,
+    # and this is the second calibration correction it has needed. The ratio
+    # alone (`free < need * 1.5`) refused a 20 GB arm on a machine with 29.0 GB
+    # free and 9 GB of headroom -- four times the free memory the 2026-08-14 OOM
+    # actually happened at. A rule tuned on one datapoint generalises badly in
+    # both directions: the first version over-fitted to swap, this one to the
+    # ratio. Refuse only when headroom is thin in ratio AND in absolute terms.
     if awk -v f="$swapfree" -v m="$min_swap" 'BEGIN{exit !(f < m)}'; then
-        if awk -v f="$free" -v n="$need" 'BEGIN{exit !(f < n * 1.5)}'; then
+        if awk -v f="$free" -v n="$need" 'BEGIN{exit !(f < n * 1.5 && f - n < 8)}'; then
             echo "FATAL: ${free} GB free is only just above the ${need} GB needed" >&2
             echo "       AND swap headroom is ${swapfree} MB. That pairing is the" >&2
             echo "       state the 2026-08-14 vLLM arm OOM'd in." >&2
@@ -152,7 +159,21 @@ arm_is_valid() {
     # This one DOES need the fallback: `curl && echo 1` prints nothing on
     # failure, and an empty string is not "1" only by accident. Say 0 outright.
     alive=$(curl -s -m 5 "$url" >/dev/null 2>&1 && echo 1 || echo 0)
-    echo "── validity: server_errors=${dead} client_unreachable=${unreach} alive_at_end=${alive}"
+    # PER-REQUEST failures, which this gate did NOT check until an arm returned
+    # 22 HTTP 500s out of 32 and was still stamped VALID (2026-08-15, pie
+    # strategy B). The three checks above ask "did the server die?"; none asks
+    # "did the requests work?". A server that stays up and refuses most of the
+    # traffic is not a valid arm either, and its surviving throughput number is
+    # a survivorship artifact -- exactly what this gate exists to prevent, in
+    # the one shape it did not cover.
+    local reqfail
+    reqfail=$(grep -acE "HTTPError|HTTP Error [45][0-9][0-9]" "$clog" 2>/dev/null)
+    echo "── validity: server_errors=${dead} client_unreachable=${unreach} alive_at_end=${alive} request_failures=${reqfail}"
+    if [ "$reqfail" != "0" ]; then
+        echo "!!! ARM VOID — requests failed. A throughput number computed from" >&2
+        echo "    the survivors measures the survivors, not the engine." >&2
+        return 1
+    fi
     if [ "$dead" != "0" ] || [ "$unreach" != "0" ] || [ "$alive" != "1" ]; then
         echo "!!! ARM VOID — the server died or was unreachable. These numbers are" >&2
         echo "    not a model result and must not be reported as one." >&2

@@ -456,3 +456,46 @@ been moving.
 
 For the MoE half there is nothing to do: pie's `affine_qmm_t_routed` measures
 ~215 ms per fire against MLX `gather_qmm`'s 242 ms sorted. Already level.
+
+---
+
+## 9. Re-measured 2026-08-15 on a genuinely clean machine
+
+The earlier run was taken while a stuck `pie run` job held 12.6 GB. This one is
+after killing it, with `roofline_probe`'s streaming roof at **296.4 GB/s**
+against the 69.8 it read while contended, and with the pie binary rebuilt so it
+contains this session's scheduler fixes rather than Aug 14 code.
+
+| engine | completed | output tok/s | wall | p50 latency |
+|---|---:|---:|---:|---:|
+| vLLM-metal | 32/32 | **206.8** | 19.8 s | 4.95 s |
+| mlx-lm 0.31.3 | 32/32 | **205.1** | 20.0 s | 4.99 s |
+| **pie strategy A** | **32/32** | **83.6** | 49.0 s | 12.17 s |
+| pie strategy B | 10/32 | — | — | — |
+
+**pie strategy A is 2.47x behind**, and the figure is stable: 83.6 here against
+88.2 before, on a different machine state and a rebuilt binary.
+
+**It confirms the serialization diagnosis.** 83.6 tok/s over 8 streams is 95.7
+ms per token per stream. `results-throughput-cause.md` predicted ~106 ms if pie
+serializes concurrent decodes and ~33 ms for eight tokens if it batches them.
+95.7 is 10% off the serialized prediction and nowhere near the batched one. The
+ceiling asserted in `LaunchGrouping` is the one being measured.
+
+### Strategy B failed, and the gate said VALID
+
+10 of 32 completed; 22 returned HTTP 500. Its 67.8 tok/s is not reported, for
+the reason pie had no number at all in §6b: a throughput figure computed from
+survivors measures the survivors.
+
+Strategy B is a session-per-conversation mode and 8-way independent traffic is
+not what it is for, so failing is defensible. **Failing with 500 is not** --
+`chat-completions`'s own wire discipline reserves 5xx for genuine faults
+precisely because opencode retries them without bound.
+
+**The gate missed it.** `arm_is_valid` asked three questions -- OOM in the
+server log, client unreachable, alive at the end -- and all three passed,
+because the server WAS alive and healthy and simply refused most of the
+traffic. None asked whether the requests worked. Now fixed. Third calibration
+correction that function has needed, and the pattern is identical each time: a
+check written against the last failure does not anticipate the next one.
