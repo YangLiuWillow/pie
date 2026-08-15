@@ -430,6 +430,43 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Whole-kernel walk over a real context. Memory-bound, so it needs a quiet
+    // machine; the tile sweep above is compute-bound and does not.
+    {
+        std::string ef;
+        Pso pf = ctx->compile_pso_from_file(dir + "/nax_slice_full.metal",
+                                            "nax_slice_full", &ef);
+        printf("\nFULL-CONTEXT WALK (memory-bound; needs a quiet machine):\n");
+        if (!pf.valid()) printf("  compile failed: %s\n", ef.c_str());
+        else {
+            const int BQ = 64, BK = 64, D = 128, CTX = 7424;
+            const int tgs = 32 * ((184 + BQ - 1) / BQ);
+            SlotHandle q = ctx->heap_alloc(size_t(BQ) * D * 2);
+            SlotHandle k = ctx->heap_alloc(size_t(D) * CTX * 2);
+            SlotHandle o = ctx->heap_alloc(size_t(BQ) * BK * 4);
+            SlotHandle cc = ctx->heap_alloc(sizeof(int));
+            std::memset(q.contents(), 0, size_t(BQ) * D * 2);
+            std::memset(k.contents(), 0, size_t(D) * CTX * 2);
+            *static_cast<int*>(cc.contents()) = CTX;
+            const Kernel kf = Kernel::Sdpa;
+            ctx->arg_bind(kf, 90, 0, q); ctx->arg_bind(kf, 90, 1, k);
+            ctx->arg_bind(kf, 90, 2, o); ctx->arg_bind(kf, 90, 3, cc);
+            ctx->make_resident();
+            LatencyHarness hf(*ctx);
+            auto enf = [&](StepEncoder& se) {
+                se.set_pso(pf); se.set_argtable(kf, 90);
+                se.dispatch(Grid{uint32_t(tgs) * 128u, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            BenchResult rf = hf.time_step("full", enf, 30, 8);
+            const double fl = double(tgs) * (CTX / BK) * 2.0 * BQ * BK * D;
+            printf("  %7.3f ms/layer  %6.2f TFLOP/s   x48 = %6.1f ms\n",
+                   rf.median.gpu_exec_ms,
+                   fl / (rf.median.gpu_exec_ms / 1000.0) / 1e12,
+                   rf.median.gpu_exec_ms * 48.0);
+            printf("  (Q.K^T only. Shipped 8x8 whole pass 6.87; MLX whole pass 1.31)\n");
+        }
+    }
+
     // Tile sweep on the CORRECT kernel. 2.30x failed the stage-1 rule; this
     // asks whether that verdict is about the API or about one tile choice.
     {

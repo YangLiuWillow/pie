@@ -445,7 +445,37 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
-### THE RULE PASSES AFTER ALL — 2.30x was the TILE, not the API
+### WHERE THIS ACTUALLY LANDS: ~1.4 ms projected, against MLX's 1.31
+
+Full-context walk, BQ=64/BK=64, every key read once from device memory:
+
+    Q.K^T over 7424 keys:  0.628 ms/layer   18.61 TFLOP/s   (x48 = 30.1 ms)
+
+Measured on a CONTENDED machine and barely below the cache-resident sweep's
+20.11, because K at 7424x128x2 is 1.9 MB and stays in cache -- so this term is
+compute-bound and the contention that blocked everything else all night does
+not much touch it. If anything the number is pessimistic.
+
+**Projection, and it is a projection:** P.V is the same shape of matmul, so
+~0.63 ms, and softmax measured 10% on the hand-filled kernel. That puts the
+whole pass near **1.4 ms against MLX's 1.31** -- parity, from 6.87 today.
+
+What is NOT measured, and would have to be before anyone believes 1.4:
+
+  * **P.V is not symmetric with Q.K^T.** V is `[key][dim]` where K is used
+    transposed, so its access pattern differs and its rate may not match.
+  * **The softmax fusion is the real unknown.** This walk accumulates straight
+    into one C across all key blocks. Flash attention cannot: it needs the
+    running max and sum between the two matmuls, which is exactly why MLX
+    hand-fills cooperative tensors. Whether the slice API can express that
+    without giving the throughput back is THE open question, and it decides
+    whether 1.4 ms is real or an artifact of measuring the easy half.
+
+So: promising enough to finish, not yet a result. The next session's first job
+is P.V and the fused softmax on this API, with the correctness harness on from
+the start rather than bolted on after three rounds of confident wrong numbers.
+
+### THE RULE PASSES — 2.30x was the TILE, not the API
 
 Recorded after the "fails" section below, which is left standing because the
 reasoning that produced it was right and only its input was wrong.
