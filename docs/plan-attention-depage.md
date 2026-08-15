@@ -445,6 +445,32 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
+### THE LAYOUT WAS QUERYABLE ALL ALONG
+
+`cooperative_tensor::get_multidimensional_index(i)` returns the (row, col) of a
+lane's i-th element. `get_capacity()` returns how many there are. For a 64x64
+destination over `execution_simdgroups<4>`:
+
+    capacity: 32 elements per lane
+    lane   0 -> (r0,c0) (r1,c0) (r2,c0) (r3,c0) (r0,c8) (r1,c8) ...
+    lane   1 -> (r4,c0) (r5,c0) (r6,c0) (r7,c0) (r4,c8) (r5,c8) ...
+    lane   8 -> (r8,c0) (r9,c0) (r10,c0) (r11,c0) (r8,c8) (r9,c8) ...
+
+**Four consecutive rows per lane, columns stepping by 8** -- nothing like the
+2 rows x 4 cols that `BaseNAXFrag` describes and that the hand-filled kernel
+assumed. That is why it was 128/2048 wrong, and no amount of lane-bit algebra
+was going to find it, because MLX's frag layout is not this API's layout.
+
+An evening went into inferring this from the output of a full matmul. It was
+one method call away. **When a layout is opaque, look for the accessor before
+reaching for the microscope.**
+
+And it unblocks the fused kernel specifically. Flash attention rescales O by
+`factor` per ROW on every key block; O at 64x128 floats is 32 KB, too big for
+threadgroup memory, so a memory-backed C costs 32 KB of device traffic per
+block. A cooperative tensor puts O in registers, and the per-row rescale needs
+exactly `get_multidimensional_index(i)[0]`. Both halves are now available.
+
 ### WHERE THIS ACTUALLY LANDS: ~1.4 ms projected, against MLX's 1.31
 
 Full-context walk, BQ=64/BK=64, every key read once from device memory:

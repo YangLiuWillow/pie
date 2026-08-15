@@ -467,6 +467,44 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Ask the API for the cooperative tensor's layout.
+    {
+        std::string ecl;
+        Pso cal = ctx->compile_pso_from_file(dir + "/nax_calibrate.metal",
+                                             "nax_calibrate", &ecl);
+        printf("\nCOOPERATIVE TENSOR LAYOUT (queried, not derived):\n");
+        if (!cal.valid()) printf("  compile failed: %s\n", ecl.c_str());
+        else {
+            const int M = 64, N = 64, K = 128;
+            SlotHandle ah = ctx->heap_alloc(size_t(M) * K * 2);
+            SlotHandle bh = ctx->heap_alloc(size_t(K) * N * 2);
+            SlotHandle oh2 = ctx->heap_alloc(128 * 128 * sizeof(float));
+            std::memset(ah.contents(), 0, size_t(M) * K * 2);
+            std::memset(bh.contents(), 0, size_t(K) * N * 2);
+            std::memset(oh2.contents(), 0, 128 * 128 * 4);
+            const Kernel kc = Kernel::Sdpa;
+            ctx->arg_bind(kc, 100, 0, ah); ctx->arg_bind(kc, 100, 1, bh);
+            ctx->arg_bind(kc, 100, 2, oh2);
+            ctx->make_resident();
+            LatencyHarness hc(*ctx);
+            auto enc3 = [&](StepEncoder& se) {
+                se.set_pso(cal); se.set_argtable(kc, 100);
+                se.dispatch(Grid{128, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            hc.time_step("cal", enc3, 1, 0);
+            const float* g = static_cast<const float*>(oh2.contents());
+            printf("  capacity: %.0f elements per lane (64x64 over 128 threads = 32)\n",
+                   double(g[0]));
+            for (int lane : {0, 1, 8, 32}) {
+                printf("    lane %3d ->", lane);
+                for (int i2 = 0; i2 < 6; ++i2)
+                    printf(" (r%.0f,c%.0f)", double(g[size_t(lane) * 128 + 1 + i2 * 2]),
+                           double(g[size_t(lane) * 128 + 1 + i2 * 2 + 1]));
+                printf(" ...\n");
+            }
+        }
+    }
+
     // P.V: correctness FIRST, then rate. The projection assumed it matches
     // Q.K^T; V's layout differs and N is 128 rather than 64, so it is measured.
     {
