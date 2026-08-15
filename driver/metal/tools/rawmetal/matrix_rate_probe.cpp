@@ -505,6 +505,136 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Isolation: threadgroup DESTINATION alone, everything else verified.
+    {
+        std::string et;
+        Pso tg = ctx->compile_pso_from_file(dir + "/nax_tg_dest.metal", "nax_tg_dest", &et);
+        printf("\nISOLATION — matmul destination in THREADGROUP memory:\n");
+        if (!tg.valid()) printf("  compile failed: %s\n", et.c_str());
+        else {
+            const int BQ = 64, BK = 32, D = 128;
+            auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+            SlotHandle qh = ctx->heap_alloc(size_t(BQ)*D*2), kh = ctx->heap_alloc(size_t(D)*BK*2);
+            SlotHandle sh2 = ctx->heap_alloc(size_t(BQ)*BK*4);
+            auto* qz = static_cast<uint16_t*>(qh.contents());
+            auto* kz = static_cast<uint16_t*>(kh.contents());
+            std::memset(sh2.contents(), 0, size_t(BQ)*BK*4);
+            std::vector<float> qf(size_t(BQ)*D), kf(size_t(BK)*D);
+            for (int r=0;r<BQ;++r) for (int d=0;d<D;++d) {
+                qf[size_t(r)*D+d]=float((r+2*d)%7)*0.25f; qz[size_t(r)*D+d]=bf(qf[size_t(r)*D+d]); }
+            for (int c=0;c<BK;++c) for (int d=0;d<D;++d) {
+                kf[size_t(c)*D+d]=float((3*c+d)%5)*0.5f; kz[size_t(d)*BK+c]=bf(kf[size_t(c)*D+d]); }
+            const Kernel kt = Kernel::Sdpa;
+            ctx->arg_bind(kt,120,0,qh); ctx->arg_bind(kt,120,1,kh); ctx->arg_bind(kt,120,2,sh2);
+            ctx->make_resident();
+            LatencyHarness ht(*ctx);
+            auto ent = [&](StepEncoder& se){ se.set_pso(tg); se.set_argtable(kt,120);
+                se.dispatch(Grid{128,1,1}, Threadgroup{128,1,1}); };
+            ht.time_step("tgdest", ent, 1, 0);
+            const float* g = static_cast<const float*>(sh2.contents());
+            int bt=0; for (int r=0;r<BQ;++r) for (int c=0;c<BK;++c) {
+                double ref=0; for (int d=0;d<D;++d) ref+=double(qf[size_t(r)*D+d])*double(kf[size_t(c)*D+d]);
+                if (std::abs(g[size_t(r)*BK+c]-ref)/(std::abs(ref)+1e-6) > 1e-2) ++bt; }
+            printf("  %d of %d wrong%s\n", bt, BQ*BK,
+                   bt==0 ? "  — threadgroup destination is FINE; fault is the cooperative O"
+                         : "  — THREADGROUP DESTINATION is the fault");
+        }
+    }
+
+    // The fused kernel: does it compile, is it right, and what does it cost?
+    {
+        std::string ef2;
+        // mi[0] IS the row: the swapped variant was tested, is worse, and
+        // indexes row_fac[0..63] with a column up to 127 -- an out-of-bounds
+        // write that HUNG THE GPU CONTEXT. Removed rather than left loaded.
+        Pso fl = ctx->compile_pso_from_file(dir + "/nax_flash.metal", "nax_flash", &ef2);
+        printf("\nFUSED FLASH ATTENTION (slice API + cooperative O):\n");
+        if (!fl.valid()) printf("  compile failed: %s\n", ef2.c_str());
+        else {
+            const int BQ = 64, D = 128, CTX = 256;   // 4 key blocks: the online
+            auto bf = [](float f) {                   // softmax must actually run
+                uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+            SlotHandle qh = ctx->heap_alloc(size_t(BQ) * D * 2);
+            SlotHandle kh = ctx->heap_alloc(size_t(D) * CTX * 2);
+            SlotHandle vh = ctx->heap_alloc(size_t(CTX) * D * 2);
+            SlotHandle oh3 = ctx->heap_alloc(size_t(BQ) * D * 4);
+            SlotHandle ch = ctx->heap_alloc(sizeof(int));
+            auto* qz = static_cast<uint16_t*>(qh.contents());
+            auto* kz = static_cast<uint16_t*>(kh.contents());
+            auto* vz = static_cast<uint16_t*>(vh.contents());
+            std::memset(oh3.contents(), 0, size_t(BQ) * D * 4);
+            *static_cast<int*>(ch.contents()) = CTX;
+            std::vector<float> qf(size_t(BQ)*D), kf(size_t(CTX)*D), vf(size_t(CTX)*D);
+            // Small magnitudes: softmax over 256 keys, so keep exponents tame.
+            for (int r = 0; r < BQ; ++r)
+              for (int d = 0; d < D; ++d) {
+                qf[size_t(r)*D+d] = float((r + d) % 5) * 0.125f;
+                qz[size_t(r)*D+d] = bf(qf[size_t(r)*D+d]);
+              }
+            for (int c = 0; c < CTX; ++c)
+              for (int d = 0; d < D; ++d) {
+                kf[size_t(c)*D+d] = float((c + 2*d) % 4) * 0.125f;
+                vf[size_t(c)*D+d] = float((3*c + d) % 6) * 0.25f;
+                kz[size_t(d)*CTX+c] = bf(kf[size_t(c)*D+d]);   // K transposed
+                vz[size_t(c)*D+d]  = bf(vf[size_t(c)*D+d]);
+              }
+            const Kernel kfl = Kernel::Sdpa;
+            ctx->arg_bind(kfl, 110, 0, qh); ctx->arg_bind(kfl, 110, 1, kh);
+            ctx->arg_bind(kfl, 110, 2, vh); ctx->arg_bind(kfl, 110, 3, oh3);
+            ctx->arg_bind(kfl, 110, 4, ch);
+            ctx->make_resident();
+            LatencyHarness hfl(*ctx);
+            auto enfl = [&](StepEncoder& se) {
+                se.set_pso(fl); se.set_argtable(kfl, 110);
+                se.dispatch(Grid{128, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            hfl.time_step("flash", enfl, 1, 0);
+            const float* og = static_cast<const float*>(oh3.contents());
+            int badf = 0; double worstf = 0;
+            for (int r = 0; r < BQ; ++r) {
+                std::vector<double> sc(CTX);
+                double mx = -1e30;
+                for (int c = 0; c < CTX; ++c) {
+                    double a2 = 0;
+                    for (int d = 0; d < D; ++d) a2 += double(qf[size_t(r)*D+d]) * double(kf[size_t(c)*D+d]);
+                    sc[c] = a2; if (a2 > mx) mx = a2;
+                }
+                double sm = 0;
+                for (int c = 0; c < CTX; ++c) { sc[c] = std::exp(sc[c] - mx); sm += sc[c]; }
+                for (int d = 0; d < D; ++d) {
+                    double ref = 0;
+                    for (int c = 0; c < CTX; ++c) ref += sc[c] * double(vf[size_t(c)*D+d]);
+                    ref /= sm;
+                    const double e = std::abs(og[size_t(r)*D+d] - ref) / (std::abs(ref) + 1e-6);
+                    if (e > 2e-2) { ++badf; worstf = e > worstf ? e : worstf; }
+                }
+            }
+            printf("  index order (row=mi[0]): %d of %d wrong\n", badf, BQ * D);
+            if (badf == 0) printf("  — CORRECT FULL ATTENTION\n");
+            if (badf) printf("  worst relative %.4f\n", worstf);
+            if (badf == 0) {
+                const int C2 = 7424, tgs = 32 * ((184 + BQ - 1) / BQ);
+                SlotHandle k2 = ctx->heap_alloc(size_t(D) * C2 * 2);
+                SlotHandle v2 = ctx->heap_alloc(size_t(C2) * D * 2);
+                std::memset(k2.contents(), 0, size_t(D) * C2 * 2);
+                std::memset(v2.contents(), 0, size_t(C2) * D * 2);
+                *static_cast<int*>(ch.contents()) = C2;
+                ctx->arg_bind(kfl, 111, 0, qh); ctx->arg_bind(kfl, 111, 1, k2);
+                ctx->arg_bind(kfl, 111, 2, v2); ctx->arg_bind(kfl, 111, 3, oh3);
+                ctx->arg_bind(kfl, 111, 4, ch);
+                ctx->make_resident();
+                auto enr2 = [&](StepEncoder& se) {
+                    se.set_pso(fl); se.set_argtable(kfl, 111);
+                    se.dispatch(Grid{uint32_t(tgs)*128u, 1, 1}, Threadgroup{128, 1, 1});
+                };
+                BenchResult rf2 = hfl.time_step("flash-rate", enr2, 30, 8);
+                printf("  WHOLE PASS: %7.3f ms/layer   x48 = %6.1f ms\n",
+                       rf2.median.gpu_exec_ms, rf2.median.gpu_exec_ms * 48.0);
+                printf("  shipped 8x8: 6.87 ms/layer.  MLX: 1.31.\n");
+            }
+        }
+    }
+
     // P.V: correctness FIRST, then rate. The projection assumed it matches
     // Q.K^T; V's layout differs and N is 128 rather than 64, so it is measured.
     {

@@ -445,6 +445,39 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
+### FUSED KERNEL: compiles, runs, WRONG — and the fault is isolated
+
+    7780 of 8192 wrong, worst relative 95.06
+
+Two new things went in together, so the first job was separating them:
+
+  * **matmul destination in THREADGROUP memory** -- isolated with
+    `nax_tg_dest.metal`, identical to the verified Q.K^T kernel except C is a
+    threadgroup tensor. **0 of 2048 wrong. Not the fault.**
+  * **O as a 64x128 cooperative tensor across key blocks** -- by elimination,
+    this is the fault.
+
+**`mi[0]` IS the row.** The swapped reading was tested and is worse (8192/8192)
+AND it indexes `row_fac[0..63]` with a column index up to 127 -- an
+out-of-bounds threadgroup write that HUNG THE GPU CONTEXT
+(`the GPU did not reach event 544 within 60000 ms`). The variant is deleted
+rather than left in the tree. Do not re-test it; bound-check any index derived
+from `get_multidimensional_index` before using it, because the failure mode is
+a device hang, not a wrong number.
+
+**Remaining suspects, in order:**
+  1. the cooperative tensor may not survive across multiple `run()` calls the
+     way the code assumes -- it is re-derived per call in MLX's usage, never
+     carried across a loop;
+  2. `get_capacity()` for a 64x128 destination is 64 elements a lane, twice the
+     calibrated 64x64 case, and the layout was only ever PRINTED for 64x64;
+  3. the read-modify-write of `ct_o[i] *= ...` between two `run()` calls may not
+     be a supported interleaving.
+
+**Isolate them the same way:** a kernel that runs P.V twice into one
+cooperative O with no softmax between, checked against a doubled reference. If
+that is wrong, suspect 1 or 3; if right, the softmax path is the fault.
+
 ### THE LAYOUT WAS QUERYABLE ALL ALONG
 
 `cooperative_tensor::get_multidimensional_index(i)` returns the (row, col) of a
