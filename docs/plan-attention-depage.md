@@ -445,7 +445,45 @@ dimension. The contraction length is right; where it starts is not.
 Measured 1163 of 2048 wrong against the current mapping's 128 -- much worse, so
 the two-fragment read-back is closer to right and the fault is elsewhere.
 
-### THE APPROACH IS WRONG, not just the indices
+### RESOLVED — and the decision rule now FAILS
+
+A correct NAX Q.K^T exists, on the documented tensor-slice API:
+
+    correctness: 0 of 2048 wrong, first try
+    rate:        12.59 TFLOP/s at matched occupancy (96 threadgroups)
+                 = 2.30x the simdgroup ceiling
+
+**The stage-1 rule was `>= 3x, else stop and re-plan`. The correct kernel is
+2.30x. The rule fails.**
+
+The 3.05x that passed it came from the hand-filled cooperative-tensor kernel,
+which computes the wrong thing. Its 16.7 TFLOP/s is not a target and must not
+be quoted as one -- correctness costs ~25% here, and that is the real number.
+
+Redone at 2.30x:
+
+    multiply  3.38 / 2.30 = 1.47 ms   (not 0.56, not 1.10)
+    staging   ~1.35 ms, still projected and still unmeasured
+    total     ~2.8 ms  against MLX's 1.31   ->  ~2.1x behind
+
+So the honest expectation for a NAX attention kernel is **6.87 -> ~2.8 ms, a
+2.4x win on attention and not parity** -- and that is before any of the staging
+number is verified.
+
+**What "stop and re-plan" should mean here, stated for whoever picks this up.**
+Not abandonment: a measured 2.4x on the largest single term in prefill is worth
+having, and the correctness harness plus a working slice-API matmul are most of
+the remaining risk retired. But the case can no longer be made on "the neural
+accelerators are 6x". It has to be made on 2.4x against the cost of a kernel
+rewrite, and that is a call for whoever owns the roadmap, not one to be made by
+continuing to code.
+
+Three things would sharpen it, cheapest first: measure the staging half on a
+quiet machine (queued); check whether `execution_simdgroups<4>` over a larger
+BQ recovers rate; and price what fusing softmax costs on this API, since that
+is the one place MLX's harder path might be forced.
+
+### The earlier dead end, kept because the reasoning is reusable
 
 Read from the real header,
 `/System/Library/Frameworks/MetalPerformancePrimitives.framework/Versions/A/Headers/MPPTensorOpsMatMul2d.h`

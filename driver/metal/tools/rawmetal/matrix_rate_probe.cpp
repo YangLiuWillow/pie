@@ -384,7 +384,9 @@ int main(int argc, char** argv) {
               }
             const Kernel ks = Kernel::Sdpa;
             ctx->arg_bind(ks, 60, 0, qh); ctx->arg_bind(ks, 60, 1, kh);
-            ctx->arg_bind(ks, 60, 2, sh);
+            SlotHandle rh = ctx->heap_alloc(sizeof(int));
+            *static_cast<int*>(rh.contents()) = 1;
+            ctx->arg_bind(ks, 60, 2, sh); ctx->arg_bind(ks, 60, 3, rh);
             ctx->make_resident();
             LatencyHarness hs(*ctx);
             auto es2 = [&](StepEncoder& se) {
@@ -406,6 +408,25 @@ int main(int argc, char** argv) {
             printf("  correctness: %d of %d scores wrong%s\n", bad2, BQ * BK,
                    bad2 == 0 ? "  — CORRECT" : "");
             if (bad2) printf("  worst relative error %.3f (extent order is the first suspect)\n", worst2);
+            // Is the CORRECT form also fast? A hollow win otherwise.
+            const int kReps = 232;   // one full 7424-key context at BK=32
+            const int kTgs = 96;     // 32 heads x 3 row-tiles, as the other arms
+            *static_cast<int*>(rh.contents()) = kReps;
+            // ONE THREADGROUP LEAVES THE GPU 99% IDLE. The first version of
+            // this measurement dispatched 128 threads against the other arms'
+            // 96 threadgroups and reported 0.26 TFLOP/s -- 64x slower than the
+            // hand-filled form, which would have been a machine-occupancy
+            // artifact reported as an API difference.
+            auto er = [&](StepEncoder& se) {
+                se.set_pso(sl); se.set_argtable(ks, 60);
+                se.dispatch(Grid{uint32_t(kTgs) * 128u, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            BenchResult rr = hs.time_step("slice-rate", er, 40, 10);
+            const double flr = double(kTgs) * kReps * 2.0 * BQ * BK * D;
+            const double tfr = flr / (rr.median.gpu_exec_ms / 1000.0) / 1e12;
+            printf("  rate: %.3f ms, %d tgs x %d reps  ->  %.2f TFLOP/s  (%.2fx simdgroup;\n",
+                   rr.median.gpu_exec_ms, kTgs, kReps, tfr, tfr / s);
+            printf("        hand-filled cooperative-tensor form got 16.7)\n");
         }
     }
 

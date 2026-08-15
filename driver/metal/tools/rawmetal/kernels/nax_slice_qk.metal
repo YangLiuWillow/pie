@@ -13,6 +13,7 @@ kernel void nax_slice_qk(
     device bfloat* qp [[buffer(0)]],
     device bfloat* kp [[buffer(1)]],
     device float* sp        [[buffer(2)]],
+    const constant int& reps [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]) {
   constexpr int BQ = 64, BK = 32, D = 128;
 
@@ -31,5 +32,11 @@ kernel void nax_slice_qk(
       mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
 
-  op.run(A, B, C);
+  // `reps` is 1 for the correctness run and large for the rate run. Repeating
+  // the SAME op is a compute-bound measurement -- the operands stay resident,
+  // so it prices the instruction path and not the memory system, which is the
+  // only thing measurable while the machine is contended.
+  for (int i = 0; i < reps; ++i) {
+    op.run(A, B, C);
+  }
 }
