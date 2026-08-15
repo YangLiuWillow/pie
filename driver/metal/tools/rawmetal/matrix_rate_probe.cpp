@@ -351,6 +351,64 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Does the documented tensor-slice form even compile here?
+    {
+        std::string es;
+        Pso sl = ctx->compile_pso_from_file(dir + "/nax_slice_qk.metal",
+                                            "nax_slice_qk", &es);
+        printf("\nTENSOR-SLICE API (the documented form): %s\n",
+               sl.valid() ? "COMPILES" : "does not compile");
+        if (!sl.valid()) printf("  %s\n", es.c_str());
+        else {
+            // The payoff: S comes back as plain row-major [BQ][BK]. There is no
+            // lane mapping to get wrong, which is the entire reason to prefer
+            // this form over hand-filled cooperative tensors.
+            const int BQ = 64, BK = 32, D = 128;
+            auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+            SlotHandle qh = ctx->heap_alloc(size_t(BQ) * D * 2);
+            SlotHandle kh = ctx->heap_alloc(size_t(D) * BK * 2);
+            SlotHandle sh = ctx->heap_alloc(size_t(BQ) * BK * sizeof(float));
+            auto* qq = static_cast<uint16_t*>(qh.contents());
+            auto* kk2 = static_cast<uint16_t*>(kh.contents());
+            std::memset(sh.contents(), 0, size_t(BQ) * BK * 4);
+            std::vector<float> qf2(size_t(BQ) * D), kf2(size_t(BK) * D);
+            for (int r = 0; r < BQ; ++r)
+              for (int d = 0; d < D; ++d) {
+                qf2[size_t(r) * D + d] = float((r + 2 * d) % 7) * 0.25f;
+                qq[size_t(r) * D + d] = bf(qf2[size_t(r) * D + d]);
+              }
+            for (int cc = 0; cc < BK; ++cc)
+              for (int d = 0; d < D; ++d) {
+                kf2[size_t(cc) * D + d] = float((3 * cc + d) % 5) * 0.5f;
+                kk2[size_t(d) * BK + cc] = bf(kf2[size_t(cc) * D + d]);   // K^T
+              }
+            const Kernel ks = Kernel::Sdpa;
+            ctx->arg_bind(ks, 60, 0, qh); ctx->arg_bind(ks, 60, 1, kh);
+            ctx->arg_bind(ks, 60, 2, sh);
+            ctx->make_resident();
+            LatencyHarness hs(*ctx);
+            auto es2 = [&](StepEncoder& se) {
+                se.set_pso(sl); se.set_argtable(ks, 60);
+                se.dispatch(Grid{128, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            hs.time_step("slice", es2, 1, 0);
+            const float* sg = static_cast<const float*>(sh.contents());
+            int bad2 = 0; double worst2 = 0;
+            for (int r = 0; r < BQ; ++r)
+              for (int cc = 0; cc < BK; ++cc) {
+                double ref = 0;
+                for (int d = 0; d < D; ++d)
+                    ref += double(qf2[size_t(r) * D + d]) * double(kf2[size_t(cc) * D + d]);
+                const double g = sg[size_t(r) * BK + cc];
+                const double e = std::abs(g - ref) / (std::abs(ref) + 1e-6);
+                if (e > 1e-2) { ++bad2; worst2 = e > worst2 ? e : worst2; }
+              }
+            printf("  correctness: %d of %d scores wrong%s\n", bad2, BQ * BK,
+                   bad2 == 0 ? "  — CORRECT" : "");
+            if (bad2) printf("  worst relative error %.3f (extent order is the first suspect)\n", worst2);
+        }
+    }
+
     // ── WHICH lane layout? A one-hot probe that NAMES it. ──
     //
     // K is an identity (K[c][d] = 1 iff d == c), so S[row][col] must equal
