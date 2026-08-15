@@ -622,6 +622,21 @@ impl Instruct for QwenInstruct {
 /// Unparseable values degrade to the raw string rather than dropping the call,
 /// which is also what the reference does: a tool call with one odd argument is
 /// worth more to an agent than no call at all.
+/// Whether a captured `<parameter=...>` name could plausibly be one.
+///
+/// A blocklist rather than an allowlist, deliberately: tool schemas are written
+/// by whoever ships the tool, and a stricter rule than the defect requires
+/// would silently refuse valid calls. These are the characters that only appear
+/// when the name scan has run past its parameter and into the document --
+/// whitespace, quotes, and the angle brackets and `=` of the markup itself.
+fn is_plausible_param_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '<' | '>' | '=' | '"' | '\'')
+        })
+}
+
 fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
     let gt = body.find('>')?;
     let name = body[..gt].trim().to_string();
@@ -653,6 +668,24 @@ fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, 
         let after = &tail[open + "<parameter=".len()..];
         let Some(gt) = after.find('>') else { break };
         let pname = after[..gt].trim().to_string();
+        // The scan above is unbounded: it takes everything up to the next `>`
+        // ANYWHERE in the document. When the model writes `<parameter=command=`
+        // and forgets the `>`, the next `>` is the redirect in `2>/dev/null`,
+        // and the name becomes ninety characters of shell. Captured live by
+        // upstream `dev-sslee` on django__django-10914 turn 1; reproduced
+        // against this parser, which emitted
+        //
+        //     {"command=\nfind /testbed ... 2": "/dev/null | head -20"}
+        //
+        // with no error at all, so the agent executed nothing useful and had no
+        // way to know why.
+        //
+        // The screen is on the NAME only. A redirect inside a parameter VALUE
+        // is ordinary shell and must still parse -- there is a test for exactly
+        // that, so this cannot be mistaken for a fix that rejects shell syntax.
+        if !is_plausible_param_name(&pname) {
+            return None;
+        }
         let vstart = &after[gt + 1..];
         // An unterminated parameter is a truncated generation, not a parse
         // failure: take the rest and let the caller decide.
@@ -1219,5 +1252,50 @@ mod tests {
             }
             other => panic!("expected Call, got {:?}", other),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod parameter_name_screen {
+    use super::*;
+
+    /// Captured live by upstream `dev-sslee` on django__django-10914 turn 1 and
+    /// reproduced against this parser before the fix, which emitted a call whose
+    /// argument KEY was ninety characters of shell text and whose VALUE was
+    /// `/dev/null | head -20` -- silently.
+    #[test]
+    fn a_parameter_name_that_swallowed_a_shell_redirect_is_refused() {
+        let live = concat!(
+            "read>\n",
+            "<parameter=command=\n",
+            "find /testbed -type f -name \"*.py\" | xargs grep -l \"FILE_UPLOAD_PERMISSION\" 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        assert_eq!(parse_coder_function_call(live, &[]), None);
+    }
+
+    /// THE GUARD ON THE GUARD. The same redirect inside a parameter VALUE is
+    /// ordinary shell and must still parse. Without this test the fix above
+    /// could be "reject anything containing a redirect" and look correct.
+    #[test]
+    fn a_redirect_inside_a_parameter_value_still_parses() {
+        let ok = concat!(
+            "bash>\n",
+            "<parameter=command>\n",
+            "grep -l FOO /testbed 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        let (name, args) = parse_coder_function_call(ok, &[]).expect("must parse");
+        assert_eq!(name, "bash");
+        assert!(args.contains("2>/dev/null"), "redirect lost from the value: {args}");
+        assert!(args.contains("\"command\""), "wrong key: {args}");
+    }
+
+    /// An empty name was the only thing upstream's older check caught, and this
+    /// parser did not even have that.
+    #[test]
+    fn an_empty_parameter_name_is_refused() {
+        assert_eq!(parse_coder_function_call("read>\n<parameter=>\nx\n</parameter>\n</function>", &[]), None);
     }
 }
