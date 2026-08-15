@@ -6874,6 +6874,57 @@ mod tests {
             "host-derived custom and causal fires should co-batch"
         );
 
+        // THE THROUGHPUT CEILING, asserted rather than inferred.
+        //
+        // `pipeline/fire.rs` sets `device_resolved_geometry = decode_envelope
+        // .is_some()`, so EVERY decode fire carries it, and the Metal driver
+        // supports at most one such program per batch
+        // (`driver/metal/src/context.cpp`: "N device-geometry programs in one
+        // batch (at most one is supported)"). Two concurrent decodes therefore
+        // cannot share a fire, and the engine serves N concurrent streams by
+        // serializing N decode fires.
+        //
+        // That is the whole of pie's 88.2 tok/s against vLLM's 206.9 at 8
+        // concurrent: the cost model in results-speculation.md predicts ~106 ms
+        // per token per stream serialized and ~33 ms for eight tokens batched,
+        // and 90 ms was measured.
+        //
+        // Neither mask is set here: this is the PLAIN case, two ordinary decode
+        // fires from two concurrent requests, which is what the harness sends.
+        let mut decode_a = dummy_launch_request(ProcessId::new_v4(), 30);
+        decode_a.request.device_resolved_geometry = true;
+        let mut decode_b = dummy_launch_request(ProcessId::new_v4(), 31);
+        decode_b.request.device_resolved_geometry = true;
+        let mut concurrent = LaunchGrouping::default();
+        assert!(
+            concurrent.accepts(&decode_a, limits, 16),
+            "the first decode of a wave must be admitted"
+        );
+        concurrent.push(&decode_a, limits, 16);
+        assert!(
+            !concurrent.accepts(&decode_b, limits, 16),
+            "two concurrent decode fires MUST NOT co-batch -- the driver allows \
+             at most one device-geometry program per batch. If this assertion \
+             ever starts failing, the ceiling described in \
+             integrations/opencode/results-throughput-cause.md has moved and \
+             that document needs re-measuring, not deleting."
+        );
+
+        // THE CONTROL. Without it the assertion above passes if `accepts`
+        // refuses for ANY reason -- a full batch, a token limit, anything --
+        // and would look like proof of a ceiling that was not there. Two
+        // requests identical but for the device-geometry flag must co-batch.
+        let plain_a = dummy_launch_request(ProcessId::new_v4(), 32);
+        let plain_b = dummy_launch_request(ProcessId::new_v4(), 33);
+        let mut plain_group = LaunchGrouping::default();
+        assert!(plain_group.accepts(&plain_a, limits, 16));
+        plain_group.push(&plain_a, limits, 16);
+        assert!(
+            plain_group.accepts(&plain_b, limits, 16),
+            "two fires WITHOUT device geometry must co-batch; if they do not, \
+             the assertion above proves nothing about device geometry"
+        );
+
         let mut dense = dummy_launch_request(ProcessId::new_v4(), 3);
         dense.request.has_user_mask = true;
         dense.request.device_resolved_geometry = true;

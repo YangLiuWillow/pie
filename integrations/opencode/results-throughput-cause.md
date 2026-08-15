@@ -78,6 +78,48 @@ lengths, where the KV term takes over, it would not.
 existing kernel was written for) and it is what concurrent batching needs. One
 kernel, two payoffs, and speculation is already implemented and waiting on it.
 
+## CONFIRMED, without a GPU
+
+The serialization claim is structural, so it does not need a serving run to
+test — it needs an assertion. `runtime/engine/src/scheduler/worker.rs` now
+carries one:
+
+```
+two concurrent decode fires MUST NOT co-batch
+```
+
+with the control that makes it mean something: two requests identical but for
+the `device_resolved_geometry` flag DO co-batch. Without that control the
+assertion passes whenever `accepts()` refuses for any reason at all — a full
+batch, a token limit — and would look like proof of a ceiling that was not
+there.
+
+Both pass. **Two concurrent decodes cannot share a fire; two ordinary fires
+can.** The ceiling is where the source trace said it was.
+
+The benchmark confirmation is still owed: `require_quiet_gpu` refuses a 30B
+serving run at 12.7 GB free against ~20 needed, with `pie-boN` holding 14.2 GB.
+What that run would add is the 15% the cost model does not explain (90 ms
+measured against 106 ms predicted), not the ceiling itself.
+
+## Found while confirming: `scheduler::worker` tests are flaky
+
+Not related to the throughput work, and worth someone's attention.
+
+    without any change: 3 of 5 full-module runs FAILED
+    with the assertion added: 1 of 5 FAILED
+
+So the assertion is not the cause — the module is flaky at roughly 40% on a
+full run. Two tests account for it, both concurrency-shaped by name:
+
+  * `two_pipelines_coalesce_into_one_wave`
+  * `close_defers_slot_retirement_until_outstanding_completion_drops`
+
+Each failed once in six runs. This matters beyond tidiness: a suite that fails
+40% of the time cannot gate anything, and the natural response to a red run is
+to re-run it until it is green — which is how a real regression gets waved
+through.
+
 ## What this does NOT say
 
 No new measurement was taken; this is arithmetic over existing probe data plus
