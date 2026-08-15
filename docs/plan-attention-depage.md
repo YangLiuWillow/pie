@@ -548,10 +548,18 @@ Full-context walk, BQ=64/BK=64, every key read once from device memory:
 
     Q.K^T over 7424 keys:  0.628 ms/layer   18.61 TFLOP/s   (x48 = 30.1 ms)
 
-Measured on a CONTENDED machine and barely below the cache-resident sweep's
-20.11, because K at 7424x128x2 is 1.9 MB and stays in cache -- so this term is
-compute-bound and the contention that blocked everything else all night does
-not much touch it. If anything the number is pessimistic.
+**RE-MEASURED ON A CLEAN MACHINE** once `pie-boN` went idle and
+`roofline_probe`'s streaming roof recovered to 296.2 GB/s from the 69.8 it read
+all night:
+
+    Q.K^T   0.618 ms/layer   (contended: 0.628)
+    P.V     0.758 ms/layer   (contended: 0.710)
+    sum     1.376 ms         (contended: 1.338)
+
+Within noise of the contended figures, which CONFIRMS the reasoning given for
+quoting them at the time: K at 7424x128x2 is 1.9 MB and stays in cache, so this
+term is compute-bound and DRAM contention barely touches it. The caveat is
+retired rather than merely restated.
 
 **Projection, and it is a projection:** P.V is the same shape of matmul, so
 ~0.63 ms, and softmax measured 10% on the hand-filled kernel. That puts the
