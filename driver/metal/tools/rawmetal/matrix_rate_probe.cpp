@@ -467,6 +467,82 @@ int main(int argc, char** argv) {
         }
     }
 
+    // P.V: correctness FIRST, then rate. The projection assumed it matches
+    // Q.K^T; V's layout differs and N is 128 rather than 64, so it is measured.
+    {
+        std::string ep;
+        Pso pv = ctx->compile_pso_from_file(dir + "/nax_slice_pv.metal",
+                                            "nax_slice_pv", &ep);
+        printf("\nP.V on the slice API:\n");
+        if (!pv.valid()) printf("  compile failed: %s\n", ep.c_str());
+        else {
+            const int BQ = 64, BK = 64, D = 128;
+            auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+            // Correctness over ONE key block, exact-in-bf16 values.
+            SlotHandle ph = ctx->heap_alloc(size_t(BQ) * BK * 2);
+            SlotHandle vh = ctx->heap_alloc(size_t(BK) * D * 2);
+            SlotHandle oh = ctx->heap_alloc(size_t(BQ) * D * 4);
+            SlotHandle ch = ctx->heap_alloc(sizeof(int));
+            auto* pq = static_cast<uint16_t*>(ph.contents());
+            auto* vq = static_cast<uint16_t*>(vh.contents());
+            std::memset(oh.contents(), 0, size_t(BQ) * D * 4);
+            *static_cast<int*>(ch.contents()) = BK;
+            std::vector<float> pf(size_t(BQ) * BK), vf(size_t(BK) * D);
+            for (int r = 0; r < BQ; ++r)
+              for (int c2 = 0; c2 < BK; ++c2) {
+                pf[size_t(r) * BK + c2] = float((r + c2) % 5) * 0.25f;
+                pq[size_t(r) * BK + c2] = bf(pf[size_t(r) * BK + c2]);
+              }
+            for (int c2 = 0; c2 < BK; ++c2)
+              for (int d = 0; d < D; ++d) {
+                vf[size_t(c2) * D + d] = float((2 * c2 + d) % 7) * 0.5f;
+                vq[size_t(c2) * D + d] = bf(vf[size_t(c2) * D + d]);
+              }
+            const Kernel kp2 = Kernel::Sdpa;
+            ctx->arg_bind(kp2, 95, 0, ph); ctx->arg_bind(kp2, 95, 1, vh);
+            ctx->arg_bind(kp2, 95, 2, oh); ctx->arg_bind(kp2, 95, 3, ch);
+            ctx->make_resident();
+            LatencyHarness hp(*ctx);
+            auto enp = [&](StepEncoder& se) {
+                se.set_pso(pv); se.set_argtable(kp2, 95);
+                se.dispatch(Grid{128, 1, 1}, Threadgroup{128, 1, 1});
+            };
+            hp.time_step("pv-check", enp, 1, 0);
+            const float* og = static_cast<const float*>(oh.contents());
+            int badp = 0; double worstp = 0;
+            for (int r = 0; r < BQ; ++r)
+              for (int d = 0; d < D; ++d) {
+                double ref = 0;
+                for (int c2 = 0; c2 < BK; ++c2)
+                    ref += double(pf[size_t(r) * BK + c2]) * double(vf[size_t(c2) * D + d]);
+                const double e = std::abs(og[size_t(r) * D + d] - ref) / (std::abs(ref) + 1e-6);
+                if (e > 1e-2) { ++badp; worstp = e > worstp ? e : worstp; }
+              }
+            printf("  correctness: %d of %d wrong%s\n", badp, BQ * D,
+                   badp == 0 ? "  — CORRECT" : "");
+            if (badp) printf("  worst relative %.3f\n", worstp);
+            if (badp == 0) {
+                const int CTX = 7424, tgs = 32 * ((184 + BQ - 1) / BQ);
+                SlotHandle vf2 = ctx->heap_alloc(size_t(CTX) * D * 2);
+                std::memset(vf2.contents(), 0, size_t(CTX) * D * 2);
+                *static_cast<int*>(ch.contents()) = CTX;
+                ctx->arg_bind(kp2, 96, 0, ph); ctx->arg_bind(kp2, 96, 1, vf2);
+                ctx->arg_bind(kp2, 96, 2, oh); ctx->arg_bind(kp2, 96, 3, ch);
+                ctx->make_resident();
+                auto enr = [&](StepEncoder& se) {
+                    se.set_pso(pv); se.set_argtable(kp2, 96);
+                    se.dispatch(Grid{uint32_t(tgs) * 128u, 1, 1}, Threadgroup{128, 1, 1});
+                };
+                BenchResult rp = hp.time_step("pv-rate", enr, 30, 8);
+                const double fl = double(tgs) * (CTX / BK) * 2.0 * BQ * D * BK;
+                printf("  full-context rate: %7.3f ms/layer  %6.2f TFLOP/s\n",
+                       rp.median.gpu_exec_ms,
+                       fl / (rp.median.gpu_exec_ms / 1000.0) / 1e12);
+                printf("  (Q.K^T was 0.628 ms at 18.61 TFLOP/s)\n");
+            }
+        }
+    }
+
     // Tile sweep on the CORRECT kernel. 2.30x failed the stage-1 rule; this
     // asks whether that verdict is about the API or about one tile choice.
     {
