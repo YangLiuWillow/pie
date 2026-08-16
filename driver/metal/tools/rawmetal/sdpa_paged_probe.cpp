@@ -848,6 +848,28 @@ int main(int argc, char** argv) {
                    t12, base12 > 0 ? t12 / base12 : 1.0,
                    t16, base16 > 0 ? t16 / base16 : 1.0, t12 * 48.0);
         }
+        // UNROLL: keys in flight per simdgroup iteration. Decode attention is
+        // LATENCY-bound, not bandwidth-bound -- on unique bytes it reaches
+        // 18-26% of the 296 GB/s roof, and the traffic it would need if the
+        // redundant reads were uncached is 121-146% of the roof, which is
+        // impossible. So the lever is overlapping loads, not removing them.
+        printf("\n  UNROLL sweep (keys in flight per simdgroup):\n");
+        for (const int hh : {2, 4}) {
+            for (const int uu : {1, 2, 4}) {
+                char f[80]; snprintf(f, sizeof f, "/sdpa_hshare_h%d_u%d.metal", hh, uu);
+                std::string eu;
+                Pso pu = ctx->compile_pso_from_file(
+                    std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f,
+                    "sdpa_hshare_decode", &eu);
+                if (!pu.valid()) { printf("    QH=%d U=%d compile fail: %s\n", hh, uu, eu.c_str()); continue; }
+                printf("    QH=%d U=%d ", hh, uu);
+                hshare_run(*ctx, pu, hh, 2047, 600 + hh * 8 + uu, true);
+                const double t12 = hshare_run(*ctx, pu, hh, 12287, 640 + hh * 8 + uu, false);
+                const double t16 = hshare_run(*ctx, pu, hh, 16383, 680 + hh * 8 + uu, false);
+                printf("    QH=%d U=%-2d  12k %6.3f ms  16k %6.3f ms  (x48 = %5.1f ms)\n",
+                       hh, uu, t12, t16, t12 * 48.0);
+            }
+        }
         printf("  A decode step's whole attention is the 16k column x48. The\n"
                "  dispatch trace puts attention at 75-77%% of a decode fire at 23k.\n\n");
     }

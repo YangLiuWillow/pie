@@ -48,6 +48,26 @@ using namespace metal;
 #define HEADS 4
 #endif
 
+// Keys in flight per simdgroup iteration.
+//
+// The loop below is a SERIAL dependent chain per key: load K, dot it, reduce
+// across the simdgroup, update the running max and sum, rescale the
+// accumulator, accumulate V. Nothing in it overlaps with anything, so the
+// kernel waits out one memory latency per key.
+//
+// And latency is what it is short of, not bandwidth. On unique bytes it
+// achieves 18-26% of this machine's 296 GB/s roof, while the amplified traffic
+// it would need if the redundant reads were NOT cache-served comes to 121-146%
+// of the roof at QH=1 -- impossible, so they are cached. A kernel that is
+// nowhere near the bandwidth roof and cannot be reading the traffic that would
+// put it there is waiting, not streaming.
+//
+// UNROLL issues that many keys' loads before doing any of their arithmetic, so
+// the loads overlap each other. It costs UNROLL x 8 more registers per lane.
+#ifndef UNROLL
+#define UNROLL 1
+#endif
+
 kernel void sdpa_hshare_decode(
     const device bfloat* queries      [[buffer(0)]],   // [1][n_q_heads][D]
     const device bfloat* k_pages      [[buffer(1)]],
@@ -94,27 +114,43 @@ kernel void sdpa_hshare_decode(
 
   const int q_pos = position_ids[0];
 
-  for (int kp = int(simd_gid); kp <= q_pos; kp += BN) {
-    const int page = int(kv_page_indices[kp / page_size]);
-    const size_t slot = size_t(page) * page_size + size_t(kp % page_size);
-    const device bfloat* kptr =
-        k_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * qk_per_thread;
-    const device bfloat* vptr =
-        v_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * v_per_thread;
+  for (int kp0 = int(simd_gid); kp0 <= q_pos; kp0 += BN * UNROLL) {
+    // ── issue every load first, so they overlap ──
+    U kv[UNROLL][qk_per_thread], vv[UNROLL][v_per_thread];
+    bool live[UNROLL];
+#pragma clang loop unroll(full)
+    for (int u = 0; u < UNROLL; ++u) {
+      const int kp = kp0 + u * BN;
+      live[u] = kp <= q_pos;
+      // Out-of-range slots read key 0 rather than branching around the load:
+      // the arithmetic runs on them either way and `live` discards the result,
+      // which keeps the loads unconditional and therefore overlappable.
+      const int kpr = live[u] ? kp : 0;
+      const int page = int(kv_page_indices[kpr / page_size]);
+      const size_t slot = size_t(page) * page_size + size_t(kpr % page_size);
+      const device bfloat* kptr =
+          k_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * qk_per_thread;
+      const device bfloat* vptr =
+          v_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * v_per_thread;
+      for (int j = 0; j < qk_per_thread; ++j) kv[u][j] = U(kptr[j]);
+      for (int j = 0; j < v_per_thread; ++j) vv[u][j] = U(vptr[j]);
+    }
 
-    // ONE read of this key and value, reused by every query head in the group.
-    // This is the whole point of the file; everything else is bookkeeping.
-    U kv[qk_per_thread], vv[v_per_thread];
-    for (int j = 0; j < qk_per_thread; ++j) kv[j] = U(kptr[j]);
-    for (int j = 0; j < v_per_thread; ++j) vv[j] = U(vptr[j]);
-
-    for (int h = 0; h < HEADS; ++h) {
-      U score = 0;
-      for (int j = 0; j < qk_per_thread; ++j) score += q[h][j] * kv[j];
-      score = simd_sum(score);
-      U factor, exp_score;
-      sdpa_online_update(score, row_max[h], row_sum[h], factor, exp_score);
-      for (int j = 0; j < v_per_thread; ++j) o[h][j] = o[h][j] * factor + exp_score * vv[j];
+    // ── then the arithmetic, with the data already in registers ──
+#pragma clang loop unroll(full)
+    for (int u = 0; u < UNROLL; ++u) {
+      for (int h = 0; h < HEADS; ++h) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; ++j) score += q[h][j] * kv[u][j];
+        score = simd_sum(score);
+        if (!live[u]) continue;   // uniform across the simdgroup: kp0+u*BN is
+                                  // the same for every lane, so simd_sum above
+                                  // is still reached by all of them
+        U factor, exp_score;
+        sdpa_online_update(score, row_max[h], row_sum[h], factor, exp_score);
+        for (int j = 0; j < v_per_thread; ++j)
+          o[h][j] = o[h][j] * factor + exp_score * vv[u][j];
+      }
     }
   }
 
