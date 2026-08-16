@@ -245,6 +245,11 @@ The older ones still hold (`results-turn-latency.md` §"Traps"). Added since:
 
 ## 8. What I would do next, in order
 
+**`docs/NEXT-decode-dispatch-count.md` is the continuation point** — it carries
+the decode measurement, what has already been ruled out, where to start, and the
+method rules, in enough detail to resume cold.
+
+
 1. **Decode**, now the larger gap. Flash-decoding to lift head sharing past
    QH=2 (§5.1).
 2. **Re-trace the prefill composition** before touching prefill again — both
