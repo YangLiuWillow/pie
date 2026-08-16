@@ -516,6 +516,114 @@ inline void sdpa_paged_hshare_dispatch(int n_q_heads, int N, Grid& g, Threadgrou
     tg = Threadgroup{1024, 1, 1};
 }
 
+// ── split-K decode attention ──
+//
+// Query heads per threadgroup and slices of the key range, for
+// `sdpa_paged_decode_split`. Both MUST equal the kernel's own QH and S template
+// arguments: the grid is `n_q_heads / kSdpaSplitHeads` wide and `kSdpaSplit`
+// deep, so a disagreement either computes a fraction of the heads or slices the
+// key range into pieces that do not tile it. Neither crashes.
+//
+// QH=4 S=4 is the measured pick, not a guess. Against the QH=2 single kernel it
+// replaces -- compiled and timed in the SAME run of `sdpa_paged_probe`,
+// interleaved context by context, on a GPU warmed until its clocks stopped
+// moving, with the split and its combine timed together:
+//
+//     ctx        2k     8k    12k    16k
+//     QH=2 S=1  0.040  0.120  0.173  0.233   ms/layer, 32 heads over 4 KV
+//     QH=4 S=4  0.041  0.104  0.151  0.200   0.96x 1.16x 1.15x 1.16x
+//
+// Every other (QH, S) in the grid was re-measured beside it and none beat this:
+// QH=4 S=8 is within noise above 8k and loses 25% at 2k, QH=4 S=2 gains only
+// 1.05-1.11x, and no QH=2 configuration wins anywhere.
+//
+// **The 2k cell is a 4% LOSS and ships anyway.** `pso_for` and `launch_shape`
+// are handed the geometry, the row count and the request count and NOT the
+// context length, so "split only above 8k" is not a question either site can
+// ask. The trade is ~1.2% of a decode step at short context against ~4.5% at
+// long.
+//
+// An earlier sweep put this at 1.02x/1.19x/1.14x/1.11x. Same direction, and it
+// was measured on a harness that timed one dispatch per command buffer -- where
+// the launch floor was larger than the kernel -- against a baseline from a
+// different run. See `docs/NEXT-decode-dispatch-count.md` for that and for the
+// GPU clock ramp, which is the larger trap of the two.
+inline constexpr int kSdpaSplitHeads = 4;
+inline constexpr int kSdpaSplit = 4;
+
+// Rows in a fire that still takes the split shape.
+//
+// One, and this is a CORRECTNESS bound rather than a preference. The partials
+// buffer is sized `n_q_heads * kSdpaSplit * (head_dim + 2)` floats with no row
+// axis, and the kernel indexes it without one, so a second row would write
+// through the first row's partials. `llama_sdpa_partial_elems` and the kernel's
+// own indexing are the two halves of that, and they meet here.
+//
+// It is also the shape the win is in. At more than one row the grid is already
+// `n_q_heads / QH * rows` threadgroups tall, so there is no occupancy left to
+// buy -- and single-stream decode is what an agentic turn is made of.
+inline constexpr int kSdpaSplitMaxRows = 1;
+
+// Whether this fire should split its key range across threadgroups.
+//
+// Asked by FOUR sites -- the compile in `build_llama_psos`, `pso_for`,
+// `launch_shape`, and the encoder deciding whether to emit the combine -- from
+// this one function, because all four must give the same answer. The encoder is
+// the new one and the worst to get wrong: a split with no combine leaves the
+// attention output untouched, so the layer reads whatever the pool last held.
+inline bool sdpa_split_this_fire(int head_dim, int kv_page_size, int n_q_heads,
+                                 int n_kv_heads, int rows, int requests, bool paged) {
+    // `PIE_METAL_SDPA_TRACE=1` reports THIS decision too, and it is not
+    // optional. An end-to-end A/B of this kernel measured 54.3/40.8/27.9 tok/s
+    // with the split on and 54.2/40.8/27.9 with it off -- identical to a tenth
+    // of a token at every size -- and a throughput number cannot tell "the fast
+    // path is no faster" from "the fast path never ran". The same trap cost
+    // real time twice already on this file's other two gates. Ask the trace
+    // before believing an A/B that shows nothing.
+    struct Trace {
+        static void note(int hd, int ps, int nq, int nkv, int r, int rq, bool pg,
+                         bool yes) {
+            if (std::getenv("PIE_METAL_SDPA_TRACE") == nullptr) return;
+            static int seen = 0;
+            if (seen++ >= 24) return;
+            std::fprintf(stderr,
+                         "[split] hd=%d page=%d nq=%d nkv=%d rows=%d requests=%d "
+                         "paged=%d on=%d -> %s\n",
+                         hd, ps, nq, nkv, r, rq, int(pg), int(sdpa_split()),
+                         yes ? "SPLIT" : "no");
+        }
+    };
+    struct Guard {
+        bool v = false;
+        int hd, ps, nq, nkv, r, rq; bool pg;
+        ~Guard() { Trace::note(hd, ps, nq, nkv, r, rq, pg, v); }
+    } guard{false, head_dim, kv_page_size, n_q_heads, n_kv_heads, rows, requests, paged};
+    if (!sdpa_split()) return false;
+    if (!paged || kv_page_size != 32 || head_dim != 128) return false;
+    if (rows != kSdpaSplitMaxRows || requests > 1) return false;
+    if (n_kv_heads <= 0 || n_q_heads % kSdpaSplitHeads != 0) return false;
+    guard.v = (n_q_heads / n_kv_heads) % kSdpaSplitHeads == 0;
+    // A threadgroup covering kSdpaSplitHeads query heads must stay inside ONE
+    // KV head, or its single `kv_head` is wrong for part of its work. At gqa 2
+    // -- llama-3 8B's shape and the numerics test's dense geometry -- this is
+    // false and the head-sharing kernel keeps the fire.
+    return (n_q_heads / n_kv_heads) % kSdpaSplitHeads == 0;
+}
+
+inline void sdpa_paged_split_dispatch(int n_q_heads, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(n_q_heads / kSdpaSplitHeads) * 1024u, 1, uint32_t(kSdpaSplit)};
+    tg = Threadgroup{1024, 1, 1};
+}
+
+// One threadgroup per query head, one lane per output dimension. 128 threads is
+// the head width, so every lane writes exactly one element and the loop in the
+// kernel runs once -- it is written as a loop anyway so a narrower head does not
+// need a second launch shape.
+inline void sdpa_paged_split_combine_dispatch(int n_q_heads, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(n_q_heads) * 128u, 1, 1};
+    tg = Threadgroup{128, 1, 1};
+}
+
 // Query rows per threadgroup in `sdpa_paged_tiled` -- one per simdgroup, and a
 // threadgroup is 1024 threads. It is the factor by which that kernel divides
 // the K/V traffic, and it must equal the kernel's own QT.

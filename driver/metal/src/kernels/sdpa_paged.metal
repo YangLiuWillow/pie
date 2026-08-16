@@ -830,6 +830,288 @@ template <typename T, int D, int V, int QH>
 
 instantiate_sdpa_paged_hshare(bfloat16, bfloat, 128, 128, 2)  // llama / qwen
 
+// ── the same decode again, with the KEY RANGE split across threadgroups ──
+//
+// ## What this is for, and what it is NOT for
+//
+// Flash-decoding is usually sold on TRAFFIC: split the key range so a
+// threadgroup can cover a whole GQA group without the grid collapsing, and each
+// KV head is read once instead of once per query head. **That argument does not
+// hold on this machine and is not the reason this exists.** From
+// `sdpa_paged_probe`'s head-sharing sweep, the decode kernel achieves 18-26% of
+// this device's 296 GB/s roof on UNIQUE bytes -- while the traffic it would
+// need if the redundant GQA reads were not cache-served works out at 121-146%
+// of that roof above 8k context. Above the roof is impossible, so those reads
+// are already being served by cache, and there is no traffic here to save.
+//
+// The kernel is LATENCY-bound. Its per-key chain -- load, dot, `simd_sum`,
+// online-softmax update, rescale, accumulate V -- is entirely serial, one
+// memory latency deep per key. Overlapping the loads was tried and REJECTED:
+// `sdpa_hshare_decode.metal`'s UNROLL knob won 7% at 12k/16k in isolation and
+// cost 19% END TO END at 5,840 tokens, because the extra registers cost more
+// than the overlap bought at short context.
+//
+// What is left is more independent chains in flight. At QH=2 over 32 query
+// heads the grid is 16 threadgroups; splitting the key range S ways makes it
+// 16*S and each chain 1/S as long. That is the whole idea, and it is also what
+// makes QH=4 viable -- QH=4 lost as a single kernel purely because its grid
+// fell to 8 threadgroups, which confirms that the earlier QH sweep was measuring
+// occupancy and not registers.
+//
+// Measured as split+combine TOGETHER, because a split that is faster only by
+// deferring work to a second dispatch has made nothing faster:
+//
+//     ctx           2k     8k    12k    16k     (ms/layer, 32 heads over 4 KV)
+//     QH=2 S=1   0.040  0.120  0.173  0.233     the single kernel it replaces
+//     QH=4 S=4   0.041  0.104  0.151  0.200     0.96x 1.16x 1.15x 1.16x
+//
+// The baseline there is compiled and timed in the SAME run, interleaved context
+// by context, on a GPU warmed until its clocks stopped moving. None of those
+// three is optional: this machine ramps under load, and the same QH=2 kernel at
+// 16k read 1.475, 1.154, 0.837 and 0.233 ms/layer across four runs ordered by
+// how warm it was. On the half-warm runs this kernel reads as a LOSS at every
+// context, reproducibly.
+//
+// The 2k column is in the sweep ON PURPOSE. The rejected unroll was landed on a
+// sweep that only covered 12k and 16k and regressed short context by 19%. This
+// one regresses 4% there, which is small enough to ship unguarded -- and it has
+// to be shipped unguarded, because neither selection site is handed the context
+// length and so neither can ask for a floor.
+//
+// ## Why the partials are a separate buffer and not the output
+//
+// Each split produces a PARTIAL softmax -- its own running max, its own sum, its
+// own unnormalized accumulator. They cannot be summed as they stand, because
+// the maxima differ. `sdpa_paged_split_combine` rescales each to the global max
+// before summing, which is the online softmax's own merge rule applied once
+// across splits instead of once per key.
+//
+// The partials are FLOAT, not the activation type. They are an intermediate
+// that gets rescaled and summed, so rounding them here would lose precision the
+// single-pass kernel never loses.
+//
+// The buffer signature is the head-sharing kernel's plus two slots, so the
+// existing `bind::SdpaPaged` table serves it; `PartialO` and `PartialMS` are
+// 18 and 19 there.
+template <typename T, int D, int V, int QH, int S>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode_split(
+    const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],   // untouched: the combine writes it
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],   // unused: FAST_FULL
+    const device uint& attention_mask_stride[[buffer(13)]],   // unused
+    const device uchar* attention_mask_enabled [[buffer(14)]],// unused
+    const constant int& window                 [[buffer(15)]],// unused: full attn
+    const device T* sinks                      [[buffer(16)]],// unused: no sink
+    device float* partial_o                    [[buffer(18)]],// [q_head][S][D]
+    device float* partial_ms                   [[buffer(19)]],// [q_head][S][2]
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  (void)out; (void)page_size; (void)attention_mask; (void)attention_mask_stride;
+  (void)attention_mask_enabled; (void)window; (void)sinks;
+  constexpr int BN = 32, BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+  constexpr float NEG_INF = -3.0e38f;
+
+  typedef float U;
+  // x indexes a GROUP of QH query heads and z indexes a SLICE of the key range,
+  // so the grid is QH times shorter and S times deeper than the shipped
+  // kernel's. `launch_shape` and `pso_for` must agree on both, or the fire
+  // computes a fraction of the attention and reports nothing.
+  //
+  // There is no row axis here on purpose: `sdpa_split_this_fire` admits one row
+  // only, because the partials are sized for one and because at more than one
+  // row the grid is already tall enough that splitting buys nothing.
+  const int group     = int(tid.x);
+  const int split     = int(tid.z);
+  const int n_q_heads = int(tpg.x) * QH;
+  const int head_base = group * QH;
+  const int kv_head   = head_base / gqa_factor;
+
+  threadgroup U red[BN * BD];
+  threadgroup U tg_max[BN];
+  threadgroup U tg_sum[BN];
+
+  U q[QH][qk_per_thread];
+  U o[QH][v_per_thread];
+  U row_max[QH], row_sum[QH];
+
+  for (int h = 0; h < QH; ++h) {
+    const device T* qp = queries + size_t(head_base + h) * D + simd_lid * qk_per_thread;
+    for (int j = 0; j < qk_per_thread; ++j) q[h][j] = U(scale) * U(qp[j]);
+    for (int j = 0; j < v_per_thread; ++j) o[h][j] = 0;
+    row_max[h] = NEG_INF;
+    row_sum[h] = 0;
+  }
+
+  const int r         = req_of_token[0];
+  const int q_pos     = position_ids[0];
+  const int page_base = int(kv_page_indptr[r]);
+  const int total     = q_pos + 1;
+
+  // Ceiling division, so the LAST split takes the short piece. Flooring would
+  // leave the tail keys in no split at all, which is a softmax over a subset --
+  // wrong attention, and nothing about it looks wrong.
+  const int chunk = (total + S - 1) / S;
+  const int lo    = split * chunk;
+  const int hi    = total < lo + chunk ? total : lo + chunk;   // exclusive
+
+  for (int kp = lo + int(simd_gid); kp < hi; kp += BN) {
+    const int page = int(kv_page_indices[page_base + (kp >> 5)]);
+    const size_t slot = size_t(page) * 32 + size_t(kp & 31);
+    const device T* kptr =
+        k_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * qk_per_thread;
+    const device T* vptr =
+        v_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * v_per_thread;
+
+    U kv[qk_per_thread], vv[v_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) kv[j] = U(kptr[j]);
+    for (int j = 0; j < v_per_thread; ++j) vv[j] = U(vptr[j]);
+
+    for (int h = 0; h < QH; ++h) {
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; ++j) score += q[h][j] * kv[j];
+      score = simd_sum(score);
+      U factor, exp_score;
+      sdpa_online_update(score, row_max[h], row_sum[h], factor, exp_score);
+      for (int j = 0; j < v_per_thread; ++j) o[h][j] = o[h][j] * factor + exp_score * vv[j];
+    }
+  }
+
+  // The same cross-simdgroup reduction the head-sharing kernel does, except the
+  // result is written UNNORMALIZED with its max and sum beside it. Dividing here
+  // would throw away exactly what the combine needs to weight this split against
+  // the others.
+  for (int h = 0; h < QH; ++h) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lid == 0) { tg_max[simd_gid] = row_max[h]; tg_sum[simd_gid] = row_sum[h]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    U m = tg_max[simd_lid];
+    U new_max = simd_max(m);
+    U fac = fast::exp(m - new_max);
+    U tot = simd_sum(tg_sum[simd_lid] * fac);
+    const int qh = head_base + h;
+    for (int i = 0; i < v_per_thread; ++i) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      red[simd_lid * BD + simd_gid] = o[h][i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      U acc = simd_sum(red[simd_gid * BD + simd_lid] * fac);
+      if (simd_lid == 0) {
+        partial_o[(size_t(qh) * S + split) * D + simd_gid * v_per_thread + i] = acc;
+      }
+    }
+    if (simd_lid == 0 && simd_gid == 0) {
+      // A split with NO keys -- short context, many splits -- must record a sum
+      // of zero and a max of -inf, so the combine skips it rather than folding
+      // in an accumulator that was never written. At 128 tokens and S=4 the
+      // last two splits are empty on every layer, so this is the ordinary case
+      // early in a turn, not an edge case.
+      partial_ms[(size_t(qh) * S + split) * 2 + 0] = (hi > lo) ? new_max : NEG_INF;
+      partial_ms[(size_t(qh) * S + split) * 2 + 1] = (hi > lo) ? tot : 0.0f;
+    }
+  }
+  (void)n_q_heads;
+}
+
+/// Merge the per-split partials into the attention output.
+///
+/// One threadgroup per query head, one lane per output dimension. The merge is
+/// the online softmax's own rule applied across splits: rescale each partial to
+/// the global max, sum the weights, divide once.
+///
+/// It rides the SAME argument table as the split above -- `out` at 3, the
+/// partials at 18 and 19 -- which is what lets it exist without a DAG entry of
+/// its own, exactly as `qmm_splitk_reduce` does for a split projection.
+template <typename T, int D, int S>
+[[kernel]] void sdpa_paged_split_combine(
+    device T* out                  [[buffer(3)]],
+    const device float* partial_o  [[buffer(18)]],
+    const device float* partial_ms [[buffer(19)]],
+    // All scalar: Metal rejects a signature mixing `uint3` and `uint` position
+    // attributes ("expecting input declarations with either all scalar types or
+    // all vector types with the same number of elements").
+    uint tid      [[threadgroup_position_in_grid]],
+    uint lid      [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]]) {
+  constexpr float NEG_INF = -3.0e38f;
+  const int qh = int(tid);
+
+  float gmax = NEG_INF;
+  for (int s = 0; s < S; ++s)
+    gmax = max(gmax, partial_ms[(size_t(qh) * S + s) * 2 + 0]);
+
+  float denom = 0;
+  float w[S];
+  for (int s = 0; s < S; ++s) {
+    const float m = partial_ms[(size_t(qh) * S + s) * 2 + 0];
+    const float t = partial_ms[(size_t(qh) * S + s) * 2 + 1];
+    // An empty split carries max -inf and sum 0, so it contributes nothing
+    // without a branch -- but the guard is explicit rather than relying on
+    // `exp(-inf - -inf)`, which is NaN when EVERY split is empty.
+    w[s] = (t > 0.0f && m > NEG_INF) ? fast::exp(m - gmax) : 0.0f;
+    denom += w[s] * t;
+  }
+  const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+
+  for (uint dd = lid; dd < uint(D); dd += nthreads) {
+    float acc = 0;
+    for (int s = 0; s < S; ++s)
+      acc += w[s] * partial_o[(size_t(qh) * S + s) * D + dd];
+    out[size_t(qh) * D + dd] = T(acc * inv);
+  }
+}
+
+#define instantiate_sdpa_paged_split(name, itype, d, v, qh, s)                \
+  template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32_h" #qh       \
+                       "_s" #s)]]                                             \
+  [[kernel]] void sdpa_paged_decode_split<itype, d, v, qh, s>(                \
+      const device itype*, const device itype*, const device itype*,          \
+      device itype*, const constant int&, const device int*,                  \
+      const device int*, const device uint*, const device uint*,              \
+      const constant int&, const constant int&, const constant float&,        \
+      const device uchar*, const device uint&, const device uchar*,           \
+      const constant int&, const device itype*,                               \
+      device float*, device float*,                                           \
+      uint3, uint3, uint, uint);
+
+// The combine depends on S ALONE -- it never looks at a query head's group --
+// so it is instantiated separately. Folding it into the macro above makes every
+// (QH, S) pair re-instantiate the same combine and the shader fails to compile
+// on the duplicate, which is the compiler noticing the same thing.
+#define instantiate_sdpa_paged_split_combine(name, itype, d, s)               \
+  template [[host_name("sdpa_paged_split_combine_" #name "_d_" #d "_s" #s)]]  \
+  [[kernel]] void sdpa_paged_split_combine<itype, d, s>(                      \
+      device itype*, const device float*, const device float*,                \
+      uint, uint, uint);
+
+instantiate_sdpa_paged_split(bfloat16, bfloat, 128, 128, 4, 4)  // llama / qwen
+instantiate_sdpa_paged_split_combine(bfloat16, bfloat, 128, 4)
+// The rest of the (QH, S) grid, for `sdpa_paged_probe`'s sweep ONLY. The
+// original sweep that picked QH=4 S=4 ran on a harness that timed a single
+// dispatch per command buffer, where the launch-and-sync floor was larger than
+// the kernel; re-deciding between the configurations needs all of them measured
+// on the fixed harness against a baseline from the same run, not just the one
+// that happened to be picked.
+instantiate_sdpa_paged_split(bfloat16, bfloat, 128, 128, 2, 2)
+instantiate_sdpa_paged_split(bfloat16, bfloat, 128, 128, 2, 4)
+instantiate_sdpa_paged_split(bfloat16, bfloat, 128, 128, 2, 8)
+instantiate_sdpa_paged_split(bfloat16, bfloat, 128, 128, 4, 2)
+instantiate_sdpa_paged_split(bfloat16, bfloat, 128, 128, 4, 8)
+instantiate_sdpa_paged_split_combine(bfloat16, bfloat, 128, 2)
+instantiate_sdpa_paged_split_combine(bfloat16, bfloat, 128, 8)
+
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
   [[kernel]] void sdpa_paged_decode<itype, d, v, sink, 0, false, 32>(      \

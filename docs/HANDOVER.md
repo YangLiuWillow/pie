@@ -84,6 +84,7 @@ and generation is verified coherent after every kernel landing.
 | | kernel | win | revert |
 |---|---|---|---|
 | decode attention | `sdpa_paged_decode_hshare` — one KV read per GQA pair | 1.18× @5.8k, 1.46× @28k | `PIE_METAL_SDPA_HSHARE=0` |
+| decode attention | `sdpa_paged_decode_split` + `..._split_combine` — the key range cut four ways so QH=4 keeps the grid tall | kernel 1.16× @8k–16k; **+1.65% on a decode step**, five paired reps | `PIE_METAL_SDPA_SPLIT=0` |
 | prefill attention | `sdpa_paged_nax` — fused flash attention on the neural accelerators | 4.86× over `sdpa_paged_mma` | `PIE_METAL_SDPA_NAX=0` |
 | routed MoE GEMM | `affine_qmm_t_routed_nax` | 1.92× / 2.21× by tile | `PIE_METAL_QMM_NAX=0` |
 | dense projections | `affine_qmm_t_nax` | 2.72× | `PIE_METAL_QMM_NAX=0` |
@@ -93,7 +94,16 @@ fragments, `frag_mma` (N=32) and `frag_mma_k32`, and the lane layout everything
 depends on. The design is MLX's (`steel/attn/nax.h`), reimplemented against the
 same public API.
 
-**The hazard all four share, and the one that must not be got wrong.** Where a
+**The split-K pair is the one landing that ADDS A DISPATCH.** The other four
+are a name swap or a same-ABI kernel swap. This one extends the attention ABI
+with the partials (`SdpaPaged::PartialO` / `PartialMS`, 18 and 19), and its
+combine is emitted inline after the split rather than taking a DAG node —
+following the precedent a split projection's GEMM and reduce already set. That
+puts a FOURTH site on the shared predicate: whether the combine runs at all. A
+split with no combine leaves the attention output holding whatever the
+activation pool last put there, which is neither a crash nor a slowdown.
+
+**The hazard all five share, and the one that must not be got wrong.** Where a
 kernel's grid differs from the one it replaces, `pso_for` and `launch_shape`
 decide independently and disagreeing runs a fraction of the fire while reporting
 nothing. Every predicate is therefore asked from ONE function by the compile
@@ -153,8 +163,12 @@ to be found by profiling rather than porting.
    `silu_mul` is the anomaly — those move almost no data and cost 3.3 ms between
    them, because at ONE token they cannot fill the GPU. Fusing or eliminating
    small per-layer dispatches is the lever, not a wider attention kernel.
-   Flash-decoding (splitting the key range so head sharing passes QH=2) remains
-   available but now targets a 1.24× slice.
+   Flash-decoding (splitting the key range so head sharing passes QH=2) has
+   since been BUILT AND LANDED — `sdpa_paged_decode_split`, 1.16× above 8k. The
+   "18% in two small kernels" that this paragraph calls the lever was
+   afterwards found to be instrument error twice over and is **retracted**; see
+   `docs/NEXT-decode-dispatch-count.md` §2a. Attention was the real target after
+   all.
 
    **What is NOT established:** why mlx-lm is faster. Its internals have not
    been profiled here, so "fewer, larger dispatches per layer" is a hypothesis
@@ -197,7 +211,7 @@ cmake --build /tmp/metaltools -j 8
 | suite | state |
 |---|---|
 | `llama_pso_test` | 32 pass |
-| `llama_decode_step_test` | 232 pass (and with each NAX/HSHARE switch off) |
+| `llama_decode_step_test` | 243 pass (and with each NAX/HSHARE/SPLIT switch off) |
 | `kv_append_paged_pso_test` | 13 pass |
 | `gptoss_decode_step_test` | all pass |
 | `llama_numerics_test` | **50 / 19** — 18 pre-existing plus one routing tie the NAX row gate flips; see `sdpa_nax_min_rows` |

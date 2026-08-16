@@ -348,6 +348,16 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             if (sdpa_should_tile(R, requests)) return ll.sdpa_paged_tiled;
             if (llama_sdpa_simdgroups(g) == 8 && ll.sdpa_paged_sg8.valid())
                 return ll.sdpa_paged_sg8;
+            // The key range split across threadgroups, for a single-row decode.
+            // BEFORE head sharing, which is the shape it replaces and which
+            // still takes every fire this one declines. Deliberately NOT
+            // guarded on `.valid()`, for the reason spelled out below: the two
+            // grids differ in their z extent, and `launch_shape` cannot ask
+            // that question. `build_llama_psos` makes both halves fatal under
+            // exactly this predicate.
+            if (sdpa_split_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                     g.n_kv_heads, R, requests, g.paged_kv_enabled))
+                return ll.sdpa_paged_split;
             // A pair of query heads per threadgroup, sharing one KV read.
             // Deliberately NOT guarded on `.valid()`: `launch_shape` cannot ask
             // that question (it is handed no `LlamaPsos`), so guarding here
@@ -581,6 +591,25 @@ std::size_t llama_splitk_partial_elems(const LlamaGeometry& g, int max_rows) {
     return std::size_t(kLlamaSplitkConcurrentLanes) * one_lane;
 }
 
+std::size_t llama_sdpa_partial_elems(const LlamaGeometry& g) {
+    // The same predicate the compile, both selection sites and the encoder ask.
+    // Sizing it from anything else would let the buffer exist for a geometry
+    // that never splits, or -- far worse -- be absent for one that does.
+    if (!sdpa_split_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads, g.n_kv_heads,
+                              /*rows=*/kSdpaSplitMaxRows, /*requests=*/1,
+                              g.paged_kv_enabled)) {
+        return 0;
+    }
+    return std::size_t(g.n_q_heads) * std::size_t(kSdpaSplit) *
+           (std::size_t(g.head_dim) + 2);
+}
+
+std::size_t llama_sdpa_partial_ms_offset(const LlamaGeometry& g) {
+    if (llama_sdpa_partial_elems(g) == 0) return 0;
+    return sizeof(float) * std::size_t(g.n_q_heads) * std::size_t(kSdpaSplit) *
+           std::size_t(g.head_dim);
+}
+
 int llama_moe_pairs(const LlamaGeometry& g, int rows) {
     return (rows < 1 ? 1 : rows) * (g.is_moe() ? g.experts_per_token : 1);
 }
@@ -755,6 +784,16 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
                 tg = Threadgroup{threads, 1, 1};
                 return;
             }
+            // Same predicate and same order as `pso_for`. This grid is
+            // `kSdpaSplitHeads` times SHORTER in x and `kSdpaSplit` times
+            // DEEPER in z than the head-sharing one below, and the encoder is
+            // reading the same predicate a third time to decide whether to emit
+            // the combine at all -- three sites, one answer.
+            if (sdpa_split_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                     g.n_kv_heads, R, requests, g.paged_kv_enabled)) {
+                sdpa_paged_split_dispatch(g.n_q_heads, grid, tg);
+                return;
+            }
             // Same predicate `pso_for` uses, from the same function. This grid
             // is `kSdpaHeadShare` times SHORTER than the one below, so the two
             // sites agreeing is the whole correctness condition here.
@@ -866,6 +905,26 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
         se.set_pso(pso_for(d, g, base, ll, mb, rows, head_rows, requests));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
+        // Split-K decode attention is TWO dispatches for the same reason, and
+        // rides the same argument table: the split above wrote a partial
+        // softmax per (query head, key slice) into slots 18 and 19 and left the
+        // attention output ALONE, and this merges them into it.
+        //
+        // Same predicate `pso_for` and `launch_shape` just used. If this is
+        // ever false while those were true, the fire's attention output holds
+        // whatever the activation pool last put there -- no crash, no error,
+        // wrong logits. That is why the three read one function.
+        if (d.kind == Kind::Sdpa &&
+            sdpa_split_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads, g.n_kv_heads,
+                                 m, requests, g.paged_kv_enabled)) {
+            se.barrier();
+            se.set_pso(ll.sdpa_paged_split_combine);
+            se.set_argtable_ordinal(ordinal_base + d.ordinal);
+            Grid cg;
+            Threadgroup ctg;
+            sdpa_paged_split_combine_dispatch(g.n_q_heads, cg, ctg);
+            se.dispatch(cg, ctg);
+        }
         // A split projection is TWO dispatches. The GEMM above wrote `split`
         // partial [M, N] slices into a side buffer and left the projection's
         // real output alone; this sums them. It rides the same argument table

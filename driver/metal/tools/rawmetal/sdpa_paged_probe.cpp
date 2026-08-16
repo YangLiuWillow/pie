@@ -768,8 +768,17 @@ void accuracy_ab(RawMetalContext& ctx, Pso mma, Pso nax, int rows, int ctx_len,
 // Timed as a PAIR, because that is what would ship: the split kernel writes
 // partials and the combine merges them, and a split that is faster only by
 // deferring work to a second dispatch has not made anything faster.
+//
+// `shipped` selects the ABI. The prototype in `kernels/sdpa_split_decode.metal`
+// puts the partials at slots 3 and 4 and the split on the grid's y; the LANDED
+// kernel in `src/kernels/sdpa_paged.metal` carries the full `bind::SdpaPaged`
+// signature with the partials at 18 and 19 and the split on z, and reaches its
+// page table through `kv_page_indptr` rather than assuming one request. Both
+// are run here for the same reason the NAX arm runs the shipped kernel beside
+// its prototype: a correctness result about a kernel that is not the one that
+// ships is a result about nothing.
 double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
-                 int ctx_len, int ordinal, bool check) {
+                 int ctx_len, int ordinal, bool check, bool shipped = false) {
     constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
     const int gqa = kHeads / kKv;
     const int pages = (ctx_len + kPage) / kPage + 1;
@@ -814,28 +823,101 @@ double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
 
     const float scale = 1.0f / 11.3137085f;
     const Kernel kind = Kernel::Sdpa;
-    ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
-    ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, po);
-    ctx.arg_bind(kind, ordinal, 4, pm);
-    ctx.arg_bind(kind, ordinal, 5, scalar<int>(ctx, gqa));
-    ctx.arg_bind(kind, ordinal, 6, pos); ctx.arg_bind(kind, ordinal, 7, pidx);
-    ctx.arg_bind(kind, ordinal, 8, scalar<int>(ctx, kPage));
-    ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, kKv));
-    ctx.arg_bind(kind, ordinal, 10, scalar<float>(ctx, scale));
-    // The combine reads the same partials at its own ordinal.
-    ctx.arg_bind(kind, ordinal + 1, 0, po);
-    ctx.arg_bind(kind, ordinal + 1, 1, pm);
-    ctx.arg_bind(kind, ordinal + 1, 2, o);
+    if (shipped) {
+        // The full `bind::SdpaPaged` table. The mask, window and sink slots are
+        // DECLARED by the shipped kernel and never read, and they are bound
+        // anyway -- an undeclared slot costs nothing, an unbound declared one
+        // costs the attention.
+        SlotHandle pindptr = ctx.heap_alloc(2 * sizeof(uint32_t));
+        static_cast<uint32_t*>(pindptr.contents())[0] = 0u;
+        static_cast<uint32_t*>(pindptr.contents())[1] = uint32_t(pages);
+        SlotHandle req = ctx.heap_alloc(sizeof(int));
+        *static_cast<int*>(req.contents()) = 0;
+        SlotHandle mask = ctx.heap_alloc(64);
+        std::memset(mask.contents(), 0, 64);
+        SlotHandle sinks = ctx.heap_alloc(64);
+        std::memset(sinks.contents(), 0, 64);
+        ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
+        ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, o);
+        ctx.arg_bind(kind, ordinal, 4, scalar<int>(ctx, gqa));
+        ctx.arg_bind(kind, ordinal, 5, pos); ctx.arg_bind(kind, ordinal, 6, req);
+        ctx.arg_bind(kind, ordinal, 7, pidx);
+        ctx.arg_bind(kind, ordinal, 8, pindptr);
+        ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, kPage));
+        ctx.arg_bind(kind, ordinal, 10, scalar<int>(ctx, kKv));
+        ctx.arg_bind(kind, ordinal, 11, scalar<float>(ctx, scale));
+        ctx.arg_bind(kind, ordinal, 12, mask);
+        ctx.arg_bind(kind, ordinal, 13, scalar<uint32_t>(ctx, 0u));
+        ctx.arg_bind(kind, ordinal, 14, mask);
+        ctx.arg_bind(kind, ordinal, 15, scalar<int>(ctx, 0));
+        ctx.arg_bind(kind, ordinal, 16, sinks);
+        ctx.arg_bind(kind, ordinal, 18, po);
+        ctx.arg_bind(kind, ordinal, 19, pm);
+    } else {
+        ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
+        ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, po);
+        ctx.arg_bind(kind, ordinal, 4, pm);
+        ctx.arg_bind(kind, ordinal, 5, scalar<int>(ctx, gqa));
+        ctx.arg_bind(kind, ordinal, 6, pos); ctx.arg_bind(kind, ordinal, 7, pidx);
+        ctx.arg_bind(kind, ordinal, 8, scalar<int>(ctx, kPage));
+        ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, kKv));
+        ctx.arg_bind(kind, ordinal, 10, scalar<float>(ctx, scale));
+        // The combine reads the same partials at its own ordinal.
+        ctx.arg_bind(kind, ordinal + 1, 0, po);
+        ctx.arg_bind(kind, ordinal + 1, 1, pm);
+        ctx.arg_bind(kind, ordinal + 1, 2, o);
+    }
     ctx.make_resident();
 
+    // An INVALID combine means "no split": run `split` alone as an ordinary
+    // whole-range decode kernel writing `out` directly. That is how the shipped
+    // QH=2 kernel this replaces gets measured in the SAME run, on the same
+    // data, against the same reference -- rather than against numbers carried
+    // over from an earlier run on a differently-loaded machine, which is the
+    // trap `four_way.sh` carries a drift control for.
+    const bool single = !comb.valid();
+    // AMORTIZED over a model's worth of layers, not one dispatch.
+    //
+    // A single dispatch per command buffer measures the launch-and-sync floor
+    // as much as the kernel, and this probe already records what that does:
+    // `bench` carries the same note after single-dispatch timing priced a
+    // 1-row fire's attention at 3.536 ms/layer. It showed up here too, and
+    // worse because it is not constant -- run alone on an otherwise idle GPU
+    // this function reported the QH=2 kernel at 0.99 ms/layer at 2k, 8k, 12k
+    // AND 16k alike, a cost that does not vary with the amount of work being
+    // the clearest possible sign that the work is not what is being measured.
+    //
+    // Repeating inside ONE command buffer leaves compute plus barrier, which is
+    // what a fused 48-layer fire actually pays. The partials are reused across
+    // reps exactly as they are reused across layers in a real fire.
+    constexpr int kSplitReps = 48;
     LatencyHarness h(ctx);
-    auto enc = [&](StepEncoder& se) {
+    auto enc_once = [&](StepEncoder& se) {
         se.set_pso(split); se.set_argtable(kind, ordinal);
-        se.dispatch(Grid{uint32_t(kHeads / qh) * 1024u, uint32_t(nsplit), 1},
+        // The shipped kernel takes the split on z and reserves y for the query
+        // row; the prototype has no row axis and puts the split on y. Getting
+        // this backwards runs `nsplit` rows of one split rather than one row of
+        // `nsplit` splits, which is a softmax over a quarter of the keys.
+        se.dispatch(single ? Grid{uint32_t(kHeads / qh) * 1024u, 1, 1}
+                    : shipped ? Grid{uint32_t(kHeads / qh) * 1024u, 1, uint32_t(nsplit)}
+                              : Grid{uint32_t(kHeads / qh) * 1024u, uint32_t(nsplit), 1},
                     Threadgroup{1024, 1, 1});
+        if (single) return;
         se.barrier();
-        se.set_pso(comb); se.set_argtable(kind, ordinal + 1);
+        // Shipped: the combine rides the SAME argument table as the split, which
+        // is what lets it exist without a DAG entry of its own.
+        se.set_pso(comb); se.set_argtable(kind, shipped ? ordinal : ordinal + 1);
         se.dispatch(Grid{uint32_t(kHeads) * 128u, 1, 1}, Threadgroup{128, 1, 1});
+    };
+    // A correctness pass wants ONE run of the pair -- repeating it would only
+    // recompute the same answer into the same buffer, and the check reads that
+    // buffer either way.
+    const int reps = check ? 1 : kSplitReps;
+    auto enc = [&](StepEncoder& se) {
+        for (int i = 0; i < reps; ++i) {
+            enc_once(se);
+            se.barrier();
+        }
     };
     BenchResult r = h.time_step("split", enc, check ? 1 : 30, check ? 0 : 8);
 
@@ -868,7 +950,136 @@ double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
                kHeads * kD, bad == 0 ? "  \xe2\x80\x94 CORRECT\n" : "\n");
         if (bad) printf("   worst %.4f\n", worst);
     }
-    return r.median.gpu_exec_ms;
+    return r.median.gpu_exec_ms / double(reps);
+}
+
+// The shipped split-K pair, checked and timed against the kernel it replaces.
+//
+// A function rather than a block inside `main` because it is called from TWO
+// places that measure different things: inside the decode section, where it is
+// one arm among many and its absolute numbers are inflated by everything
+// allocated before it, and from `PIE_SDPA_PROBE_SPLIT_ONLY`, where it runs on a
+// fresh heap and the numbers can be quoted.
+void run_shipped_split_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
+    printf("\n  SHIPPED split-K (src/kernels/sdpa_paged.metal, QH=4 S=4):\n");
+    {
+        std::string es, ec;
+        const std::string sp_path = kernels_dir + "/sdpa_paged.metal";
+        Pso sp = ctx.compile_pso_from_file(
+            sp_path, "sdpa_paged_decode_bfloat16_d_128_p32_h4_s4", &es);
+        Pso cb = ctx.compile_pso_from_file(
+            sp_path, "sdpa_paged_split_combine_bfloat16_d_128_s4", &ec);
+        if (!sp.valid() || !cb.valid()) {
+            printf("    compile fail  split=%d combine=%d\n", int(sp.valid()),
+                   int(cb.valid()));
+            if (!sp.valid()) printf("      split: %s\n", es.c_str());
+            if (!cb.valid()) printf("      combine: %s\n", ec.c_str());
+        } else {
+            for (const int cl : {127, 511, 2047, 8191, 16383}) {
+                printf("    ");
+                split_run(ctx, sp, cb, 4, 4, cl, 900 + cl % 37, /*check=*/true,
+                         /*shipped=*/true);
+            }
+            // The kernel it REPLACES, compiled and timed here rather than
+            // quoted from an earlier run. An invalid combine selects the
+            // single-kernel shape; correctness is checked for it too, so a
+            // baseline that had itself gone wrong could not silently make
+            // the split look good.
+            std::string eb;
+            Pso base_h2 = ctx.compile_pso_from_file(
+                sp_path, "sdpa_paged_decode_bfloat16_d_128_p32_h2", &eb);
+            if (!base_h2.valid()) printf("    baseline compile fail: %s\n", eb.c_str());
+            else { printf("    baseline "); split_run(ctx, base_h2, Pso{}, 2, 1, 2047,
+                                                      960, true, true); }
+            // WARM THE CLOCKS UNTIL THEY STOP MOVING, and discard all of it.
+            //
+            // This is the single largest effect in this whole arm and it is not
+            // small: the QH=2 kernel at 16k measured 1.475, 1.154, 0.837 and
+            // 0.234 ms/layer on four runs of the SAME binary -- a 6x spread,
+            // with the fast one following several minutes of sustained load.
+            // The GPU ramps under load, and until it has, everything measured
+            // is a clock state rather than a kernel. Two runs on a
+            // half-ramped machine said split-K LOSES; the fully ramped one says
+            // it wins by 1.13-1.16x, which is what the prototype sweep had
+            // originally found.
+            //
+            // A fixed warm-up count cannot know when it is done, so this loops
+            // until two consecutive measurements of the same work agree within
+            // 5%, and reports how long that took. If the table below is quoted,
+            // this line is the evidence it was quotable.
+            double prev = 0;
+            int warm = 0;
+            for (; warm < 40; ++warm) {
+                const double t =
+                    split_run(ctx, sp, cb, 4, 4, 16383, 964, false, true);
+                if (prev > 0 && t > 0 && std::abs(t - prev) < 0.05 * prev) break;
+                prev = t;
+            }
+            printf("    clocks settled after %d warm-up passes (16k, discarded)%s\n",
+                   warm, warm >= 40 ? "  <-- NEVER SETTLED; distrust the table" : "");
+            // INTERLEAVED, not one arm after the other. This machine drifts
+            // 11-12% over a long run at the long contexts, which is larger
+            // than the effect being measured; alternating the two arms at
+            // each context puts that drift inside both rather than all of
+            // it inside the second.
+            // THE WHOLE (QH, S) GRID, not just the configuration that was
+            // picked. The fault was in the HARNESS -- a single dispatch per
+            // command buffer, where the launch floor was bigger than the kernel
+            // -- so every configuration it ranked has to be re-ranked, or the
+            // conclusion is "the one I chose does not win" when the question is
+            // "does splitting the key range win at all".
+            const int ctxs[4] = {2047, 8191, 12287, 16383};
+            double base[4] = {0, 0, 0, 0};
+            for (int i = 0; i < 4; ++i)
+                if (base_h2.valid())
+                    base[i] = split_run(ctx, base_h2, Pso{}, 2, 1, ctxs[i],
+                                        980 + ctxs[i] % 29, false, true);
+            printf("    %-10s %8s %8s %8s %8s\n", "", "2k", "8k", "12k", "16k");
+            printf("    %-10s %8.3f %8.3f %8.3f %8.3f   (the kernel in use)\n",
+                   "QH=2 S=1", base[0], base[1], base[2], base[3]);
+            bool any_noise = false, any_win = false;
+            for (const int cqh : {2, 4}) {
+                for (const int cs : {2, 4, 8}) {
+                    char sn[96], cn[96];
+                    snprintf(sn, sizeof sn,
+                             "sdpa_paged_decode_bfloat16_d_128_p32_h%d_s%d", cqh, cs);
+                    snprintf(cn, sizeof cn,
+                             "sdpa_paged_split_combine_bfloat16_d_128_s%d", cs);
+                    std::string e1, e2;
+                    Pso s2 = ctx.compile_pso_from_file(sp_path, sn, &e1);
+                    Pso c2 = ctx.compile_pso_from_file(sp_path, cn, &e2);
+                    if (!s2.valid() || !c2.valid()) {
+                        printf("    QH=%d S=%-2d  no instantiation\n", cqh, cs);
+                        continue;
+                    }
+                    double t[4];
+                    for (int i = 0; i < 4; ++i)
+                        t[i] = split_run(ctx, s2, c2, cqh, cs, ctxs[i],
+                                         700 + cqh * 40 + cs * 4 + i, false, true);
+                    printf("    QH=%d S=%-2d %8.3f %8.3f %8.3f %8.3f  ", cqh, cs,
+                           t[0], t[1], t[2], t[3]);
+                    for (int i = 0; i < 4; ++i) {
+                        printf(" %5.2fx", (t[i] > 0 && base[i] > 0) ? base[i] / t[i] : 0.0);
+                        if (base[i] > 0 && t[i] > 0 && base[i] / t[i] > 1.05) any_win = true;
+                    }
+                    printf("\n");
+                    // A decode's attention cannot get cheaper on more keys. If
+                    // it reads that way the run is noise, not a measurement,
+                    // and saying so beats publishing it.
+                    for (int i = 1; i < 4; ++i)
+                        if (t[i] < t[i - 1] * 0.97) any_noise = true;
+                }
+            }
+            for (int i = 1; i < 4; ++i)
+                if (base[i] > 0 && base[i] < base[i - 1] * 0.97) any_noise = true;
+            if (any_noise)
+                printf("    >>> NOT MONOTONIC in context somewhere above: this run is\n"
+                       "        NOISE. Re-run on a quiet machine before quoting it.\n");
+            else
+                printf("    monotonic in context throughout: this run is readable.%s\n",
+                       any_win ? "" : "  NO configuration beats the kernel in use.");
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -888,6 +1099,27 @@ int main(int argc, char** argv) {
     if (!ctx) {
         printf("FAIL: no Metal context\n");
         return 1;
+    }
+    // ONE arm, on a heap nothing else has touched.
+    //
+    // Every run here allocates and never frees, and every one of them calls
+    // `make_resident()` on the result -- so an arm's cost depends on how much
+    // of the sweep ran before it. Measured: the shipped split-K arm, which sits
+    // at the END of the decode section, read 0.148 / 0.329 / 0.975 / 0.984 for
+    // the QH=2 baseline whose real cost is 0.192 / 0.307 / 0.369 / 0.430, and
+    // 12k came out slower than 16k -- impossible for the same kernel, which is
+    // what the monotonicity guard in that arm now says out loud.
+    //
+    // `PIE_SDPA_PROBE_SPLIT_ONLY=1` runs that arm alone and exits. It is the
+    // only way to get a number from it worth quoting, and the whole-probe run
+    // is still the right thing for everything that is compared WITHIN a
+    // section.
+    const bool split_only = std::getenv("PIE_SDPA_PROBE_SPLIT_ONLY") != nullptr;
+    if (split_only) {
+        printf("PIE_SDPA_PROBE_SPLIT_ONLY: the shipped split-K arm, alone on a\n"
+               "fresh heap, because this probe's arms are not independent.\n\n");
+        run_shipped_split_arm(*ctx, kernels_dir);
+        return 0;
     }
     std::string err;
     Pso mma = ctx->compile_pso_from_file(kernels_dir + "/sdpa_paged_mma.metal",
@@ -1014,6 +1246,7 @@ int main(int argc, char** argv) {
                        qh, ns, t2, t8, t12, t16);
             }
         }
+        run_shipped_split_arm(*ctx, kernels_dir);
         printf("  A decode step's whole attention is the 16k column x48. The\n"
                "  dispatch trace puts attention at 75-77%% of a decode fire at 23k.\n\n");
     }

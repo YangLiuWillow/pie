@@ -176,6 +176,23 @@ enum class SdpaPaged : uint8_t {
     // declare costs a slot, where an unbound one the kernel DOES declare
     // costs the attention.
     Rows = 17,
+    // Split-K decode attention's partials, read and written by BOTH halves:
+    // `sdpa_paged_decode_split` writes them and `sdpa_paged_split_combine`
+    // merges them, and the two ride one argument table exactly as a split
+    // projection's GEMM and reduce do.
+    //
+    // Bound unconditionally by every family whose binder writes this table,
+    // even where the split kernel can never be selected. The split is a
+    // ROW-COUNT decision made per fire, long after the table is written, so a
+    // slot left unbound for the geometries that "will not split" is a decode
+    // reading attention partials out of whatever the heap held.
+    //
+    // `PartialO` is [q_head][split][head_dim] floats and `PartialMS` is
+    // [q_head][split][2] -- the per-split running max and sum. Float, not the
+    // activation type: they are rescaled and summed downstream, so rounding
+    // them here would lose precision the single-pass kernel never loses.
+    PartialO = 18,
+    PartialMS = 19,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed

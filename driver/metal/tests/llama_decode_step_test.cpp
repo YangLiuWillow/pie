@@ -897,8 +897,11 @@ void check_the_head_sharing_grid_matches_its_kernel() {
     expect(sdpa_head_share_this_fire(128, 32, 32, 4, true) == on,
            "Qwen3-Coder-30B's own 32 heads over 4 follow the switch");
 
-    // And the grid that goes with it. A decode is one row per request; the x
-    // extent is the whole question.
+    // And the grid that goes with it. TWO rows, not one: at a single row the
+    // split-K shape below takes the fire on this geometry, and asking the
+    // head-sharing question there would be asking about a kernel that does not
+    // run. Two rows is above the split's row bound and far below the tiled
+    // kernel's, so it is head sharing's own shape.
     LlamaGeometry g = base();
     g.paged_kv_enabled = true;
     const int per_tg =
@@ -914,7 +917,7 @@ void check_the_head_sharing_grid_matches_its_kernel() {
         if (d.kind != Kind::Sdpa) continue;
         Grid grid{};
         Threadgroup tg{};
-        launch_shape(d, g, grid, tg, /*rows=*/1, /*head_rows=*/1, /*requests=*/1);
+        launch_shape(d, g, grid, tg, /*rows=*/2, /*head_rows=*/2, /*requests=*/1);
         seen = true;
         expect(tg.x == 1024, "the decode shape is 1024 threads either way");
         expect(grid.x == std::uint32_t(g.n_q_heads / per_tg) * 1024u,
@@ -926,6 +929,74 @@ void check_the_head_sharing_grid_matches_its_kernel() {
             static_cast<long long>(grid.x / 1024u) * per_tg;
         expect(heads_covered == g.n_q_heads,
                "the grid covers every query head exactly once, no more and no less");
+        break;
+    }
+    expect(seen, "the llama DAG has an Sdpa dispatch to shape");
+}
+
+/// The split-K decode's grid must cover every head AND tile the key range.
+///
+/// Two extents to get wrong instead of one. Too few threadgroups in x leaves
+/// query heads uncomputed; a z extent that disagrees with the kernel's own `S`
+/// cuts the key range into pieces that do not cover it, which is a softmax over
+/// a subset of the keys -- attention that is quietly wrong rather than absent.
+/// And unlike every earlier attention landing, this shape needs a SECOND
+/// dispatch, so the predicate is also what decides whether the merge runs at
+/// all.
+void check_the_split_grid_matches_its_kernel() {
+    using pie::metal::Grid;
+    using pie::metal::Threadgroup;
+    using pie::metal::kSdpaSplit;
+    using pie::metal::kSdpaSplitHeads;
+    using pie::metal::kSdpaSplitMaxRows;
+    using pie::metal::sdpa_split_this_fire;
+    using pie::metal::llama::launch_shape;
+
+    // Each geometry clause, and the reason the kernel would be wrong without it.
+    expect(!sdpa_split_this_fire(128, 32, 32, 4, 1, 1, /*paged=*/false),
+           "no split without paged KV: the kernel walks a page table");
+    expect(!sdpa_split_this_fire(128, 64, 32, 4, 1, 1, true),
+           "nor at page size 64: the kernel shifts and masks by 32");
+    expect(!sdpa_split_this_fire(64, 32, 32, 4, 1, 1, true),
+           "nor at head_dim 64: only d=128 is instantiated");
+    expect(!sdpa_split_this_fire(128, 32, 16, 8, 1, 1, true),
+           "nor at gqa 2, where a four-head threadgroup spans two KV heads");
+    // The row bound is not a preference. The partials have no row axis, so a
+    // second row would write through the first row's partials.
+    expect(!sdpa_split_this_fire(128, 32, 32, 4, kSdpaSplitMaxRows + 1, 1, true),
+           "nor above one row: the partials buffer has no row axis");
+
+    const bool on = pie::metal::sdpa_split();
+    expect(sdpa_split_this_fire(128, 32, 32, 4, 1, 1, true) == on,
+           on ? "Qwen3-Coder-30B's 32 heads over 4, one row: split"
+              : "PIE_METAL_SDPA_SPLIT=0 refuses a geometry it otherwise serves");
+
+    LlamaGeometry g = base();
+    g.paged_kv_enabled = true;
+    const bool splits = sdpa_split_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
+                                             g.n_kv_heads, /*rows=*/1, /*requests=*/1,
+                                             g.paged_kv_enabled);
+    const auto dag = build_llama_dag(g, true);
+    bool seen = false;
+    for (const auto& d : dag) {
+        if (d.kind != Kind::Sdpa) continue;
+        Grid grid{};
+        Threadgroup tg{};
+        launch_shape(d, g, grid, tg, /*rows=*/1, /*head_rows=*/1, /*requests=*/1);
+        seen = true;
+        if (splits) {
+            expect(grid.x == std::uint32_t(g.n_q_heads / kSdpaSplitHeads) * 1024u,
+                   "split: the grid is n_q_heads/kSdpaSplitHeads wide");
+            expect(grid.z == std::uint32_t(kSdpaSplit),
+                   "split: the grid is exactly kSdpaSplit deep, so the slices tile "
+                   "the key range");
+            const long long heads_covered =
+                static_cast<long long>(grid.x / 1024u) * kSdpaSplitHeads;
+            expect(heads_covered == g.n_q_heads,
+                   "split: every query head is covered exactly once");
+        } else {
+            expect(grid.z == 1u, "no split: the grid has no key-range axis");
+        }
         break;
     }
     expect(seen, "the llama DAG has an Sdpa dispatch to shape");
@@ -993,6 +1064,7 @@ int main() {
     check_streaming_covers_both_ffn_shapes();
     check_the_tiled_attention_is_told_its_row_count();
     check_the_head_sharing_grid_matches_its_kernel();
+    check_the_split_grid_matches_its_kernel();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -824,6 +824,12 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
             std::memset(b.zero_bias.contents(), 0, b.zero_bias.size);
         }
     }
+    // Split-K decode attention's partials. Zero for a geometry that cannot take
+    // that shape, which is most of the cases below -- the dense geometry is gqa
+    // 2 and a four-head threadgroup would span two KV heads.
+    if (const std::size_t sp = llama::llama_sdpa_partial_elems(g); sp > 0) {
+        b.sdpa_partials = ctx.heap_alloc(sizeof(float) * sp);
+    }
     b.io.resize(kIoSlotCount);
     const std::size_t io_bytes =
         std::max<std::size_t>(4096, std::size_t(g.total_pages + 8) * 4);
@@ -1677,6 +1683,30 @@ int main() {
     // changed together and are the only two things that could have.
     run_case("llama-3 (dense, paged)", base_geometry(), *ctx, kernels_dir, 0.06f,
              /*rows=*/1, /*paged=*/true);
+
+    // ── NOT here: the split-K decode attention ──
+    //
+    // It wants a gqa 4 geometry at one row, and THIS TEST CANNOT EXPRESS ONE.
+    // Both ways of reaching gqa 4 from `base_geometry` diverge before attention
+    // is even reached -- with every attention switch OFF, and one of them on
+    // the RING KV path, which this landing does not touch at all:
+    //
+    //   n_kv_heads 2 -> 1  (gqa 4, every other width unchanged)  fails at QmvO
+    //   hidden 512 -> 1024, 8 heads over 2                       fails at QmvGate
+    //
+    // The second is not about gqa: `hidden = 1024` at gqa **2** fails in the
+    // same place and worse (rel_l2 30.2 against 4.4). So `base_geometry`'s
+    // comment understates its own constraint -- 1024 satisfies both rules it
+    // names, K % 512 == 0 and N % 8 == 0, and still does not work. The
+    // reference is sound at one set of widths and has never been asked at
+    // another.
+    //
+    // That is a real hole, recorded in `docs/NEXT-decode-dispatch-count.md`,
+    // but it is a hole in THIS TEST and it predates the split -- the ring-KV
+    // control proves it. The split's correctness is established instead by
+    // `sdpa_paged_probe`, which checks the shipped kernel against a float64
+    // reference across every head, and by a differential serving run against
+    // `PIE_METAL_SDPA_SPLIT=0`.
     run_case("qwen3-moe (routed, paged)", moe, *ctx, kernels_dir, 0.06f, /*rows=*/1,
              /*paged=*/true);
 

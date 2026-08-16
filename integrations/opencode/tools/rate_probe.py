@@ -75,6 +75,7 @@ def one(base_url: str, model: str, nblocks: int, timeout: float) -> dict:
     n = 0
     usage = None
     buf = b""
+    text = []
     while True:
         # read1, not read: `read(n)` blocks until it has n bytes, which would
         # accumulate the whole generation and report TTFT == total.
@@ -97,10 +98,12 @@ def one(base_url: str, model: str, nblocks: int, timeout: float) -> dict:
                 if ev.get("usage"):
                     usage = ev["usage"]
                 for ch in ev.get("choices") or []:
-                    if (ch.get("delta") or {}).get("content"):
+                    piece = (ch.get("delta") or {}).get("content")
+                    if piece:
                         if first is None:
                             first = time.time()
                         n += 1
+                        text.append(piece)
     t1 = time.time()
     if first is None:
         return {"blocks": nblocks, "error": "no content returned"}
@@ -113,6 +116,13 @@ def one(base_url: str, model: str, nblocks: int, timeout: float) -> dict:
         "ttft_s": round(first - t0, 3),
         "decode_s": round(dec, 3),
         "decode_tok_s": round(out / dec, 1) if dec > 0 else None,
+        # The generated TEXT, so one run answers both questions a kernel change
+        # raises. `temperature: 0` makes it a function of the model and the
+        # arithmetic alone, which is what lets two arms of an A/B be compared
+        # for CORRECTNESS and not only for rate -- a kernel that got faster by
+        # computing something else is the failure this catches, and a timing
+        # cannot see it.
+        "text": "".join(text),
     }
 
 
@@ -123,10 +133,18 @@ def main():
     ap.add_argument("--label", required=True)
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--json", default=None)
+    # Three sizes are enough to compare engines and NOT enough to tell an
+    # outlier from a curve. Split-K decode attention read 1.02x / 0.94x / 1.09x
+    # across the default three, and a dip between two gains is exactly the shape
+    # that needs points either side of it before it means anything.
+    ap.add_argument("--blocks", default=None,
+                    help="comma-separated block counts, overriding the default three")
     a = ap.parse_args()
 
+    blocks = ([int(x) for x in a.blocks.split(",") if x.strip()]
+              if a.blocks else BLOCKS)
     rows = []
-    for nb in BLOCKS:
+    for nb in blocks:
         try:
             row = one(a.base_url, a.model, nb, a.timeout)
         except Exception as e:  # a dead server is a result, and must say so

@@ -1496,6 +1496,20 @@ class LlamaEngine final : public SimpleFamilyEngine {
                 std::memset(b_.zero_bias.contents(), 0, b_.zero_bias.size);
             }
         }
+        // Split-K decode attention's partials: ~66 KB for a 32-head d128
+        // checkpoint, and 0 for a geometry that can never take that shape.
+        // Allocated before `bind_llama_dag` because that is what binds it, and
+        // a null handle there means the slots go unbound -- which is correct
+        // only when the split kernel cannot be selected, and that is the same
+        // predicate this size is computed from.
+        const std::size_t sdpa_partial_elems = llama::llama_sdpa_partial_elems(g_);
+        if (sdpa_partial_elems > 0) {
+            b_.sdpa_partials = ctx.heap_alloc(sizeof(float) * sdpa_partial_elems);
+            if (!b_.sdpa_partials.valid()) {
+                if (err) *err = "llama split-K attention partial allocation failed";
+                return false;
+            }
+        }
         // One row per SAMPLED row, padded like the pool: the tail is a GEMM
         // too, and its padding rows land here.
         logits_ = ctx.heap_alloc(std::size_t(llama::llama_qmm_pool_rows(max_sampled_)) *

@@ -125,6 +125,26 @@ inline constexpr int kLlamaSplitkConcurrentLanes = 3;
 /// overlap the next projection's GEMM.
 std::size_t llama_splitk_partial_elems(const LlamaGeometry& g, int max_rows);
 
+/// Floats the split-K DECODE ATTENTION's partials need, or 0 for a geometry
+/// that can never take that shape.
+///
+/// `n_q_heads * kSdpaSplit * (head_dim + 2)`: an unnormalized accumulator per
+/// (query head, split), and the running max and sum beside it. About 66 KB for
+/// a 32-head d128 checkpoint at S=4, which is why it is one buffer for the
+/// whole model rather than one per layer -- a barrier separates every layer's
+/// attention from the next.
+///
+/// There is NO row axis, which is why `sdpa_split_this_fire` admits one row
+/// only. The kernel's indexing and this size are the two halves of that bound.
+std::size_t llama_sdpa_partial_elems(const LlamaGeometry& g);
+
+/// Byte offset of the (max, sum) pairs inside that one buffer.
+///
+/// The two live in one allocation bound at two slots, so this is the offset the
+/// binder passes for `PartialMS`. Spelled here because the kernel's layout and
+/// the bind must agree and there is no third place that could check them.
+std::size_t llama_sdpa_partial_ms_offset(const LlamaGeometry& g);
+
 /// `run_ends[i]`: the last position of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
 std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag);

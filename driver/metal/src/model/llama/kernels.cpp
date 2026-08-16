@@ -48,6 +48,25 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
                          paged_name + "_h" + std::to_string(kSdpaHeadShare),
                          &out.sdpa_paged_hshare});
     }
+    // The split-K decode, on the same terms and through the same predicate. Both
+    // halves or neither: they go in the FATAL spec list together, because a
+    // combine that failed to compile while the split succeeded would leave the
+    // attention output untouched -- the layer would read whatever the activation
+    // pool last held, with nothing to say so.
+    //
+    // The row and request counts are per-fire and this is load time, so they are
+    // passed at the values that would select the shape; every geometry clause is
+    // asked exactly as `pso_for` will ask it.
+    if (sdpa_split_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads, g.n_kv_heads,
+                             /*rows=*/kSdpaSplitMaxRows, /*requests=*/1,
+                             g.paged_kv_enabled)) {
+        const std::string h = "_h" + std::to_string(kSdpaSplitHeads);
+        const std::string s = "_s" + std::to_string(kSdpaSplit);
+        specs.push_back({"sdpa_paged.metal", paged_name + h + s, &out.sdpa_paged_split});
+        specs.push_back({"sdpa_paged.metal",
+                         "sdpa_paged_split_combine_bfloat16" + d + s,
+                         &out.sdpa_paged_split_combine});
+    }
     if (g.rope_freq_table) {
         specs.push_back({"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs});
         specs.push_back({"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb});

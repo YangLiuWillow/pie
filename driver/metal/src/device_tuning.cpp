@@ -136,6 +136,7 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
     t.sdpa_mma = env_bool("PIE_METAL_SDPA_MMA", t.sdpa_mma);
     t.sdpa_head_share =
         env_bool("PIE_METAL_SDPA_HSHARE", t.sdpa_head_share);
+    t.sdpa_split = env_bool("PIE_METAL_SDPA_SPLIT", t.sdpa_split);
     t.sdpa_nax = env_bool("PIE_METAL_SDPA_NAX", t.sdpa_nax);
     t.qmm_nax = env_bool("PIE_METAL_QMM_NAX", t.qmm_nax);
     t.sdpa_nax_min_rows =
@@ -185,6 +186,7 @@ int sdpa_tile_min_rows_per_request() {
 }
 bool sdpa_mma() { return device_tuning().sdpa_mma; }
 bool sdpa_head_share() { return device_tuning().sdpa_head_share; }
+bool sdpa_split() { return device_tuning().sdpa_split; }
 bool sdpa_nax() { return device_tuning().sdpa_nax; }
 bool qmm_nax() { return device_tuning().qmm_nax; }
 int sdpa_nax_min_rows() { return device_tuning().sdpa_nax_min_rows; }

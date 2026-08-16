@@ -289,6 +289,18 @@ struct DeviceTuning {
     /// grid differs between the two shapes, so a partial revert is wrong
     /// numbers rather than a slower kernel.
     bool sdpa_head_share = true;
+    /// Split a single-row decode's KEY RANGE across threadgroups
+    /// (`sdpa_paged_decode_split` + `sdpa_paged_split_combine`) instead of
+    /// giving one threadgroup the whole range.
+    ///
+    /// Off falls back to `sdpa_head_share`, completely: neither pipeline is
+    /// compiled, no selection site can choose it, and the second dispatch is
+    /// not emitted. All three are asked through `sdpa_split_this_fire`, because
+    /// this switch is the one that could half-apply worst -- an off that
+    /// dropped the combine but kept the split would leave the attention output
+    /// holding the previous layer's values, which is not a crash and not a
+    /// slowdown, just wrong logits.
+    bool sdpa_split = true;
     /// Run prefill attention on the M5 neural accelerators (`sdpa_paged_nax`)
     /// instead of the simdgroup matrix unit. Off falls back to
     /// `sdpa_paged_mma`, completely: the pipeline is not compiled and neither
@@ -599,6 +611,7 @@ int sdpa_tile_min_rows_per_request();
 /// Whether a tiled prefill attention runs on the simdgroup matrix unit.
 bool sdpa_mma();
 bool sdpa_head_share();
+bool sdpa_split();
 bool sdpa_nax();
 bool qmm_nax();
 int sdpa_nax_min_rows();

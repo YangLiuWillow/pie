@@ -237,6 +237,9 @@ void check_binds(const char* who, LlamaGeometry g, RawMetalContext& ctx, bool pa
         b.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2 + 64);
     }
     if (g.is_moe()) b.zero_bias = ctx.heap_alloc(4096);
+    if (const std::size_t sp = llama_sdpa_partial_elems(g); sp > 0) {
+        b.sdpa_partials = ctx.heap_alloc(sizeof(float) * sp);
+    }
     b.io.resize(kIoSlotCount);
     for (int i = 0; i < kIoSlotCount; ++i) b.io[std::size_t(i)] = ctx.heap_alloc(4096);
     b.kv.resize(std::size_t(g.n_layers));
@@ -271,6 +274,29 @@ void check_binds(const char* who, LlamaGeometry g, RawMetalContext& ctx, bool pa
         }
     }
     expect(missing == 0, std::string(who) + ": every slot the kernels read is bound");
+
+    // The split-K attention's two partial slots, asked SEPARATELY because they
+    // are conditional on the geometry and the loop above counts a fixed number
+    // of slots per kind. Both directions are checked: bound where the split can
+    // be selected, and the buffer absent where it cannot -- an allocation for a
+    // geometry that never splits would be dead memory, and an unbound slot for
+    // one that does would be a decode reading attention partials out of
+    // whatever the heap last held.
+    if (paged) {
+        const bool splits = llama_sdpa_partial_elems(g) > 0;
+        int bad = 0;
+        for (const Dispatch& d : dag) {
+            if (d.kind != Kind::Sdpa) continue;
+            const bool po = ctx.arg_slot_is_bound(
+                d.ordinal, (std::uint8_t)pie::metal::bind::SdpaPaged::PartialO);
+            const bool pm = ctx.arg_slot_is_bound(
+                d.ordinal, (std::uint8_t)pie::metal::bind::SdpaPaged::PartialMS);
+            if (po != splits || pm != splits) ++bad;
+        }
+        expect(bad == 0, std::string(who) + ": the split-K partials are bound exactly " +
+                             (splits ? "where the split can run" : "nowhere, as this "
+                                                                   "geometry never splits"));
+    }
 
     // A weight name the loader will not have is a load failure, and it should
     // arrive as one rather than as a null binding. Uniform layers mean the

@@ -111,6 +111,15 @@ void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector
                               io(IoSlot::AttnMaskStride));
                     bind_slot(ctx, ord, (std::uint8_t)P::AttnMaskEnabled,
                               io(IoSlot::AttnMaskEnabled));
+                    // The split-K partials, unconditionally where the buffer
+                    // exists at all -- whether a given FIRE splits is a row
+                    // count decided long after this table is written, so
+                    // binding these only for the fires that will split is not
+                    // available here and binding them only for some layers
+                    // would be worse. One buffer, two slots, one offset apart.
+                    bind_slot(ctx, ord, (std::uint8_t)P::PartialO, b.sdpa_partials);
+                    bind_slot(ctx, ord, (std::uint8_t)P::PartialMS, b.sdpa_partials,
+                              llama_sdpa_partial_ms_offset(g));
                     break;
                 }
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::K, kv.k);

@@ -49,6 +49,16 @@ struct BoundLlama {
     /// keeps not reading it. Binding zeros costs one small allocation and makes
     /// the guarantee independent of the kernel's internals.
     SlotHandle zero_bias{};
+    /// Partials for the split-K decode attention, sized by
+    /// `llama_sdpa_partial_elems` and bound at `SdpaPaged::PartialO` /
+    /// `PartialMS` on EVERY layer's attention.
+    ///
+    /// One buffer for the whole model, not one per layer: a barrier separates
+    /// each layer's attention from the next, and the split's own combine sits
+    /// between the write and any reuse. Left invalid by a geometry that can
+    /// never split, where both slots simply go unbound and no kernel that
+    /// declares them can be selected.
+    SlotHandle sdpa_partials{};
     SlotHandle argmax_params{};
     SlotHandle eos_flag{};
 };

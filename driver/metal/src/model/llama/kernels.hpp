@@ -65,6 +65,15 @@ struct LlamaPsos {
     /// otherwise -- `pso_for` falls back to `sdpa_paged`, which is what every
     /// checkpoint did before this existed.
     Pso sdpa_paged_hshare{};
+    /// The single-row decode again with the KEY RANGE split across
+    /// threadgroups, and the pass that merges the per-split partial softmaxes.
+    ///
+    /// The two are ONE unit: a split without its combine leaves the attention
+    /// output untouched. They are compiled together, selected together through
+    /// `sdpa_split_this_fire`, and dispatched back to back inside one DAG node
+    /// -- the same arrangement a split projection's GEMM and reduce have.
+    Pso sdpa_paged_split{};
+    Pso sdpa_paged_split_combine{};
     /// The same paged prefill attention on the M5 NEURAL ACCELERATORS. The
     /// matrix-unit kernel below is compute-bound at 3.2 TFLOP/s against a 5.48
     /// simdgroup ceiling; this one measures 10.75, which no simdgroup kernel
