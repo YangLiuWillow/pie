@@ -938,6 +938,53 @@ would be worth. Cheapest first cut: the four norms per layer are 193 dispatches
 costing 0.54 ms of which nearly all is floor — fusing each into the projection
 that consumes it removes ~190 dispatches for free.
 
+### RE-TRACED after the device-handle cache: the kernels did not move
+
+The composition above was measured on a 17.38 ms step. The step is now 14.17 ms,
+so the whole table had to be re-run before anything is planned against its
+shares. Same harness, same shape (rows=1, ctx 7424), **drift +0.00%** across the
+run — baseline 14.23 ms first and 14.23 ms last:
+
+| block | now | before | share of the 14.23 ms step |
+|---|---:|---:|---:|
+| attention (`sdpa`) | 5.16 ms | 5.20 | **36.3%** |
+| routed `ll_expert_gate,ll_expert_up` | 4.00 ms | 4.02 | **28.1%** |
+| dense matvecs incl. LM head | 3.07 ms | 3.00 | **21.6%** |
+
+**Every kernel absolute is unchanged — within 0.07 ms — while the step fell 3.26
+ms.** That settles something the commit left open: the saving was entirely
+host-side, so **the ~0.7 ms this file could not account for is host time too,
+not driver time.** It narrows where the residual can be hiding, and it is the
+one new fact this re-trace produced.
+
+What it re-weights: attention is now **over a third of a decode step**, and the
+three blocks together are 86% of it. Nothing was displaced; the denominator
+shrank.
+
+#### The rest of the re-trace reproduces the artifacts, and that is the check
+
+`rms` priced at 2.51 ms (17.6%) and `ll_moe_gather` at 2.09 ms (14.7%) — within
+noise of the 2.49 and 2.12 the section above already proved are inflated 4.6×
+and 10× by ablating a kernel whose output feeds arithmetic that diverges to inf.
+The isolated 0.54 and 0.22 stand; these two rows are not costs and are excluded
+from the table above.
+
+Two cheap internal checks say the same thing without appealing to the earlier
+work at all:
+
+* **The deltas sum to 17.66 ms against a 14.23 ms step — 124%.** Shares are
+  expected to sum to *less* than 100% (a step also contains barriers and the
+  sampler). More than 100% is proof that at least 3.4 ms of these deltas are
+  double-counted downstream slowdown.
+* **`ll_expert_down` prices at 0.06 ms (0.4%)** — a routed projection reading the
+  same weight class as the gate/up pair that costs 4.00 ms. A third projection of
+  that size cannot cost 1.5% of its siblings. Whatever the ablation is measuring
+  there, it is not the kernel.
+
+So the re-trace corroborates the three blocks and reproduces every known artifact
+in the same places. That is what a healthy instrument looks like: it should keep
+being wrong in the ways it is documented to be wrong.
+
 ### THE ROOFLINE WAS WRONG: 296 GB/s is not reachable by this access pattern
 
 Five attacks on attention's "2.05× off roofline" moved nothing. The sixth
