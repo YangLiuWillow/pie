@@ -289,9 +289,34 @@ impl ProcessCtx {
             let fwd: Resource<ForwardPass> = Resource::new_borrow(*rep);
             let _ = self.ctx().table.get(&fwd)?;
         }
+        // PIE_SUBMIT_TRACE=1 prices this call's three phases.
+        //
+        // Worth having permanently because of what it ruled OUT. The guest
+        // measures `fwd.submit` at 2.69 ms of a 17.4 ms decode step -- ~15%,
+        // host-side, and fixed per fire rather than proportional to work. None
+        // of it is here: admission and the residency gate are 0.000 ms and
+        // `submit_frame` is 0.03 ms. It is in `core_program`, which the guest's
+        // `attach_program` calls just before this, and which runs for EVERY
+        // token because both `decode-rows-probe` and `opencode-session` build a
+        // fresh `Pass` per fire.
+        let trace = std::env::var_os("PIE_SUBMIT_TRACE").is_some();
+        let t0 = trace.then(std::time::Instant::now);
         crate::inferlet::process::ensure_execution_admitted(self).await;
+        let t1 = trace.then(std::time::Instant::now);
         crate::inferlet::process::gate::residency_gate(self).await?;
-        crate::pipeline::fire::submit_frame(self, on, slot_reps).await
+        let t2 = trace.then(std::time::Instant::now);
+        let out = crate::pipeline::fire::submit_frame(self, on, slot_reps).await;
+        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+            let t3 = std::time::Instant::now();
+            eprintln!(
+                "[submit] admit={:.3}ms residency={:.3}ms submit_frame={:.3}ms total={:.3}ms",
+                (t1 - t0).as_secs_f64() * 1e3,
+                (t2 - t1).as_secs_f64() * 1e3,
+                (t3 - t2).as_secs_f64() * 1e3,
+                (t3 - t0).as_secs_f64() * 1e3
+            );
+        }
+        out
     }
 }
 

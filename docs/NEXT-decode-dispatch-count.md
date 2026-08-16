@@ -649,6 +649,62 @@ against 0.040 / 0.120 / 0.173 / 0.234 before, QH=4 S=4 at 1.18× / 1.14× / 1.17
 agreeing to the third decimal. **Fixing the instrument was worth more than any
 kernel attempt in this section.**
 
+### ATTRIBUTED: the 2.7 ms is a per-fire PROGRAM BIND, redone every token
+
+The submit cost is now located. Measured with `PIE_SUBMIT_TRACE=1` (host) and a
+temporary timer in the SDK's `attach_program` (guest):
+
+| where | cost |
+|---|---:|
+| guest `fwd.submit(pipe)` — what the probe reports | **2.69 ms** |
+| ├ `attach_program`: `builder.build()` | 0.008 ms |
+| ├ `attach_program`: `traced.encode()` | 0.004 ms |
+| ├ **`attach_program`: `wit.program(bytes)`** | **2.0–2.9 ms** |
+| └ the `submit` WIT call → host `core_submit` | 0.03 ms |
+| *inside `core_program`:* `program::register` (compile) | **0.001 ms** |
+| *inside `core_program`:* `ensure_bind_admitted` | 0.000 ms |
+
+**It is not the program, and not compilation.** The program is **230 bytes with
+10 channels**, building and encoding it costs 0.012 ms, and `program::register`
+is hash-deduped and returns in 1 µs. Nor is it the WIT boundary: the `submit`
+call beside it crosses the same boundary for 0.03 ms.
+
+What costs is everything in `core_program` AFTER the cache hit — channel
+registration, instance bind, and the pooled-KV seed claim, which that function's
+own comment calls out as "per-instance driver state". It is **per-instance work
+repeated for an identical 230-byte program, once per token.**
+
+#### Why it repeats
+
+`Pass::attach_program` short-circuits on `program_attached`, so the machinery to
+do this once already exists. It never fires, because **both callers construct a
+fresh `Pass` per fire**:
+
+    runtime/engine/tests/inferlets/decode-rows-probe/src/lib.rs   ForwardPass::new()  per fire
+    inferlets/opencode-session/src/engine.rs:605                  Pass::new()         per token
+
+So this is not a probe artifact — the serving path has the same shape, which is
+what makes it worth ~15% of a decode step in production.
+
+#### The fix, and what has to be checked first
+
+Two candidate shapes, and they are not equivalent:
+
+1. **Guest-side: hoist the `Pass` out of the decode loop** and re-`put` the
+   channels per token. Cheapest if the ports can stay bound to the same channel
+   objects while their VALUES change — that needs checking, because
+   `attach_program` binds ports to specific channel handles and a fresh channel
+   per fire would invalidate the attachment.
+2. **Host-side: cache the per-instance bind** alongside the existing program
+   cache, keyed the same way. Fixes every caller at once without touching any
+   inferlet, but it is the more invasive change and the KV seed claim may not be
+   safely reusable across fires.
+
+**Neither is a kernel change, and this is the largest single item left in a
+decode step.** `PIE_SUBMIT_TRACE=1` is kept in `core_submit` permanently — not
+because that is where the time is, but because it is what proved the time is
+NOT in admission, the residency gate or `submit_frame`.
+
 ### THE DECODE GAP IS NOT IN THE KERNELS: 15.5% is fixed HOST SUBMIT
 
 A decode step, fully attributed for the first time (ctx 7424, rows=1, 17.38 ms):
