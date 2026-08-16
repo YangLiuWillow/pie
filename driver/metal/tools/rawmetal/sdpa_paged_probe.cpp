@@ -481,9 +481,16 @@ double hshare_run(RawMetalContext& ctx, Pso pso, int heads, int ctx_len, int ord
 // gives a threadgroup one head). It changes the grid's x extent AND the
 // threadgroup size, and both are stated here from the same value for the
 // reason the note above gives.
+// `heads` and `kv` default to the serving geometry, but are parameters because
+// they had to become one: `llama_numerics_test` uses n_q_heads=4 / n_kv_heads=2
+// (gqa 2), and every correctness shape here had been 32 heads over 4 (gqa 8).
+// A kernel verified only at gqa 8 is not verified at gqa 2, and the 48-row
+// numerics failure is exactly the case that gap could hide.
 double nax_prefill_run(RawMetalContext& ctx, Pso pso, int rows, int ctx_len,
-                       int ordinal, bool check, int nwarps, int qh = 1) {
-    constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
+                       int ordinal, bool check, int nwarps, int qh = 1,
+                       int heads = 32, int kv = 4) {
+    const int kHeads = heads, kKv = kv;
+    constexpr int kD = 128, kPage = 32;
     const int kBQ = nwarps * 16;
     const int gqa = kHeads / kKv;
     const int total = ctx_len + rows;
@@ -663,8 +670,9 @@ ErrStats compare_to_reference(const uint16_t* got, const std::vector<float>& qf,
 // The shipped NAX kernel carries that ABI byte for byte, deliberately, which is
 // what makes this comparison a one-line difference rather than a second rig.
 void accuracy_ab(RawMetalContext& ctx, Pso mma, Pso nax, int rows, int ctx_len,
-                 int ordinal) {
-    constexpr int kH = 32, kKv = 4, kD = 128, kPg = 32;
+                 int ordinal, int heads = 32, int kvh = 4) {
+    const int kH = heads, kKv = kvh;
+    constexpr int kD = 128, kPg = 32;
     const int gqa = kH / kKv, total = ctx_len + rows;
     const int pages = (total + kPg - 1) / kPg + 1;
     auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
@@ -963,6 +971,17 @@ int main(int argc, char** argv) {
                     printf("    "); nax_prefill_run(*ctx, pf, 40, 96, 902, true, 4);
                     printf("    "); nax_prefill_run(*ctx, pf, 17, 1, 903, true, 4);
                     printf("    "); nax_prefill_run(*ctx, pf, 184, 224, 904, true, 4);
+                    // The geometry `llama_numerics_test` actually uses -- 4
+                    // query heads over 2 KV heads -- at the row counts that
+                    // regressed when the NAX gate was lowered. Everything above
+                    // is gqa 8; this is gqa 2, and 48 rows single-request is the
+                    // one failure that revert left unexplained.
+                    printf("  gqa=2 (4 heads over 2), the numerics test's geometry:\n");
+                    for (const int r : {32, 40, 48, 56, 64}) {
+                        printf("    rows=%-3d ", r);
+                        nax_prefill_run(*ctx, pf, r, 48, 940 + r, true, 4, 1,
+                                        /*heads=*/4, /*kv=*/2);
+                    }
                     const double t = nax_prefill_run(*ctx, pf, 184, 7424, 905, false, 4);
                     printf("    184 rows @ 7424  %7.3f ms/layer  x48 = %6.1f ms"
                            "  (%5.2f TFLOP/s)  %.2fx the 2.082 baseline\n",
@@ -989,6 +1008,14 @@ int main(int argc, char** argv) {
             printf("  accuracy, both against a float64 reference:\n");
                 accuracy_ab(*ctx, mma, shipped_nax, 184, 224, 600);
                 accuracy_ab(*ctx, mma, shipped_nax, 184, 1024, 601);
+                // The numerics test's own geometry and the row count whose
+                // routing tie flipped. The question this answers is narrow and
+                // is the only one that matters for shipping a lower row gate:
+                // is NAX LESS accurate here than the kernel it replaces? A tie
+                // that flips because the new kernel is worse is a regression; a
+                // tie that flips because it rounds differently is arbitrary.
+                printf("  at the numerics test's geometry (4 heads over 2), 48 rows:\n");
+                accuracy_ab(*ctx, mma, shipped_nax, 48, 48, 602, /*heads=*/4, /*kvh=*/2);
             }
             printf("\n");
         }

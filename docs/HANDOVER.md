@@ -175,9 +175,12 @@ to be found by profiling rather than porting.
    `bench_ab.py`'s canned replay, fixed-prompt single requests — and use
    `tools/pie_ab.sh` when an agentic number is unavoidable.
 
-4. **`llama_numerics_test` is 51 pass / 18 fail, pre-existing** and unchanged
-   through all of this. MoE routing ties, first divergence at a layer-0
-   projection.
+4. **`llama_numerics_test` is 50 pass / 19 fail.** 18 are pre-existing MoE
+   routing ties with a first divergence at a layer-0 projection. The 19th was
+   added deliberately on 2026-08-16 by lowering `sdpa_nax_min_rows` to 32, and
+   is the same class: the test's own diagnostic prints the margin (0.0176) as
+   inside the routers' own disagreement (0.0215). The kernel is verified
+   correct AND equally accurate at that geometry -- see the constant's comment.
 
 5. **pie strategy B fails under concurrent load** (10 of 32 completed, 22 HTTP
    500). Unchanged and undiagnosed.
@@ -197,7 +200,7 @@ cmake --build /tmp/metaltools -j 8
 | `llama_decode_step_test` | 232 pass (and with each NAX/HSHARE switch off) |
 | `kv_append_paged_pso_test` | 13 pass |
 | `gptoss_decode_step_test` | all pass |
-| `llama_numerics_test` | 51 / 18 pre-existing fail |
+| `llama_numerics_test` | **50 / 19** — 18 pre-existing plus one routing tie the NAX row gate flips; see `sdpa_nax_min_rows` |
 
 | probe | answers |
 |---|---|

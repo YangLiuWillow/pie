@@ -320,33 +320,31 @@ struct DeviceTuning {
     /// takes NAX at every threshold and should therefore be identical in all
     /// four columns, spans 359.2-377.3 ms. ~5% is the floor; 3.6% is under it.
     ///
-    /// **AND YET IT STAYS AT 64.** Lowering it regresses `llama_numerics_test`
-    /// from 51/18 to 48/21, and the three new failures bisect cleanly:
+    /// Lowering it moves `llama_numerics_test` from 51/18 to **50/19**, and
+    /// that one extra failure is accepted deliberately rather than dodged.
+    /// The evidence, in the order it was gathered:
     ///
-    ///     min 48, 41  -> +1   "qwen3-moe (routed, 48 rows: the batched mixture)"
-    ///     min 40, 33, 32 -> +3, adding both "40 rows over 2 requests" cases
-    ///
-    /// The two-request pair is a TEST-HARNESS artifact and not a production
-    /// bug: serving computes `requests` from the CSR
-    /// (`qo_indptr.size() - 1`, `simple_family.cpp`), so a real multi-request
-    /// fire never reaches this predicate with `requests == 1`. The numerics test
-    /// calls the encoder without passing `requests` at all, so it defaults to 1
-    /// while the DATA is two requests -- and the NAX kernel then resolves one
-    /// page base for a tile spanning both, which is exactly the case the
-    /// `requests == 1` clause exists to exclude. Instrumented directly rather
-    /// than reasoned about: `PIE_METAL_SDPA_TRACE=1` prints
-    /// `[nax] hd=128 page=32 rows=40 requests=1 paged=1 min=40 -> NAX`.
-    ///
-    /// The 48-row single-request failure is NOT explained and is the reason
-    /// this is reverted rather than worked around. It may be a real defect at
-    /// 40-63 rows for that geometry, or another harness gap; `sdpa_paged_probe`
-    /// verifies 40 and 70 rows correct at 32 heads / gqa 8, which is not the
-    /// geometry the numerics test uses.
-    ///
-    /// The cliff is real and costs 2.28x on a 32-row fire, but serving rarely
-    /// fires 32-63 rows -- `aligned_prefill_chunks` emits a large multiple of 8
-    /// plus a remainder below 16 -- so the win is small and the risk is not.
-    int sdpa_nax_min_rows = 64;
+    ///   * Lowering to 32 first gave 48/21. Two of those three were a TEST
+    ///     harness bug, not a kernel one: the numerics test's two-request arm
+    ///     called `encode_llama_step` without `requests`, so it defaulted to 1
+    ///     while the DATA was two requests, and every kernel that fire selected
+    ///     was chosen as if there were one. Serving computes `requests` from
+    ///     the CSR and never does that. The test now passes it, and those two
+    ///     failures are gone.
+    ///   * The remaining one is `qwen3-moe (routed, 48 rows: the batched
+    ///     mixture)`, and the test's own diagnostic calls it: "row 1 routed
+    ///     differently; the earliest selection it could have flipped on decided
+    ///     at a margin of 0.0176, inside the routers' own disagreement of
+    ///     0.0215". A routing tie -- the same class as the 18 that already fail.
+    ///   * The kernel is not wrong there. `sdpa_paged_probe` now carries the
+    ///     numerics test's own geometry (4 query heads over 2, gqa 2, which
+    ///     nothing had covered -- every other shape is gqa 8) and reports 0
+    ///     wrong at 32, 40, 48, 56 and 64 rows against a float64 reference.
+    ///   * And it is not less ACCURATE there, which is what would make a tie
+    ///     flip a regression rather than a coin toss: at that geometry and 48
+    ///     rows, mean error 1.34e-3 against the matrix kernel's 1.34e-3, p99
+    ///     3.57e-3 against 4.39e-3.
+    int sdpa_nax_min_rows = 32;
 
     /// Lanes that share one value row of the gated-delta scan.
     ///

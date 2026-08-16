@@ -1383,7 +1383,18 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         write_paged_io_rows(rows, {1u, 0u}, {0u, 1u, 2u},
                             {0u, std::uint32_t(a), std::uint32_t(R)});
         ctx.run_step([&](StepEncoder& se) {
-            encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, R, R);
+            // `requests` is passed, and until 2026-08-16 it was NOT -- it
+            // defaulted to 1 while this arm's DATA is two requests, so every
+            // kernel this fire selected was chosen as if there were one. That
+            // is not a cosmetic gap: `sdpa_should_tile` and
+            // `sdpa_nax_this_fire` both branch on it, and the whole point of
+            // this arm is that a row attending the wrong request gets visibly
+            // wrong numbers. It was found when lowering the NAX row threshold
+            // made these cases fail -- the kernel took a path this test was
+            // silently telling it was legal, and the failure was real for the
+            // configuration the test had actually described.
+            encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, R, R,
+                              /*requests=*/2);
         });
         int ambiguous = 0;
         std::vector<bool> permuted;
