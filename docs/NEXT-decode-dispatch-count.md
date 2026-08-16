@@ -570,37 +570,66 @@ matters:
 Conflating the two is what made the layout look promising. The rule is about the
 addresses inside one instruction, not about the shape of the stream over time.
 
+### BUILT, CORRECT, NOT MEASURED: the unroll gated inside the kernel
+
+The one rejected idea with a real win behind it. The key-loop unroll gave +7% at
+12k/16k and −19% end to end at 5,840 tokens, and was discarded WHOLE because
+neither `pso_for` nor `launch_shape` is handed the context length. **The kernel
+is** — `total = position_ids[0] + 1` is right there and uniform across the
+threadgroup, so a branch on it costs nothing and picks the unrolled loop only
+where it pays.
+
+`tools/rawmetal/kernels/sdpa_ugate_decode.metal`, correct at 8191, three arms:
+
+| `UGATE` | what it is |
+|---|---|
+| 0 | the unrolled code present and NEVER taken — a control for its own register pressure |
+| 8192 | the shape that would ship |
+| 1 | the original rejected kernel |
+
+**The question is not the speedup, it is the `never` arm at 2k.** A branch does
+not undo register allocation: the compiler allocates for the worst path, so if
+the unrolled loop's registers cost anything they are charged on every fire
+whichever branch runs — and that is the most likely explanation for a 19%
+regression caused by a change that only touched long-context behaviour.
+
+**And that question is unanswered, because the harness cannot currently ask
+it.** `split_run` allocates ~68 MB of K and V per timing and frees nothing, and
+this arm makes dozens of calls; by the end the interleaved baseline is no longer
+monotonic and the guard rejects the rows. Concretely, the SAME call on the SAME
+shipped kernel reads **0.040 ms at 2k in a short arm and 0.097–0.117 ms here**,
+so every 2k ratio in this arm is the reference moving rather than the kernel.
+
+What survived the guard, across runs, is only this: `always` is ~1.11–1.18× at
+16k, consistent with the original +7% claim, and `never` is ~1.00× at 16k. The
+2k column — the one that decides it — is not measurable until the probe reuses
+its buffers instead of allocating per call.
+
+**So the next action here is to the INSTRUMENT, not the kernel**: give
+`split_run` a cache keyed on `ctx_len` so repeated timings reuse their K/V
+buffers. That is a contained change and it unblocks this question and any other
+that needs more than a handful of timings in one arm.
+
 ### What is left to try, in order
 
 Attention is 5.05 ms against a 2.47 ms roofline — 145 GB/s achieved, **49% of
-the 296 GB/s roof**. It is not bandwidth-saturated and it is not obviously
-fixable: the reductions (LPK sweep), the load overlap (unroll), the parallelism
-(split-K, 1.06× in situ) and now the layout have all been measured and all
-rejected or nearly so.
+the 296 GB/s roof**. Its reductions (the LANES_PER_KEY sweep), its parallelism
+(split-K, 1.06× in situ) and its page layout have all been measured and
+rejected. The load overlap is the one thing left, and it is blocked on the
+instrument above.
 
-**1. The key-loop unroll, gated INSIDE the kernel on context.** The one idea
-here with a measured win that was thrown away for the wrong reason. It won 7% at
-12k/16k and cost 19% at 5,840 tokens, and was discarded whole because neither
-`pso_for` nor `launch_shape` is handed the context length. **The kernel is** —
-`total = position_ids[0] + 1` is right there. A uniform branch on it picks an
-unrolled loop only where the unroll pays. That is cheap to build and cheap to
-test, and it is worth ~7% of attention, ~2% of a step, at the long contexts an
-agentic turn actually runs at.
-
-**2. Accept attention where it is and take the smaller blocks.** The routed FFN
-has 0.97 ms available at 1.32× off; the dense matvecs 0.62 ms at 1.27× off.
-Neither is a big win but both are unexplored, and the dense group is nine
-dispatches behind one pipeline. Split the 2.96 ms across those nine first — the
-LM head is K=2048 × N=151936 running ONCE and the others are narrow and run 48×,
-so they are not one problem.
-
-**3. Question the roofline itself.** 2.47 ms assumes the KV stream can run at
-296 GB/s. Every attempt to give this kernel more of what a bandwidth-bound
-kernel wants has failed to move it, which is weak evidence that a paged gather
-with a dependent page-table lookup simply does not reach the streaming roof. If
-that is true the real headroom is smaller than 14.9% and the honest thing is to
-measure the achievable roof for THIS access pattern rather than assume the
-streaming one.
+1. **Fix `split_run`'s allocation**, then settle the gated unroll. Worth ~7% of
+   attention, ~2% of a step, at the contexts an agentic turn runs at.
+2. **The routed FFN**, 0.97 ms available at 1.32× off roofline.
+3. **The dense matvecs**, 0.62 ms at 1.27× off — nine dispatches behind one
+   pipeline, but split the 2.96 ms across them first: the LM head is
+   K=2048 × N=151936 running ONCE and the rest are narrow and run 48×.
+4. **Question the 2.47 ms roofline.** It assumes the KV stream reaches 296 GB/s.
+   Four separate attempts to give this kernel what a bandwidth-bound kernel
+   wants have failed to move it, which is weak evidence that a paged gather with
+   a dependent page-table lookup simply does not reach the streaming roof. If so
+   the real headroom is well under 14.9%, and measuring the achievable roof for
+   THIS access pattern is worth more than another kernel variant.
 
 **Measure any candidate the way split-K had to be measured**: the isolated
 kernel ratio overstated the transferable gain by 2.8×, so price it with

@@ -1256,6 +1256,78 @@ void run_layout_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
     }
 }
 
+// The rejected unroll, gated on context inside the kernel.
+//
+// Three arms, and the interesting one is NOT the speedup:
+//   never   UGATE=0, the unrolled code present but never taken. If this is
+//           slower than the shipped kernel at 2k, the compiler allocated for
+//           the unrolled path and the branch cannot save it -- which would
+//           explain the original -19% at short context and kill the idea.
+//   gated   UGATE=8192, the shape that would ship.
+//   always  UGATE=1, the original rejected kernel, for the 7% it claimed.
+void run_ugate_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
+    printf("\nKEY-LOOP UNROLL, gated on context inside the kernel:\n");
+    const std::string sp_path = kernels_dir + "/sdpa_paged.metal";
+    std::string eb;
+    Pso base = ctx.compile_pso_from_file(
+        sp_path, "sdpa_paged_decode_bfloat16_d_128_p32_h2", &eb);
+    if (!base.valid()) { printf("  baseline compile fail: %s\n", eb.c_str()); return; }
+    const std::string ld = PIE_METAL_TOOL_LOCAL_KERNELS_DIR;
+
+    // Warm on the baseline before anything is compared.
+    double prev = 0; int warm = 0;
+    for (; warm < 40; ++warm) {
+        const double t = split_run(ctx, base, Pso{}, 2, 1, 16383, 2000, false, true);
+        if (prev > 0 && std::abs(t - prev) < 0.05 * prev) break;
+        prev = t;
+    }
+    printf("  clocks settled after %d passes%s\n", warm, warm >= 40 ? "  <-- NEVER SETTLED" : "");
+
+    // INTERLEAVED, arm then baseline at each context, back to back.
+    //
+    // Measuring the baseline once up front does not work here and the failure
+    // is instructive: that block read 0.095 / 0.191 / 0.248 / 0.306 while the
+    // `never` arm -- which is the SAME algorithm with the unroll not taken --
+    // read 0.040 / 0.119 / 0.177 / 0.239 in the same run, matching what the
+    // shipped kernel measures everywhere else. A reference measured at a
+    // different moment from the thing it references is not a reference.
+    // TWO contexts, not four. This arm allocates ~34 MB per timing and frees
+    // nothing, and at four contexts x three arms the heap grows enough that the
+    // interleaved baselines stop being monotonic and the guard rejects every
+    // row. Two contexts are also the whole question: does `never` regress at 2k
+    // (registers), and does `gated` win at 16k (the unroll).
+    const int cs[2] = {2047, 16383};
+    struct Arm { const char* name; const char* file; };
+    const Arm arms[3] = {
+        {"never  (U present, not taken)", "/sdpa_ugate_g0.metal"},
+        {"gated  (>= 8192)",              "/sdpa_ugate_g8192.metal"},
+        {"always (the rejected one)",     "/sdpa_ugate_g1.metal"},
+    };
+    for (int a = 0; a < 3; ++a) {
+        std::string ea;
+        Pso k = ctx.compile_pso_from_file(ld + arms[a].file, "sdpa_ugate_decode", &ea);
+        if (!k.valid()) { printf("  %s compile fail: %s\n", arms[a].name, ea.c_str()); continue; }
+        printf("  %-30s ", arms[a].name);
+        split_run(ctx, k, Pso{}, 2, 1, 8191, 2100 + a, true, true);
+        double t[2], bl[2];
+        bool noisy = false;
+        for (int i = 0; i < 2; ++i) {
+            t[i]  = split_run(ctx, k,    Pso{}, 2, 1, cs[i], 2110 + a * 8 + i, false, true);
+            bl[i] = split_run(ctx, base, Pso{}, 2, 1, cs[i], 2200 + a * 8 + i, false, true);
+        }
+        // 16k is 8x the keys of 2k; anything under 3x on the same kernel is the
+        // machine moving, not the kernel.
+        if (t[1] < t[0] * 3.0 || bl[1] < bl[0] * 3.0) noisy = true;
+        printf("  %-30s 2k %7.3f  16k %7.3f   -> %5.2fx %5.2fx%s\n", arms[a].name,
+               t[0], t[1], t[0] > 0 ? bl[0] / t[0] : 0.0, t[1] > 0 ? bl[1] / t[1] : 0.0,
+               noisy ? "   NOISE" : "");
+        printf("  %-30s 2k %7.3f  16k %7.3f   (its own interleaved baseline)\n", "",
+               bl[0], bl[1]);
+    }
+    printf("  Read the 2k column of `never` FIRST: if it is below 1.00x the\n"
+           "  unrolled path costs registers even when it does not run.\n");
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -1288,6 +1360,11 @@ int main(int argc, char** argv) {
     // only way to get a number from it worth quoting, and the whole-probe run
     // is still the right thing for everything that is compared WITHIN a
     // section.
+    if (std::getenv("PIE_SDPA_PROBE_UGATE_ONLY") != nullptr) {
+        printf("PIE_SDPA_PROBE_UGATE_ONLY: the unroll-gate arm alone on a fresh heap.\n");
+        run_ugate_arm(*ctx, kernels_dir);
+        return 0;
+    }
     if (std::getenv("PIE_SDPA_PROBE_LAYOUT_ONLY") != nullptr) {
         printf("PIE_SDPA_PROBE_LAYOUT_ONLY: the KV layout arm alone on a fresh heap.\n");
         run_layout_arm(*ctx, kernels_dir);
