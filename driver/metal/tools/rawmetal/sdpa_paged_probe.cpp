@@ -460,6 +460,138 @@ double hshare_run(RawMetalContext& ctx, Pso pso, int heads, int ctx_len, int ord
     return r.median.gpu_exec_ms;
 }
 
+// The fused NAX prefill attention: correctness FIRST, then rate.
+//
+// That order is not a style preference. `results-*.md` records a NAX kernel
+// measured at 1.652 ms/layer and reported three times before a CPU reference
+// showed it computed the wrong thing -- a timing cannot tell correct attention
+// from a transposed operand, because both do the same FLOPs at the same rate.
+//
+// Data is distinct per query head AND per KV head, so a kernel that computed
+// the right arithmetic against the wrong head cannot pass.
+// `nwarps` is NOT optional and NOT defaulted. The kernel's query tile is
+// `nwarps * 16` rows and its threadgroup is `nwarps * 32` threads, and the
+// launch has to state both. An earlier version hardcoded 64 and 128 here and
+// swept the kernel constant anyway -- which is the `pso_for` / `launch_shape`
+// disagreement this repo documents, reproduced inside the instrument meant to
+// measure it. It reported a BQ=128 kernel as 24576 elements WRONG when the
+// kernel was fine and the grid was a different kernel's.
+double nax_prefill_run(RawMetalContext& ctx, Pso pso, int rows, int ctx_len,
+                       int ordinal, bool check, int nwarps) {
+    constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
+    const int kBQ = nwarps * 16;
+    const int gqa = kHeads / kKv;
+    const int total = ctx_len + rows;
+    const int pages = (total + kPage - 1) / kPage + 1;
+    auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+    auto unbf = [](uint16_t h) { uint32_t u = uint32_t(h) << 16; float f;
+                                 std::memcpy(&f, &u, 4); return f; };
+
+    SlotHandle q = ctx.heap_alloc(size_t(rows) * kHeads * kD * 2);
+    SlotHandle kp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle vp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle o = ctx.heap_alloc(size_t(rows) * kHeads * kD * 2);
+    SlotHandle pos = ctx.heap_alloc(size_t(rows) * sizeof(int));
+    SlotHandle pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    auto* qz = static_cast<uint16_t*>(q.contents());
+    auto* kz = static_cast<uint16_t*>(kp.contents());
+    auto* vz = static_cast<uint16_t*>(vp.contents());
+    std::memset(kz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(vz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(o.contents(), 0, size_t(rows) * kHeads * kD * 2);
+    for (int p = 0; p < pages; ++p) static_cast<uint32_t*>(pidx.contents())[p] = uint32_t(p);
+    for (int r = 0; r < rows; ++r) static_cast<int*>(pos.contents())[r] = ctx_len + r;
+
+    // Kept for the reference. Only allocated when it will be used: at the rate
+    // shape this would be 32 x 7608 x 128 floats and the rate run never reads it.
+    std::vector<float> qf, kf, vf;
+    if (check) {
+        qf.assign(size_t(rows) * kHeads * kD, 0.f);
+        kf.assign(size_t(kKv) * total * kD, 0.f);
+        vf.assign(kf.size(), 0.f);
+    }
+    for (int r = 0; r < rows; ++r)
+      for (int h = 0; h < kHeads; ++h)
+        for (int d = 0; d < kD; ++d) {
+          const float x = float((r * 2 + h * 3 + d) % 7) * 0.125f;
+          qz[(size_t(r) * kHeads + h) * kD + d] = bf(x);
+          if (check) qf[(size_t(r) * kHeads + h) * kD + d] = x;
+        }
+    for (int c = 0; c < total; ++c)
+      for (int h = 0; h < kKv; ++h)
+        for (int d = 0; d < kD; ++d) {
+          const float kk = float((c + 2 * d + 5 * h) % 4) * 0.125f;
+          const float vv = float((3 * c + d + 11 * h) % 6) * 0.25f;
+          kz[(size_t(c) * kKv + h) * kD + d] = bf(kk);
+          vz[(size_t(c) * kKv + h) * kD + d] = bf(vv);
+          if (check) {
+              kf[(size_t(h) * total + c) * kD + d] = unbf(bf(kk));
+              vf[(size_t(h) * total + c) * kD + d] = unbf(bf(vv));
+          }
+        }
+
+    const float scale = 1.0f / 11.3137085f;
+    const Kernel kind = Kernel::Sdpa;
+    ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
+    ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, o);
+    ctx.arg_bind(kind, ordinal, 4, scalar<int>(ctx, gqa));
+    ctx.arg_bind(kind, ordinal, 5, pos); ctx.arg_bind(kind, ordinal, 6, pidx);
+    ctx.arg_bind(kind, ordinal, 7, scalar<int>(ctx, kKv));
+    ctx.arg_bind(kind, ordinal, 8, scalar<float>(ctx, scale));
+    ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, rows));
+    ctx.make_resident();
+
+    const uint32_t threads = uint32_t(nwarps) * 32u;
+    Grid grid{uint32_t(kHeads) * threads, uint32_t((rows + kBQ - 1) / kBQ), 1};
+    Threadgroup tg{threads, 1, 1};
+    LatencyHarness h(ctx);
+    auto enc = [&](StepEncoder& se) {
+        se.set_pso(pso); se.set_argtable(kind, ordinal); se.dispatch(grid, tg);
+    };
+    BenchResult r = h.time_step("nax-prefill", enc, check ? 1 : 30, check ? 0 : 8);
+
+    if (check) {
+        const uint16_t* og = static_cast<const uint16_t*>(o.contents());
+        int bad = 0; double worst = 0; int wr = -1, wh = -1, wd = -1;
+        for (int rr = 0; rr < rows; ++rr) {
+            const int hi = ctx_len + rr;            // causal bound for this row
+            for (int hd = 0; hd < kHeads; ++hd) {
+                const int kvh = hd / gqa;
+                const float* kk = &kf[size_t(kvh) * total * kD];
+                const float* vv = &vf[size_t(kvh) * total * kD];
+                std::vector<double> sc(size_t(hi) + 1);
+                double mx = -1e30;
+                for (int c = 0; c <= hi; ++c) {
+                    double a2 = 0;
+                    for (int d = 0; d < kD; ++d)
+                        a2 += double(qf[(size_t(rr) * kHeads + hd) * kD + d]) *
+                              double(kk[size_t(c) * kD + d]);
+                    sc[c] = a2 * double(scale);
+                    if (sc[c] > mx) mx = sc[c];
+                }
+                double sm = 0;
+                for (int c = 0; c <= hi; ++c) { sc[c] = std::exp(sc[c] - mx); sm += sc[c]; }
+                for (int d = 0; d < kD; ++d) {
+                    double ref = 0;
+                    for (int c = 0; c <= hi; ++c) ref += sc[c] * double(vv[size_t(c) * kD + d]);
+                    ref /= sm;
+                    uint32_t bits = uint32_t(og[(size_t(rr) * kHeads + hd) * kD + d]) << 16;
+                    float got; std::memcpy(&got, &bits, 4);
+                    const double e = std::abs(double(got) - ref) / (std::abs(ref) + 1e-6);
+                    if (e > 3e-2) {
+                        ++bad;
+                        if (e > worst) { worst = e; wr = rr; wh = hd; wd = d; }
+                    }
+                }
+            }
+        }
+        printf("  correctness %d rows @ %d ctx: %d of %d wrong%s", rows, ctx_len, bad,
+               rows * kHeads * kD, bad == 0 ? "  \xe2\x80\x94 CORRECT\n" : "\n");
+        if (bad) printf("    worst %.4f at row %d head %d dim %d\n", worst, wr, wh, wd);
+    }
+    return r.median.gpu_exec_ms;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -547,6 +679,58 @@ int main(int argc, char** argv) {
         }
         printf("  A decode step's whole attention is the 16k column x48. The\n"
                "  dispatch trace puts attention at 75-77%% of a decode fire at 23k.\n\n");
+    }
+
+    // ── the fused NAX prefill: the only path to MLX's number ──
+    {
+        printf("FUSED NAX PREFILL (paged, O in registers, no staging):\n");
+        std::string ek;
+        Pso p = ctx->compile_pso_from_file(
+            std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + "/sdpa_nax_prefill.metal",
+            "sdpa_nax_prefill", &ek);
+        if (!p.valid()) {
+            printf("  compile failed: %s\n\n", ek.c_str());
+        } else {
+            // Small first, and cheap enough for an O(rows x heads x ctx x dim)
+            // CPU reference. A kernel wrong at 64 rows is wrong at 184.
+            // Deliberately unfriendly shapes, because the friendly ones hide
+            // exactly the bugs this kernel can have: a row count that is not a
+            // multiple of the 64-row threadgroup tile leaves a partial
+            // simdgroup, and a context that is not a multiple of the 32-key
+            // page leaves a partial final block. Both are masked rather than
+            // branched -- an MMA cannot run under a divergent condition -- so a
+            // mistake there is wrong numbers in a corner, not a crash.
+            nax_prefill_run(*ctx, p, 64, 96, 500, /*check=*/true, 4);    // both aligned
+            nax_prefill_run(*ctx, p, 64, 100, 501, /*check=*/true, 4);   // ctx % 32 = 4
+            nax_prefill_run(*ctx, p, 40, 96, 504, /*check=*/true, 4);    // rows < one tile
+            nax_prefill_run(*ctx, p, 70, 133, 505, /*check=*/true, 4);   // both ragged
+            nax_prefill_run(*ctx, p, 17, 1, 506, /*check=*/true, 4);     // tiny, ctx 1
+            nax_prefill_run(*ctx, p, 184, 224, 502, /*check=*/true, 4);
+            // The query-tile width is the free parameter, and it is swept
+            // rather than assumed: BK is pinned to the page size and D to the
+            // head, so this is the only one left. `nax_prefill_run` builds the
+            // grid from the kernel's own BQ, so each arm launches its own shape.
+            for (const int w : {2, 4, 8}) {
+                char f[64]; snprintf(f, sizeof f, "/sdpa_nax_prefill_w%d.metal", w);
+                std::string ew;
+                Pso pw = ctx->compile_pso_from_file(
+                    std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f,
+                    "sdpa_nax_prefill", &ew);
+                if (!pw.valid()) { printf("  BQ=%d compile fail: %s\n", w * 16, ew.c_str()); continue; }
+                // Correctness per arm too. A tile width is a different mask and
+                // a different tail, so "the 64-row one was right" is not a
+                // statement about this one.
+                nax_prefill_run(*ctx, pw, 70, 133, 520 + w, /*check=*/true, w);
+                const double t = nax_prefill_run(*ctx, pw, 184, 7424, 540 + w, false, w);
+                printf("  BQ=%-3d  184 rows @ 7424 ctx  %7.3f ms/layer  x48 = %6.1f ms"
+                       "  (%5.2f TFLOP/s)  %.2fx shipped\n",
+                       w * 16, t, t * 48.0,
+                       184.0 * 32 * 7424 * 128 * 4 / (t / 1000.0) / 1e12,
+                       6.975 / t);
+            }
+            printf("  shipped sdpa_paged_mma: 6.97.  MLX: 1.555.  "
+                   "simdgroup floor: 4.1.\n\n");
+        }
     }
 
     printf("MMA path (what a >=32-row prefill dispatches):\n");
