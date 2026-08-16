@@ -132,12 +132,34 @@ to be found by profiling rather than porting.
 
 ## 5. OPEN — do not paper over these
 
-1. **Decode is the larger deficit now**, 1.16–1.28× behind mlx-lm and untouched
-   since head sharing. The known lever is splitting the key range
-   (flash-decoding) so head sharing can go past QH=2: QH=4 and QH=8 read a
-   quarter and an eighth of the bytes and are *slower*, purely because the grid
-   is `n_q_heads/QH` threadgroups and this device stops being filled below 16.
-   Unattempted.
+1. **Decode is the larger deficit now**, 1.16–1.28× behind mlx-lm — and the
+   obvious lever is NOT the one to reach for. Traced at 18k context, the three
+   memory-bound kernels are already essentially at their rooflines:
+
+   | kernel | share | real ms | roofline | off by |
+   |---|---:|---:|---:|---:|
+   | `sdpa_paged_decode..._h2` | 42% | 7.43 | 5.98 | 1.24× |
+   | `affine_qmv_routed` | 22% | 3.97 | 3.06 | 1.30× |
+   | `affine_qmv_fast` (dense) | 9% | 1.55 | 1.53 | **1.01×** |
+   | `moe_route_sort` | 9% | 1.66 | ~0 | — |
+   | `silu_mul` | 9% | 1.64 | ~0 | — |
+
+   A decode step at that context must read 3.13 GB (KV 1.77 + active experts
+   0.91 + dense 0.45), which is 10.57 ms at 296 GB/s. pie measures 24.4 ms/token
+   and mlx-lm 21.1, so **both are ~2× off the roof and neither is at it.**
+
+   **So more attention work buys little**: it is 42% of the step and already
+   within 1.24× of the bytes it must move. The 18% spent in `moe_route_sort` and
+   `silu_mul` is the anomaly — those move almost no data and cost 3.3 ms between
+   them, because at ONE token they cannot fill the GPU. Fusing or eliminating
+   small per-layer dispatches is the lever, not a wider attention kernel.
+   Flash-decoding (splitting the key range so head sharing passes QH=2) remains
+   available but now targets a 1.24× slice.
+
+   **What is NOT established:** why mlx-lm is faster. Its internals have not
+   been profiled here, so "fewer, larger dispatches per layer" is a hypothesis
+   consistent with pie's own breakdown, not a measurement of mlx. Confirming it
+   means tracing mlx, which nobody has done.
 
 2. **The NAX kernels ignore a user attention mask.** A mask is a per-fire
    property and neither selection site is handed it, so it cannot be gated on.
