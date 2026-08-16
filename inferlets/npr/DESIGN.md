@@ -78,8 +78,17 @@ All branching lives in a patched SGLang scheduler
      `schedule_batch.py:1587`
    - no fork if < 1024 tokens of budget remain → branch degrades to sequential —
      `schedule_batch.py:1586`
-   - per-branch tokens charged `× parallel_degree` against the global
-     `max_new_tokens` — `schedule_batch.py:693-697`
+   - budget is **positional first**: finish when
+     `right_most_pos - init_input_len >= max_new_tokens - 128`
+     (`schedule_batch.py:687`) — siblings overlap positions, so this meters
+     the *longest path*, and parallel branches beyond it are nearly free.
+     The `× parallel_degree` charge (`schedule_batch.py:693-697`) is
+     secondary, active only when `stop_token_ids` is set, and **transient**:
+     it multiplies only the live request's `output_ids`; the merge re-bases
+     branch content into `origin_input_ids` at ×1 and degree resets. (Our
+     first port read this as a cumulative ×degree ledger — that overcharge
+     starved 78% of sweep runs; corrected 2026-08-16 with join refunds + the
+     positional cap.)
    - repetition penalty 1.02 inside `<step>` spans only, reset to 1.0 on merge —
      `schedule_batch.py:1614`, `scheduler.py:1475,1613`
    - sampling: temperature 1.0, top_p 0.7, `max_new_tokens` 30–40k.

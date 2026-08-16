@@ -156,11 +156,43 @@ fn default_join_mode() -> String {
 struct Ledger {
     budget: usize,
     charged: usize,
+    /// Logical position right after the prompt — the engine's
+    /// `init_input_len` in position space. Set once after the prompt fill.
+    prompt_end_pos: u32,
 }
 
 impl Ledger {
     fn remaining(&self) -> usize {
         self.budget.saturating_sub(self.charged)
+    }
+
+    /// The reference engine's ×degree charge is per-request and TRANSIENT:
+    /// a branch's own tokens count ×degree only while its block is open;
+    /// the merge re-bases the block's content into the origin at ×1 and the
+    /// degree resets (`schedule_batch.py:693-697` — `origin_input_ids`
+    /// counts ×1, only `output_ids` of the live request multiply). Our
+    /// cumulative ledger must therefore refund the multiplier at each join,
+    /// or a degree-K trajectory is charged ~K× the reference for identical
+    /// content — which starved 78% of runs in the first sweep.
+    fn refund_join(&mut self, block_tokens: usize, degree: usize) {
+        self.charged = self
+            .charged
+            .saturating_sub(block_tokens.saturating_mul(degree.saturating_sub(1)));
+    }
+
+    /// The engine's primary budget check is POSITIONAL
+    /// (`right_most_pos - init_input_len >= max_new_tokens - 128`,
+    /// `schedule_batch.py:687`): siblings overlap positions, so this meters
+    /// the longest path through the parallel structure, not the token sum.
+    fn position_exhausted(&self, next_pos: u32) -> bool {
+        next_pos.saturating_sub(self.prompt_end_pos) as usize + 128 >= self.budget
+    }
+
+    /// The engine's no-fork guard is also positional
+    /// (`schedule_batch.py:1586`: within 1024 of the positional cap).
+    fn position_remaining(&self, next_pos: u32) -> usize {
+        self.budget
+            .saturating_sub(next_pos.saturating_sub(self.prompt_end_pos) as usize)
     }
 }
 
@@ -266,6 +298,7 @@ impl Shared {
             ledger: RefCell::new(Ledger {
                 budget: input.max_new_tokens,
                 charged: 0,
+                prompt_end_pos: 0,
             }),
             stats: RefCell::new(Stats::default()),
         })
@@ -439,6 +472,10 @@ async fn decode_segment(
     let mut tokens = Vec::new();
     let mut bytes = Vec::new();
     let delta = p.delta;
+    // Logical position of the next token; generation is causal, so it
+    // advances by exactly one per generated token. Tracked locally because
+    // the generator holds the &mut borrow of the context.
+    let mut cur_pos = p.next_pos();
     // Pass-level speculation (run-ahead staging) is disabled throughout:
     // staged passes assume plain causal continuation, and stale staged
     // entries for destroyed branch contexts can race the join's refills.
@@ -449,7 +486,11 @@ async fn decode_segment(
         .position_offset(delta)
         .disable_pass_speculation();
     loop {
-        if sh.ledger.borrow().remaining() < degree
+        // Engine-faithful finish checks (`schedule_batch.py::check_finished`):
+        // primary is positional (longest path through the parallel structure);
+        // the ×degree charge is the secondary, transient check.
+        if sh.ledger.borrow().position_exhausted(cur_pos)
+            || sh.ledger.borrow().remaining() < degree
             || token_cap.is_some_and(|cap| tokens.len() >= cap)
         {
             return Ok(Segment {
@@ -467,6 +508,7 @@ async fn decode_segment(
         };
         tokens.push(token);
         bytes.extend_from_slice(sh.bytes_of(token));
+        cur_pos += 1;
         sh.ledger.borrow_mut().charged += degree;
         sh.stats.borrow_mut().tokens_generated += 1;
         if bytes.ends_with(TAG_GUIDELINE_END) {
@@ -525,7 +567,10 @@ fn try_fork<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<ForkOutcome>> + 'a>> {
     Box::pin(async move {
         let plans = parse_plans(segment_text);
-        let affordable = sh.ledger.borrow().remaining() >= sh.min_fork_budget;
+        // Engine no-fork guard is positional (`schedule_batch.py:1586`):
+        // within min_fork_budget (their 1024) of the positional cap →
+        // degrade to sequential.
+        let affordable = sh.ledger.borrow().position_remaining(p.next_pos()) >= sh.min_fork_budget;
         // Refill mode forks only at depth 1: exact nested refill needs
         // per-token position/visibility records (see module docs).
         let depth_cap = match sh.join_mode {
@@ -555,6 +600,7 @@ fn try_fork<'a>(
             plans
         );
 
+        let charged_before_block = sh.ledger.borrow().charged;
         let mut branch_futures = Vec::with_capacity(degree);
         for label in plans {
             let child = p.fork()?;
@@ -564,6 +610,16 @@ fn try_fork<'a>(
         let mut branches = Vec::with_capacity(degree);
         for r in results {
             branches.push(r?);
+        }
+        // Merge re-bases the block's content to ×1 in the reference engine;
+        // refund the transient (degree-1)× multiplier now that the block is
+        // closed. Every charge inside a flat block is a multiple of `degree`
+        // (nested textual blocks make this an approximation after their own
+        // inner refunds; refill/adopt blocks are depth-1 and exact).
+        {
+            let mut ledger = sh.ledger.borrow_mut();
+            let block_charged = ledger.charged.saturating_sub(charged_before_block);
+            ledger.refund_join(block_charged / degree.max(1), degree);
         }
         println!(
             "[npr] depth {depth}: all {degree} branches done ({} tokens total), joining ({})",
@@ -1214,6 +1270,10 @@ async fn main(input: Input) -> Result<String> {
         PCtx::new(ctx)
     };
     p.ctx.cue();
+    // Anchor the positional budget: everything up to and including the cue
+    // is prompt (the engine's `init_input_len`); generation is metered from
+    // here in position space (longest path, since siblings overlap).
+    sh.ledger.borrow_mut().prompt_end_pos = p.next_pos();
 
     let mut trajectory_bytes: Vec<u8> = Vec::new();
 
