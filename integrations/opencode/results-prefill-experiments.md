@@ -580,3 +580,48 @@ correct — at 32 heads / gqa 8, which is not the geometry the numerics test use
 Not worth forcing: serving rarely fires 32–63 rows, because
 `aligned_prefill_chunks` emits a large multiple of 8 plus a remainder below 16.
 
+
+## Decode, measured on a clean machine — the target is real and it is dispatch count
+
+The earlier decode trace ran while a Spotlight indexer held a CPU core, and small
+kernels are exactly what CPU-side dispatch cost would distort. Re-traced idle
+(roof 296.1 GB/s, nothing but the driving agent over 5%), at 12.4k context:
+
+| kernel | share | ms | per layer |
+|---|---:|---:|---:|
+| `sdpa_paged_decode..._h2` | 33.8% | 6.28 | |
+| `affine_qmv_routed` | 25.8% | 4.79 | |
+| **`moe_route_sort`** | **10.2%** | 1.89 | 39 µs |
+| `affine_qmv_fast` | 10.0% | 1.85 | |
+| **`silu_mul`** | **9.9%** | 1.83 | 38 µs |
+| `rms_single_row` | 2.6% | 0.48 | |
+
+**The contention was not the story: `sort` + `silu` are 20.1% clean against 18.5%
+contended.** So a fifth of a decode step is two kernels that move almost no data.
+
+**Neither is work-bound, and neither can simply be deleted.**
+
+* `moe_route_sort` launches **one threadgroup** (`Grid{w,1,1}`,
+  `tg{w,1,1}`), once per layer, 48 times a token — one core busy and the rest
+  idle. It is also **load-bearing at one row**, which rules out the obvious
+  saving: `llama_moe_tile_rows`'s comment is explicit that the sort, the launch
+  shapes, the pipeline choice and the pool sizer must all agree, and "a sort that
+  padded to 16 under a matvec launched for 8 rows would run the projection over a
+  fraction of its input". The routed matvec consumes the sorted stack.
+* `silu_mul` launches 6144 threads in 24 threadgroups over 8 sorted rows ×
+  768. Its memory traffic is ~37 KB, about 0.12 µs at this machine's roof — so
+  38 µs is **300× its own roofline** and essentially all fixed cost.
+
+So the lever is **the number of dispatches, not any one kernel**. A routed layer
+fires router → topk → sort → gather → gate → up → silu → down → combine, and at
+one token most of those are too small to fill the GPU while each still pays a
+launch and a barrier. 48 layers × ~9 dispatches is ~430 serialized dispatches a
+token.
+
+**Estimated ceiling:** removing `sort` and `silu` entirely would take a decode
+step from 24.4 to ~19.5 ms/token, i.e. 41.0 → 51 tok/s at 16k, **past mlx-lm's
+47.5**. That is the prize, and it is a fusion problem — `gptoss_swiglu` is the
+precedent in this driver for folding an activation into its neighbour.
+
+**Not attempted here.** It is a real kernel change and the session's remaining
+budget is better spent recording the target precisely than starting it badly.
