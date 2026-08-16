@@ -649,6 +649,69 @@ against 0.040 / 0.120 / 0.173 / 0.234 before, QH=4 S=4 at 1.18× / 1.14× / 1.17
 agreeing to the third decimal. **Fixing the instrument was worth more than any
 kernel attempt in this section.**
 
+### THE DECODE GAP IS NOT IN THE KERNELS: 15.5% is fixed HOST SUBMIT
+
+A decode step, fully attributed for the first time (ctx 7424, rows=1, 17.38 ms):
+
+| | ms | % |
+|---|---:|---:|
+| attention | 5.20 | 29.9 |
+| routed expert projections | 4.02 | 23.1 |
+| dense matvecs incl. LM head | 3.00 | 17.3 |
+| all small kernels (isolated sum) | 2.15 | 12.4 |
+| **host submit — `fwd.submit(pipe)`** | **2.69** | **15.5** |
+| unexplained remainder | 0.32 | 1.8 |
+
+`decode-rows-probe` times a fire as build → submit → await, so **submit is inside
+the step**, and it happens on the host before the Metal driver encodes anything.
+No kernel change and no amount of fusion touches it.
+
+**And it is FIXED per fire, not proportional to work:**
+
+| rows | 1 | 8 | 32 | 64 | 128 | 184 | 192 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| submit_ms | 2.71 | 2.89 | 2.80 | 2.98 | 2.95 | 2.96 | 2.79 | 3.05 |
+
+512× the work for 1.13× the submit. So it is negligible on a prefill and it
+falls almost entirely on DECODE, where the fire is small.
+
+*(The ablation runs also show submit unchanged when dispatches are removed, but
+that proves nothing — `PIE_METAL_ABLATE` acts inside the driver's encode, long
+after submit has returned. The row sweep above is the evidence.)*
+
+#### Which is the size of the whole mlx-lm gap
+
+    decode step        17.38 ms -> 57.5 steps/s
+    minus fixed submit 14.69 ms -> 68.1 steps/s     = 1.18x
+
+    measured decode gap to mlx-lm: 1.16-1.28x
+
+And at the four-way's shortest prompt, pie's 54.4 tok/s is 18.4 ms/token; minus
+2.69 ms that is **63.7 tok/s against mlx-lm's measured 66.1**.
+
+**So the decode deficit this project has been chasing through six kernel
+experiments is, to within measurement error, a fixed 2.7 ms of host-side submit
+per fire.** The kernels are within 1.2–1.5× of the floors their access patterns
+permit; the gap is somewhere else entirely, and mlx-lm — in-process, no WASM
+guest, no engine plan, no RPC hop — does not pay it.
+
+This is also the same animal as open item 2 below ("~127 ms of a cached agentic
+turn is outside the driver entirely"), which has sat unattributed since the
+handover was written.
+
+#### What has NOT been established
+
+* **What the 2.69 ms consists of.** `fwd.submit(pipe)` spans the guest→host
+  boundary, the engine's plan construction and the RPC to the worker. None of
+  those three has been priced separately, and the fix is completely different
+  for each.
+* **Whether the SERVING path pays the same.** This is measured through the
+  `decode-rows-probe` inferlet. Strategy B's session shim is a different caller
+  of the same engine, and it must be confirmed there before anyone sizes a fix.
+
+**That attribution is the next task, and it is worth more than every kernel
+experiment in this file put together.**
+
 ### The full composition, and TWO MORE ablation artifacts
 
 Extending the ablation to everything a layer dispatches produced two apparent
