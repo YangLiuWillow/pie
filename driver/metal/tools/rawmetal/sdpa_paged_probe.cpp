@@ -32,6 +32,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -592,6 +593,164 @@ double nax_prefill_run(RawMetalContext& ctx, Pso pso, int rows, int ctx_len,
     return r.median.gpu_exec_ms;
 }
 
+// The accuracy question this kernel actually has to answer.
+//
+// The NAX kernel changes serving output: the same 28.4k prompt that produced
+// 382 identical tokens with head sharing on and off produced 332 with NAX on.
+// A different attention kernel rounds differently and greedy decoding diverges
+// at ties, so that is not by itself a defect -- `apc-graft-probe` measured the
+// same shape of divergence from re-CHUNKING a prefill, which changes no
+// arithmetic at all.
+//
+// But "not by itself a defect" is a claim, and the way to test it is not to
+// compare NAX against exact arithmetic. It is to compare NAX against THE KERNEL
+// IT REPLACES, both against the same double-precision reference, on the same
+// inputs. If the two are the same order of error, the divergence is the
+// ordinary consequence of swapping kernels. If NAX is much worse, it is not.
+//
+// `relaxed_precision` in the matmul descriptor is the specific thing under
+// suspicion, which is why it is a parameter of the sweep below.
+struct ErrStats { double mean, p99, worst; long long n; };
+
+ErrStats compare_to_reference(const uint16_t* got, const std::vector<float>& qf,
+                              const std::vector<float>& kf, const std::vector<float>& vf,
+                              int rows, int ctx_len, int heads, int kv, int d,
+                              float scale) {
+    std::vector<double> errs;
+    errs.reserve(size_t(rows) * heads * d);
+    const int gqa = heads / kv;
+    const int total = ctx_len + rows;
+    for (int r = 0; r < rows; ++r) {
+        const int hi = ctx_len + r;
+        for (int h = 0; h < heads; ++h) {
+            const float* kk = &kf[size_t(h / gqa) * total * d];
+            const float* vv = &vf[size_t(h / gqa) * total * d];
+            std::vector<double> sc(size_t(hi) + 1);
+            double mx = -1e30;
+            for (int c = 0; c <= hi; ++c) {
+                double a = 0;
+                for (int e = 0; e < d; ++e)
+                    a += double(qf[(size_t(r) * heads + h) * d + e]) *
+                         double(kk[size_t(c) * d + e]);
+                sc[c] = a * double(scale);
+                if (sc[c] > mx) mx = sc[c];
+            }
+            double sm = 0;
+            for (int c = 0; c <= hi; ++c) { sc[c] = std::exp(sc[c] - mx); sm += sc[c]; }
+            for (int e = 0; e < d; ++e) {
+                double ref = 0;
+                for (int c = 0; c <= hi; ++c) ref += sc[c] * double(vv[size_t(c) * d + e]);
+                ref /= sm;
+                uint32_t bits = uint32_t(got[(size_t(r) * heads + h) * d + e]) << 16;
+                float f; std::memcpy(&f, &bits, 4);
+                errs.push_back(std::abs(double(f) - ref) / (std::abs(ref) + 1e-6));
+            }
+        }
+    }
+    std::sort(errs.begin(), errs.end());
+    double sum = 0;
+    for (double e : errs) sum += e;
+    return {sum / double(errs.size()), errs[size_t(double(errs.size()) * 0.99)],
+            errs.back(), (long long)errs.size()};
+}
+
+// Bind ONE set of buffers in the shipped `sdpa_paged_mma` ABI and run both
+// kernels over it, so nothing differs between the arms except the pipeline.
+// The shipped NAX kernel carries that ABI byte for byte, deliberately, which is
+// what makes this comparison a one-line difference rather than a second rig.
+void accuracy_ab(RawMetalContext& ctx, Pso mma, Pso nax, int rows, int ctx_len,
+                 int ordinal) {
+    constexpr int kH = 32, kKv = 4, kD = 128, kPg = 32;
+    const int gqa = kH / kKv, total = ctx_len + rows;
+    const int pages = (total + kPg - 1) / kPg + 1;
+    auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+    auto unbf = [](uint16_t h) { uint32_t u = uint32_t(h) << 16; float f;
+                                 std::memcpy(&f, &u, 4); return f; };
+
+    SlotHandle q = ctx.heap_alloc(size_t(rows) * kH * kD * 2);
+    SlotHandle kp = ctx.heap_alloc(size_t(pages) * kPg * kKv * kD * 2);
+    SlotHandle vp = ctx.heap_alloc(size_t(pages) * kPg * kKv * kD * 2);
+    SlotHandle out = ctx.heap_alloc(size_t(rows) * kH * kD * 2);
+    SlotHandle pos = ctx.heap_alloc(size_t(rows) * sizeof(int));
+    SlotHandle req = ctx.heap_alloc(size_t(rows) * sizeof(int));
+    SlotHandle pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    SlotHandle pindptr = ctx.heap_alloc(2 * sizeof(uint32_t));
+    SlotHandle mask = ctx.heap_alloc(16), mask_on = ctx.heap_alloc(size_t(rows));
+    SlotHandle sinks = ctx.heap_alloc(64);
+    auto* qz = static_cast<uint16_t*>(q.contents());
+    auto* kz = static_cast<uint16_t*>(kp.contents());
+    auto* vz = static_cast<uint16_t*>(vp.contents());
+    std::memset(kz, 0, size_t(pages) * kPg * kKv * kD * 2);
+    std::memset(vz, 0, size_t(pages) * kPg * kKv * kD * 2);
+    std::memset(mask.contents(), 0, 16);
+    std::memset(mask_on.contents(), 0, size_t(rows));
+    std::memset(sinks.contents(), 0, 64);
+    for (int i = 0; i < rows; ++i) {
+        static_cast<int*>(pos.contents())[i] = ctx_len + i;
+        static_cast<int*>(req.contents())[i] = 0;
+    }
+    for (int p2 = 0; p2 < pages; ++p2) static_cast<uint32_t*>(pidx.contents())[p2] = uint32_t(p2);
+    static_cast<uint32_t*>(pindptr.contents())[0] = 0;
+    static_cast<uint32_t*>(pindptr.contents())[1] = uint32_t(pages);
+
+    std::vector<float> qf(size_t(rows) * kH * kD), kf(size_t(kKv) * total * kD), vf(kf.size());
+    for (int r = 0; r < rows; ++r)
+      for (int h = 0; h < kH; ++h)
+        for (int d = 0; d < kD; ++d) {
+          const float x = float((r * 2 + h * 3 + d) % 7) * 0.125f;
+          qz[(size_t(r) * kH + h) * kD + d] = bf(x);
+          qf[(size_t(r) * kH + h) * kD + d] = x;
+        }
+    for (int c = 0; c < total; ++c)
+      for (int h = 0; h < kKv; ++h)
+        for (int d = 0; d < kD; ++d) {
+          const float kk = float((c + 2 * d + 5 * h) % 4) * 0.125f;
+          const float vv = float((3 * c + d + 11 * h) % 6) * 0.25f;
+          kz[(size_t(c) * kKv + h) * kD + d] = bf(kk);
+          vz[(size_t(c) * kKv + h) * kD + d] = bf(vv);
+          kf[(size_t(h) * total + c) * kD + d] = unbf(bf(kk));
+          vf[(size_t(h) * total + c) * kD + d] = unbf(bf(vv));
+        }
+
+    const float scale = 1.0f / 11.3137085f;
+    const Kernel kind = Kernel::SdpaPaged;
+    ctx.arg_bind(kind, ordinal, 0, q);    ctx.arg_bind(kind, ordinal, 1, kp);
+    ctx.arg_bind(kind, ordinal, 2, vp);   ctx.arg_bind(kind, ordinal, 3, out);
+    ctx.arg_bind(kind, ordinal, 4, scalar<int>(ctx, gqa));
+    ctx.arg_bind(kind, ordinal, 5, pos);  ctx.arg_bind(kind, ordinal, 6, req);
+    ctx.arg_bind(kind, ordinal, 7, pidx); ctx.arg_bind(kind, ordinal, 8, pindptr);
+    ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, kPg));
+    ctx.arg_bind(kind, ordinal, 10, scalar<int>(ctx, kKv));
+    ctx.arg_bind(kind, ordinal, 11, scalar<float>(ctx, scale));
+    ctx.arg_bind(kind, ordinal, 12, mask);
+    ctx.arg_bind(kind, ordinal, 13, scalar<uint32_t>(ctx, 0u));
+    ctx.arg_bind(kind, ordinal, 14, mask_on);
+    ctx.arg_bind(kind, ordinal, 15, scalar<int>(ctx, 0));
+    ctx.arg_bind(kind, ordinal, 16, sinks);
+    ctx.arg_bind(kind, ordinal, 17, scalar<int>(ctx, rows));
+    ctx.make_resident();
+
+    LatencyHarness h(ctx);
+    struct Arm { const char* name; Pso pso; int tile; };
+    const Arm arms[] = {{"sdpa_paged_mma (shipped)", mma, 32},
+                        {"sdpa_paged_nax (new)", nax, 64}};
+    for (const Arm& a : arms) {
+        if (!a.pso.valid()) { printf("    %-26s  NOT COMPILED\n", a.name); continue; }
+        std::memset(out.contents(), 0, size_t(rows) * kH * kD * 2);
+        const uint32_t tiles = uint32_t((rows + a.tile - 1) / a.tile);
+        auto enc = [&](StepEncoder& se) {
+            se.set_pso(a.pso); se.set_argtable(kind, ordinal);
+            se.dispatch(Grid{uint32_t(kH) * 128u, tiles, 1}, Threadgroup{128, 1, 1});
+        };
+        h.time_step("acc", enc, 1, 0);
+        const ErrStats e = compare_to_reference(
+            static_cast<const uint16_t*>(out.contents()), qf, kf, vf, rows, ctx_len,
+            kH, kKv, kD, scale);
+        printf("    %-26s  mean %.2e   p99 %.2e   worst %.2e\n",
+               a.name, e.mean, e.p99, e.worst);
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -729,7 +888,20 @@ int main(int argc, char** argv) {
                        6.975 / t);
             }
             printf("  shipped sdpa_paged_mma: 6.97.  MLX: 1.555.  "
-                   "simdgroup floor: 4.1.\n\n");
+                   "simdgroup floor: 4.1.\n");
+            // Accuracy against the kernel it REPLACES, not against exact.
+            {
+                std::string es;
+                Pso shipped_nax = ctx->compile_pso_from_file(
+                    std::string(PIE_METAL_TOOL_KERNELS_DIR) + "/sdpa_paged_nax.metal",
+                    "sdpa_paged_nax", &es);
+                if (!shipped_nax.valid())
+                    printf("  shipped NAX compile failed: %s\n", es.c_str());
+                printf("  accuracy, both against a float64 reference:\n");
+                accuracy_ab(*ctx, mma, shipped_nax, 184, 224, 600);
+                accuracy_ab(*ctx, mma, shipped_nax, 184, 1024, 601);
+            }
+            printf("\n");
         }
     }
 

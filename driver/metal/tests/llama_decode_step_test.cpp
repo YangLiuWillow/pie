@@ -828,10 +828,28 @@ void check_the_tiled_attention_is_told_its_row_count() {
             Grid grid{};
             Threadgroup tg{};
             launch_shape(d, g, grid, tg, rows, rows);
-            const long long covered = static_cast<long long>(grid.y) * kSdpaQueryTile;
+            // Which tile this fire is measured against is the fire's own
+            // choice, not a constant. A single-request fire of 64 rows or more
+            // now takes `sdpa_paged_nax`, whose tile is 64 where the matrix
+            // and tiled kernels use 32 -- so asserting the 32-row tile
+            // unconditionally would fail a correct grid, and (worse) would pass
+            // a wrong one if the two ever swapped. This asks the same predicate
+            // the launch did.
+            const int tile =
+                pie::metal::sdpa_nax_this_fire(g.head_dim, g.kv_page_size, rows,
+                                               // launch_shape's own default --
+                                               // the call above passes six
+                                               // arguments, so `requests` is 1.
+                                               // Asking with a different value
+                                               // than the launch used is the
+                                               // very disagreement this checks.
+                                               /*requests=*/1, g.paged_kv_enabled)
+                    ? pie::metal::kSdpaNaxTile
+                    : kSdpaQueryTile;
+            const long long covered = static_cast<long long>(grid.y) * tile;
             expect(covered >= rows,
-                   "the tiled grid covers every row of the fire at " + std::to_string(rows));
-            if (rows % kSdpaQueryTile != 0) {
+                   "the grid covers every row of the fire at " + std::to_string(rows));
+            if (rows % tile != 0) {
                 expect(covered > rows,
                        "and overhangs it when the rows do not fill whole tiles at " +
                            std::to_string(rows));

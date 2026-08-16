@@ -65,6 +65,12 @@ struct LlamaPsos {
     /// otherwise -- `pso_for` falls back to `sdpa_paged`, which is what every
     /// checkpoint did before this existed.
     Pso sdpa_paged_hshare{};
+    /// The same paged prefill attention on the M5 NEURAL ACCELERATORS. The
+    /// matrix-unit kernel below is compute-bound at 3.2 TFLOP/s against a 5.48
+    /// simdgroup ceiling; this one measures 10.75, which no simdgroup kernel
+    /// can reach. Compiled only where `sdpa_nax_this_fire`'s geometry holds,
+    /// and fatally when it does -- see `build_llama_psos`.
+    Pso sdpa_paged_nax{};
     /// The same paged attention with the query rows tiled -- one row per
     /// simdgroup, K/V staged per threadgroup. Chosen by row count, not by
     /// model: see `sdpa_should_tile`.

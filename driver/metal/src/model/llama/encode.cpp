@@ -334,6 +334,16 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             // The matrix shape before the scalar one: same tile, same grid
             // height, a quarter of the threads. Same predicates as
             // `launch_shape`, for the reason on `llama_sdpa_mma_this_fire`.
+            // The neural accelerators before the simdgroup matrix unit: same
+            // fire, same tile family, a unit that measures 10.75 TFLOP/s
+            // against 5.48. Same predicate `launch_shape` uses, and NOT
+            // guarded on `.valid()` -- `launch_shape` cannot ask that, so
+            // guarding here would let the two disagree, and the tiles differ
+            // (64 rows against 32). `build_llama_psos` makes the compile fatal
+            // under exactly this predicate.
+            if (sdpa_nax_this_fire(g.head_dim, g.kv_page_size, R, requests,
+                                   g.paged_kv_enabled))
+                return ll.sdpa_paged_nax;
             if (llama_sdpa_mma_this_fire(g, R, requests)) return ll.sdpa_paged_mma;
             if (sdpa_should_tile(R, requests)) return ll.sdpa_paged_tiled;
             if (llama_sdpa_simdgroups(g) == 8 && ll.sdpa_paged_sg8.valid())
@@ -721,6 +731,15 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             // Same predicates as `pso_for`, for the same reason. The matrix
             // shape is 128 threads where the scalar one is 1024, so this is not
             // just a different pipeline behind the same launch.
+            // Same predicate and same order as `pso_for`. The NAX grid is
+            // ceil(N/64) tiles tall where the matrix grid is ceil(N/32); the
+            // threadgroup is 128 for both, so a disagreement here is a fire
+            // that runs half its rows and says nothing.
+            if (sdpa_nax_this_fire(g.head_dim, g.kv_page_size, R, requests,
+                                   g.paged_kv_enabled)) {
+                sdpa_paged_nax_dispatch(g.n_q_heads, R, grid, tg);
+                return;
+            }
             if (llama_sdpa_mma_this_fire(g, R, requests)) {
                 sdpa_paged_mma_dispatch(g.n_q_heads, R, grid, tg);
                 return;

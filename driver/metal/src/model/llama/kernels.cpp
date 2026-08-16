@@ -127,6 +127,29 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
             return false;
         }
     }
+    // The neural-accelerator prefill attention, on the same terms as the matrix
+    // one above: compiled only where its geometry holds, and FATAL there rather
+    // than a fallback. `launch_shape` is not handed a `LlamaPsos` and so cannot
+    // notice an invalid pipeline, and the NAX tile is 64 rows against the
+    // matrix kernel's 32 -- a silent fallback would leave the grid describing a
+    // kernel other than the one that runs.
+    //
+    // The row count and the request count are per-fire and this is load time,
+    // so they are the two clauses of `sdpa_nax_this_fire` NOT asked here; every
+    // geometry clause is.
+    if (sdpa_nax_this_fire(g.head_dim, g.kv_page_size, /*rows=*/kSdpaNaxTile,
+                           /*requests=*/1, g.paged_kv_enabled)) {
+        std::string compile_error;
+        out.sdpa_paged_nax = ctx.compile_pso_from_file(
+            dir + "sdpa_paged_nax.metal", "sdpa_paged_nax", &compile_error);
+        if (!out.sdpa_paged_nax.valid()) {
+            if (err != nullptr) {
+                *err = "llama PSO 'sdpa_paged_nax' (sdpa_paged_nax.metal): " +
+                       compile_error;
+            }
+            return false;
+        }
+    }
     return true;
 }
 

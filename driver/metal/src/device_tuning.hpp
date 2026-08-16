@@ -289,6 +289,13 @@ struct DeviceTuning {
     /// grid differs between the two shapes, so a partial revert is wrong
     /// numbers rather than a slower kernel.
     bool sdpa_head_share = true;
+    /// Run prefill attention on the M5 neural accelerators (`sdpa_paged_nax`)
+    /// instead of the simdgroup matrix unit. Off falls back to
+    /// `sdpa_paged_mma`, completely: the pipeline is not compiled and neither
+    /// selection site can choose it, because the two have DIFFERENT query tiles
+    /// (64 against 32) and a partial revert would be a grid describing the
+    /// other kernel.
+    bool sdpa_nax = true;
 
     /// Lanes that share one value row of the gated-delta scan.
     ///
@@ -543,6 +550,7 @@ int sdpa_tile_min_rows_per_request();
 /// Whether a tiled prefill attention runs on the simdgroup matrix unit.
 bool sdpa_mma();
 bool sdpa_head_share();
+bool sdpa_nax();
 int gdn_scan_lanes();
 int gdn_scan_rows();
 

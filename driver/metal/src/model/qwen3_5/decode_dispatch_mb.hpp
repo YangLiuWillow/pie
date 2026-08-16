@@ -410,6 +410,47 @@ inline void sdpa_paged_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) 
     tg = Threadgroup{1024, 1, 1};
 }
 
+// Query rows per threadgroup in `sdpa_paged_nax`, and it must equal that
+// kernel's own BQ (NAXP_NWARPS * 16). Swept in `sdpa_paged_probe`: BQ 32 / 64 /
+// 128 give 2.05 / 2.08 / 2.84 ms/layer, so 32 and 64 are indistinguishable
+// within the probe's own ~1.3% drift and 128 loses. 64 is taken because it is
+// 128 threads, the same threadgroup size as `sdpa_paged_mma`.
+inline constexpr int kSdpaNaxTile = 64;
+
+/// Whether this fire's prefill attention runs on the neural accelerators.
+///
+/// Asked by `pso_for` AND `launch_shape`, from here, because the NAX grid is
+/// `ceil(N / 64)` tiles tall where the matrix kernel's is `ceil(N / 32)` --
+/// disagreeing runs half the fire and reports nothing.
+///
+/// `requests == 1` is load-bearing, not caution: a 64-row tile spanning two
+/// requests would span two page lists, and the kernel resolves ONE base pointer
+/// per tile. A prefill fire is one request contributing thousands of rows,
+/// which is the case this exists for; anything co-batched falls back to
+/// `sdpa_paged_mma`.
+///
+/// **What is NOT gated here, stated rather than left implicit:** a user
+/// attention mask is a per-FIRE property and neither caller is handed it, so
+/// this cannot see one, and the kernel ignores masks. That is the same
+/// assumption `sdpa_paged_decode_..._p32` already ships with for this family
+/// (FAST_FULL skips the mask entirely and is selected on page size alone), so
+/// it is pre-existing rather than introduced here -- but if a mask is ever
+/// enabled on llama, both kernels are wrong together.
+inline bool sdpa_nax_this_fire(int head_dim, int kv_page_size, int rows,
+                               int requests, bool paged) {
+    if (!sdpa_nax()) return false;
+    if (!paged || kv_page_size != 32 || head_dim != 128) return false;
+    if (requests != 1) return false;
+    // Below one tile the matrix kernel's 32-row tile fits the fire better.
+    return rows >= kSdpaNaxTile;
+}
+
+inline void sdpa_paged_nax_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
+    const uint32_t tiles = uint32_t((N + kSdpaNaxTile - 1) / kSdpaNaxTile);
+    g  = Grid{uint32_t(n_q_heads) * 128u, tiles < 1u ? 1u : tiles, 1};
+    tg = Threadgroup{128, 1, 1};
+}
+
 // Query heads per threadgroup in `sdpa_paged_decode_hshare`. It is the factor
 // by which that kernel divides the KV traffic, and it MUST equal the kernel's
 // own QH template argument -- the grid is `n_q_heads / kSdpaHeadShare`

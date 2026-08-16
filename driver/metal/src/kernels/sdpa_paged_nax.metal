@@ -1,56 +1,37 @@
-// Paged prefill attention on the M5 neural accelerators, fused.
+// Paged prefill attention on the M5 neural accelerators, fused. SHIPPED FORM.
 //
-// ## Why this kernel has to exist, and why tuning cannot replace it
+// The prototype and the measurements that justify this kernel are in
+// `tools/rawmetal/kernels/sdpa_nax_prefill.metal` and its arm of
+// `sdpa_paged_probe`: correct against a CPU reference at six shapes, and
+// 2.08 ms/layer at 184 rows / 7424 ctx against `sdpa_paged_mma`'s 6.97 --
+// 3.35x, at 10.75 TFLOP/s, BELOW the 4.1 ms/layer floor the 5.48 TFLOP/s
+// simdgroup ceiling puts under any simdgroup kernel. That is the arithmetic
+// proof it runs on the neural accelerators rather than a claim that it does.
 //
-// pie's prefill attention is compute-bound on the simdgroup matrix unit, and
-// the ceiling is not far above where it already runs:
+// This file differs from the prototype in ONE way and it is the ABI: the buffer
+// list is `sdpa_paged_mma`'s, byte for byte, so `bind::SdpaPaged` serves it with
+// no binder change and the only thing that differs at the launch is the grid.
 //
-//     184 rows x 32 heads x 7424 keys x 128 dim  =  22.4 GFLOP per layer
-//     sdpa_paged_mma:  6.97 ms/layer  =  3.2 TFLOP/s
-//     simdgroup ceiling (matrix_rate_probe, three configurations agree):
-//                                        5.48 TFLOP/s  ->  4.1 ms/layer floor
-//     MLX, same shapes:                  1.555 ms/layer = 14.4 TFLOP/s
+// ## What this kernel does NOT handle, and how it is kept away from them
 //
-// MLX is ABOVE the simdgroup ceiling, so it is not running on the simdgroup
-// matrix unit. `matmul2d` on the neural accelerators measures 32.5 TFLOP/s
-// against that 5.48. **There is no arrangement of the current kernel that
-// reaches MLX**; the unit is the difference, and this kernel changes the unit.
-//
-// ## The paged bridge, which is the part MLX does not have to solve
-//
-// MLX reads a contiguous K/V. pie reads a page table. The reconciliation is a
-// coincidence worth stating plainly, because the whole design rests on it:
-//
-//     kv_page_size == 32,  and a NAX fragment is 16 keys.
-//
-// So a 32-key block is EXACTLY ONE PAGE, always, with no straddling. One
-// page-table read per block gives a base pointer, and within the page key `j`
-// sits at `j * n_kv_heads * head_dim` -- a constant row stride, which is
-// precisely what `frag_load` wants. The gather costs one dependent load per 32
-// keys instead of per element, and there is no scratch buffer and no de-paging
-// pass. If `kv_page_size` is ever not 32 this kernel must not be selected;
-// nothing in this repo validates that field, so the host tests it for exact
-// equality rather than inferring a power of two.
-//
-// ## The shape
-//
-//   * 4 simdgroups (128 threads). Each owns 16 query rows, so BQ = 64.
-//   * BK = 32 keys per iteration = one page = 2 fragments.
-//   * D = 128 = 8 fragments across the head.
-//   * O is a `thread` array of 8 float fragments -- 64 floats per lane -- and
-//     it must be, because a cooperative tensor does not survive `run()`
-//     (measured: 7316 of 8192 wrong). S is 2 more fragments.
-//
-// Every masked score is driven to -inf and the multiply runs unconditionally on
-// the resulting zeros. That is not an optimization, it is required: an MMA is a
-// simdgroup-wide operation and executing it under a divergent condition is
-// undefined, while the row max and the causal bound are both per-row and hence
-// per-lane and hence divergent. `sdpa_paged_mma.metal` makes the same argument
-// at length and it carries over unchanged.
+//   * **More than one request per fire.** A 64-row query tile would span two
+//     page lists, and this kernel resolves one base pointer for the whole tile.
+//     `sdpa_nax_this_fire` requires `requests == 1`, which is what a prefill
+//     fire is -- one request contributing thousands of rows. A co-batched fire
+//     falls back to `sdpa_paged_mma`.
+//   * **A user attention mask, a sliding window, or a learned sink.** None are
+//     read. The window and sink are geometry and are gated on. The MASK is
+//     per-fire and is NOT visible to `pso_for` or `launch_shape`, so it cannot
+//     be gated on there -- see the note in `sdpa_nax_this_fire`. This kernel
+//     inherits exactly the assumption `sdpa_paged_decode_..._p32` (FAST_FULL)
+//     already makes for this family at page size 32, and if masks are ever
+//     enabled on llama BOTH must be revisited together. That is a pre-existing
+//     property of the family, not one introduced here, and it is written down
+//     rather than left implicit.
 
 #include <metal_stdlib>
 using namespace metal;
-#include "../../../src/kernels/nax_frag.h"
+#include "nax_frag.h"
 
 using namespace pie_nax;
 
@@ -58,21 +39,31 @@ using namespace pie_nax;
 #define NAXP_NWARPS 4
 #endif
 
-kernel void sdpa_nax_prefill(
-    const device bfloat* queries      [[buffer(0)]],   // [N, n_q_heads, D]
-    const device bfloat* k_pages      [[buffer(1)]],   // [pages, 32, n_kv, D]
-    const device bfloat* v_pages      [[buffer(2)]],
-    device bfloat* out                [[buffer(3)]],   // [N, n_q_heads, D]
-    const constant int& gqa_factor    [[buffer(4)]],
-    const device int* position_ids    [[buffer(5)]],   // [N]
-    const device uint* kv_page_indices[[buffer(6)]],
-    const constant int& n_kv_heads    [[buffer(7)]],
-    const constant float& scale       [[buffer(8)]],
-    const constant int& n_rows        [[buffer(9)]],   // N; the grid rounds up
+kernel void sdpa_paged_nax(
+    const device bfloat* queries     [[buffer(0)]],   // [N, n_q_heads, D]
+    const device bfloat* k_pages     [[buffer(1)]],   // [pages, 32, n_kv, D]
+    const device bfloat* v_pages     [[buffer(2)]],
+    device bfloat* out               [[buffer(3)]],   // [N, n_q_heads, D]
+    const constant int& gqa_factor             [[buffer(4)]],
+    const device int* position_ids             [[buffer(5)]],
+    const device int* req_of_token             [[buffer(6)]],
+    const device uint* kv_page_indices         [[buffer(7)]],
+    const device uint* kv_page_indptr          [[buffer(8)]],
+    const constant int& page_size              [[buffer(9)]],   // 32, gated
+    const constant int& n_kv_heads             [[buffer(10)]],
+    const constant float& scale                [[buffer(11)]],
+    const device uchar* attention_mask         [[buffer(12)]],  // unused
+    const device uint& attention_mask_stride   [[buffer(13)]],  // unused
+    const device uchar* attention_mask_enabled [[buffer(14)]],  // unused
+    const constant int& window                 [[buffer(15)]],  // unused
+    const device bfloat* sinks                 [[buffer(16)]],  // unused
+    const constant int& n_rows                 [[buffer(17)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
+  (void)page_size; (void)attention_mask; (void)attention_mask_stride;
+  (void)attention_mask_enabled; (void)window; (void)sinks;
   constexpr int kU = 16;
   constexpr int NW = NAXP_NWARPS;
   constexpr int BQ = NW * kU;    // 64 query rows per threadgroup
@@ -123,12 +114,17 @@ kernel void sdpa_nax_prefill(
   const int q_ld  = n_q_heads * D;
   const int kv_ld = n_kv_heads * D;
 
+  // The page list is per REQUEST, through the CSR. `sdpa_nax_this_fire`
+  // guarantees one request per fire, so every row of this tile shares a base
+  // and reading it from row0's request is the same as reading it from any.
+  const int page_base = int(kv_page_indptr[req_of_token[row0]]);
+
   const int n_blocks = (kp_hi + BK) / BK;   // ceil((kp_hi+1)/32)
 
   for (int kb = 0; kb < n_blocks; ++kb) {
     // ONE page-table read for the whole 32-key block. This is the entire cost
     // of paging in this kernel.
-    const int page = int(kv_page_indices[kb]);
+    const int page = int(kv_page_indices[page_base + kb]);
     const device bfloat* Kb =
         k_pages + (size_t(page) * BK * n_kv_heads + kv_head) * D;
     const device bfloat* Vb =
