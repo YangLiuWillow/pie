@@ -570,45 +570,74 @@ matters:
 Conflating the two is what made the layout look promising. The rule is about the
 addresses inside one instruction, not about the shape of the stream over time.
 
-### BUILT, CORRECT, NOT MEASURED: the unroll gated inside the kernel
+### LANDED (isolated only): the unroll gated inside the kernel
 
-The one rejected idea with a real win behind it. The key-loop unroll gave +7% at
-12k/16k and −19% end to end at 5,840 tokens, and was discarded WHOLE because
-neither `pso_for` nor `launch_shape` is handed the context length. **The kernel
-is** — `total = position_ids[0] + 1` is right there and uniform across the
-threadgroup, so a branch on it costs nothing and picks the unrolled loop only
-where it pays.
+The key-loop unroll won 7% at 12k/16k, cost 19% end to end at 5,840 tokens, and
+was discarded WHOLE because neither `pso_for` nor `launch_shape` is handed a
+context length. **The kernel is** — `position_ids[row]` is right there and
+uniform across the threadgroup — so `sdpa_paged_decode_hshare` now takes an
+`UNROLL` template argument and branches on `(q_pos + 1) >= 8192` internally.
 
-`tools/rawmetal/kernels/sdpa_ugate_decode.metal`, correct at 8191, three arms:
+**The decisive measurement was not the speedup.** A branch does not undo
+register allocation: the compiler allocates for the worst path, so if the
+unrolled loop costs registers they are charged on every fire whichever branch
+runs — the likeliest explanation for a 19% regression from a change that only
+touched long-context behaviour. So the arm that mattered is the unrolled code
+present and **never taken**:
 
-| `UGATE` | what it is |
-|---|---|
-| 0 | the unrolled code present and NEVER taken — a control for its own register pressure |
-| 8192 | the shape that would ship |
-| 1 | the original rejected kernel |
+| arm | 2k | 16k |
+|---|---:|---:|
+| **never** (present, not taken) | **1.00×** | **1.00×** |
+| gated (≥ 8192) | 1.02× | **1.09×** |
+| always (the original) | 1.20× | 1.09× |
 
-**The question is not the speedup, it is the `never` arm at 2k.** A branch does
-not undo register allocation: the compiler allocates for the worst path, so if
-the unrolled loop's registers cost anything they are charged on every fire
-whichever branch runs — and that is the most likely explanation for a 19%
-regression caused by a change that only touched long-context behaviour.
+Reproducing to the third decimal over three runs. **The path that does not use
+the unroll pays nothing**, so the gate is safe by construction: below 8192 it is
+the shipped kernel unchanged.
 
-**And that question is unanswered, because the harness cannot currently ask
-it.** `split_run` allocates ~68 MB of K and V per timing and frees nothing, and
-this arm makes dozens of calls; by the end the interleaved baseline is no longer
-monotonic and the guard rejects the rows. Concretely, the SAME call on the SAME
-shipped kernel reads **0.040 ms at 2k in a short arm and 0.097–0.117 ms here**,
-so every 2k ratio in this arm is the reference moving rather than the kernel.
+Selected by NAME (`..._h2_u4` against `..._h2`) with the same tile, threadgroup
+and grid, so no launch site can disagree — the class this file calls a one-line
+landing. `PIE_METAL_SDPA_UNROLL=0` reverts it.
 
-What survived the guard, across runs, is only this: `always` is ~1.11–1.18× at
-16k, consistent with the original +7% claim, and `never` is ~1.00× at 16k. The
-2k column — the one that decides it — is not measurable until the probe reuses
-its buffers instead of allocating per call.
+**End to end it is worth approximately nothing, and the run says so with its own
+control.** `decode-rows-probe` fired at BOTH sides of the gate — its `SHORT` and
+`LONG` exist for exactly this — one completed pair:
 
-**So the next action here is to the INSTRUMENT, not the kernel**: give
-`split_run` a cache keyed on `ctx_len` so repeated timings reuse their K/V
-buffers. That is a contained change and it unblocks this question and any other
-that needs more than a handful of timings in one arm.
+| context | unroll on | off | |
+|---|---:|---:|---:|
+| 16,384 (**above** the gate, unroll active) | 22.15 ms | 22.21 | 1.003× |
+| 7,424 (**below** it, identical code path) | 17.41 | 17.63 | 1.013× |
+
+**The below-gate row must be 1.000× by construction** — both arms run the same
+code there — so its 1.3% is this instrument's pair-to-pair noise, and it is
+four times the 0.3% effect above the gate. One pair cannot resolve this, and
+what it does bound is that the isolated 1.09× does not arrive as anything like
+1.09%.
+
+That is the split-K pattern again and worse: an isolated ratio discounted to
+nothing in situ. It stays landed because it cannot hurt — below 8192 it is the
+shipped kernel and `never` measures 1.00× — but **nobody should count it as a
+speedup** without more pairs than one.
+
+Also note `always` measures **1.20× at 2k** here, where the original e2e run
+found −19% at 5,840 tokens. Those cannot both describe the same effect. The
+gated variant sidesteps the question; whoever wants the extra 1.20× has to
+settle it first.
+
+### What the instrument fix unblocked
+
+`split_run` allocated ~68 MB of K and V per timing and freed nothing, and
+`make_resident()` walks the whole heap each call — so an arm's later timings
+were priced against a bigger heap than its earlier ones. The same call on the
+same shipped kernel read **0.040 ms at 2k early in a session and 0.097–0.117 ms
+late in a long arm**, larger than most effects this probe decides.
+
+It now caches one allocation set per (context, layout). The split-K arm
+reproduces exactly through the change — baseline 0.040 / 0.122 / 0.174 / 0.233
+against 0.040 / 0.120 / 0.173 / 0.234 before, QH=4 S=4 at 1.18× / 1.14× / 1.17×
+— and the unroll arm went from "every row rejected as noise" to three runs
+agreeing to the third decimal. **Fixing the instrument was worth more than any
+kernel attempt in this section.**
 
 ### What is left to try, in order
 

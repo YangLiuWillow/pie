@@ -301,6 +301,16 @@ struct DeviceTuning {
     /// holding the previous layer's values, which is not a crash and not a
     /// slowdown, just wrong logits.
     bool sdpa_split = true;
+    /// Take the context-gated key-loop unroll in the head-sharing decode
+    /// attention (`..._h2_u4` instead of `..._h2`).
+    ///
+    /// Safe to flip on its own, unlike `sdpa_split`: the two differ only in the
+    /// entrypoint NAME -- same tile, same threadgroup, same grid -- so no
+    /// launch site can disagree with the choice. The unroll itself is gated
+    /// inside the kernel on the row's own context, and with the unrolled code
+    /// present but not taken it measures 1.00x against the plain kernel at both
+    /// 2k and 16k, so the path that does not use it pays nothing.
+    bool sdpa_unroll = true;
     /// Run prefill attention on the M5 neural accelerators (`sdpa_paged_nax`)
     /// instead of the simdgroup matrix unit. Off falls back to
     /// `sdpa_paged_mma`, completely: the pipeline is not compiled and neither
@@ -612,6 +622,7 @@ int sdpa_tile_min_rows_per_request();
 bool sdpa_mma();
 bool sdpa_head_share();
 bool sdpa_split();
+bool sdpa_unroll();
 bool sdpa_nax();
 bool qmm_nax();
 int sdpa_nax_min_rows();

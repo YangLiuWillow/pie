@@ -44,8 +44,12 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // not selected, or selected and not compiled.
     if (sdpa_head_share_this_fire(g.head_dim, g.kv_page_size, g.n_q_heads,
                                   g.n_kv_heads, g.paged_kv_enabled)) {
+        // Name-only selection: the unrolled variant has the same tile, the
+        // same threadgroup and the same grid, so unlike the split pair there is
+        // no launch site that could disagree with this choice.
         specs.push_back({"sdpa_paged.metal",
-                         paged_name + "_h" + std::to_string(kSdpaHeadShare),
+                         paged_name + "_h" + std::to_string(kSdpaHeadShare) +
+                             (sdpa_unroll() ? "_u4" : ""),
                          &out.sdpa_paged_hshare});
     }
     // The split-K decode, on the same terms and through the same predicate. Both

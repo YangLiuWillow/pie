@@ -706,7 +706,22 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, t
 // The causal bound, the CSR page walk and the online softmax are the same
 // arithmetic as above and must stay that way. `sdpa_online_update` is shared,
 // which is what keeps the softmax itself from being a second thing to keep true.
-template <typename T, int D, int V, int QH>
+// UNROLL issues that many keys' loads before any of their arithmetic, so the
+// loads overlap, at the cost of UNROLL x 8 more registers per lane.
+//
+// It is gated INSIDE the kernel on the row's own context length, which is the
+// whole reason it can ship. Landed once before and reverted: +7% at 12k/16k and
+// -19% end to end at 5,840 tokens, and it could not be gated because neither
+// `pso_for` nor `launch_shape` is handed a context length. The KERNEL is --
+// `position_ids[row]` is right there and uniform across the threadgroup.
+//
+// Measured with the unrolled code present and NEVER TAKEN, against the plain
+// kernel, on `sdpa_paged_probe` with warmed clocks and an interleaved baseline:
+// **1.00x at 2k and 1.00x at 16k**, reproducing to the third decimal over three
+// runs. So the extra registers cost nothing on the path that does not use them,
+// which is the question that decides whether a branch can rescue this. Gated at
+// 8192 it is 1.02x at 2k and 1.09x at 16k.
+template <typename T, int D, int V, int QH, int UNROLL = 1>
 [[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode_hshare(
     const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
     const device T* k_pages     [[buffer(1)]],
@@ -767,8 +782,51 @@ template <typename T, int D, int V, int QH>
   const int q_pos     = position_ids[row];
   const int page_base = int(kv_page_indptr[r]);
 
+  // Fewest keys that earn the unrolled path. Below it the plain loop runs, which
+  // is the shipped kernel unchanged -- see the note on UNROLL for why the
+  // threshold lives here and not at a selection site.
+  constexpr int kUnrollMinContext = 8192;
+  const bool wide = UNROLL > 1 && (q_pos + 1) >= kUnrollMinContext;
+
   // PAGE_SIZE is 32 here by construction, so the divide and modulo are a shift
   // and a mask -- the same specialization the `_p32` instantiation above earns.
+  if (wide) {
+    for (int kp0 = int(simd_gid); kp0 <= q_pos; kp0 += BN * UNROLL) {
+      U kv[UNROLL][qk_per_thread], vv[UNROLL][v_per_thread];
+      bool live[UNROLL];
+#pragma clang loop unroll(full)
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kp = kp0 + u * BN;
+        live[u] = kp <= q_pos;
+        // Out-of-range slots read key 0 rather than branching around the load:
+        // the arithmetic runs either way and `live` discards it, which keeps the
+        // loads unconditional and therefore overlappable.
+        const int kpr = live[u] ? kp : 0;
+        const int page = int(kv_page_indices[page_base + (kpr >> 5)]);
+        const size_t slot = size_t(page) * 32 + size_t(kpr & 31);
+        const device T* kptr =
+            k_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * qk_per_thread;
+        const device T* vptr =
+            v_pages + (slot * n_kv_heads + kv_head) * D + simd_lid * v_per_thread;
+        for (int j = 0; j < qk_per_thread; ++j) kv[u][j] = U(kptr[j]);
+        for (int j = 0; j < v_per_thread; ++j) vv[u][j] = U(vptr[j]);
+      }
+#pragma clang loop unroll(full)
+      for (int u = 0; u < UNROLL; ++u) {
+        for (int h = 0; h < QH; ++h) {
+          U score = 0;
+          for (int j = 0; j < qk_per_thread; ++j) score += q[h][j] * kv[u][j];
+          score = simd_sum(score);
+          if (!live[u]) continue;   // uniform across the simdgroup, so the
+                                    // simd_sum above is still reached by all
+          U factor, exp_score;
+          sdpa_online_update(score, row_max[h], row_sum[h], factor, exp_score);
+          for (int j = 0; j < v_per_thread; ++j)
+            o[h][j] = o[h][j] * factor + exp_score * vv[u][j];
+        }
+      }
+    }
+  } else {
   for (int kp = int(simd_gid); kp <= q_pos; kp += BN) {
     const int page = int(kv_page_indices[page_base + (kp >> 5)]);
     const size_t slot = size_t(page) * 32 + size_t(kp & 31);
@@ -790,6 +848,7 @@ template <typename T, int D, int V, int QH>
       sdpa_online_update(score, row_max[h], row_sum[h], factor, exp_score);
       for (int j = 0; j < v_per_thread; ++j) o[h][j] = o[h][j] * factor + exp_score * vv[j];
     }
+  }
   }
 
   // Cross-simdgroup reduction, once per head. `red` is reused between heads, so
@@ -817,9 +876,9 @@ template <typename T, int D, int V, int QH>
   }
 }
 
-#define instantiate_sdpa_paged_hshare(name, itype, d, v, qh)                 \
-  template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32_h" #qh)]]   \
-  [[kernel]] void sdpa_paged_decode_hshare<itype, d, v, qh>(                 \
+#define instantiate_sdpa_paged_hshare_u(name, itype, d, v, qh, u, suffix)    \
+  template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32_h" #qh suffix)]] \
+  [[kernel]] void sdpa_paged_decode_hshare<itype, d, v, qh, u>(              \
       const device itype*, const device itype*, const device itype*,         \
       device itype*, const constant int&, const device int*,                 \
       const device int*, const device uint*, const device uint*,             \
@@ -828,7 +887,14 @@ template <typename T, int D, int V, int QH>
       const constant int&, const device itype*,                              \
       uint3, uint3, uint, uint);
 
+#define instantiate_sdpa_paged_hshare(name, itype, d, v, qh)                 \
+  instantiate_sdpa_paged_hshare_u(name, itype, d, v, qh, 1, "")
+
 instantiate_sdpa_paged_hshare(bfloat16, bfloat, 128, 128, 2)  // llama / qwen
+// The same kernel with the context-gated unroll; selected by NAME alone, since
+// the tile, the threadgroup and the grid are identical and no launch site can
+// disagree with it. `PIE_METAL_SDPA_UNROLL=0` picks the plain one.
+instantiate_sdpa_paged_hshare_u(bfloat16, bfloat, 128, 128, 2, 4, "_u4")
 
 // ── the same decode again, with the KEY RANGE split across threadgroups ──
 //

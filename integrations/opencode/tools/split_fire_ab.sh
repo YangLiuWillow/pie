@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Split-K decode attention, on and off, priced as a DECODE FIRE.
+# One decode-attention switch, on and off, priced as a DECODE FIRE.
+#
+# `SPLIT_FIRE_VAR` picks which switch; it defaults to
+# `PIE_METAL_SDPA_SPLIT` and `PIE_METAL_SDPA_UNROLL` is the other one.
 #
 # ## Why this and not the rate probe
 #
@@ -54,7 +57,10 @@ run_one() {  # $1 label, $2 split setting, $3 rep
     # this the FIRST arm always loads and the second always fails, which is a
     # per-arm bias, not just a flake.
     sleep "${SPLIT_FIRE_SETTLE:-25}"
-    PIE_METAL_SDPA_SPLIT="$2" ./target/release/pie -c "$CONF" run \
+    # `env` and not `VAR=val cmd`: the variable NAME is itself a variable here,
+    # and bash does not re-parse an expansion as an assignment -- it would try to
+    # execute a command called `PIE_METAL_SDPA_SPLIT=1`.
+    env "${SPLIT_FIRE_VAR:-PIE_METAL_SDPA_SPLIT}=$2" ./target/release/pie -c "$CONF" run \
         --path "$WASM" --manifest "$MANIFEST" \
         > "$OUT/$1-$3.txt" 2>&1
     # The probe prints `[rows] ctx=N rows=K median_ms=X samples_ms=[...]`, one
@@ -62,7 +68,12 @@ run_one() {  # $1 label, $2 split setting, $3 rep
     # is the decode step. Matched on the whole `rows=1 ` token so `rows=128`
     # cannot satisfy it.
     local line
-    line=$(grep -o "\[rows\] ctx=[0-9]* rows=1 median_ms=[0-9.]*" "$OUT/$1-$3.txt" | head -1)
+    # BOTH contexts the probe fires, not just the first. `decode-rows-probe`
+    # has SHORT and LONG for exactly this, and a switch gated on context inside
+    # the kernel has to be priced on both sides of its gate -- one number cannot
+    # show "no regression below" and "a win above" at once.
+    line=$(grep -o "\[rows\] ctx=[0-9]* rows=1 median_ms=[0-9.]*" "$OUT/$1-$3.txt" \
+           | sort -u | tr '\n' ' ')
     # A RUN THAT PRODUCED NOTHING IS FATAL, not blank.
     #
     # The first attempt at this A/B had both `off` runs die on model load --

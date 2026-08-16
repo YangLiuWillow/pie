@@ -787,25 +787,66 @@ double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
     auto unbf = [](uint16_t h) { uint32_t u = uint32_t(h) << 16; float f;
                                  std::memcpy(&f, &u, 4); return f; };
 
-    SlotHandle q = ctx.heap_alloc(size_t(kHeads) * kD * 2);
-    SlotHandle kp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
-    SlotHandle vp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
-    SlotHandle o  = ctx.heap_alloc(size_t(kHeads) * kD * 2);
-    SlotHandle po = ctx.heap_alloc(size_t(kHeads) * nsplit * kD * 4);
-    SlotHandle pm = ctx.heap_alloc(size_t(kHeads) * nsplit * 2 * 4);
-    SlotHandle pos = ctx.heap_alloc(sizeof(int));
-    SlotHandle pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    // ONE allocation set per (context, layout), reused by every later call.
+    //
+    // This function used to allocate ~68 MB of K and V per invocation and free
+    // nothing, and `make_resident()` runs over the whole heap each time -- so an
+    // arm's later timings were priced against a bigger heap than its earlier
+    // ones. Measured: the SAME call on the SAME shipped kernel read 0.040 ms at
+    // 2k early in a session and 0.097-0.117 ms late in a long arm, which is
+    // larger than most effects this probe is used to decide. With the set
+    // cached, a hundred timings cost one allocation set.
+    //
+    // Keyed on the layout as well as the context because `head_major` changes
+    // where each key is WRITTEN, and two arms sharing a buffer would otherwise
+    // read each other's fill.
+    struct Cached {
+        int ctx_len; bool head_major; int nsplit;
+        SlotHandle q, kp, vp, o, po, pm, pos, pidx;
+        std::vector<float> qf, kf, vf;
+    };
+    static std::vector<std::unique_ptr<Cached>> cache;
+    Cached* hit = nullptr;
+    for (auto& e : cache)
+        if (e->ctx_len == ctx_len && e->head_major == head_major && e->nsplit >= nsplit) {
+            hit = e.get();
+            break;
+        }
+    const bool fresh = hit == nullptr;
+    if (fresh) {
+        cache.push_back(std::make_unique<Cached>());
+        hit = cache.back().get();
+        hit->ctx_len = ctx_len; hit->head_major = head_major; hit->nsplit = 8;
+        hit->q  = ctx.heap_alloc(size_t(kHeads) * kD * 2);
+        hit->kp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+        hit->vp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+        hit->o  = ctx.heap_alloc(size_t(kHeads) * kD * 2);
+        hit->po = ctx.heap_alloc(size_t(kHeads) * 8 * kD * 4);
+        hit->pm = ctx.heap_alloc(size_t(kHeads) * 8 * 2 * 4);
+        hit->pos  = ctx.heap_alloc(sizeof(int));
+        hit->pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    }
+    SlotHandle q = hit->q, kp = hit->kp, vp = hit->vp, o = hit->o;
+    SlotHandle po = hit->po, pm = hit->pm, pos = hit->pos, pidx = hit->pidx;
     auto* qz = static_cast<uint16_t*>(q.contents());
     auto* kz = static_cast<uint16_t*>(kp.contents());
     auto* vz = static_cast<uint16_t*>(vp.contents());
+    // The OUTPUT is cleared every call -- the correctness check reads it, and a
+    // kernel that wrote nothing would otherwise pass on the previous kernel's
+    // answer. The inputs are filled once per cached set.
+    std::memset(o.contents(), 0, size_t(kHeads) * kD * 2);
+    if (fresh) {
     std::memset(kz, 0, size_t(pages) * kPage * kKv * kD * 2);
     std::memset(vz, 0, size_t(pages) * kPage * kKv * kD * 2);
-    std::memset(o.contents(), 0, size_t(kHeads) * kD * 2);
     for (int p2 = 0; p2 < pages; ++p2) static_cast<uint32_t*>(pidx.contents())[p2] = uint32_t(p2);
     *static_cast<int*>(pos.contents()) = ctx_len;
 
-    std::vector<float> qf(size_t(kHeads) * kD);
-    std::vector<float> kf(size_t(kKv) * (ctx_len + 1) * kD), vf(kf.size());
+    hit->qf.assign(size_t(kHeads) * kD, 0.0f);
+    hit->kf.assign(size_t(kKv) * (ctx_len + 1) * kD, 0.0f);
+    hit->vf.assign(hit->kf.size(), 0.0f);
+    std::vector<float>& qf = hit->qf;
+    std::vector<float>& kf = hit->kf;
+    std::vector<float>& vf = hit->vf;
     for (int h = 0; h < kHeads; ++h)
       for (int d = 0; d < kD; ++d) {
         qf[size_t(h) * kD + d] = float((h * 3 + d * 2) % 7) * 0.125f;
@@ -828,6 +869,10 @@ double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
           kz[at] = bf(kk);
           vz[at] = bf(vv);
         }
+    }
+    const std::vector<float>& qf = hit->qf;
+    const std::vector<float>& kf = hit->kf;
+    const std::vector<float>& vf = hit->vf;
 
     const float scale = 1.0f / 11.3137085f;
     const Kernel kind = Kernel::Sdpa;
