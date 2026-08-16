@@ -197,6 +197,56 @@ inline void frag_mma(thread ffrag& c0, thread ffrag& c1,
     }
 }
 
+/// C[16x16] += A[16x32] * B[16x32]ᵀ — the N=16 case, done by widening K.
+///
+/// `frag_mma` issues N=32, and a simdgroup owning an ODD number of 16-wide
+/// column fragments cannot use it. The dense projections are exactly that: the
+/// driver's tile is bm=64/bn=32 at WM=WN=2, so TN=1.
+///
+/// The obvious fix — a `matmul2d_descriptor(16, 16, 16, ...)` — is refused by
+/// the API, and the refusal is explicit:
+///
+///     "At least one of M, N, or K must be 32 if both inputs are cooperative
+///      tensors"
+///
+/// So the 32 goes on K instead of N. One call consumes TWO K-halves of A and of
+/// B and produces one 16x16 accumulator, which suits the dense tile exactly:
+/// BK is 32, so this covers a whole K-block in one instruction where the N=32
+/// form takes two.
+///
+/// The alternative was re-shaping the warps, and it is worse: the dense GEMM's
+/// threadgroup is dispatched as {32, WM, WN}, so changing WM/WN moves a LAUNCH
+/// shape — the class of change this repo keeps getting wrong. This keeps the
+/// launch identical and makes the swap a matter of the entrypoint name again.
+template <bool TRANSPOSE_B>
+inline void frag_mma_k32(thread ffrag& c,
+                         const thread bfrag& a0, const thread bfrag& a1,
+                         const thread bfrag& b0, const thread bfrag& b1) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 16, 32,
+        /*transpose_left=*/false, /*transpose_right=*/TRANSPOSE_B,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+
+    auto ct_a = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c =
+        op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b),
+                                                      float>();
+#pragma clang loop unroll(full)
+    for (short i = 0; i < kElemsPerFrag; ++i) {
+        ct_a[i] = a0[i];
+        ct_a[kElemsPerFrag + i] = a1[i];
+        ct_b[i] = b0[i];
+        ct_b[kElemsPerFrag + i] = b1[i];
+        ct_c[i] = c[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+#pragma clang loop unroll(full)
+    for (short i = 0; i < kElemsPerFrag; ++i) c[i] = ct_c[i];
+}
+
 /// Reduce each of a lane's two rows across the four lanes that share it, then
 /// combine into `acc`. `{l, l^1, l^8, l^9}` -- see the header note.
 template <typename Op>

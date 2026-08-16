@@ -2208,8 +2208,7 @@ struct NaxBlockMMA {
   STEEL_CONST short kFrag = 16;
   STEEL_CONST short TM = BM / (kFrag * WM);
   STEEL_CONST short TN = BN / (kFrag * WN);
-  static_assert(TM >= 1 && TN >= 2 && (TN % 2) == 0,
-                "frag_mma issues N=32: a simdgroup needs an even fragment count");
+  static_assert(TM >= 1 && TN >= 1, "at least one fragment each way");
 
   // The shipped BlockMMA is used with transpose_a=false, transpose_b=true, so
   // As is [BM][lda_tgp] and Bs is [BN][ldb_tgp] -- both row-major with K
@@ -2232,23 +2231,54 @@ struct NaxBlockMMA {
       for (short j = 0; j < TN; ++j) C[i][j] = pie_nax::ffrag(0);
   }
 
+  // Two shapes, chosen by whether a simdgroup owns an even number of 16-wide
+  // column fragments. `TN` is a compile-time constant so only one survives.
+  //
+  //   TN even -> the N=32 form: one matmul2d per column PAIR, K stepping by 16.
+  //   TN odd  -> the K=32 form: one matmul2d per column, K stepping by 32,
+  //              because the API refuses N=16 with two cooperative inputs and
+  //              re-shaping the warps would move a launch shape.
   METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) {
-    STEEL_PRAGMA_UNROLL
-    for (short kk = 0; kk < BK; kk += kFrag) {
-      pie_nax::bfrag a[TM], b[TN];
+    if (TN % 2 == 0) {
       STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < TM; ++i)
-        pie_nax::frag_load_tg(a[i], As + (tm + i * kFrag * WM) * A_str_m + kk,
-                              A_str_m, lid);
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < TN; ++j)
-        pie_nax::frag_load_tg(b[j], Bs + (tn + j * kFrag * WN) * B_str_n + kk,
-                              B_str_n, lid);
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < TM; ++i)
+      for (short kk = 0; kk < BK; kk += kFrag) {
+        pie_nax::bfrag a[TM], b[TN];
         STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < TN; j += 2)
-          pie_nax::frag_mma<true>(C[i][j], C[i][j + 1], a[i], b[j], b[j + 1]);
+        for (short i = 0; i < TM; ++i)
+          pie_nax::frag_load_tg(a[i], As + (tm + i * kFrag * WM) * A_str_m + kk,
+                                A_str_m, lid);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < TN; ++j)
+          pie_nax::frag_load_tg(b[j], Bs + (tn + j * kFrag * WN) * B_str_n + kk,
+                                B_str_n, lid);
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < TM; ++i)
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j + 1 < TN; j += 2)
+            pie_nax::frag_mma<true>(C[i][j], C[i][j + 1], a[i], b[j], b[j + 1]);
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short kk = 0; kk < BK; kk += 2 * kFrag) {
+        pie_nax::bfrag a0[TM], a1[TM], b0[TN], b1[TN];
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < TM; ++i) {
+          const threadgroup T* ap = As + (tm + i * kFrag * WM) * A_str_m + kk;
+          pie_nax::frag_load_tg(a0[i], ap, A_str_m, lid);
+          pie_nax::frag_load_tg(a1[i], ap + kFrag, A_str_m, lid);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < TN; ++j) {
+          const threadgroup T* bp = Bs + (tn + j * kFrag * WN) * B_str_n + kk;
+          pie_nax::frag_load_tg(b0[j], bp, B_str_n, lid);
+          pie_nax::frag_load_tg(b1[j], bp + kFrag, B_str_n, lid);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < TM; ++i)
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < TN; ++j)
+            pie_nax::frag_mma_k32<true>(C[i][j], a0[i], a1[i], b0[j], b1[j]);
+      }
     }
   }
 
@@ -2348,6 +2378,77 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN,
 
 instantiate_qmm_t_routed_nax(64, 32, 32, 64, 4)
 instantiate_qmm_t_routed_nax(64, 64, 32, 64, 4)
+
+
+/// `affine_qmm_t` (the DENSE projections), with the matmul on the accelerators.
+///
+/// 19.5% of a cold prefill. Same loaders, same tiling, same K loop; only the
+/// MMA differs. The driver's dense tile is bm=64/bn=32, which at WM=WN=2 leaves
+/// one 16-wide column fragment per simdgroup -- handled by `frag_mma_n16`, so
+/// the threadgroup stays {32,2,2} and the launch shape is untouched.
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          int WM = 2, int WN = 2>
+[[kernel]] void affine_qmm_t_aligned_nax(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using mma_t = NaxBlockMMA<T, T, BM, BN, BK, WM, WN, BK_padded, BK_padded>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_col = int(tid.x) * BN;
+  const int y_row = int(tid.y) * BM;
+
+  auto wl = (const device uint8_t*)w + y_col * K_w;
+  loader_w_t loader_w(wl, scales + y_col * K_g, biases + y_col * K_g, K, Ws,
+                      simd_gid, simd_lid);
+  const device T* xp = x + y_row * static_cast<int64_t>(K);
+  device T* yp = y + y_row * static_cast<int64_t>(N) + y_col;
+  loader_x_t loader_x(xp, K, Xs, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result(yp, N);
+}
+
+#define instantiate_qmm_t_dense_nax(gs, bm, bk, bn, b)                         \
+  template [[host_name("affine_qmm_t_nax_bfloat16_gs_" #gs "_b_" #b            \
+                       "_bm_" #bm "_bn_" #bn)]]                                \
+  [[kernel]] void affine_qmm_t_aligned_nax<bfloat, gs, b, bm, bk, bn>(         \
+      const device uint32_t*, const device bfloat*, const device bfloat*,      \
+      const device bfloat*, device bfloat*, const constant int&,               \
+      const constant int&, uint3, uint, uint);
+
+instantiate_qmm_t_dense_nax(64, 64, 32, 32, 4)
+instantiate_qmm_t_dense_nax(64, 64, 32, 64, 4)
+instantiate_qmm_t_dense_nax(64, 32, 32, 32, 4)
 
 #define instantiate_qmm_t(gs, bm, bk, bn, b)                                          \
   template [[host_name("affine_qmm_t_routed_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \

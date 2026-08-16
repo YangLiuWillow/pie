@@ -236,6 +236,35 @@ int main(int argc, char** argv) {
                    flop / (b / 1000.0) / 1e12, a / b);
         }
     }
+    // ── the DENSE projections, 19.5% of a cold prefill and untouched ──
+    // Same NaxBlockMMA, but the driver's tile is bm=64/bn=32 -> TN=1, which
+    // takes the K=32 matmul rather than the N=32 one.
+    printf("\ndense projections (q_proj shape: M=4096 K=2048 N=4096, bm=64 bn=32):\n");
+    {
+        std::string e5, e6;
+        Arm ds{"shipped", ctx->compile_pso_from_file(
+                   dir + "/quantized_qmm_t.metal",
+                   "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32", &e5), 64, 32};
+        Arm dn{"NAX", ctx->compile_pso_from_file(
+                   dir + "/quantized_qmm_t.metal",
+                   "affine_qmm_t_nax_bfloat16_gs_64_b_4_bm_64_bn_32", &e6), 64, 32};
+        if (!ds.pso.valid()) printf("  shipped dense compile: %s\n", e5.c_str());
+        if (!dn.pso.valid()) printf("  NAX dense compile: %s\n", e6.c_str());
+        if (ds.pso.valid() && dn.pso.valid()) {
+            // The dense kernel takes no tile_expert; routed_run binds one and
+            // the extra slot is simply unread, so ONE expert with every tile
+            // pointing at it is exactly a dense GEMM. That keeps the reference
+            // and the data generation shared rather than duplicated.
+            routed_run(*ctx, ds, 256, 128, 256, 1, 40, true);
+            routed_run(*ctx, dn, 256, 128, 256, 1, 41, true);
+            const double a = routed_run(*ctx, ds, 4096, 4096, 2048, 1, 42, false);
+            const double b = routed_run(*ctx, dn, 4096, 4096, 2048, 1, 43, false);
+            const double df = 2.0 * 4096.0 * 4096.0 * 2048.0;
+            printf("  %-10s %8.3f ms   %6.2f TFLOP/s\n", "shipped", a, df / (a / 1000.0) / 1e12);
+            printf("  %-10s %8.3f ms   %6.2f TFLOP/s   %.2fx\n", "NAX", b,
+                   df / (b / 1000.0) / 1e12, a / b);
+        }
+    }
     printf("\n  simdgroup ceiling 5.48 TFLOP/s, matmul2d 32.5 (matrix_rate_probe).\n");
     printf("  This is ONE of the three routed projections; a layer runs gate,\n");
     printf("  up and down, and the trace prices all three together at 43.6%% of\n");

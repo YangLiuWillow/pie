@@ -205,7 +205,20 @@ bool load_multibatch_psos(RawMetalContext& ctx,
             const int bn = 16 << i;
             const std::string suffix = q + "_bm_" + std::to_string(bm) +
                                        "_bn_" + std::to_string(bn);
-            want(qmm, "affine_qmm_t" + suffix, &out.qmm_t[w][i]);
+            // The neural-accelerator variant where one is instantiated. Same
+            // tile, same threadgroup {32,WM,WN}, same grid -- only the
+            // entrypoint name differs, so no launch site can disagree with the
+            // choice and this stays a knob rather than a rewrite.
+            //
+            // Only the 4-bit group-64 tiles the prefill actually selects are
+            // instantiated; everything else keeps the simdgroup kernel, which
+            // is right for decode widths where a GEMM is matvec-shaped anyway.
+            const bool nax_ok = qmm_nax() && quant.group == 64 &&
+                                quant.bits == 4 &&
+                                ((bm == 64 && (bn == 32 || bn == 64)) ||
+                                 (bm == 32 && bn == 32));
+            want(qmm, (nax_ok ? "affine_qmm_t_nax" : "affine_qmm_t") + suffix,
+                 &out.qmm_t[w][i]);
             if (features.fp16_precast && quant.group == 64 && quant.bits == 4) {
                 want(qmm, "affine_qmm_t_fp16_precast" + suffix,
                      &out.qmm_t_fp16_precast[w][i]);

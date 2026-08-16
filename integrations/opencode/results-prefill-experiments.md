@@ -366,3 +366,83 @@ Remaining, in order:
 2. Attention is 32.2% and now beats MLX, so it is no longer the lever it was.
 3. Decode is still ~1.2× behind mlx and untouched since head sharing.
 
+## Experiment 5 — the dense projections on NAX
+
+**The obstacle.** `NaxBlockMMA` applies unchanged except for the tile: the dense
+path is bm=64/bn=32 at WM=WN=2, so TN=1, and `frag_mma` issues N=32 which needs
+two 16-wide column fragments.
+
+**The first fix was refused by the hardware API**, explicitly and usefully:
+
+```
+matmul2d_descriptor(16, 16, 16, ...)
+  -> "At least one of M, N, or K must be 32 if both inputs are
+      cooperative tensors"
+```
+
+**So the 32 went on K instead of N.** `frag_mma_k32` consumes two K-halves of A
+and of B and produces one 16×16 accumulator. That suits the dense tile exactly —
+BK is 32, so one instruction covers a whole K-block where the N=32 form takes
+two. The other candidate, re-shaping the warps, was rejected on structure rather
+than speed: the dense GEMM's threadgroup is dispatched as `{32, WM, WN}`, so
+changing WM/WN moves a LAUNCH shape, and that is the class of change this repo
+keeps getting wrong. The K=32 route keeps the launch identical, so landing stays
+a matter of the entrypoint name.
+
+**Result — ACCEPTED. 2.72×, the best rate yet.**
+
+| shape | shipped | NAX | |
+|---|---:|---:|---:|
+| q_proj, M=4096 K=2048 N=4096, bm=64 bn=32 | 9.43 ms (7.29 TFLOP/s) | **3.46 ms** (19.84) | **2.72×** |
+
+19.84 TFLOP/s is 61% of `matmul2d`'s 32.5 peak, against 22% for the kernel it
+replaces. Correct on both arms against a float64 reference.
+
+---
+
+# Where this leaves prefill
+
+**TTFT, deterministic fixed prompts, one server per arm:**
+
+| prompt | at the start | **now** | mlx-lm | |
+|---:|---:|---:|---:|---|
+| 5,840 | 7.98 s | **2.60 s** | 2.88 s | **pie 1.11× faster** |
+| 16,090 | 27.70 s | **7.38 s** | 8.20 s | **pie 1.11× faster** |
+| 28,390 | 57.21 s | **14.31 s** | 15.40 s | **pie 1.08× faster** |
+
+**Cumulative: 3.07× / 3.75× / 4.00×, and pie's prefill is now FASTER than
+mlx-lm's at every context measured**, from 2.9–3.7× behind two days ago.
+
+**The 6-turn canned agentic replay** (`bench_ab.py --turns 6`), both engines
+measured in the same session because the standing rule forbids quoting a
+remembered number for the other engine:
+
+| | pie | mlx-lm |
+|---|---:|---:|
+| total | **7.11 s** | 7.64 s |
+| turn 1, cold 7.2k prefill (TTFC) | **3.279 s** | 3.973 s |
+| steady turn TTFC | 0.383–0.452 s | 0.430–0.442 s |
+| decode | 46–48 tok/s | **56–62 tok/s** |
+
+**pie is 1.07× faster overall and 1.21× faster on cold prefill; mlx is still
+1.25× faster on decode.** This replay is prefill-dominated (10 generated tokens
+a turn), so the total flatters pie — a turn that writes a long patch would
+weight decode more heavily. Both halves are stated so neither is hidden.
+
+Generation verified coherent after every landing: Fibonacci correct,
+17×23 = 391, the first eight primes correct, a correct one-line description of a
+KV cache. Driver suite unchanged throughout — llama_pso 32,
+llama_decode_step 232, kv_append_paged 13, gptoss all, numerics 51/18
+pre-existing.
+
+## What is left
+
+1. **Decode**, now the larger deficit: 1.25× behind mlx and untouched since GQA
+   head sharing. Task #8 (splitting the key range so head sharing can go past
+   QH=2) is the known lever and is unattempted.
+2. `PIE_METAL_QMM_NAX=0` and `PIE_METAL_SDPA_NAX=0` revert the two GEMM and
+   attention paths independently.
+3. The NAX GEMM covers only the 4-bit group-64 tiles a prefill selects. Decode
+   widths keep the simdgroup kernel, which is right — a matvec-shaped GEMM has
+   nothing for a matrix unit of either kind — but it means `qmm_nax` does
+   nothing for decode, by design and not by omission.
