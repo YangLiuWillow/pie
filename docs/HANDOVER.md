@@ -26,9 +26,23 @@ fixed prompts:
 
 TTFT is **3.07× / 3.75× / 4.00×** better than two days ago.
 
-6-turn canned agentic replay (`bench_ab.py --turns 6`), both engines in one
-session: **pie 7.11 s against mlx-lm 7.64 s**; cold 7.2k prefill 3.279 s against
-3.973 s; decode 46–48 tok/s against 56–62.
+Four engines in one session on an idle machine (`results-four-way.md`,
+`tools/four_way.sh`) — pie now, pie with all three new kernels switched off,
+mlx-lm and vLLM-metal:
+
+| | pie now | pie original | mlx-lm | vLLM-metal |
+|---|---:|---:|---:|---:|
+| TTFT 16,090 | **7.37 s** | 27.84 | 8.85 | 17.10 |
+| decode 16,090 | 41.0 tok/s | 26.1 | **47.5** | 30.3 |
+| 6-turn replay | **7.14 s** | 16.30 | 8.02 | 10.18 |
+
+**pie leads prefill (1.06–1.24× over mlx-lm, 1.6–2.7× over vLLM) and trails
+decode (mlx-lm by 1.16–1.28×).**
+
+**A four-arm run carries ~10% of position-dependent THERMAL drift at the long
+end** — the first arm repeated last is 11–12% slower at 28k, and it reproduces
+on an idle machine, so it is not contention. Interleave (as `matched_spec.sh`
+does) if that margin matters.
 
 Correctness is where it was — pie 4/5 on the SWE-bench known-5 against vLLM's
 1/5 (`results-swebench.md`); nothing since has touched the agent path's logic,
