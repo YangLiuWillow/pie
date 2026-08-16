@@ -54,25 +54,53 @@ the gate without reading that comment.**
 
 ## 2. THE TASK: decode attention (split-K now landed; the chain is what is left)
 
-### The sound composition of a decode step
+### The sound composition of a decode step — RE-MEASURED, and re-labelled
 
-Measured by ablating each kernel and taking the delta, on `decode-rows-probe` at
-rows=1, ctx 7424, baseline 17.55 ms. **Ablation is only valid for kernels that
-emit VALUES** -- see the retraction below for what happens otherwise.
+`tools/decode_retrace.sh`, ablation on `decode-rows-probe` at rows=1, ctx 7424,
+baseline **17.35 ms** on the current build (split-K landed).
 
-| kernel | cost | share | its own roofline | off by |
+| what is actually removed | cost | share | its own roofline | off by |
 |---|---:|---:|---:|---:|
-| attention (`sdpa`) | 5.26 ms | **30.0%** | 2.47 ms | **2.13x** |
-| routed expert projections (`ll_expert_gate`) | 3.79 ms | 21.6% | 3.06 ms | 1.24x |
-| dense projections (`qmv_gate`) | 2.86 ms | 16.3% | 1.53 ms | 1.87x |
-| `silu_mul` | ~0 | ~0% | - | - |
-| `moe_route_sort` | 0.25 ms | 1.4% | - | - |
+| attention (`sdpa`) | 5.05 ms | **29.1%** | 2.47 ms | **2.04×** |
+| **all three** routed expert projections | 4.03 ms | 23.2% | 3.06 ms | 1.32× |
+| **all nine** dense matvecs, incl. the LM head | 2.96 ms | 17.1% | 1.53 ms | **1.93×** |
+| everything else | ~5.3 ms | ~30.6% | — | — |
 
-Rooflines are the unique bytes each must read at ctx 7424 over 48 layers, at
-296 GB/s: KV 730 MB, active expert weights 906 MB, dense weights 452 MB.
+**The labels matter and the previous version of this table got them wrong.**
+`PIE_METAL_ABLATE` matches the kind `pso_kind` MAPS TO, and that map is
+many-to-one:
 
-**Attention is the biggest term AND the furthest from its roofline.** That is
-the target.
+```
+case QmvQ, QmvK, QmvV, QmvO, QmvGate, QmvUp, QmvDown, Router, LmHead
+                        -> Kernel::QmvGate       // NINE kinds, one token
+case ExpertGate, ExpertUp, ExpertDown
+                        -> Kernel::LlExpertGate  // THREE kinds, one token
+```
+
+So `qmv_gate` does not ablate "the dense projections" — it ablates every dense
+matvec in the model **including the LM head**, and this checkpoint is a mixture,
+so `QmvGate` itself is never even dispatched. `ll_expert_gate` ablates the whole
+routed FFN, not the gate projection. The old rows were right in MAGNITUDE (5.26 /
+3.79 / 2.86 against 5.05 / 4.03 / 2.96 here, and the rooflines were already
+computed for the whole groups) and wrong in NAME, which invites planning work
+against a kernel that is not what was measured.
+
+**A token that maps to no dispatched kind ablates NOTHING and reports a clean
+zero.** `qmv_q`, `qmv_o`, `qmv_up`, `qmv_down` and `ll_router` are all in that
+position here, and they measured −0.05, −0.04, −0.09, −0.02 and −0.03 ms. Five
+known-zeros is a free calibration: **this instrument's noise floor is ±0.09 ms,
+±0.5% of a step**, so the three real numbers above are resolved by 30–50×.
+
+Those zeros also settle the drift. The baseline repeated last read 17.77 ms,
++2.42%, and the script says so — but late drift cannot propagate backwards
+through five zeros measured against the first baseline, so 17.35 is the right
+reference for the sweep and the tail run is what moved.
+
+**Attention is still the biggest term and still the furthest from its roofline,
+and the dense matvecs are second at 1.93× off.** That group is 2.96 ms with
+1.53 ms of floor, so ~1.4 ms — **8.3% of a decode step** — is available there,
+and it is the largest untouched block left. It is also nine dispatches under one
+pipeline, so a fix reaches all of them.
 
 ### Why, and what to build
 
@@ -441,41 +469,36 @@ present and against a baseline quoted from a different run.** The arm now
 compiles the QH=2 kernel it replaces and times it **interleaved**, context by
 context, in the same run.
 
-### What is left to try — but RE-TRACE FIRST, the two compositions disagree
+### What is left to try, in order
 
-**Do not pick the next decode target off either table in these docs without
-re-measuring.** They do not agree, and the disagreement is exactly the size of
-the decision:
+The re-trace is done and the composition above is the sound one. The two docs
+disagreed because they group differently and one came from the dispatch trace;
+the ablation table is the one to plan from, now that its rows say what they
+actually remove.
 
-| kernel | this file, ctx 7,424 | `HANDOVER.md` §5, ctx 18k |
-|---|---|---|
-| decode attention | 30.0%, **2.13× off** roofline | 42%, **1.24× off** |
-| routed expert projections | 21.6%, 1.24× off | 22%, 1.30× off |
-| dense projections | 16.3%, **1.87× off** | 9%, **1.01× off** |
+**1. The dense matvecs — 2.96 ms, 17.1% of a step, 1.93× off roofline.** The
+largest untouched block, and nine dispatches behind ONE pipeline
+(`affine_qmv_fast`), so a single fix reaches q, k, v, o, the router and the LM
+head together. ~1.4 ms is available, **8.3% of a decode step** — five times what
+split-K delivered. Start by splitting that 2.96 ms across the nine: they are
+very different shapes (the LM head is K=2048 × N=vocab, the others are narrow),
+and the ablation token cannot separate them, so this needs per-ordinal timing
+rather than another ablation.
 
-The dense projections are either 1.87× off their roofline and worth ~5.8% of a
-step, or already AT it and worth nothing. Some of the spread is real — shares
-shift with context because the KV term grows — but a factor of 1.85 on the same
-kernel's roofline ratio is not a context effect, and one of the two was taken
-with the dispatch trace, which this file has already shown inflates small
-kernels by up to 38×.
+**2. Attention, still 29.1% and still 2.04× off.** The per-key chain is load →
+dot → **`simd_sum`** → online-softmax update → rescale → accumulate. Unrolling
+the loads did not pay and split-K bought 1.06× in situ, which together point at
+the cross-lane reduction and the dependent softmax update rather than at memory.
+`sdpa_paged.metal`'s own comments name the alternative shape: **KEY_PER_LANE** —
+one key per lane walking all of D, removing the `simd_sum` per key at the cost of
+D registers per lane. A restructure, not a constant.
 
-So: re-trace at one context, with the ablation method §2 uses, on the current
-build. That is rule 3 of §4, and this landing is the third time the ordering has
-rotated under it.
+**3. The routed FFN is 1.32× off its roofline** and is the least promising of
+the three despite being 23.2%: only ~1.0 ms exists between it and the floor.
 
-**If attention is still the target**, the per-key chain is load → dot →
-**`simd_sum`** → online-softmax update → rescale → accumulate. Unrolling the
-loads did not pay and split-K bought 1.06× in situ, which together point at the
-cross-lane reduction and the dependent softmax update rather than at memory.
-`sdpa_paged.metal`'s own comments name the alternative shape: **KEY_PER_LANE**
-— one key per lane walking all of D, which removes the `simd_sum` per key
-entirely at the cost of D registers per lane. A restructure, not a constant.
-
-**And measure any candidate the way this landing had to be measured**: the
-isolated kernel ratio overstated the transferable gain by 2.8×, so a prototype
-that wins in `sdpa_paged_probe` should be priced with `tools/split_fire_ab.sh`
-before anyone believes an end-to-end number for it.
+**And measure any candidate the way split-K had to be measured**: the isolated
+kernel ratio overstated the transferable gain by 2.8×, so price it with
+`tools/split_fire_ab.sh` before believing an end-to-end number.
 
 ---
 
@@ -534,7 +557,15 @@ before anyone believes an end-to-end number for it.
    timestamps, a fixed cost, so a kernel whose real cost is near the launch floor
    can be overstated by tens of times — `silu_mul` by 38×. Price small kernels by
    ablation, and cross-check any trace share below ~10% before acting on it.
-9. **Prove the binary contains the change, and that BOTH arms ran, before
+9. **`PIE_METAL_ABLATE` takes the kind `pso_kind` MAPS TO, and that map is
+   many-to-one.** Nine dense matvecs share `qmv_gate` (q, k, v, o, gate, up,
+   down, router AND the lm head); three routed projections share
+   `ll_expert_gate`. So one token ablates a whole group, and a token for a kind
+   that is never a `pso_kind` ablates nothing while printing an armed-looking
+   banner. Label a composition row by what was REMOVED, not by the token.
+   Deliberately ablating known-zero kinds is also free calibration: five of them
+   here bounded the instrument at +/-0.09 ms.
+10. **Prove the binary contains the change, and that BOTH arms ran, before
    believing an A/B.** Two arms of the same binary produce a perfect 1.00x,
    identical output and a clean drift control — the most convincing null result
    available, and it means nothing. Separately, an arm that fails to boot prints
@@ -543,7 +574,7 @@ before anyone believes an end-to-end number for it.
    `pie-bin` and the wrong name fails the package match rather than building.
    Build inside the harness, assert no driver source is newer than the binary,
    and make the gate say out loud that it fired.
-10. **A probe that has not shown its clocks are stable has not measured
+11. **A probe that has not shown its clocks are stable has not measured
    anything.** This GPU ramps under sustained load, and the same kernel on the
    same binary read 1.475 / 1.154 / 0.837 / 0.233 ms/layer across four runs
    ordered by how warm the machine was. Ratios taken across a ramp are as bad
@@ -551,7 +582,7 @@ before anyone believes an end-to-end number for it.
    1.16x win once settled. Warm until successive measurements agree, and put a
    physical sanity check on the output — attention cannot get cheaper on more
    keys, and that guard caught every bad run here.
-11. **An instrument can reproduce the bug it was built to find.** A tile-width
+12. **An instrument can reproduce the bug it was built to find.** A tile-width
    sweep hardcoded the launch shape while varying the kernel constant and
    reported a correct kernel as 24576 elements wrong. A roofline gate parsed
    `$NF` and compared the string `"GB/s"` against 250, passing for every machine
