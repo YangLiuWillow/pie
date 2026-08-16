@@ -154,6 +154,102 @@ double run(RawMetalContext& ctx, Pso pso, const Shape& s, int ordinal,
     return us_each;
 }
 
+
+/// And what does `moe_route_gather` cost on its own?
+///
+/// Ablation prices it at **2.12 ms of a 17.38 ms decode step, 12.2%** -- 44 us
+/// for each of 48 dispatches, to move 32 KB. That is 0.74 GB/s on a machine
+/// that streams at 296, so either the kernel is pathological or the ablation is
+/// lying, and only an isolation run tells them apart.
+///
+/// The reason to doubt the ablation here specifically: removing the gather
+/// leaves the sorted stack holding whatever the activation pool last put there,
+/// and this kernel's own comment says that can be bf16 inf. If the expert GEMMs
+/// downstream then run on inf, their speed is not the speed they run at in a
+/// real fire, and the delta is not the gather's cost. Dispatching it alone has
+/// no downstream at all.
+double gather_run(RawMetalContext& ctx, Pso pso, int rows, int k, int width,
+                  int ordinal) {
+    const int n = rows * k;
+    const int padded = n;               // tile_rows == 1 at decode
+    SlotHandle x    = ctx.heap_alloc(std::size_t(rows) * width * 2);
+    SlotHandle out  = ctx.heap_alloc(std::size_t(padded) * width * 2);
+    SlotHandle perm = ctx.heap_alloc(std::size_t(padded) * sizeof(int));
+    SlotHandle par  = ctx.heap_alloc(sizeof(MoeRouteParamsHost));
+    std::memset(x.contents(), 0, std::size_t(rows) * width * 2);
+    std::memset(out.contents(), 0, std::size_t(padded) * width * 2);
+    for (int i = 0; i < padded; ++i) static_cast<int*>(perm.contents())[i] = i;
+    *static_cast<MoeRouteParamsHost*>(par.contents()) = MoeRouteParamsHost{
+        std::uint32_t(n), 128u, std::uint32_t(k), 1u,
+        std::uint32_t(padded), std::uint32_t(width), 0u};
+
+    const Kernel kind = Kernel::LlMoeGather;
+    ctx.arg_bind(kind, ordinal, 0, x);
+    ctx.arg_bind(kind, ordinal, 1, out);
+    ctx.arg_bind(kind, ordinal, 2, perm);
+    ctx.arg_bind(kind, ordinal, 3, par);
+    ctx.make_resident();
+
+    // The SHIPPED launch shape: one thread per element of the sorted stack.
+    const std::uint32_t w = std::uint32_t(width);
+    const std::uint32_t tgw = w < 256u ? w : 256u;
+    constexpr int kReps = 48;           // one model's worth, so units match
+    LatencyHarness h(ctx);
+    auto enc = [&](StepEncoder& se) {
+        se.set_pso(pso);
+        se.set_argtable(kind, ordinal);
+        for (int i = 0; i < kReps; ++i) {
+            se.dispatch(Grid{w, std::uint32_t(padded), 1}, Threadgroup{tgw, 1, 1});
+            se.barrier();
+        }
+    };
+    BenchResult r = h.time_step("moe-gather", enc, 30, 8);
+    return r.median.gpu_exec_ms * 1000.0 / kReps;
+}
+
+
+/// And `rms_single_row`, which ablation prices at 2.49 ms / 14.3%.
+///
+/// Same doubt as the gather, and stronger. Removing every norm leaves the
+/// residual stream unnormalised through 48 layers; it grows without bound and
+/// reaches inf long before the end, so the projections downstream are running
+/// on inf and their speed is not the speed they run at in a real fire.
+double rms_run(RawMetalContext& ctx, Pso pso, int width, int ordinal) {
+    SlotHandle x   = ctx.heap_alloc(std::size_t(width) * 2);
+    SlotHandle w   = ctx.heap_alloc(std::size_t(width) * 2);
+    SlotHandle out = ctx.heap_alloc(std::size_t(width) * 2);
+    SlotHandle par = ctx.heap_alloc(64);
+    std::memset(x.contents(), 0, std::size_t(width) * 2);
+    std::memset(w.contents(), 0, std::size_t(width) * 2);
+    std::memset(out.contents(), 0, std::size_t(width) * 2);
+    std::memset(par.contents(), 0, 64);
+    // RmsParams{eps, axis_size, w_stride, plus_one, gain} -- eps then the width.
+    auto* pp = static_cast<float*>(par.contents());
+    pp[0] = 1e-6f;
+    static_cast<std::int32_t*>(par.contents())[1] = std::int32_t(width);
+    static_cast<std::int32_t*>(par.contents())[2] = 1;
+
+    const Kernel kind = Kernel::Rms;
+    ctx.arg_bind(kind, ordinal, 0, x);
+    ctx.arg_bind(kind, ordinal, 1, w);
+    ctx.arg_bind(kind, ordinal, 2, out);
+    ctx.arg_bind(kind, ordinal, 3, par);
+    ctx.make_resident();
+
+    constexpr int kReps = 193;   // 4 norms a layer x 48 + the final one
+    LatencyHarness h(ctx);
+    auto enc = [&](StepEncoder& se) {
+        se.set_pso(pso);
+        se.set_argtable(kind, ordinal);
+        for (int i = 0; i < kReps; ++i) {
+            se.dispatch(Grid{1024, 1, 1}, Threadgroup{1024, 1, 1});
+            se.barrier();
+        }
+    };
+    BenchResult r = h.time_step("rms", enc, 30, 8);
+    return r.median.gpu_exec_ms * 1000.0 / kReps;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -201,5 +297,40 @@ int main(int argc, char** argv) {
         printf("  >>> the two disagree by more than 25%%: this run is WARM-UP\n"
                "      DRIFT, not parameter scaling. Read the repeat, not the first.\n");
     printf("\n  A cost flat in both sweeps is fixed overhead, not the body.\n");
+
+    // ── moe_route_gather, which ablation says is 12.2% of a decode step ──
+    printf("\nmoe_route_gather, dispatched ALONE (48 barriered reps, us each)\n");
+    std::string ge;
+    Pso gpso = ctx->compile_pso_from_file(dir + "/moe_route.metal",
+                                          "moe_route_gather", &ge);
+    if (!gpso.valid()) {
+        printf("  compile fail: %s\n", ge.c_str());
+    } else {
+        const double dec = gather_run(*ctx, gpso, 1, 8, 2048, 300);
+        printf("  decode shape (1 token, top-8, hidden 2048): %.2f us per dispatch\n", dec);
+        printf("    x48 layers = %.2f ms; ablation says 2.12 ms\n", dec * 48 / 1000.0);
+        // Vary the WIDTH: the kernel is one thread per element, so a cost flat
+        // in width is fixed overhead and a cost linear in it is the copy.
+        for (const int wdt : {512, 1024, 2048, 4096}) {
+            const double t = gather_run(*ctx, gpso, 1, 8, wdt, 320 + wdt % 29);
+            printf("    width=%-5d %6.2f us\n", wdt, t);
+        }
+        const double again = gather_run(*ctx, gpso, 1, 8, 2048, 390);
+        printf("  decode shape REPEATED last: %.2f us (first: %.2f us)\n", again, dec);
+        if (dec > again * 1.25 || again > dec * 1.25)
+            printf("  >>> the two disagree by >25%%: WARM-UP DRIFT, read the repeat.\n");
+    }
+    printf("\nrms_single_row, dispatched ALONE (193 barriered reps, us each)\n");
+    std::string re;
+    Pso rpso = ctx->compile_pso_from_file(dir + "/rms_norm.metal",
+                                          "rms_single_row_bfloat16", &re);
+    if (!rpso.valid()) {
+        // The entrypoint name varies by family suffix; report rather than guess.
+        printf("  compile fail: %s\n", re.c_str());
+    } else {
+        const double t = rms_run(*ctx, rpso, 2048, 500);
+        printf("  hidden 2048: %.2f us per dispatch -> x193 = %.2f ms\n", t, t * 193 / 1000.0);
+        printf("    ablation says 2.49 ms\n");
+    }
     return 0;
 }

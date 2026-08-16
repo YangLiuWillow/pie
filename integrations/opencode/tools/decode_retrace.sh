@@ -98,18 +98,25 @@ echo "baseline            ${BASE1} ms"
 # list is one ablation of everything in it, which is the only sound way to price
 # a set of dispatches that run without barriers between them.
 declare -a NAMES=(
+    # The three big blocks, whole groups where pso_kind maps many kinds to one.
     sdpa
     ll_expert_gate,ll_expert_up
     ll_expert_down
-    qmv_gate,qmv_up
-    qmv_down
-    qmv_q,qmv_k,qmv_v
-    qmv_o
-    ll_router
-    # Kept as singles ONLY to show the concurrency-group effect: each of these
-    # is half of a pair above, and the two halves will not add up to it.
-    ll_expert_gate
-    ll_expert_up
+    qmv_gate,qmv_up,qmv_down,qmv_q,qmv_k,qmv_v,qmv_o
+    # THE UNATTRIBUTED 30.6%. Everything else a layer dispatches, which between
+    # them cost more than any single block above and have never been priced.
+    rms
+    rope
+    kv_append
+    silu_mul
+    residual
+    ll_moe_gather
+    ll_moe_combine
+    # `ll_moe_sort` is deliberately ABSENT. It emits INDICES, and plain ablation
+    # sends every downstream kernel chasing garbage -- that is how it once
+    # measured a 2.04 ms "saving" that was nothing of the kind. It is already
+    # priced at 1.4% by `PIE_METAL_MOE_SORT_SKIP_AFTER`, which leaves an earlier
+    # layer's indices in place so the access patterns stay real.
 )
 for k in "${NAMES[@]}"; do
     t=$(one "ablate-$(echo "$k" | tr ',' '+')" "$k")

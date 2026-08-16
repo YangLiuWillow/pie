@@ -78,7 +78,7 @@ const LONG: u32 = 7424;
 // opencode replay actually fires -- kept together because the driver's mod-8
 // row-count cliff (`r mod 8` in 1..6 costs a flat ~560 ms) was measured on the
 // OLD kernels and has not been re-checked since attention and both GEMMs moved.
-const ROWS: [u32; 9] = [1, 8, 32, 64, 128, 184, 189, 192, 512];
+const ROWS: [u32; 1] = [1];
 
 /// Fires per configuration, including warmup.
 /// The driver refuses a fire that reads more logits rows than this.

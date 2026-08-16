@@ -649,6 +649,72 @@ against 0.040 / 0.120 / 0.173 / 0.234 before, QH=4 S=4 at 1.18× / 1.14× / 1.17
 agreeing to the third decimal. **Fixing the instrument was worth more than any
 kernel attempt in this section.**
 
+### The full composition, and TWO MORE ablation artifacts
+
+Extending the ablation to everything a layer dispatches produced two apparent
+hot spots — `rms` at 2.49 ms (14.3%) and `ll_moe_gather` at 2.12 ms (12.2%),
+together 26.5% of a step in kernels nobody had priced. **Both are artifacts.**
+Dispatched alone, at the shipped launch shape:
+
+| kernel | ablation says | isolated | inflated by |
+|---|---:|---:|---:|
+| `ll_moe_gather` | 2.12 ms | **0.22 ms** (4.6 µs × 48) | **10×** |
+| `rms` | 2.49 ms | **0.54 ms** (2.82 µs × 193) | **4.6×** |
+
+The gather's isolated cost is **flat in width** — 4.77 / 5.02 / 4.85 / 4.63 µs at
+512 / 1024 / 2048 / 4096 — so it is pure dispatch floor with no copy cost at all.
+
+#### The rule this extends
+
+§2a says plain ablation is unsound for a kernel that emits INDICES, because
+removing it sends downstream kernels chasing garbage. **It is equally unsound
+for a kernel whose output feeds arithmetic that can diverge**, and that is a much
+larger class:
+
+* remove the gather and the sorted stack holds whatever the pool last had — the
+  kernel's own comment says that can be bf16 inf, and the expert GEMMs then run
+  on inf;
+* remove every norm and the residual stream is unnormalised through 48 layers,
+  so it grows without bound and reaches inf long before the end.
+
+In both cases the delta is mostly downstream slowdown, not the kernel. **Price a
+kernel by isolation whenever its output is consumed as a NUMBER, not just when
+it is consumed as an address.**
+
+#### What survives
+
+| | ms | % | how it is corroborated |
+|---|---:|---:|---|
+| attention | 5.20 | 29.9 | isolated probe: 0.121 ms/layer at 8k × 48 ≈ 5.8 |
+| routed expert projections | 4.02 | 23.1 | 225 GB/s on 906 MB — physically sensible |
+| dense matvecs incl. LM head | 3.00 | 17.3 | 234 GB/s on 692 MB |
+| `rms` (193 dispatches) | 0.54 | 3.1 | isolated |
+| `moe_sort` (47) | 0.24 | 1.4 | isolated, and `SKIP_AFTER` agrees |
+| `moe_gather` (48) | 0.22 | 1.3 | isolated |
+| rope, kv_append, silu, residual, combine | ~0.96 | 5.5 | each ≈ its dispatch count × the floor |
+| **still unattributed** | **~3.2** | **~18%** | |
+
+**Every small kernel costs its dispatch count times a ~3–5 µs floor and
+essentially nothing more.** That is the finding: not that any one of them is
+expensive, but that a decode step issues **1,157 dispatches** and each carries a
+few microseconds whatever it does.
+
+#### Which revives the dispatch-count question §2a closed
+
+§2a retracted "`moe_route_sort` is 10.2% and `silu_mul` is 9.9%" — correctly,
+both were instrument error — and then concluded **"There is no dispatch-count
+problem."** Those are different claims. No SINGLE small kernel is expensive, and
+1,157 dispatches at 3–5 µs is still 3.5–5.8 ms, which is the size of the
+unattributed remainder. The retraction stands; the conclusion drawn from it does
+not.
+
+**So fusion is the lever, and it is the structural difference with mlx this file
+has been guessing at.** Fewer, larger dispatches is precisely what "what does
+mlx do differently in SHAPE" would mean, and the arithmetic now says what it
+would be worth. Cheapest first cut: the four norms per layer are 193 dispatches
+costing 0.54 ms of which nearly all is floor — fusing each into the projection
+that consumes it removes ~190 dispatches for free.
+
 ### THE ROOFLINE WAS WRONG: 296 GB/s is not reachable by this access pattern
 
 Five attacks on attention's "2.05× off roofline" moved nothing. The sixth
