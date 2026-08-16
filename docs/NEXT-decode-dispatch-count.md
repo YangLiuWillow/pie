@@ -692,30 +692,42 @@ attention kernel could reach is higher still.
 This retroactively explains the five failures. They were not five bad ideas;
 they were five attempts to collect headroom that was never there.
 
-**The same correction applies to the other two blocks and has not been made.**
-The routed expert projections (1.32× off) and the dense matvecs (1.27× off) were
-also priced at 296 GB/s streaming, and both are also GATHERS — expert weights
-indexed by the router, and nine matvecs of very different shapes. Their real
-floors are above their stated ones by some unmeasured amount, so their headroom
-is also smaller than the table says. **Measure those floors the same way before
-working on either.**
+**And the other two blocks are already reading FASTER than the attention shape
+can.** Achieved bandwidth on the bytes each must move:
+
+| block | ms | MB | GB/s achieved | of the 296 roof |
+|---|---:|---:|---:|---:|
+| attention (KV) | 5.05 | 730 | **145** | 49% |
+| routed expert projections | 4.03 | 906 | **225** | 76% |
+| dense matvecs incl. LM head | 2.96 | 692 | **234** | 79% |
+
+Both GEMV blocks beat the 173–215 GB/s a paged gather reaches and sit inside the
+190–260 GB/s a contiguous read reaches with the attention kernel's shape — while
+also dequantising 4-bit weights and doing the arithmetic. Their absolute
+remaining headroom is bounded by 296/234 = 1.27× at the theoretical best and is
+realistically far less.
+
+That does NOT make their floors measured — that still wants the loads-only
+treatment applied to their own access patterns, and it is the prerequisite for
+touching either. But it does say the expected payoff is small, and it changes
+the ordering: the block furthest from its ceiling is attention, and attention is
+within 1.21× of a floor that does no arithmetic at all.
 
 ### What is left to try, in order
 
-**1. Price the other two blocks against their achievable floors**, with the
-loads-only technique above. Cheap, and it decides whether either is worth
-touching — on present evidence 0.97 ms and 0.62 ms are both upper bounds that
-will shrink.
+**1. Per-kernel decode work is near exhausted — look STRUCTURALLY.** Attention is within 1.21× of a floor that does no arithmetic at all at 16k, and
+the other two blocks already read at 76–79% of the streaming roof. The remaining
+1.16–1.28× gap to mlx-lm is therefore **not in any single kernel**, and the
+question becomes what mlx does differently in SHAPE — dispatch count, KV layout,
+how much work one threadgroup owns. **That has never been profiled**, and this
+file has said so from the beginning: "why mlx-lm is faster" is a hypothesis, not
+a measurement. It is now the only hypothesis left with room in it.
 
-**2. Accept that per-kernel decode work is near exhausted, and look
-structurally.** Attention is within 1.21× of a floor that does no arithmetic at
-all at 16k. If the other two blocks land in the same place, the remaining
-1.16–1.28× gap to mlx-lm is not in any single kernel and the question becomes
-what mlx does differently in SHAPE — dispatch count, KV layout, how much work a
-threadgroup owns. **That has never been profiled**, and this file has said so
-since the beginning: "why mlx-lm is faster" is a hypothesis, not a measurement.
+**3. If any per-kernel work is attempted anyway**, measure the block's own floor
+with the loads-only technique FIRST. The five failed attention experiments cost
+more than that measurement would have.
 
-**3. The mod-8 driver cliff**, which is unrelated to any of this and may now be
+**2. The mod-8 driver cliff**, which is unrelated to any of this and may now be
 the largest single defect left: 189 rows costs 868.9 ms against 184 rows at
 249.9, ~3.5× the base cost, and the faster kernels made it proportionally worse.
 The guest steers around it; the driver cause has never been found.
