@@ -609,10 +609,20 @@ control.** `decode-rows-probe` fired at BOTH sides of the gate — its `SHORT` a
 | 7,424 (**below** it, identical code path) | 17.41 | 17.63 | 1.013× |
 
 **The below-gate row must be 1.000× by construction** — both arms run the same
-code there — so its 1.3% is this instrument's pair-to-pair noise, and it is
-four times the 0.3% effect above the gate. One pair cannot resolve this, and
-what it does bound is that the isolated 1.09× does not arrive as anything like
-1.09%.
+code there — so its 1.3% is instrument noise, not a result.
+
+A second, aborted run gave an independent measurement of the SAME `on`
+configuration, which bounds that noise more tightly than the control does:
+
+| | ctx 16,384 | ctx 7,424 |
+|---|---:|---:|
+| run A, `on` | 22.15 | 17.41 |
+| run B, `on` | 22.31 | 17.48 |
+| boot-to-boot spread | 0.72% | 0.40% |
+
+**0.4–0.7% between boots of the same configuration, against a 0.27% effect.**
+The effect is under the floor either way. What one pair does bound is that the
+isolated 1.09× does not arrive as anything like 1.09%.
 
 That is the split-K pattern again and worse: an isolated ratio discounted to
 nothing in situ. It stays landed because it cannot hurt — below 8192 it is the
