@@ -15,6 +15,9 @@
 // token, which is why `XSlotStride` is stated rather than inferred from the
 // kind.
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "decode_consts.hpp"
 
 #include <algorithm>
@@ -270,6 +273,22 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     std::uint32_t(llama_moe_tile_rows(g, int(R))),
                     std::uint32_t(sorted),
                     std::uint32_t(g.hidden)};
+                if (d.kind == Kind::ExpertSort &&
+                    std::getenv("PIE_METAL_MOE_TRACE") != nullptr) {
+                    static int seen = 0;
+                    if (seen++ < 4) {
+                        std::fprintf(stderr,
+                                     "[moe] sort: R=%d k=%u n=%u experts=%d "
+                                     "tile_rows=%d padded=%d tiles=%d lanes=%u\n",
+                                     int(R), K, std::uint32_t(int(R) * int(K)),
+                                     g.n_experts, llama_moe_tile_rows(g, int(R)),
+                                     sorted,
+                                     sorted / (llama_moe_tile_rows(g, int(R)) < 1
+                                                   ? 1
+                                                   : llama_moe_tile_rows(g, int(R))),
+                                     shared_kernels::router_lane_width(g.n_experts));
+                    }
+                }
                 const std::uint8_t idx = d.kind == Kind::ExpertSort
                                              ? (std::uint8_t)bind::MoeRouteSort::Params
                                              : (std::uint8_t)bind::MoeRouteRows::Params;
