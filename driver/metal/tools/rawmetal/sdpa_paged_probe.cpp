@@ -763,6 +763,114 @@ void accuracy_ab(RawMetalContext& ctx, Pso mma, Pso nax, int rows, int ctx_len,
     }
 }
 
+// Split-K decode: the same attention over MORE threadgroups, plus a combine.
+//
+// Timed as a PAIR, because that is what would ship: the split kernel writes
+// partials and the combine merges them, and a split that is faster only by
+// deferring work to a second dispatch has not made anything faster.
+double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
+                 int ctx_len, int ordinal, bool check) {
+    constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
+    const int gqa = kHeads / kKv;
+    const int pages = (ctx_len + kPage) / kPage + 1;
+    auto bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return uint16_t(u >> 16); };
+    auto unbf = [](uint16_t h) { uint32_t u = uint32_t(h) << 16; float f;
+                                 std::memcpy(&f, &u, 4); return f; };
+
+    SlotHandle q = ctx.heap_alloc(size_t(kHeads) * kD * 2);
+    SlotHandle kp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle vp = ctx.heap_alloc(size_t(pages) * kPage * kKv * kD * 2);
+    SlotHandle o  = ctx.heap_alloc(size_t(kHeads) * kD * 2);
+    SlotHandle po = ctx.heap_alloc(size_t(kHeads) * nsplit * kD * 4);
+    SlotHandle pm = ctx.heap_alloc(size_t(kHeads) * nsplit * 2 * 4);
+    SlotHandle pos = ctx.heap_alloc(sizeof(int));
+    SlotHandle pidx = ctx.heap_alloc(size_t(pages) * sizeof(uint32_t));
+    auto* qz = static_cast<uint16_t*>(q.contents());
+    auto* kz = static_cast<uint16_t*>(kp.contents());
+    auto* vz = static_cast<uint16_t*>(vp.contents());
+    std::memset(kz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(vz, 0, size_t(pages) * kPage * kKv * kD * 2);
+    std::memset(o.contents(), 0, size_t(kHeads) * kD * 2);
+    for (int p2 = 0; p2 < pages; ++p2) static_cast<uint32_t*>(pidx.contents())[p2] = uint32_t(p2);
+    *static_cast<int*>(pos.contents()) = ctx_len;
+
+    std::vector<float> qf(size_t(kHeads) * kD);
+    std::vector<float> kf(size_t(kKv) * (ctx_len + 1) * kD), vf(kf.size());
+    for (int h = 0; h < kHeads; ++h)
+      for (int d = 0; d < kD; ++d) {
+        qf[size_t(h) * kD + d] = float((h * 3 + d * 2) % 7) * 0.125f;
+        qz[size_t(h) * kD + d] = bf(qf[size_t(h) * kD + d]);
+      }
+    for (int c = 0; c <= ctx_len; ++c)
+      for (int h = 0; h < kKv; ++h)
+        for (int d = 0; d < kD; ++d) {
+          const float kk = float((c + 2 * d + 5 * h) % 4) * 0.125f;
+          const float vv = float((3 * c + d + 11 * h) % 6) * 0.25f;
+          kf[(size_t(h) * (ctx_len + 1) + c) * kD + d] = kk;
+          vf[(size_t(h) * (ctx_len + 1) + c) * kD + d] = vv;
+          kz[(size_t(c) * kKv + h) * kD + d] = bf(kk);
+          vz[(size_t(c) * kKv + h) * kD + d] = bf(vv);
+        }
+
+    const float scale = 1.0f / 11.3137085f;
+    const Kernel kind = Kernel::Sdpa;
+    ctx.arg_bind(kind, ordinal, 0, q);   ctx.arg_bind(kind, ordinal, 1, kp);
+    ctx.arg_bind(kind, ordinal, 2, vp);  ctx.arg_bind(kind, ordinal, 3, po);
+    ctx.arg_bind(kind, ordinal, 4, pm);
+    ctx.arg_bind(kind, ordinal, 5, scalar<int>(ctx, gqa));
+    ctx.arg_bind(kind, ordinal, 6, pos); ctx.arg_bind(kind, ordinal, 7, pidx);
+    ctx.arg_bind(kind, ordinal, 8, scalar<int>(ctx, kPage));
+    ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, kKv));
+    ctx.arg_bind(kind, ordinal, 10, scalar<float>(ctx, scale));
+    // The combine reads the same partials at its own ordinal.
+    ctx.arg_bind(kind, ordinal + 1, 0, po);
+    ctx.arg_bind(kind, ordinal + 1, 1, pm);
+    ctx.arg_bind(kind, ordinal + 1, 2, o);
+    ctx.make_resident();
+
+    LatencyHarness h(ctx);
+    auto enc = [&](StepEncoder& se) {
+        se.set_pso(split); se.set_argtable(kind, ordinal);
+        se.dispatch(Grid{uint32_t(kHeads / qh) * 1024u, uint32_t(nsplit), 1},
+                    Threadgroup{1024, 1, 1});
+        se.barrier();
+        se.set_pso(comb); se.set_argtable(kind, ordinal + 1);
+        se.dispatch(Grid{uint32_t(kHeads) * 128u, 1, 1}, Threadgroup{128, 1, 1});
+    };
+    BenchResult r = h.time_step("split", enc, check ? 1 : 30, check ? 0 : 8);
+
+    if (check) {
+        const uint16_t* og = static_cast<const uint16_t*>(o.contents());
+        int bad = 0; double worst = 0;
+        for (int hd = 0; hd < kHeads; ++hd) {
+            const int kvh = hd / gqa;
+            const float* kk = &kf[size_t(kvh) * (ctx_len + 1) * kD];
+            const float* vv = &vf[size_t(kvh) * (ctx_len + 1) * kD];
+            std::vector<double> sc(size_t(ctx_len) + 1); double mx = -1e30;
+            for (int c = 0; c <= ctx_len; ++c) {
+                double a2 = 0;
+                for (int d = 0; d < kD; ++d)
+                    a2 += double(qf[size_t(hd) * kD + d]) * double(kk[size_t(c) * kD + d]);
+                sc[c] = a2 * double(scale); if (sc[c] > mx) mx = sc[c];
+            }
+            double sm = 0;
+            for (int c = 0; c <= ctx_len; ++c) { sc[c] = std::exp(sc[c] - mx); sm += sc[c]; }
+            for (int d = 0; d < kD; ++d) {
+                double ref = 0;
+                for (int c = 0; c <= ctx_len; ++c) ref += sc[c] * double(vv[size_t(c) * kD + d]);
+                ref /= sm;
+                const double e = std::abs(double(unbf(og[size_t(hd) * kD + d])) - ref) /
+                                 (std::abs(ref) + 1e-6);
+                if (e > 3e-2) { ++bad; worst = e > worst ? e : worst; }
+            }
+        }
+        printf("QH=%d S=%d ctx=%d: %d of %d wrong%s", qh, nsplit, ctx_len, bad,
+               kHeads * kD, bad == 0 ? "  \xe2\x80\x94 CORRECT\n" : "\n");
+        if (bad) printf("   worst %.4f\n", worst);
+    }
+    return r.median.gpu_exec_ms;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -771,7 +879,12 @@ int main(int argc, char** argv) {
     printf("pie paged attention, priced in isolation (bfloat16, d=128, page=32)\n");
     printf("MLX fast.scaled_dot_product_attention on the same shapes: 1.555 ms/layer\n\n");
 
-    auto ctx = RawMetalContext::create(/*heap_bytes=*/1024ull << 20);
+    // 6 GB. Every arm here allocates its own K/V page buffers and nothing is
+    // freed, so the heap has to hold the whole sweep: at 16k context one arm's
+    // pages are ~16 MB each and the split-K sweep adds eighteen more runs. At
+    // 1 GB it OOM'd mid-sweep and then SEGFAULTED on the invalid handle, which
+    // reads as "the kernel crashed" rather than "the probe ran out of room".
+    auto ctx = RawMetalContext::create(/*heap_bytes=*/6144ull << 20);
     if (!ctx) {
         printf("FAIL: no Metal context\n");
         return 1;
@@ -868,6 +981,37 @@ int main(int argc, char** argv) {
                 const double t16 = hshare_run(*ctx, pu, hh, 16383, 680 + hh * 8 + uu, false);
                 printf("    QH=%d U=%-2d  12k %6.3f ms  16k %6.3f ms  (x48 = %5.1f ms)\n",
                        hh, uu, t12, t16, t12 * 48.0);
+            }
+        }
+        // SPLIT-K: more threadgroups, shorter chains. Timed as split+combine.
+        printf("\n  SPLIT-K (split + combine, vs the QH=2 single kernel):\n");
+        for (const int qh : {2, 4}) {
+            for (const int ns : {2, 4, 8}) {
+                char f[80]; snprintf(f, sizeof f, "/sdpa_split_h%d_s%d.metal", qh, ns);
+                std::string es, ec;
+                const std::string path = std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f;
+                Pso sp = ctx->compile_pso_from_file(path, "sdpa_split_decode", &es);
+                Pso cb = ctx->compile_pso_from_file(path, "sdpa_split_combine", &ec);
+                if (!sp.valid() || !cb.valid()) {
+                    printf("    QH=%d S=%d split_ok=%d combine_ok=%d\n", qh, ns,
+                           int(sp.valid()), int(cb.valid()));
+                    if (!sp.valid()) printf("      split: %s\n", es.c_str());
+                    if (!cb.valid()) printf("      combine: %s\n", ec.c_str());
+                    continue;
+                }
+                printf("    ");
+                split_run(*ctx, sp, cb, qh, ns, 2047, 700 + qh * 16 + ns * 2, true);
+                // SHORT CONTEXT IS IN THIS SWEEP DELIBERATELY. The key-loop
+                // unroll won 7% at 12k/16k, was landed on that evidence, and
+                // cost 19% end to end at 5,840 tokens -- because its sweep
+                // never looked below 12k. A win at two long contexts is not a
+                // win.
+                const double t2  = split_run(*ctx, sp, cb, qh, ns, 2047,  700 + qh * 16 + ns * 2, false);
+                const double t8  = split_run(*ctx, sp, cb, qh, ns, 8191,  740 + qh * 16 + ns * 2, false);
+                const double t12 = split_run(*ctx, sp, cb, qh, ns, 12287, 760 + qh * 16 + ns * 2, false);
+                const double t16 = split_run(*ctx, sp, cb, qh, ns, 16383, 820 + qh * 16 + ns * 2, false);
+                printf("    QH=%d S=%-2d  2k %6.3f  8k %6.3f  12k %6.3f  16k %6.3f\n",
+                       qh, ns, t2, t8, t12, t16);
             }
         }
         printf("  A decode step's whole attention is the 16k column x48. The\n"
