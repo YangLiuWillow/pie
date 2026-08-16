@@ -824,6 +824,28 @@ void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const 
         // same mapping the dispatch itself uses to pick a pipeline, so a kind
         // ablated here is exactly the kind that would otherwise have run.
         if (kernel_ablated(pso_kind(d.kind))) continue;
+        // DIAGNOSTIC: skip `ExpertSort` for layers past N, leaving the indices
+        // an EARLIER layer produced in place.
+        //
+        // Plain `PIE_METAL_ABLATE=ll_moe_sort` is unsound for this kernel and
+        // measuring with it is how that was found: the sort emits `perm`, `inv`
+        // and `tile_expert`, which are ADDRESSES, so removing it entirely sends
+        // every downstream kernel chasing garbage. Measured over a whole probe
+        // run, `moe_combine_sorted` went 345.9 -> 4241.0 ms and
+        // `affine_qmv_fast_..._b_8` went 797.2 -> 134.9. The net looked like a
+        // 2.04 ms saving and was nothing of the sort.
+        //
+        // Reusing a previous layer's indices keeps them in range and structurally
+        // valid -- the gather picks the wrong rows, so the TOKENS are wrong, but
+        // every access pattern downstream is the shape it would really be. That
+        // is what makes the wall clock mean something.
+        if (d.kind == Kind::ExpertSort) {
+            static const int skip_after = [] {
+                const char* e = std::getenv("PIE_METAL_MOE_SORT_SKIP_AFTER");
+                return e && *e ? std::atoi(e) : -1;
+            }();
+            if (skip_after >= 0 && d.layer > skip_after) continue;
+        }
         const int m = d.kind == Kind::LmHead
                           ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
                                            : std::min(head_rows, rows < 1 ? 1 : rows))
