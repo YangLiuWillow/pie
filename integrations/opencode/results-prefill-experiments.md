@@ -267,3 +267,102 @@ Decode is untouched, as it should be: 53.2 / 40.0 / 27.8 tok/s against
 54.9 / 33.5 / 28.9 with the switch off — same to within noise.
 
 ---
+## Where prefill stands after experiment 3 — re-measured, not extrapolated
+
+Same 23,655-token prompt, same trace settings, third time:
+
+| traced wall | pre-NAX | after NAX | **after exp 3** |
+|---|---:|---:|---:|
+| | 66.77 s | 37.72 s | **29.98 s** |
+
+Composition now (summed over all fires, the six prefill fires dominating):
+
+| kernel | ms | share | was (after NAX) |
+|---|---:|---:|---:|
+| `affine_qmm_t_routed` (MoE GEMM) | 12898 | **43.6%** | 35% |
+| `sdpa_paged_nax` (attention) | 9537 | **32.2%** | 47% |
+| `affine_qmm_t` (dense projections) | 5774 | **19.5%** | 16% |
+| everything else | ~1200 | 4.1% | 2% |
+
+Attention fell from 17442 ms to 9537 ms in situ — **1.83×**, against 1.45× in
+isolation. It does better in the real fire than on the bench, which is the
+opposite of the usual direction and worth noting: the isolated probe runs one
+context, and the win grows with context because the below-diagonal region does.
+
+**The two quantized GEMMs are now 63% of prefill between them.** Neither has
+been touched. Both are 4-bit affine group-64 matmuls on the simdgroup matrix
+unit — the same unit, and the same ~5.5 TFLOP/s ceiling, that attention was
+moved off. That is experiment 4.
+
+---
+## Experiment 4 — the routed MoE GEMM on the neural accelerators
+
+**Hypothesis.** After experiment 3, `affine_qmm_t_routed` is the largest term in
+a cold prefill (43.6%). It runs 6.6 TFLOP/s on the simdgroup matrix unit against
+`matmul2d`'s 32.5, and it is not weight-bound at prefill widths -- 128 experts'
+4-bit weights are ~302 MB per layer, 1.02 ms at 296 GB/s, against 44.8 ms
+measured. So the unit is available to be changed, exactly as it was for
+attention.
+
+**Why the port is small.** The kernel already dequantizes 4-bit weights into
+THREADGROUP MEMORY as bfloat and runs a bfloat matmul over the staged tiles. So
+the loaders, the tiling, the dequantization, the two-fence K loop and the expert
+slice are all untouched; only `mlx::steel::BlockMMA` becomes `NaxBlockMMA`
+(8×8 simdgroup fragments → 16×16 NAX fragments, `tile_matmad` → `frag_mma`).
+This is the same shape MLX's own `quantized_nax.h` takes.
+
+`NaxBlockMMA` needs TN even, because `frag_mma` issues N=32 = two 16-wide
+fragments. At WM=WN=2 that means BN ≥ 64 — satisfied by the tile a prefill
+selects and not by the decode widths, which is the right place for the line
+anyway: a matvec-shaped GEMM has nothing for a matrix unit of either kind.
+
+**Result — ACCEPTED.** `tools/rawmetal/qmm_nax_probe.cpp`, both arms verified
+against a float64 reference with distinct data per expert, per output column and
+per input column, so a wrong expert slice or a transposed operand cannot pass.
+Serving shape: a 4096-row fire routes 8 of 128 experts per token, so 32,768
+sorted rows, N=768, K=2048.
+
+| tile | shipped | NAX | |
+|---|---:|---:|---:|
+| bm=32, bn=64 | 15.56 ms (6.63 TFLOP/s) | **8.10 ms** (12.73) | **1.92×** |
+| bm=64, bn=64 | 14.44 ms (7.14) | **6.52 ms** (15.81) | **2.21×** |
+
+**Landing was one line, and safer than the attention one.** The NAX variant takes
+the same tile, the same threadgroup and the same grid, so only the entrypoint
+NAME differs — there is no launch site that could disagree with the choice.
+`PIE_METAL_QMM_NAX=0` reverts it. Tests unchanged: llama_pso 32,
+llama_decode_step 232, kv_append_paged 13, numerics 51/18 pre-existing.
+
+**End to end, deterministic fixed prompts, TTFT:**
+
+| prompt | `QMM_NAX=0` | `QMM_NAX=1` | |
+|---:|---:|---:|---:|
+| 5,840 | 6.03 s | **3.54 s** | 1.70× |
+| 16,090 | 13.04 s | **9.05 s** | 1.44× |
+| 28,390 | 22.11 s | **16.46 s** | 1.34× |
+
+Decode unchanged (55.8 / 37.2 / 27.7 against 53.2 / 40.6 / 27.8 — noise), which
+is the expected control: this kernel does not run in a decode step.
+
+---
+
+## Where prefill stands now
+
+| prompt | at the start | **now** | mlx-lm | gap |
+|---:|---:|---:|---:|---:|
+| 5,840 | 7.98 s | **3.54 s** (2.25×) | 2.88 s | 1.23× |
+| 16,090 | 27.70 s | **9.05 s** (3.06×) | 8.20 s | **1.10×** |
+| 28,390 | 57.21 s | **16.46 s** (3.48×) | 15.40 s | **1.07×** |
+
+**Prefill is now within 7–10% of mlx-lm at the context lengths an agentic turn
+actually runs at**, from 2.9–3.7× behind two days ago. Generation is coherent
+and the driver test suite is unchanged.
+
+Remaining, in order:
+1. `affine_qmm_t` — the DENSE projections, 19.5% and untouched. Same
+   `NaxBlockMMA`, but the tile the driver picks is bm=64/bn=32, which gives
+   TN=1 and does not satisfy `frag_mma`'s N=32. Needs either an N=16 descriptor
+   or WN=1.
+2. Attention is 32.2% and now beats MLX, so it is no longer the lever it was.
+3. Decode is still ~1.2× behind mlx and untouched since head sharing.
+

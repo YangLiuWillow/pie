@@ -296,6 +296,14 @@ struct DeviceTuning {
     /// (64 against 32) and a partial revert would be a grid describing the
     /// other kernel.
     bool sdpa_nax = true;
+    /// Run the ROUTED MoE GEMM on the neural accelerators
+    /// (`affine_qmm_t_routed_nax`) instead of the simdgroup matrix unit.
+    ///
+    /// Unlike `sdpa_nax`, this one is safe to flip on its own: the NAX variant
+    /// takes the same tile, the same threadgroup and the same grid as the
+    /// kernel it replaces, so only the entrypoint NAME differs and no launch
+    /// site can disagree with it. It is a knob rather than a rewrite.
+    bool qmm_nax = true;
 
     /// Lanes that share one value row of the gated-delta scan.
     ///
@@ -551,6 +559,7 @@ int sdpa_tile_min_rows_per_request();
 bool sdpa_mma();
 bool sdpa_head_share();
 bool sdpa_nax();
+bool qmm_nax();
 int gdn_scan_lanes();
 int gdn_scan_rows();
 

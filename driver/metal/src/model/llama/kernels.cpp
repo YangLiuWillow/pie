@@ -78,8 +78,25 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
                 "affine_qmm_t_routed" + q + "_bm_" +
                 std::to_string(shared_kernels::kMoeTileWidths[t]);
             for (int i = 0; i < 3; ++i) {
+                const int bm = shared_kernels::kMoeTileWidths[t];
+                const int bn = 16 << i;
+                // The neural-accelerator variant where one is instantiated.
+                // `frag_mma` issues N=32, so a simdgroup needs an even number
+                // of 16-wide fragments: at WN=2 that is bn >= 64, which is the
+                // width a PREFILL selects. Decode widths keep the simdgroup
+                // kernel, which is correct -- a matvec-shaped GEMM has nothing
+                // for a matrix unit of either kind.
+                //
+                // Safe to choose by name alone: the NAX kernel takes the same
+                // tile, threadgroup and grid, so unlike the attention path
+                // there is no launch site that could disagree.
+                const bool use_nax =
+                    qmm_nax() && bn == 64 && (bm == 32 || bm == 64);
+                const std::string base =
+                    use_nax ? "affine_qmm_t_routed_nax" + q + "_bm_" + std::to_string(bm)
+                            : routed_bm;
                 specs.push_back({"quantized_qmm_t.metal",
-                                 routed_bm + "_bn_" + std::to_string(16 << i),
+                                 base + "_bn_" + std::to_string(bn),
                                  &out.qmm_routed[t][i]});
             }
         }

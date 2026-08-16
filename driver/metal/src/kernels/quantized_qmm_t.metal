@@ -2174,6 +2174,181 @@ template <typename T, int BM, int BK, int BN>
       simd_lid, loader_w);
 }
 
+
+// ── EXPERIMENT 4: the same quantized GEMM on the NEURAL ACCELERATORS ────────
+//
+// `affine_qmm_t_routed` is 43.6% of a cold prefill and `affine_qmm_t` another
+// 19.5% (`results-prefill-experiments.md`, re-measured after attention moved
+// off the simdgroup matrix unit). Both run ~6.9 TFLOP/s on that unit. The
+// memory roofline for the routed one at 4096 rows is 1.02 ms/layer against
+// 44.8 ms measured, so it is compute-bound, not weight-bound, and
+// `matmul2d` measures 32.5 TFLOP/s against the simdgroup unit's 5.48.
+//
+// The port is small because the hard part was already done. This kernel
+// dequantizes 4-bit weights into THREADGROUP MEMORY as bfloat and then runs a
+// bfloat matmul over the staged tiles -- so only the matmul changes, and the
+// loaders, the tiling, the dequantization and the epilogue are untouched. That
+// is the same shape MLX's own `quantized_nax.h` takes.
+//
+// `NaxBlockMMA` is interface-compatible with `mlx::steel::BlockMMA` on the
+// three entry points the K loop uses, so it is a `using` away from being
+// dropped into `qmm_t_loaded_impl`. It is NOT dropped in yet: this is an
+// experiment with its own entry point, measured against the shipped one before
+// anything shared moves.
+//
+// TN must be even. `frag_mma` issues N=32, which is two 16-wide fragments, so a
+// simdgroup must own an even number of them. At WN=2 that means BN >= 64 --
+// satisfied by the routed tile (BN=64, TN=2) and NOT by the dense one
+// (BN=32, TN=1), which is why only the routed kernel is instantiated here.
+#include "nax_frag.h"
+
+template <typename T, typename U, int BM, int BN, int BK, int WM, int WN,
+          int lda_tgp, int ldb_tgp>
+struct NaxBlockMMA {
+  STEEL_CONST short kFrag = 16;
+  STEEL_CONST short TM = BM / (kFrag * WM);
+  STEEL_CONST short TN = BN / (kFrag * WN);
+  static_assert(TM >= 1 && TN >= 2 && (TN % 2) == 0,
+                "frag_mma issues N=32: a simdgroup needs an even fragment count");
+
+  // The shipped BlockMMA is used with transpose_a=false, transpose_b=true, so
+  // As is [BM][lda_tgp] and Bs is [BN][ldb_tgp] -- both row-major with K
+  // contiguous. That is exactly what `frag_load_tg` wants, and `frag_mma<true>`
+  // handles B arriving as [N][K].
+  STEEL_CONST short A_str_m = lda_tgp;
+  STEEL_CONST short B_str_n = ldb_tgp;
+
+  pie_nax::ffrag C[TM][TN];
+  short tm, tn;
+  uint lid;
+
+  METAL_FUNC NaxBlockMMA(ushort simd_group_id, ushort simd_lane_id) {
+    tm = kFrag * short(simd_group_id / WN);
+    tn = kFrag * short(simd_group_id % WN);
+    lid = simd_lane_id;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < TM; ++i)
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < TN; ++j) C[i][j] = pie_nax::ffrag(0);
+  }
+
+  METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) {
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < BK; kk += kFrag) {
+      pie_nax::bfrag a[TM], b[TN];
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < TM; ++i)
+        pie_nax::frag_load_tg(a[i], As + (tm + i * kFrag * WM) * A_str_m + kk,
+                              A_str_m, lid);
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < TN; ++j)
+        pie_nax::frag_load_tg(b[j], Bs + (tn + j * kFrag * WN) * B_str_n + kk,
+                              B_str_n, lid);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < TM; ++i)
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < TN; j += 2)
+          pie_nax::frag_mma<true>(C[i][j], C[i][j + 1], a[i], b[j], b[j + 1]);
+    }
+  }
+
+  METAL_FUNC void store_result(device U* D, const int ldd) {
+    const short2 c = pie_nax::frag_coord(lid);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < TM; ++i) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < TN; ++j) {
+        const short r0 = tm + i * kFrag * WM + c.y;
+        const short c0 = tn + j * kFrag * WN + c.x;
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < pie_nax::kElemRows; ++ii)
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < pie_nax::kElemCols; ++jj)
+            D[(r0 + ii * pie_nax::kElemRowsJump) * ldd + c0 + jj] =
+                U(C[i][j][ii * pie_nax::kElemCols + jj]);
+      }
+    }
+  }
+};
+
+/// `affine_qmm_t_routed`, with the matmul on the neural accelerators.
+///
+/// Everything but the MMA is the shipped path: the same `QuantizedBlockLoader`
+/// dequantizing into `Ws`, the same `BlockLoader` staging `Xs`, the same
+/// two-fence K loop, the same expert slice through `tile_expert`.
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          int WM = 2, int WN = 2>
+[[kernel]] void affine_qmm_t_routed_nax(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    const device int* tile_expert [[buffer(12)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  const int e = tile_expert[tid.y];
+  if (e < 0) return;
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  const size_t w_bytes = size_t(e) * size_t(N) * size_t(K) *
+                         size_t(bytes_per_pack) / size_t(pack_factor);
+  const size_t g_off = size_t(e) * size_t(N) * size_t(K / group_size);
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using mma_t = NaxBlockMMA<T, T, BM, BN, BK, WM, WN, BK_padded, BK_padded>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_col = int(tid.x) * BN;
+  const int y_row = int(tid.y) * BM;
+
+  auto wl = (const device uint8_t*)w + w_bytes;
+  wl += y_col * K_w;
+  loader_w_t loader_w(wl, scales + g_off + y_col * K_g,
+                      biases + g_off + y_col * K_g, K, Ws, simd_gid, simd_lid);
+
+  const device T* xp = x + y_row * static_cast<int64_t>(K);
+  device T* yp = y + y_row * static_cast<int64_t>(N) + y_col;
+  loader_x_t loader_x(xp, K, Xs, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result(yp, N);
+}
+
+#define instantiate_qmm_t_routed_nax(gs, bm, bk, bn, b)                        \
+  template [[host_name("affine_qmm_t_routed_nax_bfloat16_gs_" #gs "_b_" #b     \
+                       "_bm_" #bm "_bn_" #bn)]]                                \
+  [[kernel]] void affine_qmm_t_routed_nax<bfloat, gs, b, bm, bk, bn>(          \
+      const device uint32_t*, const device bfloat*, const device bfloat*,      \
+      const device bfloat*, device bfloat*, const constant int&,               \
+      const constant int&, const device int*, uint3, uint, uint);
+
+instantiate_qmm_t_routed_nax(64, 32, 32, 64, 4)
+instantiate_qmm_t_routed_nax(64, 64, 32, 64, 4)
+
 #define instantiate_qmm_t(gs, bm, bk, bn, b)                                          \
   template [[host_name("affine_qmm_t_routed_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
   [[kernel]] void affine_qmm_t_routed<bfloat, gs, b, bm, bk, bn>(              \

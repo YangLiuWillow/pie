@@ -22,6 +22,9 @@ add_rawmetal_tool(sdpa_paged_probe sdpa_paged_probe.cpp harness.cpp)
 # Prices the M5 neural accelerators against `simdgroup_matrix`, which is the
 # last unmeasured explanation for pie's attention gap against MLX.
 add_rawmetal_tool(matrix_rate_probe matrix_rate_probe.cpp harness.cpp)
+# Prices the ROUTED MoE GEMM, which the dispatch trace makes the largest term
+# in a cold prefill once attention moved off the simdgroup matrix unit.
+add_rawmetal_tool(qmm_nax_probe qmm_nax_probe.cpp harness.cpp)
 add_rawmetal_tool(q35contract_probe q35contract_probe.cpp)
 if(PIE_LOADER_STATICLIB)
   target_link_libraries(q35contract_probe PRIVATE ${PIE_LOADER_STATICLIB})
