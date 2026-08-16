@@ -778,7 +778,8 @@ void accuracy_ab(RawMetalContext& ctx, Pso mma, Pso nax, int rows, int ctx_len,
 // its prototype: a correctness result about a kernel that is not the one that
 // ships is a result about nothing.
 double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
-                 int ctx_len, int ordinal, bool check, bool shipped = false) {
+                 int ctx_len, int ordinal, bool check, bool shipped = false,
+                 bool head_major = false) {
     constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
     const int gqa = kHeads / kKv;
     const int pages = (ctx_len + kPage) / kPage + 1;
@@ -817,8 +818,15 @@ double split_run(RawMetalContext& ctx, Pso split, Pso comb, int qh, int nsplit,
           const float vv = float((3 * c + d + 11 * h) % 6) * 0.25f;
           kf[(size_t(h) * (ctx_len + 1) + c) * kD + d] = kk;
           vf[(size_t(h) * (ctx_len + 1) + c) * kD + d] = vv;
-          kz[(size_t(c) * kKv + h) * kD + d] = bf(kk);
-          vz[(size_t(c) * kKv + h) * kD + d] = bf(vv);
+          // Where the key lands inside its page IS the thing under test.
+          //   shipped     [slot][kv_head][dim]        -> 32 runs of 256 B
+          //   head-major  [page][kv_head][slot][dim]  -> one 8 KB run
+          const size_t at =
+              head_major
+                  ? (((size_t(c) / 32) * kKv + size_t(h)) * 32 + size_t(c) % 32) * kD + d
+                  : (size_t(c) * kKv + size_t(h)) * kD + d;
+          kz[at] = bf(kk);
+          vz[at] = bf(vv);
         }
 
     const float scale = 1.0f / 11.3137085f;
@@ -1178,6 +1186,76 @@ void run_kpl_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
     }
 }
 
+// Is the KV PAGE LAYOUT what attention's remaining 2.05x is made of?
+//
+// Pages are `[slot][kv_head][dim]`, so a threadgroup serving one kv head reads
+// 256 B of every 1024 B -- 32 separate runs per page where one 8 KB run would
+// do. The LANES_PER_KEY sweep priced exactly this effect one level down:
+// doubling the number of separate regions per load cost ~1.4x, monotonically,
+// from 1 region to 32.
+//
+// Both arms are ONE source file with `HEAD_MAJOR` flipped, and both are the
+// shipped `sdpa_paged_decode_hshare` in every other respect, so what is
+// measured is the layout. The control is also checked against the same float64
+// reference as the candidate: if the host wrote the candidate's keys to the
+// wrong offsets, the candidate would be fast and WRONG, and only the reference
+// says which.
+void run_layout_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
+    (void)kernels_dir;
+    printf("\nKV PAGE LAYOUT: [slot][kv_head][dim] against [page][kv_head][slot][dim]\n");
+    const std::string ld = PIE_METAL_TOOL_LOCAL_KERNELS_DIR;
+    for (const int qh : {2}) {
+        char f0[96], f1[96];
+        snprintf(f0, sizeof f0, "/sdpa_hmajor_h%d_m0.metal", qh);
+        snprintf(f1, sizeof f1, "/sdpa_hmajor_h%d_m1.metal", qh);
+        std::string e0, e1;
+        Pso slotmajor = ctx.compile_pso_from_file(ld + f0, "sdpa_hmajor_decode", &e0);
+        Pso headmajor = ctx.compile_pso_from_file(ld + f1, "sdpa_hmajor_decode", &e1);
+        if (!slotmajor.valid() || !headmajor.valid()) {
+            printf("  compile fail  slot=%d head=%d\n  %s\n  %s\n",
+                   int(slotmajor.valid()), int(headmajor.valid()), e0.c_str(), e1.c_str());
+            continue;
+        }
+        // Correctness for BOTH, at a context that is not a whole number of
+        // pages, so a key landing in the wrong slot inside the last page shows.
+        for (const int cl : {127, 1000, 8191}) {
+            printf("  slot-major ");
+            split_run(ctx, slotmajor, Pso{}, qh, 1, cl, 1800 + cl % 31, true, true, false);
+            printf("  head-major ");
+            split_run(ctx, headmajor, Pso{}, qh, 1, cl, 1830 + cl % 31, true, true, true);
+        }
+        double prev = 0; int warm = 0;
+        for (; warm < 40; ++warm) {
+            const double t = split_run(ctx, slotmajor, Pso{}, qh, 1, 16383, 1860,
+                                       false, true, false);
+            if (prev > 0 && std::abs(t - prev) < 0.05 * prev) break;
+            prev = t;
+        }
+        printf("  clocks settled after %d passes%s\n", warm,
+               warm >= 40 ? "  <-- NEVER SETTLED" : "");
+
+        const int cs[4] = {2047, 8191, 12287, 16383};
+        double a[4], b[4];
+        bool noisy = false;
+        for (int i = 0; i < 4; ++i) {
+            a[i] = split_run(ctx, slotmajor, Pso{}, qh, 1, cs[i], 1900 + i, false, true, false);
+            b[i] = split_run(ctx, headmajor, Pso{}, qh, 1, cs[i], 1910 + i, false, true, true);
+        }
+        for (int i = 1; i < 4; ++i)
+            if (a[i] < a[i - 1] * 0.97 || b[i] < b[i - 1] * 0.97) noisy = true;
+        printf("  %-22s %8s %8s %8s %8s\n", "", "2k", "8k", "12k", "16k");
+        printf("  %-22s %8.3f %8.3f %8.3f %8.3f\n", "[slot][head][dim]", a[0], a[1], a[2], a[3]);
+        printf("  %-22s %8.3f %8.3f %8.3f %8.3f\n", "[page][head][slot][dim]",
+               b[0], b[1], b[2], b[3]);
+        printf("  %-22s", "speedup");
+        for (int i = 0; i < 4; ++i) printf(" %7.2fx", b[i] > 0 ? a[i] / b[i] : 0.0);
+        printf("\n");
+        if (noisy) printf("  >>> NOT MONOTONIC: this run is NOISE, re-run quiet.\n");
+        printf("  attention is 5.05 ms of a 17.35 ms decode step with a 2.47 ms\n"
+               "  roofline, so a layout worth ~2x here is worth ~14%% of a step.\n");
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -1210,6 +1288,11 @@ int main(int argc, char** argv) {
     // only way to get a number from it worth quoting, and the whole-probe run
     // is still the right thing for everything that is compared WITHIN a
     // section.
+    if (std::getenv("PIE_SDPA_PROBE_LAYOUT_ONLY") != nullptr) {
+        printf("PIE_SDPA_PROBE_LAYOUT_ONLY: the KV layout arm alone on a fresh heap.\n");
+        run_layout_arm(*ctx, kernels_dir);
+        return 0;
+    }
     if (std::getenv("PIE_SDPA_PROBE_KPL_ONLY") != nullptr) {
         printf("PIE_SDPA_PROBE_KPL_ONLY: the KEY_PER_LANE arm alone on a fresh\n"
                "heap, because this probe's arms are not independent.\n");

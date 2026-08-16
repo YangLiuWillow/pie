@@ -532,40 +532,75 @@ and the number of independent transactions it must issue and wait on is set by
 coalescing. Removing arithmetic from the dependency chain does nothing; adding
 memory transactions to it is expensive.
 
+### REFUTED: the KV page layout
+
+The hypothesis after the LANES_PER_KEY sweep was that attention's remaining
+2.05× is the page layout. Pages are `[slot][kv_head][dim]`, so a threadgroup
+serving one kv head reads 256 B of every 1024 B — a 32-key page is 32 KB of
+which one head uses 8 KB, as 32 separate runs instead of one.
+
+`tools/rawmetal/kernels/sdpa_hmajor_decode.metal` is the shipped head-sharing
+kernel with `HEAD_MAJOR` flipping ONE line — `[page][kv_head][slot][dim]`, same
+page size, same allocator, same page table — and the harness writes the keys to
+match. Both arms correct at 127, 1000 and 8191 (a non-page-multiple context on
+purpose, so a key landing in the wrong slot of the last page would show):
+
+| | 2k | 8k | 12k | 16k |
+|---|---:|---:|---:|---:|
+| `[slot][head][dim]` | 0.097 | 0.189 | 0.248 | 0.307 |
+| `[page][head][slot][dim]` | 0.090 | 0.181 | 0.240 | 0.344 |
+| | 1.07× | 1.04× | 1.03× | **0.89×** |
+
+**Nothing, and a loss at the longest context.** A change that would have touched
+`kv_append_paged`, the page allocator and every kernel that walks a page table
+is not worth making.
+
+#### The distinction this draws, which the LPK result did not
+
+Both results are about "how many separate regions", and only one of them
+matters:
+
+* **Scatter WITHIN one load instruction is expensive.** In the LPK sweep the 32
+  lanes of a single load addressed 32 different regions, and each doubling cost
+  ~1.4×.
+* **Strided access ACROSS iterations is not.** In the layout question every
+  single load is still one coalesced 256 B run; only successive iterations are
+  1 KB apart. The memory system absorbs that.
+
+Conflating the two is what made the layout look promising. The rule is about the
+addresses inside one instruction, not about the shape of the stream over time.
+
 ### What is left to try, in order
 
-Headroom against each block's own roofline:
+Attention is 5.05 ms against a 2.47 ms roofline — 145 GB/s achieved, **49% of
+the 296 GB/s roof**. It is not bandwidth-saturated and it is not obviously
+fixable: the reductions (LPK sweep), the load overlap (unroll), the parallelism
+(split-K, 1.06× in situ) and now the layout have all been measured and all
+rejected or nearly so.
 
-| block | measured | roofline | available | of a step |
-|---|---:|---:|---:|---:|
-| **attention** | 5.05 ms | 2.47 | **2.58 ms** | **14.9%** |
-| routed expert projections | 4.03 | 3.06 | 0.97 | 5.6% |
-| dense matvecs incl. LM head | 2.96 | 2.34 | 0.62 | 3.6% |
+**1. The key-loop unroll, gated INSIDE the kernel on context.** The one idea
+here with a measured win that was thrown away for the wrong reason. It won 7% at
+12k/16k and cost 19% at 5,840 tokens, and was discarded whole because neither
+`pso_for` nor `launch_shape` is handed the context length. **The kernel is** —
+`total = position_ids[0] + 1` is right there. A uniform branch on it picks an
+unrolled loop only where the unroll pays. That is cheap to build and cheap to
+test, and it is worth ~7% of attention, ~2% of a step, at the long contexts an
+agentic turn actually runs at.
 
-**1. The KV page layout — the strongest remaining hypothesis for attention's
-2.05×.** Pages are `[slot][kv_head][dim]`, so ONE kv head's keys are 256 B of
-every 1024 B:
+**2. Accept attention where it is and take the smaller blocks.** The routed FFN
+has 0.97 ms available at 1.32× off; the dense matvecs 0.62 ms at 1.27× off.
+Neither is a big win but both are unexplored, and the dense group is nine
+dispatches behind one pipeline. Split the 2.96 ms across those nine first — the
+LM head is K=2048 × N=151936 running ONCE and the others are narrow and run 48×,
+so they are not one problem.
 
-    a 32-key page is 32 KB; one kv head uses 8 KB of it,
-    as 32 separate 256 B runs rather than one 8 KB run
-
-No bytes are wasted at cache-line granularity — but this is the SAME mechanism
-the LPK sweep just priced, one level up: many small regions instead of few large
-ones, which is what a memory-latency-bound kernel pays for. A
-`[kv_head][slot][dim]` page would make each head's 32 keys one contiguous run.
-
-**Test it cheaply before building it.** This probe already carries a contiguous
-(de-paged) path and a `depage_cost` arm; timing the SAME decode kernel against a
-contiguous KV says whether the layout is worth a cross-cutting change, and that
-change is large — it touches `kv_append_paged`, the page allocator and every
-attention kernel that walks a page table.
-
-**2. The routed FFN**, 0.97 ms available across three projections, 1.32× off.
-
-**3. The dense matvecs**, 0.62 ms, 1.27× off. Nine dispatches behind one
-pipeline, so a fix reaches all of them — but there is little to reach, and the
-LM head is K=2048 × N=151936 running ONCE while the others are narrow and run
-48×, so split the 2.96 ms before attempting anything.
+**3. Question the roofline itself.** 2.47 ms assumes the KV stream can run at
+296 GB/s. Every attempt to give this kernel more of what a bandwidth-bound
+kernel wants has failed to move it, which is weak evidence that a paged gather
+with a dependent page-table lookup simply does not reach the streaming roof. If
+that is true the real headroom is smaller than 14.9% and the honest thing is to
+measure the achievable roof for THIS access pattern rather than assume the
+streaming one.
 
 **Measure any candidate the way split-K had to be measured**: the isolated
 kernel ratio overstated the transferable gain by 2.8×, so price it with
