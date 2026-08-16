@@ -1082,6 +1082,102 @@ void run_shipped_split_arm(RawMetalContext& ctx, const std::string& kernels_dir)
     }
 }
 
+// KEY_PER_LANE decode: the same arithmetic with 32x fewer reductions.
+//
+// Timed by `split_run` in its single-kernel mode against the shipped QH=2
+// kernel, interleaved context by context on warmed clocks -- the same machinery
+// the split-K arm uses, and deliberately not a second harness. This prototype
+// carries the SHIPPED `bind::SdpaPaged` signature so that is possible.
+void run_kpl_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
+    printf("\nKEY_PER_LANE decode (prototype, vs the shipped QH=2 kernel):\n");
+    const std::string sp_path = kernels_dir + "/sdpa_paged.metal";
+    std::string eb;
+    Pso base_h2 = ctx.compile_pso_from_file(
+        sp_path, "sdpa_paged_decode_bfloat16_d_128_p32_h2", &eb);
+    if (!base_h2.valid()) { printf("  baseline compile fail: %s\n", eb.c_str()); return; }
+
+    for (const int qh : {2, 4}) {
+        char f[80];
+        snprintf(f, sizeof f, "/sdpa_kpl_h%d.metal", qh);
+        std::string ek;
+        Pso k = ctx.compile_pso_from_file(
+            std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f, "sdpa_kpl_decode", &ek);
+        if (!k.valid()) { printf("  QH=%d compile fail: %s\n", qh, ek.c_str()); continue; }
+
+        // Correctness FIRST, and at short context too: a block-softmax kernel
+        // whose last block is partly past the end is exactly where a stray
+        // lane's -inf leaks into a max.
+        for (const int cl : {31, 127, 1023, 2047, 8191}) {
+            printf("  QH=%d ", qh);
+            split_run(ctx, k, Pso{}, qh, 1, cl, 1200 + qh * 32 + cl % 29, true, true);
+        }
+        // Warm until the clocks stop moving; see the split arm for why this is
+        // not optional on this machine.
+        double prev = 0; int warm = 0;
+        for (; warm < 40; ++warm) {
+            const double t = split_run(ctx, k, Pso{}, qh, 1, 16383, 1290, false, true);
+            if (prev > 0 && std::abs(t - prev) < 0.05 * prev) break;
+            prev = t;
+        }
+        printf("  QH=%d clocks settled after %d passes%s\n", qh, warm,
+               warm >= 40 ? "  <-- NEVER SETTLED; distrust the row" : "");
+
+        const int ctxs[4] = {2047, 8191, 12287, 16383};
+        double kt[4], bt[4];
+        bool noise = false;
+        for (int i = 0; i < 4; ++i) {
+            kt[i] = split_run(ctx, k, Pso{}, qh, 1, ctxs[i], 1300 + qh * 16 + i, false, true);
+            bt[i] = split_run(ctx, base_h2, Pso{}, 2, 1, ctxs[i], 1340 + i, false, true);
+        }
+        for (int i = 1; i < 4; ++i)
+            if (kt[i] < kt[i - 1] * 0.97 || bt[i] < bt[i - 1] * 0.97) noise = true;
+        printf("  %-12s %8s %8s %8s %8s\n", "", "2k", "8k", "12k", "16k");
+        printf("  %-12s %8.3f %8.3f %8.3f %8.3f\n", "QH=2 shipped", bt[0], bt[1], bt[2], bt[3]);
+        printf("  %-12s %8.3f %8.3f %8.3f %8.3f\n", "KPL", kt[0], kt[1], kt[2], kt[3]);
+        printf("  %-12s", "speedup");
+        for (int i = 0; i < 4; ++i) printf(" %7.2fx", kt[i] > 0 ? bt[i] / kt[i] : 0.0);
+        printf("\n");
+        if (noise)
+            printf("  >>> NOT MONOTONIC in context: this run is NOISE, re-run quiet.\n");
+    }
+
+    // The DIAL between the two ends: LPK lanes cooperate on one key, so 32/LPK
+    // keys are in flight. LPK=32 is the shipped shape and LPK=1 is the rejected
+    // one above; the bet is that the middle beats both.
+    printf("\n  LANES_PER_KEY sweep (baseline = the shipped QH=2 kernel):\n");
+    for (const int qh : {2, 4}) {
+        for (const int lpk : {16, 8, 4}) {
+            char f[96];
+            snprintf(f, sizeof f, "/sdpa_lpk_h%d_l%d.metal", qh, lpk);
+            std::string el;
+            Pso k = ctx.compile_pso_from_file(
+                std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f, "sdpa_lpk_decode", &el);
+            if (!k.valid()) {
+                printf("    QH=%d LPK=%-2d compile fail: %s\n", qh, lpk, el.c_str());
+                continue;
+            }
+            printf("    QH=%d LPK=%-2d ", qh, lpk);
+            split_run(ctx, k, Pso{}, qh, 1, 127, 1400 + qh * 64 + lpk, true, true);
+            printf("    QH=%d LPK=%-2d ", qh, lpk);
+            split_run(ctx, k, Pso{}, qh, 1, 8191, 1420 + qh * 64 + lpk, true, true);
+            double t[4], bl[4];
+            const int cs[4] = {2047, 8191, 12287, 16383};
+            bool noisy = false;
+            for (int i = 0; i < 4; ++i) {
+                t[i]  = split_run(ctx, k, Pso{}, qh, 1, cs[i], 1500 + qh * 64 + lpk * 4 + i,
+                                  false, true);
+                bl[i] = split_run(ctx, base_h2, Pso{}, 2, 1, cs[i], 1700 + i, false, true);
+            }
+            for (int i = 1; i < 4; ++i)
+                if (t[i] < t[i - 1] * 0.97 || bl[i] < bl[i - 1] * 0.97) noisy = true;
+            printf("    QH=%d LPK=%-2d  %6.3f %6.3f %6.3f %6.3f  ->", qh, lpk,
+                   t[0], t[1], t[2], t[3]);
+            for (int i = 0; i < 4; ++i) printf(" %5.2fx", t[i] > 0 ? bl[i] / t[i] : 0.0);
+            printf("%s\n", noisy ? "   NOISE" : "");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -1114,6 +1210,12 @@ int main(int argc, char** argv) {
     // only way to get a number from it worth quoting, and the whole-probe run
     // is still the right thing for everything that is compared WITHIN a
     // section.
+    if (std::getenv("PIE_SDPA_PROBE_KPL_ONLY") != nullptr) {
+        printf("PIE_SDPA_PROBE_KPL_ONLY: the KEY_PER_LANE arm alone on a fresh\n"
+               "heap, because this probe's arms are not independent.\n");
+        run_kpl_arm(*ctx, kernels_dir);
+        return 0;
+    }
     const bool split_only = std::getenv("PIE_SDPA_PROBE_SPLIT_ONLY") != nullptr;
     if (split_only) {
         printf("PIE_SDPA_PROBE_SPLIT_ONLY: the shipped split-K arm, alone on a\n"

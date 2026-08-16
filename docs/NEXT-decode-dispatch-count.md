@@ -491,9 +491,50 @@ present and against a baseline quoted from a different run.** The arm now
 compiles the QH=2 kernel it replaces and times it **interleaved**, context by
 context, in the same run.
 
+### REJECTED: KEY_PER_LANE, and the whole LANES_PER_KEY axis with it
+
+The last named idea in this file, now measured and dead. The reasoning behind it
+was: at d=128 a lane multiplies 4 dimensions behind a five-step `simd_sum`, so
+the reduction costs more than the arithmetic it reduces; give the key to the
+LANE and 32 keys are scored with no reduction at all. Per lane at ctx 7424 the
+FMAs are identical (928 either way) and the serial reductions drop 232 → 7.2.
+
+`tools/rawmetal/kernels/sdpa_kpl_decode.metal` — **correct at every context**,
+including 31 and 127 where the last block runs past the end, and **0.53× the
+speed at QH=2, 0.31× at QH=4.**
+
+So the axis was swept rather than abandoned: LPK lanes cooperate on one key,
+32/LPK keys in flight. LPK=32 is the shipped shape, LPK=1 is the above.
+`sdpa_lpk_decode.metal`, all correct, against the shipped kernel interleaved on
+warmed clocks:
+
+| lanes/key | q regs/lane | keys in flight | 2k | 8k | 12k | 16k |
+|---:|---:|---:|---:|---:|---:|---:|
+| **32 (shipped)** | 4 | 1 | **1.00×** | **1.00×** | **1.00×** | **1.00×** |
+| 16 | 8 | 2 | 0.75× | 0.68× | 0.67× | 0.66× |
+| 8 | 16 | 4 | 0.62× | 0.49× | 0.49× | 0.51× |
+| 4 | 32 | 8 | 0.42× | 0.35× | 0.34× | 0.34× |
+| 1 (KEY_PER_LANE) | 128 → threadgroup | 32 | 0.61× | 0.53× | 0.52× | 0.53× |
+
+**Monotonic: fewer lanes per key is worse, every step.** The shipped shape is
+the optimum on this axis and there is nothing left in the middle to find.
+
+**The reduction was never the constraint.** What each halving of LPK actually
+does is double the number of separate memory REGIONS one load instruction must
+touch — 1 region at LPK=32, 32 at LPK=1 — and that costs ~1.4× per doubling.
+Coalescing is worth far more than the shuffle chain it would buy back. (KEY_PER_LANE
+pays a second time: q no longer fits in registers and moves to threadgroup
+memory, read back 128 times per head per key.)
+
+This also sharpens the "latency-bound, not bandwidth-bound" finding above. Both
+are true, and they are not in tension: the kernel is bound by **memory latency**,
+and the number of independent transactions it must issue and wait on is set by
+coalescing. Removing arithmetic from the dependency chain does nothing; adding
+memory transactions to it is expensive.
+
 ### What is left to try, in order
 
-Headroom, measured minus each block's own roofline, on the corrected table:
+Headroom against each block's own roofline:
 
 | block | measured | roofline | available | of a step |
 |---|---:|---:|---:|---:|
@@ -501,22 +542,30 @@ Headroom, measured minus each block's own roofline, on the corrected table:
 | routed expert projections | 4.03 | 3.06 | 0.97 | 5.6% |
 | dense matvecs incl. LM head | 2.96 | 2.34 | 0.62 | 3.6% |
 
-**1. Attention.** More headroom than the other two combined, and the only block
-more than 2× off its floor. The per-key chain is load → dot → **`simd_sum`** →
-online-softmax update → rescale → accumulate. Unrolling the loads did not pay
-and split-K bought 1.06× in situ, which together point at the cross-lane
-reduction and the dependent softmax update rather than at memory.
-`sdpa_paged.metal`'s own comments name the alternative: **KEY_PER_LANE** — one
-key per lane walking all of D, removing the `simd_sum` per key at the cost of D
-registers per lane. A restructure, not a constant, and the last untried shape.
+**1. The KV page layout — the strongest remaining hypothesis for attention's
+2.05×.** Pages are `[slot][kv_head][dim]`, so ONE kv head's keys are 256 B of
+every 1024 B:
 
-**2. The routed FFN**, 0.97 ms available across three projections.
+    a 32-key page is 32 KB; one kv head uses 8 KB of it,
+    as 32 separate 256 B runs rather than one 8 KB run
 
-**3. The dense matvecs**, 0.62 ms. Nine dispatches behind one pipeline, so a fix
-would reach all of them at once — but there is little to reach. If it is
-attempted, split the 2.96 ms across the nine first: the LM head is K=2048 ×
-N=151936 and runs ONCE, the others are narrow and run 48×, and no ablation token
-can separate them.
+No bytes are wasted at cache-line granularity — but this is the SAME mechanism
+the LPK sweep just priced, one level up: many small regions instead of few large
+ones, which is what a memory-latency-bound kernel pays for. A
+`[kv_head][slot][dim]` page would make each head's 32 keys one contiguous run.
+
+**Test it cheaply before building it.** This probe already carries a contiguous
+(de-paged) path and a `depage_cost` arm; timing the SAME decode kernel against a
+contiguous KV says whether the layout is worth a cross-cutting change, and that
+change is large — it touches `kv_append_paged`, the page allocator and every
+attention kernel that walks a page table.
+
+**2. The routed FFN**, 0.97 ms available across three projections, 1.32× off.
+
+**3. The dense matvecs**, 0.62 ms, 1.27× off. Nine dispatches behind one
+pipeline, so a fix reaches all of them — but there is little to reach, and the
+LM head is K=2048 × N=151936 running ONCE while the others are narrow and run
+48×, so split the 2.96 ms before attempting anything.
 
 **Measure any candidate the way split-K had to be measured**: the isolated
 kernel ratio overstated the transferable gain by 2.8×, so price it with
