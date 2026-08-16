@@ -1373,6 +1373,70 @@ void run_ugate_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
            "  unrolled path costs registers even when it does not run.\n");
 }
 
+// Is 296 GB/s reachable by a decode's KV access pattern at all?
+//
+// Attention is priced against the unique KV bytes at the streaming roof, and
+// five attacks on the resulting 2.05x gap have moved nothing. This asks whether
+// the target was ever real: the shipped kernel with the arithmetic removed, so
+// what remains is the loads and only the loads.
+void run_kvroof_arm(RawMetalContext& ctx, const std::string& kernels_dir) {
+    printf("\nKV ACCESS ROOF: what the loads alone reach, against the 296 GB/s stream\n");
+    const std::string ld = PIE_METAL_TOOL_LOCAL_KERNELS_DIR;
+    std::string eb;
+    Pso attn = ctx.compile_pso_from_file(
+        kernels_dir + "/sdpa_paged.metal",
+        "sdpa_paged_decode_bfloat16_d_128_p32_h2", &eb);
+    if (!attn.valid()) { printf("  attention compile fail: %s\n", eb.c_str()); return; }
+    std::string e1, e2;
+    Pso gather = ctx.compile_pso_from_file(ld + "/sdpa_kvroof_p1.metal",
+                                           "sdpa_kvroof_decode", &e1);
+    Pso contig = ctx.compile_pso_from_file(ld + "/sdpa_kvroof_p0.metal",
+                                           "sdpa_kvroof_decode", &e2);
+    if (!gather.valid() || !contig.valid()) {
+        printf("  loads-only compile fail\n  %s\n  %s\n", e1.c_str(), e2.c_str());
+        return;
+    }
+    // Warm until the clocks stop moving; mandatory on this machine.
+    double prev = 0; int warm = 0;
+    for (; warm < 40; ++warm) {
+        const double t = split_run(ctx, attn, Pso{}, 2, 1, 16383, 2400, false, true);
+        if (prev > 0 && std::abs(t - prev) < 0.05 * prev) break;
+        prev = t;
+    }
+    printf("  clocks settled after %d passes%s\n", warm,
+           warm >= 40 ? "  <-- NEVER SETTLED" : "");
+
+    const int cs[3] = {8191, 12287, 16383};
+    printf("  %-26s %8s %8s %8s\n", "ms/layer", "8k", "12k", "16k");
+    double a[3], g[3], c[3];
+    for (int i = 0; i < 3; ++i) {
+        a[i] = split_run(ctx, attn,   Pso{}, 2, 1, cs[i], 2410 + i, false, true);
+        g[i] = split_run(ctx, gather, Pso{}, 2, 1, cs[i], 2420 + i, false, true);
+        c[i] = split_run(ctx, contig, Pso{}, 2, 1, cs[i], 2430 + i, false, true);
+    }
+    printf("  %-26s %8.3f %8.3f %8.3f\n", "attention (shipped)", a[0], a[1], a[2]);
+    printf("  %-26s %8.3f %8.3f %8.3f\n", "loads only, PAGED gather", g[0], g[1], g[2]);
+    printf("  %-26s %8.3f %8.3f %8.3f\n", "loads only, contiguous", c[0], c[1], c[2]);
+
+    // Unique KV bytes: every key, both tensors, all four kv heads, once.
+    printf("\n  %-26s %8s %8s %8s\n", "GB/s on unique bytes", "8k", "12k", "16k");
+    auto gbs = [&](const double* t, const char* name) {
+        printf("  %-26s", name);
+        for (int i = 0; i < 3; ++i) {
+            const double bytes = double(cs[i] + 1) * 4.0 * 128.0 * 2.0 * 2.0;
+            printf(" %8.0f", t[i] > 0 ? bytes / (t[i] / 1000.0) / 1e9 : 0.0);
+        }
+        printf("\n");
+    };
+    gbs(a, "attention (shipped)");
+    gbs(g, "loads only, PAGED gather");
+    gbs(c, "loads only, contiguous");
+    printf("\n  If the PAGED row is near attention's, the 2.47 ms roofline was\n"
+           "  never reachable and the headroom it implies does not exist. If it\n"
+           "  is near the contiguous row, the gather is fine and attention's gap\n"
+           "  is somewhere the last five experiments did not look.\n");
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string kernels_dir = PIE_METAL_TOOL_KERNELS_DIR;
@@ -1405,6 +1469,11 @@ int main(int argc, char** argv) {
     // only way to get a number from it worth quoting, and the whole-probe run
     // is still the right thing for everything that is compared WITHIN a
     // section.
+    if (std::getenv("PIE_SDPA_PROBE_KVROOF_ONLY") != nullptr) {
+        printf("PIE_SDPA_PROBE_KVROOF_ONLY: the KV access-roof arm, alone.\n");
+        run_kvroof_arm(*ctx, kernels_dir);
+        return 0;
+    }
     if (std::getenv("PIE_SDPA_PROBE_UGATE_ONLY") != nullptr) {
         printf("PIE_SDPA_PROBE_UGATE_ONLY: the unroll-gate arm alone on a fresh heap.\n");
         run_ugate_arm(*ctx, kernels_dir);

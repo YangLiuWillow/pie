@@ -61,7 +61,7 @@ baseline **17.35 ms** on the current build (split-K landed).
 
 | what is actually removed | cost | share | its own roofline | off by |
 |---|---:|---:|---:|---:|
-| attention (`sdpa`) | 5.05 ms | **29.1%** | 2.47 ms | **2.04×** |
+| attention (`sdpa`) | 5.05 ms | **29.1%** | 2.47 ms *(unreachable; see below)* | 2.04× *(really ~1.55×)* |
 | **all three** routed expert projections | 4.03 ms | 23.2% | 3.06 ms | 1.32× |
 | **all nine** dense matvecs, incl. the LM head | 2.96 ms | 17.1% | 1.53 ms | **1.93×** |
 | everything else | ~5.3 ms | ~30.6% | — | — |
@@ -649,29 +649,79 @@ against 0.040 / 0.120 / 0.173 / 0.234 before, QH=4 S=4 at 1.18× / 1.14× / 1.17
 agreeing to the third decimal. **Fixing the instrument was worth more than any
 kernel attempt in this section.**
 
+### THE ROOFLINE WAS WRONG: 296 GB/s is not reachable by this access pattern
+
+Five attacks on attention's "2.05× off roofline" moved nothing. The sixth
+question was whether the target existed, and it did not.
+
+`tools/rawmetal/kernels/sdpa_kvroof_decode.metal` is the shipped head-sharing
+kernel with **everything but the loads removed** — same grid, same threadgroup,
+same page walk, same strides, same bytes, no dot product and no softmax. The
+accumulator is written out so nothing can be optimised away. `PAGED=0` reads the
+same bytes from one contiguous run, page table untouched.
+
+| GB/s on unique KV bytes | 8k | 12k | 16k |
+|---|---:|---:|---:|
+| attention (shipped) | 138 | 145 | 144 |
+| **loads only, PAGED gather** | **215** | **185** | **173** |
+| loads only, contiguous | 260 | 212 | 190 |
+| *streaming roof (`roofline_probe`)* | *296* | *296* | *296* |
+
+**A decode's KV read tops out around 173–215 GB/s, not 296.** The pattern is a
+page-table lookup per 32 keys and then 256 B from a page that may be anywhere,
+with one kv head's keys 1 KB apart. That is not a stream and a stream's roof
+does not apply to it. Even the contiguous arm — no indirection at all — reaches
+only 190 GB/s at 16k, so this is the kernel's shape as much as the paging.
+
+Judged against the floor its own access pattern permits, attention is:
+
+| | 8k | 12k | 16k |
+|---|---:|---:|---:|
+| **above its achievable floor** | **1.55×** | **1.27×** | **1.21×** |
+| above the streaming roof *(what the docs said)* | 2.13× | 2.03× | 2.06× |
+
+and it converges toward the floor as context grows. The page indirection itself
+costs 1.10–1.22×, shrinking with context — which is exactly why the head-major
+layout bought nothing.
+
+**So the headroom was overstated by about half.** At ctx 7424 attention is
+5.05 ms with an achievable floor near 3.26 ms: **~1.8 ms, 10.3% of a step, not
+2.58 ms and 14.9%** — and that floor does NO arithmetic, so what a real
+attention kernel could reach is higher still.
+
+This retroactively explains the five failures. They were not five bad ideas;
+they were five attempts to collect headroom that was never there.
+
+**The same correction applies to the other two blocks and has not been made.**
+The routed expert projections (1.32× off) and the dense matvecs (1.27× off) were
+also priced at 296 GB/s streaming, and both are also GATHERS — expert weights
+indexed by the router, and nine matvecs of very different shapes. Their real
+floors are above their stated ones by some unmeasured amount, so their headroom
+is also smaller than the table says. **Measure those floors the same way before
+working on either.**
+
 ### What is left to try, in order
 
-Attention is 5.05 ms against a 2.47 ms roofline — 145 GB/s achieved, **49% of
-the 296 GB/s roof**. Its reductions (the LANES_PER_KEY sweep), its parallelism
-(split-K, 1.06× in situ) and its page layout have all been measured and
-rejected. The load overlap is the one thing left, and it is blocked on the
-instrument above.
+**1. Price the other two blocks against their achievable floors**, with the
+loads-only technique above. Cheap, and it decides whether either is worth
+touching — on present evidence 0.97 ms and 0.62 ms are both upper bounds that
+will shrink.
 
-1. **Fix `split_run`'s allocation**, then settle the gated unroll. Worth ~7% of
-   attention, ~2% of a step, at the contexts an agentic turn runs at.
-2. **The routed FFN**, 0.97 ms available at 1.32× off roofline.
-3. **The dense matvecs**, 0.62 ms at 1.27× off — nine dispatches behind one
-   pipeline, but split the 2.96 ms across them first: the LM head is
-   K=2048 × N=151936 running ONCE and the rest are narrow and run 48×.
-4. **Question the 2.47 ms roofline.** It assumes the KV stream reaches 296 GB/s.
-   Four separate attempts to give this kernel what a bandwidth-bound kernel
-   wants have failed to move it, which is weak evidence that a paged gather with
-   a dependent page-table lookup simply does not reach the streaming roof. If so
-   the real headroom is well under 14.9%, and measuring the achievable roof for
-   THIS access pattern is worth more than another kernel variant.
+**2. Accept that per-kernel decode work is near exhausted, and look
+structurally.** Attention is within 1.21× of a floor that does no arithmetic at
+all at 16k. If the other two blocks land in the same place, the remaining
+1.16–1.28× gap to mlx-lm is not in any single kernel and the question becomes
+what mlx does differently in SHAPE — dispatch count, KV layout, how much work a
+threadgroup owns. **That has never been profiled**, and this file has said so
+since the beginning: "why mlx-lm is faster" is a hypothesis, not a measurement.
 
-**Measure any candidate the way split-K had to be measured**: the isolated
-kernel ratio overstated the transferable gain by 2.8×, so price it with
+**3. The mod-8 driver cliff**, which is unrelated to any of this and may now be
+the largest single defect left: 189 rows costs 868.9 ms against 184 rows at
+249.9, ~3.5× the base cost, and the faster kernels made it proportionally worse.
+The guest steers around it; the driver cause has never been found.
+
+**Measure any candidate the way split-K had to be measured**: isolated ratios
+overstate what transfers — 1.16× → 1.06×, 1.09× → ~1.00× — so price it with
 `tools/split_fire_ab.sh` before believing an end-to-end number.
 
 ---
