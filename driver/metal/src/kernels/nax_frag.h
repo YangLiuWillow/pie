@@ -115,6 +115,27 @@ inline void frag_load_rows(thread vec<T, kElemsPerFrag>& dst, const device T* sr
     }
 }
 
+/// Load a fragment from a THREADGROUP-memory staging buffer.
+///
+/// The device-memory form above is right when a block is read once. It is wrong
+/// when the same block is read by several simdgroups of the same threadgroup,
+/// which is what a query tile wider than one simdgroup does: four simdgroups
+/// each issue the same loads, and eight query heads sharing a KV head issue
+/// them again. Staging once and reading from here is the alternative, and which
+/// one wins is a measurement, not a principle -- see
+/// `results-prefill-experiments.md`.
+template <typename T>
+inline void frag_load_tg(thread vec<T, kElemsPerFrag>& dst, const threadgroup T* src,
+                         int row_stride, uint simd_lid) {
+    const short2 c = frag_coord(simd_lid);
+    src += c.y * row_stride + c.x;
+#pragma clang loop unroll(full)
+    for (short i = 0; i < kElemRows; ++i)
+#pragma clang loop unroll(full)
+        for (short j = 0; j < kElemCols; ++j)
+            dst[i * kElemCols + j] = src[i * kElemRowsJump * row_stride + j];
+}
+
 /// Store a float fragment to device memory, converting.
 template <typename T>
 inline void frag_store(const thread ffrag& src, device T* dst, int row_stride,

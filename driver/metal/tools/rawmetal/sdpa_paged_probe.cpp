@@ -477,8 +477,12 @@ double hshare_run(RawMetalContext& ctx, Pso pso, int heads, int ctx_len, int ord
 // disagreement this repo documents, reproduced inside the instrument meant to
 // measure it. It reported a BQ=128 kernel as 24576 elements WRONG when the
 // kernel was fine and the grid was a different kernel's.
+// `qh` is query heads per threadgroup (1 for the device-memory kernel, which
+// gives a threadgroup one head). It changes the grid's x extent AND the
+// threadgroup size, and both are stated here from the same value for the
+// reason the note above gives.
 double nax_prefill_run(RawMetalContext& ctx, Pso pso, int rows, int ctx_len,
-                       int ordinal, bool check, int nwarps) {
+                       int ordinal, bool check, int nwarps, int qh = 1) {
     constexpr int kHeads = 32, kKv = 4, kD = 128, kPage = 32;
     const int kBQ = nwarps * 16;
     const int gqa = kHeads / kKv;
@@ -542,8 +546,8 @@ double nax_prefill_run(RawMetalContext& ctx, Pso pso, int rows, int ctx_len,
     ctx.arg_bind(kind, ordinal, 9, scalar<int>(ctx, rows));
     ctx.make_resident();
 
-    const uint32_t threads = uint32_t(nwarps) * 32u;
-    Grid grid{uint32_t(kHeads) * threads, uint32_t((rows + kBQ - 1) / kBQ), 1};
+    const uint32_t threads = uint32_t(nwarps) * uint32_t(qh) * 32u;
+    Grid grid{uint32_t(kHeads / qh) * threads, uint32_t((rows + kBQ - 1) / kBQ), 1};
     Threadgroup tg{threads, 1, 1};
     LatencyHarness h(ctx);
     auto enc = [&](StepEncoder& se) {
@@ -889,6 +893,25 @@ int main(int argc, char** argv) {
             }
             printf("  shipped sdpa_paged_mma: 6.97.  MLX: 1.555.  "
                    "simdgroup floor: 4.1.\n");
+            // EXPERIMENT 1: stage K/V once per threadgroup and share it across
+            // QH query heads of a GQA group. Prefill attention is memory-bound
+            // (1.23 ms roofline against 2.08 measured) and the block is read 32
+            // times over. QH is swept because occupancy, which capped the
+            // decode version at 2, is not the constraint at prefill widths.
+            printf("  EXP 1 -- staged K/V, QH heads per threadgroup (RT=4, BQ=64):\n");
+            for (const int qh : {1, 2, 4, 8}) {
+                char f[64]; snprintf(f, sizeof f, "/sdpa_nax_stg_q%d.metal", qh);
+                std::string eq;
+                Pso ps = ctx->compile_pso_from_file(
+                    std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f,
+                    "sdpa_nax_stg", &eq);
+                if (!ps.valid()) { printf("    QH=%d compile fail: %s\n", qh, eq.c_str()); continue; }
+                printf("    QH=%d ", qh);
+                nax_prefill_run(*ctx, ps, 70, 133, 700 + qh, true, 4, qh);
+                const double t = nax_prefill_run(*ctx, ps, 184, 7424, 720 + qh, false, 4, qh);
+                printf("    QH=%-2d  184 rows @ 7424  %7.3f ms/layer  x48 = %6.1f ms"
+                       "  %.2fx the unstaged 2.082\n", qh, t, t * 48.0, 2.082 / t);
+            }
             // Accuracy against the kernel it REPLACES, not against exact.
             {
                 std::string es;
@@ -897,7 +920,73 @@ int main(int argc, char** argv) {
                     "sdpa_paged_nax", &es);
                 if (!shipped_nax.valid())
                     printf("  shipped NAX compile failed: %s\n", es.c_str());
-                printf("  accuracy, both against a float64 reference:\n");
+                // EXPERIMENT 2: pages per key block. NPG=1 is the shipped kernel
+            // reproduced, so every ratio is the softmax epilogue amortizing and
+            // nothing else.
+            printf("  EXP 2 -- keys per block (NPG pages of 32; NPG=1 is the control):\n");
+            for (const int npg : {1, 2, 4, 8}) {
+                char f[64]; snprintf(f, sizeof f, "/sdpa_nax_bk_p%d.metal", npg);
+                std::string eb;
+                Pso pb = ctx->compile_pso_from_file(
+                    std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + f,
+                    "sdpa_nax_bk", &eb);
+                if (!pb.valid()) { printf("    NPG=%d compile fail: %s\n", npg, eb.c_str()); continue; }
+                // The tail guard is what these shapes exercise: a context that
+                // ends mid-block, and one that ends exactly on a page boundary
+                // so the last block reaches past the list.
+                printf("    NPG=%d ", npg);
+                nax_prefill_run(*ctx, pb, 70, 133, 800 + npg, true, 4);
+                printf("    NPG=%d ", npg);
+                nax_prefill_run(*ctx, pb, 64, 32, 810 + npg, true, 4);
+                printf("    NPG=%d ", npg);
+                nax_prefill_run(*ctx, pb, 184, 224, 820 + npg, true, 4);
+                const double t = nax_prefill_run(*ctx, pb, 184, 7424, 830 + npg, false, 4);
+                printf("    NPG=%-2d (%3d keys)  184 rows @ 7424  %7.3f ms/layer"
+                       "  x48 = %6.1f ms  %.2fx\n", npg, npg * 32, t, t * 48.0, 2.082 / t);
+            }
+            // EXPERIMENT 3: split the key loop so the mask and the tail check
+            // run only in the blocks that owe them.
+            printf("  EXP 3 -- mask/tail only where owed (split key loop):\n");
+            {
+                std::string ef;
+                Pso pf = ctx->compile_pso_from_file(
+                    std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + "/sdpa_nax_fast.metal",
+                    "sdpa_nax_fast", &ef);
+                if (!pf.valid()) printf("    compile fail: %s\n", ef.c_str());
+                else {
+                    // The split is derived from the smallest LIVE position in a
+                    // simdgroup, so the shapes that matter are the ones with a
+                    // partial final tile and a ragged context -- where a dead
+                    // row could wrongly widen the unmasked region.
+                    printf("    "); nax_prefill_run(*ctx, pf, 70, 133, 900, true, 4);
+                    printf("    "); nax_prefill_run(*ctx, pf, 64, 32, 901, true, 4);
+                    printf("    "); nax_prefill_run(*ctx, pf, 40, 96, 902, true, 4);
+                    printf("    "); nax_prefill_run(*ctx, pf, 17, 1, 903, true, 4);
+                    printf("    "); nax_prefill_run(*ctx, pf, 184, 224, 904, true, 4);
+                    const double t = nax_prefill_run(*ctx, pf, 184, 7424, 905, false, 4);
+                    printf("    184 rows @ 7424  %7.3f ms/layer  x48 = %6.1f ms"
+                           "  (%5.2f TFLOP/s)  %.2fx the 2.082 baseline\n",
+                           t, t * 48.0,
+                           184.0 * 32 * 7424 * 128 * 4 / (t / 1000.0) / 1e12, 2.082 / t);
+                    // The tile width is re-swept: removing the inner-loop work
+                    // changed what the kernel is limited by, so the optimum
+                    // found under the old balance is not evidence about this one.
+                    for (const int w : {2, 4, 8}) {
+                        char fw[64]; snprintf(fw, sizeof fw, "/sdpa_nax_fast_w%d.metal", w);
+                        std::string ew;
+                        Pso pw = ctx->compile_pso_from_file(
+                            std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + fw,
+                            "sdpa_nax_fast", &ew);
+                        if (!pw.valid()) { printf("    BQ=%d fail: %s\n", w*16, ew.c_str()); continue; }
+                        printf("    BQ=%-3d ", w * 16);
+                        nax_prefill_run(*ctx, pw, 70, 133, 910 + w, true, w);
+                        const double tw = nax_prefill_run(*ctx, pw, 184, 7424, 920 + w, false, w);
+                        printf("    BQ=%-3d  %7.3f ms/layer  x48 = %6.1f ms  %.2fx\n",
+                               w * 16, tw, tw * 48.0, 2.082 / tw);
+                    }
+                }
+            }
+            printf("  accuracy, both against a float64 reference:\n");
                 accuracy_ab(*ctx, mma, shipped_nax, 184, 224, 600);
                 accuracy_ab(*ctx, mma, shipped_nax, 184, 1024, 601);
             }

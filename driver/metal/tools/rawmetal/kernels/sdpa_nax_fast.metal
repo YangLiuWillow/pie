@@ -1,51 +1,43 @@
-// Paged prefill attention on the M5 neural accelerators, fused. SHIPPED FORM.
+// EXPERIMENT 3: pay for the mask and the tail only where they are owed.
 //
-// **Updated by experiment 3** (`results-prefill-experiments.md`): the key loop
-// is split so the causal mask and the ragged-tail check run only in the blocks
-// that owe them. 2.082 -> 1.435 ms/layer, which is past MLX's 1.555 on the same
-// shapes and 4.86x the `sdpa_paged_mma` this replaced. Two earlier experiments
-// failed first and are recorded there: staging K/V to remove a nominal 32x read
-// amplification (2.4x SLOWER -- the reads were already cache-served) and
-// widening the key block to amortize the softmax (up to 8x slower -- it tracks
-// live registers, not epilogue frequency).
+// Experiments 1 and 2 agree on what the kernel is bound by, by elimination:
+// not memory (staging the block to remove a nominal 32x read amplification made
+// it 2.4x slower) and not the softmax epilogue (making it run half as often
+// made it 1.4x slower, and a quarter as often 4x slower, tracking live
+// registers exactly). What is left is register pressure and the inner loop's
+// own instruction count.
 //
-// The prototype and the measurements that justify this kernel are in
-// `tools/rawmetal/kernels/sdpa_nax_prefill.metal` and its arm of
-// `sdpa_paged_probe`: correct against a CPU reference at six shapes, and
-// 2.08 ms/layer at 184 rows / 7424 ctx against `sdpa_paged_mma`'s 6.97 --
-// 3.35x, at 10.75 TFLOP/s, BELOW the 4.1 ms/layer floor the 5.48 TFLOP/s
-// simdgroup ceiling puts under any simdgroup kernel. That is the arithmetic
-// proof it runs on the neural accelerators rather than a claim that it does.
+// So this removes work rather than rearranging it. Two things ran on every key
+// block that are owed by almost none of them:
 //
-// This file differs from the prototype in ONE way and it is the ABI: the buffer
-// list is `sdpa_paged_mma`'s, byte for byte, so `bind::SdpaPaged` serves it with
-// no binder change and the only thing that differs at the launch is the grid.
+//   * **the tail check.** `frag_load_rows` tests `r < lim` per element -- eight
+//     conditionals per fragment, on all ~232 blocks of a 7424-context fire,
+//     when only the final block is ragged.
+//   * **the causal mask.** 16 comparisons per lane per block, when a prefill of
+//     184 rows at 7424 context has ~226 blocks lying ENTIRELY below the
+//     diagonal and ~6 straddling it.
 //
-// ## What this kernel does NOT handle, and how it is kept away from them
+// MLX makes both conditional (`align_K && is_last_k`, and `kb >= kb_min_causal`)
+// and that is the difference being tested here. The key loop splits in two:
 //
-//   * **More than one request per fire.** A 64-row query tile would span two
-//     page lists, and this kernel resolves one base pointer for the whole tile.
-//     `sdpa_nax_this_fire` requires `requests == 1`, which is what a prefill
-//     fire is -- one request contributing thousands of rows. A co-batched fire
-//     falls back to `sdpa_paged_mma`.
-//   * **A user attention mask, a sliding window, or a learned sink.** None are
-//     read. The window and sink are geometry and are gated on. The MASK is
-//     per-fire and is NOT visible to `pso_for` or `launch_shape`, so it cannot
-//     be gated on there -- see the note in `sdpa_nax_this_fire`. This kernel
-//     inherits exactly the assumption `sdpa_paged_decode_..._p32` (FAST_FULL)
-//     already makes for this family at page size 32, and if masks are ever
-//     enabled on llama BOTH must be revisited together. That is a pre-existing
-//     property of the family, not one introduced here, and it is written down
-//     rather than left implicit.
+//     kb <  kb_safe   every key of every row is live and unmasked -- branchless
+//                     loads, no comparisons, no per-element predicates
+//     kb >= kb_safe   the straddling and ragged tail, exactly as before
+//
+// `kb_safe` is derived from the SMALLEST live position in the simdgroup, so a
+// block is only in the fast region when it is below the diagonal for every row
+// the simdgroup owns. Dead rows (a partial final tile) take INT_MAX in that
+// minimum rather than -1, or one absent row would drag every block into the
+// slow region and the experiment would measure nothing.
 
 #include <metal_stdlib>
 using namespace metal;
-#include "nax_frag.h"
+#include "../../../src/kernels/nax_frag.h"
 
 using namespace pie_nax;
 
-#ifndef NAXP_NWARPS
-#define NAXP_NWARPS 4
+#ifndef NAXF_NWARPS
+#define NAXF_NWARPS 4
 #endif
 
 // One key block, with the masking and the tail check compiled in or out.
@@ -156,33 +148,23 @@ inline void nax_block(
   }
 }
 
-kernel void sdpa_paged_nax(
-    const device bfloat* queries     [[buffer(0)]],
-    const device bfloat* k_pages     [[buffer(1)]],
-    const device bfloat* v_pages     [[buffer(2)]],
-    device bfloat* out               [[buffer(3)]],
-    const constant int& gqa_factor             [[buffer(4)]],
-    const device int* position_ids             [[buffer(5)]],
-    const device int* req_of_token             [[buffer(6)]],
-    const device uint* kv_page_indices         [[buffer(7)]],
-    const device uint* kv_page_indptr          [[buffer(8)]],
-    const constant int& page_size              [[buffer(9)]],   // 32, gated
-    const constant int& n_kv_heads             [[buffer(10)]],
-    const constant float& scale                [[buffer(11)]],
-    const device uchar* attention_mask         [[buffer(12)]],  // unused
-    const device uint& attention_mask_stride   [[buffer(13)]],  // unused
-    const device uchar* attention_mask_enabled [[buffer(14)]],  // unused
-    const constant int& window                 [[buffer(15)]],  // unused
-    const device bfloat* sinks                 [[buffer(16)]],  // unused
-    const constant int& n_rows                 [[buffer(17)]],
+kernel void sdpa_nax_fast(
+    const device bfloat* queries      [[buffer(0)]],
+    const device bfloat* k_pages      [[buffer(1)]],
+    const device bfloat* v_pages      [[buffer(2)]],
+    device bfloat* out                [[buffer(3)]],
+    const constant int& gqa_factor    [[buffer(4)]],
+    const device int* position_ids    [[buffer(5)]],
+    const device uint* kv_page_indices[[buffer(6)]],
+    const constant int& n_kv_heads    [[buffer(7)]],
+    const constant float& scale       [[buffer(8)]],
+    const constant int& n_rows        [[buffer(9)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
-  (void)page_size; (void)attention_mask; (void)attention_mask_stride;
-  (void)attention_mask_enabled; (void)window; (void)sinks;
   constexpr int kU = 16;
-  constexpr int BQ = NAXP_NWARPS * kU;
+  constexpr int BQ = NAXF_NWARPS * kU;
   constexpr int BK = 32, D = 128;
   constexpr int TD = D / kU, TK = BK / kU;
   constexpr float NEG_INF = -3.0e38f;
@@ -226,24 +208,20 @@ kernel void sdpa_paged_nax(
   const int q_ld = n_q_heads * D;
   const int kv_ld = n_kv_heads * D;
 
-  // The page list is per REQUEST. `sdpa_nax_this_fire` guarantees one request
-  // per fire, so every row of this tile shares a base.
-  const int page_base = int(kv_page_indptr[req_of_token[row0]]);
-
   const int n_blocks = (kp_hi + BK) / BK;
   // Blocks whose last key is at or below the SMALLEST live position: every row
   // of this simdgroup attends all 32 of them, so no mask and no tail check.
   const int kb_safe = min(n_blocks, (kp_lo + 1) / BK);
 
   for (int kb = 0; kb < kb_safe; ++kb) {
-    const int page = int(kv_page_indices[page_base + kb]);
+    const int page = int(kv_page_indices[kb]);
     const device bfloat* Kb = k_pages + (size_t(page) * BK * n_kv_heads + kv_head) * D;
     const device bfloat* Vb = v_pages + (size_t(page) * BK * n_kv_heads + kv_head) * D;
     nax_block<false, TD, TK>(O, row_max, row_sum, q_pos, Q, Kb, Vb, q_ld, kv_ld,
                              kb, kp_hi, scale2, sn, simd_lid);
   }
   for (int kb = kb_safe; kb < n_blocks; ++kb) {
-    const int page = int(kv_page_indices[page_base + kb]);
+    const int page = int(kv_page_indices[kb]);
     const device bfloat* Kb = k_pages + (size_t(page) * BK * n_kv_heads + kv_head) * D;
     const device bfloat* Vb = v_pages + (size_t(page) * BK * n_kv_heads + kv_head) * D;
     nax_block<true, TD, TK>(O, row_max, row_sum, q_pos, Q, Kb, Vb, q_ld, kv_ld,
