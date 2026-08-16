@@ -14,35 +14,43 @@ because each was a belief that steered work in the wrong direction.
 
 ## 1. Where it stands
 
-**pie's prefill is now faster than mlx-lm's; pie's decode is still ~1.25×
-slower.** Both measured in the same session, on the same machine, deterministic
-fixed prompts:
+**pie's prefill is the fastest of the three engines; pie's decode is still
+behind mlx-lm.** Four arms in ONE session on an idle machine (streaming roof
+292–296 GB/s) — `results-four-way.md`, `tools/four_way.sh`. "pie original" is the
+same binary with all three new kernels switched off, which is a stronger control
+than an old commit.
 
-| prompt | pie TTFT | mlx-lm | | pie decode | mlx-lm |
-|---:|---:|---:|---|---:|---:|
-| 5,840 | **2.60 s** | 2.88 s | pie 1.11× | 54.6 tok/s | 66.3 |
-| 16,090 | **7.38 s** | 8.20 s | pie 1.11× | 40.1 | 47.6 |
-| 28,390 | **14.31 s** | 15.40 s | pie 1.08× | 27.9 | 35.9 |
+**TTFT (prefill), seconds:**
 
-TTFT is **3.07× / 3.75× / 4.00×** better than two days ago.
+| prompt | **pie now** | pie original | mlx-lm | vLLM-metal |
+|---:|---:|---:|---:|---:|
+| 5,840 | **2.80** | 8.25 | 2.98 | 4.43 |
+| 16,090 | **7.37** | 27.84 | 8.85 | 17.10 |
+| 28,390 | **13.93** | 57.40 | 17.33 | 37.15 |
 
-Four engines in one session on an idle machine (`results-four-way.md`,
-`tools/four_way.sh`) — pie now, pie with all three new kernels switched off,
-mlx-lm and vLLM-metal:
+**Decode, tok/s:**
 
-| | pie now | pie original | mlx-lm | vLLM-metal |
-|---|---:|---:|---:|---:|
-| TTFT 16,090 | **7.37 s** | 27.84 | 8.85 | 17.10 |
-| decode 16,090 | 41.0 tok/s | 26.1 | **47.5** | 30.3 |
-| 6-turn replay | **7.14 s** | 16.30 | 8.02 | 10.18 |
+| prompt | pie now | pie original | **mlx-lm** | vLLM-metal |
+|---:|---:|---:|---:|---:|
+| 5,840 | 54.4 | 46.9 | **66.1** | 51.3 |
+| 16,090 | 41.0 | 26.1 | **47.5** | 30.3 |
+| 28,390 | 27.8 | 19.8 | **35.6** | 16.8 |
 
-**pie leads prefill (1.06–1.24× over mlx-lm, 1.6–2.7× over vLLM) and trails
-decode (mlx-lm by 1.16–1.28×).**
+**6-turn canned agentic replay:** pie **7.14 s**, mlx-lm 8.02, vLLM-metal 10.18,
+pie original 16.30.
+
+So: **prefill pie by 1.06–1.24× over mlx-lm and 1.6–2.7× over vLLM-metal;
+decode mlx-lm by 1.16–1.28×.** Which engine wins end to end depends on the shape
+of the turn — the replay is prefill-dominated (~10 generated tokens a turn) and
+gives it to pie by 1.12×. Against pie two days ago: **2.95–4.12× on prefill,
+1.16–1.57× on decode, 2.28× on the replay.**
 
 **A four-arm run carries ~10% of position-dependent THERMAL drift at the long
-end** — the first arm repeated last is 11–12% slower at 28k, and it reproduces
-on an idle machine, so it is not contention. Interleave (as `matched_spec.sh`
-does) if that margin matters.
+end.** The first arm repeated last is 11–12% slower at 28k, and it reproduces on
+an idle machine, so it is not contention. Interleave (as `matched_spec.sh` does)
+if that margin matters. Separately, a CPU-saturating Spotlight indexer changed
+every cell by <3% — this workload is GPU- and bandwidth-bound and one busy core
+does not reach it.
 
 Correctness is where it was — pie 4/5 on the SWE-bench known-5 against vLLM's
 1/5 (`results-swebench.md`); nothing since has touched the agent path's logic,
@@ -100,21 +108,31 @@ site can disagree at all — that is why their landing was one line.
 
 Same 23,655-token prompt, `PIE_METAL_DISPATCH_TRACE=1 PIE_METAL_TRACE_STRIDE=8`:
 
-| traced wall | pre-NAX | after NAX attn | after exp 3 |
-|---|---:|---:|---:|
-| | 66.77 s | 37.72 s | 29.98 s |
+| traced wall | pre-NAX | + NAX attn | + exp 3 | **+ NAX GEMMs** |
+|---|---:|---:|---:|---:|
+| | 66.77 s | 37.72 s | 29.98 s | **17.57 s** |
 
-Shares move a lot as terms are fixed, which is why they are re-measured rather
-than carried: attention went 69% → 47% → 32%, the routed GEMM 19% → 35% → 44%.
-**Do not plan off a share measured before the last change.** Both GEMMs have
-since been moved to NAX and the composition is stale again — re-trace before
-choosing the next target.
+**3.80× cumulative.** Current shares:
+
+| kernel | share | history |
+|---|---:|---|
+| `sdpa_paged_nax` (attention) | **56.7%** | 69% → 47% → 32% → 57% |
+| `affine_qmm_t_routed_nax` | 23.7% | 19% → 35% → 44% → 24% |
+| `affine_qmm_t_nax` | 11.6% | 9% → 16% → 20% → 12% |
+| everything else | 8.0% | |
+
+**Attention is the largest term again** — the third rotation of the ordering.
+Every time a term is fixed the ordering changes, so **re-trace before choosing a
+target; do not plan off a share measured before the last change.** It is a
+harder target now than it was: pie's attention already beats MLX's, so there is
+no reference left to copy and the remaining headroom (15.5 → 32.5 TFLOP/s) has
+to be found by profiling rather than porting.
 
 ---
 
 ## 5. OPEN — do not paper over these
 
-1. **Decode is the larger deficit now**, ~1.25× behind mlx-lm and untouched
+1. **Decode is the larger deficit now**, 1.16–1.28× behind mlx-lm and untouched
    since head sharing. The known lever is splitting the key range
    (flash-decoding) so head sharing can go past QH=2: QH=4 and QH=8 read a
    quarter and an eighth of the bytes and are *slower*, purely because the grid
