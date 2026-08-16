@@ -479,3 +479,18 @@ and total in-server time has gone from 1.96× mlx to roughly level. The mlx
 column is from the earlier session and is NOT a same-session measurement, so it
 is indicative here; the same-session comparisons are the fixed-prompt table and
 the 6-turn replay above, and both agree.
+
+## Composition re-traced after the GEMMs, and a four-way comparison
+
+Both in `results-four-way.md`. The short version:
+
+* traced wall on the same 23,655-token prompt: 66.77 → 37.72 → 29.98 →
+  **17.57 s**, i.e. **3.80×** cumulative;
+* in situ the GEMMs moved 3.17× (routed) and 2.90× (dense), better than the
+  2.21× / 2.72× measured in isolation;
+* **attention is the largest term again at 56.7%** — third rotation of the
+  ordering, and the reason the rule is to re-trace rather than to plan off a
+  share measured before the last change;
+* against three other engines measured in the same session, pie now leads
+  prefill (1.10–1.24× over mlx-lm, 1.7–2.7× over vLLM-metal) and trails decode
+  (mlx-lm by 1.17–1.28×).
