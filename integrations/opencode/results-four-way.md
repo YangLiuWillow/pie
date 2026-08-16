@@ -153,3 +153,43 @@ bash integrations/opencode/tools/four_way.sh
 # or, on a machine with a daemon that will finish on its own:
 bash integrations/opencode/tools/when_quiet.sh -- bash integrations/opencode/tools/four_way.sh
 ```
+
+## Prefix caching, and how it changes the reading of everything above
+
+All three engines hit **97–98%** on the 6-turn replay, and it is worth separating
+the cold turn from the cached ones because they are different measurements:
+
+| engine | cold turn 1 TTFC | cached turns (mean) | vs pie now |
+|---|---:|---:|---|
+| **pie now** | **3.345 s** | **0.403 s** | — |
+| pie original | 10.499 s | 0.721 s | pie 3.14× / 1.79× |
+| mlx-lm | 4.321 s | 0.441 s | pie 1.29× / 1.09× |
+| vLLM-metal | 5.999 s | 0.461 s | pie 1.79× / 1.14× |
+
+**Prefix caching compresses the engine differences.** On a cold prompt the three
+engines span 3.3–6.0 s; on a cached turn they span 0.403–0.461 s, a 14% spread.
+That is the honest context for the headline prefill numbers: `rate_probe` measures
+**cold** prefill on every call, which is the worst case, and a real agentic
+session is mostly cached turns.
+
+Two things follow, and they pull in opposite directions:
+
+1. **The kernel work matters less than the cold numbers suggest** for a session
+   that stays in cache — 1.79× on a cached turn against 3.14× on a cold one.
+2. **It still matters on cached turns**, because a 190-token delta is not free:
+   those rows still attend the whole 7.4k context through the same attention and
+   GEMMs. pie original spends 0.721 s where pie now spends 0.403.
+
+**And a cached turn is dominated by FIXED cost, not by its fresh tokens.** 192
+tokens in 0.403 s is 476 tok/s, against 2157 tok/s on the cold turn — the same
+kernels, a fifth of the apparent rate. Whatever that fixed term is, it is now a
+larger share of a steady agentic turn than the tokens are, and it has not been
+attributed. (`results-turn-latency.md` chased something similar once and the
+answer was a driver row-count cliff, since steered around; this is a different
+residue and is unexamined.)
+
+**vLLM reports `cached_tokens: 0` on every turn** while plainly caching — its
+TTFC drops from 5.999 s to ~0.46 s. It does not populate
+`prompt_tokens_details`, so its column above is "not reported", not "not cached".
+Reading it as zero would be the instrument-silence error this repo keeps
+tripping over.
