@@ -669,10 +669,11 @@ temporary timer in the SDK's `attach_program` (guest):
 is hash-deduped and returns in 1 µs. Nor is it the WIT boundary: the `submit`
 call beside it crosses the same boundary for 0.03 ms.
 
-What costs is everything in `core_program` AFTER the cache hit — channel
-registration, instance bind, and the pooled-KV seed claim, which that function's
-own comment calls out as "per-instance driver state". It is **per-instance work
-repeated for an identical 230-byte program, once per token.**
+What costs is something in `core_program` AFTER the cache hit. That function's
+own comment calls the region "per-instance driver state (channel registration,
+instance bind) or pooled KV", and naming those three together was as far as the
+first pass got — see the next section, which prices them separately and finds
+that only one of the three costs anything at all.
 
 #### Why it repeats
 
@@ -686,24 +687,118 @@ fresh `Pass` per fire**:
 So this is not a probe artifact — the serving path has the same shape, which is
 what makes it worth ~15% of a decode step in production.
 
-#### The fix, and what has to be checked first
+#### Two candidate fixes were drafted here. NEITHER WAS NEEDED
 
-Two candidate shapes, and they are not equivalent:
+For the record, because the reasoning was wrong in an instructive way. The two
+candidates were (1) hoist the `Pass` out of the guest's decode loop, and (2)
+cache the per-instance bind host-side. Both attack the REPETITION — they assume
+the bind is expensive and try to do it less often.
 
-1. **Guest-side: hoist the `Pass` out of the decode loop** and re-`put` the
-   channels per token. Cheapest if the ports can stay bound to the same channel
-   objects while their VALUES change — that needs checking, because
-   `attach_program` binds ports to specific channel handles and a fresh channel
-   per fire would invalidate the attachment.
-2. **Host-side: cache the per-instance bind** alongside the existing program
-   cache, keyed the same way. Fixes every caller at once without touching any
-   inferlet, but it is the more invasive change and the KV seed claim may not be
-   safely reusable across fires.
+The bind is not expensive. It costs **0.003 ms**. Pricing the three named
+suspects separately is what showed it, and is the whole lesson of the section
+below: "channel registration, instance bind, and the seed claim" is a phrase
+from a comment, not a measurement, and treating it as one aimed two designs at
+the wrong target.
 
-**Neither is a kernel change, and this is the largest single item left in a
-decode step.** `PIE_SUBMIT_TRACE=1` is kept in `core_submit` permanently — not
-because that is where the time is, but because it is what proved the time is
-NOT in admission, the residency gate or `submit_frame`.
+### FOUND: one Objective-C call, 20 times per token
+
+`PIE_SUBMIT_TRACE=1` now splits `core_program` phase by phase, and the driver
+control it dispatches:
+
+| phase of `core_program` | cost |
+|---|---:|
+| `program::register` (the compile cache) | 0.001 ms |
+| `ensure_bind_admitted` | 0.000 ms |
+| channel-handle validation | 0.001 ms |
+| KV page extent + geometry class | 0.004 ms |
+| **`register_channels_bind_classified`** | **2.60–2.80 ms** |
+| tail (host shadow, `attach_bound`) | 0.002 ms |
+
+and inside that one control, on the driver thread:
+
+| | cost |
+|---|---:|
+| **`register_channel_set`** (10 channels) | **2.70 ms** |
+| `driver.bind_instance` | **0.003 ms** |
+
+So it is channel registration, and nothing else — ~270 µs per channel.
+
+`Registry::register_channel` allocates two host-shared buffers per channel (the
+cell ring, and its four control words) through `make_platform_shared_storage`,
+and that function opened by calling `MTLCreateSystemDefaultDevice()`. Timed per
+call:
+
+    [storage] bytes=14848 device=0.172 newBuffer=0.029 memset=0.003
+    [storage] bytes=32    device=0.143 newBuffer=0.005 memset=0.000
+    [storage] bytes=14848 device=0.141 newBuffer=0.003 memset=0.002
+    [storage] bytes=32    device=0.149 newBuffer=0.003 memset=0.000
+
+**`MTLCreateSystemDefaultDevice()` is not a getter.** It costs 0.13–0.17 ms —
+about 50x the `newBufferWithLength:` it exists to serve. Two per channel, ten
+channels, once per token is twenty of them: 2.7 ms.
+
+The fix is a function-local static in `driver/metal/src/pipeline/shared_storage.mm`
+(thread-safe initialization under C++11; the device is a process-wide singleton
+and `RawMetalContext` already holds one for its lifetime). Instrumented, that
+moves `register_channel_set` from 2.70 ms to **0.04 ms** and `core_program` from
+2.65 ms to **0.08 ms**.
+
+#### What it is worth, and the part still unaccounted for
+
+`decode-rows-probe`, `rows=1` at ctx 7424, two binaries interleaved, three reps:
+
+| rep | with the cache | baseline |
+|---|---:|---:|
+| 1 | 14.14 / 14.22 | 17.43 / 17.47 |
+| 2 | 14.15 / 14.16 | 17.37 / 17.48 |
+| 3 | 14.16 / 14.19 | 17.41 / 17.45 |
+
+**14.17 ms against 17.43 ms — 3.26 ms, or 1.23x per decode step**, with 0.08 ms
+of spread inside each arm and no overlap between them.
+
+**That is larger than the attribution, and the gap is not explained.**
+`core_program`'s own timer accounts for 2.57 ms of the 3.26. The other three
+`MTLCreateSystemDefaultDevice` call sites in the driver are model-load admission
+and geometry setup, not per-fire, so they do not cover the remaining ~0.7 ms
+either. There are plausible mechanisms — twenty fewer device references per fire
+relieving Objective-C runtime pressure elsewhere on the host path — but none has
+been measured, so the residual stays an open number rather than an explanation.
+The saving is verified; its itemization is short by ~0.7 ms.
+
+#### Correctness, measured separately from throughput
+
+Same generation on both binaries through the real server (`rate_probe.py`,
+greedy, three prompt sizes), reading the TEXT and not the clock:
+
+| prompt | text |
+|---|---|
+| 5840 | IDENTICAL (988 chars) |
+| 13015 | IDENTICAL (881 chars) |
+| 22240 | IDENTICAL (869 chars) |
+
+Byte-identical at every size, which is the expected result: the change alters
+which `id<MTLDevice>` handle allocates a channel's ring buffer, not any
+arithmetic.
+
+**The throughput half of that same run is void, and its own drift control says
+so** — devcache-first vs devcache-last disagreed by 22.2% at 13015 tokens. The
+tok/s column read 1.16x / 0.94x / 1.12x, which is this instrument's known ~10%
+scatter and not a measurement of anything. The 1.23x above comes from
+`decode-rows-probe`, which is why that probe exists. Two claims, two
+instruments: the HTTP path can settle text identity and cannot settle 3 ms.
+
+#### The one instrument that does NOT check this
+
+`generate.wasm` is not a correctness check for a driver change. Its decode loop
+carries `ECHO_TOKEN` forward — "the fire's 'sampled' token = the loop-carried
+echo constant" — so it prints `[42, 42, ...]` from any driver that plumbs
+channels at all, including one returning zeros. Both arms agreeing there is
+evidence about the fire plumbing and none whatsoever about numerics. Text
+parity has to come from a real generation.
+
+`PIE_SUBMIT_TRACE=1` is kept in `core_submit` permanently — not because that is
+where the time is, but because it is what proved the time is NOT in admission,
+the residency gate or `submit_frame`.
 
 ### THE DECODE GAP IS NOT IN THE KERNELS: 15.5% is fixed HOST SUBMIT
 
@@ -754,6 +849,15 @@ guest, no engine plan, no RPC hop — does not pay it.
 This is also the same animal as open item 2 below ("~127 ms of a cached agentic
 turn is outside the driver entirely"), which has sat unattributed since the
 handover was written.
+
+**This prediction has now been collected, and it under-promised.** The
+projection above was 14.69 ms if the whole 2.69 ms went away; the device-handle
+cache measured **14.17 ms**, because the saving (3.26 ms) turned out larger than
+the submit cost the table attributes — see the ~0.7 ms this file declines to
+explain. The submit row is now ~0.1 ms rather than 2.69, so the step's
+composition needs re-measuring before anything else is planned against it: the
+shares in the table above are all fractions of a 17.38 ms step that no longer
+exists.
 
 #### What has NOT been established
 
