@@ -138,6 +138,8 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
         env_bool("PIE_METAL_SDPA_HSHARE", t.sdpa_head_share);
     t.sdpa_nax = env_bool("PIE_METAL_SDPA_NAX", t.sdpa_nax);
     t.qmm_nax = env_bool("PIE_METAL_QMM_NAX", t.qmm_nax);
+    t.sdpa_nax_min_rows =
+        env_int("PIE_METAL_SDPA_NAX_MIN_ROWS", t.sdpa_nax_min_rows);
     t.moe_batch_min_per_expert =
         env_int_allow_zero("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
     t.gdn_scan_lanes = env_int("PIE_METAL_GDN_SCAN_LANES", t.gdn_scan_lanes);
@@ -185,6 +187,7 @@ bool sdpa_mma() { return device_tuning().sdpa_mma; }
 bool sdpa_head_share() { return device_tuning().sdpa_head_share; }
 bool sdpa_nax() { return device_tuning().sdpa_nax; }
 bool qmm_nax() { return device_tuning().qmm_nax; }
+int sdpa_nax_min_rows() { return device_tuning().sdpa_nax_min_rows; }
 int moe_batch_min_per_expert() { return device_tuning().moe_batch_min_per_expert; }
 
 }  // namespace pie::metal

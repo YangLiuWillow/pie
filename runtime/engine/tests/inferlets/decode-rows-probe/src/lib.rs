@@ -69,7 +69,16 @@ const LONG: u32 = 7424;
 /// measured ~1150 ms at a 7.4k context — far more than either half of the cost
 /// model predicts. 32 is `sdpa_should_tile`'s crossover, so 8 and 64 bracket the
 /// kernel switch; 189 is the exact width the opencode replay fires.
-const ROWS: [u32; 1] = [184];
+// Swept to find the INTERCEPT, which is the whole question here: a cached
+// agentic turn prefills ~192 fresh tokens and takes 0.403 s, i.e. 476 tok/s
+// against 2157 tok/s on the cold turn with the same kernels. That gap is a
+// fixed per-fire term, and a fire-cost-versus-rows line is what prices it.
+//
+// 1 is a decode step. 184/192 are the fast widths and 189 the width the
+// opencode replay actually fires -- kept together because the driver's mod-8
+// row-count cliff (`r mod 8` in 1..6 costs a flat ~560 ms) was measured on the
+// OLD kernels and has not been re-checked since attention and both GEMMs moved.
+const ROWS: [u32; 9] = [1, 8, 32, 64, 128, 184, 189, 192, 512];
 
 /// Fires per configuration, including warmup.
 /// The driver refuses a fire that reads more logits rows than this.

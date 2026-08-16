@@ -16,6 +16,7 @@
 
 #include "decode_abi.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 #include "decode_dispatch.hpp"
@@ -438,11 +439,37 @@ inline constexpr int kSdpaNaxTile = 64;
 /// enabled on llama, both kernels are wrong together.
 inline bool sdpa_nax_this_fire(int head_dim, int kv_page_size, int rows,
                                int requests, bool paged) {
+    // `PIE_METAL_SDPA_TRACE=1` also reports THIS decision, because the answer
+    // was not observable and that cost real time twice: once for the matrix
+    // path (see `llama_sdpa_mma_this_fire`) and once here, when lowering the
+    // row threshold regressed three numerics cases and the question "what
+    // `requests` does this actually receive?" could not be answered by reading.
+    struct Trace {
+        static void note(int hd, int ps, int r, int rq, bool pg, bool yes) {
+            if (std::getenv("PIE_METAL_SDPA_TRACE") == nullptr) return;
+            static int seen = 0;
+            if (seen++ >= 24) return;
+            std::fprintf(stderr,
+                         "[nax] hd=%d page=%d rows=%d requests=%d paged=%d "
+                         "min=%d -> %s\n",
+                         hd, ps, r, rq, int(pg), sdpa_nax_min_rows(),
+                         yes ? "NAX" : "no");
+        }
+    };
+    const bool ok = sdpa_nax() && paged && kv_page_size == 32 &&
+                    head_dim == 128 && requests == 1 &&
+                    rows >= sdpa_nax_min_rows();
+    Trace::note(head_dim, kv_page_size, rows, requests, paged, ok);
     if (!sdpa_nax()) return false;
     if (!paged || kv_page_size != 32 || head_dim != 128) return false;
     if (requests != 1) return false;
-    // Below one tile the matrix kernel's 32-row tile fits the fire better.
-    return rows >= kSdpaNaxTile;
+    // NOT `rows >= kSdpaNaxTile`. That was the first form, on the reasoning
+    // that a fire below one tile is better served by the matrix kernel's 32-row
+    // tile -- and `decode-rows-probe` refuted it: 32 rows at 7424 context costs
+    // 222 ms where 64 rows costs 129, because the gate sent the 32-row fire to
+    // the slower kernel. The threshold is a measured constant now, not a
+    // consequence of the tile size, and `PIE_METAL_SDPA_NAX_MIN_ROWS` sweeps it.
+    return rows >= sdpa_nax_min_rows();
 }
 
 inline void sdpa_paged_nax_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {

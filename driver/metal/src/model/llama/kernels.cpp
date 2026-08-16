@@ -154,7 +154,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // The row count and the request count are per-fire and this is load time,
     // so they are the two clauses of `sdpa_nax_this_fire` NOT asked here; every
     // geometry clause is.
-    if (sdpa_nax_this_fire(g.head_dim, g.kv_page_size, /*rows=*/kSdpaNaxTile,
+    if (sdpa_nax_this_fire(g.head_dim, g.kv_page_size, /*rows=*/sdpa_nax_min_rows(),
                            /*requests=*/1, g.paged_kv_enabled)) {
         std::string compile_error;
         out.sdpa_paged_nax = ctx.compile_pso_from_file(

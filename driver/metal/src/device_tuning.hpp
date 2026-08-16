@@ -304,6 +304,49 @@ struct DeviceTuning {
     /// kernel it replaces, so only the entrypoint NAME differs and no launch
     /// site can disagree with it. It is a knob rather than a rewrite.
     bool qmm_nax = true;
+    /// Fewest query rows in a fire that still takes `sdpa_paged_nax`.
+    ///
+    /// This started at the NAX kernel's own 64-row tile on the reasoning that a
+    /// smaller fire is better served by the matrix kernel's 32-row tile. That
+    /// was an assumption and `decode-rows-probe` refuted it: a 32-row fire at
+    /// 7424 context costs 222 ms and a 64-row fire 129 ms, and an A/B with
+    /// `PIE_METAL_SDPA_NAX=0` shows the two are identical below 64 and 2-2.85x
+    /// apart at or above it. The gate was the cliff.
+    ///
+    /// Swept with `PIE_METAL_SDPA_NAX_MIN_ROWS` at 64 / 32 / 16 / 8. A 32-row
+    /// fire goes 223.2 -> 97.8 ms (2.28x) and nothing else moves. 16 and 8 are
+    /// NOT taken: the only cell they touch is an 8-row fire at 61.2 -> 59.0 ms,
+    /// and the sweep's own control says that is noise -- a 512-row fire, which
+    /// takes NAX at every threshold and should therefore be identical in all
+    /// four columns, spans 359.2-377.3 ms. ~5% is the floor; 3.6% is under it.
+    ///
+    /// **AND YET IT STAYS AT 64.** Lowering it regresses `llama_numerics_test`
+    /// from 51/18 to 48/21, and the three new failures bisect cleanly:
+    ///
+    ///     min 48, 41  -> +1   "qwen3-moe (routed, 48 rows: the batched mixture)"
+    ///     min 40, 33, 32 -> +3, adding both "40 rows over 2 requests" cases
+    ///
+    /// The two-request pair is a TEST-HARNESS artifact and not a production
+    /// bug: serving computes `requests` from the CSR
+    /// (`qo_indptr.size() - 1`, `simple_family.cpp`), so a real multi-request
+    /// fire never reaches this predicate with `requests == 1`. The numerics test
+    /// calls the encoder without passing `requests` at all, so it defaults to 1
+    /// while the DATA is two requests -- and the NAX kernel then resolves one
+    /// page base for a tile spanning both, which is exactly the case the
+    /// `requests == 1` clause exists to exclude. Instrumented directly rather
+    /// than reasoned about: `PIE_METAL_SDPA_TRACE=1` prints
+    /// `[nax] hd=128 page=32 rows=40 requests=1 paged=1 min=40 -> NAX`.
+    ///
+    /// The 48-row single-request failure is NOT explained and is the reason
+    /// this is reverted rather than worked around. It may be a real defect at
+    /// 40-63 rows for that geometry, or another harness gap; `sdpa_paged_probe`
+    /// verifies 40 and 70 rows correct at 32 heads / gqa 8, which is not the
+    /// geometry the numerics test uses.
+    ///
+    /// The cliff is real and costs 2.28x on a 32-row fire, but serving rarely
+    /// fires 32-63 rows -- `aligned_prefill_chunks` emits a large multiple of 8
+    /// plus a remainder below 16 -- so the win is small and the risk is not.
+    int sdpa_nax_min_rows = 64;
 
     /// Lanes that share one value row of the gated-delta scan.
     ///
@@ -560,6 +603,7 @@ bool sdpa_mma();
 bool sdpa_head_share();
 bool sdpa_nax();
 bool qmm_nax();
+int sdpa_nax_min_rows();
 int gdn_scan_lanes();
 int gdn_scan_rows();
 

@@ -494,3 +494,89 @@ Both in `results-four-way.md`. The short version:
 * against three other engines measured in the same session, pie now leads
   prefill (1.10–1.24× over mlx-lm, 1.7–2.7× over vLLM-metal) and trails decode
   (mlx-lm by 1.17–1.28×).
+
+## The "fixed per-fire cost", attributed — and a cliff of my own making
+
+`decode-rows-probe` fires an exact geometry at a fixed context through the real
+engine and driver, and carries three clocks. Swept at ctx 7424 on the current
+build:
+
+| rows | fire ms | ms/row | attention kernel selected |
+|---:|---:|---:|---|
+| 1 | 17.6 | 17.6 | per-row (head-shared) |
+| 8 | 61.2 | 7.6 | per-row |
+| **32** | **223.2** | 7.0 | **MMA — NAX gate excludes it** |
+| 64 | 129.3 | 2.0 | NAX |
+| 128 | 190.6 | 1.5 | NAX |
+| 184 | 249.9 | 1.36 | NAX |
+| **189** | **868.9** | 4.6 | NAX + the mod-8 cliff |
+| 192 | 255.3 | 1.33 | NAX |
+| 512 | 367.4 | 0.72 | NAX |
+
+Guest-side trace building is 0.03 ms and the `submit` WIT call 2.2–3.0 ms
+throughout, so neither is the story; everything below is inside the await.
+
+**There is no single fixed cost — the curve is piecewise by kernel regime.**
+Within the NAX regime (64+) it is close to linear: **≈66 ms fixed plus ≈1.0
+ms/row**. A cached agentic turn firing 192 fresh rows predicts 66 + 190 = 256 ms
+against 255.3 measured.
+
+**And most of that 66 ms is physics, not overhead.** Once a fire is wide enough
+that all 128 experts are touched, the routed GEMM reads the whole expert set:
+128 × 3 × 2048 × 768 × 0.5 B = 302 MB per layer, ×48 = 14.5 GB → **~49 ms at
+296 GB/s**. That is ~3/4 of the fixed term and it is irreducible at this batch.
+It also explains the 8-row point: 8 × 8 = 64 expert-slots over 128 experts, so
+only about half the experts are touched and the fire costs *less* than the
+"fixed" cost.
+
+So of a cached turn's 403 ms TTFC: ~255 ms prefill fire (≈49 ms unavoidable MoE
+weight read, ≈17 ms other fixed, ≈190 ms proportional), ~18 ms first-token
+decode fire, ~3 ms submit, and ~127 ms outside the driver entirely — the guest
+render, the shim, the gateway and HTTP, which nothing here has attributed.
+
+### Two cliffs, one of them mine
+
+**The mod-8 cliff survives and is relatively worse than ever.** 189 rows costs
+868.9 ms against 184 rows at 249.9 — **+619 ms**, close to the ~560 ms absolute
+penalty documented on the old kernels, but now **3.5× the base cost** instead of
+2×. Making the kernels faster made this driver defect proportionally far more
+damaging. The guest still steers around it (`aligned_prefill_chunks`).
+
+**A 32-row fire costs more than a 64-row fire** — 223.2 against 129.3 — and that
+one is mine. `sdpa_nax_this_fire` required `rows >= kSdpaNaxTile`, which I wrote
+as "below one tile the matrix kernel's 32-row tile fits the fire better". That
+was an assumption, and an A/B settles it: with `PIE_METAL_SDPA_NAX=0` the two
+kernels are **identical below 64 rows (1.00×) and 2.0–2.85× apart at or above
+it**, so the gate — not the tile — was the cliff.
+
+Sweeping `PIE_METAL_SDPA_NAX_MIN_ROWS`:
+
+| rows | min=64 | min=32 | min=16 | min=8 |
+|---:|---:|---:|---:|---:|
+| 8 | 61.2 | 61.2 | 61.4 | 59.0 |
+| **32** | **223.2** | **97.8** | 97.8 | 97.9 |
+| 512 (control) | 367.4 | 371.1 | 377.3 | 359.2 |
+
+The 512-row row is the noise floor: it takes NAX at every threshold and should be
+identical, and it spans 5%. So min=32 is a real 2.28× and min=16/8 are not.
+
+**It is reverted to 64 anyway, and that is the point of this entry.** Lowering it
+regresses `llama_numerics_test` 51/18 → 48/21, bisecting cleanly: min 48/41 adds
+the 48-row single-request case, min 40 and below add both "40 rows over 2
+requests" cases.
+
+The two-request pair is a **test-harness artifact, not a production bug** —
+instrumented rather than argued. Serving computes `requests` from the CSR
+(`qo_indptr.size() - 1`), so a real multi-request fire never reaches the
+predicate claiming one request. The numerics test calls the encoder without
+passing `requests` at all, so it defaults to 1 while the data is two requests,
+and NAX then resolves one page base for a tile spanning both. `[nax]` tracing
+prints it directly: `rows=40 requests=1 paged=1 min=40 -> NAX`.
+
+**The 48-row single-request failure is NOT explained**, and that is why this is
+reverted rather than worked around. `sdpa_paged_probe` verifies 40 and 70 rows
+correct — at 32 heads / gqa 8, which is not the geometry the numerics test uses.
+
+Not worth forcing: serving rarely fires 32–63 rows, because
+`aligned_prefill_chunks` emits a large multiple of 8 plus a remainder below 16.
+
