@@ -25,6 +25,10 @@ add_rawmetal_tool(matrix_rate_probe matrix_rate_probe.cpp harness.cpp)
 # Prices the ROUTED MoE GEMM, which the dispatch trace makes the largest term
 # in a cold prefill once attention moved off the simdgroup matrix unit.
 add_rawmetal_tool(qmm_nax_probe qmm_nax_probe.cpp harness.cpp)
+# Prices moe_route_sort ALONE. In situ it is 11.6% of a decode step for a body
+# of ~150 operations, and only dispatching it by itself separates the kernel's
+# own cost from what the dispatch chain does to it.
+add_rawmetal_tool(moe_sort_probe moe_sort_probe.cpp harness.cpp)
 add_rawmetal_tool(q35contract_probe q35contract_probe.cpp)
 if(PIE_LOADER_STATICLIB)
   target_link_libraries(q35contract_probe PRIVATE ${PIE_LOADER_STATICLIB})
