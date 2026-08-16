@@ -446,3 +446,36 @@ pre-existing.
    widths keep the simdgroup kernel, which is right — a matvec-shaped GEMM has
    nothing for a matrix unit of either kind — but it means `qmm_nax` does
    nothing for decode, by design and not by omission.
+
+## Final check on the real agentic path
+
+`tools/pie_ab.sh django__django-14373 3` — three reps per arm, because one run
+cannot price anything here:
+
+| rep | wall | turns | patch | server | TTFT | decode |
+|---|---:|---:|---|---:|---:|---:|
+| all-on 1 | 29 s | 5 | 412 B ✓ | 21.1 s | 8.1 | 13.0 |
+| all-on 2 | 27 s | 5 | 412 B ✓ | 20.8 s | 8.2 | 12.7 |
+| all-on 3 | 27 s | 5 | 412 B ✓ | 20.3 s | 8.2 | 12.1 |
+| HSHARE=0 1 | 15 s | 3 | **0 B** | 7.7 s | 4.5 | 3.2 |
+| HSHARE=0 2 | 31 s | 7 | 412 B ✓ | 23.9 s | 9.3 | 14.7 |
+| HSHARE=0 3 | 64 s | 7 | 412 B ✓ | 56.3 s | 14.3 | 42.0 |
+
+Five of six produce the correct 412-byte patch, and **the empty one is in the
+CONTROL arm** — the same run-to-run nondeterminism documented in
+`results-head-sharing-decode.md`, not a regression.
+
+Against this instance's original baseline (`results-e2e-one-instance.md`), with
+its caveat that totals carry large variance and per-call rates do not:
+
+| | baseline pie | **now** | mlx-lm (2026-08-15) |
+|---|---:|---:|---:|
+| time in server | 42.6 s | **20.3–21.1 s** | 21.7 s |
+| — TTFT | 24.9 s | **8.1–8.2 s** | 9.2 s |
+| — decode | 17.7 s | **12.1–13.0 s** | 12.5 s |
+
+**TTFT on the real agentic workload is 3.05× better and now below mlx-lm's**,
+and total in-server time has gone from 1.96× mlx to roughly level. The mlx
+column is from the earlier session and is NOT a same-session measurement, so it
+is indicative here; the same-session comparisons are the fixed-prompt table and
+the 6-turn replay above, and both agree.
