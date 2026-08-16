@@ -96,11 +96,33 @@ Those zeros also settle the drift. The baseline repeated last read 17.77 ms,
 through five zeros measured against the first baseline, so 17.35 is the right
 reference for the sweep and the tail run is what moved.
 
-**Attention is still the biggest term and still the furthest from its roofline,
-and the dense matvecs are second at 1.93× off.** That group is 2.96 ms with
-1.53 ms of floor, so ~1.4 ms — **8.3% of a decode step** — is available there,
-and it is the largest untouched block left. It is also nine dispatches under one
-pipeline, so a fix reaches all of them.
+**The rooflines must be recomputed for the GROUP, and the first version of this
+table was not** — it compared the measured 2.96 ms against 1.53 ms, a floor
+derived from "dense weights 452 MB", which is q+k+v+o at 4 bits with **no
+group scales and no LM head**. The ablation removes the LM head. Counting what
+is actually removed, at 4 bits plus a bf16 scale and bias per group of 64:
+
+| | bytes | |
+|---|---:|---|
+| lm_head, K=2048 N=151936, ×1 | 175.0 MB | one dispatch per fire |
+| q ×48 | 226.5 | |
+| k ×48, v ×48 | 28.3 + 28.3 | |
+| o ×48 | 226.5 | |
+| router ×48 | 7.1 | |
+| **total** | **691.7 MB** | → **2.34 ms** at 296 GB/s |
+
+So the dense matvecs are **1.27× off their roofline with ~0.62 ms available**,
+not 1.93× and 1.4 ms. That is 3.6% of a step, and it is the LEAST attractive of
+the three, not the most.
+
+**Attention remains the target by a wide margin**: 5.05 ms against a 2.47 ms KV
+roofline is 2.05× off, with **2.58 ms — 14.9% of a decode step — available.**
+That is more than the other two blocks' headroom combined.
+
+*This correction is the same error the row labels above caused, one level up:
+a measured group compared against a roofline computed for a different set. It
+survived into a commit. Recompute the floor for exactly what the ablation
+removes, every time.*
 
 ### Why, and what to build
 
@@ -471,32 +493,32 @@ context, in the same run.
 
 ### What is left to try, in order
 
-The re-trace is done and the composition above is the sound one. The two docs
-disagreed because they group differently and one came from the dispatch trace;
-the ablation table is the one to plan from, now that its rows say what they
-actually remove.
+Headroom, measured minus each block's own roofline, on the corrected table:
 
-**1. The dense matvecs — 2.96 ms, 17.1% of a step, 1.93× off roofline.** The
-largest untouched block, and nine dispatches behind ONE pipeline
-(`affine_qmv_fast`), so a single fix reaches q, k, v, o, the router and the LM
-head together. ~1.4 ms is available, **8.3% of a decode step** — five times what
-split-K delivered. Start by splitting that 2.96 ms across the nine: they are
-very different shapes (the LM head is K=2048 × N=vocab, the others are narrow),
-and the ablation token cannot separate them, so this needs per-ordinal timing
-rather than another ablation.
+| block | measured | roofline | available | of a step |
+|---|---:|---:|---:|---:|
+| **attention** | 5.05 ms | 2.47 | **2.58 ms** | **14.9%** |
+| routed expert projections | 4.03 | 3.06 | 0.97 | 5.6% |
+| dense matvecs incl. LM head | 2.96 | 2.34 | 0.62 | 3.6% |
 
-**2. Attention, still 29.1% and still 2.04× off.** The per-key chain is load →
-dot → **`simd_sum`** → online-softmax update → rescale → accumulate. Unrolling
-the loads did not pay and split-K bought 1.06× in situ, which together point at
-the cross-lane reduction and the dependent softmax update rather than at memory.
-`sdpa_paged.metal`'s own comments name the alternative shape: **KEY_PER_LANE** —
-one key per lane walking all of D, removing the `simd_sum` per key at the cost of
-D registers per lane. A restructure, not a constant.
+**1. Attention.** More headroom than the other two combined, and the only block
+more than 2× off its floor. The per-key chain is load → dot → **`simd_sum`** →
+online-softmax update → rescale → accumulate. Unrolling the loads did not pay
+and split-K bought 1.06× in situ, which together point at the cross-lane
+reduction and the dependent softmax update rather than at memory.
+`sdpa_paged.metal`'s own comments name the alternative: **KEY_PER_LANE** — one
+key per lane walking all of D, removing the `simd_sum` per key at the cost of D
+registers per lane. A restructure, not a constant, and the last untried shape.
 
-**3. The routed FFN is 1.32× off its roofline** and is the least promising of
-the three despite being 23.2%: only ~1.0 ms exists between it and the floor.
+**2. The routed FFN**, 0.97 ms available across three projections.
 
-**And measure any candidate the way split-K had to be measured**: the isolated
+**3. The dense matvecs**, 0.62 ms. Nine dispatches behind one pipeline, so a fix
+would reach all of them at once — but there is little to reach. If it is
+attempted, split the 2.96 ms across the nine first: the LM head is K=2048 ×
+N=151936 and runs ONCE, the others are narrow and run 48×, and no ablation token
+can separate them.
+
+**Measure any candidate the way split-K had to be measured**: the isolated
 kernel ratio overstated the transferable gain by 2.8×, so price it with
 `tools/split_fire_ab.sh` before believing an end-to-end number.
 
