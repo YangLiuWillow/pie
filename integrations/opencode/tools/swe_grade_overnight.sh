@@ -103,7 +103,9 @@ if not reports:
     raise SystemExit
 for arm, (f, d) in sorted(reports.items()):
     ids = d.get("resolved_ids") or []
-    tot = d.get("total_instances") or d.get("submitted_instances") or "?"
+    # `total_instances` is the whole DATASET (500), not what was submitted --
+    # printing it made "resolved 4/500" out of a 10-instance run.
+    tot = d.get("submitted_instances") or len(d.get("submitted_ids") or []) or "?"
     kn = sum(1 for i in ids if i in known)
     un = sum(1 for i in ids if i not in known)
     print(f"\n{arm}:  resolved {len(ids)}/{tot}   (known-solvable {kn}/5, unseen {un}/5)")
