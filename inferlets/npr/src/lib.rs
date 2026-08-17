@@ -107,6 +107,14 @@ struct Input {
     /// Run the refill-join numeric oracle instead of the normal flow.
     #[serde(default)]
     selftest: bool,
+    /// Selftest hook: pad the prompt with N filler sentences so the prompt
+    /// fill exceeds a reduced `max_forward_tokens` and exercises the
+    /// runtime's chunked prefill. Cross-boot comparison of the reported
+    /// reference distribution (`ref_ids`/`ref_probs`) between a chunked and
+    /// an unchunked config is the chunk-equivalence test; within-boot TVs
+    /// cannot see prompt-KV differences (the prefix is common-mode).
+    #[serde(default)]
+    selftest_prompt_pad: usize,
     /// Test hook: cap each branch at this many generated tokens (treated
     /// as a terminal stop). Lets smoke tests with stock models — which
     /// never emit `</step>` — leave budget for the post-join stages.
@@ -1040,9 +1048,17 @@ fn tv(a: &(Vec<u32>, Vec<f32>), b: &(Vec<u32>, Vec<f32>)) -> f32 {
 ///   e_ctl    — B causally after A, no masks               (negative control)
 /// All of e_pos/e_mask/e_short/e_refill must match the reference; e_ctl
 /// must not.
-async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
+async fn selftest(model: &Model, sh: &Shared, pad: usize) -> Result<String> {
     let mut base = Context::new(model)?;
-    base.user("Solve: what is the domain of f(x) = 1/log(2 - log(x - 2))? Reason briefly.");
+    let mut prompt =
+        String::from("Solve: what is the domain of f(x) = 1/log(2 - log(x - 2))? Reason briefly.");
+    for i in 0..pad {
+        prompt.push_str(&format!(
+            " Contextual note {i}: the composition of logarithms constrains the domain \
+             through each layer, and every constraint must hold simultaneously."
+        ));
+    }
+    base.user(&prompt);
     base.flush().await?;
     base.cue();
     let pend = base.take_buffer();
@@ -1206,6 +1222,9 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
         && tvs[9].1 > 0.05;
     Ok(inferlet::serde_json::json!({
         "selftest_pass": pass,
+        "prompt_pad": pad,
+        "ref_ids": e_ref.0,
+        "ref_probs": e_ref.1,
         "tv": tvs.iter().map(|(n, v)| (n.to_string(), *v)).collect::<HashMap<_, _>>(),
     })
     .to_string())
@@ -1255,7 +1274,7 @@ async fn main(input: Input) -> Result<String> {
     let sh = Rc::new(Shared::new(&model, &input)?);
 
     if input.selftest {
-        return selftest(&model, &sh).await;
+        return selftest(&model, &sh, input.selftest_prompt_pad).await;
     }
 
     // Prompt per NPR `evals/evaluate.py`: user turn = question + "\n\n" +
