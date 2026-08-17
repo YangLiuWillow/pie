@@ -40,11 +40,22 @@
 //! holds even for the narrow tail chunks -- while eight of the nine produce
 //! distinct results. Kernel choice is not the variable.
 //!
-//! The mechanism is REDUCTION ORDER. For a token at position `p` in chunk
-//! `[b,e)`, attention reads keys below `b` from the paged cache and keys in
-//! `[b,p]` from this fire's own freshly written KV. Moving the boundary moves
-//! that split, the online softmax accumulates in a different order, and float
-//! addition is not associative. Same code, different partition, different bits.
+//! The mechanism is REDUCTION ORDER — but NOT, as first written here, a split
+//! between "cached" and "freshly written" KV. **pie has no such split.**
+//! `decode_step.hpp` emits `KvAppend` BEFORE `Sdpa` in the one ordered DAG both
+//! prefill and decode use, so every fire writes its KV to pages first and then
+//! attends over pages uniformly. That first explanation was wrong and is
+//! recorded here rather than deleted, because a later reader will otherwise
+//! re-derive it: it is the intuitive story and it does not hold.
+//!
+//! What actually varies with chunk width is the SHAPE OF THE FIRE, and the
+//! attention kernel's accumulation order is a function of that shape: the row
+//! count sets how queries are tiled, and each fire's own `kv_len` sets the key
+//! extent it walks. A 2048-row fire and a 32-row fire reduce the same keys in
+//! different groupings, and float addition is not associative. The difference
+//! then PROPAGATES: chunk i's hidden states are chunk i's KV, which every later
+//! chunk reads, so a perturbation in the first fire is carried forward through
+//! the whole prefill rather than staying local.
 //!
 //! That is stronger than the hypothesis it replaces: ANY chunking perturbs
 //! prefill numerics on ANY backend, whatever kernel runs. It explains the CUDA
