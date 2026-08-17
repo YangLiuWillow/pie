@@ -634,6 +634,53 @@ found −19% at 5,840 tokens. Those cannot both describe the same effect. The
 gated variant sidesteps the question; whoever wants the extra 1.20× has to
 settle it first.
 
+### RECONCILED (2026-08-16): that 1.003× measured a DIFFERENT KERNEL
+
+The table above prices the unroll at 1.003× at ctx 16384 and concludes it is
+"worth approximately nothing end to end". The server, measured interleaved on
+the same day as this note, says **1.13× at ctx 16090 and 0.85× at 28390**.
+
+Both numbers are right. The probe was not measuring the unrolled kernel.
+
+    decode_dispatch_mb.hpp:604   if (rows != kSdpaSplitMaxRows ...) return false;
+    kSdpaSplitMaxRows = 1
+
+A **rows=1 fire is taken by the split-K kernel**, and `_u4` is a variant of the
+**head-sharing** kernel. So both arms of that A/B ran the same split kernel,
+which is exactly why they agreed to three decimals. The trace says it in one
+line:
+
+    [split] hd=128 page=32 nq=32 nkv=4 rows=1 requests=1 paged=1 on=1 -> SPLIT
+
+`sdpa_split_this_fire`'s own comment predicted this trap — *"a throughput number
+cannot tell 'the fast path is no faster' from 'the fast path never ran'. Ask the
+trace before believing an A/B that shows nothing"* — and the answer was one env
+var away for weeks.
+
+**The server reaches the unrolled kernel because it SPECULATES.**
+`inferlets/opencode-session/src/engine.rs:558` gates drafting on greedy + no
+recurrent fold, and a verify fire embeds `DRAFT_K + 1` rows. `rows > 1` fails the
+split gate, so those fires run head-sharing — where the unroll lives.
+
+#### What this invalidates, and what it does not
+
+* **The unroll only ever affected speculative fires.** Its lower gate is context;
+  it needs an upper one too, and **neither bound can be chosen from a rows=1
+  probe.**
+* **`decode-rows-probe` cannot currently reach that path at all.** `SHORT` and
+  `LONG` are both hardcoded 7424 — below the unroll's own 8192 gate. The 16384
+  in the table above came from a different value of `LONG`.
+* **The composition table is a rows=1 SPLIT-kernel fire.** Attention at 36.3%
+  and the rest are shares of that fire. The server spends part of its decode on
+  multi-row head-sharing fires, which this probe never times.
+* **Not affected:** the device-handle cache (host-side, kernel-independent) and
+  the pie-vs-mlx interleaved comparison (server measurements throughout).
+
+**The rule this adds to §2a:** an A/B on a kernel selected by a runtime GATE
+must prove the gate chose the kernel under test. A null result from an
+unexercised path is indistinguishable from a null result from a useless change,
+and this project has now produced both.
+
 ### What the instrument fix unblocked
 
 `split_run` allocated ~68 MB of K and V per timing and freed nothing, and
