@@ -1005,7 +1005,11 @@ invalidated) a real experiment:
 3. **Report the repeat-run noise floor next to every numeric-equivalence
    claim** (selftest's `noise_floor` arm): an arm near the floor differs by
    nondeterminism; above it, systematically.
-4. **Write the discriminating prediction down before the run** — otherwise
+4. **Write the discriminating prediction down before the run — and let
+   the holder of a hypothesis run the discriminating test on it** (each
+   wrong mechanism this week was retired by its own author's trace, not by
+   debate; that habit transfers to solo work where "have two peers" does
+   not). — otherwise
    a null is a shrug, not evidence. And keep the control that would stay
    silent under the bug you're hunting: its silence is the trap.
 5. **"Same prompt, same engine" is not "same arithmetic."** (Revised
@@ -1019,10 +1023,22 @@ invalidated) a real experiment:
    partition → bit-identical; different partition → different bits.* Our
    runtime chunker's bitwise equality is consistent, not contradictory —
    our CUDA path writes KV first and attends uniformly over pages, so the
-   partition doesn't move the accumulation. Our rows=1-vs-rows=N offset
-   (0.028, reproduced to 9 decimals across same-arch cards) is plausibly
-   the same class via query-batch tiling, i.e. **expected deterministic
-   numerics, not a defect**. Corollary stands: everything measured across
+   partition doesn't move the accumulation — which upgrades the result
+   from "happens to be exact" to "cannot exhibit the effect by
+   construction" (falsifiable: any path attending its own fresh-fire KV
+   should show boundary effects; any path that attends uniformly over
+   pages cannot). Sharper form of the law, after the second collapse
+   (`even_spans` divides evenly, so only `k = ceil(n/cap)` survives):
+   **same k → identical partition → identical bits**; production exposure
+   is crossing a k boundary, a small discrete set, not arbitrary drift.
+   Our rows=1-vs-rows=N offset (0.028, reproduced to 9 decimals across
+   same-arch cards) is HYPOTHESIZED to be the same class via query-batch
+   tiling — but that is an untraced, mechanism-shaped story, the exact
+   species that died twice this week. Pre-registered discriminating test
+   (CUDA, post-sweep): vary the refill's fire size (REFILL_CHUNK) —
+   shape-dependent reduction order predicts the offset MOVES with fire
+   size; if it is invariant, the story is wrong and something else is the
+   parent. Until run, the offset is "deterministic, unexplained". Corollary stands: everything measured across
    CPU, CUDA (warm), and Metal is bit-deterministic; "nondeterminism"
    enters a writeup only to be ruled out. The selection-pinning knob's
    remaining justification narrows to the per-shape first-sight transient
@@ -1030,7 +1046,8 @@ invalidated) a real experiment:
 6. **"0/0 passed" reads as green.** A fully-skipped suite prints a
    success-shaped line; assert that the expected cases actually ran (a
    count, not an absence of failures).
-7. **Reading a line is not propagating its consequence.** The parallel
+7. **Reading a line is not propagating its consequence — even a line you
+   quoted while designing the experiment.** The parallel
    session quoted the very clamp (`cap.min(max_embed_length())`) that made
    their "one-shot" baseline secretly chunked — and still designed the
    baseline assuming the opposite. Code you have read still has to be
