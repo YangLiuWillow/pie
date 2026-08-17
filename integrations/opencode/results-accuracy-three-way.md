@@ -115,3 +115,45 @@ integrations/opencode/tools/transcript_health.py DIR [DIR2]
 Grading needs `export PATH=$HOME/.local/lima/bin:$PATH` — colima bundles its own
 lima there, and without it `colima status` reports `lima not found` and sends you
 to a package manager that is not installed, while the VM is already running.
+
+## Loop rate, measured — and a discrepancy that is not explained
+
+Twenty fresh runs on the shipped configuration, five reps each, every run
+restarting the server exactly as the graded run did:
+
+| instance | runs | looped | rate | non-empty patches |
+|---|---:|---:|---:|---:|
+| 11099 | 5 | 0 | 0% | 3 |
+| 12276 | 5 | 1 | **20%** | 2 |
+| 13158 | 5 | 0 | 0% | 0 |
+| **14373** *(control)* | 5 | **0** | **0%** | 4 |
+| **pooled** | **20** | **1** | **5%** | |
+
+The control behaves: 14373 never loops and patches 4/5, so the metric is not
+firing on everything.
+
+**Tonight's graded run had 4 of 10 instances looping — 40%.** Against a 5%
+rate, the chance of 4-or-more loops in ten instances is **0.001**. These two
+measurements are not samples from the same distribution, and I cannot say why.
+
+What differs between them, none of it tested:
+
+* the graded arm ran ten instances through ONE `run_swebench.py` invocation
+  sharing one workdir; the rate runs each got a fresh workdir;
+* the graded arm ran first, after a day of GPU benchmarking; the rate runs
+  followed two hours of SWE-bench;
+* ordering — the graded arm interleaved ten different instances, the rate runs
+  repeated one instance five times.
+
+Until that is resolved, **the loop rate is not a stable property of the engine**,
+and the honest use of these numbers is narrow:
+
+1. A single agentic run's loop count says nothing. 12276 loops 20% of the time;
+   the graded run caught one of those and I read it as a regression.
+2. Failure and degeneration are largely independent. 13158 produced zero patches
+   in five runs and never looped once; 12276 produced no patch in three runs of
+   which only one looped. "Most failures are loops" was one run's coincidence.
+3. Something makes loops CLUSTER within a run. That is worth chasing, because if
+   it is the shared workdir it is a harness defect contaminating the graded
+   numbers, and if it is machine state it is a confound in every agentic
+   measurement this repo takes.
