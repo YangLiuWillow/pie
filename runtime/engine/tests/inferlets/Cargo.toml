@@ -18,6 +18,7 @@ members = [
     "mirostat",
     "entropycheck",
     "logprob-determinism",
+    "chunk-width-determinism",
     "tempgen",
     "multisamp",
     "isolatedtopp",

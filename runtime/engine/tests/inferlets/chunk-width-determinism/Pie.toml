@@ -1,0 +1,4 @@
+[package]
+name = "chunk-width-determinism"
+version = "0.1.0"
+description = "Does prefill chunk width change the logits? Shape-gated kernel selection probe"
