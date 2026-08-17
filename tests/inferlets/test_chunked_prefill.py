@@ -373,20 +373,30 @@ async def test_chunking_is_exact_in_logprobs(client, args):
         width= 999  ~ 2 chunks  tokens=same  max|dlp|=0.00000000
 
     Tokens identical at every width, so `test_chunking_is_exact` above passes
-    throughout. Two chunks is exact; more than two is not; and the magnitude is
-    not monotonic in chunk count. A wider sweep found no rule at all -- at an
-    8409-token prompt, nine chunks is bit-identical while ten differs, and a
-    516-token chunk is exact while an 841-token chunk is not -- which rules out
-    both a chunk-size threshold and a chunk-count one.
+    throughout.
 
-    Suspected mechanism: shape-gated kernel selection. pie's output is a
-    function of which kernels get selected, selection is gated on runtime
-    conditions including row count, and chunking changes rows per forward. (The
-    pie-opencode session independently found the `_u4` decode unroll variant
-    producing different text from the non-unrolled kernel on the same weights
-    and prompt.) A selection-pinning knob would make this decidable: pin it, and
-    the deltas either vanish -- proving the mechanism -- or persist, sending us
-    elsewhere.
+    READ THE BASELINE CAREFULLY. `prefill_chunk` absent does NOT mean one fire:
+    `prefill_chunks` clamps to the driver capacity,
+    `cap.unwrap_or(u32::MAX).min(max_embed_length())`. So the reference arm is
+    the driver's default partition, and any width above that capacity collapses
+    onto the identical partition -- which is why width 999 reads exactly
+    0.000000 here rather than proving anything about equivalence. This test
+    therefore compares PARTITION AGAINST PARTITION. To compare against a true
+    one-shot fire, the prompt must fit inside `max_embed_length()`.
+
+    Mechanism (established by the pie-opencode session on Metal, and it refuted
+    the kernel-selection hypothesis this docstring used to carry -- a kernel
+    trace shows identical selection across nine widths with eight distinct
+    results): for a token at position p in chunk [b, e), attention reads keys
+    below b from the paged cache and keys in [b, p] from that fire's own freshly
+    written KV. Moving the boundary moves that split, the online softmax
+    accumulates in a different order, and float addition is not associative.
+
+    So the difference is expected numerical behaviour of chunked attention over
+    a paged cache, not a correctness bug, and removing it would mean forcing a
+    fixed reduction order across chunk boundaries at a cost. The test earns its
+    place anyway: the value moves, that value is the denominator of the
+    off-policy correction, and nothing else in this suite can see it.
 
     See rl-post-training-knowledge/pod-kit/parity/ for the measurements.
     """
@@ -441,10 +451,14 @@ async def test_chunking_is_exact_in_logprobs(client, args):
         "and this one is the only thing that sees it. That logprob is the "
         "denominator of the off-policy correction.\n"
         "Do NOT fix this by loosening the tolerance: warm repeats of a fixed "
-        "configuration are bit-identical, so the floor really is zero and the "
-        "difference really is the chunking. The suspected mechanism is "
-        "shape-gated kernel selection (see the pie-opencode session's _u4 "
-        "finding); a selection-pinning knob would make this decidable."
+        "partition are bit-identical, so the floor really is zero and the "
+        "difference really is the partition. The cause is reduction order -- "
+        "moving a chunk boundary moves the split between keys read from the "
+        "paged cache and keys read from the fire's own fresh KV, and float "
+        "addition is not associative. Note the reference arm is the driver's "
+        "DEFAULT partition, not a one-shot fire (prefill_chunks clamps to "
+        "max_embed_length), so widths above that capacity will read 0.000000 "
+        "by identity rather than by equivalence."
     )
     widths = "/".join(str(w) for w in _WIDTHS)
     print(f"    logprobs identical at chunk widths {widths} vs one-shot "
