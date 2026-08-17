@@ -58,8 +58,78 @@ use std::time::Instant;
 /// The two contexts. Far enough apart that the slope between them is not noise:
 /// at ~3.2 ms per 1k, 14k of separation is ~45 ms of signal against a ~1 ms
 /// spread between repeats.
+///
+/// DEFAULTS ONLY — override per run with the inferlet argument, e.g.
+/// `-- short=7424,long=28160,rows=1:5:8`. They are constants no longer because
+/// two questions this probe is asked cannot be answered at a fixed 7424:
+///
+///  * `sdpa_paged_decode_hshare`'s unroll is gated INSIDE the kernel on
+///    `(q_pos + 1) >= 8192`, so at 7424 both arms of an unroll A/B run the same
+///    code. With SHORT and LONG both 7424 — which is what they were — the probe
+///    could not reach that path at any row count, and an A/B on it returned
+///    1.003x and read as "the unroll is worth nothing".
+///  * the server measures that same switch at 1.13x at 16k and 0.85x at 28k, so
+///    the crossover is somewhere between, and finding it needs a context sweep
+///    this probe had no way to express.
 const SHORT: u32 = 7424;
 const LONG: u32 = 7424;
+
+/// The first positional argument, out of the JSON envelope the host delivers.
+///
+/// `pie run ... -- short=7424,long=28160` arrives as
+/// `{"_positional":["short=7424,long=28160"]}`, NOT as the bare string. This
+/// matters beyond the parsing: `inferlets/generate` does
+/// `input.trim().parse().unwrap_or(DEFAULT_MAX_TOKENS)` on the same envelope,
+/// so its argument never parses and it silently generates the default count —
+/// which is why asking it for 24 tokens yields 5. Read the envelope.
+///
+/// Hand-scanned rather than taking a serde_json dependency for one field. Only
+/// valid because every value this probe accepts is `[0-9a-z=,:]` — no escapes,
+/// no embedded quotes. A value that could contain `"` needs a real parser.
+fn positional(input: &str) -> &str {
+    const KEY: &str = "\"_positional\":[\"";
+    match input.find(KEY) {
+        Some(at) => {
+            let rest = &input[at + KEY.len()..];
+            rest.find('"').map_or(rest, |end| &rest[..end])
+        }
+        // An envelope with no positional entry means no arguments, which is the
+        // defaults. Anything that is not an envelope is taken literally, so the
+        // probe stays callable with a bare string.
+        None if input.trim_start().starts_with('{') => "",
+        None => input.trim(),
+    }
+}
+
+/// `short=`, `long=` and `rows=` out of the inferlet argument, defaults above.
+///
+/// Unparseable input FAILS rather than falling back: a typo'd `rows=1:5:8`
+/// silently measuring the default nine row counts at the default context is the
+/// same class of bug as an A/B whose two arms are the same binary — it produces
+/// a full, plausible table that answers a different question than the one asked.
+fn config(input: &str) -> Result<(u32, u32, Vec<u32>)> {
+    let (mut short, mut long, mut rows) = (SHORT, LONG, ROWS.to_vec());
+    for field in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("bad probe argument {field:?}: want key=value"))?;
+        match key {
+            "short" => short = value.parse().map_err(|_| format!("bad short {value:?}"))?,
+            "long" => long = value.parse().map_err(|_| format!("bad long {value:?}"))?,
+            "rows" => {
+                rows = value
+                    .split(':')
+                    .map(|r| r.parse::<u32>().map_err(|_| format!("bad row {r:?}")))
+                    .collect::<std::result::Result<Vec<u32>, String>>()?;
+                if rows.is_empty() {
+                    return Err("rows= is empty".to_string());
+                }
+            }
+            _ => return Err(format!("unknown probe argument {key:?}")),
+        }
+    }
+    Ok((short, long, rows))
+}
 
 /// Row counts. 1 is the baseline decode step; 4 is `draft::DRAFT_K` plus the
 /// always-real row, which is the shape speculation actually fires; 8 is there to
@@ -266,8 +336,15 @@ fn median(v: &[u64]) -> f64 {
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let page = kv_page_size();
-    let ctx_long = LONG;
-    let ctx_short = (SHORT / page) * page;
+    let (short_arg, long_arg, row_set) = config(positional(&_input))?;
+    let ctx_long = (long_arg / page) * page;
+    let ctx_short = (short_arg / page) * page;
+    if ctx_short > ctx_long {
+        return Err(format!(
+            "short {ctx_short} exceeds long {ctx_long}: the slope solve below \
+             divides by (long - short)"
+        ));
+    }
 
     // Enough tokens to fill the long context, plus room for the widest fire.
     let text = notes(0);
@@ -302,7 +379,7 @@ async fn main(_input: String) -> Result<String> {
     // (rows, context) -> median us, and the first-fire cost of that shape.
     let mut table: Vec<(u32, u32, f64, u64)> = Vec::new();
     for &ctx in &[ctx_short, ctx_long] {
-        for &rows in &ROWS {
+        for &rows in &row_set {
             let mut samples = Vec::new();
             for i in 0..FIRES {
                 let us = timed_fire(&ws, &pipe, toks[0], ctx, rows, page, &pool_ids).await?;
@@ -347,7 +424,7 @@ async fn main(_input: String) -> Result<String> {
     let span_k = (ctx_long - ctx_short) as f64 / 1000.0;
     let base_slope = (at(1, ctx_long) - at(1, ctx_short)) / span_k;
     let mut lines = Vec::new();
-    for &rows in &ROWS {
+    for &rows in &row_set {
         let s = (at(rows, ctx_long) - at(rows, ctx_short)) / span_k;
         let fixed = at(rows, ctx_short) - s * (ctx_short as f64 / 1000.0);
         lines.push(format!(
