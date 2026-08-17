@@ -109,6 +109,25 @@ arm() {  # $1 tag, $2 upstream, $3 model string, $4 restart cmd
     [ "$calls" -gt 0 ] || log "WARNING: $tag recorded NO calls -- latency unavailable"
     # The prompt-shape guarantee, checked rather than assumed.
     [ "$dropped" = "0" ] || log "WARNING: $tag dropped enable_thinking on $dropped calls -- NOT COMPARABLE"
+    # An arm can finish every instance "ok", fast, and have written NOTHING.
+    # That is exactly what strategy B did here: 24/24 empty patches in 12
+    # minutes, which reads as a fast arm in every timing column. Patch bytes are
+    # not accuracy -- only the Docker grade is -- but ALL-empty is not a low
+    # score, it is a broken arm, and it is worth saying before the grade.
+    local nonempty=0
+    [ -f "$OUT/preds-$tag.jsonl" ] && nonempty=$(python3 -c "
+import json,sys
+n=0
+for l in open('$OUT/preds-$tag.jsonl'):
+    try: n += 1 if (json.loads(l).get('model_patch') or '').strip() else 0
+    except Exception: pass
+print(n)" 2>/dev/null || echo 0)
+    log "$tag non-empty patches: $nonempty/$n"
+    if [ "$n" -gt 0 ] && [ "$nonempty" = "0" ]; then
+        log "WARNING: $tag wrote NO non-empty patch on any instance -- the arm is"
+        log "         broken, not merely inaccurate. Check $OUT/wd-$tag/*.opencode.log"
+        log "         for 'The server could not complete this turn.'"
+    fi
 }
 
 # Wait for the CONDITION, not a duration: `sleep 8` killed an earlier run at
@@ -116,10 +135,48 @@ arm() {  # $1 tag, $2 upstream, $3 model string, $4 restart cmd
 # model's pages well before it RECLAIMS them.
 MEMWAIT="$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1"
 
+# ── STRATEGY A, and it is not the strategy that won the 30B run ──────────
+#
+# The first attempt at this run used strategy B -- the long-lived
+# `opencode-session` inferlet that holds the conversation's KV across turns,
+# which is what produced 42 tok/s at 12.3 calls/instance on Qwen3-Coder-30B.
+# It returned 24 EMPTY PATCHES out of 24 instances.
+#
+# Every instance showed the same alternation. A turn generates and retains its
+# KV at length N; the next turn tries to resume from N and the driver refuses:
+#
+#     prefill take @493: g0 take: channel is poisoned: driver published
+#     poison epoch 1
+#
+# The inferlet degrades that turn to `finish_reason:"length"` with zero tokens
+# and the text "The server could not complete this turn.", opencode gives up,
+# and the instance ends with nothing written. It is not size-dependent -- it
+# reproduces at 500 prompt tokens as readily as at 38k -- and it has nothing to
+# do with tools: a plain four-turn chat with no tool schema fails identically
+# on every resume.
+#
+# Controlled against the non-hybrid checkpoint, same strategy, same probe:
+#
+#     Qwen3-Coder-30B  turns 1-4 all OK, cached=13 -> 28 -> 43 (reuse working)
+#     Qwen3.6-35B      every resume poisoned, cached=0 throughout
+#
+# So it is the HYBRID family's session-resume path, not the model size, not the
+# renderer, and not the tool dialect.
+#
+# Strategy A serves one `chat-completions` inferlet PER REQUEST and lets the KV
+# die with it, so there is no resume to poison. Verified: four-turn chat and a
+# two-turn tool loop both clean.
+#
+# THE COST, which belongs in the report and not in a footnote: strategy A has
+# no cross-turn prefix reuse, while vLLM runs with --enable-prefix-caching and
+# llama.cpp keeps its slot cache. pie is therefore paying full prefill on every
+# turn of an agentic loop that re-sends the whole transcript, and the two
+# engines it is being compared against are not. That handicap lands squarely on
+# TTFT and on throughput.
 PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 10; \
 $MEMWAIT; \
 PIE_PYTHON=$PIEPY $REPO/integrations/opencode/tools/boot_pie.sh s36 \
-  PIE_STRATEGY=b PIE_MODEL=$PIEMODEL PIE_MAX_MODEL_LEN=65536 \
+  PIE_STRATEGY=a PIE_MODEL=$PIEMODEL PIE_MAX_MODEL_LEN=65536 \
   PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY"
 VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 10; \
 $MEMWAIT; \
