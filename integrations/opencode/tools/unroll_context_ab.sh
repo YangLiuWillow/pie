@@ -107,30 +107,25 @@ probe() {  # $1 label -> json; FATAL if it produced nothing
 
 run_pie() {  # $1 label
     stop_all; require_quiet_gpu 20 || return 1; check_roof "$1" || return 1
-    echo "   ── $1 (pie)"
+    echo "   ── $1 (pie, UNROLL=1)"
     PIE_PYTHON=$PIEPY tools/boot_pie.sh "$1" \
         PIE_STRATEGY=b PIE_MODEL=qwen3-coder-30b PIE_MAX_MODEL_LEN=65536 \
         PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY \
-        PIE_METAL_SDPA_HSHARE=1 PIE_METAL_SDPA_NAX=1 PIE_METAL_QMM_NAX=1 \
+        PIE_METAL_SDPA_HSHARE=1 PIE_METAL_SDPA_NAX=1 PIE_METAL_QMM_NAX=1 PIE_METAL_SDPA_UNROLL=1 \
         > "$OUT/boot-$1.log" 2>&1 || { echo "   [$1] BOOT FAILED"; return 1; }
     probe "$1" http://127.0.0.1:8080 qwen3-coder-30b
 }
 
-run_mlx() {  # $1 label
+run_mlx() {  # $1 label -- the unroll-OFF pie arm (name kept: same slot)
     stop_all; require_quiet_gpu 20 || return 1; check_roof "$1" || return 1
-    echo "   ── $1 (mlx-lm)"
-    nohup /tmp/venv-mlxlm/bin/mlx_lm.server --model "$MLXMODEL" --port 8001 \
-        --host 127.0.0.1 > "$OUT/boot-$1.log" 2>&1 &
-    local ok=0
-    for _ in $(seq 1 60); do
-        curl -s -m 3 -o /dev/null http://127.0.0.1:8001/v1/models && { ok=1; break; }
-        sleep 3
-    done
-    # "Something answered" is not "the thing I meant is alive" -- but here the
-    # server is freshly spawned and nothing else binds 8001, and a probe that
-    # returns no rate is fatal below regardless.
-    [ "$ok" = 1 ] || { echo "   [$1] mlx never came up"; return 1; }
-    probe "$1" http://127.0.0.1:8001 "$MLXMODEL"
+    echo "   ── $1 (pie, UNROLL=0)"
+    PIE_PYTHON=$PIEPY tools/boot_pie.sh "$1" \
+        PIE_STRATEGY=b PIE_MODEL=qwen3-coder-30b PIE_MAX_MODEL_LEN=65536 \
+        PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY \
+        PIE_METAL_SDPA_HSHARE=1 PIE_METAL_SDPA_NAX=1 PIE_METAL_QMM_NAX=1 \
+        PIE_METAL_SDPA_UNROLL=0 \
+        > "$OUT/boot-$1.log" 2>&1 || { echo "   [$1] BOOT FAILED"; return 1; }
+    probe "$1" http://127.0.0.1:8080 qwen3-coder-30b
 }
 
 echo "=============================================================="
@@ -163,8 +158,8 @@ def load(engine):
     return by
 pie, mlx = load("pie"), load("mlx")
 
-print(f"\n{'prompt':>7}  {'pie samples':>22} {'median':>7} {'spread':>7}"
-      f"   {'mlx samples':>22} {'median':>7} {'spread':>7}   {'pie/mlx':>8}")
+print(f"\n{'prompt':>7}  {'unroll=1':>22} {'median':>7} {'spread':>7}"
+      f"   {'unroll=0':>22} {'median':>7} {'spread':>7}   {'pie/mlx':>8}")
 verdicts = []
 for p in sorted(set(pie) | set(mlx)):
     a, b = pie.get(p, []), mlx.get(p, [])
@@ -177,8 +172,8 @@ for p in sorted(set(pie) | set(mlx)):
     # The honest test: is the gap bigger than the noise that produced it? The
     # worst case for pie against the best case for mlx, and vice versa.
     lo, hi = min(a)/max(b), max(a)/min(b)
-    if lo > 1:   v = "pie faster"
-    elif hi < 1: v = "mlx faster"
+    if lo > 1:   v = "unroll HELPS"
+    elif hi < 1: v = "unroll HURTS"
     else:        v = "UNDECIDED"
     verdicts.append((p, v))
     print(f"{p:>7}  {str([round(x,1) for x in a]):>22} {ma:>7.1f} {sa:>6.1f}%"
