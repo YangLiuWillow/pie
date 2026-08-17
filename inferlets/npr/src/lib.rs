@@ -1073,6 +1073,12 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
     println!("[npr selftest] p_fork={p_fork} n_a={} n_a_short={} n_b={nb}", toks_a.len(), toks_a_short.len());
     println!("[npr selftest] e_ref...");
     let e_ref = fill_and_probe(&base, None, &toks_b, None, None).await?;
+    println!("[npr selftest] e_ref2 (noise floor)...");
+    // The identical computation a second time: TV(ref, ref2) is the pure
+    // run-to-run kernel-noise floor. Every other arm's TV should be read
+    // against it — an arm near the floor differs by noise; an arm well
+    // above it differs systematically (layout, masks, or a bug).
+    let e_ref2 = fill_and_probe(&base, None, &toks_b, None, None).await?;
     println!("[npr selftest] e_pos...");
     let e_pos = fill_and_probe(&base, None, &toks_b, Some(natural_pos.clone()), None).await?;
     println!("[npr selftest] e_mask...");
@@ -1145,6 +1151,7 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
     let e_ctl = fill_and_probe(&base, Some(&toks_a), &toks_b, None, None).await?;
 
     let tvs = [
+        ("noise_floor", tv(&e_ref, &e_ref2)),
         ("positions", tv(&e_ref, &e_pos)),
         ("mask", tv(&e_ref, &e_mask)),
         ("mask_4run", tv(&e_ref, &e_4run)),
@@ -1168,9 +1175,9 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
         &e_ctl.0[..3.min(e_ctl.0.len())],
     );
 
-    let pass = tvs[..7].iter().all(|(_, v)| *v < 0.05)
-        && tvs[7].1 > 0.05
-        && tvs[8].1 > 0.05;
+    let pass = tvs[..8].iter().all(|(_, v)| *v < 0.05)
+        && tvs[8].1 > 0.05
+        && tvs[9].1 > 0.05;
     Ok(inferlet::serde_json::json!({
         "selftest_pass": pass,
         "tv": tvs.iter().map(|(n, v)| (n.to_string(), *v)).collect::<HashMap<_, _>>(),
