@@ -2,31 +2,38 @@
 //!
 //! ## Why this exists
 //!
-//! A sibling investigation on CUDA (H200, Qwen3-1.7B, greedy) found prefill
-//! exactly reproducible and decode not: across 16 token-identical runs, **0 of
-//! 32 tokens had the same logprob twice**, mean per-token spread 0.024 nats.
+//! **RETRACTED PREMISE, kept because it is why this file exists.** This probe
+//! was built to answer a sibling CUDA report of decode nondeterminism — "0 of 32
+//! tokens had the same logprob twice across 16 runs, mean spread 0.024 nats".
+//! That report has since been **withdrawn by its author**: on a control run only
+//! the FIRST request deviated and runs 1-9 were bit-identical, so "identical
+//! across all runs" was failing on a single outlier, and the quoted spread was a
+//! max-minus-min that one outlier sets. CUDA is bit-deterministic too.
 //!
-//! Metal was checked against that and came back clean — nine 200-token greedy
-//! generations, three server boots, two binaries, byte-identical text. But text
-//! identity is a COARSER claim than logprob identity: an argmax is stable under
-//! any perturbation smaller than the gap to the runner-up, so drifting values
-//! can hide entirely behind identical tokens. That check could not have seen the
-//! CUDA finding even if Metal had it.
+//! So this file must NOT be read as Metal-clean-where-CUDA-is-dirty. There is no
+//! contrast. What it is: the first value-layer determinism measurement anyone has
+//! taken on Metal, which was previously impossible here rather than merely
+//! undone — `inferlets/openai-serving` hardcodes `"logprobs": null` in six
+//! places, so no endpoint on this branch could observe a logprob at all.
 //!
-//! Nothing on this branch could: `inferlets/openai-serving` hardcodes
-//! `"logprobs": null` in six places, so the value layer is not merely untested
-//! through the server — it is unobservable. `entropycheck` reads logits but
-//! fires exactly one prefill, which is the arm that is deterministic on CUDA
-//! too, so repeating it would be a clean number answering nothing.
+//! The reason a text check could not substitute: text identity is a COARSER
+//! claim than logprob identity. An argmax is stable under any perturbation
+//! smaller than the gap to the runner-up, so drifting values hide entirely
+//! behind identical tokens. Nine byte-identical 200-token generations across
+//! three boots and two binaries said nothing about the value layer.
+//!
+//! `entropycheck` was the nearest existing instrument and could not stand in
+//! either: it reads logits but fires exactly ONE prefill, so it says nothing
+//! about a decode loop at all.
 //!
 //! ## What this measures
 //!
 //! A greedy decode loop that publishes, per generated token:
 //!
 //!   * the token id — the argmax, i.e. what a text diff would see;
-//!   * **the chosen token's logprob** — `reduce_max(log_softmax(logits))`, which
-//!     is the same quantity `characterize_noise.py` compares (its reference
-//!     number is 0/32 identical on H200);
+//!   * **the chosen token's logprob** — `reduce_max(log_softmax(logits))`, the
+//!     same quantity `characterize_noise.py` compares, so the two are directly
+//!     comparable rather than merely adjacent;
 //!   * **the whole-vocab entropy** — `entropy(softmax(logits))`, a sum over all
 //!     151936 lanes and therefore sensitive to drift anywhere in the
 //!     distribution, not only near the top.
@@ -44,7 +51,13 @@
 //!
 //! One `[lpdet]` line per step. Run it N times and compare the lines: identical
 //! bits across runs means the value layer is deterministic; identical token ids
-//! with differing bits is exactly the CUDA finding, reproduced on Metal.
+//! with DIFFERING bits is the interesting failure — drift that a text diff
+//! cannot see.
+//!
+//! Compare runs that are each a process's FIRST request, which is what separate
+//! invocations give you. The retracted CUDA report turned out to be a
+//! first-request-at-a-new-shape transient, so a harness that discards the first
+//! sample would have hidden the very thing it was hunting.
 
 use inferlet::Result;
 use inferlet::ptir::attention::prelude::*;
@@ -138,9 +151,10 @@ async fn main(_input: String) -> Result<String> {
         *l0.first().ok_or("prefill logprob empty")?,
         *h0.first().ok_or("prefill entropy empty")?,
     );
-    // Step 0 is the PREFILL's own value. On CUDA this arm is deterministic and
-    // decode is not, so keeping the two distinguishable in the output is the
-    // point of labelling it separately.
+    // Step 0 is the PREFILL's own value, labelled `phase=` so it stays
+    // distinguishable from the decode steps: the two run different kernels
+    // (prefill attention against the paged decode path), so a difference that
+    // appears in one and not the other localizes itself.
     println!(
         "[lpdet] step=0 phase=prefill tok={t0} lp_bits={:08x} h_bits={:08x}",
         l0.to_bits(),

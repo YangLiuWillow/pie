@@ -8,9 +8,14 @@
 # layer all in it, at a length where a small perturbation has many chances to
 # reach a narrow top-2 gap and flip a token.
 #
-# Length is the amplifier. A sibling CUDA finding puts decode divergence at "the
-# first position where the top-2 gap is narrow", so 1000 tokens is roughly five
-# times the exposure of the 200-token generations checked so far.
+# Length is the amplifier: a value-layer perturbation only becomes a TOKEN
+# difference where the top-2 gap is narrow, so 1000 tokens is roughly five times
+# the exposure of the 200-token generations checked before this.
+#
+# (This was originally motivated by a CUDA nondeterminism report that its author
+# has since retracted -- it was a first-request transient, not drift. The test
+# stands on its own: it covers the serving path, which the inferlet probe does
+# not.)
 #
 # Two boots, because a single boot shares one process, one set of compiled
 # pipelines and one prefix cache; only a second boot recomputes from cold.
