@@ -1041,20 +1041,6 @@ fn tv(a: &(Vec<u32>, Vec<f32>), b: &(Vec<u32>, Vec<f32>)) -> f32 {
 /// All of e_pos/e_mask/e_short/e_refill must match the reference; e_ctl
 /// must not.
 async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
-    // Warmup: a boot's FIRST forward can take a different kernel/algorithm
-    // path than every later one (measured as a single ~0.086-nat deviant on
-    // sm_86 by a parallel session — after it, decode is bit-reproducible).
-    // Burn that transient on a throwaway fill so every measured arm below
-    // runs warm and noise_floor is a true floor, not a warmup artifact.
-    {
-        let mut warm = Context::new(model)?;
-        let toks = sh.tokenizer.encode("selftest warmup fill, discarded");
-        let mut pass = warm.forward();
-        pass.input(&toks);
-        pass.execute().await?;
-        warm.destroy();
-    }
-
     let mut base = Context::new(model)?;
     base.user("Solve: what is the domain of f(x) = 1/log(2 - log(x - 2))? Reason briefly.");
     base.flush().await?;
@@ -1075,6 +1061,32 @@ async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
     let toks_a_short = &toks_a[..8.min(toks_a.len())];
     let toks_b = sh.tokenizer.encode(text_b);
     let nb = toks_b.len();
+
+    // Per-SHAPE warmup (correction from a parallel session: the first-sight
+    // transient is keyed by GEMM dimensions, NOT per-boot — a throwaway of
+    // one length warms only that length, and unseen shapes deviate by up to
+    // ~1.9 nats on first sight). Burn every distinct arm-fill length once
+    // on a scratch context so all measured arms below run shape-warm. The
+    // prompt fill's own first-sight lands in the shared prefix KV, which is
+    // common-mode across arms and cancels in every comparison.
+    {
+        let mut lens: Vec<usize> =
+            vec![nb, toks_a.len(), toks_a_short.len(), nb.saturating_sub(1), 1];
+        lens.sort_unstable();
+        lens.dedup();
+        for m in lens {
+            if m == 0 {
+                continue;
+            }
+            let mut warm = base.fork()?;
+            let fill: Vec<u32> = toks_b.iter().cycle().take(m).copied().collect();
+            let mut pass = warm.forward();
+            pass.input(&fill);
+            pass.execute().await?;
+            warm.destroy();
+        }
+        println!("[npr selftest] shape warmup done");
+    }
 
     let natural_pos: Vec<u32> = (p_fork..p_fork + nb as u32).collect();
     let causal = |kv_before: u32| causal_rows(kv_before, nb);
