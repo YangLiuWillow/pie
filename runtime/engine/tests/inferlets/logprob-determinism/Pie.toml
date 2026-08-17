@@ -1,0 +1,4 @@
+[package]
+name = "logprob-determinism"
+version = "0.1.0"
+description = "Value-layer determinism probe: per-token logprob and entropy bits across greedy decode"

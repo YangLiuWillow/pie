@@ -17,6 +17,7 @@ members = [
     "grammar-wit-bench",
     "mirostat",
     "entropycheck",
+    "logprob-determinism",
     "tempgen",
     "multisamp",
     "isolatedtopp",
