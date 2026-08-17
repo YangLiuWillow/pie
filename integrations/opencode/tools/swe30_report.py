@@ -42,7 +42,7 @@ import sys
 
 MIN_TOKENS_FOR_RATE = 16
 LOOP_THRESHOLD = 10
-ARMS = ("pie", "mlx", "vllm")
+ARMS = ("pie", "mlx", "vllm", "llamacpp")
 
 
 def graded(out, run_tag, arm):
@@ -130,14 +130,18 @@ def main():
             tot_med=st.median(tot) if tot else float("nan"),
             tot_p90=pct(tot, 90),
             degraded=sum(1 for r in c if r.get("usage_degraded")),
+            # A call that lost `enable_thinking=false` asked a DIFFERENT
+            # question than the other arms did. Counted separately from
+            # `usage_degraded`, which only costs a token count.
+            tmpl_dropped=sum(1 for r in c if r.get("template_dropped")),
             loops=lp,
         ))
 
     print("\n=== ACCURACY (graded) ===")
-    print(f"{'arm':<6} {'resolved':>9} {'submitted':>10}")
+    print(f"{'arm':<9} {'resolved':>9} {'submitted':>10}")
     for r in rows:
         res = "not graded" if r["resolved"] is None else f"{r['resolved']}"
-        print(f"{r['arm']:<6} {res:>9} {str(r['submitted'] or r['instances']):>10}")
+        print(f"{r['arm']:<9} {res:>9} {str(r['submitted'] or r['instances']):>10}")
     got = [r for r in rows if r["resolved"] is not None]
     if len(got) > 1:
         spread = max(x["resolved"] for x in got) - min(x["resolved"] for x in got)
@@ -148,25 +152,35 @@ def main():
         else:
             print(f"\n  spread {spread} of {n}.")
 
+    # Prompt-shape parity, before any number that depends on it. An arm that
+    # lost `enable_thinking=false` answered a different prompt, so its accuracy
+    # and token counts are not comparable -- say so at the top, not in a note.
+    bad = [r for r in rows if r["tmpl_dropped"]]
+    if bad:
+        print("\n=== PROMPT PARITY VIOLATED ===")
+        for r in bad:
+            print(f"  {r['arm']}: {r['tmpl_dropped']}/{r['calls']} calls lost enable_thinking=false")
+        print("  These arms answered a DIFFERENT PROMPT. Do not compare them.")
+
     print("\n=== THROUGHPUT ===")
-    print(f"{'arm':<6} {'tok/s (weighted)':>17} {'calls':>7} {'calls/inst':>11} {'usage degraded':>15}")
+    print(f"{'arm':<9} {'tok/s (weighted)':>17} {'calls':>7} {'calls/inst':>11} {'usage degraded':>15}")
     for r in rows:
-        print(f"{r['arm']:<6} {r['tokw']:>17.1f} {r['calls']:>7} {r['cpi']:>11.1f} {r['degraded']:>15}")
+        print(f"{r['arm']:<9} {r['tokw']:>17.1f} {r['calls']:>7} {r['cpi']:>11.1f} {r['degraded']:>15}")
 
     print("\n=== LATENCY (seconds per call) ===")
-    print(f"{'arm':<6} {'TTFT med':>9} {'TTFT p90':>9} {'call med':>9} {'call p90':>9}")
+    print(f"{'arm':<9} {'TTFT med':>9} {'TTFT p90':>9} {'call med':>9} {'call p90':>9}")
     for r in rows:
-        print(f"{r['arm']:<6} {r['ttft_med']:>9.2f} {r['ttft_p90']:>9.2f} "
+        print(f"{r['arm']:<9} {r['ttft_med']:>9.2f} {r['ttft_p90']:>9.2f} "
               f"{r['tot_med']:>9.2f} {r['tot_p90']:>9.2f}")
 
     print("\n=== DEGENERATION (loops; a loop makes a run FASTER) ===")
-    print(f"{'arm':<6} {'looped':>8} {'of':>5} {'rate':>7}")
+    print(f"{'arm':<9} {'looped':>8} {'of':>5} {'rate':>7}")
     for r in rows:
         if r["loops"]:
             n, t = r["loops"]
-            print(f"{r['arm']:<6} {n:>8} {t:>5} {(n/t*100 if t else 0):>6.0f}%")
+            print(f"{r['arm']:<9} {n:>8} {t:>5} {(n/t*100 if t else 0):>6.0f}%")
         else:
-            print(f"{r['arm']:<6} {'-':>8} {'-':>5} {'-':>7}")
+            print(f"{r['arm']:<9} {'-':>8} {'-':>5} {'-':>7}")
 
     if len(got) > 1:
         print("\n=== WHICH INSTANCES (graded) ===")

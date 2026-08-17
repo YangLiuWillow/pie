@@ -113,24 +113,48 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 req = None
 
-        # Ask for usage, but be prepared to be refused.
-        sent = body
+        # Two injections, and they are NOT equally droppable.
+        #
+        # `stream_options` is bookkeeping: losing it costs a token count, and
+        # the row says `usage_degraded` so the report can exclude it.
+        #
+        # `chat_template_kwargs` is CORRECTNESS. Qwen3.6 is a thinking model
+        # whose template prefills `<think>` unless told otherwise, while pie's
+        # renderer hard-codes the no-think cue. An arm that loses this field
+        # answers a DIFFERENT PROMPT than the others, and the difference shows
+        # up as accuracy and token count -- attributed to the engine, which did
+        # nothing wrong. So it is dropped only after `stream_options` has
+        # already been dropped, and when it is dropped the row is stamped
+        # `template_dropped` so the report can refuse to compare that arm.
+        probe = dict(req) if req is not None else None
         asked_usage = False
-        if req is not None and streaming and "stream_options" not in req:
-            probe = dict(req)
+        asked_template = False
+        if probe is not None and streaming and "stream_options" not in req:
             probe["stream_options"] = {"include_usage": True}
-            sent = json.dumps(probe).encode()
             asked_usage = True
+        if probe is not None and ARGS.template_kwargs and "chat_template_kwargs" not in req:
+            probe["chat_template_kwargs"] = ARGS.template_kwargs
+            asked_template = True
+        sent = json.dumps(probe).encode() if (asked_usage or asked_template) else body
 
         t0 = time.time()
         status, headers, conn = self._open(sent)
 
-        # A 4xx here may be our injected field, not the agent's request. Retry
-        # verbatim once so the run continues -- degraded, and marked so.
+        # A 4xx here may be our injected fields, not the agent's request. Back
+        # them off one at a time, most-droppable first, so the run continues.
         degraded = False
+        template_dropped = False
         if asked_usage and 400 <= status < 500:
             conn.close()
             degraded = True
+            retry = dict(req)
+            if asked_template:
+                retry["chat_template_kwargs"] = ARGS.template_kwargs
+            t0 = time.time()
+            status, headers, conn = self._open(json.dumps(retry).encode())
+        if asked_template and 400 <= status < 500:
+            conn.close()
+            template_dropped = True
             t0 = time.time()
             status, headers, conn = self._open(body)
 
@@ -229,6 +253,8 @@ class Handler(BaseHTTPRequestHandler):
             "finish_reason": finish,
             "n_messages": len(req.get("messages") or []) if req else None,
             "usage_degraded": degraded,
+            "template_kwargs": ARGS.template_kwargs or None,
+            "template_dropped": template_dropped,
         })
 
     def _open(self, body: bytes):
@@ -252,7 +278,15 @@ def main():
     p.add_argument("--port", type=int, default=8099)
     p.add_argument("--out", required=True)
     p.add_argument("--tag", default="")
+    # One control point for prompt shape across every arm. Setting this on the
+    # servers instead would mean four different mechanisms (a pie renderer
+    # constant, a vLLM flag, an mlx request field, a llama.cpp flag) and no
+    # single place that proves they agree.
+    p.add_argument("--template-kwargs", default=None,
+                   help='JSON merged into every chat request, e.g. \'{"enable_thinking":false}\'')
     ARGS = p.parse_args()
+    if ARGS.template_kwargs:
+        ARGS.template_kwargs = json.loads(ARGS.template_kwargs)
     up = ARGS.upstream.split("://", 1)[-1]
     ARGS.host, _, port = up.partition(":")
     ARGS.port_up = int(port or 80)
