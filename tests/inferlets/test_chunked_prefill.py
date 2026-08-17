@@ -335,9 +335,85 @@ async def test_policies_agree_with_the_baseline_past_the_ceiling(client, args):
     print("    4 policies reproduce the baseline exactly on a >8192-token prompt")
 
 
+async def _rollout(client, **params):
+    base = {"max_tokens": 8, "temperature": 0.0, "save_kv": False}
+    return _parse(await run_inferlet(client, "rl-rollout", {**base, **params}))
+
+
+async def test_chunking_is_exact_in_logprobs(client, args):
+    """Chunking must not move the LOGPROBS, not merely the text.
+
+    `test_chunking_is_exact` above compares generated text, and deliberately
+    picks a prompt whose continuation is decisive so "the argmax cannot be
+    flipped by reduction order". That makes it a sound argmax-level test and a
+    blind one at the value level: measured on an A6000, chunk width moves
+    logprobs by 0.0017-0.065 nats while every token stays identical. The text
+    assertion passes throughout.
+
+    The value level is what RL consumes. That logprob is the denominator of the
+    off-policy correction, so a chunk-width-dependent shift is a systematic
+    error in the importance weight -- up to ~6.7% at 0.065 nats -- on rollouts
+    whose prompt happened to cross a chunk boundary.
+
+    Two things make this assertion honest rather than flaky:
+
+    - The tolerance is measured on THIS device in THIS boot, not hardcoded. A
+      bitwise assertion would be permanently red on GPU (chunk width changes
+      GEMM shapes, and a different accumulation order is correct behaviour) and
+      permanently green on CPU, where it proves nothing.
+    - The first request at any given shape is DISCARDED. Algorithm selection
+      settles on first sight of a shape, and that request deviates by up to
+      ~1.9 nats -- far larger than the effect under test. Warming is per-shape,
+      not per-process, so each configuration is warmed on its own.
+
+    See rl-post-training-knowledge/pod-kit/parity/ for the measurements.
+    """
+    prompt = _prompt_for(1024, decisive=True)
+    common = {"prompt": prompt, "seed": 4242, "max_tokens": 8}
+
+    async def measured(**extra):
+        """Warm this exact shape, then take the value that repeats."""
+        await _rollout(client, **common, **extra)          # first sight, discarded
+        a = await _rollout(client, **common, **extra)
+        b = await _rollout(client, **common, **extra)
+        assert a["logprobs"] == b["logprobs"], (
+            "two warm runs of the same shape disagree, so there is no stable "
+            f"value to compare against: {a['logprobs']} vs {b['logprobs']}"
+        )
+        return a
+
+    one = await measured()
+    assert one["logprobs"], "one-shot produced no logprobs to compare against"
+    # The floor: repeating a shape must be exact, which `measured` just proved.
+    # Anything above zero is therefore attributable to chunk width alone.
+    tol = 0.0
+
+    worst = 0.0
+    for width in _WIDTHS:
+        many = await measured(prefill_chunk=width)
+        assert many["token_ids"] == one["token_ids"], (
+            f"chunk={width}: chunked prefill changed the tokens, which the "
+            "text-level test should already have caught"
+        )
+        d = max(abs(a - b) for a, b in zip(many["logprobs"], one["logprobs"]))
+        worst = max(worst, d)
+        assert d <= tol, (
+            f"chunk={width}: chunked prefill moved the logprobs by {d:.6f} nats "
+            f"(tolerance {tol:.6f}, measured on this device this boot).\n"
+            f"  one-shot: {one['logprobs']}\n"
+            f"  chunked : {many['logprobs']}\n"
+            "Tokens are identical, so the text-level test passes and this one "
+            "is the only thing that sees it. That logprob feeds TIS."
+        )
+    widths = "/".join(str(w) for w in _WIDTHS)
+    print(f"    logprobs identical at chunk widths {widths} vs one-shot "
+          f"(worst {worst:.6f})")
+
+
 run_tests(
     [
         test_chunking_is_exact,
+        test_chunking_is_exact_in_logprobs,
         test_above_the_one_shot_ceiling,
         test_quest_still_evicts_at_long_context,
         test_trackb_chunking_is_exact,

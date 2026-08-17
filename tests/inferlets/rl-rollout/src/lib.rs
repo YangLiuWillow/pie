@@ -62,6 +62,18 @@ struct Input {
     /// rendered ids are reported back as `prompt_token_ids`.
     #[serde(default)]
     messages: Option<Vec<ChatMsg>>,
+    /// Prefill chunk width, clamped to the driver's `max_embed_length()`.
+    /// `None` (the default, and what the bridge always sends) takes the
+    /// driver's own capacity, so this changes nothing in production.
+    ///
+    /// It exists for `test_chunked_prefill.py`: forcing the width down runs the
+    /// multi-chunk path on a short prompt, which is the only practical way to
+    /// check that concatenating chunks reproduces the one-shot fire. The same
+    /// knob is on quest-attention, trackb-h2o, trackb-snapkv and tova; it is
+    /// here because this is the inferlet whose LOGPROBS feed RL, and the
+    /// existing test asserts only that the generated text matches.
+    #[serde(default)]
+    prefill_chunk: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -395,7 +407,7 @@ macro_rules! define_run_one {
             // only the last chunk carries the sampling epilogue. With a resumed
             // snapshot only the suffix [resumed_len..n) is prefilled — the
             // whole point of the snapshot.
-            let spans: Vec<(u32, u32)> = prefill_chunks(n - resumed_len, None)
+            let spans: Vec<(u32, u32)> = prefill_chunks(n - resumed_len, input.prefill_chunk)
                 .iter()
                 .map(|&(b, e)| (b + resumed_len, e + resumed_len))
                 .collect();
