@@ -100,13 +100,19 @@ arm() {  # $1 tag, $2 upstream, $3 model string, $4 restart cmd
     [ "$calls" -gt 0 ] || log "WARNING: $tag recorded NO calls -- latency unavailable"
 }
 
-PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 8; \
+# 30s, not 8. `pie` needs ~22.5 GiB resident and macOS RELEASES its pages well
+# before it RECLAIMS them: a back-to-back boot reports "only 11.35 GiB is
+# reclaimable" and refuses, while `vm_stat` shows 35 GB free. That is exactly how
+# the first attempt at this run died on instance 3 of 30 -- and the failure is
+# per-arm fatal, since the harness rightly refuses to drive a server it did not
+# start. The other two engines get the same settle for symmetry.
+PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 30; \
 PIE_PYTHON=$PIEPY $REPO/integrations/opencode/tools/boot_pie.sh s30 \
   PIE_STRATEGY=b PIE_MODEL=qwen3-coder-30b PIE_MAX_MODEL_LEN=65536 \
   PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY"
-VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 8; \
+VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 30; \
 VLLM_MAX_MODEL_LEN=65536 $REPO/integrations/opencode/tools/boot_vllm.sh s30"
-MLX_RESTART="pkill -f mlx_lm.server; sleep 8; \
+MLX_RESTART="pkill -f mlx_lm.server; sleep 30; \
 nohup /tmp/venv-mlxlm/bin/mlx_lm.server --model $MLXMODEL --port 8001 --host 127.0.0.1 \
   >/tmp/mlx_s30.log 2>&1 & \
 for i in \$(seq 1 60); do curl -s -m 3 -o /dev/null http://127.0.0.1:8001/v1/models && break; sleep 3; done"
@@ -119,6 +125,10 @@ arm pie  http://127.0.0.1:8080 "probe/qwen3-coder-30b" "$PIE_RESTART"
 arm mlx  http://127.0.0.1:8001 "probe/$MLXMODEL"       "$MLX_RESTART"
 arm vllm http://127.0.0.1:8000 "probe/qwen3-coder-30b" "$VLLM_RESTART"
 
+for a in pie mlx vllm; do
+    n=0; [ -f "$OUT/preds-$a.jsonl" ] && n=$(wc -l < "$OUT/preds-$a.jsonl" | tr -d ' ')
+    [ "$n" -ge 25 ] || log "INCOMPLETE ARM: $a has only $n/30 predictions -- do not compare it"
+done
 log "=== transcript health per arm ==="
 for a in pie mlx vllm; do
     [ -d "$OUT/wd-$a" ] && python3 tools/transcript_health.py "$OUT/wd-$a" 2>&1 | tail -6 | sed "s/^/  [$a] /" | tee -a "$OUT/run.log"
