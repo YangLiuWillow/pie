@@ -266,6 +266,14 @@ async def handle_completions(request: web.Request) -> web.StreamResponse:
         inp["saved_lens"] = bridge.hints.candidates(prompt_tokens)
     else:
         inp["prompt"] = prompt_text
+    # Diagnostics only: force the prefill chunk width for this request. Absent
+    # from normal traffic, so the inferlet takes the driver's own capacity and
+    # nothing about training changes. It exists so chunk-equivalence can be
+    # tested WITHIN one boot -- otherwise the width can only be changed through
+    # driver.max_forward_tokens, which needs a restart, and a restart puts
+    # cross-boot variation inside the very comparison being made.
+    if "prefill_chunk" in body:
+        inp["prefill_chunk"] = int(body["prefill_chunk"])
 
     try:
         out = await bridge.rollout(inp)

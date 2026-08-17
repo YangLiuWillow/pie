@@ -366,6 +366,28 @@ async def test_chunking_is_exact_in_logprobs(client, args):
       ~1.9 nats -- far larger than the effect under test. Warming is per-shape,
       not per-process, so each configuration is warmed on its own.
 
+    THIS TEST CURRENTLY FAILS, and that is the point. Measured on an A6000:
+
+        width=  37  ~28 chunks  tokens=same  max|dlp|=0.07112300
+        width= 128  ~11 chunks  tokens=same  max|dlp|=0.00035091
+        width= 999  ~ 2 chunks  tokens=same  max|dlp|=0.00000000
+
+    Tokens identical at every width, so `test_chunking_is_exact` above passes
+    throughout. Two chunks is exact; more than two is not; and the magnitude is
+    not monotonic in chunk count. A wider sweep found no rule at all -- at an
+    8409-token prompt, nine chunks is bit-identical while ten differs, and a
+    516-token chunk is exact while an 841-token chunk is not -- which rules out
+    both a chunk-size threshold and a chunk-count one.
+
+    Suspected mechanism: shape-gated kernel selection. pie's output is a
+    function of which kernels get selected, selection is gated on runtime
+    conditions including row count, and chunking changes rows per forward. (The
+    pie-opencode session independently found the `_u4` decode unroll variant
+    producing different text from the non-unrolled kernel on the same weights
+    and prompt.) A selection-pinning knob would make this decidable: pin it, and
+    the deltas either vanish -- proving the mechanism -- or persist, sending us
+    elsewhere.
+
     See rl-post-training-knowledge/pod-kit/parity/ for the measurements.
     """
     prompt = _prompt_for(1024, decisive=True)
@@ -388,23 +410,42 @@ async def test_chunking_is_exact_in_logprobs(client, args):
     # Anything above zero is therefore attributable to chunk width alone.
     tol = 0.0
 
-    worst = 0.0
+    # Measure EVERY width before asserting. Failing on the first bad one hides
+    # which configurations are clean, and that map is the useful part: the
+    # effect is not monotonic in chunk count and has no known size threshold,
+    # so "which widths are exact" cannot be predicted, only measured.
+    rows, worst = [], 0.0
     for width in _WIDTHS:
         many = await measured(prefill_chunk=width)
-        assert many["token_ids"] == one["token_ids"], (
-            f"chunk={width}: chunked prefill changed the tokens, which the "
-            "text-level test should already have caught"
-        )
+        chunks = -(-one["num_prompt_tokens"] // width)  # ceil
+        same_toks = many["token_ids"] == one["token_ids"]
         d = max(abs(a - b) for a, b in zip(many["logprobs"], one["logprobs"]))
         worst = max(worst, d)
-        assert d <= tol, (
-            f"chunk={width}: chunked prefill moved the logprobs by {d:.6f} nats "
-            f"(tolerance {tol:.6f}, measured on this device this boot).\n"
-            f"  one-shot: {one['logprobs']}\n"
-            f"  chunked : {many['logprobs']}\n"
-            "Tokens are identical, so the text-level test passes and this one "
-            "is the only thing that sees it. That logprob feeds TIS."
-        )
+        rows.append((width, chunks, same_toks, d))
+        print(f"      width={width:>5} ~{chunks:>3} chunks  tokens="
+              f"{'same' if same_toks else 'DIFFER'}  max|dlp|={d:.8f}")
+
+    bad = [r for r in rows if r[3] > tol]
+    tok_changed = [r for r in rows if not r[2]]
+    assert not tok_changed, (
+        f"chunked prefill changed the TOKENS at widths "
+        f"{[r[0] for r in tok_changed]} -- the text-level test above should "
+        "have caught this, so one of the two tests is wrong"
+    )
+    assert not bad, (
+        "chunked prefill moved the logprobs at widths "
+        + ", ".join(f"{r[0]}({r[3]:.6f} nats)" for r in bad)
+        + f"; tolerance {tol:.6f}, measured on this device this boot.\n"
+        f"  one-shot: {one['logprobs']}\n"
+        "Tokens are identical at every width, so the text-level test passes "
+        "and this one is the only thing that sees it. That logprob is the "
+        "denominator of the off-policy correction.\n"
+        "Do NOT fix this by loosening the tolerance: warm repeats of a fixed "
+        "configuration are bit-identical, so the floor really is zero and the "
+        "difference really is the chunking. The suspected mechanism is "
+        "shape-gated kernel selection (see the pie-opencode session's _u4 "
+        "finding); a selection-pinning knob would make this decidable."
+    )
     widths = "/".join(str(w) for w in _WIDTHS)
     print(f"    logprobs identical at chunk widths {widths} vs one-shot "
           f"(worst {worst:.6f})")
