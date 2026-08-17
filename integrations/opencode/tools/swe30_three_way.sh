@@ -106,13 +106,20 @@ arm() {  # $1 tag, $2 upstream, $3 model string, $4 restart cmd
 # the first attempt at this run died on instance 3 of 30 -- and the failure is
 # per-arm fatal, since the harness rightly refuses to drive a server it did not
 # start. The other two engines get the same settle for symmetry.
-PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 30; \
+# Wait for the CONDITION, not a duration -- see tools/wait_for_memory.sh for why
+# `sleep 8` died on instance 3 and `sleep 30` on instance 14. If the machine
+# cannot admit the model within five minutes the restart fails loudly, which is
+# better than booting into 11 GiB and losing the arm.
+PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 10; \
+$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1; \
 PIE_PYTHON=$PIEPY $REPO/integrations/opencode/tools/boot_pie.sh s30 \
   PIE_STRATEGY=b PIE_MODEL=qwen3-coder-30b PIE_MAX_MODEL_LEN=65536 \
   PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY"
-VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 30; \
+VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 10; \
+$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1; \
 VLLM_MAX_MODEL_LEN=65536 $REPO/integrations/opencode/tools/boot_vllm.sh s30"
-MLX_RESTART="pkill -f mlx_lm.server; sleep 30; \
+MLX_RESTART="pkill -f mlx_lm.server; sleep 10; \
+$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1; \
 nohup /tmp/venv-mlxlm/bin/mlx_lm.server --model $MLXMODEL --port 8001 --host 127.0.0.1 \
   >/tmp/mlx_s30.log 2>&1 & \
 for i in \$(seq 1 60); do curl -s -m 3 -o /dev/null http://127.0.0.1:8001/v1/models && break; sleep 3; done"
