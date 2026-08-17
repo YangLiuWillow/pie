@@ -1052,3 +1052,9 @@ invalidated) a real experiment:
    their "one-shot" baseline secretly chunked — and still designed the
    baseline assuming the opposite. Code you have read still has to be
    carried into the experimental design as a constraint, explicitly.
+8. **Don't spend someone else's calibration.** When citing another
+   experimenter's hedged statement ("plausibly", "strong negative on one
+   machine"), the hedge is part of the result — twice this week a
+   calibrated claim hardened into a flat one purely by being restated.
+   "Deterministic, unexplained" is a respectable resting state; it tells
+   the next person there is something to find.
