@@ -476,6 +476,13 @@ async fn decode_segment(
     degree: usize,
     watch_step: bool,
     token_cap: Option<usize>,
+    // Engine-faithful ×degree check is PER-REQUEST (`schedule_batch.py:
+    // 693-697`): a branch tests `inherited(×1) + own_output × degree`, not
+    // the sum of all siblings' multiplied outputs against a shared ledger —
+    // the shared-sum version starves any long parallel block mid-flight at
+    // roughly budget/degree total tokens (the silent ~10k truncation).
+    inherited: usize,
+    own_before: usize,
 ) -> Result<Segment> {
     let mut tokens = Vec::new();
     let mut bytes = Vec::new();
@@ -497,8 +504,9 @@ async fn decode_segment(
         // Engine-faithful finish checks (`schedule_batch.py::check_finished`):
         // primary is positional (longest path through the parallel structure);
         // the ×degree charge is the secondary, transient check.
+        let degree_charge = inherited + (own_before + tokens.len()) * degree;
         if sh.ledger.borrow().position_exhausted(cur_pos)
-            || sh.ledger.borrow().remaining() < degree
+            || degree_charge + 128 >= sh.ledger.borrow().budget
             || token_cap.is_some_and(|cap| tokens.len() >= cap)
         {
             return Ok(Segment {
@@ -829,10 +837,19 @@ fn run_branch(
         let header = format!("\n<step>\n{label}:");
         let header_tokens = sh.encode_with_tags(&header);
         p.ctx.append(&header_tokens);
+        // The engine's per-request charge counts inherited generated tokens
+        // at ×1 (they live in `origin_input_ids` post-rebase). Snapshot the
+        // ledger at branch start: post-refund `charged` is exactly that
+        // ×1 basis.
+        let inherited = sh.ledger.borrow().charged;
+        let mut own = 0usize;
         let mut tokens = header_tokens;
         let mut bytes = header.into_bytes();
         loop {
-            let segment = decode_segment(&sh, &mut p, degree, true, sh.max_step_tokens).await?;
+            let segment =
+                decode_segment(&sh, &mut p, degree, true, sh.max_step_tokens, inherited, own)
+                    .await?;
+            own += segment.tokens.len();
             tokens.extend_from_slice(&segment.tokens);
             bytes.extend_from_slice(&segment.bytes);
             match segment.stop {
@@ -1348,7 +1365,10 @@ async fn main(input: Input) -> Result<String> {
     }
 
     loop {
-        let segment = decode_segment(&sh, &mut p, 1, false, None).await?;
+        let segment = {
+            let inherited = sh.ledger.borrow().charged;
+            decode_segment(&sh, &mut p, 1, false, None, inherited, 0).await?
+        };
         trajectory_bytes.extend_from_slice(&segment.bytes);
         match segment.stop {
             Stop::GuidelineEnd => {
