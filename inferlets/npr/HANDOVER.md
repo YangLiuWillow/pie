@@ -250,3 +250,27 @@ avg 0.204, 78% unanswered — the token-starvation bug) and must not be quoted a
 a post-fix result. Rule for any future sweep: deploy with a persistent volume
 **and** pull results off-pod continuously (a local-side scp loop every few
 minutes); treat pod disks as lossable at any moment. Both pods were terminated.
+
+## 11. Final four-arm sweep (2026-08-17, L40S, `results/aime25-rerun.jsonl`)
+
+AIME 2025, 25 problems × k=2 per arm, 30k per-request budget, concurrency 8,
+prompt cache on, zero engine errors in 200 runs (one client-side timeout,
+counted as unanswered). Paper reference: 50.4 avg@8.
+
+| arm        | avg   | pass@2 | unanswered | mean gen | join mean |
+|------------|-------|--------|------------|----------|-----------|
+| adopt      | 0.460 | 0.520  | 20%        | 19.0k    | 1.17 s    |
+| refill     | 0.460 | 0.520  | 26%        | 18.5k    | 2.52 s    |
+| textual    | 0.360 | 0.440  | 36%        | 18.7k    | —         |
+| sequential | 0.440 | 0.560  | 2%         | 8.4k     | —         |
+
+Reads: (1) adopt ≡ refill exactly on avg and pass@2, with the graft join 2.2×
+faster and 674k tokens grafted at 0 fallbacks — the KV-graft join is quality-
+neutral and strictly faster. (2) Both are within noise of the paper (±0.14 at
+n=50). (3) textual trails by 10 points — KV surgery matters. (4) At equal wall
+clock (~580 s) the parallel arms generate 2.3× the tokens of sequential.
+(5) The residual weakness is the 20–26% unanswered rate on parallel arms vs 2%
+sequential — per-`<step>` repetition penalty 1.02 is the remaining
+unimplemented NPR knob and the prime suspect. Pod hygiene for reruns: deploy
+with a volume, gate hosts on `cuInit(0)==0` (3 of 4 community L40S hosts had
+broken CUDA), stream results off-pod continuously.
