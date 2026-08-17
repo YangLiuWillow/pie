@@ -982,3 +982,29 @@ deadlock would *look* like a 100%-failure cliff.
 
 Workaround until fixed: keep peak concurrent KV demand under the pool
 (the diagnostic re-ran at concurrency 8 without issue).
+
+### Measurement hygiene (cross-session lessons, 2026-08-14/16)
+
+Collected from this branch's sweeps and two parallel sessions' parity work
+on the same machine-pool; each of these silently invalidated (or nearly
+invalidated) a real experiment:
+
+1. **A run of identical fast failures is never a model result.** Engines
+   dead-latch (bugs 13/15/16, vLLM's EngineDeadError); gate sweeps on
+   consecutive-failure breakers and end-of-run liveness, not on boot-time
+   liveness.
+2. **"The forward genuinely ran" is not evidence the bytes you read are the
+   ones it produced.** The CAS trie dedups committed pages by content
+   metadata (tokens/positions/masks), not KV bytes — a re-filled identical
+   prefix recomputes, then gets rewired to the boot-lifetime first copy.
+   Any within-boot comparison of two computations over shared prefixes can
+   have its signal silently eaten (nearly cost a parallel session their
+   chunk-equivalence verdict: dedup keys don't include the chunk width that
+   produced the bytes). Fixes: per-case leading sentinels to break lineage,
+   or boot-per-arm.
+3. **Report the repeat-run noise floor next to every numeric-equivalence
+   claim** (selftest's `noise_floor` arm): an arm near the floor differs by
+   nondeterminism; above it, systematically.
+4. **Write the discriminating prediction down before the run** — otherwise
+   a null is a shrug, not evidence. And keep the control that would stay
+   silent under the bug you're hunting: its silence is the trap.
