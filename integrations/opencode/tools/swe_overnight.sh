@@ -128,6 +128,12 @@ known = set("django__django-12276 django__django-13028 django__django-13089 "
             "django__django-14373 django__django-15569".split())
 arms = {}
 for f in sorted(glob.glob(f"{out}/preds-*.jsonl")):
+    # `preds-<arm>.cases.jsonl` is the runner's per-case METADATA (case_id,
+    # seconds, workspace) and is matched by this glob too. Its rows have no
+    # `instance_id`, so `d.get("instance_id")` returned None and sorting
+    # None against str crashed the summary after all three arms had run.
+    if ".cases." in f:
+        continue
     tag = os.path.basename(f)[len("preds-"):-len(".jsonl")]
     rows = {}
     for line in open(f):
