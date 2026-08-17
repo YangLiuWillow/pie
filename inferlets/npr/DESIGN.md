@@ -1008,15 +1008,30 @@ invalidated) a real experiment:
 4. **Write the discriminating prediction down before the run** — otherwise
    a null is a shrug, not evidence. And keep the control that would stay
    silent under the bug you're hunting: its silence is the trap.
-5. **"Same prompt, same engine" is not "same kernels."** Kernel *selection*
-   is gated on runtime shape (context length, rows per forward, unroll
-   variants), and different instantiations produce different — fully
-   deterministic — outputs. This explains discrete, non-monotonic,
-   no-rule-fits deltas across chunk widths, and reframes small systematic
-   TVs (our 0.028, reproduced to 9 decimals across same-arch cards) as
-   selection-regime differences, not noise. Corollary: everything measured
-   across CPU, CUDA (warm), and Metal is bit-deterministic; the word
-   "nondeterminism" enters a writeup only to be ruled out.
+5. **"Same prompt, same engine" is not "same arithmetic."** (Revised
+   2026-08-16 after the parallel session's own correction.) The chunk-width
+   deltas were first blamed on kernel *selection*; a trace refuted that —
+   identical kernels, different results. The proven mechanism is
+   **reduction order**: a token's attention reads earlier keys from the
+   paged cache and same-fire keys from fresh KV, so the chunk boundary
+   changes the online softmax's accumulation order, and float addition is
+   not associative. Rule that fits 20/20 of their observations: *same
+   partition → bit-identical; different partition → different bits.* Our
+   runtime chunker's bitwise equality is consistent, not contradictory —
+   our CUDA path writes KV first and attends uniformly over pages, so the
+   partition doesn't move the accumulation. Our rows=1-vs-rows=N offset
+   (0.028, reproduced to 9 decimals across same-arch cards) is plausibly
+   the same class via query-batch tiling, i.e. **expected deterministic
+   numerics, not a defect**. Corollary stands: everything measured across
+   CPU, CUDA (warm), and Metal is bit-deterministic; "nondeterminism"
+   enters a writeup only to be ruled out. The selection-pinning knob's
+   remaining justification narrows to the per-shape first-sight transient
+   (and our offset, until tested).
 6. **"0/0 passed" reads as green.** A fully-skipped suite prints a
    success-shaped line; assert that the expected cases actually ran (a
    count, not an absence of failures).
+7. **Reading a line is not propagating its consequence.** The parallel
+   session quoted the very clamp (`cap.min(max_embed_length())`) that made
+   their "one-shot" baseline secretly chunked — and still designed the
+   baseline assuming the opposite. Code you have read still has to be
+   carried into the experimental design as a constraint, explicitly.
