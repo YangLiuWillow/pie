@@ -1,5 +1,11 @@
 # Is pie's accuracy at parity with mlx-lm and vLLM-metal? — 2026-08-17
 
+> **Superseded in part by `results-30-instance-three-way.md`** (same day, 30
+> instances, with per-call latency). Two numbers here did not survive it: the 5%
+> loop rate below is an outlier — at n=30 every engine loops on 33-43% of
+> instances — and the 4/10 figures come from a set later shown to be selected for
+> solvability, since no engine resolved any of twenty unbiased instances.
+
 **Yes. Graded 4/10 each.** SWE-bench Verified, ten instances, stock opencode,
 `swebench.harness.run_evaluation` in Docker, **every arm restarting its server
 per instance**.
