@@ -1008,3 +1008,15 @@ invalidated) a real experiment:
 4. **Write the discriminating prediction down before the run** — otherwise
    a null is a shrug, not evidence. And keep the control that would stay
    silent under the bug you're hunting: its silence is the trap.
+5. **"Same prompt, same engine" is not "same kernels."** Kernel *selection*
+   is gated on runtime shape (context length, rows per forward, unroll
+   variants), and different instantiations produce different — fully
+   deterministic — outputs. This explains discrete, non-monotonic,
+   no-rule-fits deltas across chunk widths, and reframes small systematic
+   TVs (our 0.028, reproduced to 9 decimals across same-arch cards) as
+   selection-regime differences, not noise. Corollary: everything measured
+   across CPU, CUDA (warm), and Metal is bit-deterministic; the word
+   "nondeterminism" enters a writeup only to be ruled out.
+6. **"0/0 passed" reads as green.** A fully-skipped suite prints a
+   success-shaped line; assert that the expected cases actually ran (a
+   count, not an absence of failures).
