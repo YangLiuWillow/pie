@@ -234,3 +234,19 @@ assumption. (`write_kv_kernel` in the CUDA driver was already slot-correct.)
   has run low before ($25 left at $11/hr across four pods). Terminate pods when
   experiments wrap; check for other sessions' idle pods and flag them rather than
   killing them.
+
+## 10. Data-loss postmortem (2026-08-17)
+
+The final A6000 sweep (4 arms × 25 problems × k=2, fixed per-request budget,
+`aime25-a6000-final.jsonl`) reached 190/200 before the pod was stopped. Both
+sweep pods had been deployed with `volumeInGb: 0`, so `/workspace` lived on the
+ephemeral container disk, which RunPod wipes on stop — the results were
+unrecoverable the moment the pod first stopped (confirmed by restarting it:
+`/workspace` was empty). The only surviving numbers from that sweep are the
+interim adopt-arm scoring taken on-pod at ~190/200: **avg 0.545, pass@2 0.591,
+21% unanswered** (25 problems, k=2), vs the paper's 50.4 avg@8. The local
+`results/aime25-a40.jsonl` predates the per-request ×degree ledger fix (adopt
+avg 0.204, 78% unanswered — the token-starvation bug) and must not be quoted as
+a post-fix result. Rule for any future sweep: deploy with a persistent volume
+**and** pull results off-pod continuously (a local-side scp loop every few
+minutes); treat pod disks as lossable at any moment. Both pods were terminated.
