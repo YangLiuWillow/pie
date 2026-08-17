@@ -120,10 +120,7 @@ runs over pie, mlx and vLLM alike:
 2. **The known-solvable five are the August run's wins**, biased toward
    solvable. Only the unseen five are an unbiased read, and there the scores are
    1/5, 1/5, 0/5 — too small to separate anything.
-3. **Quantizations differ.** pie serves its own 4-bit conversion; mlx-lm and
-   vLLM serve `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`. These are not
-   bit-identical models, so a per-instance difference need not be an engine
-   difference.
+3. **The weights are identical across engines** — verified byte-level, see below.
 4. **Nothing here measures agent quality.** A resolved instance is the agent and
    the engine together.
 
@@ -181,3 +178,15 @@ and the honest use of these numbers is narrow:
    it is the shared workdir it is a harness defect contaminating the graded
    numbers, and if it is machine state it is a confound in every agentic
    measurement this repo takes.
+
+### On the weights being identical
+
+**All three engines serve the same weights.** pie's artifact is
+`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` repacked into its container
+format, not a separate conversion: 17.21 GB against the source's 17.20 GB,
+`pie model info` names that repo as the source, and the `--quant` flag that
+would requantize was not used. Verified at the byte level -- 512-byte slices
+taken from the midpoints of a 4-bit packed weight, its bf16 scales, and the
+8-bit router all appear verbatim in the artifact. The quantization parameters
+match too, including MLX's per-tensor override of `mlp.gate` to 8 bits at group
+64, which pie's driver reports at boot.

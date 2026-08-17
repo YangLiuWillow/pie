@@ -110,9 +110,8 @@ why `tools/transcript_health.py` runs beside them.
 1. **Twenty of thirty instances were solved by nobody** — see the top. The
    headline numbers describe a set selected for solvability.
 2. **n = 10 effective.** One instance moves any arm by 10 points on that subset.
-3. **The quantizations differ.** pie serves its own 4-bit conversion; mlx-lm and
-   vLLM serve `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`. Not
-   bit-identical models.
+3. **The weights are identical across engines.** Verified byte-level; see
+   the note below the caveats.
 4. **Latency is uncontrolled** — different trajectories meant different prompt
    lengths per engine.
 5. **Nothing here separates agent from engine.** A resolved instance is both.
@@ -132,3 +131,15 @@ is already running.
 Restarts gate on `tools/wait_for_memory.sh`, not a fixed sleep: two earlier
 attempts died at instances 3 and 14 because macOS releases a 22.5 GiB model's
 pages well before it reclaims them.
+
+### On the weights being identical
+
+**All three engines serve the same weights.** pie's artifact is
+`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` repacked into its container
+format, not a separate conversion: 17.21 GB against the source's 17.20 GB,
+`pie model info` names that repo as the source, and the `--quant` flag that
+would requantize was not used. Verified at the byte level -- 512-byte slices
+taken from the midpoints of a 4-bit packed weight, its bf16 scales, and the
+8-bit router all appear verbatim in the artifact. The quantization parameters
+match too, including MLX's per-tensor override of `mlp.gate` to 8 bits at group
+64, which pie's driver reports at boot.
