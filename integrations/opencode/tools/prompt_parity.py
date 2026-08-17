@@ -112,7 +112,24 @@ def main():
     ap.add_argument("--arm", action="append", default=[],
                     help="name=baseurl:model:token (repeatable); replaces the defaults")
     ap.add_argument("--timeout", type=float, default=600)
+    # The four arms can never be live together: each needs ~20 GiB on a 48 GiB
+    # box, which is why every other tool here restarts servers between arms. So
+    # results accumulate across boots instead of being collected in one pass.
+    ap.add_argument("--append", metavar="FILE",
+                    help="append this run's live arms to FILE as JSONL")
+    ap.add_argument("--summarize", metavar="FILE",
+                    help="compare the arms accumulated in FILE and exit")
     a = ap.parse_args()
+
+    if a.summarize:
+        seen = {}
+        for line in open(a.summarize):
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                seen[r["arm"]] = r          # last boot of an arm wins
+        rows = [(r["arm"], r["plain"], r["tools"], "") for r in seen.values()]
+        return report(rows)
 
     arms = DEFAULT_ARMS
     if a.arm:
@@ -134,6 +151,17 @@ def main():
         tools, e2 = ask(base, model, token, True, a.timeout)
         rows.append((name, plain, tools, e1 or e2))
 
+    if a.append:
+        with open(a.append, "a") as fh:
+            for name, plain, tools, _ in rows:
+                if plain and tools:
+                    fh.write(json.dumps(
+                        {"arm": name, "plain": plain, "tools": tools}) + "\n")
+
+    return report(rows)
+
+
+def report(rows):
     print(f"\n{'arm':<10} {'plain':>7} {'w/ tools':>9} {'tool delta':>11}  note")
     for name, plain, tools, err in rows:
         d = (tools - plain) if (plain and tools) else None
