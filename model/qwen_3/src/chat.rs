@@ -638,7 +638,7 @@ fn is_plausible_name(s: &str) -> bool {
         })
 }
 
-fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
+pub(crate) fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
     let gt = body.find('>')?;
     let name = body[..gt].trim().to_string();
     // Same unbounded scan, same failure, one level up. A model that writes

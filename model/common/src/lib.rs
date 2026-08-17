@@ -52,6 +52,8 @@ pub mod probe;
 pub mod decoders;
 #[cfg(feature = "chat")]
 pub mod instruct;
+#[cfg(feature = "chat")]
+pub mod parser_engine;
 
 // ── Neither aspect ───────────────────────────────────────────────────
 mod metadata;
