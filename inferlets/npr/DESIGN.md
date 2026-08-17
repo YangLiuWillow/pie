@@ -1023,14 +1023,21 @@ invalidated) a real experiment:
    partition → bit-identical; different partition → different bits.* Our
    runtime chunker's bitwise equality is consistent, not contradictory —
    our CUDA path writes KV first and attends uniformly over pages, so the
-   partition doesn't move the accumulation — which upgrades the result
-   from "happens to be exact" to "cannot exhibit the effect by
-   construction" (falsifiable: any path attending its own fresh-fire KV
-   should show boundary effects; any path that attends uniformly over
-   pages cannot). Sharper form of the law, after the second collapse
-   (`even_spans` divides evenly, so only `k = ceil(n/cap)` survives):
-   **same k → identical partition → identical bits**; production exposure
-   is crossing a k boundary, a small discrete set, not arbitrary drift.
+   partition doesn't move the accumulation — RETRACTED 2026-08-16: both
+   engines write KV before attending (verified in both drivers), so no
+   fresh-vs-cached split exists anywhere and that mechanism never
+   discriminated anything. What stands is measured fact, scoped: our
+   runtime chunker (sequential-prefix splits — NOT the SDK path's even
+   division) produced bit-identical results across genuinely different
+   partitions (one ~710-token fire vs 512+~198), where the SDK path
+   differs across partitions on its stack. The surviving general law is
+   theirs and applies to their splitter: same k (= ceil(n/cap), even
+   spans) → identical partition → identical bits; exposure = crossing a k
+   boundary. WHY our path is partition-invariant where theirs is not is
+   **unexplained** — fixed per-query page-order reduction in our paged
+   attention is the obvious candidate and is exactly the kind of untraced
+   mechanism-shaped story this list warns about (four of those died this
+   week, two surviving multiple messages before their holder traced them).
    Our rows=1-vs-rows=N offset (0.028, reproduced to 9 decimals across
    same-arch cards) is HYPOTHESIZED to be the same class via query-batch
    tiling — but that is an untraced, mechanism-shaped story, the exact
