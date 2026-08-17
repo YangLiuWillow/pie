@@ -296,6 +296,18 @@ bool use_cublas_grouped_batched_bf16() {
     return enabled;
 }
 
+// cublasGemmGroupedBatchedEx first shipped in cuBLAS 12.5. Building against
+// an older toolkit (stock CUDA 12.4 images are common on rented pods) must
+// not require a multi-GB toolkit upgrade: the uniform-shape call site has a
+// universal cublasGemmBatchedEx fallback, and the variable-shape site is
+// only reached by grouped-expert (MoE) paths that dense models never hit.
+#if defined(CUBLAS_VER_MAJOR) && \
+    (CUBLAS_VER_MAJOR > 12 || (CUBLAS_VER_MAJOR == 12 && CUBLAS_VER_MINOR >= 5))
+#define PIE_HAS_CUBLAS_GROUPED_BATCHED 1
+#else
+#define PIE_HAS_CUBLAS_GROUPED_BATCHED 0
+#endif
+
 bool gemm_bf16_lt_impl(
     cublasHandle_t cublas_handle,
     const void* act, const void* W, void* y,
@@ -705,6 +717,7 @@ void gemm_batched_bf16_impl(
 {
     if (batch_count <= 0) return;
     const float alpha = 1.f;
+#if PIE_HAS_CUBLAS_GROUPED_BATCHED
     if (use_cublas_grouped_batched_bf16()) {
         const cublasOperation_t transa_array[1] = {CUBLAS_OP_T};
         const cublasOperation_t transb_array[1] = {CUBLAS_OP_N};
@@ -730,6 +743,7 @@ void gemm_batched_bf16_impl(
             return;
         }
     }
+#endif
     const auto status = cublasGemmBatchedEx(
               handle,
               /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
@@ -763,6 +777,16 @@ void gemm_grouped_bf16_impl(
     float beta)
 {
     if (group_count <= 0) return;
+#if !PIE_HAS_CUBLAS_GROUPED_BATCHED
+    (void)handle; (void)act_ptrs_host; (void)W_ptrs_host; (void)y_ptrs_host;
+    (void)M_array_host; (void)N; (void)K; (void)beta;
+    // Variable-shape grouped GEMM has no pre-12.5 fallback; only
+    // grouped-expert (MoE) forwards reach it. Dense models never do.
+    throw std::runtime_error(
+        "ops::gemm_grouped_bf16: cublasGemmGroupedBatchedEx requires cuBLAS "
+        ">= 12.5; this build used an older toolkit (grouped-expert/MoE "
+        "models unavailable, dense models unaffected)");
+#else
 
     std::vector<cublasOperation_t> transa(group_count, CUBLAS_OP_T);
     std::vector<cublasOperation_t> transb(group_count, CUBLAS_OP_N);
@@ -810,6 +834,7 @@ void gemm_grouped_bf16_impl(
         check(cublasGetStream(handle, &stream), "cublasGetStream");
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+#endif
 }
 
 [[noreturn]] void unsupported(const char* api,
