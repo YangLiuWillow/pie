@@ -32,9 +32,11 @@ the engine.
 
 **django-12276.** pie produced 0 bytes with a transcript repeating one sentence
 45 times. mlx-lm and vLLM both resolved it the same night, and **pie itself
-resolved it in August**. That is the only concrete accuracy cost attributable to
-pie tonight, and it is n=1 — pie gains 10914 where mlx fails, which is why the
-totals tie.
+resolved it in August**. That looked like the one concrete accuracy cost attributable to pie — until the
+rate measurement below put 12276's loop probability at 20% across five fresh
+runs of the same configuration. The graded run caught one of those; pie gains
+10914 where mlx fails, which is why the totals tie. It is a coin-flip instance,
+not a regression.
 
 ### Degenerate repetition is the checkpoint's, not pie's
 
@@ -54,15 +56,31 @@ pie's one extra (11099, 132×) is the agent re-issuing an identical failing
 `sed`: tool-error handling, not decoding, and it should not be counted with the
 others.
 
-## First bisect result: speculation is implicated
+## Speculation is NOT the cause — the bisect refuted itself
 
-| arm | patch | maxrep |
-|---|---:|---:|
-| speculation **on** (tonight's config) | 0 B | 45 |
-| speculation **off** (`SPEC_OFF=1`) | **1333 B** | **4** |
+The first arm looked decisive and was not:
 
-Pending the control arm reproducing the failure, this points at speculation —
-and the mechanism was established independently earlier the same day:
+| arm | instance | patch | maxrep |
+|---|---|---:|---:|
+| speculation **off** | 12276 | 1333 B | 4 |
+| speculation **off** | 11099 | 0 B | **104** |
+| speculation **on** *(the failing config)* | 12276 | **3216 B** | **2** |
+| speculation **on** | 11099 | 895 B | 1 |
+
+Two rows kill it. `spec-off` **loops anyway** on 11099 (104), and the shipped
+configuration — byte-for-byte what produced 0 bytes at maxrep 45 hours earlier —
+**produced a clean 3216-byte patch** on the same instance. The failure does not
+reproduce, so no single-rep comparison of any switch can speak to it, and the
+remaining arms were abandoned rather than run for the appearance of rigour.
+
+I reported "speculation is implicated" off the first row before the control
+landed. That was the second time in one night I read a single agentic run as
+signal; the first was calling this an accuracy regression at all.
+
+### The mechanism below is still true — it is simply not what causes this
+
+It remains the case that speculation is not output-equivalent on this driver,
+which matters for reproducibility even though it does not explain the loops:
 
 > `rows == 1` selects the **split-K** kernel; `rows > 1` selects the
 > **head-sharing** kernel (plus `_u4` above the 8192 context gate).
@@ -76,8 +94,8 @@ trajectory; a prompt-lookup drafter then locks any repetition in, because once a
 line recurs it proposes the whole line and greedy verification confirms it in
 bulk.
 
-`SPEC_OFF=1` is a one-line mitigation available today, at the cost of
-speculation's throughput.
+`SPEC_OFF=1` is therefore NOT a fix for the loops — it loops too. It remains a
+way to get output-equivalent decoding if that is ever wanted for its own sake.
 
 ## Instrument gap this exposed
 
