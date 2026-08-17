@@ -1328,6 +1328,10 @@ async fn main(input: Input) -> Result<String> {
     sh.ledger.borrow_mut().prompt_end_pos = p.next_pos();
 
     let mut trajectory_bytes: Vec<u8> = Vec::new();
+    // Why the top-level loop ended — recorded in the output JSON so a
+    // truncated trajectory names its own cause instead of being diagnosed
+    // from token counts (a silent ~10k stop cost an evening of guessing).
+    let mut stop_reason = "unknown";
 
     if let Some(primer) = input.primer.as_deref() {
         let tokens = sh.encode_with_tags(primer);
@@ -1355,6 +1359,9 @@ async fn main(input: Input) -> Result<String> {
                     } => {
                         trajectory_bytes.extend_from_slice(&bytes);
                         if terminal {
+                            // A branch hit EOS/budget inside the block; the
+                            // join completed but the run ends here.
+                            stop_reason = "branch_terminal";
                             break;
                         }
                     }
@@ -1362,7 +1369,18 @@ async fn main(input: Input) -> Result<String> {
                 }
             }
             // `</step>` is not watched at top level; Eos/Budget end the run.
-            Stop::StepEnd | Stop::Eos | Stop::Budget => break,
+            Stop::StepEnd => {
+                stop_reason = "step_end";
+                break;
+            }
+            Stop::Eos => {
+                stop_reason = "eos";
+                break;
+            }
+            Stop::Budget => {
+                stop_reason = "budget";
+                break;
+            }
         }
     }
 
@@ -1396,6 +1414,7 @@ async fn main(input: Input) -> Result<String> {
         "adopt_fallbacks": stats.adopt_fallbacks,
         "join_ms": stats.join_ms,
         "prompt_cache": prompt_cache_state,
+        "stop_reason": stop_reason,
         "tokens_charged": ledger.charged,
         "token_budget": ledger.budget,
         "elapsed_ms": start.elapsed().as_millis() as u64,
