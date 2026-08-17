@@ -69,20 +69,35 @@ for arm in pie mlx vllm; do
 done
 
 log "=== RESOLVED COUNTS ==="
-$PY - "$OUT" <<'PY' 2>&1 | tee -a "$OUT/grade.log"
+$PY - "$OUT" "$RUN_TAG" <<'PY' 2>&1 | tee -a "$OUT/grade.log"
 import json, glob, os, sys
-out = sys.argv[1]
+out, run_tag = sys.argv[1], sys.argv[2]
 known = set("django__django-12276 django__django-13028 django__django-13089 "
             "django__django-14373 django__django-15569".split())
+# The summary report is `<model_name_or_path>.<run_id>.json` in the CWD --
+# `swebench.harness.reporting.make_run_report` builds it as
+#     Path(predictions[0][KEY_MODEL].replace("/","__") + f".{run_id}" + ".json")
+# so for label `pie` and run_id `overnight_pie` it is `pie.overnight_pie.json`.
+#
+# An earlier version of this filtered on `"report" in filename`, which matches
+# NONE of those and DOES match the per-instance
+# `logs/run_evaluation/<run>/<model>/<inst>/report.json` files -- a different
+# schema with no `resolved_ids`. It would have printed "resolved 0/?" for every
+# arm: wrong, and shaped exactly like an answer.
 reports = {}
-for f in glob.glob(f"{out}/*.json") + glob.glob(f"{out}/**/*.json", recursive=True):
-    base = os.path.basename(f)
-    if "report" not in base.lower(): continue
-    try: d = json.load(open(f))
-    except Exception: continue
-    for arm in ("pie", "mlx", "vllm"):
-        if arm in base and arm not in reports:
+for arm in ("pie", "mlx", "vllm"):
+    exact = os.path.join(out, f"{arm}.{run_tag}_{arm}.json")
+    cands = [exact] if os.path.exists(exact) else sorted(
+        glob.glob(os.path.join(out, f"{arm}.*.json")))
+    for f in cands:
+        try: d = json.load(open(f))
+        except Exception: continue
+        # Identify by SCHEMA, not by name: the summary has resolved_ids.
+        if "resolved_ids" in d:
             reports[arm] = (f, d)
+            break
+    if arm not in reports:
+        print(f"{arm}: no summary report found (looked for {os.path.basename(exact)})")
 if not reports:
     print("no grading reports found; read grade-*.log")
     raise SystemExit
