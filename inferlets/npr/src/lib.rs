@@ -1041,6 +1041,20 @@ fn tv(a: &(Vec<u32>, Vec<f32>), b: &(Vec<u32>, Vec<f32>)) -> f32 {
 /// All of e_pos/e_mask/e_short/e_refill must match the reference; e_ctl
 /// must not.
 async fn selftest(model: &Model, sh: &Shared) -> Result<String> {
+    // Warmup: a boot's FIRST forward can take a different kernel/algorithm
+    // path than every later one (measured as a single ~0.086-nat deviant on
+    // sm_86 by a parallel session — after it, decode is bit-reproducible).
+    // Burn that transient on a throwaway fill so every measured arm below
+    // runs warm and noise_floor is a true floor, not a warmup artifact.
+    {
+        let mut warm = Context::new(model)?;
+        let toks = sh.tokenizer.encode("selftest warmup fill, discarded");
+        let mut pass = warm.forward();
+        pass.input(&toks);
+        pass.execute().await?;
+        warm.destroy();
+    }
+
     let mut base = Context::new(model)?;
     base.user("Solve: what is the domain of f(x) = 1/log(2 - log(x - 2))? Reason briefly.");
     base.flush().await?;
