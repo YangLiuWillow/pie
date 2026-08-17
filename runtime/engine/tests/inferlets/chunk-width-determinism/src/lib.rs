@@ -31,9 +31,26 @@
 //!
 //! **Chunk width IS rows per fire.** So different widths land on different
 //! kernel instantiations, and a discrete, shape-keyed, non-monotonic pattern is
-//! precisely what that would produce. If Metal shows the same effect, the cause
-//! is pie's own shape-gated selection on both backends rather than anything
-//! specific to a CUDA autotuner.
+//! precisely what that would produce.
+//!
+//! ## That hypothesis was TESTED AND REFUTED, and the answer is more general
+//!
+//! `PIE_METAL_SDPA_TRACE=1` across nine widths reports IDENTICAL kernel
+//! selection in every arm -- every prefill fire takes NAX, since `rows >= 32`
+//! holds even for the narrow tail chunks -- while eight of the nine produce
+//! distinct results. Kernel choice is not the variable.
+//!
+//! The mechanism is REDUCTION ORDER. For a token at position `p` in chunk
+//! `[b,e)`, attention reads keys below `b` from the paged cache and keys in
+//! `[b,p]` from this fire's own freshly written KV. Moving the boundary moves
+//! that split, the online softmax accumulates in a different order, and float
+//! addition is not associative. Same code, different partition, different bits.
+//!
+//! That is stronger than the hypothesis it replaces: ANY chunking perturbs
+//! prefill numerics on ANY backend, whatever kernel runs. It explains the CUDA
+//! observation without an autotuner, and it predicts the non-monotonicity --
+//! there is no reason for one partition's rounding to order sensibly against
+//! another's.
 //!
 //! ## What is held fixed
 //!
