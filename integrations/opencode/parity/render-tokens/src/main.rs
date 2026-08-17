@@ -58,14 +58,19 @@ fn main() -> Result<()> {
     // `PARITY_MODEL_NAME` overrides it when the path does not.
     let model_name = std::env::var("PARITY_MODEL_NAME").unwrap_or_else(|_| args[1].clone());
     let coder = pie_model::instruct::is_coder_lineage("qwen3", &model_name);
-    // ONE predicate drives both halves, because that is how the server binds
-    // them: "a checkpoint with no thinking channel is the Coder release, and
-    // the Coder release speaks XML tool calls." `has_thinking` was hardcoded
-    // `true` here, so a Coder render carried an empty `<think></think>` cue
-    // the server never emits — 4 tokens of pure harness artifact, reported as
-    // a pie-vs-vLLM divergence.
-    let tool_dialect = if coder { ToolDialect::Coder } else { ToolDialect::Hermes };
-    eprintln!("[render-tokens] coder={coder} tool_dialect={tool_dialect:?} (from {model_name})");
+    // TWO predicates now, mirroring the server exactly. They were one, on the
+    // rule that "a checkpoint with no thinking channel is the Coder release,
+    // and the Coder release speaks XML tool calls" — until Qwen3.6, a thinking
+    // model that speaks XML. `has_thinking` is still `!coder` (it was once
+    // hardcoded `true` here, so a Coder render carried an empty
+    // `<think></think>` cue the server never emits — 4 tokens of pure harness
+    // artifact, reported as a pie-vs-vLLM divergence); the dialect now comes
+    // from its own predicate. Both are `instruct`'s, never copies: a harness
+    // that guesses either one certifies parity against a prompt the server
+    // does not send.
+    let xml = pie_model::instruct::speaks_xml_tools("qwen3", &model_name);
+    let tool_dialect = if xml { ToolDialect::Coder } else { ToolDialect::Hermes };
+    eprintln!("[render-tokens] coder={coder} xml_tools={xml} tool_dialect={tool_dialect:?} (from {model_name})");
     let instruct = QwenInstruct::new(
         tokenizer.clone(),
         ChatMLConfig {

@@ -54,6 +54,60 @@ pub fn is_coder_lineage(arch_name: &str, model_name: &str) -> bool {
     squashed.contains("coder")
 }
 
+/// Whether this checkpoint speaks the XML tool-call dialect
+/// (`<tool_call><function=NAME><parameter=P>`) instead of Hermes JSON.
+///
+/// This used to be `is_coder_lineage` itself, on the reasoning that a
+/// checkpoint with no thinking channel is the Coder release and the Coder
+/// release speaks XML. Qwen3.5/3.6 broke that equivalence: they are THINKING
+/// models that nonetheless speak XML, which is exactly the pairing the single
+/// predicate could not express. Read from the checkpoints' own
+/// `chat_template.jinja`:
+///
+/// ```text
+///   Qwen3-8B-4bit                       no `<function=`  -> Hermes JSON
+///   Qwen3-Coder-30B-A3B-Instruct-4bit      `<function=`  -> XML  (coder)
+///   Qwen3.6-35B-A3B-4bit                   `<function=`  -> XML  (thinking)
+/// ```
+///
+/// ## What serving Qwen3.6 as Hermes did, measured rather than assumed
+///
+/// It did **not** break tool calling. Same request, same checkpoint, only this
+/// predicate changed:
+///
+/// ```text
+///   Hermes  169 prompt tokens  -> finish_reason=tool_calls, arguments correct
+///   XML     314 prompt tokens  -> finish_reason=tool_calls, arguments correct
+/// ```
+///
+/// The model complied with whichever dialect it was instructed in. So the case
+/// for this function is **comparability, not accuracy**: mlx-lm, vLLM and
+/// llama.cpp all render the checkpoint's own `chat_template.jinja` and
+/// therefore all speak XML. With pie alone on Hermes, pie alone answered a
+/// different prompt — a 145-token difference in the tool preamble — and every
+/// cross-engine number would have carried that difference silently. Whether
+/// the native dialect also helps on long multi-tool agentic traffic is a
+/// hypothesis this comment does not assert.
+///
+/// The old comment warned that splitting the two predicates would let a future
+/// edit set one and not the other — "a prompt in one dialect read by a parser
+/// for the other". That risk is real and is why this lives beside
+/// `is_coder_lineage`, shares its haystack and squashing, and is covered by
+/// `dialect_and_thinking_are_independent_for_qwen3_5_lineage` below: the two
+/// are now independent facts about a checkpoint, so they are two predicates,
+/// but they are two predicates in one place.
+///
+/// `qwen3next` is deliberately NOT listed. It is excluded from coder lineage
+/// like 3.5/3.6, but no checkpoint was on hand to read its template from, and
+/// guessing the dialect is the failure this function exists to prevent.
+pub fn speaks_xml_tools(arch_name: &str, model_name: &str) -> bool {
+    let hay = format!("{model_name} {arch_name}").to_lowercase();
+    let squashed: String = hay.chars().filter(|c| !matches!(c, '_' | '.' | '-')).collect();
+    squashed.contains("qwen35")
+        || squashed.contains("qwen36")
+        || is_coder_lineage(arch_name, model_name)
+}
+
 /// Create the appropriate instruct implementation for the given architecture.
 ///
 /// This match is the chat aspect's registry: `model_type` in, implementation
@@ -98,12 +152,11 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 // empty think block. See `is_coder_lineage`.
                 has_thinking: !is_coder_lineage(arch_name, model_name),
                 has_tools: true,
-                // The same signal decides both halves: a checkpoint with no
-                // thinking channel is the Coder release, and the Coder release
-                // speaks XML tool calls. Splitting them into two predicates
-                // would let a future edit set one and not the other, which is
-                // a prompt in one dialect read by a parser for the other.
-                tool_dialect: if is_coder_lineage(arch_name, model_name) {
+                // These two were one signal until Qwen3.6, which is a thinking
+                // model that speaks XML tool calls -- the pairing a single
+                // predicate could not express. See `speaks_xml_tools` for what
+                // serving it as Hermes did and, just as importantly, did not do.
+                tool_dialect: if speaks_xml_tools(arch_name, model_name) {
                     ToolDialect::Coder
                 } else {
                     ToolDialect::Hermes
@@ -280,6 +333,44 @@ mod tests {
             assert!(
                 !cue_is_plain("qwen3_5moe", name),
                 "{name} was demoted to the non-thinking cue by its deployment name"
+            );
+        }
+    }
+
+    /// The pairing the old single predicate could not express.
+    ///
+    /// `tool_dialect` and `has_thinking` were both `is_coder_lineage`, on the
+    /// rule that a checkpoint with no thinking channel is the Coder release and
+    /// the Coder release speaks XML. Qwen3.6 is a THINKING model that speaks
+    /// XML, so under the coupling it was served Hermes JSON while its own
+    /// `chat_template.jinja` mandates
+    /// `<tool_call><function=NAME><parameter=P>` unconditionally. The tool
+    /// calls that go missing to a dialect mismatch land in the accuracy column.
+    ///
+    /// Asserted as the three real checkpoints, each with the dialect read out
+    /// of its own template, so the table cannot drift from what is shipped.
+    #[test]
+    fn dialect_and_thinking_are_independent_for_qwen3_5_lineage() {
+        // (arch stem, deployment name, speaks XML, thinks)
+        for (arch, name, xml, thinks) in [
+            // Plain Qwen3: Hermes JSON, and it thinks.
+            ("qwen3", "mlx-community--Qwen3-8B-4bit", false, true),
+            // Coder: XML, and it does NOT think. The old coupling's whole case.
+            ("qwen3moe", "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit", true, false),
+            // Qwen3.6: XML *and* it thinks -- the combination that broke it.
+            ("qwen3_5moe", "mlx-community--Qwen3.6-35B-A3B-4bit", true, true),
+            ("qwen3_5moe", "Qwen--Qwen3.6-35B-A3B", true, true),
+        ] {
+            assert_eq!(
+                speaks_xml_tools(arch, name),
+                xml,
+                "{name} on {arch}: wrong tool dialect -- the prompt would be \
+                 rendered in one dialect and parsed in the other"
+            );
+            assert_eq!(
+                !cue_is_plain(arch, name),
+                thinks,
+                "{name} on {arch}: wrong thinking channel"
             );
         }
     }
