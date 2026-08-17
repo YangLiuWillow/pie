@@ -384,13 +384,22 @@ async def test_chunking_is_exact_in_logprobs(client, args):
     therefore compares PARTITION AGAINST PARTITION. To compare against a true
     one-shot fire, the prompt must fit inside `max_embed_length()`.
 
-    Mechanism (established by the pie-opencode session on Metal, and it refuted
-    the kernel-selection hypothesis this docstring used to carry -- a kernel
-    trace shows identical selection across nine widths with eight distinct
-    results): for a token at position p in chunk [b, e), attention reads keys
-    below b from the paged cache and keys in [b, p] from that fire's own freshly
-    written KV. Moving the boundary moves that split, the online softmax
-    accumulates in a different order, and float addition is not associative.
+    Mechanism: FIRE SHAPE. The row count sets how the attention kernel tiles its
+    queries and the fire's own kv_len sets the key extent it walks, so a
+    2048-row fire and a 32-row fire reduce the same keys in different groupings,
+    and float addition is not associative. It propagates because chunk i's
+    hidden states ARE chunk i's KV, which every later chunk reads.
+
+    Two wrong mechanisms preceded that one, both recorded so a reader does not
+    re-derive them. (1) Shape-gated KERNEL SELECTION -- refuted by a kernel trace
+    showing identical selection across nine chunk widths with eight distinct
+    results. (2) A FRESH-VS-CACHED split, in which attention supposedly read keys
+    below the chunk base from pages and keys inside the chunk from the fire's own
+    freshly written KV -- refuted because pie has no such split: KvAppend
+    precedes Sdpa in the shared per-token DAG (metal decode_step.hpp:133-134),
+    and the CUDA driver appends K/V into the paged cache inside the projection
+    pass (split_packed.hpp:36). Every fire writes KV to pages first, then attends
+    over pages uniformly.
 
     So the difference is expected numerical behaviour of chunked attention over
     a paged cache, not a correctness bug, and removing it would mean forcing a
@@ -453,9 +462,10 @@ async def test_chunking_is_exact_in_logprobs(client, args):
         "Do NOT fix this by loosening the tolerance: warm repeats of a fixed "
         "partition are bit-identical, so the floor really is zero and the "
         "difference really is the partition. The cause is reduction order -- "
-        "moving a chunk boundary moves the split between keys read from the "
-        "paged cache and keys read from the fire's own fresh KV, and float "
-        "addition is not associative. Note the reference arm is the driver's "
+        "the fire's row count sets the attention kernel's query tiling and its "
+        "kv_len sets the key extent, so a different partition reduces the same "
+        "keys in different groupings, and float addition is not associative. "
+        "Note the reference arm is the driver's "
         "DEFAULT partition, not a one-shot fire (prefill_chunks clamps to "
         "max_embed_length), so widths above that capacity will read 0.000000 "
         "by identity rather than by equivalence."
