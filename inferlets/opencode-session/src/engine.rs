@@ -299,6 +299,7 @@ impl BindState for inferlet::ptir::hybrid::ForwardPass {
 /// point on a multi-thousand-token prompt). `on_token` receives each accepted
 /// token and owns all stop policy; `Break` ends the turn.
 pub async fn generate(
+    pipe: &Pipeline,
     resume: Resume,
     delta: &[u32],
     cue: &[u32],
@@ -310,6 +311,7 @@ pub async fn generate(
     match model::pass_kind() {
         model::ForwardKind::Attention => {
             generate_for::<WitAttention>(
+                pipe,
                 resume,
                 delta,
                 cue,
@@ -322,6 +324,7 @@ pub async fn generate(
         }
         model::ForwardKind::Hybrid => {
             generate_for::<WitHybrid>(
+                pipe,
                 resume,
                 delta,
                 cue,
@@ -342,6 +345,7 @@ pub async fn generate(
 }
 
 async fn generate_for<W>(
+    pipe: &Pipeline,
     resume: Resume,
     delta: &[u32],
     cue: &[u32],
@@ -356,7 +360,6 @@ where
 {
     let t0 = std::time::Instant::now();
     let page_t = kv_page_size();
-    let pipe = Pipeline::new();
 
     // Fresh, forked, or extended in place — see `Resume` for why the last one
     // exists and when it is the only option that runs.
@@ -487,7 +490,7 @@ where
     // Nothing here samples: the read-out rows are mid-prompt. The turn's first
     // token comes from the cue, in phase 2.
     prefill_span::<W>(
-        &pipe,
+        pipe,
         &state,
         n0,
         delta,
@@ -545,14 +548,14 @@ where
     let retain_rs: Vec<RsWorkingSet> = state
         .rs
         .iter()
-        .map(|r| r.fork(&pipe))
+        .map(|r| r.fork(pipe))
         .collect::<Result<_>>()
         .context("rs.fork (retention snapshot)")?;
     let recurrent = !state.rs.is_empty();
 
     // ── 3. Prefill the cue and sample the turn's first token ─────────────
     let g0 = prefill_span::<W>(
-        &pipe,
+        pipe,
         &state,
         render_len,
         cue,
@@ -717,7 +720,7 @@ where
                 sink.put(&tok);
                 rng.put(&r_next);
             });
-            if let Err(e) = submit_frame(&pipe, &[Some(&fwd)]) {
+            if let Err(e) = submit_frame(pipe, &[Some(&fwd)]) {
                 gen_error = Some(e);
                 break;
             }
@@ -812,8 +815,13 @@ where
         eprint!("{line}");
     }
 
-    // Close releases the scheduler wait-set and rejects further submissions.
-    pipe.close();
+    // The pipeline is CALLER-OWNED and outlives the turn. The caller parks it
+    // after a successful turn — leaving the frame wait-set without running
+    // down `submit_deadline`, so the next turn's submit rejoins instead of
+    // paying a cold lane join — and drops it after a failed one, because a
+    // pipeline failure is sticky and every later submit on it would inherit
+    // the reason. This used to be `pipe.close()` here, which made every turn
+    // open and tear down its own pipeline.
 
     // Retain the SNAPSHOT, not the state generation just advanced. KV needs
     // nothing done to it — the scratch cells past `render_len` are simply never

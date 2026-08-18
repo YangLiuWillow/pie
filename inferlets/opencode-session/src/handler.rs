@@ -204,6 +204,18 @@ pub struct Daemon {
     specials: Vec<String>,
     /// Chat stop set, plus the turn-START marker.
     stop_ids: Vec<u32>,
+    /// The submission pipeline, PROCESS-lived rather than turn-lived. Parked
+    /// between turns (`Pipeline::park` — leaves the frame wait-set without
+    /// running down `submit_deadline`, and a parked lane is never killed by
+    /// the silence timeout), so the next turn's first submit rejoins instead
+    /// of paying a cold lane join per turn — a cost that lands in TTFT, the
+    /// column the A-vs-B comparison is quoted on.
+    ///
+    /// `None` after a failed turn: a pipeline failure is sticky (every later
+    /// submit inherits the reason), so the failed pipeline is dropped — drop
+    /// closes it, and already-submitted fires still drain — and the next turn
+    /// starts a fresh one.
+    pipe: Option<inferlet::ptir::Pipeline>,
 }
 
 impl Daemon {
@@ -237,6 +249,7 @@ impl Daemon {
             counter: 0,
             specials,
             stop_ids,
+            pipe: None,
         }
     }
 
@@ -543,6 +556,9 @@ impl Daemon {
         // because the resumed prefix is already resident.
         self.enforce_retention(delta.len() as u32 + cue.len() as u32 + max_tokens as u32);
 
+        // The process-lived pipeline: taken for the turn, parked and put back
+        // on success, dropped on any failure (see the field doc).
+        let pipe = self.pipe.take().unwrap_or_default();
         let run = {
             let resume = match owned_parent.take() {
                 Some(r) => engine::Resume::InPlace(r.state, cached_tokens),
@@ -550,6 +566,7 @@ impl Daemon {
             };
             let st = &mut state;
             engine::generate(
+                &pipe,
                 resume,
                 &delta,
                 &cue,
@@ -571,6 +588,8 @@ impl Daemon {
         let run = match run {
             Ok(g) => g,
             Err(e) => {
+                // `pipe` drops here: a setup failure may have poisoned it, and
+                // a pipeline failure is sticky. The next turn starts fresh.
                 eprintln!("[opencode-session] generation setup failed: {e}");
                 self.degrade(&sink, &mut state, streaming, include_usage);
                 return;
@@ -578,6 +597,12 @@ impl Daemon {
         };
         if let Some(e) = &run.gen_error {
             eprintln!("[opencode-session] generation degraded to length-finish: {e}");
+        } else {
+            // A clean turn keeps its pipeline. Park FIRST: a lane that goes
+            // silent without parking is eventually terminated by the silence
+            // timeout, and the gap to the next user turn is unbounded.
+            pipe.park();
+            self.pipe = Some(pipe);
         }
 
         state.flush_tail();

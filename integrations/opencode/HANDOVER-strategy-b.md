@@ -120,7 +120,30 @@ If the failures need more than one conversation it is seats, not fork, and the
 fork/fold experiment in `finding-inferlet-killed-at-large-context.md` §10 is not
 worth building.
 
-### 3.2 `park()` — unused in the whole crate
+### 3.2 DONE 2026-08-18, with a null result — `park()` is in, the TTFT attribution was wrong
+
+> Implemented: the pipeline is process-lived (the daemon owns it, parks it
+> after a clean turn, drops it after a failed one — a pipeline failure is
+> sticky). Correct under a full ramp (28 park/rejoin cycles, same 61,711
+> reach, zero faults) and a swebench instance (patch produced, 17 refusals
+> and a pool-pressure branch drop on one pipeline, zero faults).
+>
+> MEASURED: no TTFT movement. Per-turn prefill delta park−base averages
+> +9 ms over 28 matched turns; decode span +0.1 ms. The premise below was
+> wrong about WHERE seed binding is paid: instantiation is per **Pass** —
+> every fire builds a fresh `Pass::new()` and sends its seeds — so pipeline
+> lifetime cannot skip it. The only pipeline-level cost is the frame lane
+> join, which measures below noise at 2.2k-token prefills.
+>
+> The real seed-binding item is PASS reuse — "steady-state resubmits carry
+> only the identity hash" applies to resubmitting the SAME pass, which the
+> decode loop never does (fresh pass per token, seeded `pages_d` channel of
+> pool size each time). That is adjacent to the open decode gap (21.8 vs
+> 39.3 tok/s, same kernel) and sits in the decode loop liszt-ai-00 owns.
+> A process-lived pipeline is the prerequisite for it and is now in place.
+> The original section follows.
+
+### 3.2-as-handed-over: `park()` — unused in the whole crate
 
 `engine.rs:356` opens `Pipeline::new()` per turn and closes it at `:746`.
 `submit`'s contract: the first submit of a pass binds seeds, steady-state
