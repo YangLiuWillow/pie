@@ -258,3 +258,54 @@ ends in a 503; that is honest, but the harness must be seen to handle it.
 
 Strategy A is still **UNTESTED** against any of this. `ramp_context.py`
 against a `PIE_STRATEGY=a` boot would settle it cheaply.
+
+---
+
+## 10. OPEN: a second fold-drift class — is `RsWorkingSet::fork` copy-on-write?
+
+Two poison epochs survive the earlier-boundary fix (§ commit
+`1f0aeee3b`), and they are a different mechanism:
+
+```
+instance 5126 launch failed: recurrent slot 1 is at position 806, this fire starts at 768
+instance 5878 launch failed: recurrent slot 0 is at position 789, this fire starts at 768
+```
+
+Gaps of 38 and 21 tokens against a fire starting at 768. Small, and about the
+size of one cue plus one generation (`cue=7`, so 7+31 and 7+14).
+
+**Where the retained fold is supposed to come from.** `engine.rs` no longer
+buffers-and-discards — that scheme was CUDA-only and silently no-op'd on Metal.
+Generation now FOLDS normally, and retention instead takes a `fork` of the rs
+working set *before a single scratch token is written*:
+
+```rust
+let retain_rs: Vec<RsWorkingSet> = state.rs.iter().map(|r| r.fork(&pipe))...
+```
+
+So the retained fold should stand at `render_len` while the live state folds on
+through cue and generation.
+
+**The hypothesis.** `working-set.wit` specifies that fork as lazy
+copy-on-write: "the first fold/write on a shared folded or buffered slab copies
+the relevant object before mutation". If the parent instead folds IN PLACE on a
+shared slab, the child's fold advances with it — and the retained state would
+sit exactly one cue+generation ahead of `render_len`, which is what these two
+measurements show.
+
+That is a hypothesis with a matching signature, NOT a confirmed cause. It has
+not been tested.
+
+**How to test it, without an agent.** Fork an rs working set, fold `n` tokens
+into the PARENT, then fire a continuation from the CHILD at the pre-fork
+position. If fork is CoW the child continues cleanly; if the parent folded in
+place the driver refuses with `recurrent slot ... is at position X, this fire
+starts at Y` and `Y + n == X`. `driver/metal/tests/executor_geometry_test.cpp`
+already pins the sibling invariant (`rebase_linear_sequence`) and is the
+natural home.
+
+**Why it matters more than its frequency suggests.** Nothing clears a poison
+epoch. Each occurrence can end the process, and the agent harness retries over
+it, so the only trace is a `launch failed` line in the engine log and a
+`prefill take: channel is poisoned` in the shim log. Two landed in a
+five-minute run whose three trajectories all reported success.
