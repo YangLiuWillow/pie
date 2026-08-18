@@ -201,6 +201,10 @@ SHAPES = {
                       result("c1", "# Title"),
                       {"role": "assistant", "content": "Listing.", "tool_calls": [R2]},
                       result("c2", "a\nb")], TOOLS),
+    # `agent_loop_3` was here and is gone: its catch profile was IDENTICAL to
+    # `agent_loop_2` across every mutation, so a third round detected nothing a
+    # second did not. Run `--mutation-matrix` before adding a shape, and again
+    # before keeping one.
     # A post-query assistant turn with NO tool calls. Rare in an agent loop --
     # a text-only reply usually ends the turn and a user message follows it --
     # and it is exactly the case a `reasoning-header` flag carried only on the
@@ -223,15 +227,27 @@ SHAPES = {
                             result("c1", "# Title"),
                             {"role": "assistant", "content": "", "tool_calls": [R2]},
                             result("c2", "a\nb")], TOOLS),
-    "agent_loop_3": ([{"role": "system", "content": SYS},
-                      {"role": "user", "content": "Investigate"},
-                      {"role": "assistant", "content": "Reading.", "tool_calls": [R1]},
-                      result("c1", "# Title"),
-                      {"role": "assistant", "content": "", "tool_calls": [R2]},
-                      result("c2", "a\nb"),
-                      {"role": "assistant", "content": "One more.", "tool_calls": [R1]},
-                      result("c1", "# Title again")], TOOLS),
 }
+
+
+def render_batch(binary, tokenizer_json, bodies, env):
+    """All of an arm's cells in ONE invocation.
+
+    `render-tokens` parses the tokenizer once per process, and an 11-20 MB
+    `tokenizer.json` costs ~0.7 s. Spawning per cell spends that 140 times a
+    run; batching spends it five times, once per arm.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(bodies, fh)
+        path = fh.name
+    try:
+        proc = subprocess.run([binary, str(tokenizer_json), path],
+                              capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            return None, proc.stderr
+        return json.loads(proc.stdout), None
+    finally:
+        os.unlink(path)
 
 
 def hf_tools(tools):
@@ -266,6 +282,119 @@ def hf_messages(messages):
     return out
 
 
+# Every renderer fact the harness can deliberately break. Keep in step with
+# `PARITY_MUTATE` in render-tokens: a fact with no mutation here is a fact the
+# suite cannot prove it checks.
+MUTATIONS = [
+    "system_before_tools", "empty_reasoning_header", "generation_suffix",
+    "tool_response_trailing_newline", "coder_schema", "thinking_off_suffix",
+    "drop_empty_system", "ignore_is_last", "header_on_pre_query",
+]
+
+
+def mutation_matrix(a, arms, shapes, mutations, AutoTokenizer):
+    """Which shapes catch which deliberate mistake.
+
+    The point is not coverage for its own sake. A shape that catches nothing
+    another shape does not catch is REDUNDANT and should go -- `agent_loop_3`
+    went that way, its profile identical to `agent_loop_2`. A mutation no shape
+    catches is a HOLE: the suite cannot tell that fact is wrong.
+
+    Tokenizers load once here. Sweeping by invoking the whole harness per
+    (mutation, shape) reloads them 126 times and takes longer than the sweep
+    deserves.
+    """
+    loaded = []
+    for arm, cache_dir, deploy_name, *rest in arms:
+        snaps = glob.glob(f"{HUB}/{cache_dir}/snapshots/*/")
+        if not snaps:
+            continue
+        snap = pathlib.Path(snaps[0])
+        tok = AutoTokenizer.from_pretrained(str(snap), local_files_only=True)
+        # The reference does not depend on the mutation, so render it ONCE for
+        # the whole sweep instead of nine times.
+        refs = {}
+        for name, (messages, tools) in shapes.items():
+            for thinking in (False, True):
+                txt = tok.apply_chat_template(
+                    hf_messages(messages), tools=hf_tools(tools),
+                    add_generation_prompt=True, enable_thinking=thinking,
+                    tokenize=False)
+                refs[(name, thinking)] = tok(txt, add_special_tokens=False)["input_ids"]
+        loaded.append((
+            arm, deploy_name, tok, snap / "tokenizer.json",
+            "qwen" if (rest and rest[0] == "qwen") else "shipped", refs,
+        ))
+
+    names = list(shapes)
+    print(f"\n{'':<32}" + "".join(f"{i + 1:>3}" for i in range(len(names))))
+    for i, n in enumerate(names):
+        print(f"  {i + 1:>2}  {n}")
+    print()
+
+    caught = {m: set() for m in mutations}
+    for m in mutations:
+        # ONE invocation per (mutation, arm) covering every shape, not one per
+        # (mutation, shape, arm). Same batching argument as the main run: with
+        # 9 mutations that is 45 tokenizer parses instead of 630.
+        for arm, deploy, tok, tokenizer_json, cs, refs in loaded:
+            order = [(n, t) for n in names for t in (False, True)]
+            bodies = []
+            for name, thinking in order:
+                messages, tools = shapes[name]
+                b = {"model": deploy, "messages": messages,
+                     "chat_template_kwargs": {"enable_thinking": thinking}}
+                if tools:
+                    b["tools"] = tools
+                bodies.append(b)
+            env = dict(os.environ, PARITY_MODEL_NAME=deploy,
+                       PARITY_CODER_SCHEMA=cs, PARITY_MUTATE=m)
+            got, _ = render_batch(a.bin, tokenizer_json, bodies, env)
+            if got is None:
+                caught[m].update(names)
+                continue
+            for (name, thinking), ids in zip(order, got):
+                if ids != refs[(name, thinking)]:
+                    caught[m].add(name)
+
+    for m in mutations:
+        row = "".join("  X" if n in caught[m] else "  ." for n in names)
+        print(f"{m:<32}{row}")
+
+    print()
+    holes = [m for m in mutations if not caught[m]]
+    if holes:
+        print("HOLES -- no shape detects these, the suite cannot see them wrong:")
+        for m in holes:
+            print(f"  {m}")
+    # Which shapes would a MINIMAL suite keep? Greedy set cover: repeatedly
+    # take the shape catching the most still-uncaught mutations.
+    #
+    # "Is this subsumed by some other shape" is the wrong question and gives a
+    # useless answer -- four shapes that all catch the same four mutations each
+    # subsume the others, so all four get flagged when you need to keep one.
+    per_shape = {n: {m for m in mutations if n in caught[m]} for n in names}
+    need = {m for m in mutations if caught[m]}
+    keep = []
+    while need:
+        best = max(names, key=lambda n: len(per_shape[n] & need))
+        if not (per_shape[best] & need):
+            break
+        keep.append(best)
+        need -= per_shape[best]
+    extra = [n for n in names if n not in keep]
+    print(f"A MINIMAL suite for these mutations is {len(keep)} shape(s): "
+          f"{', '.join(keep)}")
+    if extra:
+        print("The rest catch nothing the minimal set misses BY THIS MUTATION")
+        print("SET -- which is not the same as useless. Read each shape's own")
+        print("comment before deleting: a shape may guard a bug no mutation")
+        print("here expresses, and the mutation is then the thing to add.")
+        for n in extra:
+            print(f"    {n:<30} {sorted(per_shape[n]) or 'catches nothing'}")
+    return 0 if not holes else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -273,6 +402,10 @@ def main():
     ap.add_argument("--shape", action="append", default=[])
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print the first divergence for each failing cell")
+    ap.add_argument("--mutation-matrix", action="store_true",
+                    help="sweep every renderer mutation and report which shapes "
+                         "catch it; a shape catching nothing another does not is "
+                         "redundant, a mutation nothing catches is a hole")
     a = ap.parse_args()
 
     try:
@@ -283,6 +416,10 @@ def main():
 
     arms = [x for x in ARMS if not a.arm or x[0] in a.arm]
     shapes = {k: v for k, v in SHAPES.items() if not a.shape or k in a.shape}
+
+    if a.mutation_matrix:
+        return mutation_matrix(a, arms, shapes, MUTATIONS, AutoTokenizer)
+
     rows, total_ok, total = [], 0, 0
 
     for arm, cache_dir, deploy_name, *rest in arms:
@@ -298,6 +435,21 @@ def main():
 
         ok = 0
         cells = len(shapes) * 2
+        # One invocation for the whole arm; see `render_batch`.
+        order = [(n, t) for n in shapes for t in (False, True)]
+        bodies = []
+        for name, thinking in order:
+            messages, tools = shapes[name]
+            b = {"model": deploy_name, "messages": messages,
+                 "chat_template_kwargs": {"enable_thinking": thinking}}
+            if tools:
+                b["tools"] = tools
+            bodies.append(b)
+        env = dict(os.environ, PARITY_MODEL_NAME=deploy_name,
+                   PARITY_CODER_SCHEMA=coder_schema)
+        batched, batch_err = render_batch(a.bin, tokenizer_json, bodies, env)
+        by_cell = dict(zip(order, batched)) if batched else {}
+
         for name, (messages, tools) in shapes.items():
             for thinking in (False, True):
                 total += 1
@@ -310,25 +462,12 @@ def main():
                 # The mode travels in the REQUEST, the same way a real client
                 # sends it and the same way `plan_render` reads it. It was an
                 # env var while `cue`/`cue-no-think` were two WIT functions.
-                body = {"model": deploy_name, "messages": messages,
-                        "chat_template_kwargs": {"enable_thinking": thinking}}
-                if tools:
-                    body["tools"] = tools
-                with tempfile.NamedTemporaryFile("w", suffix=".json",
-                                                 delete=False) as fh:
-                    json.dump(body, fh)
-                    req = fh.name
-                env = dict(os.environ, PARITY_MODEL_NAME=deploy_name,
-                           PARITY_CODER_SCHEMA=coder_schema)
-                proc = subprocess.run([a.bin, str(tokenizer_json), req],
-                                      capture_output=True, text=True, env=env)
-                os.unlink(req)
-                if proc.returncode != 0:
+                pie_ids = by_cell.get((name, thinking))
+                if pie_ids is None:
                     if a.verbose:
                         print(f"  [{arm}/{name}/think={thinking}] BIN ERROR\n"
-                              f"{proc.stderr[:400]}")
+                              f"{(batch_err or '')[:400]}")
                     continue
-                pie_ids = json.loads(proc.stdout)
                 if pie_ids == hf_ids:
                     ok += 1
                     total_ok += 1

@@ -37,17 +37,31 @@ fn main() -> Result<()> {
     // Accept either a raw request body or a wire-capture fixture wrapper.
     let raw = std::fs::read_to_string(&args[2])
         .with_context(|| format!("reading request from {}", args[2]))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw).context("parsing request JSON")?;
-    if let Some(body) = value.get("body") {
-        value = match body {
-            serde_json::Value::String(s) => {
-                serde_json::from_str(s).context("parsing fixture .body string")?
+    // A JSON ARRAY is a batch: every element is rendered with the SAME
+    // tokenizer and config, and the output is an array of id arrays in the same
+    // order. Parsing an 11-20 MB `tokenizer.json` costs ~0.7 s and the parity
+    // suite has 140 cells; one invocation per arm instead of one per cell is
+    // the difference between a 100 s run and a 4 s one.
+    let parsed: serde_json::Value = serde_json::from_str(&raw).context("parsing request JSON")?;
+    let bodies: Vec<serde_json::Value> = match parsed {
+        serde_json::Value::Array(v) => v,
+        other => vec![other],
+    };
+    let batch = bodies.len() > 1 || matches!(
+        serde_json::from_str::<serde_json::Value>(&raw), Ok(serde_json::Value::Array(_)));
+    let requests: Vec<ChatCompletionRequest> = bodies
+        .into_iter()
+        .map(|mut value| {
+            if let Some(body) = value.get("body") {
+                value = match body {
+                    serde_json::Value::String(s) => serde_json::from_str(s)
+                        .context("parsing fixture .body string")?,
+                    other => other.clone(),
+                };
             }
-            other => other.clone(),
-        };
-    }
-    let request: ChatCompletionRequest =
-        serde_json::from_value(value).context("deserializing ChatCompletionRequest")?;
+            serde_json::from_value(value).context("deserializing ChatCompletionRequest")
+        })
+        .collect::<Result<_>>()?;
 
     // The exact config `model/src/instruct.rs::create` binds for "qwen3" —
     // including the tool dialect, which is decided by that module's OWN
@@ -72,6 +86,11 @@ fn main() -> Result<()> {
     // recognised by its DEPLOYMENT name -- which is what the fixtures carry.
     let tool_dialect = pie_model::instruct::tool_dialect(&model_name, &model_name);
     eprintln!("[render-tokens] coder={coder} tool_dialect={tool_dialect:?} (from {model_name})");
+    // Mutation switch: flip ONE renderer fact so the parity suite can be asked
+    // which shapes actually catch which mistake. A shape that catches nothing
+    // no other shape catches is redundant; a mutation no shape catches is a
+    // hole. Test-only, and never set in a real run.
+    let mutate = std::env::var("PARITY_MUTATE").unwrap_or_default();
     let instruct = QwenInstruct::new(
         tokenizer.clone(),
         ChatMLConfig {
@@ -81,45 +100,72 @@ fn main() -> Result<()> {
             // Mirrors the registry: only Qwen3.5/3.6 leads with the tools
             // block. Derived here rather than hardcoded, so the harness cannot
             // certify an ordering the server does not use.
-            system_before_tools: !matches!(tool_dialect, ToolDialect::Qwen35Xml),
-            empty_reasoning_header: matches!(tool_dialect, ToolDialect::Qwen35Xml),
+            system_before_tools: !matches!(tool_dialect, ToolDialect::Qwen35Xml)
+                ^ (mutate == "system_before_tools"),
+            empty_reasoning_header: matches!(tool_dialect, ToolDialect::Qwen35Xml)
+                ^ (mutate == "empty_reasoning_header"),
             // Mirrors the registry: Qwen3.5/3.6 opens the turn inside a
             // reasoning block, Qwen3 opens it bare.
-            generation_suffix: if matches!(tool_dialect, ToolDialect::Qwen35Xml) {
+            generation_suffix: if matches!(tool_dialect, ToolDialect::Qwen35Xml)
+                ^ (mutate == "generation_suffix")
+            {
                 "<think>\n"
             } else {
                 ""
             },
-            tool_response_trailing_newline: matches!(tool_dialect, ToolDialect::Coder),
+            tool_response_trailing_newline: matches!(tool_dialect, ToolDialect::Coder)
+                ^ (mutate == "tool_response_trailing_newline"),
             // The harness picks per arm, which is exactly the operator choice
             // the field models: PARITY_CODER_SCHEMA=qwen renders Qwen's
             // published variant, anything else the mlx/GGUF one.
-            coder_schema: if std::env::var("PARITY_CODER_SCHEMA").as_deref() == Ok("qwen") {
+            coder_schema: if (std::env::var("PARITY_CODER_SCHEMA").as_deref() == Ok("qwen"))
+                ^ (mutate == "coder_schema")
+            {
                 CoderSchema::QwenMain
             } else {
                 CoderSchema::MlxGguf
             },
-            thinking_off_suffix: "<think>\n\n</think>\n\n",
+            thinking_off_suffix: if mutate == "thinking_off_suffix" {
+                ""
+            } else {
+                "<think>\n\n</think>\n\n"
+            },
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },
     );
 
-    let ops = plan_render(&request).map_err(|e| anyhow::anyhow!("plan_render: {e}"))?;
+    let mut all: Vec<Vec<u32>> = Vec::with_capacity(requests.len());
+    for request in &requests {
+    let ops = plan_render(request).map_err(|e| anyhow::anyhow!("plan_render: {e}"))?;
 
     let mut ids: Vec<u32> = Vec::new();
     for op in &ops {
         let toks = match op {
             RenderOp::EquipAfterSystem { system, tools } => {
-                instruct.equip_after_system(system.as_deref(), tools)
+                // `drop_empty_system` restores the `text_opt()` behaviour that
+                // normalised a `content: ""` system turn out of existence.
+                let system = match system.as_deref() {
+                    Some("") if mutate == "drop_empty_system" => None,
+                    other => other,
+                };
+                instruct.equip_after_system(system, tools)
             }
             RenderOp::User(msg) => instruct.user(msg),
-            RenderOp::Assistant(msg, p) => instruct.assistant_at(msg, p.after_query, p.is_last),
+            // Positional mutations act on the OP STREAM, so the serving crate
+            // needs no test hooks: `ignore_is_last` forgets which turn is
+            // final, `header_on_pre_query` claims every replayed turn follows
+            // the query.
+            RenderOp::Assistant(msg, p) => instruct.assistant_at(
+                msg,
+                p.after_query || mutate == "header_on_pre_query",
+                p.is_last && mutate != "ignore_is_last",
+            ),
             RenderOp::AssistantWithToolCalls { content, calls, pos } => instruct
                 .assistant_with_tool_calls_at(
                     content.as_deref(),
                     calls,
-                    pos.after_query,
-                    pos.is_last,
+                    pos.after_query || mutate == "header_on_pre_query",
+                    pos.is_last && mutate != "ignore_is_last",
                 ),
             RenderOp::AnswerBatch(results) => instruct.answer_batch(results),
             // The mode rides on the op, set by the request's
@@ -132,10 +178,17 @@ fn main() -> Result<()> {
         };
         ids.extend(toks);
     }
+        all.push(ids);
+    }
 
-    println!("{}", serde_json::to_string(&ids)?);
-    // Decoded prompt (special tokens kept) to stderr for eyeballing diffs.
-    let decoded = tokenizer.decode(&ids, false);
-    std::io::stderr().write_all(decoded.as_bytes())?;
+    if batch {
+        println!("{}", serde_json::to_string(&all)?);
+    } else {
+        println!("{}", serde_json::to_string(&all[0])?);
+        // Decoded prompt (special tokens kept) to stderr for eyeballing diffs.
+        // Only for a single request -- interleaving N of them helps nobody.
+        let decoded = tokenizer.decode(&all[0], false);
+        std::io::stderr().write_all(decoded.as_bytes())?;
+    }
     Ok(())
 }
