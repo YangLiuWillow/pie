@@ -188,6 +188,42 @@ impl DriverBackend {
     }
 
     pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+        // Every program that reaches a driver passes through HERE, which is
+        // why the probe lives at this funnel and not at one of the several
+        // callers. The Metal driver's cache holds 64 shapes and never evicts
+        // (`kMaxProgramCacheEntries`), so each distinct container spends a
+        // budget that never returns; logging the DECODED container is what
+        // says which field is varying per turn.
+        if tracing::enabled!(tracing::Level::INFO) {
+            let shape = pie_ir::container::decode(&desc.reference_ptir)
+                .map(|c| {
+                    let chans = c
+                        .channels
+                        .iter()
+                        .map(|d| format!("{:?}x{}", d.shape, d.capacity))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let ports = c
+                        .ports
+                        .iter()
+                        .map(|p| format!("{p:?}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "stages={} chans=[{}] ports=[{}]",
+                        c.stages.len(),
+                        chans,
+                        ports
+                    )
+                })
+                .unwrap_or_else(|e| format!("<undecodable: {e:?}>"));
+            tracing::info!(
+                target: "pie::progcache",
+                program_hash = format_args!("0x{:016x}", desc.program_hash),
+                %shape,
+                "driver program registration"
+            );
+        }
         // Attach whatever this driver reads and the caller did not already
         // supply. Generation is memoised per program per backend, so a
         // re-registration costs a lookup.

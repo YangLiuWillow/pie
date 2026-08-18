@@ -438,7 +438,13 @@ where
     const POOL_GRANULARITY: u32 = 256;
     /// The step used once quantizing at the coarse one would reach past
     /// `QUANTIZE_BELOW_PERCENT` of the pool.
-    const TOP_GRANULARITY: u32 = 64;
+    ///
+    /// Sized by the DRIVER's program budget, not by taste -- see
+    /// `pool_shape_budget_fits_the_driver_program_cache`. Every distinct value
+    /// this produces costs `PROGRAMS_PER_POOL_SHAPE` cache entries, and the
+    /// cache holds 64 and never evicts. 64 here was measured at 65 entries and
+    /// overflowed by exactly one.
+    const TOP_GRANULARITY: u32 = 128;
     /// Where the step narrows. Below the gate's 94.1% saturation point by more
     /// than one `TOP_GRANULARITY`, so the rounding itself can never be what
     /// saturates the pool.
@@ -1013,5 +1019,104 @@ mod aligned_chunk_tests {
         // add a fire and buy nothing.
         assert_eq!(aligned_prefill_chunks(5, 2048), vec![(0, 5)]);
         assert_eq!(aligned_prefill_chunks(15, 2048), vec![(0, 15)]);
+    }
+}
+
+#[cfg(test)]
+mod pool_shape_tests {
+    /// Mirrors `pool_pages_want` in `generate`. Kept as a copy on purpose: the
+    /// real one reads `kv_pool_status()` over the WIT boundary, which does not
+    /// exist in a unit test, and the arithmetic is the whole subject here.
+    fn pool_pages_want(need_pages: u32, pool_total: u32) -> u32 {
+        const POOL_GRANULARITY: u32 = 256;
+        const TOP_GRANULARITY: u32 = 128;
+        const QUANTIZE_BELOW_PERCENT: u32 = 85;
+        let coarse = need_pages.next_multiple_of(POOL_GRANULARITY);
+        if pool_total == 0 || coarse <= pool_total * QUANTIZE_BELOW_PERCENT / 100 {
+            coarse
+        } else {
+            need_pages.next_multiple_of(TOP_GRANULARITY)
+        }
+    }
+
+    /// Distinct reservations one conversation produces as it grows to fill the
+    /// pool. Each is a different `pages_p` channel length, hence a different
+    /// program container, hence a cache entry per fire shape.
+    fn distinct_pool_shapes(pool_total: u32, page: u32, max_tokens: u32, step: u32) -> Vec<u32> {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut n = step;
+        while n < pool_total * page {
+            let need = (n + max_tokens + 2).div_ceil(page);
+            let want = pool_pages_want(need, pool_total);
+            if want > pool_total {
+                break;
+            }
+            if !seen.contains(&want) {
+                seen.push(want);
+            }
+            n += step;
+        }
+        seen
+    }
+
+    /// The reservation's quantization is bounded by a DRIVER resource, and
+    /// nothing in the build says so -- which is how the last tuning of it
+    /// shipped, overflowing the cache by exactly one entry and turning a turn
+    /// into an empty completion eight minutes into a run.
+    ///
+    /// The two constants are measured, not assumed:
+    ///
+    /// * `DRIVER_PROGRAM_CACHE` is `kMaxProgramCacheEntries` in
+    ///   `driver/metal/src/pipeline/m1_runtime.cpp`. It NEVER evicts, so this
+    ///   is a whole-process budget, not a working set.
+    /// * `PROGRAMS_PER_POOL_SHAPE` is 5, measured by logging every decoded
+    ///   container at the driver funnel: the container binds the `pages_p`
+    ///   length together with the fire's token count, so the cache holds their
+    ///   CROSS PRODUCT. One conversation registers fire shapes
+    ///   [1024, 152, ~3, 7, 1] against each distinct pool size.
+    ///
+    /// A failure here means a retune spends a budget it cannot see. Fix it by
+    /// widening the step -- or by breaking the cross product, which is the
+    /// real repair and would make this test's factor 1 instead of 5.
+    #[test]
+    fn pool_shape_budget_fits_the_driver_program_cache() {
+        const DRIVER_PROGRAM_CACHE: usize = 64;
+        const PROGRAMS_PER_POOL_SHAPE: usize = 5;
+
+        // The measured deployment: 2048 pages of 32, `max_model_len` 65,536.
+        let shapes = distinct_pool_shapes(2048, 32, 4096, 2204);
+        let programs = shapes.len() * PROGRAMS_PER_POOL_SHAPE;
+        assert!(
+            programs <= DRIVER_PROGRAM_CACHE,
+            "one conversation reserves {} distinct pool sizes {shapes:?}, costing \
+             {programs} of the driver's {DRIVER_PROGRAM_CACHE} program cache entries \
+             ({PROGRAMS_PER_POOL_SHAPE} per pool size). The cache does not evict, so \
+             the overflow is permanent for the process and the turn comes back as an \
+             empty completion.",
+            shapes.len()
+        );
+
+        // Growth has to stay coarse where it is cheap: a fine step from the
+        // start would spend the budget long before the pool filled.
+        assert!(
+            shapes.len() <= 12,
+            "too many pool shapes before the cross product is even applied: {shapes:?}"
+        );
+    }
+
+    /// The reason the fine step exists at all: the coarse one rounds the last
+    /// bucket up to the WHOLE pool, which reports 100% occupied and makes the
+    /// gateway refuse the next turn.
+    #[test]
+    fn the_top_of_the_pool_is_never_reserved_whole_by_rounding() {
+        let pool = 2048u32;
+        // A turn needing 1850 pages must not reserve all 2048.
+        assert!(
+            pool_pages_want(1850, pool) < pool,
+            "rounding alone saturated the pool: {} of {pool}",
+            pool_pages_want(1850, pool)
+        );
+        // And it must still cover the demand.
+        assert!(pool_pages_want(1850, pool) >= 1850);
     }
 }
