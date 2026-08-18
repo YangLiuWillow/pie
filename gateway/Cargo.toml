@@ -70,3 +70,7 @@ clap = { version = "4.6", features = ["derive"] }
 [dev-dependencies]
 # Blob route `oneshot` tests (bravo's `blob.rs`).
 tower = { version = "0.5", features = ["util"] }
+# A real WebSocket client for `tests/ws_turn_refusal.rs`. The behaviour under
+# test is `ingress::ws::serve`'s loop -- whether a refused turn closes the
+# socket -- which only exists over a live connection.
+tokio-tungstenite = "0.30"

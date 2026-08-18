@@ -103,8 +103,27 @@ class InferletBridge:
 
     async def _connect_client(self):
         self.client = PieClient(self.pie_uri, identity=self.identity)
+        self.client.on_server_error = self._on_server_error
         await self.client.connect()
         await self.client.authenticate("session-shim")
+
+    def _on_server_error(self, message):
+        """A gateway-level refusal (e.g. admission) for the in-flight turn.
+
+        The frame carries no `req_id` — the gateway refuses a turn before
+        minting one — so it cannot be demuxed. `turn_lock` serializes turns, so
+        there is at most one in flight and attributing it is exact.
+
+        This used to be unnecessary because a refusal closed the socket and
+        killed the process, which failed every turn as a side effect. The
+        gateway now keeps the session (`gateway/tests/ws_turn_refusal.rs`), so
+        the refusal has to be delivered deliberately or the turn hangs until
+        the client gives up.
+        """
+        LOG(f"gateway refused the in-flight turn: {message}")
+        for q in list(self.queues.values()):
+            q.put_nowait(("error", {"status": 503, "error": openai_error(
+                f"pie refused the turn: {message}", "server_error")["error"]}))
 
     async def _launch(self):
         launch_input = {}
@@ -177,7 +196,13 @@ class InferletBridge:
             async with self.turn_lock:
                 if self.proc is None:
                     await self._launch()
-                await self.proc.signal(json.dumps({"req_id": req_id, "body": body}))
+                signal = json.dumps({"req_id": req_id, "body": body})
+                # The turn payload carries the WHOLE conversation, so it grows
+                # every turn. Logged because the socket dies at large context
+                # and byte size is the one axis nothing else measures
+                # (`finding-inferlet-killed-at-large-context.md`).
+                LOG(f"submit req={req_id[:8]} bytes={len(signal.encode())}")
+                await self.proc.signal(signal)
                 while True:
                     try:
                         event, data = await asyncio.wait_for(q.get(), timeout=KEEPALIVE_S)

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import json
 import msgpack
 import websockets
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .crypto import ParsedPrivateKey
+
+_LOG = logging.getLogger(__name__)
 
 
 class Event(Enum):
@@ -87,6 +90,14 @@ class PieClient:
         # Buffer for early events to prevent race conditions.
         self.orphan_events = {}
 
+        # Why the listener last stopped, for callers that only see the
+        # synthesized "connection closed" error.
+        self._last_listener_error = None
+        # The last `{"type": "error"}` the gateway sent on a text frame.
+        self._last_server_error = None
+        # Optional `fn(message: str)` called for each such frame.
+        self.on_server_error = None
+
     # Also keep old name for backward compat
     @property
     def inst_event_queues(self):
@@ -112,7 +123,20 @@ class PieClient:
         self.listener_task = asyncio.create_task(self._listen_to_server())
 
     async def _listen_to_server(self):
-        """Background task to receive and process all incoming server messages."""
+        """Background task to receive and process all incoming server messages.
+
+        When this loop ends, every `recv()` waiter is woken with a synthesized
+        `Event.Error` carrying "WebSocket connection closed" — a CLIENT-SIDE
+        string, not something the server sent. A caller that sees that payload
+        has learned the socket died, and nothing about the process.
+
+        So the reason the loop ended is the only evidence of what happened, and
+        it used to be discarded by a bare `except Exception: pass`. That made an
+        unreachable server, a close code from the peer, and a decode bug all
+        indistinguishable at the call site. It is recorded here instead, and
+        threaded into the synthesized error so the waiter sees it too.
+        """
+        reason = "listener exited normally (server closed the stream)"
         try:
             async for raw_msg in self.ws:
                 if isinstance(raw_msg, bytes):
@@ -121,14 +145,52 @@ class PieClient:
                         await self._process_server_message(message)
                     except msgpack.UnpackException:
                         pass
-        except (
-            websockets.ConnectionClosedOK,
-            websockets.ConnectionClosedError,
-            Exception,
-        ):
-            pass
+                else:
+                    # The gateway states its own failures on TEXT frames
+                    # (`gateway/src/ingress/ws.rs::error_json`) and then drops
+                    # the socket WITHOUT a close frame, so the client sees a
+                    # bare 1006 a moment later. Dropping text here discarded
+                    # the server's reason and left only that 1006 — the server
+                    # said exactly why, and nobody read it.
+                    self._note_server_text(raw_msg)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # noqa: BLE001 - the reason IS the payload
+            reason = f"{type(e).__name__}: {e}"
+            close = getattr(self.ws, "close_code", None)
+            if close is not None:
+                reason += f" (close code {close}, reason {getattr(self.ws, 'close_reason', None)!r})"
+            self._last_listener_error = reason
+            _LOG.warning("pie-client websocket listener stopped: %s", reason)
         finally:
-            self._fail_connection_waiters(ConnectionError("WebSocket connection closed"))
+            if self._last_server_error:
+                reason = f"{reason}; server said: {self._last_server_error}"
+            self._fail_connection_waiters(
+                ConnectionError(f"WebSocket connection closed: {reason}")
+            )
+
+    def _note_server_text(self, raw: str):
+        """Record a server text frame; surface `{"type":"error"}` loudly."""
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            _LOG.warning("pie-client: server text frame (unparsed): %.500s", raw)
+            return
+        if msg.get("type") == "error":
+            self._last_server_error = msg.get("message") or raw
+            _LOG.warning("pie-client: server reported an error: %s",
+                         self._last_server_error)
+            # The frame carries no `req_id` -- the gateway refuses a turn
+            # before minting one it could name -- so it cannot be demuxed
+            # here. A caller that knows how many turns it has in flight can
+            # attribute it; one that does not should at least see it.
+            if self.on_server_error is not None:
+                try:
+                    self.on_server_error(self._last_server_error)
+                except Exception:  # a bad hook must not kill the listener
+                    _LOG.exception("pie-client: on_server_error hook raised")
+        elif msg.get("type") != "turn_done":
+            _LOG.debug("pie-client: server text frame: %.500s", raw)
 
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""

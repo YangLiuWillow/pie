@@ -533,11 +533,27 @@ impl Daemon {
         // arrives at the shim as a dozen separate lines and the measurement is
         // unreadable exactly where it matters.
         let t_retain = t_entry.elapsed();
+        // Pool occupancy AFTER retaining, because that is the number the
+        // gateway's admission gate reads on the NEXT turn: it rejects when the
+        // worker's `kv_pressure_bucket` reaches 240/255 (94.1%), and a
+        // rejected turn used to take the WebSocket -- and every retained
+        // branch -- down with it. Printed per turn so the occupancy at the
+        // rejection is measured rather than inferred.
+        let (pool_avail, pool_total) = kv_pool_status();
+        let pool_pct = if pool_total == 0 {
+            0
+        } else {
+            (pool_total - pool_avail) as u64 * 100 / pool_total as u64
+        };
         let line = format!(
-            "[opencode-session] turn {} cached={cached_tokens} delta={} cue={} gen={accepted} {retained}\n",
+            "[opencode-session] turn {} cached={cached_tokens} delta={} cue={} gen={accepted} \
+             pool={}/{} ({}%) {retained}\n",
             self.counter,
             delta.len(),
-            cue.len()
+            cue.len(),
+            pool_total - pool_avail,
+            pool_total,
+            pool_pct
         );
         eprint!("{}", line);
         // Cumulative from turn entry, so each field is "everything up to here"

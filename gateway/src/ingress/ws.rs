@@ -206,12 +206,10 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                 Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => live.push(new_rx),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Message::Text(error_json(&e.to_string()).into()))
-                                .await;
-                            break;
-                        }
+                        // A refused turn is non-fatal, for the same reason a
+                        // bad frame is: report it and keep the session. See
+                        // `turn_refusal_keeps_the_session`.
+                        Err(e) => report_turn_refusal(&mut tx, &e).await,
                     },
                     Ok(Incoming::Cancel) => handle.cancel().await,
                     Err(e) => {
@@ -222,12 +220,10 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                 Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => live.push(new_rx),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Message::Text(error_json(&e.to_string()).into()))
-                                .await;
-                            break;
-                        }
+                        // A refused turn is non-fatal, for the same reason a
+                        // bad frame is: report it and keep the session. See
+                        // `turn_refusal_keeps_the_session`.
+                        Err(e) => report_turn_refusal(&mut tx, &e).await,
                     },
                     Ok(Incoming::Cancel) => handle.cancel().await,
                     Err(e) => {
@@ -308,6 +304,38 @@ fn encode(msg: &pie_client_api::ServerMessage) -> Option<Vec<u8>> {
 
 fn turn_done_json() -> String {
     "{\"type\":\"turn_done\"}".to_string()
+}
+
+/// Report a refused turn on the socket and KEEP the session.
+///
+/// This used to `break`, which ran `handle.close()` and dropped the socket —
+/// and on this gateway a dropped socket is not a dropped request, it is a
+/// dropped *process*: the worker tears the session's inferlet down and every
+/// working set it retained dies with it. A multi-turn agent then rebuilds tens
+/// of thousands of tokens of KV from cold.
+///
+/// The refusals that reach here are transient by construction. The coarse
+/// admission gate (`gateway::admission`) reports "cluster saturated" whenever
+/// the planner has ANY queued allocation — `kv_pressure_bucket` clamps to 240
+/// on `waiters != 0`, which is exactly the gate's `kv_saturate_bucket` — so one
+/// momentarily queued allocation refused the turn and killed a session holding
+/// 55k tokens of warm KV. Measured on `tools/ramp_context.py`: the turn at
+/// 57,303 tokens was refused, the socket dropped without a close frame, and the
+/// client saw a bare 1006 with no reason attached.
+///
+/// Dropping the socket is also wrong for the turns that did NOT fail: a session
+/// may have several streaming concurrently, and `break` aborted all of them
+/// because a later, unrelated turn was refused.
+///
+/// The client learns the reason from the error frame, exactly as it does for a
+/// bad frame, and may retry. Refusing a turn is the gate doing its job;
+/// destroying the session is not.
+async fn report_turn_refusal(
+    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    e: &crate::session::SessionError,
+) {
+    tracing::warn!(error = %e, "ws: turn refused (session kept)");
+    let _ = tx.send(Message::Text(error_json(&e.to_string()).into())).await;
 }
 
 fn error_json(msg: &str) -> String {
