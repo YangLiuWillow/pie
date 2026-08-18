@@ -43,11 +43,35 @@ error -- it shows up as accuracy, attributed to the engine.
 
 ## The measured baseline
 
-    arm            2026-08-17    now
-    qwen3            24/26      30/30
-    qwen3_coder      12/26      30/30
-    qwen3_5           5/26      30/30
-                                90/90
+    arm                     2026-08-17    now
+    qwen3                     24/26      30/30
+    qwen3_coder               12/26      30/30
+    qwen3_5                    5/26      30/30
+    qwen3_coder_upstream          -      10/30   <- see below
+    qwen3_5_upstream              -      30/30
+                                        130/150
+
+## "Which template" is a real question, and the answer differs per model
+
+The `_upstream` arms render against QWEN'S OWN repos rather than the
+mlx-community conversions pie actually serves. For Qwen3.6 that is the same
+file -- byte-identical, 7764 bytes -- and both tokenizers encode identically,
+so `qwen3_5_upstream` passing 30/30 says the renderer matches the model
+author's template, not merely a converter's copy of it.
+
+Qwen3-Coder is NOT the same file. mlx-community ships 6722 bytes where Qwen
+currently publishes 6211, and the difference is not cosmetic: Qwen's revision
+opens the tools turn with a `# Tools\n\n` heading that the mlx checkpoint's
+does not. Every shape declaring tools diverges by exactly those three tokens;
+every shape without tools passes. Hence 10/30.
+
+That is not a bug to fix blindly. The template shipped WITH a checkpoint is
+what that checkpoint was fine-tuned against, and it is what mlx-lm and vLLM
+execute when serving the same files -- so `qwen3_coder` at 30/30 is the number
+that governs cross-engine parity on the checkpoint under test. `10/30` says
+something different and also worth knowing: serving Qwen's own Coder repo
+would need the heading. Two references, two numbers, neither standing in for
+the other.
 
 Every arm renders byte-for-byte what its own `chat_template.jinja` renders, in
 both thinking modes, across all thirteen shapes. What closed the gap, in the
@@ -121,6 +145,18 @@ ARMS = [
      "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit"),
     ("qwen3_5", "models--mlx-community--Qwen3.6-35B-A3B-4bit",
      "mlx-community--Qwen3.6-35B-A3B-4bit"),
+    # Qwen's OWN repos, because the served checkpoint's template is not always
+    # the model author's. mlx-community ships a Coder template that differs
+    # from Qwen's currently-published one (6722 bytes against 6211: their tool
+    # schema renderer uses `param_fields`/`normed_json_key`/`</return>` where
+    # Qwen's uses `json_dict`/`json_key`). Qwen3.6's is byte-identical between
+    # the two, and both tokenizers encode identically, so only Coder is really
+    # a second reference -- but the arm is here for both, because "which
+    # template" is a question this harness should answer rather than assume.
+    ("qwen3_coder_upstream", "models--Qwen--Qwen3-Coder-30B-A3B-Instruct",
+     "Qwen--Qwen3-Coder-30B-A3B-Instruct"),
+    ("qwen3_5_upstream", "models--Qwen--Qwen3.6-35B-A3B",
+     "Qwen--Qwen3.6-35B-A3B"),
 ]
 
 TOOLS = [
