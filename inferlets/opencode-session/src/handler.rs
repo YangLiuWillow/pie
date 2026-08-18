@@ -663,8 +663,24 @@ impl Daemon {
     /// retune a silent guest bug. "Leave room for another turn" is a statement
     /// this guest can make on its own terms.
     fn enforce_retention(&mut self, reserve_tokens: u32) -> usize {
-        // What "room for another turn" means, as a share of the pool.
-        const KEEP_FREE_PERCENT: u32 = 10;
+        // The engine's admission headroom, MIRRORED — and named as a mirror
+        // rather than dressed up as a guest-local rule.
+        //
+        // The gateway refuses a turn once the worker's pressure bucket reaches
+        // 240 of 255, i.e. above ~94% used, so staying under that needs ~6%
+        // free and no more. I first wrote this as "leave room for another
+        // turn" at 10% to avoid the cross-layer constant, and that is strictly
+        // worse: it fires at 90% used, a full turn before the engine would
+        // have refused anything, and on a pool sized to exactly one
+        // conversation it takes the tip every turn. Measured immediately —
+        // `turn 25 pool=0`, then `cached=0 delta=57296`, the same reuse
+        // collapse an 85% threshold caused earlier.
+        //
+        // So the guest does need this number. Pretending otherwise cost a turn
+        // of reuse per turn. The honest fix is for the host to publish its
+        // admission headroom (a WIT addition); until then this mirrors it,
+        // with the pointer, so a gateway retune has one place to update.
+        const KEEP_FREE_PERCENT: u32 = 6;
 
         let page = kv_page_size().max(1);
         let (_, pool_total) = kv_pool_status();
