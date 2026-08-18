@@ -174,11 +174,32 @@ MEMWAIT="$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1"
 # chunked re-prefill collides with the slot the retained state still holds.
 # opencode appends a new user message every turn, so it does not take that
 # path; a client that retried a request verbatim would.
+# RETAINED-KV BUDGET, and it has to be set here rather than left to the
+# launcher's default. That default is HALF the effective pool:
+#
+#     pool          2048 pages * 32 = 65,536 tokens
+#     retain_tokens 32,768 = 1024 pages
+#
+# which is only safe if no single request needs the other half. At
+# max_model_len 65536 a request may legitimately need the WHOLE pool, and this
+# workload gets close: a 45,453-token prefill is 1421 pages, so 1024 + 1421 =
+# 2445 against a 2048-page pool and the fire is refused:
+#
+#     KV pool starved: 512 pages asked, 0 free of 2048, no host swap room to
+#     evict into (or no swap transport), and no fire in flight anywhere to
+#     complete and free pages
+#
+# This never bit before because retention never actually held anything on this
+# model -- every resume failed and the branch was dropped. Making resume work
+# made the over-commit reachable. 16,384 tokens = 512 pages leaves 1536 pages
+# (49k tokens) for the live request, which covers the longest context this
+# workload reaches, while still retaining more than the 7k-24k prefixes the
+# reuse chain actually uses.
 PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 10; \
 $MEMWAIT; \
-PIE_PYTHON=$PIEPY $REPO/integrations/opencode/tools/boot_pie.sh s36 \
+PIE_PYTHON=$PIEPY PIE_RETAIN_TOKENS=16384 $REPO/integrations/opencode/tools/boot_pie.sh s36 \
   PIE_STRATEGY=b PIE_MODEL=$PIEMODEL PIE_MAX_MODEL_LEN=65536 \
-  PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY"
+  PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY PIE_RETAIN_TOKENS=16384"
 VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 10; \
 $MEMWAIT; \
 VLLM_MODEL=$MLXMODEL VLLM_SERVED_NAME=$PIEMODEL VLLM_MAX_MODEL_LEN=65536 \
