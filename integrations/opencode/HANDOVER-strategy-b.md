@@ -135,13 +135,23 @@ worth building.
 > lifetime cannot skip it. The only pipeline-level cost is the frame lane
 > join, which measures below noise at 2.2k-token prefills.
 >
-> The real seed-binding item is PASS reuse — "steady-state resubmits carry
-> only the identity hash" applies to resubmitting the SAME pass, which the
-> decode loop never does (fresh pass per token, seeded `pages_d` channel of
-> pool size each time). That is adjacent to the open decode gap (21.8 vs
-> 39.3 tok/s, same kernel) and sits in the decode loop liszt-ai-00 owns.
-> A process-lived pipeline is the prerequisite for it and is now in place.
-> The original section follows.
+> The remaining seed-binding item is PASS reuse — "steady-state resubmits
+> carry only the identity hash" applies to resubmitting the SAME pass,
+> which the decode loop never does (fresh pass per token, seeded `pages_d`
+> channel of pool size each time). A process-lived pipeline is its
+> prerequisite and is now in place.
+>
+> CALIBRATED SMALL before anyone chases it (liszt-ai-00, from
+> `docs/NEXT-decode-dispatch-count.md`): after the device-handle cache,
+> `PIE_SUBMIT_TRACE` prices the per-fire program path at ~0.1 ms
+> (core_program 2.65 → 0.08 ms, register_channel_set 2.70 → 0.04 ms,
+> `program::register` hash-deduped at 1 µs) ≈ 0.7% of a 14 ms decode step
+> — UNLESS the pool-sized `pages_d` seed (8 KB at 2048 pages) carries a
+> cost the trace does not split. Discriminating measurement:
+> decode-rows-probe with `PIE_SUBMIT_TRACE=1`, one row, then a Pass-reuse
+> arm — owned by liszt-ai-00 in the decode loop. Do NOT expect it to
+> explain A's 21.8 vs B's 39.3 at 28k: different inferlet, and the gap is
+> context-dependent (parity at 5.8k). The original section follows.
 
 ### 3.2-as-handed-over: `park()` — unused in the whole crate
 
