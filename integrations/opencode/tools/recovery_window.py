@@ -68,7 +68,18 @@ def probe():
         with urllib.request.urlopen(req, timeout=300) as r:
             return True, json.load(r)["choices"][0]["message"]["content"][:30]
     except urllib.error.HTTPError as e:
-        return False, f"{e.code}"
+        # The REASON, not just the code. A 503 from admission and a 503 from a
+        # model-name mismatch are the same number and different findings, and
+        # this tool recorded only the number until one of each got confused for
+        # the other. That is the same mistake three layers of this stack made
+        # today -- the client swallowing a close code, the client dropping the
+        # gateway's text frame, the gateway breaking with no log -- so a probe
+        # written to diagnose it had better not repeat it.
+        try:
+            body = e.read()[:200].decode(errors="replace")
+        except Exception:
+            body = "<unreadable>"
+        return False, f"{e.code} {body}"
     except Exception as e:  # transport, not admission
         return False, f"{type(e).__name__}"
 
@@ -94,6 +105,7 @@ while time.time() - t0 < DEADLINE_S:
     time.sleep(1)
 
 print(f"\nNO RECOVERY in {DEADLINE_S}s ({attempts} attempts)")
-print("VERDICT: this is a real wedge — pages are still held by something the "
-      "guest did not release, and no report interval explains it.")
+print("VERDICT: a real wedge IF the refusals above say 'admission rejected'. "
+      "If they say anything else — a model-name mismatch, a transport error — "
+      "this measured that instead, and the wedge question is still open.")
 sys.exit(2)
