@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+
+#include "pipeline/program_cache_policy.hpp"
 #include <map>
 #include <sstream>
 #include <unordered_map>
@@ -761,6 +763,14 @@ struct M1Runtime::Impl {
     Pso grouped_commit{};
     std::vector<CompileFault> compile_faults;
     std::size_t max_program_cache_entries = kMaxProgramCacheEntries;
+    /// Recency per cached program, for the eviction below. A counter rather
+    /// than a list: the cache is 64 entries, so a linear scan to find the
+    /// oldest is cheaper than maintaining order on every hit -- and the hit is
+    /// the hot path.
+    std::unordered_map<std::uint64_t, std::uint64_t> program_used_at;
+    std::uint64_t program_clock = 0;
+    std::size_t program_evictions = 0;
+    std::size_t program_uncached = 0;
 
     bool compile_cached(
         const std::string& source,
@@ -876,6 +886,57 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
     return std::unique_ptr<M1Runtime>(new M1Runtime(std::move(impl)));
 }
 
+/// Cache a freshly compiled program, evicting to make room, and DECLINE
+/// rather than fail if it cannot.
+///
+/// Eviction is least-recently-used, and it skips any entry another owner still
+/// holds. `use_count() == 1` means this map is the only reference, so dropping
+/// it frees the entry now; anything greater is bound to a live instance or an
+/// in-flight fire, and those keep their own `shared_ptr` -- the reference count
+/// is the pin, so an evicted-but-running program finishes normally and only the
+/// NEXT lookup misses. That is the same reason an OS can drop a clean page: the
+/// thing is reconstructible, and here reconstruction is a recompile.
+///
+/// Declining is the important half. If every entry is pinned there is nothing
+/// to give, and the caller still gets its executable -- uncached, so it pays
+/// the compile again next time. Slow beats refused.
+void M1Runtime::cache_program(
+    std::uint64_t program_hash,
+    const std::shared_ptr<M1ProgramExecutable>& executable) {
+    while (impl_->programs.size() >= impl_->max_program_cache_entries) {
+        // The choice itself lives in `program_cache_policy.hpp` so it can be
+        // tested without a Metal device; this only supplies the view.
+        std::vector<ProgramCacheEntry> entries;
+        entries.reserve(impl_->programs.size());
+        for (const auto& [hash, program] : impl_->programs) {
+            const auto used = impl_->program_used_at.find(hash);
+            entries.push_back(ProgramCacheEntry{
+                hash,
+                program.use_count(),
+                used == impl_->program_used_at.end() ? 0 : used->second});
+        }
+        const auto chosen = pick_lru_victim(entries);
+        if (!chosen.has_value()) {
+            ++impl_->program_uncached;
+            std::cerr << "[pie-driver-metal] register_program: cache full and "
+                         "every entry is live; serving program_hash=0x"
+                      << std::hex << program_hash << std::dec
+                      << " UNCACHED (it will recompile next fire)\n";
+            return;
+        }
+        const std::uint64_t evicted = *chosen;
+        impl_->programs.erase(evicted);
+        impl_->program_used_at.erase(evicted);
+        ++impl_->program_evictions;
+        std::cerr << "[pie-driver-metal] register_program: evicted LRU "
+                     "program_hash=0x"
+                  << std::hex << evicted << std::dec << " (evictions "
+                  << impl_->program_evictions << ")\n";
+    }
+    impl_->programs.emplace(program_hash, executable);
+    impl_->program_used_at[program_hash] = ++impl_->program_clock;
+}
+
 std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
     std::uint64_t program_hash,
     const ExecPlan& plan,
@@ -888,6 +949,7 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
     if (const auto found = impl_->programs.find(program_hash);
         found != impl_->programs.end()) {
         ++impl_->stats.memory_hits;
+        impl_->program_used_at[program_hash] = ++impl_->program_clock;
         return found->second;
     }
     if (const auto found = impl_->negative.find(program_hash);
@@ -969,28 +1031,28 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
             std::to_string(kMetalM1MaxChannels) +
             " channel slots per lane");
     }
-    if (impl_->programs.size() >= impl_->max_program_cache_entries) {
-        // Name the budget that ran out. This cache NEVER evicts, so "full" is
-        // terminal for every new shape for the rest of the process, and the
-        // caller only sees `status -5` -- which is how it went unexplained
-        // through several runs. The count and the shape that was refused are
-        // what say whether the cap is too small or the shape churn too high.
-        std::cerr << "[pie-driver-metal] register_program: Metal M1 program "
-                     "executable cache is full ("
-                  << impl_->programs.size() << " entries, cap "
-                  << impl_->max_program_cache_entries
-                  << ", no eviction); refused program_hash=0x" << std::hex
-                  << program_hash << std::dec << " stages="
-                  << plan.trace.stages.size()
-                  << " channels=" << plan.trace.channels.size() << "\n";
-        return reject_retryable("Metal M1 program executable cache is full");
-    }
-
-    std::cerr << "[pie-driver-metal] register_program: cache entry "
-              << (impl_->programs.size() + 1) << "/"
-              << impl_->max_program_cache_entries << " program_hash=0x"
+    // A FULL CACHE IS NO LONGER A FAILURE. This used to refuse the program,
+    // which turned a capacity limit into a functional one: `register_program`
+    // returned retryable, the fire never ran, and the turn came back as a
+    // fluent empty completion that read like a model problem. Measured: a
+    // conversation that walked past 64 distinct shapes degraded every
+    // subsequent turn, permanently, because nothing here evicted.
+    //
+    // A compiled program is an OPTIMISATION. The comparison that settles the
+    // design is a JIT code cache, not a page cache: when the JVM's CodeCache
+    // fills it stops compiling and falls back to the interpreter -- slower,
+    // still correct -- and modern ones sweep on top of that. Refusing the work
+    // because you cannot cache the result is the one thing neither does.
+    //
+    // So compilation proceeds unconditionally from here, and caching is
+    // best-effort at the end (`cache_program`). The worst case is recompiling
+    // this shape on every fire, which is slow and correct, instead of a turn
+    // that produces nothing.
+    std::cerr << "[pie-driver-metal] register_program: compiling program_hash=0x"
               << std::hex << program_hash << std::dec
-              << " stages=" << plan.trace.stages.size()
+              << " (cache " << impl_->programs.size() << "/"
+              << impl_->max_program_cache_entries
+              << ") stages=" << plan.trace.stages.size()
               << " channels=" << plan.trace.channels.size() << "\n";
     auto executable = std::make_shared<M1ProgramExecutable>();
     executable->program_hash = program_hash;
@@ -1464,7 +1526,7 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
     }
     impl_->grouped_readiness = grouped_readiness;
     impl_->grouped_commit = grouped_commit;
-    impl_->programs.emplace(program_hash, executable);
+    cache_program(program_hash, executable);
     transaction.commit();
     impl_->stats.stage_entries = impl_->stage_cache.size();
     impl_->stats.program_entries = impl_->programs.size();

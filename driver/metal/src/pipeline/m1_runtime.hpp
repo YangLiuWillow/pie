@@ -191,6 +191,12 @@ class M1Runtime {
         std::uint32_t count = 1);
     void set_program_cache_capacity_for_test(std::size_t capacity);
 
+    /// Cache a compiled program, evicting LRU to make room. Best-effort: a
+    /// cache with nothing evictable declines rather than failing the caller.
+    void cache_program(
+        std::uint64_t program_hash,
+        const std::shared_ptr<M1ProgramExecutable>& executable);
+
   private:
     struct Impl;
     explicit M1Runtime(std::unique_ptr<Impl> impl);
