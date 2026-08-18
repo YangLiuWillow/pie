@@ -86,9 +86,14 @@ while true; do
 
     # ---- 3. A turn the gateway refused. Survivable since the session is kept,
     #         but the turn still failed and the client saw a 503.
+    #         Not necessarily admission: the same line carries "stream
+    #         aborted" when a fire failed underneath, so the REASON is printed
+    #         rather than assumed. Reading this as saturation once sent me
+    #         looking at the pool for a driver poison epoch.
     r=$(count "gateway refused" "$SHIM")
     if [ "$r" -gt "$fired_refused" ]; then
-        echo "TURN-REFUSED=$r — admission rejected a turn (pool saturated); the client got a 503"
+        why=$(grep -a "gateway refused" "$SHIM" 2>/dev/null | tail -1 | sed 's/.*turn: //')
+        echo "TURN-REFUSED=$r — the client got a 503; reason: ${why:-unknown}"
         fired_refused=$r
     fi
 
@@ -120,9 +125,18 @@ while true; do
     # ---- 7. Driver faults. A poison epoch is permanent: nothing clears it, so
     #         ONE of these converts the engine into a permanently refusing one
     #         that reads like a capacity problem.
+    #
+    #         Searched in BOTH logs, because it was missed in the engine one.
+    #         The guest sees a poisoned channel at its own `take` and reports
+    #         it on stderr, which the shim captures — so a poison epoch can be
+    #         plainly visible to the inferlet and absent from the engine log
+    #         this check was reading. Measured: `prefill take @7498: channel is
+    #         poisoned: driver published poison epoch 1` in the shim log, zero
+    #         hits in the engine log, and this check silent while the
+    #         downstream TURN-REFUSED fired on the same event.
     d=0
     for pat in "poison" "Metal forward timed out" "readiness fault" "KV pool starved"; do
-        d=$((d + $(count "$pat" "$ENGINE")))
+        d=$((d + $(count "$pat" "$ENGINE") + $(count "$pat" "$SHIM")))
     done
     if [ "$d" -gt "$fired_driver" ]; then
         echo "DRIVER-FAULT=$d (poison / fence timeout / readiness / pool starved) — see $ENGINE"
