@@ -117,29 +117,32 @@ impl Default for SessionState {
 
 /// How this turn gets its starting state.
 ///
-/// There is no fork variant, and that is a finding rather than a
-/// simplification. Copy-on-write branching of a session's state does not work
-/// on this stack today, in two independent ways:
+/// There is still no fork variant HERE, but that is now a statement about
+/// where the fork happens rather than about whether forking works. A turn
+/// resumes by extending the state it was given, in place; the fork it needs
+/// is taken later, at the scratch boundary in `generate`, so that the thing
+/// retained is the fold as it stood at `render_len`.
 ///
-/// - **KV.** The scheduler builds every pre-launch CoW plan with
+/// Both halves of a copy-on-write branch work on Metal now:
+///
+/// - **KV.** The scheduler built every pre-launch CoW plan with
 ///   `PIE_MEMORY_DOMAIN_CUDA_DEVICE` hardcoded, and Metal refuses a copy whose
-///   domain is not `METAL_SHARED`. Fixed in this branch at the backend boundary
-///   (`runtime/engine/src/driver/backend.rs::copy_kv`), so `WorkingSet::fork`
-///   now works on Metal — but on its own that was not enough.
-/// - **The fold.** `RsWorkingSet::fork` mints a new sequence id and the driver
-///   rejects the child as a continuation of its parent:
+///   domain is not `METAL_SHARED`. Fixed at the backend boundary
+///   (`runtime/engine/src/driver/backend.rs::copy_kv`).
+/// - **The fold.** `RsWorkingSet::fork` shares the folded slot by refcount and
+///   the first write copies it. That copy used to strand the child: a
+///   recurrent fire's sequence id is DERIVED from its slot, `(1<<63) |
+///   rs_slot_id`, and `MetalExecutor::copy_state` carried the PARENT's id onto
+///   the copy, so the child announced an id its own record contradicted —
 ///   `recurrent slot 1 holds sequence 2^63, this fire is sequence 2^63+1`.
-///   Nothing in the guest can work around that.
+///   The driver now rebases the id onto the destination slot
+///   (`rebase_linear_sequence`), which is what makes a CoW child able to
+///   continue itself.
 ///
-/// So a turn extends the state it resumed, in place, on both pass kinds. That
-/// is sound because nothing generated is retained: KV past `render_len` is
-/// scratch the next turn overwrites, and the recurrent scratch is buffered
-/// rather than folded and then discarded (see the module docs).
-///
-/// The cost is branching: two turns cannot extend one parent concurrently.
-/// Turns are sequential and retention drops the parent it extended, so nothing
-/// does that today — but B-3 (forking the working set for subagents) needs real
-/// CoW on both halves and is blocked on the recurrent side.
+/// The cost that remains is concurrency, not correctness: two turns still do
+/// not extend one parent at the same time. Turns are sequential and retention
+/// drops the parent it extended, so nothing does that today — and B-3 (forking
+/// the working set for subagents) is no longer blocked on the recurrent side.
 pub enum Resume {
     /// First turn: build fresh state.
     Cold,
@@ -423,7 +426,6 @@ where
         pool_pages,
         temperature,
         top_p,
-        false,
         &mut on_prefill_chunk,
     )
     .await?;
@@ -434,11 +436,19 @@ where
     // KV that is free — they are written past `render_len`, into cells the next
     // turn overwrites, and no later fire's `kv_len` ever covers them.
     //
-    // A fold has no `kv_len` and cannot be rewound, so on a recurrent-state
-    // model the same fires would corrupt the state they are supposed to leave
-    // alone. The obvious fix is to generate on a fork; it does not work. The
-    // KV half is refused on Metal (see `Resume`), and the recurrent half is
-    // refused everywhere:
+    // A fold has no `kv_len` and cannot be rewound, so the recurrent half needs
+    // the pre-generation state kept rather than reconstructed. FORK IT HERE:
+    // `RsWorkingSet::fork` is an O(1) refcount share, and the first writing
+    // fire of the generation below copies the folded slot on write. The child
+    // this returns therefore keeps the fold exactly as it stands at
+    // `render_len`, while generation runs away from it on a private copy. That
+    // child is what gets retained.
+    //
+    // This is the "generate on a fork" shape the previous design tried and
+    // abandoned, and the reason it did not work was never the shape. A
+    // recurrent fire's sequence id is DERIVED from its slot — `(1<<63) |
+    // rs_slot_id` — and `MetalExecutor::copy_state` carried the parent's id
+    // onto the copy, so the child announced an id its own record contradicted:
     //
     // ```text
     // [pie-driver-metal] instance 2 launch failed: paged continuation:
@@ -446,34 +456,31 @@ where
     //   this fire is sequence 9223372036854775809
     // ```
     //
-    // `RsWorkingSet::fork` mints a NEW sequence id, and the driver rejects it
-    // as a continuation of the folded state it was forked from. (The qwen-code
-    // session hit this too, from the other direction — sealing on a fresh
-    // pipeline.)
+    // The driver now rebases that id onto the destination slot
+    // (`rebase_linear_sequence`, pinned in `executor_geometry_test`), so a
+    // copy-on-write child can continue itself and forking is usable.
     //
-    // So generation does not fold at all: it BUFFERS. `fold_len: Some(0)` puts
-    // each fire's tokens in the recurrent buffer instead of the fold, where
-    // attention still reads them for this turn — `runtime/engine/tests/
-    // inferlets/gdn-foldcommit` pins buffer-then-fold against fold-directly —
-    // and `discard_buffered` then abandons them for free. That is exactly the
-    // REJECT half of fold-commit, which is what a speculative tail is, and a
-    // generation we do not intend to retain is one.
-    //
-    // The happy consequence: both pass kinds now extend in place and NOTHING
-    // forks. `Resume::Fork` is gone.
+    // Generation therefore FOLDS normally. The buffer-and-discard scheme this
+    // replaces was CUDA-only in a way nothing checked: Metal validates
+    // `rs_fold_lens` in `batch/compose.cpp` and then never reads it again, and
+    // refuses the buffer READ path outright, so every fire folded regardless
+    // and `discard_buffered` silently left the guest believing a state stood at
+    // `render_len` while the device had folded the whole scratch span. That is
+    // the bug this replaces; see `integrations/opencode/finding-hybrid-session-
+    // resume.md`.
     let ws = &state.ws;
     let rs = &state.rs[..];
     let pool_ids: Vec<u32> = (0..pool_pages).collect();
 
-    // Buffer capacity for the whole scratch span. Purely logical until a fire
-    // leaves tokens in it.
-    let scratch_tokens = cue.len() as u32 + cfg.max_tokens as u32 + 1;
-    if let Some(r) = state.rs.first() {
-        let per_page = r.buffer_page_size().max(1);
-        r.alloc_buffer(scratch_tokens.div_ceil(per_page))
-            .context("rs.alloc_buffer")?;
-    }
-    let buffering = !state.rs.is_empty();
+    // The retention snapshot, taken before a single scratch token is written.
+    // Empty on an attention-only model, where KV alone rewinds for free.
+    let retain_rs: Vec<RsWorkingSet> = state
+        .rs
+        .iter()
+        .map(|r| r.fork(&pipe))
+        .collect::<Result<_>>()
+        .context("rs.fork (retention snapshot)")?;
+    let recurrent = !state.rs.is_empty();
 
     // ── 3. Prefill the cue and sample the turn's first token ─────────────
     let g0 = prefill_span::<W>(
@@ -484,7 +491,6 @@ where
         pool_pages,
         temperature,
         top_p,
-        buffering,
         &mut on_prefill_chunk,
     )
     .await?;
@@ -495,10 +501,6 @@ where
 
     let mut accepted = 0usize;
     let mut gen_error: Option<String> = None;
-    // Fires whose tokens landed in the recurrent buffer during decode. The cue
-    // span is counted separately; together they are exactly what must be
-    // abandoned before this state is retained.
-    let mut decode_fires = 0u32;
     let g0u = g0 as u32;
     let mut done = stop_ids.contains(&g0u);
     if !done {
@@ -555,7 +557,7 @@ where
     // `SPEC_OFF=1 cargo build` disables drafting, which is the CONTROL arm:
     // built from this same source so an A/B cannot compare two builds that
     // differ in more than speculation.
-    let speculate = !buffering
+    let speculate = !recurrent
         && temperature == 0.0
         && crate::draft::DRAFT_K > 0
         && option_env!("SPEC_OFF").is_none();
@@ -600,7 +602,6 @@ where
             // Vary the counter per step, or every token would be sampled from
             // the same Gumbel draw.
             let rng = Channel::from([0x9e37_u32, i as u32]).named("rng_d");
-            let fold0 = Channel::from([0u32]).named("fold0_d");
 
             let fwd: Pass<W> = Pass::new();
             if let Err(e) = fwd.embed(&toks, &embed_indptr) {
@@ -625,7 +626,9 @@ where
                     mask: None,
                 },
                 rs,
-                buffering.then_some(&fold0),
+                // Fold. The retention snapshot was forked before this loop, so
+                // the state these fires advance is already a private copy.
+                None,
             ) {
                 gen_error = Some(e);
                 break;
@@ -685,12 +688,11 @@ where
             // Every row executed, so every row is in KV. Only `take + 1` of
             // them are KEPT; the rest are masked by the next fire's `kv_len`,
             // which is why this is sound without a fold to rewind.
-            decode_fires += 1;
             let mut stop = false;
             let mut emitted = 0usize;
             for tok in d[..take].iter().copied().chain(std::iter::once(fresh)) {
                 // A stop token is sampled but never embedded: truncated at,
-                // never written. That is why `decode_fires` is not `accepted`.
+                // never written.
                 if stop_ids.contains(&tok) {
                     stop = true;
                     break;
@@ -745,22 +747,16 @@ where
     // Close releases the scheduler wait-set and rejects further submissions.
     pipe.close();
 
-    // Abandon the scratch span. KV needs nothing — those cells are simply never
-    // covered by a later `kv_len`. The recurrent buffer does: it still holds the
-    // cue and every decoded token, and the next turn's delta prefill folds over
-    // `[buffer | its own tokens]`, so anything left here would be folded into
-    // the retained state as if the client had sent it.
-    if let Some(r) = state.rs.first() {
-        let buffered = cue.len() as u32 + decode_fires;
-        if buffered > 0 {
-            if let Err(e) = r.discard_buffered(buffered) {
-                // The state is no longer trustworthy: its buffer holds tokens
-                // the conversation does not contain. Fail the turn so the
-                // caller drops it rather than retaining a poisoned prefix.
-                gen_error = Some(format!("discard_buffered({buffered}): {e}"));
-            }
-        }
-    }
+    // Retain the SNAPSHOT, not the state generation just advanced. KV needs
+    // nothing done to it — the scratch cells past `render_len` are simply never
+    // covered by a later `kv_len`. The recurrent half cannot be rewound at all,
+    // which is why the fork above exists: `retain_rs` still holds the fold as
+    // it stood at `render_len`, and the state the decode loop folded its way to
+    // is dropped here with the turn.
+    let state = SessionState {
+        ws: state.ws,
+        rs: retain_rs,
+    };
 
     let hit_max = accepted >= cfg.max_tokens;
     Ok(Generation {
@@ -843,7 +839,6 @@ async fn prefill_span<W>(
     pool_pages: u32,
     temperature: f32,
     top_p: f32,
-    buffered: bool,
     on_chunk: &mut impl FnMut(),
 ) -> Result<i32>
 where
@@ -880,7 +875,6 @@ where
         let page_indptr = Channel::from([0u32, abs_e.div_ceil(page_t)]).named("pidx_p");
         let outc = Channel::new([1], dtype::i32).named("g0");
         // Owned here so the port outlives the bind and reaches `submit`.
-        let fold0 = Channel::from([0u32]).named("fold0_p");
 
         let fwd: Pass<W> = Pass::new();
         fwd.embed(&toks, &embed_indptr)?;
@@ -902,7 +896,7 @@ where
                 mask: None,
             },
             &st.rs[..],
-            buffered.then_some(&fold0),
+            None,
         )?;
         let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
         fwd.epilogue(move || {

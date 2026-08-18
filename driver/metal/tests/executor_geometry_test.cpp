@@ -373,6 +373,63 @@ int main() {
                "prefill local sampling rows [last] and multiple rows scatter to concatenated logits");
     }
 
+    // ── copy_state rebases the sequence id onto the destination slot ──
+    //
+    // A recurrent fire's id IS its slot: `(1<<63) | rs_slot_id`. A
+    // copy-on-write child therefore cannot inherit its parent's id, or the
+    // first fire on the child announces `1<<63|dst` against a record saying
+    // `1<<63|src` and the paged continuation check refuses it. This is the
+    // failure that made `RsWorkingSet::fork` unusable.
+    {
+        constexpr std::uint64_t kHigh = 1ull << 63;
+        LinearSequenceState parent;
+        parent.has_resident = true;
+        parent.resident_sequence_id = kHigh | 0u;  // slot 0's derived id
+        parent.resident_slot = 0;
+        parent.resident_next_position = 493;
+        parent.resident_pages = {5, 9};
+        parent.ring_backed = true;
+        parent.paged_backed = true;
+
+        const LinearSequenceState child = rebase_linear_sequence(parent, 1);
+        expect(child.resident_sequence_id == (kHigh | 1u),
+              "copy_state rebases a slot-derived sequence id onto the destination slot");
+        expect(child.resident_slot == 1 && !child.ring_backed && child.paged_backed &&
+                   child.resident_next_position == 493 &&
+                   child.resident_pages == std::vector<std::uint32_t>({5, 9}),
+              "copy_state carries position, pages and paged-backing but never ring-backing");
+
+        // The whole point: the child's own next fire is now accepted.
+        MemberForwardDesc desc;
+        desc.sequence_id = kHigh | 1u;  // as the forward build derives it for slot 1
+        desc.token_ids = {13};
+        desc.position_ids = {493};
+        desc.has_rs_slot = true;
+        desc.rs_slot_id = 1;
+        desc.rs_reset = false;
+        desc.kv_pages = {5, 9};
+        desc.qo_indptr = {0, 1};
+        desc.kv_page_indptr = {0, 2};
+        desc.request_rs_slot_ids = {1};
+        desc.request_rs_reset = {0};
+        desc.request_rs_read = {1};
+        desc.request_rs_write = {1};
+        std::unordered_map<std::uint32_t, LinearSequenceState> states;
+        states[1] = child;
+        std::string reason;
+        expect(validate_paged_request_state(states, desc, 0, &reason),
+              "a copy-on-write child continues itself after the rebase (" + reason + ")");
+
+        // And without the rebase it is exactly the reported failure.
+        LinearSequenceState unrebased = child;
+        unrebased.resident_sequence_id = kHigh | 0u;
+        states[1] = unrebased;
+        reason.clear();
+        expect(!validate_paged_request_state(states, desc, 0, &reason) &&
+                   contains(reason, "holds sequence"),
+              "an unrebased id reproduces the fork refusal (" + reason + ")");
+    }
+
     std::printf("\n==== executor_geometry_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

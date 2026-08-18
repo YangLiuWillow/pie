@@ -138,6 +138,40 @@ bool validate_linear_sequence_geometry(const LinearSequenceState& state,
     return true;
 }
 
+LinearSequenceState rebase_linear_sequence(const LinearSequenceState& src,
+                                           std::uint32_t dst_slot) {
+    LinearSequenceState copied = src;
+    copied.resident_slot = dst_slot;
+    // The destination is explicitly NOT ring-backed (see the
+    // `LinearSequenceState` doc) — only an actual forward()/reset through
+    // dst_slot can promote it. `paged_backed` DOES carry: the bytes and the
+    // page list came with the copy, which is what the paged path continues on.
+    copied.ring_backed = false;
+    // A recurrent fire's sequence id is not free-standing metadata: it is
+    // DERIVED from the slot the fire runs on, `(1<<63) | rs_slot_id` (see the
+    // forward build in context.cpp). Carrying the SOURCE's id onto a different
+    // slot is therefore inconsistent by construction — the copy records "slot
+    // N holds sequence 1<<63|M" while the very next fire on slot N announces
+    // itself as `1<<63|N`, and the paged continuation check refuses it:
+    //
+    //   recurrent slot 1 holds sequence 9223372036854775808,
+    //   this fire is sequence 9223372036854775809
+    //
+    // That is exactly what made `RsWorkingSet::fork` unusable: a forked fire
+    // copies its folded state on write, the copy lands here, and the child
+    // could then never continue itself. Rebasing the id onto the destination
+    // is what lets a copy-on-write child be its own sequence.
+    //
+    // Only slot-derived ids are rebased. The high bit is what separates that
+    // id space from the `instance_id` space used when an arch has no rs slot,
+    // and an id from that space must not be rewritten.
+    if ((copied.resident_sequence_id >> 63) != 0) {
+        copied.resident_sequence_id =
+            (1ull << 63) | static_cast<std::uint64_t>(dst_slot);
+    }
+    return copied;
+}
+
 void close_linear_sequence(LinearSequenceState& state, std::uint64_t sequence_id) {
     if (state.has_resident && (state.ring_backed || state.paged_backed) &&
         state.resident_sequence_id == sequence_id) {
@@ -3423,10 +3457,8 @@ bool MetalExecutor::copy_state(std::uint32_t src_slot, std::uint32_t dst_slot, s
         // corresponds to the bytes just copied in, so drop it.
         slot_states_.erase(dst_slot);
     } else {
-        LinearSequenceState copied = it->second;
-        copied.resident_slot = dst_slot;
-        copied.ring_backed = false;
-        slot_states_[dst_slot] = std::move(copied);
+        slot_states_[dst_slot] =
+            rebase_linear_sequence(it->second, dst_slot);
     }
     return true;
 }

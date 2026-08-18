@@ -639,6 +639,15 @@ bool validate_linear_sequence_geometry(const LinearSequenceState& state,
 // touched, so "close of one sequence must not erase copied destination
 // metadata"). Exposed standalone so it (and the "B accepted after A
 // closes" sequence of events) is unit-testable without a live executor.
+// Pure state transition backing the metadata half of
+// `MetalExecutor::copy_state` — returns `src`'s tracked bookkeeping as it must
+// read at `dst_slot`. The sequence id is REBASED onto the destination because
+// a recurrent fire derives its id from its slot; see the definition. Exposed
+// standalone so the rebase (and the CoW-child continuation it enables) is
+// unit-testable without a live executor.
+LinearSequenceState rebase_linear_sequence(const LinearSequenceState& src,
+                                           std::uint32_t dst_slot);
+
 void close_linear_sequence(LinearSequenceState& state, std::uint64_t sequence_id);
 
 bool validate_paged_request_state(
