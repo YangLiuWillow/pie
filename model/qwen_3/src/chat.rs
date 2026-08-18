@@ -42,7 +42,61 @@ pub enum ToolDialect {
     /// Arguments arrive as *strings* and are typed from the schema on the way
     /// out, because XML carries no types.
     Coder,
+    /// Qwen3.5 and later, including the `qwen3_5`-architected Qwen3.6: a hybrid.
+    ///
+    /// The SCHEMAS are JSON, exactly as Hermes writes them — the template does
+    /// `{{- tool | tojson }}` inside `<tools>`. The CALLS are Coder's nested
+    /// XML. Serving it as `Coder` renders `<function><name>` schema blocks the
+    /// checkpoint's template never writes; serving it as `Hermes` instructs a
+    /// call format the model was not trained to emit. It is neither, so it is
+    /// its own row.
+    Qwen35Xml,
 }
+
+impl ToolDialect {
+    /// Does a *call* go out (and come back) as nested XML?
+    ///
+    /// Asked as a question rather than compared with `==`, because two
+    /// dialects now answer yes and a `== ToolDialect::Coder` left behind at any
+    /// one of the five dispatch sites renders a call in one format and parses
+    /// it in another — silently, on Qwen3.6 only.
+    pub fn emits_xml_calls(self) -> bool {
+        matches!(self, ToolDialect::Coder | ToolDialect::Qwen35Xml)
+    }
+}
+
+/// What the Qwen3.5+ `chat_template` says after the `<tools>` block, verbatim.
+///
+/// A raw literal, not a `\`-continued one: every space and blank line here is
+/// the checkpoint's, and a continuation would let rustfmt's indentation into a
+/// prompt whose bytes are the contract.
+///
+/// Transcribed from `mlx-community/Qwen3.6-35B-A3B-4bit`'s own
+/// `chat_template.jinja` (line 53) and diffed against it — 815 characters,
+/// identical to the template's text once the two leading newlines the caller
+/// supplies are removed.
+const QWEN35_XML_CALL_INSTRUCTION: &str = r#"If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>"#;
 
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
@@ -162,15 +216,16 @@ impl QwenInstruct {
             if !c.is_empty() {
                 text.push('\n');
                 text.push_str(c);
-                // The Coder template trims the content and closes it with a
-                // newline of its own before the first call; Hermes does not.
-                if dialect == ToolDialect::Coder {
+                // The Coder/Qwen3.5 templates trim the content and close it
+                // with a newline of their own before the first call; Hermes
+                // does not.
+                if dialect.emits_xml_calls() {
                     text = format!("\n{}\n", c.trim());
                 }
             }
         }
         for (name, arguments_json) in calls {
-            if dialect == ToolDialect::Coder {
+            if dialect.emits_xml_calls() {
                 // Arguments go back out as the XML the model produced them in.
                 // A value that was typed on the way IN (an int, a bool, an
                 // object) is rendered as its plain text here, because that is
@@ -259,6 +314,38 @@ impl QwenInstruct {
              {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
              </tool_call>",
         );
+        prompt
+    }
+
+    /// The Qwen3.5+ tools turn: Hermes's JSON schemas under a different
+    /// heading, followed by the XML call instruction.
+    ///
+    /// Transcribed from the checkpoint's `chat_template.jinja`:
+    ///
+    /// ```jinja
+    /// {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+    /// {%- for tool in tools %}{{- "\n" }}{{- tool | tojson }}{%- endfor %}
+    /// {{- "\n</tools>" }}
+    /// {{- '\n\nIf you choose to call a function ONLY reply ...' }}
+    /// ```
+    ///
+    /// `tojson` serialises the tool as the caller passed it, which for an
+    /// OpenAI request is the `{"type": "function", "function": …}` envelope —
+    /// so the same envelope-if-missing rule as the Hermes builder applies, and
+    /// for the same reason.
+    fn build_tool_system_prompt_qwen35(tools: &[String]) -> String {
+        let mut prompt =
+            String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for tool in tools {
+            prompt.push('\n');
+            if tool.contains("\"type\"") && tool.contains("\"function\"") {
+                prompt.push_str(tool);
+            } else {
+                prompt.push_str(&format!("{{\"type\": \"function\", \"function\": {tool}}}"));
+            }
+        }
+        prompt.push_str("\n</tools>\n\n");
+        prompt.push_str(QWEN35_XML_CALL_INSTRUCTION);
         prompt
     }
 
@@ -494,11 +581,14 @@ impl Instruct for QwenInstruct {
                 None => Vec::new(),
             };
         }
+        // The SCHEMA rendering is where the three dialects differ, and it does
+        // not follow the call format: Qwen3.5 writes JSON schemas like Hermes
+        // and XML calls like Coder.
         let coder = self.config.tool_dialect == ToolDialect::Coder;
-        let tools_block = if coder {
-            Self::build_tool_system_prompt_coder(tools)
-        } else {
-            Self::build_tool_system_prompt(tools)
+        let tools_block = match self.config.tool_dialect {
+            ToolDialect::Coder => Self::build_tool_system_prompt_coder(tools),
+            ToolDialect::Qwen35Xml => Self::build_tool_system_prompt_qwen35(tools),
+            ToolDialect::Hermes => Self::build_tool_system_prompt(tools),
         };
         let merged = match system_content {
             Some(c) if !c.is_empty() => format!("{c}\n\n{tools_block}"),
@@ -775,7 +865,7 @@ impl ToolDecoder for QwenToolDecoder {
             //
             // The prefix is KEPT rather than consumed: it carries the function
             // name, and `</function>` then closes what `</tool_call>` would have.
-            if self.dialect == ToolDialect::Coder {
+            if self.dialect.emits_xml_calls() {
                 if let Some(pos) = self.accumulated.find("<function=") {
                     self.inside = true;
                     self.unwrapped = true;
@@ -798,7 +888,7 @@ impl ToolDecoder for QwenToolDecoder {
         self.inside = false;
         self.unwrapped = false;
 
-        if self.dialect == ToolDialect::Coder {
+        if self.dialect.emits_xml_calls() {
             if let Some(fs) = call_body.find("<function=") {
                 let after = &call_body[fs + "<function=".len()..];
                 let body = match after.find("</function>") {
@@ -919,6 +1009,46 @@ mod tests {
     #[test]
     fn qwen2_thinking_disabled() {
         assert!(!qwen2().config.has_thinking);
+    }
+
+    /// Qwen3.5/3.6 writes JSON schemas and XML calls, and neither neighbour
+    /// renders that.
+    ///
+    /// This is the test the shipped-then-corrected version of this change did
+    /// not have. Routing Qwen3.6 to `ToolDialect::Coder` got the CALL format
+    /// right and the SCHEMA format wrong -- `<function><name>` blocks the
+    /// checkpoint's template never writes -- and every existing test passed,
+    /// because they all asked about calls.
+    #[test]
+    fn qwen35_renders_json_schemas_under_the_templates_own_heading() {
+        let schema = r#"{"type": "function", "function": {"name": "read_file"}}"#.to_string();
+        let block = QwenInstruct::build_tool_system_prompt_qwen35(&[schema.clone()]);
+
+        // The heading is the Qwen3.5 template's, not Qwen3's.
+        assert!(
+            block.starts_with("# Tools\n\nYou have access to the following functions:\n\n<tools>"),
+            "wrong tools heading:\n{block}"
+        );
+        // Schemas are JSON, verbatim -- NOT Coder's XML schema blocks.
+        assert!(block.contains(&schema), "the schema was not written as JSON:\n{block}");
+        assert!(
+            !block.contains("<name>"),
+            "Coder's XML schema blocks leaked into the Qwen3.5 preamble:\n{block}"
+        );
+        // And the call instruction is the checkpoint's, verbatim.
+        assert!(block.ends_with(QWEN35_XML_CALL_INSTRUCTION), "instruction missing or altered");
+        assert_eq!(
+            QWEN35_XML_CALL_INSTRUCTION.len(),
+            815,
+            "the instruction is transcribed from chat_template.jinja; a length change \
+             means the bytes the model was trained on no longer match"
+        );
+
+        // The three dialects render three different tools turns.
+        let hermes = QwenInstruct::build_tool_system_prompt(&[schema.clone()]);
+        let coder = QwenInstruct::build_tool_system_prompt_coder(&[schema]);
+        assert_ne!(block, hermes, "Qwen3.5 collapsed into the Hermes preamble");
+        assert_ne!(block, coder, "Qwen3.5 collapsed into the Coder preamble");
     }
 
     #[test]

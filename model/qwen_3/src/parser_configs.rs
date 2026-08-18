@@ -288,7 +288,7 @@ mod tests {
         let rows = [
             (QWEN3, true, ToolDialect::Hermes),
             (QWEN3_CODER, false, ToolDialect::Coder),
-            (QWEN3_5, true, ToolDialect::Coder),
+            (QWEN3_5, true, ToolDialect::Qwen35Xml),
         ];
         for (cfg, thinking, dialect) in rows {
             for text in CORPUS {

@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, bail};
 use pie_model_common::instruct::Instruct;
-use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolDialect};
+use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
 use pie_openai_serving::render::{RenderOp, plan_render};
 use pie_openai_serving::types::ChatCompletionRequest;
 use pie_tokenizer::Tokenizer;
@@ -68,9 +68,10 @@ fn main() -> Result<()> {
     // from its own predicate. Both are `instruct`'s, never copies: a harness
     // that guesses either one certifies parity against a prompt the server
     // does not send.
-    let xml = pie_model::instruct::speaks_xml_tools("qwen3", &model_name);
-    let tool_dialect = if xml { ToolDialect::Coder } else { ToolDialect::Hermes };
-    eprintln!("[render-tokens] coder={coder} xml_tools={xml} tool_dialect={tool_dialect:?} (from {model_name})");
+    // The arch stem is hardcoded "qwen3" here, so a 3.5/3.6 checkpoint is
+    // recognised by its DEPLOYMENT name -- which is what the fixtures carry.
+    let tool_dialect = pie_model::instruct::tool_dialect(&model_name, &model_name);
+    eprintln!("[render-tokens] coder={coder} tool_dialect={tool_dialect:?} (from {model_name})");
     let instruct = QwenInstruct::new(
         tokenizer.clone(),
         ChatMLConfig {

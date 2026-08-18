@@ -7,6 +7,7 @@
 
 pub use pie_model_common::instruct::*;
 
+use pie_model_qwen_3::chat::ToolDialect;
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 
@@ -54,58 +55,45 @@ pub fn is_coder_lineage(arch_name: &str, model_name: &str) -> bool {
     squashed.contains("coder")
 }
 
-/// Whether this checkpoint speaks the XML tool-call dialect
-/// (`<tool_call><function=NAME><parameter=P>`) instead of Hermes JSON.
+/// Which tool dialect this checkpoint speaks.
 ///
-/// This used to be `is_coder_lineage` itself, on the reasoning that a
-/// checkpoint with no thinking channel is the Coder release and the Coder
-/// release speaks XML. Qwen3.5/3.6 broke that equivalence: they are THINKING
-/// models that nonetheless speak XML, which is exactly the pairing the single
-/// predicate could not express. Read from the checkpoints' own
-/// `chat_template.jinja`:
+/// Three answers, not two, and the third is why this replaced a boolean.
+/// Qwen3.5/3.6 is a HYBRID: JSON schemas like Qwen3, nested-XML calls like
+/// Qwen3-Coder. Read from the checkpoints' own `chat_template.jinja`:
 ///
 /// ```text
-///   Qwen3-8B-4bit                       no `<function=`  -> Hermes JSON
-///   Qwen3-Coder-30B-A3B-Instruct-4bit      `<function=`  -> XML  (coder)
-///   Qwen3.6-35B-A3B-4bit                   `<function=`  -> XML  (thinking)
+///   Qwen3-8B-4bit              <tools> holds JSON, calls are JSON  -> Hermes
+///   Qwen3-Coder-30B-A3B        <tools> holds XML,  calls are XML   -> Coder
+///   Qwen3.6-35B-A3B            <tools> holds JSON, calls are XML   -> Qwen35Xml
 /// ```
 ///
-/// ## What serving Qwen3.6 as Hermes did, measured rather than assumed
+/// ## Two signals, because one is not enough
 ///
-/// It did **not** break tool calling. Same request, same checkpoint, only this
-/// predicate changed:
+/// The 3.5/3.6 row keys on the ARCHITECTURE, which is the durable signal and
+/// the one upstream uses: `qwen3_5_moe` is a fact about the checkpoint, while
+/// a deployment name is whatever an operator typed.
 ///
-/// ```text
-///   Hermes  169 prompt tokens  -> finish_reason=tool_calls, arguments correct
-///   XML     314 prompt tokens  -> finish_reason=tool_calls, arguments correct
-/// ```
-///
-/// The model complied with whichever dialect it was instructed in. So the case
-/// for this function is **comparability, not accuracy**: mlx-lm, vLLM and
-/// llama.cpp all render the checkpoint's own `chat_template.jinja` and
-/// therefore all speak XML. With pie alone on Hermes, pie alone answered a
-/// different prompt — a 145-token difference in the tool preamble — and every
-/// cross-engine number would have carried that difference silently. Whether
-/// the native dialect also helps on long multi-tool agentic traffic is a
-/// hypothesis this comment does not assert.
-///
-/// The old comment warned that splitting the two predicates would let a future
-/// edit set one and not the other — "a prompt in one dialect read by a parser
-/// for the other". That risk is real and is why this lives beside
-/// `is_coder_lineage`, shares its haystack and squashing, and is covered by
-/// `dialect_and_thinking_are_independent_for_qwen3_5_lineage` below: the two
-/// are now independent facts about a checkpoint, so they are two predicates,
-/// but they are two predicates in one place.
-///
-/// `qwen3next` is deliberately NOT listed. It is excluded from coder lineage
-/// like 3.5/3.6, but no checkpoint was on hand to read its template from, and
-/// guessing the dialect is the failure this function exists to prevent.
-pub fn speaks_xml_tools(arch_name: &str, model_name: &str) -> bool {
-    let hay = format!("{model_name} {arch_name}").to_lowercase();
-    let squashed: String = hay.chars().filter(|c| !matches!(c, '_' | '.' | '-')).collect();
-    squashed.contains("qwen35")
-        || squashed.contains("qwen36")
-        || is_coder_lineage(arch_name, model_name)
+/// The Coder row cannot. `Qwen3-Coder-30B-A3B-Instruct` and the *thinking*
+/// `Qwen3-30B-A3B` are both `Qwen3MoeForCausalLM`, both carry `<think>` in
+/// vocab, and this checkpoint ships no `_name_or_path` — so the arch stem
+/// cannot separate them and the name is the only signal there is. Upstream's
+/// registry drops the name entirely and would hand Qwen3-Coder the thinking
+/// cue, which that checkpoint answers with an immediate EOS. Hence: arch first
+/// for the row that has one, name second for the row that does not.
+pub fn tool_dialect(arch_name: &str, model_name: &str) -> ToolDialect {
+    let squash = |s: &str| -> String {
+        s.to_lowercase().chars().filter(|c| !matches!(c, '_' | '.' | '-')).collect()
+    };
+    // The arch stem alone: a DEPLOYMENT called "qwen3.6-bench" served from a
+    // Qwen3 checkpoint is a Qwen3, and asking the name here would say otherwise.
+    let arch = squash(arch_name);
+    if arch.contains("qwen35") || arch.contains("qwen36") {
+        return ToolDialect::Qwen35Xml;
+    }
+    if is_coder_lineage(arch_name, model_name) {
+        return ToolDialect::Coder;
+    }
+    ToolDialect::Hermes
 }
 
 /// Create the appropriate instruct implementation for the given architecture.
@@ -135,7 +123,7 @@ pub fn speaks_xml_tools(arch_name: &str, model_name: &str) -> bool {
 /// reaches a registry is data, and guessing at underscore placement is how the
 /// silent version of this bug comes back.
 pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolDialect};
+    use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
 
     match arch_name {
         // model types …
@@ -152,15 +140,10 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 // empty think block. See `is_coder_lineage`.
                 has_thinking: !is_coder_lineage(arch_name, model_name),
                 has_tools: true,
-                // These two were one signal until Qwen3.6, which is a thinking
-                // model that speaks XML tool calls -- the pairing a single
-                // predicate could not express. See `speaks_xml_tools` for what
-                // serving it as Hermes did and, just as importantly, did not do.
-                tool_dialect: if speaks_xml_tools(arch_name, model_name) {
-                    ToolDialect::Coder
-                } else {
-                    ToolDialect::Hermes
-                },
+                // Thinking and dialect were one signal until Qwen3.6, which
+                // thinks AND speaks XML -- the pairing a single predicate could
+                // not express. They are two questions now; see `tool_dialect`.
+                tool_dialect: tool_dialect(arch_name, model_name),
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -343,27 +326,41 @@ mod tests {
     /// rule that a checkpoint with no thinking channel is the Coder release and
     /// the Coder release speaks XML. Qwen3.6 is a THINKING model that speaks
     /// XML, so under the coupling it was served Hermes JSON while its own
-    /// `chat_template.jinja` mandates
-    /// `<tool_call><function=NAME><parameter=P>` unconditionally. The tool
-    /// calls that go missing to a dialect mismatch land in the accuracy column.
+    /// `chat_template.jinja` mandates `<tool_call><function=NAME><parameter=P>`
+    /// unconditionally.
     ///
-    /// Asserted as the three real checkpoints, each with the dialect read out
-    /// of its own template, so the table cannot drift from what is shipped.
+    /// And the dialect is three-valued, not two: Qwen3.6 writes JSON schemas
+    /// with XML calls, so serving it as `Coder` renders `<function><name>`
+    /// schema blocks its template never writes. Each row's dialect is read out
+    /// of that checkpoint's own template, so the table cannot drift from what
+    /// is shipped.
     #[test]
     fn dialect_and_thinking_are_independent_for_qwen3_5_lineage() {
-        // (arch stem, deployment name, speaks XML, thinks)
-        for (arch, name, xml, thinks) in [
-            // Plain Qwen3: Hermes JSON, and it thinks.
-            ("qwen3", "mlx-community--Qwen3-8B-4bit", false, true),
-            // Coder: XML, and it does NOT think. The old coupling's whole case.
-            ("qwen3moe", "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit", true, false),
-            // Qwen3.6: XML *and* it thinks -- the combination that broke it.
-            ("qwen3_5moe", "mlx-community--Qwen3.6-35B-A3B-4bit", true, true),
-            ("qwen3_5moe", "Qwen--Qwen3.6-35B-A3B", true, true),
+        // (arch stem, deployment name, dialect, thinks)
+        for (arch, name, dialect, thinks) in [
+            // Plain Qwen3: JSON schemas, JSON calls, and it thinks.
+            ("qwen3", "mlx-community--Qwen3-8B-4bit", ToolDialect::Hermes, true),
+            // Coder: XML schemas, XML calls, and it does NOT think. The old
+            // coupling's whole case.
+            (
+                "qwen3moe",
+                "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit",
+                ToolDialect::Coder,
+                false,
+            ),
+            // Qwen3.6: JSON schemas, XML calls, AND it thinks -- neither of the
+            // rows above, which is why the dialect stopped being a boolean.
+            (
+                "qwen3_5moe",
+                "mlx-community--Qwen3.6-35B-A3B-4bit",
+                ToolDialect::Qwen35Xml,
+                true,
+            ),
+            ("qwen3_5moe", "Qwen--Qwen3.6-35B-A3B", ToolDialect::Qwen35Xml, true),
         ] {
             assert_eq!(
-                speaks_xml_tools(arch, name),
-                xml,
+                tool_dialect(arch, name),
+                dialect,
                 "{name} on {arch}: wrong tool dialect -- the prompt would be \
                  rendered in one dialect and parsed in the other"
             );
@@ -373,6 +370,28 @@ mod tests {
                 "{name} on {arch}: wrong thinking channel"
             );
         }
+    }
+
+    /// The row upstream's registry does not have.
+    ///
+    /// `dev-sslee` keys the dialect on `arch_name` alone and drops `model_name`
+    /// from `create()` entirely, which is cleaner for 3.5/3.6 and loses
+    /// Qwen3-Coder: it is `qwen3_moe`, so an arch-only registry hands it
+    /// Qwen3's thinking cue and the JSON dialect. The name is the only signal
+    /// that separates it, so the name is still asked -- but only after the arch
+    /// has had its say.
+    #[test]
+    fn arch_decides_before_the_name_does() {
+        // A Qwen3 checkpoint DEPLOYED under a 3.6-ish name is still a Qwen3.
+        assert_eq!(tool_dialect("qwen3", "qwen3.6-bench"), ToolDialect::Hermes);
+        // A 3.5-architected checkpoint deployed under a coder-ish name is still
+        // Qwen3.5 -- arch wins, and it is not Coder.
+        assert_eq!(tool_dialect("qwen3_5moe", "qwen3_5_moe-coder-bench"), ToolDialect::Qwen35Xml);
+        // And Coder still resolves, which an arch-only registry cannot do.
+        assert_eq!(
+            tool_dialect("qwen3moe", "Qwen3-Coder-30B-A3B-Instruct"),
+            ToolDialect::Coder
+        );
     }
 
     /// Does this arch string reach an instruct that renders tool schemas?
