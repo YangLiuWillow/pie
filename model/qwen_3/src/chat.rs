@@ -810,7 +810,7 @@ pub(crate) fn parse_xml_tool_call(call: &str, schemas: &[String]) -> Option<(Str
     }
 }
 
-pub(crate) fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
+fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
     let gt = body.find('>')?;
     let name = body[..gt].trim().to_string();
     // Same unbounded scan, same failure, one level up. A model that writes

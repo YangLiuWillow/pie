@@ -7,5 +7,3 @@
 
 #[cfg(feature = "chat")]
 pub mod chat;
-#[cfg(feature = "chat")]
-pub mod parser_configs;
