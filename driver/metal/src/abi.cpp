@@ -76,7 +76,11 @@ extern "C" int32_t pie_metal_register_program(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->register_program(*program, program_id);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] register_program: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] register_program: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -90,7 +94,11 @@ extern "C" int32_t pie_metal_register_channel(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->register_channel(*channel, binding);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] register_channel: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] register_channel: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -104,7 +112,11 @@ extern "C" int32_t pie_metal_bind_instance(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->bind_instance(*instance, binding);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] bind_instance: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] bind_instance: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -165,7 +177,11 @@ extern "C" int32_t pie_metal_launch(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->launch(*frame, completion);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] launch: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] launch: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -182,7 +198,11 @@ extern "C" int32_t pie_metal_copy_kv(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->copy_kv(*copy, completion);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] copy_kv: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] copy_kv: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -199,7 +219,11 @@ extern "C" int32_t pie_metal_copy_state(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->copy_state(*copy, completion);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] copy_state: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] copy_state: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -216,7 +240,11 @@ extern "C" int32_t pie_metal_resize_pool(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->resize_pool(*resize, completion);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] resize_pool: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] resize_pool: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -227,7 +255,11 @@ extern "C" int32_t pie_metal_close_instance(
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->close_instance(instance_id);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] close_instance: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] close_instance: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
@@ -238,7 +270,11 @@ extern "C" int32_t pie_metal_close_channel(
     if (driver == nullptr || channel_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_context(driver)->close_channel(channel_id);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] close_channel: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     } catch (...) {
+        std::cerr << "[pie-driver-metal] close_channel: unknown exception\n";
         return PIE_STATUS_DRIVER_ERROR;
     }
 }
