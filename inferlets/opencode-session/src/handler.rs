@@ -295,7 +295,7 @@ impl Daemon {
         // replaying this turn as history renders no cue at all, so a retained
         // cue is tokens no re-render will ever produce (engine docs).
         let (delta_ops, cue_ops) = match ops.split_last() {
-            Some((RenderOp::Cue, head)) => (head, &ops[ops.len() - 1..]),
+            Some((RenderOp::Cue(_), head)) => (head, &ops[ops.len() - 1..]),
             _ => {
                 eprintln!("[opencode-session] render plan did not end with a cue");
                 send_error(req_id, 500, SERVER_ERROR, "internal error while rendering the prompt");
