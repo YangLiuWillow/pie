@@ -970,9 +970,28 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
             " channel slots per lane");
     }
     if (impl_->programs.size() >= impl_->max_program_cache_entries) {
+        // Name the budget that ran out. This cache NEVER evicts, so "full" is
+        // terminal for every new shape for the rest of the process, and the
+        // caller only sees `status -5` -- which is how it went unexplained
+        // through several runs. The count and the shape that was refused are
+        // what say whether the cap is too small or the shape churn too high.
+        std::cerr << "[pie-driver-metal] register_program: Metal M1 program "
+                     "executable cache is full ("
+                  << impl_->programs.size() << " entries, cap "
+                  << impl_->max_program_cache_entries
+                  << ", no eviction); refused program_hash=0x" << std::hex
+                  << program_hash << std::dec << " stages="
+                  << plan.trace.stages.size()
+                  << " channels=" << plan.trace.channels.size() << "\n";
         return reject_retryable("Metal M1 program executable cache is full");
     }
 
+    std::cerr << "[pie-driver-metal] register_program: cache entry "
+              << (impl_->programs.size() + 1) << "/"
+              << impl_->max_program_cache_entries << " program_hash=0x"
+              << std::hex << program_hash << std::dec
+              << " stages=" << plan.trace.stages.size()
+              << " channels=" << plan.trace.channels.size() << "\n";
     auto executable = std::make_shared<M1ProgramExecutable>();
     executable->program_hash = program_hash;
     executable->requires_m2_placement = requires_m2_placement;

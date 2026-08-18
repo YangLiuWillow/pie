@@ -392,15 +392,66 @@ where
     // rate -- ~570 ms of compile, on every turn, matching the ~600 ms first-fire
     // cost `decode-rows-probe` measures for any unseen shape.
     //
-    // Rounding collapses that to one compile per 8192 tokens of growth. It costs
-    // nothing real: `reserve` is purely logical -- no memory is held until a
-    // forward writes -- so an over-reservation is a longer page-id list and
-    // nothing else. Same constant and same reasoning as
-    // `inferlets/chat-completions`, which got this fix first.
+    // Rounding collapses that to one compile per 8192 tokens of growth.
+    //
+    // It does NOT cost nothing, which this comment used to claim: the rounded
+    // reservation is physically backed, and the pool reports it as occupied.
+    // Measured turn by turn on `tools/ramp_context.py` (page 32, pool 2048),
+    // the pool's own `kv-pool-status` returned exactly `pool_pages_want` every
+    // time -- 1280, 1536, 1792, 2048 -- while the turn had written 963, 1171,
+    // 1447 and 1722 pages. Up to 365 pages, ~12k tokens, held and never
+    // written.
+    //
+    // That is fatal at the top of the pool rather than merely wasteful. The
+    // gateway's admission gate refuses a turn once the worker's
+    // `kv_pressure_bucket` reaches 240/255 (94.1%), so the turn that rounds up
+    // to 2048 of 2048 makes the pool report 100% and the NEXT turn is refused
+    // -- at 55,099 tokens on a pool that holds 65,536, with 326 of the pages
+    // it was refused over holding nothing. (Until `gateway/tests/
+    // ws_turn_refusal.rs`, that refusal also killed the process and every
+    // retained branch, which is how this stayed hidden: see
+    // `integrations/opencode/finding-inferlet-killed-at-large-context.md`.)
+    //
+    // So: keep quantizing, but with a FINER step near the top, where a coarse
+    // one is what saturates the pool.
+    //
+    // Not "stop quantizing above the ceiling" -- that was tried and measured
+    // and is worse. It reaches one turn further (57,303 vs 55,099) and then
+    // fails differently: the driver's program cache holds
+    // `kMaxProgramCacheEntries = 64` entries and NEVER evicts
+    // (`driver/metal/src/pipeline/m1_runtime.cpp`), so a fresh shape per turn
+    // spends a hard, non-recyclable budget and the turn comes back
+    // `register_program: Metal M1 program executable cache is full` -- a
+    // DEGRADED turn with an empty completion, which is worse than the clean
+    // refusal it was trading away. (That is also what the unexplained
+    // `status -5` failures were; they say their own name now that
+    // `driver/metal/src/abi.cpp` logs `what()`.)
+    //
+    // The fine step keeps both budgets bounded: over-reservation is at most
+    // `TOP_GRANULARITY` pages instead of 255, and the band adds at most
+    // (pool - ceiling)/TOP_GRANULARITY shapes -- 5 here, against one per turn.
+    //
+    // `inferlets/chat-completions` reached the "coarse rounding is not free"
+    // conclusion from the other direction (its flat granularity cost 24 of 32
+    // concurrent requests) and switched to `next_power_of_two`, which does not
+    // help this case: 1799 -> 2048, the whole pool again.
     const POOL_GRANULARITY: u32 = 256;
-    let pool_pages_want = (n + cfg.max_tokens as u32 + 2)
-        .div_ceil(page_t)
-        .next_multiple_of(POOL_GRANULARITY);
+    /// The step used once quantizing at the coarse one would reach past
+    /// `QUANTIZE_BELOW_PERCENT` of the pool.
+    const TOP_GRANULARITY: u32 = 64;
+    /// Where the step narrows. Below the gate's 94.1% saturation point by more
+    /// than one `TOP_GRANULARITY`, so the rounding itself can never be what
+    /// saturates the pool.
+    const QUANTIZE_BELOW_PERCENT: u32 = 85;
+    let need_pages = (n + cfg.max_tokens as u32 + 2).div_ceil(page_t);
+    let (_, pool_total) = kv_pool_status();
+    let coarse = need_pages.next_multiple_of(POOL_GRANULARITY);
+    let quantize_ceiling = pool_total * QUANTIZE_BELOW_PERCENT / 100;
+    let pool_pages_want = if pool_total == 0 || coarse <= quantize_ceiling {
+        coarse
+    } else {
+        need_pages.next_multiple_of(TOP_GRANULARITY)
+    };
     let have = state.ws.page_len();
     if pool_pages_want > have {
         state.ws.reserve(pool_pages_want - have).context("ws.reserve")?;
