@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use pie_model_qwen_3::chat::{ChatMLConfig, CoderSchema, QwenInstruct, ToolDialect};
+use pie_model_common::instruct::Instruct;
 use pie_openai_serving::render::{RenderOp, plan_render};
 use pie_openai_serving::types::ChatCompletionRequest;
 use pie_tokenizer::Tokenizer;
@@ -69,39 +69,19 @@ fn load_pietok(path: &Path) -> Arc<Tokenizer> {
     Arc::new(Tokenizer::from_canonical(&canonical).expect("rebuilding the tokenizer"))
 }
 
-/// The exact config `model/src/instruct.rs::create` binds, decided by the same
-/// predicates rather than a copy of them — a harness that guesses the dialect
-/// certifies a prompt the server never sends.
-fn instruct(tokenizer: Arc<Tokenizer>, deploy: &str, coder_schema: &str) -> QwenInstruct {
-    let dialect = pie_model::instruct::tool_dialect(deploy, deploy);
-    let coder = pie_model::instruct::is_coder_lineage("qwen3", deploy);
-    QwenInstruct::new(
-        tokenizer,
-        ChatMLConfig {
-            has_thinking: !coder,
-            has_tools: true,
-            tool_dialect: dialect,
-            system_before_tools: !matches!(dialect, ToolDialect::Qwen35Xml),
-            empty_reasoning_header: matches!(dialect, ToolDialect::Qwen35Xml),
-            generation_suffix: if matches!(dialect, ToolDialect::Qwen35Xml) {
-                "<think>\n"
-            } else {
-                ""
-            },
-            thinking_off_suffix: "<think>\n\n</think>\n\n",
-            tool_response_trailing_newline: matches!(dialect, ToolDialect::Coder),
-            coder_schema: if coder_schema == "qwen" {
-                CoderSchema::QwenMain
-            } else {
-                CoderSchema::MlxGguf
-            },
-            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-        },
-    )
+/// The renderer the ENGINE would bind, from the registry itself.
+///
+/// Not a reconstructed `ChatMLConfig`. The first version of this test copied
+/// the qwen row's ten fields, which defeats the point: porting a model means
+/// adding a row to `instruct::create`, and a test carrying its own copy would
+/// happily pass against config nobody serves. `arch` is the driver's arch stem
+/// — `architectures[0]` lowercased with the task suffix removed — recorded in
+/// the fixture because only the generator knows it.
+fn instruct(tokenizer: Arc<Tokenizer>, arch: &str, deploy: &str) -> Arc<dyn Instruct> {
+    pie_model::instruct::create(arch, deploy, tokenizer)
 }
 
-fn render(inst: &QwenInstruct, body: &Value) -> Vec<u32> {
-    use pie_model_common::instruct::Instruct;
+fn render(inst: &dyn Instruct, body: &Value) -> Vec<u32> {
     let request: ChatCompletionRequest =
         serde_json::from_value(body.clone()).expect("fixture body deserializes");
     let ops = plan_render(&request).expect("fixture body plans");
@@ -143,13 +123,12 @@ fn rendered_tokens_match_each_checkpoints_own_chat_template() {
     for (digest, rel) in doc["tokenizers"].as_object().unwrap() {
         toks.insert(digest.clone(), load_pietok(&dir.join(rel.as_str().unwrap())));
     }
-    let mut arms: HashMap<String, QwenInstruct> = HashMap::new();
+    let mut arms: HashMap<String, Arc<dyn Instruct>> = HashMap::new();
     for (arm, meta) in doc["arms"].as_object().unwrap() {
         let t = toks[meta["tokenizer"].as_str().unwrap()].clone();
         arms.insert(
             arm.clone(),
-            instruct(t, meta["deploy"].as_str().unwrap(),
-                     meta["coder_schema"].as_str().unwrap()),
+            instruct(t, meta["arch"].as_str().unwrap(), meta["deploy"].as_str().unwrap()),
         );
     }
 
@@ -165,7 +144,7 @@ fn rendered_tokens_match_each_checkpoints_own_chat_template() {
             .iter()
             .map(|v| v.as_u64().unwrap() as u32)
             .collect();
-        let got = render(&arms[arm], &case["body"]);
+        let got = render(arms[arm].as_ref(), &case["body"]);
         if got != want {
             let at = got.iter().zip(&want).position(|(a, b)| a != b);
             failures.push(format!(

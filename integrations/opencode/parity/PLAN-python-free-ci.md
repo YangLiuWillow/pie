@@ -106,3 +106,31 @@ fail is worth nothing, so this was checked rather than assumed.
 
 `ci.yml` gains `render-parity` and remains Python-free — the only `python` in
 the file is inside the error message that tells a human how to regenerate.
+
+## Built, final shape
+
+    ci.yml  render-parity          cargo test, 112 cells, ~0.5 s, no Python
+    render-drift.yml               weekly, Python, live HuggingFace
+
+    tests/fixtures/render/         112 cases, 3 blobs, 17.6 MB
+    PORTING-A-MODEL.md             the workflow for the next model
+
+The golden test builds its renderer through `instruct::create`, NOT a
+reconstructed `ChatMLConfig`. The first version copied the qwen row's ten
+fields and would have passed against config nobody serves — which defeats the
+purpose, since porting a model IS adding a row. The fixture therefore records
+each arm's ARCH STEM (`qwen3_5moe`, not `qwen3_5_moe`), because only the
+generator knows it.
+
+`qwen3_coder_upstream` is marked `python_only`: it needs
+`CoderSchema::QwenMain` where the registry defaults to `MlxGguf`, so
+`create()` cannot produce it. 140 cells in the Python harness, 112 in the
+golden test. A config the registry cannot express is a signal about the
+registry, not a reason to special-case the test.
+
+Both failure modes verified rather than assumed:
+
+    flip system_before_tools in the TEST's config   80/140 cells (old version)
+    flip it in model/src/instruct.rs (the REGISTRY) 32/112 cells, right arm only
+
+The second is the one that matters: it is what a bad port looks like.

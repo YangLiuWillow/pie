@@ -105,13 +105,25 @@ import tempfile
 HUB = os.path.expanduser("~/.cache/huggingface/hub")
 
 # (arm, HF cache dir, the deployment name pie's registry keys the dialect off)
+# (arm, HF cache dir, deployment name, ARCH STEM, [flag])
+#
+# The arch stem is what the engine passes `instruct::create` -- `arch_stem` in
+# driver/metal and its Rust twin in worker/src/embedded_driver.rs, i.e.
+# `architectures[0]` lowercased with the task suffix removed. Recording it lets
+# the Rust golden test build its renderer through the REAL registry instead of
+# reconstructing a ChatMLConfig, which would drift the moment a model is ported.
+#
+# `python_only` marks an arm whose config is not the registry default and so
+# cannot come from `create()`; it is still checked here, just not in the golden
+# test. Today that is the Qwen-published Coder template, which needs
+# `CoderSchema::QwenMain` where the registry defaults to `MlxGguf`.
 ARMS = [
     ("qwen3", "models--mlx-community--Qwen3-8B-4bit",
-     "mlx-community--Qwen3-8B-4bit"),
+     "mlx-community--Qwen3-8B-4bit", "qwen3"),
     ("qwen3_coder", "models--mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit",
-     "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit"),
+     "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit", "qwen3moe"),
     ("qwen3_5", "models--mlx-community--Qwen3.6-35B-A3B-4bit",
-     "mlx-community--Qwen3.6-35B-A3B-4bit"),
+     "mlx-community--Qwen3.6-35B-A3B-4bit", "qwen3_5moe"),
     # Qwen's OWN repos, because the served checkpoint's template is not always
     # the model author's. mlx-community ships a Coder template that differs
     # from Qwen's currently-published one (6722 bytes against 6211: their tool
@@ -123,9 +135,9 @@ ARMS = [
     # Same renderer, the other variant: pie supports both, so the harness
     # proves both rather than picking a winner.
     ("qwen3_coder_upstream", "models--Qwen--Qwen3-Coder-30B-A3B-Instruct",
-     "Qwen--Qwen3-Coder-30B-A3B-Instruct", "qwen"),
+     "Qwen--Qwen3-Coder-30B-A3B-Instruct", "qwen3moe", "qwen", "python_only"),
     ("qwen3_5_upstream", "models--Qwen--Qwen3.6-35B-A3B",
-     "Qwen--Qwen3.6-35B-A3B"),
+     "Qwen--Qwen3.6-35B-A3B", "qwen3_5moe"),
 ]
 
 TOOLS = [
@@ -298,13 +310,19 @@ def emit_fixtures(a, arms, shapes, AutoTokenizer):
     (out / "tok").mkdir(parents=True, exist_ok=True)
 
     tokenizers, arm_meta, cases = {}, {}, []
-    for arm, cache_dir, deploy_name, *rest in arms:
+    for arm, cache_dir, deploy_name, arch, *rest in arms:
         snaps = glob.glob(f"{HUB}/{cache_dir}/snapshots/*/")
         if not snaps:
             print(f"  SKIP {arm}: not in the HF cache", file=sys.stderr)
             continue
+        if "python_only" in rest:
+            # Its config is not the registry default, so the golden test — which
+            # builds through `instruct::create` on purpose, so a ported model
+            # is checked against the row someone actually added — cannot
+            # reproduce it. Checked by this harness instead.
+            print(f"  (python-only arm, not in fixtures: {arm})", file=sys.stderr)
+            continue
         snap = pathlib.Path(snaps[0])
-        coder_schema = "qwen" if (rest and rest[0] == "qwen") else "shipped"
 
         # Compile the tokenizer through pie's own path and key it by content, so
         # two arms sharing a tokenizer share a blob.
@@ -322,7 +340,7 @@ def emit_fixtures(a, arms, shapes, AutoTokenizer):
             tmp.rename(final)
         tokenizers[digest] = f"tok/{digest}.pietok"
         arm_meta[arm] = {"tokenizer": digest, "deploy": deploy_name,
-                         "coder_schema": coder_schema}
+                         "arch": arch}
 
         tok = AutoTokenizer.from_pretrained(str(snap), local_files_only=True)
         for name, (messages, tools) in shapes.items():
@@ -381,7 +399,7 @@ def mutation_matrix(a, arms, shapes, mutations, AutoTokenizer):
     deserves.
     """
     loaded = []
-    for arm, cache_dir, deploy_name, *rest in arms:
+    for arm, cache_dir, deploy_name, arch, *rest in arms:
         snaps = glob.glob(f"{HUB}/{cache_dir}/snapshots/*/")
         if not snaps:
             continue
@@ -399,7 +417,7 @@ def mutation_matrix(a, arms, shapes, mutations, AutoTokenizer):
                 refs[(name, thinking)] = tok(txt, add_special_tokens=False)["input_ids"]
         loaded.append((
             arm, deploy_name, tok, snap / "tokenizer.json",
-            "qwen" if (rest and rest[0] == "qwen") else "shipped", refs,
+            "qwen" if "qwen" in rest else "shipped", refs,
         ))
 
     names = list(shapes)
@@ -505,9 +523,9 @@ def main():
 
     rows, total_ok, total = [], 0, 0
 
-    for arm, cache_dir, deploy_name, *rest in arms:
-        expected = bool(rest and rest[0] == "expected")
-        coder_schema = rest[0] if rest and rest[0] == "qwen" else "shipped"
+    for arm, cache_dir, deploy_name, arch, *rest in arms:
+        expected = "expected" in rest
+        coder_schema = "qwen" if "qwen" in rest else "shipped"
         snaps = glob.glob(f"{HUB}/{cache_dir}/snapshots/*/")
         if not snaps:
             rows.append((arm, None, f"not in the HF cache ({cache_dir})", expected))

@@ -1,0 +1,70 @@
+# Are the committed render fixtures still what HuggingFace renders?
+#
+# `ci.yml`'s render-parity job answers "did THIS PR break the renderer" and is
+# pure cargo — the HuggingFace oracle ran once, when a human regenerated
+# tests/fixtures/render. That leaves one thing unwatched: the oracle itself
+# moving. Qwen revised the Qwen3-Coder chat template after mlx-community and
+# unsloth had snapshotted it, and pie found out days later, by hand, by curling
+# a URL.
+#
+# So this runs the Python harness against LIVE HuggingFace on a schedule. A red
+# build here means the world changed, not that a PR did — which is why it is a
+# separate workflow that no pull request can block on.
+name: render drift
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays, early
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render-drift:
+    name: fixtures vs live HuggingFace templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # Tokenizer + template only. No weights: `allow_patterns` keeps this to
+      # tens of MB against tens of GB.
+      - name: Install the oracle
+        run: python -m pip install --quiet "transformers>=4.51" huggingface_hub
+
+      - name: Fetch templates and tokenizers
+        run: |
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+                   "vocab.json", "merges.txt", "config.json"]
+          for repo in ["mlx-community/Qwen3-8B-4bit",
+                       "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+                       "mlx-community/Qwen3.6-35B-A3B-4bit",
+                       "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                       "Qwen/Qwen3.6-35B-A3B"]:
+              snapshot_download(repo, allow_patterns=FILES)
+              print("fetched", repo)
+          PY
+
+      - name: Build the renderer
+        run: cargo build -p render-tokens
+
+      - name: Compare pie against the LIVE templates
+        run: |
+          python integrations/opencode/parity/check_render_matrix.py \
+              --bin target/debug/render-tokens -v
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          echo "::warning::pie no longer renders what these checkpoints publish."
+          echo "Either a template moved upstream, or the renderer regressed and"
+          echo "ci.yml's render-parity job is passing against stale fixtures."
+          echo "Regenerate and READ THE DIFF:"
+          echo "  python integrations/opencode/parity/check_render_matrix.py \\"
+          echo "      --bin target/debug/render-tokens --emit-fixtures tests/fixtures/render"
