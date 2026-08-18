@@ -43,23 +43,31 @@ error -- it shows up as accuracy, attributed to the engine.
 
 ## The measured baseline
 
-    2026-08-17, before any fix          after #25 (system_before_tools)
-      qwen3        24/26                  and #26 (empty_reasoning_header):
-      qwen3_coder  12/26                    qwen3        24/26
-      qwen3_5       5/26                    qwen3_coder  12/26
-                                            qwen3_5      12/26
+    arm            2026-08-17    now
+    qwen3            24/26      26/26
+    qwen3_coder      12/26      26/26
+    qwen3_5           5/26      26/26
+                                78/78
 
-On the qwen3_5 arm EVERY no-think cell now matches except `empty_system`. The
-14 that remain are the 13 thinking cells -- `generation_suffix: "<think>\n"`,
-the template opening the assistant turn inside a reasoning block -- plus that
-one edge case, where pie drops an empty system message the template renders as
-an empty system turn.
+Every arm renders byte-for-byte what its own `chat_template.jinja` renders, in
+both thinking modes, across all thirteen shapes. What closed the gap, in the
+order it was closed and with the cells each was worth:
 
-The two fixes were worth 7 cells and each landed where predicted: #25 flipped
-only shapes carrying both a system message and tools, #26 only shapes with an
-assistant turn after the last user query. qwen3 and qwen3_coder did not move,
-which is the control -- both were already ordered correctly and neither writes
-an empty reasoning header.
+    system_before_tools        +2   tools block leads the system content on 3.5/3.6
+    empty_reasoning_header     +5   post-query assistant turns carry <think></think>
+    generation_suffix         +12   3.5/3.6 opens the turn INSIDE a reasoning block
+    empty system turn          +4   a system message of "" is a turn, not an absence
+    tool_response framing     +12   Coder puts the newline after the block, not before
+
+The last two were found by this harness rather than by reading, and neither
+could have come from upstream: `dev-sslee` has no Qwen3-Coder row at all, so
+its arm never rendered a Coder tool response, and its own measurement reports
+qwen3_5 at 26/26 through a registry the live server does not reach.
+
+Keeping it honest: a green matrix is a statement about the RENDERER. The
+reasoning-header flag still stops at the WIT boundary, so the server does not
+yet benefit from `empty_reasoning_header` -- `render-tokens` links the renderer
+directly. See task #28.
 
 ## One deliberate divergence the harness accounts for
 
@@ -252,16 +260,18 @@ def main():
                     tokenize=False)
                 hf_ids = tok(hf_text, add_special_tokens=False)["input_ids"]
 
-                body = {"model": deploy_name, "messages": messages}
+                # The mode travels in the REQUEST, the same way a real client
+                # sends it and the same way `plan_render` reads it. It was an
+                # env var while `cue`/`cue-no-think` were two WIT functions.
+                body = {"model": deploy_name, "messages": messages,
+                        "chat_template_kwargs": {"enable_thinking": thinking}}
                 if tools:
                     body["tools"] = tools
                 with tempfile.NamedTemporaryFile("w", suffix=".json",
                                                  delete=False) as fh:
                     json.dump(body, fh)
                     req = fh.name
-                env = dict(os.environ,
-                           PARITY_MODEL_NAME=deploy_name,
-                           PARITY_THINKING="1" if thinking else "0")
+                env = dict(os.environ, PARITY_MODEL_NAME=deploy_name)
                 proc = subprocess.run([a.bin, str(tokenizer_json), req],
                                       capture_output=True, text=True, env=env)
                 os.unlink(req)

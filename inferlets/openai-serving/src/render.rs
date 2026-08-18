@@ -173,7 +173,14 @@ fn plan_from(
     );
     if leading_system || !tool_schemas.is_empty() {
         let system = if leading_system {
-            let s = messages[0].text_opt();
+            // `text()`, not `text_opt()`: for an ASSISTANT turn an empty
+            // string means "no content" and normalising it away is right, but
+            // in the system slot it is the difference between a turn the
+            // template renders and one it does not. A `{"role":"system",
+            // "content":""}` renders as `<|im_start|>system\n<|im_end|>\n`;
+            // dropping it lost five tokens and was the last failing cell on
+            // both the qwen3 and qwen3_5 parity arms.
+            let s = Some(messages[0].text());
             rest = &messages[1..];
             s
         } else {

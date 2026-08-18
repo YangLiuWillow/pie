@@ -127,6 +127,39 @@ pub struct ChatMLConfig {
     /// which is where it hid.
     pub empty_reasoning_header: bool,
     pub generation_suffix: &'static str,
+    /// The generation suffix when the caller turns thinking OFF.
+    ///
+    /// A sibling of `generation_suffix` rather than a tweak to it, because the
+    /// two are independent strings in the template:
+    ///
+    /// ```jinja
+    ///   {%- if enable_thinking is defined and enable_thinking is false %}
+    ///       {{- '<think>\n\n</think>\n\n' }}
+    ///   {%- else %}
+    ///       {{- '<think>\n' }}
+    /// ```
+    ///
+    /// `cue_no_think` used to append a hardcoded `<think>\n\n</think>\n\n`
+    /// to the generation header. That was right only while `generation_suffix`
+    /// was empty; the moment a family sets one, the two concatenate and the
+    /// cue carries BOTH — `<think>\n<think>\n\n</think>\n\n`. Ported from
+    /// upstream dev-sslee, which pre-encodes the two headers separately.
+    pub thinking_off_suffix: &'static str,
+    /// Where the newline sits around a replayed `<tool_response>` block.
+    ///
+    /// The two families disagree, and each is transcribed from its own
+    /// template:
+    ///
+    /// ```text
+    ///   Qwen3 / Qwen3.5 / 3.6   '\n<tool_response>\n' … '\n</tool_response>'
+    ///   Qwen3-Coder             '<tool_response>\n'   … '\n</tool_response>\n'
+    /// ```
+    ///
+    /// Same characters, moved from the front to the back — so the turn is one
+    /// token short rather than malformed, and it stayed invisible until a
+    /// positional diff ran the Coder arm. Upstream cannot have seen this: its
+    /// registry has no Qwen3-Coder row at all.
+    pub tool_response_trailing_newline: bool,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
 }
@@ -153,6 +186,7 @@ pub struct QwenInstruct {
     assistant_prefix_no_nl: Vec<u32>,
     turn_suffix: Vec<u32>,
     generation_header: Vec<u32>,
+    thinking_off_header: Vec<u32>,
     stop_ids: Vec<u32>,
     // Thinking delimiters
     think_prefix_ids: Vec<u32>,
@@ -193,6 +227,8 @@ impl QwenInstruct {
 
         let mut generation_header = make_prefix("assistant");
         generation_header.extend(encode(config.generation_suffix));
+        let mut thinking_off_header = make_prefix("assistant");
+        thinking_off_header.extend(encode(config.thinking_off_suffix));
 
         Self {
             system_prefix: make_prefix("system"),
@@ -201,6 +237,7 @@ impl QwenInstruct {
             user_prefix_no_nl,
             assistant_prefix_no_nl,
             generation_header,
+            thinking_off_header,
             turn_suffix,
             stop_ids,
             think_prefix_ids: think_prefix,
@@ -282,12 +319,29 @@ impl QwenInstruct {
     /// The inner text of a merged tool-results turn — everything between the
     /// `<|im_start|>user` role tag and `<|im_end|>`. Same byte-testability
     /// rationale as [`Self::assistant_with_tool_calls_inner_text`].
-    fn answer_batch_inner_text(results: &[(String, String)]) -> String {
+    fn answer_batch_inner_text(results: &[(String, String)], trailing_newline: bool) -> String {
+        // Both shapes put exactly one newline between the role tag and the
+        // first block; they differ in where the SEPARATOR lives, which is what
+        // makes a multi-result turn diverge rather than just the first one.
+        //
+        //   Coder     '<|im_start|>user\n' then, per result,
+        //             '<tool_response>\n' … '\n</tool_response>\n'
+        //   Qwen3.x   '<|im_start|>user'   then, per result,
+        //             '\n<tool_response>\n' … '\n</tool_response>'
         let mut text = String::new();
+        if trailing_newline {
+            text.push('\n');
+        }
         for (_name, value) in results {
-            text.push_str("\n<tool_response>\n");
+            if !trailing_newline {
+                text.push('\n');
+            }
+            text.push_str("<tool_response>\n");
             text.push_str(value);
             text.push_str("\n</tool_response>");
+            if trailing_newline {
+                text.push('\n');
+            }
         }
         text
     }
@@ -592,14 +646,11 @@ impl Instruct for QwenInstruct {
         if !self.config.has_thinking {
             return self.cue();
         }
-        // Reference (enable_thinking=false): the cue closes the thinking
-        // channel with an empty think block — <|im_start|>assistant\n
-        // <think>\n\n</think>\n\n (parity divergence D1). One whole-text
-        // encode for the non-special run, same D4 rationale as the replay
-        // primitives.
-        let mut tokens = self.generation_header.clone();
-        tokens.extend(self.tokenizer.encode("<think>\n\n</think>\n\n"));
-        tokens
+        // Reference (enable_thinking=false): the template's own
+        // `thinking_off_suffix`, pre-encoded beside the thinking-on header
+        // rather than appended to it. Appending is what would double the cue
+        // once a family sets `generation_suffix` — see the field's docs.
+        self.thinking_off_header.clone()
     }
 
     fn seal(&self) -> Vec<u32> {
@@ -736,7 +787,7 @@ impl Instruct for QwenInstruct {
         // chunk (there's no unconditional newline baked into the opening tag
         // either — same shape as assistant_with_tool_calls above). Single
         // whole-text encode for D4 parity, same rationale as there.
-        let text = Self::answer_batch_inner_text(results);
+        let text = Self::answer_batch_inner_text(results, self.config.tool_response_trailing_newline);
         let mut tokens = self.user_prefix_no_nl.clone();
         tokens.extend(self.tokenizer.encode(&text));
         tokens.extend(&self.turn_suffix);
@@ -1140,6 +1191,8 @@ mod tests {
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -1155,6 +1208,8 @@ mod tests {
                 has_thinking: false,
                 has_tools: true,
                 generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -1170,6 +1225,8 @@ mod tests {
                 has_thinking: true,
                 has_tools: false,
                 generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>"],
             },
         )
@@ -1389,7 +1446,7 @@ mod tests {
         // The role tag + turn suffix are pre-tokenized; the inner text is the
         // byte-testable part (whole-text-encoded at runtime — D4).
         assert_eq!(
-            QwenInstruct::answer_batch_inner_text(&[("fn1".to_string(), "Hello".to_string())]),
+            QwenInstruct::answer_batch_inner_text(&[("fn1".to_string(), "Hello".to_string())], false),
             "\n<tool_response>\nHello\n</tool_response>"
         );
     }
@@ -1597,7 +1654,7 @@ mod tests {
             QwenInstruct::answer_batch_inner_text(&[
                 ("fn1".to_string(), "Hello".to_string()),
                 ("fn2".to_string(), "world".to_string()),
-            ]),
+            ], false),
             "\n<tool_response>\nHello\n</tool_response>\n<tool_response>\nworld\n</tool_response>"
         );
     }
@@ -1638,6 +1695,8 @@ mod tests {
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         );

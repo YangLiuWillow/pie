@@ -159,7 +159,26 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                     tool_dialect(arch_name, model_name),
                     ToolDialect::Qwen35Xml
                 ),
-                generation_suffix: "",
+                // Qwen3.5/3.6 opens the model's turn INSIDE a reasoning block;
+                // Qwen3 opens it bare and only the thinking-OFF branch adds
+                // anything. An empty suffix here made every thinking-mode cue
+                // start from a position the checkpoint never trains at -- and
+                // it went unnoticed because no guest could reach the
+                // thinking-on cue until `cue(thinking)` existed.
+                generation_suffix: if matches!(
+                    tool_dialect(arch_name, model_name),
+                    ToolDialect::Qwen35Xml
+                ) {
+                    "<think>\n"
+                } else {
+                    ""
+                },
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                // Coder moves the newline to the back of the block.
+                tool_response_trailing_newline: matches!(
+                    tool_dialect(arch_name, model_name),
+                    ToolDialect::Coder
+                ),
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -172,6 +191,8 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 system_before_tools: true,
                 empty_reasoning_header: false,
                 generation_suffix: "<think>\n",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -193,6 +214,8 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 system_before_tools: true,
                 empty_reasoning_header: false,
                 generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
         )),
@@ -237,6 +260,8 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 system_before_tools: true,
                 empty_reasoning_header: false,
                 generation_suffix: "",
+                thinking_off_suffix: "<think>\n\n</think>\n\n",
+                tool_response_trailing_newline: false,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),

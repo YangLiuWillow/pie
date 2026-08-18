@@ -32,6 +32,8 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
             empty_reasoning_header: false,
             has_tools: true,
             generation_suffix: "",
+            thinking_off_suffix: "<think>\n\n</think>\n\n",
+            tool_response_trailing_newline: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },
     )
