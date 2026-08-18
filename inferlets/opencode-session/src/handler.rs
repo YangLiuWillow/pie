@@ -413,7 +413,7 @@ impl Daemon {
         }
 
         let t_resume = t_entry.elapsed();
-        let cached_tokens = resume_at.map(|(_, b)| b).unwrap_or(0);
+        let mut cached_tokens = resume_at.map(|(_, b)| b).unwrap_or(0);
         let delta = &full[cached_tokens as usize..];
         let prompt_tokens = cached_tokens + (delta.len() + cue.len()) as u32;
 
@@ -462,17 +462,54 @@ impl Daemon {
         // tokens are about to be rewritten by this turn's delta — so the
         // surviving list is truncated to `<= b` before the state is reused.
         let mut owned_parent: Option<Retained> = None;
+        let mut resumed_earlier_refused = false;
         if let Some((idx, b)) = resume_at {
             let mut r = self.sessions.remove(idx);
             let tip = r.boundaries.last().map(|(l, _)| *l).unwrap_or(0);
             if b < tip {
-                eprintln!(
-                    "[opencode-session] resuming at an earlier boundary ({b} < {tip}): \
-                     a retry or a truncated history"
-                );
+                // REWINDING IS A KV-ONLY POWER. Truncating the boundary list
+                // moves this branch's KV back to `b`, because paged KV is
+                // reversibly discardable. The FOLD is not: it stands at `tip`
+                // and nothing in the guest can move it left. The engine's own
+                // interface says so as a correctness gate -- "evicting KV does
+                // not undo the fold" (`forward-hybrid.wit`) -- and this path
+                // did it anyway.
+                //
+                // The driver catches it, which is the only reason it was not
+                // silent output corruption:
+                //
+                //   instance 2529 launch failed: paged continuation:
+                //   recurrent slot 0 is at position 12210, this fire starts at 7498
+                //
+                // 12210 is the tip, 7498 the earlier boundary. It then poisons
+                // every channel on the instance, and nothing clears a poison
+                // epoch, so one of these can end the process. Two landed in a
+                // five-minute agent run; the harness retried over both, which
+                // is exactly how a fault this severe stayed invisible.
+                //
+                // So on a recurrent model an earlier-boundary resume is
+                // REFUSED. A cold rebuild costs one prefill; the alternative
+                // is a poisoned instance or, without the driver's check, a
+                // fluent answer computed from a state that never existed.
+                if !r.state.rs.is_empty() {
+                    eprint!(
+                        "{}",
+                        format!(
+                            "[opencode-session] refusing an earlier-boundary resume \
+                             ({b} < {tip}) on a recurrent model: the fold cannot rewind; \
+                             rebuilding cold\n"
+                        )
+                    );
+                    // Dropping `r` releases the branch, KV and fold together.
+                    cached_tokens = 0;
+                    owned_parent = None;
+                    resumed_earlier_refused = true;
+                }
             }
-            r.boundaries.retain(|(l, _)| *l <= b);
-            owned_parent = Some(r);
+            if !resumed_earlier_refused {
+                r.boundaries.retain(|(l, _)| *l <= b);
+                owned_parent = Some(r);
+            }
         }
 
         // Make room for what THIS TURN will actually write. Every branch still
