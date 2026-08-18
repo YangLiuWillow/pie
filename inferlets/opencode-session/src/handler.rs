@@ -413,7 +413,81 @@ impl Daemon {
         }
 
         let t_resume = t_entry.elapsed();
-        let mut cached_tokens = resume_at.map(|(_, b)| b).unwrap_or(0);
+
+        // ── Settle the resume decision BEFORE anything is derived from it ──
+        //
+        // Everything this turn slices divides `full` at the resume boundary:
+        // the delta it prefills, the tokens it reports, the demand it hands
+        // retention, and — through `render_len` — the length the retained
+        // state claims. So the one decision that can send the turn cold has
+        // to come first.
+        //
+        // The first version of this guard ran AFTER `delta` was sliced and
+        // only zeroed `cached_tokens`. Its "cold rebuild" then prefilled the
+        // stale suffix `full[b..]` at positions 0..n, and `retain_turn` filed
+        // that state under the full render's prefix addresses filtered to
+        // `<= n` — a branch whose addresses hash true history prefixes while
+        // its state holds the wrong tokens, and whose recorded tip is the
+        // last stride cut below `n` while its fold stands at `n`. The next
+        // resume matched that tip, passed this guard (b == tip), and fired
+        // below the fold:
+        //
+        //   instance 1003 launch failed: paged continuation:
+        //   recurrent slot 1 is at position 733, this fire starts at 512
+        //
+        // 733 = 8297 - 7564: the length of the suffix the "cold" rebuild
+        // actually prefilled. All three post-guard poison epochs were this
+        // (806/768, 789/768, 733/512 — each fold at the mislabeled length,
+        // each fire at the last 256-stride cut under it). Had the driver not
+        // checked, the resume would have served output computed from tokens
+        // the addresses disclaim — on a pure-attention model, silently.
+        //
+        // The branch is TAKEN out of the list: the turn extends that very
+        // working set (nothing forks — see `engine::Resume`), so leaving a
+        // second handle behind would advertise a prefix whose tail is about
+        // to be overwritten. `retain_turn` puts the extended state back; a
+        // failed turn drops it, which is a clean miss.
+        //
+        // Resuming at boundary `b` invalidates every boundary ABOVE it —
+        // those tokens are about to be rewritten by this turn's delta — so
+        // the surviving list is truncated to `<= b` before the state is
+        // reused.
+        let mut owned_parent: Option<Retained> = None;
+        let mut resume_boundary: u32 = 0;
+        if let Some((idx, b)) = resume_at {
+            let r = self.sessions.remove(idx);
+            let tip = r.boundaries.last().map(|(l, _)| *l).unwrap_or(0);
+            // REWINDING IS A KV-ONLY POWER. Truncating the boundary list
+            // moves this branch's KV back to `b`, because paged KV is
+            // reversibly discardable. The FOLD is not: it stands at `tip`
+            // and nothing in the guest can move it left. The engine's own
+            // interface says so as a correctness gate -- "evicting KV does
+            // not undo the fold" (`forward-hybrid.wit`).
+            //
+            // So on a recurrent model an earlier-boundary resume is REFUSED
+            // and the turn rebuilds cold — genuinely cold, from the top of
+            // `full`. A cold rebuild costs one prefill; the alternative is a
+            // poisoned instance or, without the driver's check, a fluent
+            // answer computed from a state that never existed.
+            if b < tip && !r.state.rs.is_empty() {
+                eprint!(
+                    "{}",
+                    format!(
+                        "[opencode-session] refusing an earlier-boundary resume \
+                         ({b} < {tip}) on a recurrent model: the fold cannot rewind; \
+                         rebuilding cold\n"
+                    )
+                );
+                // Dropping `r` releases the branch, KV and fold together.
+            } else {
+                let mut r = r;
+                r.boundaries.retain(|(l, _)| *l <= b);
+                owned_parent = Some(r);
+                resume_boundary = b;
+            }
+        }
+
+        let cached_tokens = resume_boundary;
         let delta = &full[cached_tokens as usize..];
         let prompt_tokens = cached_tokens + (delta.len() + cue.len()) as u32;
 
@@ -452,65 +526,6 @@ impl Daemon {
         let keepalive = state.meta.keepalive();
         let ka_sink = sink.clone();
 
-        // The branch is TAKEN out of the list: the turn extends that very
-        // working set (nothing forks — see `engine::Resume`), so leaving a
-        // second handle behind would advertise a prefix whose tail is about to
-        // be overwritten. `retain_turn` puts the extended state back; a failed
-        // turn drops it, which is a clean miss.
-        //
-        // Resuming at boundary `b` invalidates every boundary ABOVE it — those
-        // tokens are about to be rewritten by this turn's delta — so the
-        // surviving list is truncated to `<= b` before the state is reused.
-        let mut owned_parent: Option<Retained> = None;
-        let mut resumed_earlier_refused = false;
-        if let Some((idx, b)) = resume_at {
-            let mut r = self.sessions.remove(idx);
-            let tip = r.boundaries.last().map(|(l, _)| *l).unwrap_or(0);
-            if b < tip {
-                // REWINDING IS A KV-ONLY POWER. Truncating the boundary list
-                // moves this branch's KV back to `b`, because paged KV is
-                // reversibly discardable. The FOLD is not: it stands at `tip`
-                // and nothing in the guest can move it left. The engine's own
-                // interface says so as a correctness gate -- "evicting KV does
-                // not undo the fold" (`forward-hybrid.wit`) -- and this path
-                // did it anyway.
-                //
-                // The driver catches it, which is the only reason it was not
-                // silent output corruption:
-                //
-                //   instance 2529 launch failed: paged continuation:
-                //   recurrent slot 0 is at position 12210, this fire starts at 7498
-                //
-                // 12210 is the tip, 7498 the earlier boundary. It then poisons
-                // every channel on the instance, and nothing clears a poison
-                // epoch, so one of these can end the process. Two landed in a
-                // five-minute agent run; the harness retried over both, which
-                // is exactly how a fault this severe stayed invisible.
-                //
-                // So on a recurrent model an earlier-boundary resume is
-                // REFUSED. A cold rebuild costs one prefill; the alternative
-                // is a poisoned instance or, without the driver's check, a
-                // fluent answer computed from a state that never existed.
-                if !r.state.rs.is_empty() {
-                    eprint!(
-                        "{}",
-                        format!(
-                            "[opencode-session] refusing an earlier-boundary resume \
-                             ({b} < {tip}) on a recurrent model: the fold cannot rewind; \
-                             rebuilding cold\n"
-                        )
-                    );
-                    // Dropping `r` releases the branch, KV and fold together.
-                    cached_tokens = 0;
-                    owned_parent = None;
-                    resumed_earlier_refused = true;
-                }
-            }
-            if !resumed_earlier_refused {
-                r.boundaries.retain(|(l, _)| *l <= b);
-                owned_parent = Some(r);
-            }
-        }
 
         // Make room for what THIS TURN will actually write. Every branch still
         // in `self.sessions` is now a non-keeper: the one being resumed was
@@ -789,6 +804,24 @@ impl Daemon {
             return format!("not retained (generation error: {e})");
         }
         let total = run.total_len;
+        // The state must hold the ENTIRE render it is about to be addressed
+        // as. `addressed` hashes prefixes of this request's full render; a
+        // state whose length differs holds some OTHER token sequence, and
+        // filing it under these addresses is cache poison — a later resume
+        // would reuse KV whose address disclaims its content. That is not
+        // hypothetical: the stale-delta refusal bug built a state from
+        // `full[b..]` at positions 0..n and retained it here, and the only
+        // reason it surfaced as a driver refusal rather than silent wrong
+        // output is that the model had a fold to disagree with the resume
+        // position. Refusing to retain converts the whole class into one
+        // loud line and a re-prefill.
+        let render_len = addressed.last().map(|(l, _)| *l).unwrap_or(0);
+        if render_len != total {
+            return format!(
+                "not retained (state holds {total} tokens of a {render_len}-token \
+                 render — addressing it would poison the cache)"
+            );
+        }
         // Store EVERY boundary of this render, not just the tip. The retained
         // KV covers [0, total), so every boundary at or below it is a valid
         // resume point — and the interior ones are the only thing another

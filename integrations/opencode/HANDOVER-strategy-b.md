@@ -8,6 +8,10 @@ saturation, and no longer dies silently — but it still poisons a driver
 instance now and then, and the harness's retries are what hide it. Do not run
 the 30-instance benchmark until §3.1 is settled.
 
+> **2026-08-18 update: §3.1 is settled — root-caused to `1f0aeee3b`'s own
+> stale delta, fixed, and re-measured (see §3.1 and finding §11). The
+> benchmark blocker is lifted once the fixed-wasm probe runs clean.**
+
 ---
 
 ## 1. The bug this session opened with, and what it actually was
@@ -53,7 +57,33 @@ tip, when keeping it would leave the pool with no room for another turn.
 
 ## 3. Open, ranked
 
-### 3.1 A second fold-drift class poisons driver instances — BLOCKS THE BENCHMARK
+### 3.1 RESOLVED 2026-08-18 — the "second class" was `1f0aeee3b`'s own stale delta
+
+> The arm-A test below ran once and answered everything: one conversation,
+> fresh process, poison on the first run. Neither hypothesis survived. The
+> refusal path reset `cached_tokens` but not the already-sliced `delta`, so
+> its "cold rebuild" prefilled `full[b..]` at positions 0..n and retained the
+> result under the full render's prefix addresses — recorded tip at the last
+> 256-stride cut below n, fold at n. Every "class 2" failure is
+> `fire at last_stride_cut(len), slot at len` (806/768, 789/768, 733/512).
+> Fork-CoW is fine (fold stood at exactly `render_len`); seat pressure is
+> refuted; the §10 driver experiment is not worth building. Fixed by settling
+> the resume decision before anything derives from it, plus a `retain_turn`
+> guard that refuses to file a state under a render it does not hold. See
+> `finding-inferlet-killed-at-large-context.md` §11. The original section
+> follows for the record.
+>
+> Re-measured on the fixed wasm — same instance, one process, three
+> sequential runs: 3/3 non-empty patches, 43 refusals fired, 0 launch
+> failed, 0 poison epochs, watchdog silent. The benchmark blocker is
+> lifted. What the fix leaves behind is a performance item, not a
+> correctness one: every truncation/compaction on a recurrent model is a
+> full cold prefill, and interior-boundary reuse is structurally
+> unavailable on hybrids (the fold cannot rewind), so B's prefix-reuse
+> advantage exists only at exact-tip resumes. The benchmark should COUNT
+> refusals per run.
+
+### 3.1-as-handed-over: A second fold-drift class poisons driver instances — BLOCKS THE BENCHMARK
 
 ```
 instance 5126 launch failed: recurrent slot 1 is at position 806, this fire starts at 768

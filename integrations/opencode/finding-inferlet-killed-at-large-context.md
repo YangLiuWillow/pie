@@ -261,7 +261,11 @@ against a `PIE_STRATEGY=a` boot would settle it cheaply.
 
 ---
 
-## 10. OPEN: a second fold-drift class — is `RsWorkingSet::fork` copy-on-write?
+## 10. ~~OPEN~~ RESOLVED in §11: a second fold-drift class — is `RsWorkingSet::fork` copy-on-write?
+
+> **2026-08-18: no. Both hypotheses below (fork-CoW breakage, seat pressure)
+> were refuted by one arm-A run — see §11. Kept as written because the §3.1
+> test design is what produced the discriminating evidence.**
 
 Two poison epochs survive the earlier-boundary fix (§ commit
 `1f0aeee3b`), and they are a different mechanism:
@@ -337,3 +341,95 @@ epoch. Each occurrence can end the process, and the agent harness retries over
 it, so the only trace is a `launch failed` line in the engine log and a
 `prefill take: channel is poisoned` in the shim log. Two landed in a
 five-minute run whose three trajectories all reported success.
+
+---
+
+## 11. RESOLVED: the "second class" was the first fix biting its own tail
+
+**Date: 2026-08-18, session after the handover. Neither §10 hypothesis
+survived contact with one run of the §3.1 arm-A test.**
+
+The discriminating run (one swebench instance, fresh process, fixed-`1f0aeee3b`
+wasm) reproduced the poison on the first try, and the shim log this time
+carried the whole chain:
+
+```
+turn 5 ... retained 50e9bc646991d93b (len 12335)          # main line
+refusing an earlier-boundary resume (7564 < 12335) ...    # opencode truncated history
+turn 6 cached=0 delta=733 ... retained 4a7c7828 (len 733) # "cold" rebuild
+[pie-driver-metal] instance 1003 launch failed: paged continuation:
+    recurrent slot 1 is at position 733, this fire starts at 512
+```
+
+**733 = 8297 − 7564.** The refusal in `1f0aeee3b` reset `cached_tokens` to 0
+but `delta` had already been sliced — `&full[7564..]` — and was never
+recomputed. The "cold rebuild" therefore prefilled the *last 733 tokens of an
+8297-token history at positions 0..733*, and `retain_turn` filed that state
+under the full render's prefix addresses filtered to `<= 733`. Two lies in one
+branch:
+
+* **Content**: addresses hash `full[..256]`, `full[..512]` — true history
+  prefixes — while the state holds `full[7564..]`. On a pure-attention model
+  a later resume would have served from it silently.
+* **Tip**: the addressed list under 733 ends at the last 256-stride cut
+  (512), because the head render op has no interior edge there. So the
+  branch's recorded tip sits BELOW its fold (733), and the next resume at
+  that tip passes the `b < tip` guard trivially and fires below the fold.
+
+Every observed "class 2" signature is this arithmetic:
+
+| retained len | last stride cut ≤ len | fold | observed |
+|---|---|---|---|
+| 806 | 768 | 806 | `slot 1 at 806, fire at 768` (gap 38) |
+| 789 | 768 | 789 | `slot 0 at 789, fire at 768` (gap 21) |
+| 733 | 512 | 733 | `slot 1 at 733, fire at 512` (gap 221) |
+
+The "gaps of about one cue plus one generation" reading in §10 was a
+coincidence of the first two lens; 221 breaks it, `len − last_stride_cut`
+explains all three.
+
+**Both §10 hypotheses are dead.** Fork IS copy-on-write on this path — the
+fold stood at exactly `render_len` (733), not `render_len + cue + gen` (899).
+Seat pressure is refuted as the necessary condition — one conversation, fresh
+process, poison on the first run. The fork/fold driver experiment in §10 is
+not worth building. (`sequence_id` on a recurrent fire is derived from the
+slot — `(1<<63)|rs_slot_id` — so the driver's sequence check can never
+distinguish two lineages sharing a slot; the position check is the only gate.
+That is why the error text alone couldn't discriminate.)
+
+**The fix (this session):** the resume decision now settles BEFORE
+`cached_tokens`/`delta`/`prompt_tokens` are derived, so a refusal rebuilds
+from the top of `full`; and `retain_turn` refuses to retain a state whose
+length differs from the render it would be addressed as (`not retained (state
+holds N tokens of an M-token render)`), which converts any recurrence of the
+class into one loud line and a re-prefill instead of cache poison.
+
+**Class-1 note for the record:** the refusal fires *within* a single
+conversation — opencode truncates/edits history mid-session (turn 6 matched
+the 12335-tip branch at its interior 7564) — so the trigger needs no
+cross-conversation traffic at all.
+
+**Measured, fixed wasm (same instance, one process, three sequential runs):**
+
+```
+non-empty patches                 3 / 3
+earlier-boundary refusals fired   43   (vs 4 in the pre-fix run that poisoned twice)
+launch failed                     0    (was 1 per ~1 run)
+poison epochs                     0    (was 1-2 per run)
+retain guard firings              0    (the ordering fix removes the cause;
+                                        the guard is the net)
+watchdog                          silent
+```
+
+The exact pre-fix reproduction point was crossed in run 1: same trajectory
+shape (turns 703/7728/7861/12340/1499, truncation refusal at 7566 < 12340),
+and the rebuild prefilled `delta=8523` — the full render — where the pre-fix
+code prefilled 733 and poisoned the next turn.
+
+**What this leaves behind (performance, not correctness):** the refusal rate.
+Every opencode truncation/compaction on a recurrent model now costs a full
+cold prefill (~8-12k tokens at the shapes above), and interior-boundary
+cross-conversation reuse is structurally unavailable — the fold cannot rewind,
+so B's prefix-reuse advantage on hybrids exists only at exact-tip resumes.
+That is the next thing to weigh against A in the benchmark, and it should be
+REPORTED by the benchmark (count refusals per run), not discovered again.
