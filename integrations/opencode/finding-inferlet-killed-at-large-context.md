@@ -215,6 +215,33 @@ container-layout change; the test holds the line until then.
 | a hard context/model limit at ~53.5k | ramp at `max_tokens=8` | **falsified** — survived 59,507 |
 | a websocket size limit | payload at death is ~218 KB against a 1 MiB client limit | not reached |
 
+## 8b. The refusal after saturation is BOUNDED, not a wedge
+
+A conversation that fills the pool still gets one 503, and the reflex is to
+call that a wedge. Measured with `tools/recovery_window.py`:
+
+```
+t+ 0.0s  refused  503 admission rejected: cluster saturated
+t+ 4.5s  SERVED
+RECOVERY WINDOW: 4.5s
+```
+
+That is the coarse-load report interval, not a fault. `gateway/src/admission.rs`
+reads only `RoutingTable.coarse_load.kv_pressure_bucket`, which the worker
+PUSHES every `REPORT_INTERVAL = 2s` (`worker/src/link/control.rs`), and the
+controller advances the gateway epoch only on a bucket cross. So after the
+guest frees its pages the gate keeps refusing until the next report lands.
+
+This was written up once as "the wedge is back" on the strength of a probe
+fired sub-second after the flush. It was racing the report. The lesson is the
+measurement, not the mechanism: served-vs-refused cannot distinguish a bounded
+lag from a permanent hold, and only the WINDOW can — which is why the tool
+reports elapsed time and prints the refusal body rather than the status code
+alone.
+
+The guest log shows the whole cycle: turn 27 flushes to 0%, turn 28 serves
+cold (`cached=0`) and the pool returns to 12%.
+
 ## 9. Bearing on the four-way benchmark
 
 The unblocking condition is met for the failure this document was opened for:
