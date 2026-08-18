@@ -747,10 +747,107 @@ impl Daemon {
         let dropped = before - self.sessions.len();
         self.sessions.push(candidate);
 
+        let trimmed = self.trim_to_admissible();
+
+        let mut line = format!("retained {} (len {total}", &address[..16]);
         if dropped > 0 {
-            format!("retained {} (len {total}, superseded {dropped})", &address[..16])
-        } else {
-            format!("retained {} (len {total})", &address[..16])
+            line.push_str(&format!(", superseded {dropped}"));
+        }
+        if trimmed > 0 {
+            line.push_str(&format!(", trimmed {trimmed}"));
+        }
+        line.push(')');
+        line
+    }
+
+    /// Leave the pool in a state the NEXT turn can be ADMITTED in.
+    ///
+    /// `make_room` answers a different question, for a different party, at a
+    /// different time: "can THIS turn write?", asked by the guest, before the
+    /// turn. Nobody asked "can the next turn get in at all?" -- and that one is
+    /// decided by the gateway, from the worker's pool occupancy, BEFORE this
+    /// guest runs again.
+    ///
+    /// So a turn that ends with the pool full refuses its own successor, and
+    /// the guest -- the only thing that can free those pages -- never runs to
+    /// free them. The full state sustains itself. Measured: after a
+    /// conversation ended at 2048/2048, an idle server refused a FOUR-token
+    /// request, permanently, and every turn of a fresh SWE-bench instance with
+    /// it. Not one turn of that run executed.
+    ///
+    /// That is why this drops the last branch too when nothing else is left.
+    /// Losing the tip costs one cold re-prefill; keeping it costs the server.
+    /// The same trade `make_room` documents -- "the worst case is a cold turn,
+    /// not a failed one" -- applied to the case `make_room` cannot see.
+    fn trim_to_admissible(&mut self) -> usize {
+        // Trim to the GATE's own line, and not one page sooner.
+        //
+        // The gate refuses when the worker's pressure bucket reaches 240 of 255
+        // (`gateway/src/admission.rs`, `planner.rs::kv_pressure_bucket`), so
+        // that bucket -- not a round percentage -- is the only number that
+        // decides anything here. Computed in the gate's units for the same
+        // reason: a percentage invites a margin, and a margin is what broke
+        // this the first time.
+        //
+        // That first attempt trimmed below 85% "to leave room for growth". One
+        // conversation legitimately occupies 87-93% of a pool this size, so it
+        // flushed on EVERY turn and reuse went to zero -- measured, turn by
+        // turn: 81%, then 0%, then `cached=0 delta=52888` for the rest of the
+        // run. It swapped a permanent wedge for a permanent full-price prefill,
+        // which is the exact failure `make_room` above documents.
+        //
+        // Trimming only at the line gives the sawtooth instead: fast turns
+        // until the pool fills, ONE flush, one cold turn, fast again. On this
+        // deployment `total_pages * kv_page_size == max_model_len`, so the pool
+        // holds exactly one maximum-length conversation and nothing else --
+        // a flush at the top is not a tuning failure, it is the configuration
+        // saying a single full conversation cannot also leave headroom.
+        const GATE_SATURATED_BUCKET: u64 = 240;
+        let mut dropped = 0usize;
+        loop {
+            let (available, total) = kv_pool_status();
+            if total == 0 {
+                return dropped;
+            }
+            let used = u64::from(total - available);
+            // The gate rounds; matching that avoids trimming a pool the gate
+            // would have admitted. It cannot see the `waiters`/`nonresident`
+            // clamps, which are the engine's own and not occupancy at all.
+            let bucket = (used * 255 + u64::from(total) / 2) / u64::from(total);
+            let used_pct = used * 100 / u64::from(total);
+            if bucket < GATE_SATURATED_BUCKET {
+                return dropped;
+            }
+            let Some(last) = self.sessions.len().checked_sub(1) else {
+                // Over the line with nothing left to give: the pages are held
+                // by something this guest does not own. Say so -- silence here
+                // reads as "trimmed enough" and the next turn is refused with
+                // no explanation on this side.
+                if dropped == 0 {
+                    eprint!(
+                        "{}",
+                        format!(
+                            "[opencode-session] pool at {used_pct}% with no retained                              branch left to drop; the next turn may be refused
+"
+                        )
+                    );
+                }
+                return dropped;
+            };
+            // Oldest first, so the branch most likely to be resumed next is the
+            // last to go.
+            let is_tip = last == 0;
+            self.sessions.remove(0);
+            dropped += 1;
+            if is_tip {
+                eprint!(
+                    "{}",
+                    format!(
+                        "[opencode-session] dropped the TIP to stay admissible                          (pool was {used_pct}%); the next turn re-prefills
+"
+                    )
+                );
+            }
         }
     }
 
