@@ -25,8 +25,36 @@ use std::sync::Arc;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--compile <tokenizer.json> <out.pietok>`: pie's own compiled tokenizer,
+    // for the committed render-parity fixtures. Parsing HF JSON costs ~100 ms
+    // and 11-20 MB; the compiled form loads in under a millisecond from a
+    // third of the bytes, so the fixtures carry that instead.
+    if args.len() == 4 && args[1] == "--compile" {
+        let tok = Tokenizer::from_file(std::path::Path::new(&args[2]))
+            .with_context(|| format!("loading tokenizer from {}", args[2]))?;
+        let canonical = tok.to_canonical().context("compiling to pie.tokenizer/1")?;
+        // A flat container, not JSON: `pie.tokenizer/1`'s objects are raw
+        // bytes, and serialising them as JSON arrays-of-integers turned 6.8 MB
+        // into 20.6 MB. Per object: u32 name length, name, u32 data length,
+        // data -- all little-endian.
+        let mut blob: Vec<u8> = Vec::new();
+        for (name, bytes) in canonical.objects() {
+            blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            blob.extend_from_slice(name.as_bytes());
+            blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            blob.extend_from_slice(bytes);
+        }
+        std::fs::write(&args[3], &blob)
+            .with_context(|| format!("writing {}", args[3]))?;
+        eprintln!("[render-tokens] compiled {} -> {} ({} bytes)",
+                  args[2], args[3], blob.len());
+        return Ok(());
+    }
+
     if args.len() != 3 {
-        bail!("usage: render-tokens <tokenizer.json> <request.json>");
+        bail!("usage: render-tokens <tokenizer.json> <request.json>\n\
+                      render-tokens --compile <tokenizer.json> <out.pietok>");
     }
 
     let tokenizer = Arc::new(

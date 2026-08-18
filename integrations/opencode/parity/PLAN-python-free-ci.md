@@ -1,4 +1,4 @@
-# Python-free CI for render bit-parity
+# Python-free CI for render bit-parity  — BUILT
 
 ## The goal
 
@@ -33,13 +33,13 @@ there returns nothing: it reads checked-in JSON. `scripts/sync-wit.sh` +
   Measured: 11.4 MB tokenizer.json -> 4.0 MB, 20.0 MB -> 6.8 MB (~35%), and
   loading is ~420x faster than parsing HF JSON (96-138 ms -> under 1 ms).
 
-`check_render_matrix.py --emit-fixtures <dir>`  **TODO**
+`check_render_matrix.py --emit-fixtures <dir>`  **DONE**
   For every (arm, shape, thinking): render the reference with
   `apply_chat_template`, tokenize, and write the request body beside the
   expected ids. Shapes live in Python today; the fixture carries the exact
   BODY so the Rust side needs no copy of them.
 
-### 2. Committed fixtures under `tests/fixtures/render/`  — TODO
+### 2. Committed fixtures under `tests/fixtures/render/`  — DONE
 
     tok/<sha16>.pietok      compiled tokenizers, ~10.8 MB total
     cases.json              { tokenizers, arms, cases: [{arm, shape, thinking,
@@ -50,7 +50,7 @@ there returns nothing: it reads checked-in JSON. `scripts/sync-wit.sh` +
   the whole corpus, so one blob per encode-equivalence class is sound — record
   that decision in the fixture file rather than leaving it implicit.
 
-### 3. Rust test  — TODO
+### 3. Rust test  — DONE
 
   Lives beside the deps it needs (`render-tokens` already links
   `pie-openai-serving`, `pie-model-qwen-3`, `pie-tokenizer`), so
@@ -60,7 +60,7 @@ there returns nothing: it reads checked-in JSON. `scripts/sync-wit.sh` +
   `Tokenizer::from_canonical`, run `plan_render` + `QwenInstruct` over each
   case's body, compare ids. No HF cache, no network, no Python.
 
-### 4. `ci.yml` job  — TODO
+### 4. `ci.yml` job  — DONE
 
   `cargo test -p render-tokens`. Path filter on `model/**`,
   `inferlets/openai-serving/**`, `interface/**`.
@@ -80,3 +80,29 @@ Goldens can go stale if an upstream template changes (Qwen revised the Coder
 template after mlx-community and unsloth snapshotted it — found by hand, days
 late). A weekly scheduled job re-running the Python harness against live HF is
 the intended tripwire; a red build there means the world moved, not the PR.
+
+## As built
+
+    tests/fixtures/render/cases.json                140 cases, 1.0 MB
+    tests/fixtures/render/tok/30ecc0eb….pietok      4.0 MB  qwen3, qwen3_coder,
+                                                            qwen3_coder_upstream
+    tests/fixtures/render/tok/a6b82869….pietok      6.8 MB  qwen3_5
+    tests/fixtures/render/tok/a86f6a2e….pietok      6.8 MB  qwen3_5_upstream
+                                                   ------
+                                                   17.6 MB
+
+Three blobs, not the two estimated: Coder's mlx and Qwen tokenizers compile
+IDENTICALLY (one blob serves three arms), while Qwen3.6's two differ in
+metadata. They were verified to encode identically over the whole corpus, so
+one blob could serve both — kept separate anyway, because correctness is worth
+6.8 MB and a fixture that quietly substitutes one tokenizer for another is a
+fixture that can lie.
+
+    cargo test -p render-tokens --test render_parity     0.48 s, 140 cells
+
+Verified to FAIL: flipping `system_before_tools` in the test's config broke 80
+of 140 cells with the first divergence located per cell. A test that cannot
+fail is worth nothing, so this was checked rather than assumed.
+
+`ci.yml` gains `render-parity` and remains Python-free — the only `python` in
+the file is inside the error message that tells a human how to regenerate.

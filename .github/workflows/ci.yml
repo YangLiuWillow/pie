@@ -273,6 +273,34 @@ jobs:
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the
   # full unit-test suite too since dummy doesn't pull in cmake.
+  # The hand-written Rust chat renderers against each checkpoint's OWN
+  # chat_template.jinja, token for token. Pure cargo: the HuggingFace oracle
+  # ran once when a human regenerated tests/fixtures/render, exactly as
+  # model/config/tests/differential.rs consumes goldens recorded from the C++
+  # normalizer it replaces. No Python, no network, no HF cache.
+  #
+  # What it catches that nothing else does: a renderer that asks the model a
+  # different question than its template asks. That never appears in
+  # throughput and never raises an error -- it appears as accuracy, blamed on
+  # the engine. Five such divergences shipped in Qwen3.6 before this existed.
+  render-parity:
+    name: render parity (token-exact vs chat_template.jinja)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fixtures are present
+        run: |
+          test -f tests/fixtures/render/cases.json || {
+            echo "::error::tests/fixtures/render is missing. Regenerate with"
+            echo "  python integrations/opencode/parity/check_render_matrix.py \\"
+            echo "      --bin target/debug/render-tokens --emit-fixtures tests/fixtures/render"
+            exit 1
+          }
+
+      - name: Render parity
+        run: cargo test -p render-tokens --test render_parity
+
   pie-worker-dummy:
     name: pie-worker (driver-dummy)
     strategy:
