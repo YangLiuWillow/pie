@@ -82,6 +82,30 @@ pub trait Instruct: Send + Sync {
         tokens
     }
     fn assistant(&self, msg: &str) -> Vec<u32>;
+    /// A replayed assistant turn that sits AFTER the conversation's last real
+    /// user query.
+    ///
+    /// Qwen3.5/3.6 renders those turns with a reasoning block even when the
+    /// reasoning is empty — `<think>\n\n</think>\n\n` before the content —
+    /// and renders earlier turns bare. The rule is the template's:
+    ///
+    /// ```jinja
+    /// {%- if ... or (loop.index0 > ns.last_query_index) %}
+    ///     {{- '<|im_start|>' + role + '\n<think>\n' + reasoning + '\n</think>\n\n' + content }}
+    /// {%- else %}
+    ///     {{- '<|im_start|>' + role + '\n' + content }}
+    /// ```
+    ///
+    /// Position is knowable only to whoever holds the whole message list, so
+    /// it arrives as an argument rather than being inferred here.
+    ///
+    /// Defaulted to the position-blind render: every family whose template has
+    /// not been read against this keeps exactly its current behaviour, rather
+    /// than acquiring a reasoning block nobody verified it wants.
+    fn assistant_at(&self, msg: &str, reasoning_header: bool) -> Vec<u32> {
+        let _ = reasoning_header;
+        self.assistant(msg)
+    }
     fn cue(&self) -> Vec<u32>;
 
     /// The generation cue with the thinking channel explicitly closed — the
@@ -133,6 +157,17 @@ pub trait Instruct: Send + Sync {
     /// support tools (mirrors `equip`/`answer`'s no-tool-support behavior
     /// elsewhere in this trait). Override when the architecture supports
     /// tool calling; see `QwenInstruct` for a worked example.
+    /// [`Self::assistant_at`] for a turn that also made tool calls.
+    fn assistant_with_tool_calls_at(
+        &self,
+        content: Option<&str>,
+        calls: &[(String, String)],
+        reasoning_header: bool,
+    ) -> Vec<u32> {
+        let _ = reasoning_header;
+        self.assistant_with_tool_calls(content, calls)
+    }
+
     fn assistant_with_tool_calls(&self, content: Option<&str>, calls: &[(String, String)]) -> Vec<u32> {
         let _ = calls;
         self.assistant(content.unwrap_or(""))

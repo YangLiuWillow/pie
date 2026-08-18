@@ -28,6 +28,8 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
         ChatMLConfig {
             has_thinking: false,
             tool_dialect: ToolDialect::Hermes,
+            system_before_tools: true,
+            empty_reasoning_header: false,
             has_tools: true,
             generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],

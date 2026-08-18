@@ -41,34 +41,25 @@ A mismatch is pie asking the model a different question than the checkpoint's
 own template asks. It does not show up in tok/s, and it does not show up as an
 error -- it shows up as accuracy, attributed to the engine.
 
-## The measured baseline, 2026-08-17
+## The measured baseline
 
-    arm            cells   what fails
-    qwen3          24/26   `empty_system` only -- pie drops an empty system
-                           message where the template renders an empty system
-                           turn. Both thinking modes.
-    qwen3_coder    12/26
-    qwen3_5         5/26   every shape that declares tools or replays an
-                           assistant turn
+    2026-08-17, before any fix          after #25 (system_before_tools)
+      qwen3        24/26                  and #26 (empty_reasoning_header):
+      qwen3_coder  12/26                    qwen3        24/26
+      qwen3_5       5/26                    qwen3_coder  12/26
+                                            qwen3_5      12/26
 
-The qwen3_5 failures are the four `ChatMLConfig` fields upstream `dev-sslee`
-has and this branch does not, and the harness quantifies each one:
+On the qwen3_5 arm EVERY no-think cell now matches except `empty_system`. The
+14 that remain are the 13 thinking cells -- `generation_suffix: "<think>\n"`,
+the template opening the assistant turn inside a reasoning block -- plus that
+one edge case, where pie drops an empty system message the template renders as
+an empty system turn.
 
-    system_user_tools  no-think   351 vs 351   pure reordering: the template
-                                               writes the tools block BEFORE
-                                               the system content
-                                               (`system_before_tools`)
-    system_user_tools  thinking   347 vs 349   -2 tokens: the template opens
-                                               the turn inside a reasoning
-                                               block (`generation_suffix`)
-    agent_loop_2       no-think   454 vs 462   -8 tokens: 2 replayed assistant
-                                               turns x 4 tokens of
-                                               `<think>\n\n</think>\n\n`
-                                               (`empty_reasoning_header`)
-
-Those were first found by reading the Rust against the Jinja by hand. This
-reproduces all three by a different method and puts a number on each, which is
-the point -- the next one will be found by running this instead.
+The two fixes were worth 7 cells and each landed where predicted: #25 flipped
+only shapes carrying both a system message and tools, #26 only shapes with an
+assistant turn after the last user query. qwen3 and qwen3_coder did not move,
+which is the control -- both were already ordered correctly and neither writes
+an empty reasoning header.
 
 ## One deliberate divergence the harness accounts for
 

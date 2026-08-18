@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, bail};
 use pie_model_common::instruct::Instruct;
-use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
+use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolDialect};
 use pie_openai_serving::render::{RenderOp, plan_render};
 use pie_openai_serving::types::ChatCompletionRequest;
 use pie_tokenizer::Tokenizer;
@@ -83,6 +83,11 @@ fn main() -> Result<()> {
             has_thinking: !coder,
             has_tools: true,
             tool_dialect,
+            // Mirrors the registry: only Qwen3.5/3.6 leads with the tools
+            // block. Derived here rather than hardcoded, so the harness cannot
+            // certify an ordering the server does not use.
+            system_before_tools: !matches!(tool_dialect, ToolDialect::Qwen35Xml),
+            empty_reasoning_header: matches!(tool_dialect, ToolDialect::Qwen35Xml),
             generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },
@@ -97,9 +102,9 @@ fn main() -> Result<()> {
                 instruct.equip_after_system(system.as_deref(), tools)
             }
             RenderOp::User(msg) => instruct.user(msg),
-            RenderOp::Assistant(msg) => instruct.assistant(msg),
-            RenderOp::AssistantWithToolCalls { content, calls } => {
-                instruct.assistant_with_tool_calls(content.as_deref(), calls)
+            RenderOp::Assistant(msg, header) => instruct.assistant_at(msg, *header),
+            RenderOp::AssistantWithToolCalls { content, calls, reasoning_header } => {
+                instruct.assistant_with_tool_calls_at(content.as_deref(), calls, *reasoning_header)
             }
             RenderOp::AnswerBatch(results) => instruct.answer_batch(results),
             // Which cue depends on the thinking mode under test, and both

@@ -144,6 +144,21 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 // thinks AND speaks XML -- the pairing a single predicate could
                 // not express. They are two questions now; see `tool_dialect`.
                 tool_dialect: tool_dialect(arch_name, model_name),
+                // Qwen3 and Qwen3-Coder lead with the caller's system message;
+                // Qwen3.5/3.6 leads with the tools block. One arm serves all
+                // three, so this follows the dialect rather than repeating the
+                // lineage test.
+                system_before_tools: !matches!(
+                    tool_dialect(arch_name, model_name),
+                    ToolDialect::Qwen35Xml
+                ),
+                // Qwen3.5/3.6 writes a reasoning block on every post-query
+                // assistant turn; Qwen3 writes one only when the turn actually
+                // carried reasoning.
+                empty_reasoning_header: matches!(
+                    tool_dialect(arch_name, model_name),
+                    ToolDialect::Qwen35Xml
+                ),
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -154,6 +169,8 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 has_thinking: true,
                 has_tools: false,
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 generation_suffix: "<think>\n",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -173,6 +190,8 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 has_thinking: true,
                 has_tools: true,
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
@@ -215,6 +234,8 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 has_thinking: false,
                 has_tools: false,
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },

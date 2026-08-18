@@ -103,6 +103,29 @@ pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
     pub tool_dialect: ToolDialect,
+    /// Does the caller's system message lead the tools turn, or follow it?
+    ///
+    /// Every Qwen template folds both into ONE system turn; which half leads
+    /// is the template's to say, and they disagree. Read from the checkpoints:
+    ///
+    /// ```text
+    ///   Qwen3-8B          system_message, then "# Tools"          -> true
+    ///   Qwen3-Coder-30B   system_message, then "You have access"  -> true
+    ///   Qwen3.6-35B       "# Tools" block, then system_message    -> false
+    /// ```
+    ///
+    /// A pure reordering: same tokens, same count, different order. Nothing
+    /// that measures length can see it, which is why serving Qwen3.6 with
+    /// Qwen3's order survived until a positional diff went looking.
+    pub system_before_tools: bool,
+    /// Does a post-query assistant turn carry a reasoning block even when its
+    /// reasoning is EMPTY?
+    ///
+    /// Qwen3.5/3.6 writes one either way; Qwen3 writes one only when the turn
+    /// carries reasoning. Four tokens per replayed turn, so an agent loop of
+    /// twenty turns diverges by eighty — invisible to any single-turn check,
+    /// which is where it hid.
+    pub empty_reasoning_header: bool,
     pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
@@ -273,10 +296,37 @@ impl QwenInstruct {
     /// If `</think>` is present, keeps only the content after the last `</think>`,
     /// with leading newlines stripped (matching the reference template).
     fn strip_thinking(msg: &str) -> &str {
-        if let Some(pos) = msg.rfind("</think>") {
-            msg[pos + "</think>".len()..].trim_start_matches('\n')
+        Self::split_thinking(msg).1
+    }
+
+    /// `(reasoning, content)` — the same cut `strip_thinking` makes, keeping
+    /// the half it throws away.
+    ///
+    /// The template does exactly this split and then chooses whether to render
+    /// the reasoning half; discarding it here made that choice unavailable.
+    fn split_thinking(msg: &str) -> (&str, &str) {
+        let Some(close) = msg.rfind("</think>") else { return ("", msg) };
+        let content = msg[close + "</think>".len()..].trim_start_matches('\n');
+        let head = &msg[..close];
+        let reasoning = match head.rfind("<think>") {
+            Some(open) => &head[open + "<think>".len()..],
+            None => head,
+        };
+        (reasoning.trim(), content)
+    }
+
+    /// A replayed assistant turn's body: reasoning block, then content.
+    fn reasoning_header_for<'a>(&self, msg: &'a str, reasoning_header: bool) -> (String, &'a str) {
+        let (reasoning, content) = if self.config.has_thinking {
+            Self::split_thinking(msg)
         } else {
-            msg
+            ("", msg)
+        };
+        let renders = self.config.empty_reasoning_header || !reasoning.is_empty();
+        if reasoning_header && self.config.has_thinking && renders {
+            (format!("<think>\n{reasoning}\n</think>\n\n"), content)
+        } else {
+            (String::new(), content)
         }
     }
 
@@ -591,7 +641,13 @@ impl Instruct for QwenInstruct {
             ToolDialect::Hermes => Self::build_tool_system_prompt(tools),
         };
         let merged = match system_content {
-            Some(c) if !c.is_empty() => format!("{c}\n\n{tools_block}"),
+            Some(c) if !c.is_empty() => {
+                if self.config.system_before_tools {
+                    format!("{c}\n\n{tools_block}")
+                } else {
+                    format!("{tools_block}\n\n{c}")
+                }
+            }
             // The Coder template does not open a bare tools turn: with tools
             // and no system message it emits its own stand-in system line
             // first, and the model saw that line in training.
@@ -599,6 +655,47 @@ impl Instruct for QwenInstruct {
             _ => tools_block,
         };
         self.system(&merged)
+    }
+
+    fn assistant_at(&self, msg: &str, reasoning_header: bool) -> Vec<u32> {
+        let (header, content) = self.reasoning_header_for(msg, reasoning_header);
+        if header.is_empty() {
+            return self.role_tokens("assistant", content);
+        }
+        // One string, one encode: BPE merges across the header/content join
+        // the same way HF's does over its fully-rendered template output.
+        self.role_tokens("assistant", &format!("{header}{content}"))
+    }
+
+    fn assistant_with_tool_calls_at(
+        &self,
+        content: Option<&str>,
+        calls: &[(String, String)],
+        reasoning_header: bool,
+    ) -> Vec<u32> {
+        if !self.config.has_tools || calls.is_empty() {
+            return self.assistant_at(content.unwrap_or(""), reasoning_header);
+        }
+        let (header, _) = self.reasoning_header_for(content.unwrap_or(""), reasoning_header);
+        if header.is_empty() {
+            return self.assistant_with_tool_calls(content, calls);
+        }
+        // The header sits between the role tag and the turn's inner text, so
+        // it joins the SAME single-pass encode the inner text already uses --
+        // see the D4 note below for why that matters.
+        let (_, stripped) = self.reasoning_header_for(content.unwrap_or(""), reasoning_header);
+        let body = Self::assistant_with_tool_calls_inner_text(
+            Some(stripped),
+            calls,
+            self.config.tool_dialect,
+        );
+        // `inner_text` opens with its own '\n' after the role tag; the header
+        // replaces that, because the template writes '\n<think>' there.
+        let body = body.strip_prefix('\n').unwrap_or(&body);
+        let mut tokens = self.assistant_prefix_no_nl.clone();
+        tokens.extend(self.tokenizer.encode(&format!("\n{header}{body}")));
+        tokens.extend(&self.turn_suffix);
+        tokens
     }
 
     fn assistant_with_tool_calls(&self, content: Option<&str>, calls: &[(String, String)]) -> Vec<u32> {
@@ -1038,6 +1135,8 @@ mod tests {
             make_tok(),
             ChatMLConfig {
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",
@@ -1051,6 +1150,8 @@ mod tests {
             make_tok(),
             ChatMLConfig {
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 has_thinking: false,
                 has_tools: true,
                 generation_suffix: "",
@@ -1064,6 +1165,8 @@ mod tests {
             make_tok(),
             ChatMLConfig {
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 has_thinking: true,
                 has_tools: false,
                 generation_suffix: "",
@@ -1530,6 +1633,8 @@ mod tests {
             tok,
             ChatMLConfig {
                 tool_dialect: ToolDialect::Hermes,
+                system_before_tools: true,
+                empty_reasoning_header: false,
                 has_thinking: true,
                 has_tools: true,
                 generation_suffix: "",

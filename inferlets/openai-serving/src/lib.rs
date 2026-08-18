@@ -220,7 +220,7 @@ mod fixture_tests {
         }
         assert!(matches!(&ops[1], RenderOp::User(t) if !t.is_empty()));
         match &ops[2] {
-            RenderOp::AssistantWithToolCalls { content, calls } => {
+            RenderOp::AssistantWithToolCalls { content, calls, .. } => {
                 assert_eq!(*content, None, "content \"\" must render as None");
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].0, "read");

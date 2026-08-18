@@ -111,8 +111,16 @@ fn render_one(op: &RenderOp, out: &mut Vec<u32>) -> Result<(), String> {
             out.extend(tools::equip_after_system(system.as_deref(), schemas)?);
         }
         RenderOp::User(t) => out.extend(chat::user(t)),
-        RenderOp::Assistant(t) => out.extend(chat::assistant(t)),
-        RenderOp::AssistantWithToolCalls { content, calls } => {
+        // The flag stops here: `pie:instruct/chat.assistant` and
+        // `tools.assistant-with-tool-calls` take no position argument, so the
+        // host rebuilds the turn without knowing whether it follows the last
+        // user query. Qwen3.5/3.6 therefore still loses its empty reasoning
+        // block on this path -- the renderer knows how to write it and the
+        // wire cannot ask for it. Extending the two WIT functions is the
+        // remaining half of this change; `render-tokens` links the renderer
+        // directly, which is why the parity matrix already shows the fix.
+        RenderOp::Assistant(t, _reasoning_header) => out.extend(chat::assistant(t)),
+        RenderOp::AssistantWithToolCalls { content, calls, .. } => {
             let wit_calls: Vec<tools::ToolCall> = calls
                 .iter()
                 .map(|(name, args)| tools::ToolCall {
