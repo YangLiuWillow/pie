@@ -45,11 +45,11 @@ error -- it shows up as accuracy, attributed to the engine.
 
     arm                     2026-08-17    now
     qwen3                     24/26      30/30
-    qwen3_coder               12/26      30/30
     qwen3_5                    5/26      30/30
-    qwen3_coder_upstream          -      10/30   <- see below
+    qwen3_coder_upstream          -      30/30
     qwen3_5_upstream              -      30/30
-                                        130/150
+    qwen3_coder               12/26      10/30   <- deliberate, see below
+                                        120/120 graded
 
 ## "Which template" is a real question, and the answer differs per model
 
@@ -65,13 +65,25 @@ opens the tools turn with a `# Tools\n\n` heading that the mlx checkpoint's
 does not. Every shape declaring tools diverges by exactly those three tokens;
 every shape without tools passes. Hence 10/30.
 
-That is not a bug to fix blindly. The template shipped WITH a checkpoint is
-what that checkpoint was fine-tuned against, and it is what mlx-lm and vLLM
-execute when serving the same files -- so `qwen3_coder` at 30/30 is the number
-that governs cross-engine parity on the checkpoint under test. `10/30` says
-something different and also worth knowing: serving Qwen's own Coder repo
-would need the heading. Two references, two numbers, neither standing in for
-the other.
+pie tracks QWEN's file. A checkpoint redistributed with a patched or older
+copy does not get to become the reference, so `qwen3_coder_upstream` is the
+graded arm and the mlx conversion's is carried as an expected divergence --
+visible, sized, and not failing the run.
+
+Matching Qwen took two changes, and only the first was obvious: the `# Tools`
+heading, and then `render_extra_keys`. Qwen has no special handling for
+`enum` or `required` at all -- every unhandled schema key goes through one
+generic passthrough, JSON for containers and plain text otherwise, with the key
+used RAW as the tag. The mlx conversion added a `render_item_list` macro that
+writes `[`tz`]` where Qwen writes `["tz"]`, and a `normed_json_key` that
+rewrites tag names. Adding the heading alone left both Coder arms at 10/30;
+only replacing the special-cased lists with the generic rule closed it.
+
+The cost is real and stated rather than hidden: serving
+`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`, pie now renders three tokens
+of heading and JSON-quoted lists that THAT checkpoint's template does not, so
+mlx-lm and vLLM serving the same files render something different. Twenty of
+its thirty cells. That is the trade the choice buys, in the direction chosen.
 
 Every arm renders byte-for-byte what its own `chat_template.jinja` renders, in
 both thinking modes, across all thirteen shapes. What closed the gap, in the
@@ -141,8 +153,12 @@ HUB = os.path.expanduser("~/.cache/huggingface/hub")
 ARMS = [
     ("qwen3", "models--mlx-community--Qwen3-8B-4bit",
      "mlx-community--Qwen3-8B-4bit"),
+    # EXPECTED to diverge. pie tracks Qwen's published Coder template, and the
+    # mlx conversion ships a different one -- see `qwen3_coder_upstream`. The
+    # arm stays so the size and shape of that divergence is visible rather than
+    # forgotten, but it does not fail the run.
     ("qwen3_coder", "models--mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit",
-     "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit"),
+     "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit", "expected"),
     ("qwen3_5", "models--mlx-community--Qwen3.6-35B-A3B-4bit",
      "mlx-community--Qwen3.6-35B-A3B-4bit"),
     # Qwen's OWN repos, because the served checkpoint's template is not always
@@ -317,10 +333,11 @@ def main():
     shapes = {k: v for k, v in SHAPES.items() if not a.shape or k in a.shape}
     rows, total_ok, total = [], 0, 0
 
-    for arm, cache_dir, deploy_name in arms:
+    for arm, cache_dir, deploy_name, *rest in arms:
+        expected = bool(rest and rest[0] == "expected")
         snaps = glob.glob(f"{HUB}/{cache_dir}/snapshots/*/")
         if not snaps:
-            rows.append((arm, None, f"not in the HF cache ({cache_dir})"))
+            rows.append((arm, None, f"not in the HF cache ({cache_dir})", expected))
             continue
         snap = pathlib.Path(snaps[0])
         tok = AutoTokenizer.from_pretrained(str(snap), local_files_only=True)
@@ -379,18 +396,27 @@ def main():
                     print(f"      shared tail: {pie_text[max(0,p-70):p]!r}")
                     print(f"      pie next   : {pie_text[p:p+90]!r}")
                     print(f"      hf  next   : {hf_text[p:p+90]!r}")
-        rows.append((arm, (ok, cells), None))
+        rows.append((arm, (ok, cells), None, expected))
 
-    print(f"\n{'arm':<14} {'cells':>9}   status")
-    for arm, score, err in rows:
+    print(f"\n{'arm':<22} {'cells':>9}   status")
+    graded = 0
+    graded_ok = 0
+    for arm, score, err, expected in rows:
         if err:
-            print(f"{arm:<14} {'-':>9}   {err}")
+            print(f"{arm:<22} {'-':>9}   {err}")
+            continue
+        ok, cells = score
+        if expected:
+            mark = "OK" if ok == cells else f"{cells - ok} EXPECTED DIVERGENCE"
         else:
-            ok, cells = score
             mark = "OK" if ok == cells else f"{cells - ok} MISMATCH"
-            print(f"{arm:<14} {f'{ok}/{cells}':>9}   {mark}")
-    print(f"\n{total_ok}/{total} cells token-exact "
-          f"({len(shapes)} shapes x 2 thinking modes x {len(arms)} arms)")
+            graded += cells
+            graded_ok += ok
+        print(f"{arm:<22} {f'{ok}/{cells}':>9}   {mark}")
+    print(f"\n{graded_ok}/{graded} graded cells token-exact "
+          f"({len(shapes)} shapes x 2 thinking modes), "
+          f"{total_ok}/{total} including expected divergences")
+    total_ok, total = graded_ok, graded
     if total_ok != total:
         print("\nA mismatch is pie asking a different question than the "
               "checkpoint's own\ntemplate asks. Re-run with -v for the first "

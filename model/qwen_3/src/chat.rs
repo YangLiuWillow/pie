@@ -462,25 +462,25 @@ impl QwenInstruct {
         prompt
     }
 
-    /// `render_item_list` from the Coder template: `[`a`, `b`]` for strings,
-    /// bare for anything else, wrapped in a tag, and emitted only when the list
-    /// is present and non-empty.
-    fn coder_item_list(out: &mut String, list: Option<&serde_json::Value>, tag: &str) {
-        let Some(items) = list.and_then(|v| v.as_array()) else { return };
-        if items.is_empty() {
-            return;
-        }
-        out.push_str(&format!("\n<{tag}>["));
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
+    /// `render_extra_keys` from Qwen's Coder template, verbatim in behaviour:
+    /// every key not already handled becomes `<key>value</key>`, with mappings
+    /// and non-string sequences serialised as JSON and everything else as its
+    /// plain string. The key is used RAW as the tag name — Qwen does no
+    /// normalisation, and the mlx conversion's `normed_json_key` is one of the
+    /// places the two templates part company.
+    fn coder_extra_keys(out: &mut String, v: Option<&serde_json::Value>, handled: &[&str]) {
+        let Some(obj) = v.and_then(|x| x.as_object()) else { return };
+        for (k, val) in obj {
+            if handled.contains(&k.as_str()) {
+                continue;
             }
-            match item.as_str() {
-                Some(s) => out.push_str(&format!("`{s}`")),
-                None => out.push_str(&item.to_string()),
-            }
+            let body = if val.is_object() || val.is_array() {
+                val.to_string()
+            } else {
+                val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string())
+            };
+            out.push_str(&format!("\n<{k}>{body}</{k}>"));
         }
-        out.push_str(&format!("]</{tag}>"));
     }
 
     /// The Coder checkpoint's tool preamble, transcribed from its own
@@ -492,8 +492,29 @@ impl QwenInstruct {
     /// block is part of it — it is what tells the model to nest `<function=…>`
     /// inside `<tool_call>`, which is precisely the structure pie's decoder
     /// then looks for.
+    /// The tools turn as **Qwen** publishes it, not as the mlx-community
+    /// conversion ships it.
+    ///
+    /// The two disagree, and the disagreement is real rather than cosmetic:
+    ///
+    /// ```text
+    ///   Qwen/Qwen3-Coder-30B-A3B-Instruct    6211 bytes, opens '# Tools\n\n'
+    ///   mlx-community/…-4bit                 6722 bytes, no heading
+    /// ```
+    ///
+    /// Qwen's is the authority here — pie tracks the model author's template,
+    /// so a checkpoint redistributed with an older or patched copy does not
+    /// silently become the reference. Verified against the live file at
+    /// `huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/chat_template.jinja`
+    /// (sha 5a38bfa0…), not a cached snapshot that might have gone stale.
+    ///
+    /// The cost is stated where it is measured: `qwen3_coder_upstream` in the
+    /// parity matrix is the arm this serves, and the `qwen3_coder` arm — the
+    /// mlx conversion — necessarily drops by the same three tokens. The two
+    /// templates cannot both be matched.
     fn build_tool_system_prompt_coder(tools: &[String]) -> String {
-        let mut out = String::from("You have access to the following functions:\n\n<tools>");
+        let mut out =
+            String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for tool in tools {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(tool) else { continue };
             // Accept either the bare function object or the OpenAI envelope.
@@ -516,37 +537,21 @@ impl QwenInstruct {
                     if let Some(d) = pf.get("description").and_then(|x| x.as_str()) {
                         out.push_str(&format!("\n<description>{}</description>", d.trim()));
                     }
-                    Self::coder_item_list(&mut out, pf.get("enum"), "enum");
-                    // Any remaining schema key, tag-named after the template's
-                    // normalisation. Mappings go out as JSON, scalars as text.
-                    if let Some(obj) = pf.as_object() {
-                        for (k, val) in obj {
-                            if matches!(k.as_str(), "type" | "description" | "enum" | "required") {
-                                continue;
-                            }
-                            let tag = k.replace(['-', ' '], "_").replace('$', "");
-                            let body = if val.is_object() || val.is_array() {
-                                val.to_string()
-                            } else {
-                                val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string())
-                            };
-                            out.push_str(&format!("\n<{tag}>{body}</{tag}>"));
-                        }
-                    }
-                    Self::coder_item_list(&mut out, pf.get("required"), "required");
+                    // handled_keys = ['name', 'type', 'description']; enum and
+                    // required are NOT special-cased -- that is the mlx
+                    // conversion's `render_item_list`, and it renders
+                    // `[`a`]` where Qwen renders `["a"]`.
+                    Self::coder_extra_keys(&mut out, Some(pf), &["name", "type", "description"]);
                     out.push_str("\n</parameter>");
                 }
             }
-            Self::coder_item_list(&mut out, params.and_then(|p| p.get("required")), "required");
+            // handled_keys = ['type', 'properties']
+            Self::coder_extra_keys(&mut out, params, &["type", "properties"]);
             out.push_str("\n</parameters>");
-            if let Some(r) = f.get("return") {
-                let body = if r.is_object() || r.is_array() {
-                    r.to_string()
-                } else {
-                    r.as_str().map(str::to_string).unwrap_or_else(|| r.to_string())
-                };
-                out.push_str(&format!("\n<return>{body}</return>"));
-            }
+            // handled_keys = ['type', 'name', 'description', 'parameters'] --
+            // `return` falls out of this rather than being named, which is how
+            // the template treats it.
+            Self::coder_extra_keys(&mut out, Some(f), &["type", "name", "description", "parameters"]);
             out.push_str("\n</function>");
         }
         out.push_str("\n</tools>");
@@ -1599,15 +1604,21 @@ mod tests {
             "required":["tz"]}}}"#
             .to_string();
         let p = QwenInstruct::build_tool_system_prompt_coder(&[schema]);
-        assert!(p.starts_with("You have access to the following functions:\n\n<tools>"));
+        // Qwen's published template, not the mlx conversion's: the heading is
+        // present, and `required` goes through the generic key passthrough as
+        // JSON rather than the conversion's backtick list. Both were asserted
+        // the other way here until pie switched authority to the model author's
+        // file; `qwen3_coder_upstream` in the parity matrix is the arm this
+        // serves.
+        assert!(p.starts_with("# Tools\n\nYou have access to the following functions:\n\n<tools>"));
         assert!(p.contains("<function>\n<name>get_time</name>"));
         assert!(p.contains("<parameter>\n<name>tz</name>\n<type>string</type>"));
-        assert!(p.contains("<required>[`tz`]</required>"));
+        assert!(p.contains(r#"<required>["tz"]</required>"#));
         // The instruction the model needs in order to emit what we parse.
         assert!(p.contains("<tool_call>\n<function=example_function_name>"));
         assert!(p.contains("must be nested within <tool_call></tool_call> XML tags"));
-        // And NOT the Hermes preamble it used to get.
-        assert!(!p.contains("# Tools"));
+        // The Hermes preamble is still a different thing, heading or no.
+        assert!(!p.contains("You may call one or more functions"));
     }
 
     #[test]
