@@ -61,14 +61,14 @@ merely a converter's copy.
 
 Qwen3-Coder is two different files, both live today:
 
-    Shipped   mlx-community/…-4bit  6722 bytes  sha 672e747c…
+    MlxGguf   mlx-community/…-4bit  6722 bytes  sha 672e747c…
               unsloth/…-GGUF        same variant, embedded in the GGUF
               no `# Tools` heading; `render_item_list` writes [`a`]
 
     QwenMain  Qwen/Qwen3-Coder-…    6211 bytes  sha 5a38bfa0…
               `# Tools` heading; generic `render_extra_keys` writes ["a"]
 
-pie renders both -- `CoderSchema`, defaulting to `Shipped` because that is what
+pie renders both -- `CoderSchema`, defaulting to `MlxGguf` because that is what
 every redistributed checkpoint carries and because a three-way benchmark where
 one engine sends a different prompt is not measuring engines. The arms differ
 only in which variant they ask for, so 150/150 is the claim that BOTH are

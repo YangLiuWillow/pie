@@ -34,7 +34,7 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
             generation_suffix: "",
             thinking_off_suffix: "<think>\n\n</think>\n\n",
             tool_response_trailing_newline: false,
-            coder_schema: CoderSchema::Shipped,
+            coder_schema: CoderSchema::MlxGguf,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },
     )

@@ -59,7 +59,7 @@ pub enum ToolDialect {
 /// predate the revision. Two files, both live today:
 ///
 /// ```text
-///   Shipped   mlx-community/…-4bit  6722 bytes  sha 672e747c…
+///   MlxGguf   mlx-community/…-4bit  6722 bytes  sha 672e747c…
 ///             unsloth/…-GGUF        same variant, embedded in the GGUF
 ///             no `# Tools` heading; `render_item_list` writes [`a`]
 ///
@@ -75,12 +75,17 @@ pub enum ToolDialect {
 /// choice with a default that matches what is actually distributed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CoderSchema {
-    /// What mlx-community and unsloth ship. The default, because it is what
-    /// every redistributed checkpoint on this machine carries, and because a
-    /// three-way benchmark where one engine sends a different prompt is not
-    /// measuring engines.
-    Shipped,
-    /// Qwen's currently-published file.
+    /// The variant the redistributions carry: `mlx-community/…-4bit` ships it
+    /// as `chat_template.jinja`, and `unsloth/…-GGUF` embeds the same one in
+    /// the GGUF metadata. Named for BOTH because naming it `Mlx` alone would
+    /// mislead anyone serving a GGUF, which carries it just as much.
+    ///
+    /// The default, because it is what every redistributed checkpoint carries
+    /// and because a three-way benchmark in which one engine sends a different
+    /// prompt is not measuring engines.
+    MlxGguf,
+    /// The variant on Qwen's own `main` branch, which the redistributions
+    /// predate.
     QwenMain,
 }
 
@@ -1291,7 +1296,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
-                coder_schema: CoderSchema::Shipped,
+                coder_schema: CoderSchema::MlxGguf,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -1309,7 +1314,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
-                coder_schema: CoderSchema::Shipped,
+                coder_schema: CoderSchema::MlxGguf,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -1327,7 +1332,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
-                coder_schema: CoderSchema::Shipped,
+                coder_schema: CoderSchema::MlxGguf,
                 stop_tokens: &["<|im_end|>"],
             },
         )
@@ -1463,7 +1468,7 @@ mod tests {
 
         // The three dialects render three different tools turns.
         let hermes = QwenInstruct::build_tool_system_prompt(&[schema.clone()]);
-        let coder = QwenInstruct::build_tool_system_prompt_coder(&[schema], CoderSchema::Shipped);
+        let coder = QwenInstruct::build_tool_system_prompt_coder(&[schema], CoderSchema::MlxGguf);
         assert_ne!(block, hermes, "Qwen3.5 collapsed into the Hermes preamble");
         assert_ne!(block, coder, "Qwen3.5 collapsed into the Coder preamble");
     }
@@ -1692,7 +1697,7 @@ mod tests {
         // BOTH variants, because pie renders both and the two live templates
         // disagree: the shipped one (mlx-community, unsloth) writes no heading
         // and backtick lists, Qwen's published one writes `# Tools` and JSON.
-        let p = QwenInstruct::build_tool_system_prompt_coder(&[schema.clone()], CoderSchema::Shipped);
+        let p = QwenInstruct::build_tool_system_prompt_coder(&[schema.clone()], CoderSchema::MlxGguf);
         assert!(p.starts_with("You have access to the following functions:\n\n<tools>"));
         assert!(!p.contains("# Tools"), "the shipped variant has no heading");
         assert!(p.contains("<required>[`tz`]</required>"), "shipped writes backtick lists");
@@ -1808,7 +1813,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
-                coder_schema: CoderSchema::Shipped,
+                coder_schema: CoderSchema::MlxGguf,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         );

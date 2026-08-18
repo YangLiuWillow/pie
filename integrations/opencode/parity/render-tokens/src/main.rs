@@ -93,11 +93,11 @@ fn main() -> Result<()> {
             tool_response_trailing_newline: matches!(tool_dialect, ToolDialect::Coder),
             // The harness picks per arm, which is exactly the operator choice
             // the field models: PARITY_CODER_SCHEMA=qwen renders Qwen's
-            // published variant, anything else the shipped one.
+            // published variant, anything else the mlx/GGUF one.
             coder_schema: if std::env::var("PARITY_CODER_SCHEMA").as_deref() == Ok("qwen") {
                 CoderSchema::QwenMain
             } else {
-                CoderSchema::Shipped
+                CoderSchema::MlxGguf
             },
             thinking_off_suffix: "<think>\n\n</think>\n\n",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
