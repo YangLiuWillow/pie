@@ -135,48 +135,49 @@ print(n)" 2>/dev/null || echo 0)
 # model's pages well before it RECLAIMS them.
 MEMWAIT="$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1"
 
-# ── STRATEGY A, and it is not the strategy that won the 30B run ──────────
+# ── STRATEGY B, restored ─────────────────────────────────────────────────
 #
-# The first attempt at this run used strategy B -- the long-lived
-# `opencode-session` inferlet that holds the conversation's KV across turns,
-# which is what produced 42 tok/s at 12.3 calls/instance on Qwen3-Coder-30B.
-# It returned 24 EMPTY PATCHES out of 24 instances.
+# The first attempt at this run used strategy A -- one `chat-completions`
+# inferlet per request, KV dying with it -- because strategy B returned 24
+# EMPTY PATCHES out of 24 instances on this model. Every instance showed the
+# same alternation: a turn generates and retains at length N, the next turn's
+# resume is refused, the inferlet degrades that turn to `finish_reason:"length"`
+# with zero tokens and "The server could not complete this turn.", and opencode
+# gives up with nothing written.
 #
-# Every instance showed the same alternation. A turn generates and retains its
-# KV at length N; the next turn tries to resume from N and the driver refuses:
+# That is fixed. The cause was not the resume path but a copy-on-write one: a
+# recurrent fire's sequence id is DERIVED from its slot, `(1<<63) |
+# rs_slot_id`, and `MetalExecutor::copy_state` carried the PARENT's id onto the
+# copy, so a forked child announced an id its own record contradicted. With the
+# id rebased onto the destination slot, `RsWorkingSet::fork` works, and the
+# guest forks the fold at the scratch boundary and retains the child instead of
+# buffering-and-discarding a scratch span that Metal never buffered in the
+# first place. See `integrations/opencode/finding-hybrid-session-resume.md`.
 #
-#     prefill take @493: g0 take: channel is poisoned: driver published
-#     poison epoch 1
+# Verified end to end on ONE instance before this run was started
+# (django__django-12276, /tmp/swe36-b1):
 #
-# The inferlet degrades that turn to `finish_reason:"length"` with zero tokens
-# and the text "The server could not complete this turn.", opencode gives up,
-# and the instance ends with nothing written. It is not size-dependent -- it
-# reproduces at 500 prompt tokens as readily as at 38k -- and it has nothing to
-# do with tools: a plain four-turn chat with no tool schema fails identically
-# on every resume.
+#     9 turns, 7 of them resumes   0 degraded   0 driver refusals
+#     reuse chains 7727 -> 13299 -> 21026 -> ... -> 24645 cached tokens
+#     patch: 434 bytes, non-empty, and the correct fix
 #
-# Controlled against the non-hybrid checkpoint, same strategy, same probe:
+# WHY THIS MATTERS FOR THE COMPARISON. Strategy A had no cross-turn prefix
+# reuse at all, while vLLM runs `--enable-prefix-caching` and llama.cpp keeps
+# its slot cache -- so pie paid full prefill on every turn of an agentic loop
+# that re-sends the whole transcript, and the engines it was measured against
+# did not. That handicap landed on TTFT first and throughput second, and it
+# also made the four-way incomparable to the 30B three-way, which ran B. With B
+# restored, both of those go away.
 #
-#     Qwen3-Coder-30B  turns 1-4 all OK, cached=13 -> 28 -> 43 (reuse working)
-#     Qwen3.6-35B      every resume poisoned, cached=0 throughout
-#
-# So it is the HYBRID family's session-resume path, not the model size, not the
-# renderer, and not the tool dialect.
-#
-# Strategy A serves one `chat-completions` inferlet PER REQUEST and lets the KV
-# die with it, so there is no resume to poison. Verified: four-turn chat and a
-# two-turn tool loop both clean.
-#
-# THE COST, which belongs in the report and not in a footnote: strategy A has
-# no cross-turn prefix reuse, while vLLM runs with --enable-prefix-caching and
-# llama.cpp keeps its slot cache. pie is therefore paying full prefill on every
-# turn of an agentic loop that re-sends the whole transcript, and the two
-# engines it is being compared against are not. That handicap lands squarely on
-# TTFT and on throughput.
+# One case remains open and is NOT reached by this workload: a byte-identical
+# re-send alternates success/failure, because the repeat goes cold and its
+# chunked re-prefill collides with the slot the retained state still holds.
+# opencode appends a new user message every turn, so it does not take that
+# path; a client that retried a request verbatim would.
 PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 10; \
 $MEMWAIT; \
 PIE_PYTHON=$PIEPY $REPO/integrations/opencode/tools/boot_pie.sh s36 \
-  PIE_STRATEGY=a PIE_MODEL=$PIEMODEL PIE_MAX_MODEL_LEN=65536 \
+  PIE_STRATEGY=b PIE_MODEL=$PIEMODEL PIE_MAX_MODEL_LEN=65536 \
   PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY"
 VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 10; \
 $MEMWAIT; \
