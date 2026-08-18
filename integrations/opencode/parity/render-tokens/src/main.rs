@@ -57,6 +57,8 @@ fn main() -> Result<()> {
     // name is taken from the tokenizer path, which names the checkpoint;
     // `PARITY_MODEL_NAME` overrides it when the path does not.
     let model_name = std::env::var("PARITY_MODEL_NAME").unwrap_or_else(|_| args[1].clone());
+    // `enable_thinking` on the HF side; the pie side has to match it.
+    let thinking = std::env::var("PARITY_THINKING").is_ok_and(|v| v == "1");
     let coder = pie_model::instruct::is_coder_lineage("qwen3", &model_name);
     // TWO predicates now, mirroring the server exactly. They were one, on the
     // rule that "a checkpoint with no thinking channel is the Coder release,
@@ -71,7 +73,10 @@ fn main() -> Result<()> {
     // The arch stem is hardcoded "qwen3" here, so a 3.5/3.6 checkpoint is
     // recognised by its DEPLOYMENT name -- which is what the fixtures carry.
     let tool_dialect = pie_model::instruct::tool_dialect(&model_name, &model_name);
-    eprintln!("[render-tokens] coder={coder} tool_dialect={tool_dialect:?} (from {model_name})");
+    eprintln!(
+        "[render-tokens] coder={coder} thinking={thinking} tool_dialect={tool_dialect:?} \
+         (from {model_name})"
+    );
     let instruct = QwenInstruct::new(
         tokenizer.clone(),
         ChatMLConfig {
@@ -97,9 +102,15 @@ fn main() -> Result<()> {
                 instruct.assistant_with_tool_calls(content.as_deref(), calls)
             }
             RenderOp::AnswerBatch(results) => instruct.answer_batch(results),
-            // The harness's HF side renders with enable_thinking=False, so
-            // the pie side takes the matching no-think cue (D1).
-            RenderOp::Cue => instruct.cue_no_think(),
+            // Which cue depends on the thinking mode under test, and both
+            // must be reachable: `cue_no_think` closes an empty reasoning
+            // block, `cue` opens the turn the way the template does with
+            // thinking on. Rendering only one of them is how
+            // `generation_suffix` stayed wrong for Qwen3.5/3.6 -- no harness
+            // ever asked for the thinking-on cue.
+            RenderOp::Cue => {
+                if thinking { instruct.cue() } else { instruct.cue_no_think() }
+            }
         };
         ids.extend(toks);
     }
