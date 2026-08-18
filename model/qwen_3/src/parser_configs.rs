@@ -25,7 +25,7 @@ use pie_model_common::parser_engine::{
     ParserEngineConfig, ReasoningChannel, ToolChannel, parse_hermes_json,
 };
 
-use crate::chat::parse_coder_function_call;
+use crate::chat::parse_xml_tool_call;
 
 const THINK: ReasoningChannel = ReasoningChannel {
     open: "<think>",
@@ -80,22 +80,14 @@ pub const QWEN3_5: ParserEngineConfig = ParserEngineConfig {
     tools: Some(XML_TOOLS),
 };
 
-/// Strip the `<function=…></function>` shell, then read the parameters.
+/// The XML call surface, opener recovery included.
 ///
-/// The engine hands over the whole matched body; for a wrapped call that is
-/// what sat inside `<tool_call>`, and for an unwrapped one it is the
-/// `<function=…></function>` itself. Both reduce to the same inner text, so
-/// the unwrapping happens once, here, rather than as a special case in the
-/// engine.
+/// A thin forward to `chat::parse_xml_tool_call` rather than a second copy of
+/// the stripping logic: the engine hands over the whole matched body, and what
+/// counts as an opener — `<function=NAME>`, `<function>NAME`, or a bare
+/// `<NAME>` that still closes with `</function>` — is one decision, made once.
 fn parse_coder_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
-    const OPEN: &str = "<function=";
-    let fs = body.find(OPEN)?;
-    let after = &body[fs + OPEN.len()..];
-    let inner = match after.find("</function>") {
-        Some(fe) => &after[..fe],
-        None => after,
-    };
-    parse_coder_function_call(inner, schemas)
+    parse_xml_tool_call(body, schemas)
 }
 
 #[cfg(test)]

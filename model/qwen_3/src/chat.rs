@@ -723,9 +723,91 @@ impl Instruct for QwenInstruct {
 fn is_plausible_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
+        // A closing tag read as an opener yields "/function" or "/parameter".
+        // Upstream screens the same way; it matters once the opener recovery
+        // below is willing to read a name out of a bare `<...>`.
+        && !s.starts_with('/')
         && !s.chars().any(|c| {
             c.is_whitespace() || matches!(c, '<' | '>' | '=' | '"' | '\'')
         })
+}
+
+/// Locate the tag naming the function and return `(name, offset of its `>`)`.
+///
+/// Ported from upstream `dev-sslee` c1e0a84ab. The template teaches
+/// `<function=NAME>` and that is tried first, but a model that closes with
+/// `</function>` while opening some other way has still plainly named a
+/// function, and refusing it throws away an action the model unambiguously
+/// took. Two malformations were observed live from this checkpoint family:
+///
+/// ```text
+///   <function>NAME          the tag is right, the name follows as text (3/29 calls)
+///   <NAME>                  the bare form; vLLM's qwen3_xml accepts it
+/// ```
+///
+/// Losing those costs the call and reports malformed syntax, which sends an
+/// agent into re-issuing the action instead of acting on its result.
+///
+/// The recovered forms are accepted only where a false positive is
+/// implausible: the tag must be the FIRST in the call, it must not be one of
+/// the surface's own structural tags, and the CALLER must have found a
+/// `</function>` close. Prose cannot reach here — this only ever sees the
+/// inside of a `<tool_call>` block.
+fn parse_xml_function_opener(call: &str) -> Option<(String, usize)> {
+    const TAUGHT: &str = "<function=";
+    if let Some(at) = call.find(TAUGHT) {
+        let start = at + TAUGHT.len();
+        let end = call[start..].find('>')? + start;
+        return Some((call[start..end].trim().to_string(), end));
+    }
+
+    // The FIRST tag and nothing later, so a `<parameter=…>` deeper in the body
+    // can never be mistaken for the function name.
+    let open = call.find('<')?;
+    let end = call[open + 1..].find('>')? + open + 1;
+    let inner = call[open + 1..end].trim();
+
+    // `<function>NAME`: read the name from after the tag, bounded by the first
+    // whitespace or `<` so it cannot swallow the body.
+    if inner == "function" {
+        let name = call[end + 1..]
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == '<')
+            .next()
+            .unwrap_or("");
+        return is_plausible_name(name).then(|| (name.to_string(), end));
+    }
+
+    // Bare `<NAME>`, excluding the surface's own tags.
+    if !is_plausible_name(inner) || matches!(inner, "tool_call" | "parameter") {
+        return None;
+    }
+    Some((inner.to_string(), end))
+}
+
+/// A whole `<tool_call>` body -> `(name, arguments-json)`.
+///
+/// Takes the body WITH its opener, unlike `parse_coder_function_call`, because
+/// recovering a malformed opener means deciding what the opener was — which the
+/// two call sites cannot each do for themselves without drifting apart.
+pub(crate) fn parse_xml_tool_call(call: &str, schemas: &[String]) -> Option<(String, String)> {
+    let call = call.trim();
+    let (name, name_end) = parse_xml_function_opener(call)?;
+    let body_start = name_end + 1;
+    match call[body_start..].find("</function>") {
+        // The taught opener keeps the lenient tail: an unterminated call is a
+        // truncated generation, and the parameters read so far are still real.
+        None if call.contains("<function=") => {
+            parse_coder_function_call(&call[call.find("<function=").unwrap() + 10..], schemas)
+        }
+        // A RECOVERED opener is accepted only with its close, which is the
+        // guard that keeps a bare `<NAME>` from matching ordinary markup.
+        None => None,
+        Some(rel) => {
+            let inner = &call[body_start..body_start + rel];
+            parse_coder_params(&name, inner, schemas)
+        }
+    }
 }
 
 pub(crate) fn parse_coder_function_call(body: &str, schemas: &[String]) -> Option<(String, String)> {
@@ -740,7 +822,16 @@ pub(crate) fn parse_coder_function_call(body: &str, schemas: &[String]) -> Optio
     if !is_plausible_name(&name) {
         return None;
     }
-    let rest = &body[gt + 1..];
+    parse_coder_params(&name, &body[gt + 1..], schemas)
+}
+
+/// The `<parameter=K>V</parameter>` list of a call whose NAME is already known.
+///
+/// Split out so the recovered-opener path (`parse_xml_tool_call`) and the
+/// taught-opener path read parameters with one implementation. They diverged
+/// on the typing rules the first time this was two copies.
+fn parse_coder_params(name: &str, rest: &str, schemas: &[String]) -> Option<(String, String)> {
+    let name = name.to_string();
 
     // The declared type of each parameter of THIS function, if we were told.
     let mut types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -889,15 +980,10 @@ impl ToolDecoder for QwenToolDecoder {
         self.unwrapped = false;
 
         if self.dialect.emits_xml_calls() {
-            if let Some(fs) = call_body.find("<function=") {
-                let after = &call_body[fs + "<function=".len()..];
-                let body = match after.find("</function>") {
-                    Some(fe) => &after[..fe],
-                    None => after,
-                };
-                if let Some((name, args)) = parse_coder_function_call(body, &self.schemas) {
-                    return ToolEvent::Call(name, args);
-                }
+            // Whole body, opener included: deciding what a malformed opener was
+            // is `parse_xml_tool_call`'s job, not each call site's.
+            if let Some((name, args)) = parse_xml_tool_call(&call_body, &self.schemas) {
+                return ToolEvent::Call(name, args);
             }
         } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_body) {
             let name = v["name"].as_str().unwrap_or("").to_string();
@@ -1019,6 +1105,76 @@ mod tests {
     /// right and the SCHEMA format wrong -- `<function><name>` blocks the
     /// checkpoint's template never writes -- and every existing test passed,
     /// because they all asked about calls.
+    /// A call the model plainly made, opened in a way the template never taught.
+    ///
+    /// Ported from upstream c1e0a84ab, whose live capture from this checkpoint
+    /// family was `<list_files>` opened bare and closed with `</function>`.
+    /// Refusing it costs the call and reports malformed syntax, which sends an
+    /// agent into re-issuing the action instead of acting on its result.
+    #[test]
+    fn a_malformed_opener_is_recovered_when_the_call_still_closes() {
+        // The taught form, unchanged.
+        let (name, args) = parse_xml_tool_call(
+            "<function=read_file>\n<parameter=path>README.md</parameter>\n</function>",
+            &[],
+        )
+        .expect("taught opener");
+        assert_eq!(name, "read_file");
+        assert!(args.contains("README.md"));
+
+        // `<function>NAME` -- the tag is right, the name follows as text.
+        let (name, _) = parse_xml_tool_call(
+            "<function>read_file\n<parameter=path>README.md</parameter>\n</function>",
+            &[],
+        )
+        .expect("<function>NAME");
+        assert_eq!(name, "read_file");
+
+        // Bare `<NAME>`, the live capture's shape.
+        let (name, args) = parse_xml_tool_call(
+            "<list_files>\n<parameter=recursive>false</parameter>\n</function>",
+            &[],
+        )
+        .expect("bare <NAME>");
+        assert_eq!(name, "list_files");
+        assert!(args.contains("recursive"));
+    }
+
+    /// The guards that keep recovery from inventing calls out of markup.
+    #[test]
+    fn opener_recovery_refuses_what_is_not_a_call() {
+        // No `</function>` close: a recovered opener is not trusted without it.
+        assert_eq!(
+            parse_xml_tool_call("<list_files>\n<parameter=recursive>false</parameter>", &[]),
+            None,
+            "a bare opener with no close must not become a call"
+        );
+        // The surface's own structural tags are not function names.
+        assert_eq!(
+            parse_xml_tool_call("<parameter=path>README.md</parameter>\n</function>", &[]),
+            None,
+            "<parameter=...> was read as the function name"
+        );
+        // A closing tag read as an opener yields "/function".
+        assert_eq!(parse_xml_tool_call("</function>", &[]), None);
+        // And the live shell-redirect malformation still refuses.
+        let live = concat!(
+            "<function=bash>\n<parameter=command=\n",
+            "find /testbed -name \"*.py\" | xargs grep -l FOO 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        assert_eq!(parse_xml_tool_call(live, &[]), None);
+        // ...while the repaired form keeps its redirect intact.
+        let repaired = concat!(
+            "<function=bash>\n<parameter=command>\n",
+            "find /testbed -name \"*.py\" | xargs grep -l FOO 2>/dev/null | head -20\n",
+            "</parameter>\n</function>"
+        );
+        let (name, args) = parse_xml_tool_call(repaired, &[]).expect("repaired parses");
+        assert_eq!(name, "bash");
+        assert!(args.contains("2>/dev/null"), "the redirect was mangled: {args}");
+    }
+
     #[test]
     fn qwen35_renders_json_schemas_under_the_templates_own_heading() {
         let schema = r#"{"type": "function", "function": {"name": "read_file"}}"#.to_string();
