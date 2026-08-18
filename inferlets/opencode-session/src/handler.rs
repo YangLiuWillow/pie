@@ -57,10 +57,6 @@ const DEFAULT_MAX_TOKENS: usize = 4096;
 const DEFAULT_TEMPERATURE: f32 = 0.6;
 const DEFAULT_TOP_P: f32 = 0.95;
 
-/// Hard cap on retained branches, as a backstop. The REAL bound is
-/// [`Daemon::retain_tokens`] — see below.
-const MAX_RETAINED: usize = 8;
-
 /// Default retained-KV budget, in tokens, when the launcher supplies none.
 ///
 /// ## Why a token budget and not a branch count
