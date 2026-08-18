@@ -293,8 +293,36 @@ shared slab, the child's fold advances with it — and the retained state would
 sit exactly one cue+generation ahead of `render_len`, which is what these two
 measurements show.
 
-That is a hypothesis with a matching signature, NOT a confirmed cause. It has
-not been tested.
+That is a hypothesis with a matching signature, NOT a confirmed cause — and a
+later measurement WEAKENS it, so read the alternative below before spending a
+test on it.
+
+**Why the fork-CoW reading is probably wrong.** In the same run, 4 resumes
+SUCCEEDED and 2 poisoned. If the parent folded in place on a shared slab,
+copy-on-write would be broken universally and every resume would fail. It does
+not.
+
+**The better fit: RS seat pressure.** The engine caps recurrent-state seats:
+
+```
+admission: more lanes than the recurrent-state pool can seat;
+requested=8 seated=4 seat_cost=2
+```
+
+FOUR seats. The run that produced these failures put three sequential agent
+conversations through ONE guest process, each retaining a branch that holds a
+slot. The two failures name DIFFERENT slots (0 and 1) at the same position
+(768) — two conversations of similar length, not one conversation drifting.
+Intermittent, slot-indexed, and cross-conversation all point at a slot being
+reused or reclaimed while a retained branch still expects it, rather than at a
+fold advancing under its own child.
+
+**So test seat pressure first, and it is cheaper than the fork test.** Run ONE
+conversation to completion against a fresh process and check for any
+`launch failed`; then run three sequential conversations against the same
+process and check again. If the failures need more than one conversation, it is
+seats, not fork. Only if a single conversation reproduces it is the fork/fold
+experiment below worth building.
 
 **How to test it, without an agent.** Fork an rs working set, fold `n` tokens
 into the PARENT, then fire a continuation from the CHILD at the pre-fork
