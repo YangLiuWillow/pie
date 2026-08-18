@@ -38,8 +38,32 @@ impl pie::inferlet::chat::Host for ProcessCtx {
         Ok(crate::model::model().instruct().system_user(&system, &user))
     }
 
-    async fn assistant(&mut self, message: String) -> Result<Vec<u32>> {
-        Ok(crate::model::model().instruct().assistant(&message))
+    async fn assistant_call(
+        &mut self,
+        content: Option<String>,
+        calls: Vec<pie::inferlet::tools::ToolCall>,
+        after_query: bool,
+        is_last: bool,
+    ) -> Result<Vec<u32>> {
+        let pairs: Vec<(String, String)> = calls
+            .into_iter()
+            .map(|c| (c.name, c.arguments_json))
+            .collect();
+        Ok(crate::model::model().instruct().assistant_with_tool_calls_at(
+            content.as_deref(),
+            &pairs,
+            after_query,
+            is_last,
+        ))
+    }
+
+    async fn assistant(
+        &mut self,
+        message: String,
+        after_query: bool,
+        is_last: bool,
+    ) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().assistant_at(&message, after_query, is_last))
     }
 
     /// The template's `enable_thinking`, applied here rather than chosen by

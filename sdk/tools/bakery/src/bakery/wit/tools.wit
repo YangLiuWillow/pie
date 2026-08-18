@@ -29,12 +29,6 @@ interface tools {
     /// Provide a tool result (after a tool-call reply)
     answer: func(name: string, value: string) -> list<u32>;
 
-    /// Replay a past assistant turn that made one or more tool calls.
-    /// `content` is any free text that preceded the call(s); `calls` are
-    /// in order, with `arguments-json` already JSON-encoded. For models
-    /// without tool support, falls back to a plain assistant-text replay
-    /// of `content`.
-    assistant-with-tool-calls: func(content: option<string>, calls: list<tool-call>) -> list<u32>;
 
     /// Replay one or more past tool results as a single merged turn — most
     /// chat templates group consecutive tool results into one turn rather

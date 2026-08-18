@@ -38,13 +38,13 @@ pub enum RenderOp {
     /// real user query. Qwen3.5/3.6 renders those with a reasoning block even
     /// when the reasoning is empty and renders earlier ones bare, so the flag
     /// is part of the render, not a hint. See `Instruct::assistant_at`.
-    Assistant(String, bool),
+    Assistant(String, TurnPos),
     /// `content` is `None` when the wire carried `""`/null/absent —
     /// opencode replays tool-call turns with `content: ""`.
     AssistantWithToolCalls {
         content: Option<String>,
         calls: Vec<(String, String)>,
-        reasoning_header: bool,
+        pos: TurnPos,
     },
     /// Consecutive `role:"tool"` results merged into one replayed turn —
     /// the model was fine-tuned on the merged form. Pairs are
@@ -60,6 +60,20 @@ pub enum RenderOp {
     /// picked between two WIT functions; the choice is data now, so it travels
     /// with the op like every other rendering decision.
     Cue(bool),
+}
+
+/// Where a replayed assistant turn sits, which is what decides whether the
+/// template opens it with a reasoning block.
+///
+/// Two facts, because the families ask different questions of them: Qwen3.6
+/// writes the block for any post-query turn, Qwen3 only for one that is LAST
+/// or carries reasoning. Only the holder of the message list knows either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnPos {
+    /// After the conversation's last real user query.
+    pub after_query: bool,
+    /// The final message before the generation cue.
+    pub is_last: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,9 +236,12 @@ fn plan_from(
             }
             "assistant" => {
                 let calls = msg.calls();
-                let reasoning_header = (i as isize) > last_query;
+                let pos = TurnPos {
+                    after_query: (i as isize) > last_query,
+                    is_last: i + 1 == rest.len(),
+                };
                 if calls.is_empty() {
-                    ops.push(RenderOp::Assistant(msg.text(), reasoning_header));
+                    ops.push(RenderOp::Assistant(msg.text(), pos));
                 } else {
                     for c in calls {
                         call_names.insert(c.id.clone(), c.function.name.clone());
@@ -236,7 +253,7 @@ fn plan_from(
                     ops.push(RenderOp::AssistantWithToolCalls {
                         content: msg.text_opt(),
                         calls: pairs,
-                        reasoning_header,
+                        pos,
                     });
                 }
                 i += 1;
@@ -308,9 +325,8 @@ mod tests {
                 content: None, // empty-string content normalized away
                 calls: vec![("read".into(), "{\"a\":1}".into()),
                             ("grep".into(), "{\"b\":2}".into())],
-                // after the last user turn, so the template would open a
-                // reasoning block on the families that write one
-                reasoning_header: true,
+                // after the last user turn; not last, since tool results follow
+                pos: TurnPos { after_query: true, is_last: false },
             }
         );
         // Two consecutive tool results merged into ONE batch, id→name
@@ -408,7 +424,10 @@ mod tests {
         }));
         let ops = plan_render(&r).unwrap();
         // "answer" precedes the final user turn, so it renders bare.
-        assert_eq!(ops[1], RenderOp::Assistant("answer".into(), false));
+        assert_eq!(
+            ops[1],
+            RenderOp::Assistant("answer".into(), TurnPos { after_query: false, is_last: false })
+        );
     }
 
     /// Which assistant turns sit after the last real user query.
@@ -450,7 +469,7 @@ mod tests {
             {"role": "user", "content": "two"}
         ]}));
         let ops = plan_render(&r).unwrap();
-        assert!(matches!(&ops[1], RenderOp::Assistant(_, false)));
+        assert!(matches!(&ops[1], RenderOp::Assistant(_, p) if !p.after_query));
 
         // An agent loop: every assistant turn FOLLOWS the only user query,
         // because tool results arrive as role:"tool" and never reset it.
@@ -462,8 +481,8 @@ mod tests {
         ]}));
         let ops = plan_render(&r).unwrap();
         let flags: Vec<bool> = ops.iter().filter_map(|o| match o {
-            RenderOp::Assistant(_, h) => Some(*h),
-            RenderOp::AssistantWithToolCalls { reasoning_header, .. } => Some(*reasoning_header),
+            RenderOp::Assistant(_, p) => Some(p.after_query),
+            RenderOp::AssistantWithToolCalls { pos, .. } => Some(pos.after_query),
             _ => None,
         }).collect();
         assert_eq!(flags, vec![true, true], "both loop turns follow the query");
@@ -476,7 +495,7 @@ mod tests {
             {"role": "user", "content": "again"}
         ]}));
         let ops = plan_render(&r).unwrap();
-        assert!(matches!(&ops[1], RenderOp::Assistant(_, false)));
+        assert!(matches!(&ops[1], RenderOp::Assistant(_, p) if !p.after_query));
     }
 
     #[test]

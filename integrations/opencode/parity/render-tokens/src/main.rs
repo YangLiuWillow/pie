@@ -105,10 +105,14 @@ fn main() -> Result<()> {
                 instruct.equip_after_system(system.as_deref(), tools)
             }
             RenderOp::User(msg) => instruct.user(msg),
-            RenderOp::Assistant(msg, header) => instruct.assistant_at(msg, *header),
-            RenderOp::AssistantWithToolCalls { content, calls, reasoning_header } => {
-                instruct.assistant_with_tool_calls_at(content.as_deref(), calls, *reasoning_header)
-            }
+            RenderOp::Assistant(msg, p) => instruct.assistant_at(msg, p.after_query, p.is_last),
+            RenderOp::AssistantWithToolCalls { content, calls, pos } => instruct
+                .assistant_with_tool_calls_at(
+                    content.as_deref(),
+                    calls,
+                    pos.after_query,
+                    pos.is_last,
+                ),
             RenderOp::AnswerBatch(results) => instruct.answer_batch(results),
             // The mode rides on the op, set by the request's
             // `chat_template_kwargs.enable_thinking` — the same path the

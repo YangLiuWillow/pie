@@ -370,14 +370,23 @@ impl QwenInstruct {
     }
 
     /// A replayed assistant turn's body: reasoning block, then content.
-    fn reasoning_header_for<'a>(&self, msg: &'a str, reasoning_header: bool) -> (String, &'a str) {
+    fn reasoning_header_for<'a>(
+        &self,
+        msg: &'a str,
+        after_query: bool,
+        is_last: bool,
+    ) -> (String, &'a str) {
         let (reasoning, content) = if self.config.has_thinking {
             Self::split_thinking(msg)
         } else {
             ("", msg)
         };
-        let renders = self.config.empty_reasoning_header || !reasoning.is_empty();
-        if reasoning_header && self.config.has_thinking && renders {
+        // Qwen3.6 writes the block for any post-query turn; Qwen3 only for one
+        // that is LAST or actually carries reasoning. Both start from
+        // `after_query`.
+        let renders =
+            self.config.empty_reasoning_header || is_last || !reasoning.is_empty();
+        if after_query && self.config.has_thinking && renders {
             (format!("<think>\n{reasoning}\n</think>\n\n"), content)
         } else {
             (String::new(), content)
@@ -708,8 +717,8 @@ impl Instruct for QwenInstruct {
         self.system(&merged)
     }
 
-    fn assistant_at(&self, msg: &str, reasoning_header: bool) -> Vec<u32> {
-        let (header, content) = self.reasoning_header_for(msg, reasoning_header);
+    fn assistant_at(&self, msg: &str, after_query: bool, is_last: bool) -> Vec<u32> {
+        let (header, content) = self.reasoning_header_for(msg, after_query, is_last);
         if header.is_empty() {
             return self.role_tokens("assistant", content);
         }
@@ -722,19 +731,20 @@ impl Instruct for QwenInstruct {
         &self,
         content: Option<&str>,
         calls: &[(String, String)],
-        reasoning_header: bool,
+        after_query: bool,
+        is_last: bool,
     ) -> Vec<u32> {
         if !self.config.has_tools || calls.is_empty() {
-            return self.assistant_at(content.unwrap_or(""), reasoning_header);
+            return self.assistant_at(content.unwrap_or(""), after_query, is_last);
         }
-        let (header, _) = self.reasoning_header_for(content.unwrap_or(""), reasoning_header);
+        let (header, _) = self.reasoning_header_for(content.unwrap_or(""), after_query, is_last);
         if header.is_empty() {
             return self.assistant_with_tool_calls(content, calls);
         }
         // The header sits between the role tag and the turn's inner text, so
         // it joins the SAME single-pass encode the inner text already uses --
         // see the D4 note below for why that matters.
-        let (_, stripped) = self.reasoning_header_for(content.unwrap_or(""), reasoning_header);
+        let (_, stripped) = self.reasoning_header_for(content.unwrap_or(""), after_query, is_last);
         let body = Self::assistant_with_tool_calls_inner_text(
             Some(stripped),
             calls,

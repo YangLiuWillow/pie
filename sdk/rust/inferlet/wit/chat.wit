@@ -1,5 +1,6 @@
 interface chat {
     use types.{error};
+    use tools.{tool-call};
 
     variant event {
         /// Generated text chunk
@@ -15,7 +16,26 @@ interface chat {
     first-user: func(message: string) -> list<u32>;
     user: func(message: string) -> list<u32>;
     system-user: func(system: string, user: string) -> list<u32>;
-    assistant: func(message: string) -> list<u32>;
+    /// Replay a past assistant turn.
+    ///
+    /// `after-query` and `is-last` place the turn, which is what decides
+    /// whether the template opens it with a reasoning block. Neither is
+    /// knowable from the turn itself -- only the holder of the message list
+    /// knows where the last real user query was, or which turn is final:
+    ///
+    ///   Qwen3    a block if after the query AND (last OR it carries reasoning)
+    ///   Qwen3.6  a block if after the query
+    ///
+    /// A family whose template has no reasoning channel ignores both.
+    assistant: func(message: string, after-query: bool, is-last: bool) -> list<u32>;
+
+    /// [`assistant`] for a turn that also made tool calls.
+    ///
+    /// `content` is any free text that preceded the call(s); `calls` are in
+    /// order, with `arguments-json` already JSON-encoded. A model without tool
+    /// support falls back to a plain assistant-text replay of `content`.
+    assistant-call: func(content: option<string>, calls: list<tool-call>,
+                         after-query: bool, is-last: bool) -> list<u32>;
 
     /// Cue the model to generate (fills generation header).
     ///

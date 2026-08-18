@@ -44,10 +44,10 @@ error -- it shows up as accuracy, attributed to the engine.
 ## The measured baseline
 
     arm            2026-08-17    now
-    qwen3            24/26      26/26
-    qwen3_coder      12/26      26/26
-    qwen3_5           5/26      26/26
-                                78/78
+    qwen3            24/26      28/28
+    qwen3_coder      12/26      28/28
+    qwen3_5           5/26      28/28
+                                84/84
 
 Every arm renders byte-for-byte what its own `chat_template.jinja` renders, in
 both thinking modes, across all thirteen shapes. What closed the gap, in the
@@ -58,16 +58,18 @@ order it was closed and with the cells each was worth:
     generation_suffix         +12   3.5/3.6 opens the turn INSIDE a reasoning block
     empty system turn          +4   a system message of "" is a turn, not an absence
     tool_response framing     +12   Coder puts the newline after the block, not before
+    is_last                    +2   Qwen3 writes the block for a post-query turn
+                                    only when it is LAST or carries reasoning
 
 The last two were found by this harness rather than by reading, and neither
 could have come from upstream: `dev-sslee` has no Qwen3-Coder row at all, so
 its arm never rendered a Coder tool response, and its own measurement reports
 qwen3_5 at 26/26 through a registry the live server does not reach.
 
-Keeping it honest: a green matrix is a statement about the RENDERER. The
-reasoning-header flag still stops at the WIT boundary, so the server does not
-yet benefit from `empty_reasoning_header` -- `render-tokens` links the renderer
-directly. See task #28.
+The flag reaches the server now: `chat.assistant` and `chat.assistant-call`
+both carry `after-query` and `is-last`, so the serving path renders what this
+measures. It did not until task #28 landed, and a green matrix said nothing
+about the server until then -- `render-tokens` links the renderer directly.
 
 ## One deliberate divergence the harness accounts for
 
@@ -178,6 +180,16 @@ SHAPES = {
                       result("c1", "# Title"),
                       {"role": "assistant", "content": "Listing.", "tool_calls": [R2]},
                       result("c2", "a\nb")], TOOLS),
+    # A post-query assistant turn with NO tool calls. Rare in an agent loop --
+    # a text-only reply usually ends the turn and a user message follows it --
+    # and it is exactly the case a `reasoning-header` flag carried only on the
+    # tool-call path would miss. Upstream's `assistant-call` has that gap; this
+    # cell is here so ours cannot acquire it silently.
+    "plain_assistant_after_query": ([{"role": "system", "content": SYS},
+                                     {"role": "user", "content": "Investigate"},
+                                     {"role": "assistant", "content": "", "tool_calls": [R1]},
+                                     result("c1", "# Title"),
+                                     {"role": "assistant", "content": "Found it."}], TOOLS),
     "agent_loop_3": ([{"role": "system", "content": SYS},
                       {"role": "user", "content": "Investigate"},
                       {"role": "assistant", "content": "Reading.", "tool_calls": [R1]},

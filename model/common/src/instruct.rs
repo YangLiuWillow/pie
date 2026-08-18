@@ -89,6 +89,19 @@ pub trait Instruct: Send + Sync {
     /// reasoning is empty — `<think>\n\n</think>\n\n` before the content —
     /// and renders earlier turns bare. The rule is the template's:
     ///
+    /// TWO positional facts, because the families disagree on the condition
+    /// and only one of them is `after_query`:
+    ///
+    /// ```jinja
+    ///   Qwen3    if (loop.index0 > last_query_index)
+    ///                and (loop.last or reasoning_content)   -> header
+    ///   Qwen3.6  if (loop.index0 > last_query_index)         -> header
+    /// ```
+    ///
+    /// Reading Qwen3's rule as "after the query" alone drops the header on a
+    /// LAST plain assistant turn, which the matrix caught the moment a shape
+    /// exercised it.
+    ///
     /// ```jinja
     /// {%- if ... or (loop.index0 > ns.last_query_index) %}
     ///     {{- '<|im_start|>' + role + '\n<think>\n' + reasoning + '\n</think>\n\n' + content }}
@@ -102,8 +115,8 @@ pub trait Instruct: Send + Sync {
     /// Defaulted to the position-blind render: every family whose template has
     /// not been read against this keeps exactly its current behaviour, rather
     /// than acquiring a reasoning block nobody verified it wants.
-    fn assistant_at(&self, msg: &str, reasoning_header: bool) -> Vec<u32> {
-        let _ = reasoning_header;
+    fn assistant_at(&self, msg: &str, after_query: bool, is_last: bool) -> Vec<u32> {
+        let _ = (after_query, is_last);
         self.assistant(msg)
     }
     fn cue(&self) -> Vec<u32>;
@@ -162,9 +175,10 @@ pub trait Instruct: Send + Sync {
         &self,
         content: Option<&str>,
         calls: &[(String, String)],
-        reasoning_header: bool,
+        after_query: bool,
+        is_last: bool,
     ) -> Vec<u32> {
-        let _ = reasoning_header;
+        let _ = (after_query, is_last);
         self.assistant_with_tool_calls(content, calls)
     }
 
