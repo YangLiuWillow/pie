@@ -435,28 +435,39 @@ where
     // conclusion from the other direction (its flat granularity cost 24 of 32
     // concurrent requests) and switched to `next_power_of_two`, which does not
     // help this case: 1799 -> 2048, the whole pool again.
-    const POOL_GRANULARITY: u32 = 256;
-    /// The step used once quantizing at the coarse one would reach past
-    /// `QUANTIZE_BELOW_PERCENT` of the pool.
-    ///
-    /// Sized by the DRIVER's program budget, not by taste -- see
-    /// `pool_shape_budget_fits_the_driver_program_cache`. Every distinct value
-    /// this produces costs `PROGRAMS_PER_POOL_SHAPE` cache entries, and the
-    /// cache holds 64 and never evicts. 64 here was measured at 65 entries and
-    /// overflowed by exactly one.
-    const TOP_GRANULARITY: u32 = 128;
-    /// Where the step narrows. Below the gate's 94.1% saturation point by more
-    /// than one `TOP_GRANULARITY`, so the rounding itself can never be what
-    /// saturates the pool.
+    /// Where the step narrows. Below the gate's 94.1% saturation point by
+    /// enough that the rounding itself can never be what saturates the pool.
     const QUANTIZE_BELOW_PERCENT: u32 = 85;
-    let need_pages = (n + cfg.max_tokens as u32 + 2).div_ceil(page_t);
+    /// Both steps are DERIVED FROM THE POOL, because the budget they spend is
+    /// a COUNT and a fixed step is not.
+    ///
+    /// The driver's program cache holds 64 entries and never evicts, and each
+    /// distinct reservation costs five of them (the container binds the
+    /// `pages_p` length together with the fire's token count, so the cache
+    /// keeps their cross product). What must stay bounded is therefore the
+    /// NUMBER of distinct reservations one conversation makes -- and a step
+    /// written as a constant only bounds that for the pool size it was chosen
+    /// against.
+    ///
+    /// Which is exactly how it broke: 256/128 was measured at 50 of 64 on a
+    /// 2048-page pool, and raising `max_model_len` to give the pool headroom
+    /// doubled it to 4096 and the same constants asked for 95. The run that
+    /// found this finished at 64/64 -- it did not overflow, it ran out of
+    /// conversation first.
+    ///
+    /// Dividing the pool instead holds the count flat at 10 shapes (50 entries)
+    /// across 1024, 2048 and 4096 alike; see
+    /// `pool_shape_budget_fits_the_driver_program_cache`.
     let (_, pool_total) = kv_pool_status();
-    let coarse = need_pages.next_multiple_of(POOL_GRANULARITY);
+    let coarse_granularity = (pool_total / 8).max(256);
+    let top_granularity = (pool_total / 16).max(64);
+    let need_pages = (n + cfg.max_tokens as u32 + 2).div_ceil(page_t);
+    let coarse = need_pages.next_multiple_of(coarse_granularity);
     let quantize_ceiling = pool_total * QUANTIZE_BELOW_PERCENT / 100;
     let pool_pages_want = if pool_total == 0 || coarse <= quantize_ceiling {
         coarse
     } else {
-        need_pages.next_multiple_of(TOP_GRANULARITY)
+        need_pages.next_multiple_of(top_granularity)
     };
     let have = state.ws.page_len();
     if pool_pages_want > have {
@@ -1028,14 +1039,14 @@ mod pool_shape_tests {
     /// real one reads `kv_pool_status()` over the WIT boundary, which does not
     /// exist in a unit test, and the arithmetic is the whole subject here.
     fn pool_pages_want(need_pages: u32, pool_total: u32) -> u32 {
-        const POOL_GRANULARITY: u32 = 256;
-        const TOP_GRANULARITY: u32 = 128;
         const QUANTIZE_BELOW_PERCENT: u32 = 85;
-        let coarse = need_pages.next_multiple_of(POOL_GRANULARITY);
+        let coarse_granularity = (pool_total / 8).max(256);
+        let top_granularity = (pool_total / 16).max(64);
+        let coarse = need_pages.next_multiple_of(coarse_granularity);
         if pool_total == 0 || coarse <= pool_total * QUANTIZE_BELOW_PERCENT / 100 {
             coarse
         } else {
-            need_pages.next_multiple_of(TOP_GRANULARITY)
+            need_pages.next_multiple_of(top_granularity)
         }
     }
 
@@ -1083,25 +1094,33 @@ mod pool_shape_tests {
         const DRIVER_PROGRAM_CACHE: usize = 64;
         const PROGRAMS_PER_POOL_SHAPE: usize = 5;
 
-        // The measured deployment: 2048 pages of 32, `max_model_len` 65,536.
-        let shapes = distinct_pool_shapes(2048, 32, 4096, 2204);
-        let programs = shapes.len() * PROGRAMS_PER_POOL_SHAPE;
-        assert!(
-            programs <= DRIVER_PROGRAM_CACHE,
-            "one conversation reserves {} distinct pool sizes {shapes:?}, costing \
-             {programs} of the driver's {DRIVER_PROGRAM_CACHE} program cache entries \
-             ({PROGRAMS_PER_POOL_SHAPE} per pool size). The cache does not evict, so \
-             the overflow is permanent for the process and the turn comes back as an \
-             empty completion.",
-            shapes.len()
-        );
-
-        // Growth has to stay coarse where it is cheap: a fine step from the
-        // start would spend the budget long before the pool filled.
-        assert!(
-            shapes.len() <= 12,
-            "too many pool shapes before the cross product is even applied: {shapes:?}"
-        );
+        // EVERY pool this deployment can be configured with, not just the one
+        // the steps were last tuned against. 2048 is `max_model_len` 65,536 and
+        // 4096 is 131,072 -- the driver's own cap, and the only way a hybrid
+        // gets pool headroom, since `effective_total_pages` forces the pool to
+        // `ceil(max_model_len / kv_page_size)` and ignores configured
+        // `total_pages` entirely.
+        for pool in [1024u32, 2048, 4096] {
+            let shapes = distinct_pool_shapes(pool, 32, 4096, 2204);
+            let programs = shapes.len() * PROGRAMS_PER_POOL_SHAPE;
+            assert!(
+                programs <= DRIVER_PROGRAM_CACHE,
+                "at pool {pool}, one conversation reserves {} distinct sizes \
+                 {shapes:?}, costing {programs} of the driver's \
+                 {DRIVER_PROGRAM_CACHE} program cache entries \
+                 ({PROGRAMS_PER_POOL_SHAPE} each). The cache does not evict, so the \
+                 overflow is permanent for the process and every later turn comes \
+                 back as an empty completion.",
+                shapes.len()
+            );
+            // Growth stays coarse where it is cheap: a fine step from the start
+            // would spend the budget long before the pool filled.
+            assert!(
+                shapes.len() <= 12,
+                "at pool {pool}: too many shapes before the cross product is even \
+                 applied: {shapes:?}"
+            );
+        }
     }
 
     /// The reason the fine step exists at all: the coarse one rounds the last
