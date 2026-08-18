@@ -143,6 +143,26 @@ impl Retained {
     }
 }
 
+/// Does a newly retained tip make `older` redundant?
+///
+/// True when the tip's render passes THROUGH `older`'s own tip -- same token
+/// length, same address -- because then every boundary `older` could be resumed
+/// at is also a boundary of the new state, which covers strictly more.
+///
+/// An `older` with no boundaries can never be matched by any resume, so it is
+/// redundant by a different route: it is pages nothing can reach.
+///
+/// Address equality is the whole test. Two branches at the same length with
+/// different addresses are different conversations that must both survive --
+/// that is the case this must never get wrong, since dropping the wrong one
+/// costs a full re-prefill of someone else's history.
+fn branch_is_superseded(tip: &[(u32, String)], older: &[(u32, String)]) -> bool {
+    let Some(older_tip) = older.last() else {
+        return true;
+    };
+    tip.iter().any(|b| b == older_tip)
+}
+
 pub struct Retained {
     state: SessionState,
     /// Ascending `(token length, address of the render's first `len` tokens)`
@@ -696,9 +716,42 @@ impl Daemon {
         if let Err(why) = candidate.verify(kv_page_size()) {
             return format!("not retained (kv_verify: {why})");
         }
+        // Reclaim what this tip supersedes, AFTER it is retained, so a refusal
+        // between the two leaves the chain resumable rather than empty.
+        //
+        // Ported from test-time-bench's decoder, which keeps at most two
+        // snapshots per conversation line -- first boundary + tip -- and calls
+        // eviction "closing the arena-page leak that kept it opt-in". Its leak
+        // is ours: a branch nothing will ever resume still holds its pages, and
+        // pages held past their usefulness are what saturates the pool and gets
+        // the turn refused.
+        //
+        // Adapted, not copied, because the two designs hold state differently.
+        // TTB launches per turn and saves a separate context per boundary, so
+        // it must pay for the first one to keep a shared head resumable. Here a
+        // boundary is a LABEL into one live state, so the tip already offers
+        // every earlier cut of its own render at no extra pages -- the "first"
+        // half of first-and-tip is free, and buying it as a second branch would
+        // spend a whole working set on something already covered.
+        //
+        // Superseded means: this render passed THROUGH that branch's tip, so
+        // everything it could serve, the tip serves. The resume path already
+        // removes the branch it resumed; this catches the ones a MISS leaves
+        // behind, which nothing else drops until the pool is under pressure.
+        let tip_boundaries = candidate.boundaries.clone();
+        let before = self.sessions.len();
+        // The tip is held OUT of the scan rather than skipped by index: it
+        // supersedes itself, and a self-drop would retain nothing at all.
+        self.sessions
+            .retain(|branch| !branch_is_superseded(&tip_boundaries, &branch.boundaries));
+        let dropped = before - self.sessions.len();
         self.sessions.push(candidate);
 
-        format!("retained {} (len {total})", &address[..16])
+        if dropped > 0 {
+            format!("retained {} (len {total}, superseded {dropped})", &address[..16])
+        } else {
+            format!("retained {} (len {total})", &address[..16])
+        }
     }
 
     /// A turn that failed before producing anything still has to look like a
@@ -829,4 +882,62 @@ fn render_one(op: &RenderOp, out: &mut Vec<u32>) -> Result<(), String> {
         RenderOp::Cue(thinking) => out.extend(chat::cue(*thinking)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::branch_is_superseded;
+
+    fn b(pairs: &[(u32, &str)]) -> Vec<(u32, String)> {
+        pairs.iter().map(|(l, a)| (*l, (*a).to_string())).collect()
+    }
+
+    /// The ordinary case: this turn resumed the branch and extended it, so the
+    /// new state passes through the old tip and covers strictly more.
+    #[test]
+    fn a_tip_supersedes_the_branch_it_grew_from() {
+        let tip = b(&[(100, "aa"), (200, "bb"), (300, "cc")]);
+        assert!(branch_is_superseded(&tip, &b(&[(100, "aa"), (200, "bb")])));
+    }
+
+    /// THE case that must never be got wrong. Two conversations reach the same
+    /// token length with different content; dropping the other one costs a full
+    /// re-prefill of a history this branch cannot serve.
+    #[test]
+    fn same_length_different_address_is_a_different_conversation() {
+        let tip = b(&[(100, "aa"), (200, "bb")]);
+        assert!(!branch_is_superseded(&tip, &b(&[(100, "aa"), (200, "ZZ")])));
+    }
+
+    /// A branch that shares a head but diverged is still live: its own tip is
+    /// not on this render, so this state cannot serve it.
+    #[test]
+    fn a_branch_that_diverged_survives_its_shared_head() {
+        let tip = b(&[(100, "aa"), (200, "bb"), (300, "cc")]);
+        assert!(!branch_is_superseded(&tip, &b(&[(100, "aa"), (250, "dd")])));
+    }
+
+    /// A longer branch is not covered by a shorter tip -- supersession is not
+    /// symmetric, and treating it as such would drop the better branch.
+    #[test]
+    fn a_shorter_tip_does_not_supersede_a_longer_branch() {
+        let tip = b(&[(100, "aa"), (200, "bb")]);
+        assert!(!branch_is_superseded(&tip, &b(&[(100, "aa"), (400, "ee")])));
+    }
+
+    /// Boundaries are what a resume matches on, so a branch with none can never
+    /// be reached again. It is pages nothing can claim.
+    #[test]
+    fn an_unreachable_branch_is_reclaimed() {
+        assert!(branch_is_superseded(&b(&[(100, "aa")]), &[]));
+    }
+
+    /// An interior match is enough: the resume path truncates a branch's
+    /// boundaries to the cut it resumed at, so an older branch's tip commonly
+    /// sits in the middle of the new render rather than at its end.
+    #[test]
+    fn an_interior_boundary_match_counts() {
+        let tip = b(&[(100, "aa"), (200, "bb"), (300, "cc")]);
+        assert!(branch_is_superseded(&tip, &b(&[(100, "aa")])));
+    }
 }
