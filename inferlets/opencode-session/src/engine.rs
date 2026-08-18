@@ -438,26 +438,26 @@ where
     /// Where the step narrows. Below the gate's 94.1% saturation point by
     /// enough that the rounding itself can never be what saturates the pool.
     const QUANTIZE_BELOW_PERCENT: u32 = 85;
-    /// Both steps are DERIVED FROM THE POOL, because the budget they spend is
-    /// a COUNT and a fixed step is not.
-    ///
-    /// The driver's program cache holds 64 entries and never evicts, and each
-    /// distinct reservation costs five of them (the container binds the
-    /// `pages_p` length together with the fire's token count, so the cache
-    /// keeps their cross product). What must stay bounded is therefore the
-    /// NUMBER of distinct reservations one conversation makes -- and a step
-    /// written as a constant only bounds that for the pool size it was chosen
-    /// against.
-    ///
-    /// Which is exactly how it broke: 256/128 was measured at 50 of 64 on a
-    /// 2048-page pool, and raising `max_model_len` to give the pool headroom
-    /// doubled it to 4096 and the same constants asked for 95. The run that
-    /// found this finished at 64/64 -- it did not overflow, it ran out of
-    /// conversation first.
-    ///
-    /// Dividing the pool instead holds the count flat at 10 shapes (50 entries)
-    /// across 1024, 2048 and 4096 alike; see
-    /// `pool_shape_budget_fits_the_driver_program_cache`.
+    // Both steps are DERIVED FROM THE POOL, because the budget they spend is
+    // a COUNT and a fixed step is not.
+    //
+    // The driver's program cache holds 64 entries and never evicts, and each
+    // distinct reservation costs five of them (the container binds the
+    // `pages_p` length together with the fire's token count, so the cache
+    // keeps their cross product). What must stay bounded is therefore the
+    // NUMBER of distinct reservations one conversation makes -- and a step
+    // written as a constant only bounds that for the pool size it was chosen
+    // against.
+    //
+    // Which is exactly how it broke: 256/128 was measured at 50 of 64 on a
+    // 2048-page pool, and raising `max_model_len` to give the pool headroom
+    // doubled it to 4096 and the same constants asked for 95. The run that
+    // found this finished at 64/64 -- it did not overflow, it ran out of
+    // conversation first.
+    //
+    // Dividing the pool instead holds the count flat at 10 shapes (50 entries)
+    // across 1024, 2048 and 4096 alike; see
+    // `pool_shape_budget_fits_the_driver_program_cache`.
     let (_, pool_total) = kv_pool_status();
     let coarse_granularity = (pool_total / 8).max(256);
     let top_granularity = (pool_total / 16).max(64);

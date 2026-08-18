@@ -143,6 +143,23 @@ impl Retained {
     }
 }
 
+/// The cache budget in tokens: the operator's `retain_tokens`, clamped so one
+/// conversation's history cannot claim a shared pool, less what the turn about
+/// to run needs.
+///
+/// Pure, because this is the arithmetic the whole retention rule reduces to and
+/// it is the part that can be wrong without crashing — a budget too generous
+/// wedges the pool, one too tight collapses reuse, and both look like an
+/// ordinary slow run.
+fn cache_budget_tokens(retain_tokens: u32, pool_tokens: u32, reserve_tokens: u32) -> u32 {
+    const MAX_POOL_SHARE_PERCENT: u32 = 60;
+    let mut budget = retain_tokens;
+    if pool_tokens > 0 {
+        budget = budget.min(pool_tokens / 100 * MAX_POOL_SHARE_PERCENT);
+    }
+    budget.saturating_sub(reserve_tokens)
+}
+
 /// Does a newly retained tip make `older` redundant?
 ///
 /// True when the tip's render passes THROUGH `older`'s own tip -- same token
@@ -476,7 +493,7 @@ impl Daemon {
         // whether the pages this turn needs are available, which is knowable
         // here and nowhere earlier: it is the delta, not the whole prompt,
         // because the resumed prefix is already resident.
-        self.make_room(delta.len() as u32 + cue.len() as u32 + max_tokens as u32);
+        self.enforce_retention(delta.len() as u32 + cue.len() as u32 + max_tokens as u32);
 
         let run = {
             let resume = match owned_parent.take() {
@@ -620,69 +637,97 @@ impl Daemon {
         }
     }
 
-    /// Retain the rendered-history state, addressed by the TOKENS it holds.
+    /// THE retention rule. One invariant, one place, two evaluation points.
     ///
-    /// The address is `hash(model ‖ template ‖ full_render)` — this turn's own
-    /// render, and nothing the server produced. Next turn that same render
-    /// reappears as an interior boundary of the next one (history is
-    /// append-only), so it is found by the boundary scan without either side
-    /// predicting anything.
+    /// This replaces three mechanisms that grew one per failure — a demand
+    /// check before the turn, an admissibility check after it, and a
+    /// supersession sweep — none of which shared a budget, and all of which
+    /// substituted for `retain_tokens`: a field declared, documented, plumbed
+    /// from the shim, printed at startup, and enforced NOWHERE. The budget was
+    /// always the design; nothing implemented it, so each symptom got a patch.
     ///
-    /// That "never name a prediction" rule is load-bearing and was measured
-    /// upstream: an OpenHands version that predicted the next boundary from the
-    /// inferlet's own text and tool calls saw its hit rate collapse to ~3%,
-    /// because the host re-serializes JSON arguments with different bytes.
-    /// Naming only full host renders restored 96.6%.
+    /// The model is ownership, and it has exactly two categories:
     ///
-    /// Returns a log fragment. A turn that errored mid-generation is not
-    /// retained: the delta prefill may have stopped part-way, so the length
-    /// recorded here would over-claim.
-    /// Free pages until `need_tokens` worth are available, by dropping
-    /// retained branches oldest-first.
+    /// * The TIP is the working set. The next turn resumes it, so it is kept
+    ///   even when it alone exceeds the budget — evicting it is the reuse
+    ///   collapse measured at 85%: `cached=0 delta=52888` for the rest of a
+    ///   run, a permanent full-price prefill traded for a transient one.
+    /// * Every OLDER branch is cache. Bounded by `retain_tokens`, in the
+    ///   tokens that field is denominated in, and dropped oldest-first.
     ///
-    /// Only ever called where the caller has taken the branch it intends to
-    /// resume OUT of `self.sessions`, so this cannot evict the prefix the
-    /// current turn depends on — the `current-name` protection in
-    /// `task/89207-host-retention`'s `enforce-retention`, spelled here as
-    /// ownership rather than a name.
+    /// The one exception is the wedge, and it is the only case that may take
+    /// the tip: if what this guest holds leaves the pool with no room for
+    /// another turn, the engine refuses the next one and this guest — the only
+    /// thing that could free those pages — never runs again to free them.
+    /// Measured: an idle server refused a four-token request permanently.
+    /// Losing the tip costs one cold prefill; keeping it costs the server.
     ///
-    /// Stops when the need is met or nothing is left to give. Failing to free
-    /// enough is not an error here: the turn proceeds and either fits anyway
-    /// or fails at prefill with the driver's own message, which is more
-    /// informative than one this guest could invent.
-    fn make_room(&mut self, need_tokens: u32) {
+    /// Deliberately NOT expressed against the gateway's admission constant.
+    /// The guest used to carry `240/255` in two places, which made a gateway
+    /// retune a silent guest bug. "Leave room for another turn" is a statement
+    /// this guest can make on its own terms.
+    fn enforce_retention(&mut self, reserve_tokens: u32) -> usize {
+        // What "room for another turn" means, as a share of the pool.
+        const KEEP_FREE_PERCENT: u32 = 10;
+
         let page = kv_page_size().max(1);
-        // Free a margin beyond the need rather than exactly it. Running the
-        // pool to its last page is not safe the way running it to 90% is: an
-        // over-commit does not degrade, it KILLS the inferlet process, which
-        // takes the gateway WebSocket down and every retained branch with it
-        // (see `DEFAULT_RETAIN_TOKENS`). Observed once at 63k across two large
-        // conversations, where this accounting said the turn had room. The
-        // margin costs at most one extra eviction and buys the difference
-        // between a slow turn and a dead session.
-        const HEADROOM_PERCENT: u32 = 10;
         let (_, pool_total) = kv_pool_status();
-        let headroom = pool_total * HEADROOM_PERCENT / 100;
-        let need_pages = need_tokens.div_ceil(page).saturating_add(headroom);
+        let pool_tokens = pool_total.saturating_mul(page);
+
+        // The cache budget: the operator's figure, clamped so no single
+        // conversation's history can claim a shared pool.
+        let budget =
+            cache_budget_tokens(self.retain_tokens, pool_tokens, reserve_tokens);
+
+        let mut dropped = 0usize;
+        // Older branches are cache: drop oldest-first until they fit. The tip
+        // is excluded from both the cost and the eviction — `sessions.len()
+        // > 1` — because it is the working set, not cache.
         loop {
-            let (available, total) = kv_pool_status();
-            if total == 0 || available >= need_pages || self.sessions.is_empty() {
-                return;
+            let cache_tokens: u32 = self
+                .sessions
+                .iter()
+                .rev()
+                .skip(1)
+                .map(|r| r.tip())
+                .sum();
+            if self.sessions.len() <= 1 || cache_tokens <= budget {
+                break;
             }
-            let dropped = self.sessions.remove(0);
-            // ONE string, ONE placeholder: a multi-fragment `eprintln!` is
-            // split by the runtime's stderr capture into a client message per
-            // fragment, which is how this line first arrived as `: evicted a
-            // branch (` and nothing else.
-            let line = format!(
-                "[opencode-session] evicted a branch ({} tokens) to free \
-                 {need_pages} pages; {available}/{total} were available, \
-                 {} branch(es) left\n",
-                dropped.tip(),
-                self.sessions.len()
+            let gone = self.sessions.remove(0);
+            dropped += 1;
+            eprint!(
+                "{}",
+                format!(
+                    "[opencode-session] dropped a cached branch ({} tokens); \
+                     cache {cache_tokens} > budget {budget}, {} left\n",
+                    gone.tip(),
+                    self.sessions.len()
+                )
             );
-            eprint!("{line}");
         }
+
+        // The wedge exception. Only now, and only if the pool itself has no
+        // room left for another turn.
+        let keep_free = pool_total / 100 * KEEP_FREE_PERCENT;
+        while !self.sessions.is_empty() {
+            let (available, total) = kv_pool_status();
+            if total == 0 || available >= keep_free.max(1) {
+                break;
+            }
+            let gone = self.sessions.remove(0);
+            dropped += 1;
+            eprint!(
+                "{}",
+                format!(
+                    "[opencode-session] dropped a branch ({} tokens) to leave the \
+                     pool room for another turn ({available}/{total} free); the \
+                     next turn re-prefills\n",
+                    gone.tip()
+                )
+            );
+        }
+        dropped
     }
 
     fn retain_turn(
@@ -747,7 +792,7 @@ impl Daemon {
         let dropped = before - self.sessions.len();
         self.sessions.push(candidate);
 
-        let trimmed = self.trim_to_admissible();
+        let trimmed = self.enforce_retention(0);
 
         let mut line = format!("retained {} (len {total}", &address[..16]);
         if dropped > 0 {
@@ -760,96 +805,6 @@ impl Daemon {
         line
     }
 
-    /// Leave the pool in a state the NEXT turn can be ADMITTED in.
-    ///
-    /// `make_room` answers a different question, for a different party, at a
-    /// different time: "can THIS turn write?", asked by the guest, before the
-    /// turn. Nobody asked "can the next turn get in at all?" -- and that one is
-    /// decided by the gateway, from the worker's pool occupancy, BEFORE this
-    /// guest runs again.
-    ///
-    /// So a turn that ends with the pool full refuses its own successor, and
-    /// the guest -- the only thing that can free those pages -- never runs to
-    /// free them. The full state sustains itself. Measured: after a
-    /// conversation ended at 2048/2048, an idle server refused a FOUR-token
-    /// request, permanently, and every turn of a fresh SWE-bench instance with
-    /// it. Not one turn of that run executed.
-    ///
-    /// That is why this drops the last branch too when nothing else is left.
-    /// Losing the tip costs one cold re-prefill; keeping it costs the server.
-    /// The same trade `make_room` documents -- "the worst case is a cold turn,
-    /// not a failed one" -- applied to the case `make_room` cannot see.
-    fn trim_to_admissible(&mut self) -> usize {
-        // Trim to the GATE's own line, and not one page sooner.
-        //
-        // The gate refuses when the worker's pressure bucket reaches 240 of 255
-        // (`gateway/src/admission.rs`, `planner.rs::kv_pressure_bucket`), so
-        // that bucket -- not a round percentage -- is the only number that
-        // decides anything here. Computed in the gate's units for the same
-        // reason: a percentage invites a margin, and a margin is what broke
-        // this the first time.
-        //
-        // That first attempt trimmed below 85% "to leave room for growth". One
-        // conversation legitimately occupies 87-93% of a pool this size, so it
-        // flushed on EVERY turn and reuse went to zero -- measured, turn by
-        // turn: 81%, then 0%, then `cached=0 delta=52888` for the rest of the
-        // run. It swapped a permanent wedge for a permanent full-price prefill,
-        // which is the exact failure `make_room` above documents.
-        //
-        // Trimming only at the line gives the sawtooth instead: fast turns
-        // until the pool fills, ONE flush, one cold turn, fast again. On this
-        // deployment `total_pages * kv_page_size == max_model_len`, so the pool
-        // holds exactly one maximum-length conversation and nothing else --
-        // a flush at the top is not a tuning failure, it is the configuration
-        // saying a single full conversation cannot also leave headroom.
-        const GATE_SATURATED_BUCKET: u64 = 240;
-        let mut dropped = 0usize;
-        loop {
-            let (available, total) = kv_pool_status();
-            if total == 0 {
-                return dropped;
-            }
-            let used = u64::from(total - available);
-            // The gate rounds; matching that avoids trimming a pool the gate
-            // would have admitted. It cannot see the `waiters`/`nonresident`
-            // clamps, which are the engine's own and not occupancy at all.
-            let bucket = (used * 255 + u64::from(total) / 2) / u64::from(total);
-            let used_pct = used * 100 / u64::from(total);
-            if bucket < GATE_SATURATED_BUCKET {
-                return dropped;
-            }
-            let Some(last) = self.sessions.len().checked_sub(1) else {
-                // Over the line with nothing left to give: the pages are held
-                // by something this guest does not own. Say so -- silence here
-                // reads as "trimmed enough" and the next turn is refused with
-                // no explanation on this side.
-                if dropped == 0 {
-                    eprint!(
-                        "{}",
-                        format!(
-                            "[opencode-session] pool at {used_pct}% with no retained                              branch left to drop; the next turn may be refused
-"
-                        )
-                    );
-                }
-                return dropped;
-            };
-            // Oldest first, so the branch most likely to be resumed next is the
-            // last to go.
-            let is_tip = last == 0;
-            self.sessions.remove(0);
-            dropped += 1;
-            if is_tip {
-                eprint!(
-                    "{}",
-                    format!(
-                        "[opencode-session] dropped the TIP to stay admissible                          (pool was {used_pct}%); the next turn re-prefills
-"
-                    )
-                );
-            }
-        }
-    }
 
     /// A turn that failed before producing anything still has to look like a
     /// turn. Non-whitespace content, `finish_reason:"length"`, clean close.
@@ -1036,5 +991,53 @@ mod retention_tests {
     fn an_interior_boundary_match_counts() {
         let tip = b(&[(100, "aa"), (200, "bb"), (300, "cc")]);
         assert!(branch_is_superseded(&tip, &b(&[(100, "aa")])));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::cache_budget_tokens;
+
+    const POOL: u32 = 65_536; // 2048 pages x 32
+
+    /// The operator's figure is honoured when it is the smaller bound. This is
+    /// the field that was declared, documented, plumbed and enforced NOWHERE
+    /// until the retention rule was consolidated.
+    #[test]
+    fn the_operators_budget_is_what_binds_when_it_is_smaller() {
+        assert_eq!(cache_budget_tokens(32_768, POOL, 0), 32_768);
+    }
+
+    /// ...and cannot claim a shared pool no matter what it is set to. A budget
+    /// larger than the pool is how the guest wedges the engine: it holds
+    /// everything, the gate refuses the next turn, and only a turn could free
+    /// the pages.
+    #[test]
+    fn no_setting_lets_one_conversation_claim_the_pool() {
+        assert!(cache_budget_tokens(u32::MAX, POOL, 0) < POOL);
+        assert_eq!(cache_budget_tokens(1_000_000, POOL, 0), POOL / 100 * 60);
+    }
+
+    /// The turn about to run is charged against the same budget, in the same
+    /// unit, rather than through a second mechanism with its own headroom.
+    #[test]
+    fn the_running_turn_is_charged_to_the_same_budget() {
+        let idle = cache_budget_tokens(32_768, POOL, 0);
+        assert_eq!(cache_budget_tokens(32_768, POOL, 8_192), idle - 8_192);
+    }
+
+    /// A turn bigger than the budget leaves nothing for cache and must say so
+    /// as zero, not wrap. Saturating here is the difference between "evict
+    /// everything" and "evict nothing, then wedge".
+    #[test]
+    fn a_turn_larger_than_the_budget_saturates_to_zero() {
+        assert_eq!(cache_budget_tokens(32_768, POOL, 100_000), 0);
+    }
+
+    /// An unknown pool (status unavailable) must not silently clamp the budget
+    /// to zero and evict the whole cache.
+    #[test]
+    fn an_unknown_pool_falls_back_to_the_operators_figure() {
+        assert_eq!(cache_budget_tokens(32_768, 0, 0), 32_768);
     }
 }
