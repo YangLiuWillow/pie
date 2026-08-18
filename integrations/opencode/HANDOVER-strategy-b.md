@@ -141,17 +141,16 @@ worth building.
 > channel of pool size each time). A process-lived pipeline is its
 > prerequisite and is now in place.
 >
-> CALIBRATED SMALL before anyone chases it (liszt-ai-00, from
-> `docs/NEXT-decode-dispatch-count.md`): after the device-handle cache,
-> `PIE_SUBMIT_TRACE` prices the per-fire program path at ~0.1 ms
-> (core_program 2.65 → 0.08 ms, register_channel_set 2.70 → 0.04 ms,
-> `program::register` hash-deduped at 1 µs) ≈ 0.7% of a 14 ms decode step
-> — UNLESS the pool-sized `pages_d` seed (8 KB at 2048 pages) carries a
-> cost the trace does not split. Discriminating measurement:
-> decode-rows-probe with `PIE_SUBMIT_TRACE=1`, one row, then a Pass-reuse
-> arm — owned by liszt-ai-00 in the decode loop. Do NOT expect it to
-> explain A's 21.8 vs B's 39.3 at 28k: different inferlet, and the gap is
-> context-dependent (parity at 5.8k). The original section follows.
+> CLOSED — MEASURED NOT WORTH BUILDING (liszt-ai-00, probe run on the
+> current build with park() in, recorded at their `4c6c4da27`, raw trace
+> in `data-longctx/`): decode-rows-probe, ctx 7424, rows=1,
+> `PIE_SUBMIT_TRACE=1` → `build_ms=0.02 submit_ms=0.11` against a
+> 14.09 ms step median. A fresh Pass per token — pool-sized `pages_d`
+> seed included — is 0.8% of a decode fire; `submit_frame` is
+> 0.016–0.05 ms per fire after the first. Pass reuse cannot buy more than
+> ~0.1 ms/fire. The pages_d question is answered: no unsplit cost. The
+> decode gap lives elsewhere (same run: rows=8 costs 4.1× the 1-row fire
+> — the per-row KV re-read). The original section follows.
 
 ### 3.2-as-handed-over: `park()` — unused in the whole crate
 
