@@ -122,11 +122,12 @@ purpose, since porting a model IS adding a row. The fixture therefore records
 each arm's ARCH STEM (`qwen3_5moe`, not `qwen3_5_moe`), because only the
 generator knows it.
 
-`qwen3_coder_upstream` is marked `python_only`: it needs
-`CoderSchema::QwenMain` where the registry defaults to `MlxGguf`, so
-`create()` cannot produce it. 140 cells in the Python harness, 112 in the
-golden test. A config the registry cannot express is a signal about the
-registry, not a reason to special-case the test.
+`qwen3_coder_upstream` WAS `python_only` -- it needed `CoderSchema::QwenMain`
+where the registry hardcoded `MlxGguf`, so `create()` could not produce it, and
+the golden test covered 112 of 140 cells. That gap was a signal about the
+registry, and the registry was fixed: `InstructOverrides` carries the facts pie
+cannot read off anything it holds, and `create_with` applies them. 140/140 in
+both now.
 
 Both failure modes verified rather than assumed:
 

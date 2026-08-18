@@ -77,8 +77,24 @@ fn load_pietok(path: &Path) -> Arc<Tokenizer> {
 /// happily pass against config nobody serves. `arch` is the driver's arch stem
 /// — `architectures[0]` lowercased with the task suffix removed — recorded in
 /// the fixture because only the generator knows it.
-fn instruct(tokenizer: Arc<Tokenizer>, arch: &str, deploy: &str) -> Arc<dyn Instruct> {
-    pie_model::instruct::create(arch, deploy, tokenizer)
+fn instruct(
+    tokenizer: Arc<Tokenizer>,
+    arch: &str,
+    deploy: &str,
+    coder_schema: &str,
+) -> Arc<dyn Instruct> {
+    // `create_with`, not a reconstructed config: the override is the one fact
+    // pie cannot read off anything it carries — which of Qwen3-Coder's two
+    // published templates a checkpoint ships — so an operator supplies it, and
+    // the fixture records which the arm asked for. Everything else still comes
+    // from the registry row.
+    let overrides = pie_model::instruct::InstructOverrides {
+        coder_schema: match coder_schema {
+            "qwen" => Some(pie_model::instruct::ToolCallSchema::QwenMain),
+            _ => None,
+        },
+    };
+    pie_model::instruct::create_with(arch, deploy, tokenizer, &overrides)
 }
 
 fn render(inst: &dyn Instruct, body: &Value) -> Vec<u32> {
@@ -128,7 +144,12 @@ fn rendered_tokens_match_each_checkpoints_own_chat_template() {
         let t = toks[meta["tokenizer"].as_str().unwrap()].clone();
         arms.insert(
             arm.clone(),
-            instruct(t, meta["arch"].as_str().unwrap(), meta["deploy"].as_str().unwrap()),
+            instruct(
+                t,
+                meta["arch"].as_str().unwrap(),
+                meta["deploy"].as_str().unwrap(),
+                meta["coder_schema"].as_str().unwrap_or("shipped"),
+            ),
         );
     }
 

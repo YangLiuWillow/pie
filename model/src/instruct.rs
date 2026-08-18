@@ -8,6 +8,10 @@
 pub use pie_model_common::instruct::*;
 
 use pie_model_qwen_3::chat::{CoderSchema, ToolDialect};
+
+/// Re-exported so callers can name an override without depending on the
+/// generation crate directly.
+pub use pie_model_qwen_3::chat::CoderSchema as ToolCallSchema;
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 
@@ -123,6 +127,35 @@ pub fn tool_dialect(arch_name: &str, model_name: &str) -> ToolDialect {
 /// reaches a registry is data, and guessing at underscore placement is how the
 /// silent version of this bug comes back.
 pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
+    create_with(arch_name, model_name, tokenizer, &InstructOverrides::default())
+}
+
+/// Facts about a checkpoint that pie cannot read off anything it carries, and
+/// so cannot decide for itself.
+///
+/// Today there is one, and it is a fair example of the category: Qwen3-Coder
+/// has two published chat templates and pie serves either
+/// ([`CoderSchema`]), but which one a given checkpoint ships is written in the
+/// `chat_template.jinja` that is NOT imported into the artifact. The deployment
+/// name cannot settle it — `mlx-community/…` and `Qwen/…` both name the same
+/// model, and an operator may call a deployment anything.
+///
+/// So it is an override rather than a guess. `None` means "the registry's
+/// default", which is chosen to match what redistributed checkpoints actually
+/// carry. When the template is imported and its facts read at convert time,
+/// this shrinks back to nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InstructOverrides {
+    pub coder_schema: Option<ToolCallSchema>,
+}
+
+/// [`create`], with the operator's overrides applied.
+pub fn create_with(
+    arch_name: &str,
+    model_name: &str,
+    tokenizer: Arc<Tokenizer>,
+    overrides: &InstructOverrides,
+) -> Arc<dyn Instruct> {
     use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct};
 
     match arch_name {
@@ -183,7 +216,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 // carries -- mlx-community's `chat_template.jinja` and the one
                 // embedded in unsloth's GGUF are the same file. Qwen's own repo
                 // publishes a revised one; `CoderSchema::QwenMain` renders it.
-                coder_schema: CoderSchema::MlxGguf,
+                coder_schema: overrides.coder_schema.unwrap_or(CoderSchema::MlxGguf),
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),

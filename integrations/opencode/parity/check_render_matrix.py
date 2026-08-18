@@ -113,10 +113,10 @@ HUB = os.path.expanduser("~/.cache/huggingface/hub")
 # the Rust golden test build its renderer through the REAL registry instead of
 # reconstructing a ChatMLConfig, which would drift the moment a model is ported.
 #
-# `python_only` marks an arm whose config is not the registry default and so
-# cannot come from `create()`; it is still checked here, just not in the golden
-# test. Today that is the Qwen-published Coder template, which needs
-# `CoderSchema::QwenMain` where the registry defaults to `MlxGguf`.
+# The fifth field is an OVERRIDE, not a config the harness invents: "qwen"
+# selects Qwen's published Coder template where the registry defaults to the
+# redistributed one. The golden test passes it to `instruct::create_with`, so
+# every arm still renders through the registry.
 ARMS = [
     ("qwen3", "models--mlx-community--Qwen3-8B-4bit",
      "mlx-community--Qwen3-8B-4bit", "qwen3"),
@@ -135,7 +135,7 @@ ARMS = [
     # Same renderer, the other variant: pie supports both, so the harness
     # proves both rather than picking a winner.
     ("qwen3_coder_upstream", "models--Qwen--Qwen3-Coder-30B-A3B-Instruct",
-     "Qwen--Qwen3-Coder-30B-A3B-Instruct", "qwen3moe", "qwen", "python_only"),
+     "Qwen--Qwen3-Coder-30B-A3B-Instruct", "qwen3moe", "qwen"),
     ("qwen3_5_upstream", "models--Qwen--Qwen3.6-35B-A3B",
      "Qwen--Qwen3.6-35B-A3B", "qwen3_5moe"),
 ]
@@ -315,13 +315,6 @@ def emit_fixtures(a, arms, shapes, AutoTokenizer):
         if not snaps:
             print(f"  SKIP {arm}: not in the HF cache", file=sys.stderr)
             continue
-        if "python_only" in rest:
-            # Its config is not the registry default, so the golden test — which
-            # builds through `instruct::create` on purpose, so a ported model
-            # is checked against the row someone actually added — cannot
-            # reproduce it. Checked by this harness instead.
-            print(f"  (python-only arm, not in fixtures: {arm})", file=sys.stderr)
-            continue
         snap = pathlib.Path(snaps[0])
 
         # Compile the tokenizer through pie's own path and key it by content, so
@@ -339,8 +332,13 @@ def emit_fixtures(a, arms, shapes, AutoTokenizer):
         else:
             tmp.rename(final)
         tokenizers[digest] = f"tok/{digest}.pietok"
-        arm_meta[arm] = {"tokenizer": digest, "deploy": deploy_name,
-                         "arch": arch}
+        # `coder_schema` is an OVERRIDE the golden test hands to
+        # `instruct::create_with`, not a config it reconstructs: which of
+        # Qwen3-Coder's two published templates a checkpoint ships is not
+        # readable from anything pie carries, so an operator says. Every other
+        # field still comes from the registry row.
+        arm_meta[arm] = {"tokenizer": digest, "deploy": deploy_name, "arch": arch,
+                         "coder_schema": "qwen" if "qwen" in rest else "shipped"}
 
         tok = AutoTokenizer.from_pretrained(str(snap), local_files_only=True)
         for name, (messages, tools) in shapes.items():

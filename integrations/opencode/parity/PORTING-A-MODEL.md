@@ -40,8 +40,12 @@ Get the stem from the checkpoint:
 version reconstructed `ChatMLConfig` field by field and would have passed
 against a row nobody serves. If your new model needs a config the registry
 cannot express, that is a signal about the registry — not a reason to special-
-case the test. (The one arm that does, `qwen3_coder_upstream`, is marked
-`python_only` and checked by the Python harness alone.)
+case the test. When pie genuinely cannot know a fact -- which of
+Qwen3-Coder's two published templates a checkpoint ships is written only in the
+`chat_template.jinja` the artifact does not import -- it becomes an entry in
+`InstructOverrides`, an operator's answer, and `create_with` applies it. The
+test passes the same override the fixture records, so every arm still renders
+through the registry.
 
 ## What "correct" means, and how to find out when it is not
 
