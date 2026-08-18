@@ -138,17 +138,32 @@ while true; do
         fired_terminal=$c
     fi
 
-    # ---- 9. Reuse collapse. Within an instance turns should resume; only a
-    #         NEW conversation legitimately starts cold. A run of cold turns is
-    #         silent in every timing column.
+    # ---- 9. Reuse collapse, counted as CONSECUTIVE cold turns rather than a
+    #         share of them.
+    #
+    #         A share cries wolf on exactly the run this exists to watch. Every
+    #         new conversation legitimately starts cold, and a benchmark is
+    #         nothing but conversation boundaries — three repeats of one
+    #         SWE-bench instance tripped "6/12 recent turns had cached=0" while
+    #         all three produced the correct patch and every health counter was
+    #         zero. Over 30 instances a share-based check fires continuously
+    #         and gets ignored, which is worse than no check.
+    #
+    #         Thrashing looks different: it is turn after turn re-prefilling
+    #         the SAME growing history, so the cold turns are consecutive.
+    #         Interspersed cold turns are just new conversations.
     if [ -f "$SHIM" ]; then
-        run=$(grep -aoE "cached=[0-9]+" "$SHIM" 2>/dev/null | tail -12 | grep -c "cached=0" | tr -dc '0-9')
-        run=${run:-0}
-        if [ "$run" -ge 6 ] && [ "$fired_reuse" -eq 0 ]; then
-            echo "REUSE-COLLAPSE: $run/12 recent turns had cached=0 — retention is thrashing"
+        streak=$(grep -aoE "cached=[0-9]+" "$SHIM" 2>/dev/null | tail -12 | awk '
+            /cached=0$/ { n++; if (n > m) m = n; next }
+            { n = 0 }
+            END { print m + 0 }')
+        streak=$(printf '%s' "${streak:-0}" | tr -dc '0-9')
+        streak=${streak:-0}
+        if [ "$streak" -ge 4 ] && [ "$fired_reuse" -eq 0 ]; then
+            echo "REUSE-COLLAPSE: $streak consecutive turns had cached=0 — one conversation is re-prefilling every turn"
             fired_reuse=1
         fi
-        [ "$run" -lt 3 ] && fired_reuse=0
+        [ "$streak" -lt 2 ] && fired_reuse=0
     fi
 
     # ---- 10. Degraded turns: a turn that died before producing anything, but
