@@ -174,32 +174,44 @@ MEMWAIT="$REPO/integrations/opencode/tools/wait_for_memory.sh 26 300 || exit 1"
 # chunked re-prefill collides with the slot the retained state still holds.
 # opencode appends a new user message every turn, so it does not take that
 # path; a client that retried a request verbatim would.
-# RETAINED-KV BUDGET, and it has to be set here rather than left to the
-# launcher's default. That default is HALF the effective pool:
+# RETAINED-KV BUDGET, and the ceiling on it is STRUCTURAL, not a tuning taste.
 #
-#     pool          2048 pages * 32 = 65,536 tokens
-#     retain_tokens 32,768 = 1024 pages
+# pie's KV pool is not sized independently of the context ceiling:
+# `driver/metal/src/context.cpp:245` returns
+# `min(total_pages, ceil(max_model_len / kv_page_size))`, so the pool is
+# clamped to the context ring and `pool == EXACTLY ONE max-length sequence`:
 #
-# which is only safe if no single request needs the other half. At
-# max_model_len 65536 a request may legitimately need the WHOLE pool, and this
-# workload gets close: a 45,453-token prefill is 1421 pages, so 1024 + 1421 =
-# 2445 against a 2048-page pool and the fire is refused:
+#     pool 2048 pages * 32 = 65,536 tokens == max_model_len
 #
-#     KV pool starved: 512 pages asked, 0 free of 2048, no host swap room to
-#     evict into (or no swap transport), and no fire in flight anywhere to
-#     complete and free pages
+# Every retained token is therefore taken directly out of what a single live
+# request can use, and a conversation approaching the ceiling starves:
 #
-# This never bit before because retention never actually held anything on this
-# model -- every resume failed and the branch was dropped. Making resume work
-# made the over-commit reachable. 16,384 tokens = 512 pages leaves 1536 pages
-# (49k tokens) for the live request, which covers the longest context this
-# workload reaches, while still retaining more than the 7k-24k prefixes the
-# reuse chain actually uses.
+#     retain 32,768 (1024p) + live 45,453 (1421p) = 2445p > 2048  STARVED
+#     retain 16,384 ( 512p) + live 53,248 (1664p) = 2176p > 2048  STARVED
+#
+# Both were observed here, the second surfacing as
+# `pie_metal_register_program failed with status -5` rather than a clean
+# starvation message (abi.cpp swallows the reason in `catch (...)`).
+#
+# This was latent until now: retention never held anything on a hybrid model,
+# because every resume failed and the branch was dropped. Making resume work
+# made the over-commit reachable.
+#
+# 8192 tokens = 256 pages leaves 1792 pages (57,344 tokens) for the live
+# request, which covers the longest context this workload has reached (53k)
+# with margin.
+#
+# THE COST, and it belongs in the report: pie can only ever reuse an 8k prefix,
+# so on turns past 8k the rest is re-prefilled. vLLM at the SAME 65,536 ceiling
+# gets a 193,536-token pool -- three maximal sequences -- and caches without
+# that tension. Raising pie's `max_model_len` would grow its pool, but it would
+# also hand pie a context ceiling the other three arms do not have, so the arms
+# are kept at 65,536 and the limitation is reported instead of configured away.
 PIE_RESTART="pkill -f '$REPO/target/release/pie .*serve'; pkill -f session_shim.py; sleep 10; \
 $MEMWAIT; \
-PIE_PYTHON=$PIEPY PIE_RETAIN_TOKENS=16384 $REPO/integrations/opencode/tools/boot_pie.sh s36 \
+PIE_PYTHON=$PIEPY PIE_RETAIN_TOKENS=8192 $REPO/integrations/opencode/tools/boot_pie.sh s36 \
   PIE_STRATEGY=b PIE_MODEL=$PIEMODEL PIE_MAX_MODEL_LEN=65536 \
-  PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY PIE_RETAIN_TOKENS=16384"
+  PIE_MAX_FORWARD_TOKENS=4096 PIE_PYTHON=$PIEPY PIE_RETAIN_TOKENS=8192"
 VLLM_RESTART="pkill -f 'vllm serve'; pkill -f 'VLLM::EngineCore'; sleep 10; \
 $MEMWAIT; \
 VLLM_MODEL=$MLXMODEL VLLM_SERVED_NAME=$PIEMODEL VLLM_MAX_MODEL_LEN=65536 \
