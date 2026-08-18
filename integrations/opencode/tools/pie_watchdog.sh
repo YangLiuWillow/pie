@@ -55,18 +55,20 @@ fired_starved=0
 fired_verify=0
 fired_driver=0
 
-# The Metal M1 program cache holds this many entries and NEVER evicts
-# (`driver/metal/src/pipeline/m1_runtime.cpp`), so consumption is one-way for
-# the life of the process. Warning BEFORE the wall is the point: once it is
-# full, `register_program` rejects and every later turn degrades to an empty
-# completion, which reads as a model quality problem and not a driver limit.
-PROGRAM_CACHE_CAP=64
+# The Metal M1 program cache capacity, matched to the engine's own 256-entry
+# program registry. A full cache no longer rejects -- it serves the program
+# uncached and recompiles per fire -- so crossing this is a PERFORMANCE cliff
+# now rather than the empty completions it used to cause. Still worth warning
+# on: eviction is currently inert (every entry is pinned by the driver's
+# ProgramRecord), so consumption remains one-way for the life of the process.
+PROGRAM_CACHE_CAP=256
 PROGRAM_CACHE_WARN=$((PROGRAM_CACHE_CAP * 7 / 8))
 
 while true; do
-    # ---- 1. Program cache exhausted. The turn comes back EMPTY, and nothing
-    #         else in the run says why. This is what the unexplained `status -5`
-    #         failures were.
+    # ---- 1. Program cache exhausted. This was what the unexplained `status -5`
+    #         failures were, back when a full cache REFUSED the fire and the
+    #         turn came back empty. Kept after that was fixed: if it fires
+    #         again, the fallback regressed.
     c=$(count "cache is full" "$ENGINE")
     if [ "$c" -gt "$fired_cachefull" ]; then
         echo "PROGRAM-CACHE-FULL=$c — register_program is rejecting; turns now degrade to empty completions"
@@ -74,8 +76,9 @@ while true; do
     fi
 
     # ---- 2. ...and the same budget approaching its wall, while there is still
-    #         time to act. The cache never evicts, so this only ever rises.
-    used=$(count "register_program: cache entry" "$ENGINE")
+    #         time to act. Eviction is inert today, so this only ever rises.
+    #         Counts compiles, which is the line `compile_program` now emits.
+    used=$(count "register_program: compiling" "$ENGINE")
     if [ "$used" -ge "$PROGRAM_CACHE_WARN" ] && [ "$fired_cachewarn" -lt "$used" ]; then
         echo "PROGRAM-CACHE-HEADROOM: $used/$PROGRAM_CACHE_CAP entries used and never evicted"
         fired_cachewarn=$used

@@ -67,7 +67,30 @@ std::string encode_m1_cache_identity(
 namespace {
 
 constexpr std::size_t kMaxStageCacheEntries = 64;
-constexpr std::size_t kMaxProgramCacheEntries = 64;
+// Matched to the ENGINE's program registry, which is the other half of this
+// budget: `runtime/engine/src/pipeline/program.rs` keeps a 256-entry LRU of
+// registered programs and evicts. This cache held 64 and never evicted, so it
+// filled four times sooner than the engine would ever retire anything -- and
+// since the ABI has no `close_program` verb (only `close_instance` and
+// `close_channel`), the engine had no way to tell this side to let go even
+// when it did evict.
+//
+// Two registries for the same objects, with different capacities and no
+// channel between them. Aligning the capacity is what removes the practical
+// problem; the missing verb only starts to matter above 256, which is where
+// engine-side eviction first fires.
+//
+// Raising it is safe ONLY because a full cache no longer fails the fire (see
+// `cache_program`). While overflow was fatal, raising the cap just moved the
+// wall and I said so; now that overflow costs a recompile instead of a turn,
+// the cap is a performance knob rather than a correctness one.
+//
+// Measured cost of holding more: none that host RSS can see. Across a run that
+// compiled 41 programs, RSS FELL from 2873 to 2583 MB -- the per-program cost
+// is below a ~300 MB noise floor. Caveat worth keeping: Metal pipeline state
+// objects may live in driver memory RSS does not count, so this bounds the
+// host cost and not the device cost.
+constexpr std::size_t kMaxProgramCacheEntries = 256;
 
 /// Override the program-cache capacity for a run.
 ///

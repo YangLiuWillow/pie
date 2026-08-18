@@ -1091,7 +1091,7 @@ mod pool_shape_tests {
     /// real repair and would make this test's factor 1 instead of 5.
     #[test]
     fn pool_shape_budget_fits_the_driver_program_cache() {
-        const DRIVER_PROGRAM_CACHE: usize = 64;
+        const DRIVER_PROGRAM_CACHE: usize = 256;
         const PROGRAMS_PER_POOL_SHAPE: usize = 5;
 
         // EVERY pool this deployment can be configured with, not just the one
