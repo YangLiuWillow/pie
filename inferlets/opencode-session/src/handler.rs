@@ -234,14 +234,6 @@ impl Daemon {
         let t_entry = std::time::Instant::now();
         let sink = Sink::new(req_id);
 
-        // Give the pool back before asking it for anything. Eviction that runs
-        // only after a turn retains cannot rescue a turn that is already
-        // starving, and starving is exactly the state a long retained branch
-        // leaves the pool in: `KV pool starved: N pages asked, 0 free of 2048`
-        // arrives at PREFILL, so the turn dies before reaching any code that
-        // would have freed a page. Running it here is what makes the hard tier
-        // reachable at all.
-        self.enforce_retention(true);
 
         let body = match serde_json::to_vec(&env.body) {
             Ok(b) => b,
@@ -450,6 +442,22 @@ impl Daemon {
             owned_parent = Some(r);
         }
 
+        // Make room for what THIS TURN will actually write. Every branch still
+        // in `self.sessions` is now a non-keeper: the one being resumed was
+        // just removed into `owned_parent`, so nothing here can evict the
+        // prefix this turn is about to build on.
+        //
+        // Demand, not occupancy. A percentage watermark cannot answer the
+        // question that matters — both failures this replaces were pools at a
+        // perfectly ordinary 87%. One turn needed 512 pages and 256 were free,
+        // so it starved while the watermark said "fine"; the other spared
+        // nothing at 85% and evicted the branch the next turn needed, so reuse
+        // went to zero and every turn re-prefilled ~48k. What decides both is
+        // whether the pages this turn needs are available, which is knowable
+        // here and nowhere earlier: it is the delta, not the whole prompt,
+        // because the resumed prefix is already resident.
+        self.make_room(delta.len() as u32 + cue.len() as u32 + max_tokens as u32);
+
         let run = {
             let resume = match owned_parent.take() {
                 Some(r) => engine::Resume::InPlace(r.state, cached_tokens),
@@ -593,65 +601,47 @@ impl Daemon {
     /// Returns a log fragment. A turn that errored mid-generation is not
     /// retained: the delta prefill may have stopped part-way, so the length
     /// recorded here would over-claim.
-    /// Drop retained branches until the KV pool is back under its watermarks.
+    /// Free pages until `need_tokens` worth are available, by dropping
+    /// retained branches oldest-first.
     ///
-    /// The bound that matters is LIVE POOL OCCUPANCY, not a token budget fixed
-    /// before the run. `retain_tokens` stays as a ceiling, but it is no longer
-    /// the thing being defended, because it never could be: the launcher picks
-    /// it from the driver config without knowing how long a turn will get, and
-    /// the pool here is CLAMPED to the context ring, so the worst-case live
-    /// turn wants the whole pool alone. A budget leaving room for that reuses
-    /// nothing; one that does not starves the turn it meant to accelerate.
-    /// Both were measured on this workload before this existed.
+    /// Only ever called where the caller has taken the branch it intends to
+    /// resume OUT of `self.sessions`, so this cannot evict the prefix the
+    /// current turn depends on — the `current-name` protection in
+    /// `task/89207-host-retention`'s `enforce-retention`, spelled here as
+    /// ownership rather than a name.
     ///
-    /// Two tiers, after `task/89207-host-retention`'s `enforce-retention`:
-    ///
-    /// - **evict**: drop idle branches oldest-first, but keep the newest — it
-    ///   is the one the next turn resumes, so dropping it trades a possible
-    ///   rebuild for a certain one.
-    /// - **hard**: drop even the newest. Losing reuse is a slowdown; holding
-    ///   the pool is an OUTAGE. A single long conversation is easily larger
-    ///   than the evict tier all by itself, and a guest that always spares the
-    ///   last branch pins the pool at zero free forever — every later request,
-    ///   including brand-new conversations, then dies at
-    ///   `KV pool starved: N pages asked, 0 free`, with no path back because
-    ///   the turn that would have evicted never gets to run. Measured exactly
-    ///   that way: a 57k-token conversation wedged the pool permanently.
-    ///
-    /// `preflight` runs this BEFORE a turn prefills rather than after it
-    /// retains. Eviction that only runs on the success path cannot rescue a
-    /// turn that is already starving, which is the case that matters.
-    fn enforce_retention(&mut self, preflight: bool) {
-        const EVICT_PERCENT: u32 = 70;
-        const HARD_PERCENT: u32 = 85;
-        let when = if preflight { "preflight" } else { "retain" };
+    /// Stops when the need is met or nothing is left to give. Failing to free
+    /// enough is not an error here: the turn proceeds and either fits anyway
+    /// or fails at prefill with the driver's own message, which is more
+    /// informative than one this guest could invent.
+    fn make_room(&mut self, need_tokens: u32) {
+        let page = kv_page_size().max(1);
+        // Free a margin beyond the need rather than exactly it. Running the
+        // pool to its last page is not safe the way running it to 90% is: an
+        // over-commit does not degrade, it KILLS the inferlet process, which
+        // takes the gateway WebSocket down and every retained branch with it
+        // (see `DEFAULT_RETAIN_TOKENS`). Observed once at 63k across two large
+        // conversations, where this accounting said the turn had room. The
+        // margin costs at most one extra eviction and buys the difference
+        // between a slow turn and a dead session.
+        const HEADROOM_PERCENT: u32 = 10;
+        let (_, pool_total) = kv_pool_status();
+        let headroom = pool_total * HEADROOM_PERCENT / 100;
+        let need_pages = need_tokens.div_ceil(page).saturating_add(headroom);
         loop {
             let (available, total) = kv_pool_status();
-            if total == 0 {
-                return;
-            }
-            let used = total.saturating_sub(available);
-            let pct = (used as u64 * 100 / total as u64) as u32;
-            let held: u32 = self.sessions.iter().map(Retained::tip).sum();
-            let over_hard = pct > HARD_PERCENT;
-            let over_evict = pct > EVICT_PERCENT
-                || held > self.retain_tokens
-                || self.sessions.len() > MAX_RETAINED;
-            if self.sessions.is_empty() || (!over_evict && !over_hard) {
-                return;
-            }
-            // The newest is spared UNTIL the hard tier; past it nothing is.
-            if self.sessions.len() <= 1 && !over_hard {
+            if total == 0 || available >= need_pages || self.sessions.is_empty() {
                 return;
             }
             let dropped = self.sessions.remove(0);
-            // ONE string, ONE placeholder. A multi-fragment `eprintln!` is
+            // ONE string, ONE placeholder: a multi-fragment `eprintln!` is
             // split by the runtime's stderr capture into a client message per
-            // fragment, which arrives at the shim as `: evicted a branch (`
-            // and nothing else — the same trap the turn line above documents.
+            // fragment, which is how this line first arrived as `: evicted a
+            // branch (` and nothing else.
             let line = format!(
-                "[opencode-session] {when}: evicted a branch ({} tokens); pool \
-                 {used}/{total} pages ({pct}%), {} branch(es) left\n",
+                "[opencode-session] evicted a branch ({} tokens) to free \
+                 {need_pages} pages; {available}/{total} were available, \
+                 {} branch(es) left\n",
                 dropped.tip(),
                 self.sessions.len()
             );
@@ -692,7 +682,6 @@ impl Daemon {
         }
         self.sessions.push(candidate);
 
-        self.enforce_retention(false);
         format!("retained {} (len {total})", &address[..16])
     }
 
