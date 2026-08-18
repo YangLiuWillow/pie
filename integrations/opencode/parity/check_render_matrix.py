@@ -44,10 +44,10 @@ error -- it shows up as accuracy, attributed to the engine.
 ## The measured baseline
 
     arm            2026-08-17    now
-    qwen3            24/26      28/28
-    qwen3_coder      12/26      28/28
-    qwen3_5           5/26      28/28
-                                84/84
+    qwen3            24/26      30/30
+    qwen3_coder      12/26      30/30
+    qwen3_5           5/26      30/30
+                                90/90
 
 Every arm renders byte-for-byte what its own `chat_template.jinja` renders, in
 both thinking modes, across all thirteen shapes. What closed the gap, in the
@@ -70,6 +70,23 @@ The flag reaches the server now: `chat.assistant` and `chat.assistant-call`
 both carry `after-query` and `is-last`, so the serving path renders what this
 measures. It did not until task #28 landed, and a green matrix said nothing
 about the server until then -- `render-tokens` links the renderer directly.
+
+## What 90/90 does NOT say
+
+The cells are the ones written here, and a shape nobody wrote is a shape
+nobody checks -- `reasoning_mid_loop` passed the moment it was added, but the
+branch it covers was unmeasured until then, and `plain_assistant_after_query`
+FAILED when added and cost a `is_last` fact to fix. Known-unmeasured today:
+
+  * multimodal turns. Qwen3.6 carries a vision tower and its template has
+    image/video content parts; every shape here is text.
+  * `preserve_thinking`, the template's other route to a reasoning header.
+  * non-ASCII content. `python_json` mirrors `json.dumps`, which escapes
+    non-ASCII by default; that path is noted as unhandled until parity says
+    otherwise, and no shape here has a non-ASCII character to say it with.
+  * a user turn whose content is itself wrapped in `<tool_response>`, which is
+    the `multi_step_tool` guard the last-query walk carries.
+  * conversations long enough to cross whatever the serving layer truncates at.
 
 ## One deliberate divergence the harness accounts for
 
@@ -190,6 +207,18 @@ SHAPES = {
                                      {"role": "assistant", "content": "", "tool_calls": [R1]},
                                      result("c1", "# Title"),
                                      {"role": "assistant", "content": "Found it."}], TOOLS),
+    # A replayed turn that actually CARRIES reasoning, mid-loop so it is not
+    # last. Both templates branch on `reasoning_content` being non-empty and
+    # every other shape here leaves it empty, so this is the branch that was
+    # measured only in its empty form.
+    "reasoning_mid_loop": ([{"role": "system", "content": SYS},
+                            {"role": "user", "content": "Investigate"},
+                            {"role": "assistant",
+                             "content": "<think>\nCheck the README first.\n</think>\n\nReading.",
+                             "tool_calls": [R1]},
+                            result("c1", "# Title"),
+                            {"role": "assistant", "content": "", "tool_calls": [R2]},
+                            result("c2", "a\nb")], TOOLS),
     "agent_loop_3": ([{"role": "system", "content": SYS},
                       {"role": "user", "content": "Investigate"},
                       {"role": "assistant", "content": "Reading.", "tool_calls": [R1]},
