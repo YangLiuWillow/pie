@@ -68,6 +68,23 @@ namespace {
 
 constexpr std::size_t kMaxStageCacheEntries = 64;
 constexpr std::size_t kMaxProgramCacheEntries = 64;
+
+/// Override the program-cache capacity for a run.
+///
+/// Not a tuning knob -- a TEST knob, so eviction is reachable in minutes
+/// instead of requiring a conversation long enough to compile 64 distinct
+/// shapes. A capacity of 8 walks the same code path the 64 case walks, and
+/// walks it a dozen times, which is what makes a regression here observable
+/// rather than theoretical.
+inline std::size_t program_cache_capacity_from_env() {
+    if (const char* raw = std::getenv("PIE_METAL_PROGRAM_CACHE_ENTRIES")) {
+        const long parsed = std::strtol(raw, nullptr, 10);
+        if (parsed > 0) {
+            return static_cast<std::size_t>(parsed);
+        }
+    }
+    return kMaxProgramCacheEntries;
+}
 constexpr std::size_t kMaxNegativeEntries = 64;
 constexpr std::size_t kMaxRegionsPerStage = 256;
 constexpr std::size_t kMaxRegionsPerProgram = 1024;
@@ -762,7 +779,7 @@ struct M1Runtime::Impl {
     Pso grouped_readiness{};
     Pso grouped_commit{};
     std::vector<CompileFault> compile_faults;
-    std::size_t max_program_cache_entries = kMaxProgramCacheEntries;
+    std::size_t max_program_cache_entries = program_cache_capacity_from_env();
     /// Recency per cached program, for the eviction below. A counter rather
     /// than a list: the cache is 64 entries, so a linear scan to find the
     /// oldest is cheaper than maintaining order on every hit -- and the hit is
