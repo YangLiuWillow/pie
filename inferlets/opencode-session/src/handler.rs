@@ -680,6 +680,31 @@ impl Daemon {
         if let Err(why) = candidate.verify(kv_page_size()) {
             return format!("not retained (kv_verify: {why})");
         }
+        // A branch bigger than the budget is not retained at all.
+        //
+        // `retain_tokens` was always meant to bound what one session pins, but
+        // eviction spares the branch the next turn resumes -- correctly, or a
+        // long conversation rebuilds every turn -- so a SINGLE conversation
+        // grew past the budget without anything stopping it. Measured: a branch
+        // reached 53,440 tokens, 82% of a 65,536-token pool, and the inferlet
+        // process was killed outright. The engine logged no reason, the shim
+        // reconnected, and the run continued having silently lost every
+        // retained branch.
+        //
+        // Refusing to retain costs this conversation its reuse from here on --
+        // it rebuilds each turn, which is what strategy A did throughout. That
+        // is a slowdown. Riding at 82% is a crash that takes the other
+        // conversations' branches with it.
+        if candidate.tip() > self.retain_tokens {
+            let line = format!(
+                "[opencode-session] not retained: branch is {} tokens, over the \
+                 {}-token budget; this conversation rebuilds from here\n",
+                candidate.tip(),
+                self.retain_tokens
+            );
+            eprint!("{line}");
+            return format!("not retained (over budget: {} tokens)", candidate.tip());
+        }
         self.sessions.push(candidate);
 
         format!("retained {} (len {total})", &address[..16])
