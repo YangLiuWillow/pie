@@ -7,7 +7,7 @@
 
 pub use pie_model_common::instruct::*;
 
-use pie_model_qwen_3::chat::ToolDialect;
+use pie_model_qwen_3::chat::{CoderSchema, ToolDialect};
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 
@@ -179,6 +179,11 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                     tool_dialect(arch_name, model_name),
                     ToolDialect::Coder
                 ),
+                // The variant every redistributed Qwen3-Coder checkpoint
+                // carries -- mlx-community's and unsloth's alike. Qwen's own
+                // repo publishes a revised file; `CoderSchema::QwenMain`
+                // renders that one.
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -193,6 +198,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 generation_suffix: "<think>\n",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),
@@ -216,6 +222,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
             },
         )),
@@ -262,6 +269,7 @@ pub fn create(arch_name: &str, model_name: &str, tokenizer: Arc<Tokenizer>) -> A
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),

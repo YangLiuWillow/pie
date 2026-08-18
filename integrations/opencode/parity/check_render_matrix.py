@@ -45,84 +45,38 @@ error -- it shows up as accuracy, attributed to the engine.
 
     arm                     2026-08-17    now
     qwen3                     24/26      30/30
+    qwen3_coder               12/26      30/30
     qwen3_5                    5/26      30/30
     qwen3_coder_upstream          -      30/30
     qwen3_5_upstream              -      30/30
-    qwen3_coder               12/26      10/30   <- deliberate, see below
-                                        120/120 graded
+                                        150/150
 
-## "Which template" is a real question, and the answer differs per model
+## "Which template" is a real question, and it has two right answers
 
 The `_upstream` arms render against QWEN'S OWN repos rather than the
-mlx-community conversions pie actually serves. For Qwen3.6 that is the same
-file -- byte-identical, 7764 bytes -- and both tokenizers encode identically,
-so `qwen3_5_upstream` passing 30/30 says the renderer matches the model
-author's template, not merely a converter's copy of it.
+redistributed conversions pie serves. For Qwen3.6 that is the same file --
+byte-identical at 7764 bytes -- and both tokenizers encode identically, so
+`qwen3_5_upstream` passing says the renderer matches the model author, not
+merely a converter's copy.
 
-Qwen3-Coder is NOT the same file. mlx-community ships 6722 bytes where Qwen
-currently publishes 6211, and the difference is not cosmetic: Qwen's revision
-opens the tools turn with a `# Tools\n\n` heading that the mlx checkpoint's
-does not. Every shape declaring tools diverges by exactly those three tokens;
-every shape without tools passes. Hence 10/30.
+Qwen3-Coder is two different files, both live today:
 
-pie tracks QWEN's file. A checkpoint redistributed with a patched or older
-copy does not get to become the reference, so `qwen3_coder_upstream` is the
-graded arm and the mlx conversion's is carried as an expected divergence --
-visible, sized, and not failing the run.
+    Shipped   mlx-community/…-4bit  6722 bytes  sha 672e747c…
+              unsloth/…-GGUF        same variant, embedded in the GGUF
+              no `# Tools` heading; `render_item_list` writes [`a`]
 
-Matching Qwen took two changes, and only the first was obvious: the `# Tools`
-heading, and then `render_extra_keys`. Qwen has no special handling for
-`enum` or `required` at all -- every unhandled schema key goes through one
-generic passthrough, JSON for containers and plain text otherwise, with the key
-used RAW as the tag. The mlx conversion added a `render_item_list` macro that
-writes `[`tz`]` where Qwen writes `["tz"]`, and a `normed_json_key` that
-rewrites tag names. Adding the heading alone left both Coder arms at 10/30;
-only replacing the special-cased lists with the generic rule closed it.
+    QwenMain  Qwen/Qwen3-Coder-…    6211 bytes  sha 5a38bfa0…
+              `# Tools` heading; generic `render_extra_keys` writes ["a"]
 
-The cost is real and stated rather than hidden: serving
-`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`, pie now renders three tokens
-of heading and JSON-quoted lists that THAT checkpoint's template does not, so
-mlx-lm and vLLM serving the same files render something different. Twenty of
-its thirty cells. That is the trade the choice buys, in the direction chosen.
+pie renders both -- `CoderSchema`, defaulting to `Shipped` because that is what
+every redistributed checkpoint carries and because a three-way benchmark where
+one engine sends a different prompt is not measuring engines. The arms differ
+only in which variant they ask for, so 150/150 is the claim that BOTH are
+exact, not that one was chosen.
 
-Every arm renders byte-for-byte what its own `chat_template.jinja` renders, in
-both thinking modes, across all thirteen shapes. What closed the gap, in the
-order it was closed and with the cells each was worth:
-
-    system_before_tools        +2   tools block leads the system content on 3.5/3.6
-    empty_reasoning_header     +5   post-query assistant turns carry <think></think>
-    generation_suffix         +12   3.5/3.6 opens the turn INSIDE a reasoning block
-    empty system turn          +4   a system message of "" is a turn, not an absence
-    tool_response framing     +12   Coder puts the newline after the block, not before
-    is_last                    +2   Qwen3 writes the block for a post-query turn
-                                    only when it is LAST or carries reasoning
-
-The last two were found by this harness rather than by reading, and neither
-could have come from upstream: `dev-sslee` has no Qwen3-Coder row at all, so
-its arm never rendered a Coder tool response, and its own measurement reports
-qwen3_5 at 26/26 through a registry the live server does not reach.
-
-The flag reaches the server now: `chat.assistant` and `chat.assistant-call`
-both carry `after-query` and `is-last`, so the serving path renders what this
-measures. It did not until task #28 landed, and a green matrix said nothing
-about the server until then -- `render-tokens` links the renderer directly.
-
-## What 90/90 does NOT say
-
-The cells are the ones written here, and a shape nobody wrote is a shape
-nobody checks -- `reasoning_mid_loop` passed the moment it was added, but the
-branch it covers was unmeasured until then, and `plain_assistant_after_query`
-FAILED when added and cost a `is_last` fact to fix. Known-unmeasured today:
-
-  * multimodal turns. Qwen3.6 carries a vision tower and its template has
-    image/video content parts; every shape here is text.
-  * `preserve_thinking`, the template's other route to a reasoning header.
-  * non-ASCII content. `python_json` mirrors `json.dumps`, which escapes
-    non-ASCII by default; that path is noted as unhandled until parity says
-    otherwise, and no shape here has a non-ASCII character to say it with.
-  * a user turn whose content is itself wrapped in `<tool_response>`, which is
-    the `multi_step_tool` guard the last-query walk carries.
-  * conversations long enough to cross whatever the serving layer truncates at.
+Getting there needed two changes, and only the first was visible in a diff: the
+heading, and then the list rendering. Setting the heading alone left both Coder
+arms at 10/30 -- it moved the divergence rather than removing it.
 
 ## One deliberate divergence the harness accounts for
 
@@ -153,12 +107,8 @@ HUB = os.path.expanduser("~/.cache/huggingface/hub")
 ARMS = [
     ("qwen3", "models--mlx-community--Qwen3-8B-4bit",
      "mlx-community--Qwen3-8B-4bit"),
-    # EXPECTED to diverge. pie tracks Qwen's published Coder template, and the
-    # mlx conversion ships a different one -- see `qwen3_coder_upstream`. The
-    # arm stays so the size and shape of that divergence is visible rather than
-    # forgotten, but it does not fail the run.
     ("qwen3_coder", "models--mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit",
-     "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit", "expected"),
+     "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit"),
     ("qwen3_5", "models--mlx-community--Qwen3.6-35B-A3B-4bit",
      "mlx-community--Qwen3.6-35B-A3B-4bit"),
     # Qwen's OWN repos, because the served checkpoint's template is not always
@@ -169,8 +119,10 @@ ARMS = [
     # the two, and both tokenizers encode identically, so only Coder is really
     # a second reference -- but the arm is here for both, because "which
     # template" is a question this harness should answer rather than assume.
+    # Same renderer, the other variant: pie supports both, so the harness
+    # proves both rather than picking a winner.
     ("qwen3_coder_upstream", "models--Qwen--Qwen3-Coder-30B-A3B-Instruct",
-     "Qwen--Qwen3-Coder-30B-A3B-Instruct"),
+     "Qwen--Qwen3-Coder-30B-A3B-Instruct", "qwen"),
     ("qwen3_5_upstream", "models--Qwen--Qwen3.6-35B-A3B",
      "Qwen--Qwen3.6-35B-A3B"),
 ]
@@ -335,6 +287,7 @@ def main():
 
     for arm, cache_dir, deploy_name, *rest in arms:
         expected = bool(rest and rest[0] == "expected")
+        coder_schema = rest[0] if rest and rest[0] == "qwen" else "shipped"
         snaps = glob.glob(f"{HUB}/{cache_dir}/snapshots/*/")
         if not snaps:
             rows.append((arm, None, f"not in the HF cache ({cache_dir})", expected))
@@ -365,7 +318,8 @@ def main():
                                                  delete=False) as fh:
                     json.dump(body, fh)
                     req = fh.name
-                env = dict(os.environ, PARITY_MODEL_NAME=deploy_name)
+                env = dict(os.environ, PARITY_MODEL_NAME=deploy_name,
+                           PARITY_CODER_SCHEMA=coder_schema)
                 proc = subprocess.run([a.bin, str(tokenizer_json), req],
                                       capture_output=True, text=True, env=env)
                 os.unlink(req)

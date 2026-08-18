@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, bail};
 use pie_model_common::instruct::Instruct;
-use pie_model_qwen_3::chat::{ChatMLConfig, QwenInstruct, ToolDialect};
+use pie_model_qwen_3::chat::{ChatMLConfig, CoderSchema, QwenInstruct, ToolDialect};
 use pie_openai_serving::render::{RenderOp, plan_render};
 use pie_openai_serving::types::ChatCompletionRequest;
 use pie_tokenizer::Tokenizer;
@@ -91,6 +91,14 @@ fn main() -> Result<()> {
                 ""
             },
             tool_response_trailing_newline: matches!(tool_dialect, ToolDialect::Coder),
+            // The harness picks per arm, which is exactly the operator choice
+            // the field models: PARITY_CODER_SCHEMA=qwen renders Qwen's
+            // published variant, anything else the shipped one.
+            coder_schema: if std::env::var("PARITY_CODER_SCHEMA").as_deref() == Ok("qwen") {
+                CoderSchema::QwenMain
+            } else {
+                CoderSchema::Shipped
+            },
             thinking_off_suffix: "<think>\n\n</think>\n\n",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },

@@ -53,6 +53,37 @@ pub enum ToolDialect {
     Qwen35Xml,
 }
 
+/// Which Qwen3-Coder tools-turn rendering a checkpoint carries.
+///
+/// Qwen revised this template, and the redistributions people actually serve
+/// predate the revision. Two files, both live today:
+///
+/// ```text
+///   Shipped   mlx-community/…-4bit  6722 bytes  sha 672e747c…
+///             unsloth/…-GGUF        same variant, embedded in the GGUF
+///             no `# Tools` heading; `render_item_list` writes [`a`]
+///
+///   QwenMain  Qwen/Qwen3-Coder-…    6211 bytes  sha 5a38bfa0…
+///             `# Tools` heading; generic `render_extra_keys` writes ["a"]
+/// ```
+///
+/// The heading and the list style co-vary, so one choice covers both.
+///
+/// Neither is "the" template, which is the whole point of it being a field:
+/// the right answer is a property of the checkpoint in hand, and pie does not
+/// import the file that would settle it. Until it does, this is an operator's
+/// choice with a default that matches what is actually distributed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CoderSchema {
+    /// What mlx-community and unsloth ship. The default, because it is what
+    /// every redistributed checkpoint on this machine carries, and because a
+    /// three-way benchmark where one engine sends a different prompt is not
+    /// measuring engines.
+    Shipped,
+    /// Qwen's currently-published file.
+    QwenMain,
+}
+
 impl ToolDialect {
     /// Does a *call* go out (and come back) as nested XML?
     ///
@@ -160,6 +191,9 @@ pub struct ChatMLConfig {
     /// positional diff ran the Coder arm. Upstream cannot have seen this: its
     /// registry has no Qwen3-Coder row at all.
     pub tool_response_trailing_newline: bool,
+    /// Which Qwen3-Coder template variant to render. Ignored by every dialect
+    /// but [`ToolDialect::Coder`].
+    pub coder_schema: CoderSchema,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
 }
@@ -462,6 +496,27 @@ impl QwenInstruct {
         prompt
     }
 
+    /// `render_item_list` from the Coder template: `[`a`, `b`]` for strings,
+    /// bare for anything else, wrapped in a tag, and emitted only when the list
+    /// is present and non-empty.
+    fn coder_item_list(out: &mut String, list: Option<&serde_json::Value>, tag: &str) {
+        let Some(items) = list.and_then(|v| v.as_array()) else { return };
+        if items.is_empty() {
+            return;
+        }
+        out.push_str(&format!("\n<{tag}>["));
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            match item.as_str() {
+                Some(s) => out.push_str(&format!("`{s}`")),
+                None => out.push_str(&item.to_string()),
+            }
+        }
+        out.push_str(&format!("]</{tag}>"));
+    }
+
     /// `render_extra_keys` from Qwen's Coder template, verbatim in behaviour:
     /// every key not already handled becomes `<key>value</key>`, with mappings
     /// and non-string sequences serialised as JSON and everything else as its
@@ -512,9 +567,13 @@ impl QwenInstruct {
     /// parity matrix is the arm this serves, and the `qwen3_coder` arm — the
     /// mlx conversion — necessarily drops by the same three tokens. The two
     /// templates cannot both be matched.
-    fn build_tool_system_prompt_coder(tools: &[String]) -> String {
-        let mut out =
-            String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    fn build_tool_system_prompt_coder(tools: &[String], schema: CoderSchema) -> String {
+        let qwen = schema == CoderSchema::QwenMain;
+        let mut out = String::from(if qwen {
+            "# Tools\n\nYou have access to the following functions:\n\n<tools>"
+        } else {
+            "You have access to the following functions:\n\n<tools>"
+        });
         for tool in tools {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(tool) else { continue };
             // Accept either the bare function object or the OpenAI envelope.
@@ -537,21 +596,43 @@ impl QwenInstruct {
                     if let Some(d) = pf.get("description").and_then(|x| x.as_str()) {
                         out.push_str(&format!("\n<description>{}</description>", d.trim()));
                     }
-                    // handled_keys = ['name', 'type', 'description']; enum and
-                    // required are NOT special-cased -- that is the mlx
-                    // conversion's `render_item_list`, and it renders
-                    // `[`a`]` where Qwen renders `["a"]`.
-                    Self::coder_extra_keys(&mut out, Some(pf), &["name", "type", "description"]);
+                    if qwen {
+                        // handled_keys = ['name', 'type', 'description']
+                        Self::coder_extra_keys(&mut out, Some(pf), &["name", "type", "description"]);
+                    } else {
+                        Self::coder_item_list(&mut out, pf.get("enum"), "enum");
+                        Self::coder_extra_keys(
+                            &mut out,
+                            Some(pf),
+                            &["name", "type", "description", "enum", "required"],
+                        );
+                        Self::coder_item_list(&mut out, pf.get("required"), "required");
+                    }
                     out.push_str("\n</parameter>");
                 }
             }
-            // handled_keys = ['type', 'properties']
-            Self::coder_extra_keys(&mut out, params, &["type", "properties"]);
+            if qwen {
+                // handled_keys = ['type', 'properties']
+                Self::coder_extra_keys(&mut out, params, &["type", "properties"]);
+            } else {
+                Self::coder_item_list(&mut out, params.and_then(|p| p.get("required")), "required");
+            }
             out.push_str("\n</parameters>");
-            // handled_keys = ['type', 'name', 'description', 'parameters'] --
-            // `return` falls out of this rather than being named, which is how
-            // the template treats it.
-            Self::coder_extra_keys(&mut out, Some(f), &["type", "name", "description", "parameters"]);
+            if qwen {
+                // handled_keys = ['type', 'name', 'description', 'parameters']
+                Self::coder_extra_keys(
+                    &mut out,
+                    Some(f),
+                    &["type", "name", "description", "parameters"],
+                );
+            } else if let Some(r) = f.get("return") {
+                let body = if r.is_object() || r.is_array() {
+                    r.to_string()
+                } else {
+                    r.as_str().map(str::to_string).unwrap_or_else(|| r.to_string())
+                };
+                out.push_str(&format!("\n<return>{body}</return>"));
+            }
             out.push_str("\n</function>");
         }
         out.push_str("\n</tools>");
@@ -701,7 +782,9 @@ impl Instruct for QwenInstruct {
         // and XML calls like Coder.
         let coder = self.config.tool_dialect == ToolDialect::Coder;
         let tools_block = match self.config.tool_dialect {
-            ToolDialect::Coder => Self::build_tool_system_prompt_coder(tools),
+            ToolDialect::Coder => {
+                Self::build_tool_system_prompt_coder(tools, self.config.coder_schema)
+            }
             ToolDialect::Qwen35Xml => Self::build_tool_system_prompt_qwen35(tools),
             ToolDialect::Hermes => Self::build_tool_system_prompt(tools),
         };
@@ -1208,6 +1291,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -1225,6 +1309,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -1242,6 +1327,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>"],
             },
         )
@@ -1377,7 +1463,7 @@ mod tests {
 
         // The three dialects render three different tools turns.
         let hermes = QwenInstruct::build_tool_system_prompt(&[schema.clone()]);
-        let coder = QwenInstruct::build_tool_system_prompt_coder(&[schema]);
+        let coder = QwenInstruct::build_tool_system_prompt_coder(&[schema], CoderSchema::Shipped);
         assert_ne!(block, hermes, "Qwen3.5 collapsed into the Hermes preamble");
         assert_ne!(block, coder, "Qwen3.5 collapsed into the Coder preamble");
     }
@@ -1603,17 +1689,21 @@ mod tests {
             "properties":{"tz":{"type":"string","description":"zone"}},
             "required":["tz"]}}}"#
             .to_string();
-        let p = QwenInstruct::build_tool_system_prompt_coder(&[schema]);
-        // Qwen's published template, not the mlx conversion's: the heading is
-        // present, and `required` goes through the generic key passthrough as
-        // JSON rather than the conversion's backtick list. Both were asserted
-        // the other way here until pie switched authority to the model author's
-        // file; `qwen3_coder_upstream` in the parity matrix is the arm this
-        // serves.
-        assert!(p.starts_with("# Tools\n\nYou have access to the following functions:\n\n<tools>"));
+        // BOTH variants, because pie renders both and the two live templates
+        // disagree: the shipped one (mlx-community, unsloth) writes no heading
+        // and backtick lists, Qwen's published one writes `# Tools` and JSON.
+        let p = QwenInstruct::build_tool_system_prompt_coder(&[schema.clone()], CoderSchema::Shipped);
+        assert!(p.starts_with("You have access to the following functions:\n\n<tools>"));
+        assert!(!p.contains("# Tools"), "the shipped variant has no heading");
+        assert!(p.contains("<required>[`tz`]</required>"), "shipped writes backtick lists");
+
+        let q = QwenInstruct::build_tool_system_prompt_coder(&[schema], CoderSchema::QwenMain);
+        assert!(q.starts_with("# Tools\n\nYou have access to the following functions:\n\n<tools>"));
+        assert!(q.contains(r#"<required>["tz"]</required>"#), "Qwen writes JSON lists");
+
+        let p = q;
         assert!(p.contains("<function>\n<name>get_time</name>"));
         assert!(p.contains("<parameter>\n<name>tz</name>\n<type>string</type>"));
-        assert!(p.contains(r#"<required>["tz"]</required>"#));
         // The instruction the model needs in order to emit what we parse.
         assert!(p.contains("<tool_call>\n<function=example_function_name>"));
         assert!(p.contains("must be nested within <tool_call></tool_call> XML tags"));
@@ -1718,6 +1808,7 @@ mod tests {
                 generation_suffix: "",
                 thinking_off_suffix: "<think>\n\n</think>\n\n",
                 tool_response_trailing_newline: false,
+                coder_schema: CoderSchema::Shipped,
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         );
