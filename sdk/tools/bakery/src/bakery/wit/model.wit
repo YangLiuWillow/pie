@@ -52,6 +52,32 @@ interface model {
     // Tokens per KV page for the bound model/driver.
     kv-page-size: func() -> u32;
 
+    // Live occupancy of the KV page pool.
+    //
+    // A guest that retains state across turns is managing residency, and until
+    // this existed it had to do so BLIND: `kv-page-size` said how big a page
+    // was and nothing said how many there were, so the only party who could
+    // size a retention budget was the launcher, which had read the driver
+    // config. That budget was a guess fixed before the run, and it is the
+    // wrong shape twice over — too generous and a long turn starves the pool
+    // it is competing with, too mean and the guest throws away reuse it could
+    // have had.
+    //
+    // Read together so the two numbers cannot disagree: a guest comparing a
+    // `used` from one call against a `total` from another would act on a ratio
+    // that never held.
+    record kv-pool {
+        // Pages the pool holds. Note this is CLAMPED to the context ring
+        // (`min(total_pages, ceil(max_model_len / kv_page_size))`), so on a
+        // deployment whose ceiling equals its pool it is exactly one
+        // max-length sequence — every retained page is one the live turn
+        // cannot have.
+        total-pages: u32,
+        // Pages neither held by a live working set nor awaiting recycle.
+        available-pages: u32,
+    }
+    kv-pool-status: func() -> kv-pool;
+
     // Waves per frame (k) for this deployment — a static constant fixed at
     // engine start, exactly like kv-page-size. `forward.submit` takes exactly
     // this many ordered slots; slot i executes in wave i. Guests must be

@@ -42,7 +42,7 @@ use crate::engine::{self, GenConfig, SessionState};
 use crate::turn::TurnState;
 use crate::wire::{Envelope, Sink, recover_req_id, send_error};
 
-use inferlet::ptir::attention::prelude::kv_page_size;
+use inferlet::ptir::attention::prelude::{kv_page_size, kv_pool_status};
 use inferlet::{chat, model, runtime, tools};
 use pie_openai_serving::error::{INVALID_REQUEST_ERROR, SERVER_ERROR, parse_request};
 use pie_openai_serving::streaming::ChunkMeta;
@@ -233,6 +233,15 @@ impl Daemon {
         // against a turn that runs for a second.
         let t_entry = std::time::Instant::now();
         let sink = Sink::new(req_id);
+
+        // Give the pool back before asking it for anything. Eviction that runs
+        // only after a turn retains cannot rescue a turn that is already
+        // starving, and starving is exactly the state a long retained branch
+        // leaves the pool in: `KV pool starved: N pages asked, 0 free of 2048`
+        // arrives at PREFILL, so the turn dies before reaching any code that
+        // would have freed a page. Running it here is what makes the hard tier
+        // reachable at all.
+        self.enforce_retention(true);
 
         let body = match serde_json::to_vec(&env.body) {
             Ok(b) => b,
@@ -584,6 +593,72 @@ impl Daemon {
     /// Returns a log fragment. A turn that errored mid-generation is not
     /// retained: the delta prefill may have stopped part-way, so the length
     /// recorded here would over-claim.
+    /// Drop retained branches until the KV pool is back under its watermarks.
+    ///
+    /// The bound that matters is LIVE POOL OCCUPANCY, not a token budget fixed
+    /// before the run. `retain_tokens` stays as a ceiling, but it is no longer
+    /// the thing being defended, because it never could be: the launcher picks
+    /// it from the driver config without knowing how long a turn will get, and
+    /// the pool here is CLAMPED to the context ring, so the worst-case live
+    /// turn wants the whole pool alone. A budget leaving room for that reuses
+    /// nothing; one that does not starves the turn it meant to accelerate.
+    /// Both were measured on this workload before this existed.
+    ///
+    /// Two tiers, after `task/89207-host-retention`'s `enforce-retention`:
+    ///
+    /// - **evict**: drop idle branches oldest-first, but keep the newest — it
+    ///   is the one the next turn resumes, so dropping it trades a possible
+    ///   rebuild for a certain one.
+    /// - **hard**: drop even the newest. Losing reuse is a slowdown; holding
+    ///   the pool is an OUTAGE. A single long conversation is easily larger
+    ///   than the evict tier all by itself, and a guest that always spares the
+    ///   last branch pins the pool at zero free forever — every later request,
+    ///   including brand-new conversations, then dies at
+    ///   `KV pool starved: N pages asked, 0 free`, with no path back because
+    ///   the turn that would have evicted never gets to run. Measured exactly
+    ///   that way: a 57k-token conversation wedged the pool permanently.
+    ///
+    /// `preflight` runs this BEFORE a turn prefills rather than after it
+    /// retains. Eviction that only runs on the success path cannot rescue a
+    /// turn that is already starving, which is the case that matters.
+    fn enforce_retention(&mut self, preflight: bool) {
+        const EVICT_PERCENT: u32 = 70;
+        const HARD_PERCENT: u32 = 85;
+        let when = if preflight { "preflight" } else { "retain" };
+        loop {
+            let (available, total) = kv_pool_status();
+            if total == 0 {
+                return;
+            }
+            let used = total.saturating_sub(available);
+            let pct = (used as u64 * 100 / total as u64) as u32;
+            let held: u32 = self.sessions.iter().map(Retained::tip).sum();
+            let over_hard = pct > HARD_PERCENT;
+            let over_evict = pct > EVICT_PERCENT
+                || held > self.retain_tokens
+                || self.sessions.len() > MAX_RETAINED;
+            if self.sessions.is_empty() || (!over_evict && !over_hard) {
+                return;
+            }
+            // The newest is spared UNTIL the hard tier; past it nothing is.
+            if self.sessions.len() <= 1 && !over_hard {
+                return;
+            }
+            let dropped = self.sessions.remove(0);
+            // ONE string, ONE placeholder. A multi-fragment `eprintln!` is
+            // split by the runtime's stderr capture into a client message per
+            // fragment, which arrives at the shim as `: evicted a branch (`
+            // and nothing else — the same trap the turn line above documents.
+            let line = format!(
+                "[opencode-session] {when}: evicted a branch ({} tokens); pool \
+                 {used}/{total} pages ({pct}%), {} branch(es) left\n",
+                dropped.tip(),
+                self.sessions.len()
+            );
+            eprint!("{line}");
+        }
+    }
+
     fn retain_turn(
         &mut self,
         run: engine::Generation,
@@ -617,34 +692,7 @@ impl Daemon {
         }
         self.sessions.push(candidate);
 
-        // Evict oldest-first until BOTH bounds hold. The token budget is the
-        // one that matters; the count is a backstop for pathological cases
-        // (very many tiny branches). Dropping a `Retained` releases its KV
-        // pages and, on a hybrid model, its folded recurrent state.
-        //
-        // The newest branch is never evicted even if it alone exceeds the
-        // budget: it is the one the next turn will resume, and dropping it
-        // would guarantee a rebuild every turn rather than risk one.
-        loop {
-            let held: u32 = self.sessions.iter().map(Retained::tip).sum();
-            let over = held > self.retain_tokens || self.sessions.len() > MAX_RETAINED;
-            if !over || self.sessions.len() <= 1 {
-                if over {
-                    eprintln!(
-                        "[opencode-session] retained {held} tokens in 1 branch, over the \
-                         {} budget — raise retain_tokens or lower the context",
-                        self.retain_tokens
-                    );
-                }
-                break;
-            }
-            let dropped = self.sessions.remove(0);
-            eprintln!(
-                "[opencode-session] evicted a branch ({} tokens); {held} held over a {} budget",
-                dropped.tip(),
-                self.retain_tokens
-            );
-        }
+        self.enforce_retention(false);
         format!("retained {} (len {total})", &address[..16])
     }
 

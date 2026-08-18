@@ -45,6 +45,15 @@ interface tools {
     /// Detects tool calls in generated tokens.
     resource decoder {
         constructor();
+        /// The same decoder, told which tools this request offered.
+        ///
+        /// Additive rather than a change to `constructor`, which every existing
+        /// guest calls. Only one dialect needs it: Qwen3-Coder spells a call as
+        /// XML, and XML carries no types, so the schema is the only thing that
+        /// can say whether `30` is the number 30 or the string "30". A decoder
+        /// built by the bare constructor still reports every call — it types
+        /// each argument as a string.
+        with-tools: static func(tools: list<string>) -> decoder;
         feed: func(tokens: list<u32>) -> result<event, error>;
         reset: func();
     }

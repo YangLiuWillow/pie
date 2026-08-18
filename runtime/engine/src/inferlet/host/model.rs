@@ -7,6 +7,7 @@ use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
 use crate::model;
+use crate::store::registry as store_registry;
 
 impl pie::inferlet::model::Host for ProcessCtx {
     async fn name(&mut self) -> Result<String> {
@@ -50,6 +51,30 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn kv_page_size(&mut self) -> Result<u32> {
         Ok(model::model().kv_page_size())
+    }
+
+    /// Live KV pool occupancy, so a guest that retains state across turns can
+    /// size that retention against the pool it is competing with instead of
+    /// against a number the launcher guessed before the run.
+    ///
+    /// Both fields are read under ONE lock. Two separate calls would let a
+    /// guest compare a `used` from one moment against a `total` from another
+    /// and act on a ratio that never held.
+    async fn kv_pool_status(&mut self) -> Result<pie::inferlet::model::KvPool> {
+        // Single-model runtime: the one model (index 0), driver 0 — the same
+        // binding `working-set.new` uses.
+        let stores = store_registry::get(0, 0);
+        let (total_pages, available_pages) =
+            store_registry::with_kv_lock(&stores.kv, "host-kv-pool-status", |kv| {
+                (kv.capacity_pages(), kv.available_pages())
+            });
+        Ok(pie::inferlet::model::KvPool {
+            total_pages,
+            // `available_pages` counts pages, and a pool that large would need
+            // more memory than any device has; the cast cannot lose a page in
+            // practice, and saturating says so rather than wrapping if it did.
+            available_pages: u32::try_from(available_pages).unwrap_or(u32::MAX),
+        })
     }
 
     /// Waves per frame (k) — the static deployment constant `forward.submit`

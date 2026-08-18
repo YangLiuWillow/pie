@@ -1404,6 +1404,21 @@ pub fn kv_page_size() -> u32 {
     PAGE.with(|c| *c.get_or_init(crate::model::kv_page_size))
 }
 
+/// Live KV pool occupancy: `(available_pages, total_pages)`.
+///
+/// NOT cached, unlike [`kv_page_size`] — the whole point is that it changes.
+/// Call it at the moment a retention decision is made, not once at startup.
+///
+/// `total_pages` is clamped to the context ring on this deployment, so where
+/// the context ceiling equals the pool the whole pool is one max-length
+/// sequence and every retained page is one the live turn cannot have. A guest
+/// retaining state across turns should evict against THIS rather than against
+/// a budget fixed before the run.
+pub fn kv_pool_status() -> (u32, u32) {
+    let p = crate::model::kv_pool_status();
+    (p.available_pages, p.total_pages)
+}
+
 /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
 /// budget (cached). Split a prompt of L tokens into `ceil(L / C)` chunks, or
 /// let [`prefill_chunks`] do it, which is what you want.
@@ -1697,7 +1712,8 @@ impl Default for Pipeline {
 pub mod shared_prelude {
     pub use super::{
         Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, channel_capacity, frame_size, kv_page_size, live_slots, max_embed_length,
+        WorkingSet, channel_capacity, frame_size, kv_page_size, kv_pool_status, live_slots,
+        max_embed_length,
         pad_tokens, prefill_chunks, unpad_tokens,
     };
     /// Every inferlet returns `inferlet::Result` from `#[inferlet::main]` and
