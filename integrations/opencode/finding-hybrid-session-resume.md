@@ -202,3 +202,69 @@ refuse a **zero fold length it is going to ignore** just as loudly, rather than
 validating the shape and folding anyway. That one-line refusal in
 `compose.cpp` would have failed the very first buffered fire instead of the
 next turn's resume.
+
+---
+
+# Open: the inferlet is killed at ~53.5k tokens of context — 2026-08-18
+
+Separate from everything above, and NOT caused by session resume or by the
+retention policy.
+
+## Signature
+
+```text
+[opencode-session] turn 206 cached=53221 delta=219 cue=7 gen=74 retained ... (len 53440)
+[session-shim] inferlet terminal event error: 'WebSocket connection closed'
+[session-shim] reconnect attempt failed: ConnectionError('WebSocket connection closed')
+[session-shim] session inferlet up: opencode-session@0.1.0 process=<new>
+```
+
+The guest process dies. The ENGINE keeps running and logs no reason —
+`grep -iE "warn|error|kill|fatal|starv|abort|panic"` over the engine log for
+that window returns only the unrelated boot-time rs-slot capping warning. The
+shim reconnects and the run CONTINUES, having silently lost every retained
+branch, so the event is invisible in the timing columns, in the patch count,
+and in the degraded-turn count. `tools/pie_watchdog.sh` keys on the shim's
+`terminal event error` for exactly that reason.
+
+## What it is not
+
+| hypothesis | test | result |
+|---|---|---|
+| retained branch riding at 82% of the pool | refuse to retain over budget | **still crashes** — the refusal fires, the kill follows three lines later |
+| KV pool starvation | that failure has its own explicit message | different signature, and the pool had room |
+| session resume | reuse was working right up to it (`cached=53221`, delta 219) | unrelated |
+
+The refusal experiment is decisive: a conversation that large has its pages
+resident DURING the turn whether or not the branch is retained afterwards, so
+retention was never the pressure. That change was reverted.
+
+## What it is
+
+Size, and reproducibly close: **53,440** and **53,562** tokens on two separate
+runs. It very likely also covers the `pie_metal_register_program failed with
+status -5` failures left unexplained earlier — every one landed at a 45k–54k
+prefill, and `abi.cpp` discards the reason in `catch (...)`, so a large-context
+fault there would present exactly as an opaque `DRIVER_ERROR`.
+
+Nothing about it is specific to strategy B; strategy A drives the same prefill
+sizes and should reach it too. That is untested.
+
+## Why it matters for the four-way
+
+An instance whose context passes ~53.5k loses its session mid-run. The harness
+does not fail — opencode keeps going against a fresh process — so the arm
+reports a normal instance with a worse patch. Any pie accuracy number carries
+that, and the honest thing is to report the crash count beside it.
+
+## Next
+
+1. Surface the swallowed reason: `abi.cpp` wraps `register_program` in
+   `catch (...)` and returns `PIE_STATUS_DRIVER_ERROR`, discarding `what()`.
+   That is the one piece of evidence that would settle whether the -5s and this
+   kill are the same fault.
+2. Bisect the threshold with a synthetic single-conversation ramp — it is
+   cheap, needs no agent, and 53.4k/53.6k suggests a hard edge rather than
+   pressure.
+3. Check strategy A at the same context size, to confirm this is not a
+   session-inferlet bug.
