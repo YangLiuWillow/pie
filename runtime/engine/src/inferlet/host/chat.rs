@@ -42,12 +42,12 @@ impl pie::inferlet::chat::Host for ProcessCtx {
         Ok(crate::model::model().instruct().assistant(&message))
     }
 
-    async fn cue(&mut self) -> Result<Vec<u32>> {
-        Ok(crate::model::model().instruct().cue())
-    }
-
-    async fn cue_no_think(&mut self) -> Result<Vec<u32>> {
-        Ok(crate::model::model().instruct().cue_no_think())
+    /// The template's `enable_thinking`, applied here rather than chosen by
+    /// which function the guest called.
+    async fn cue(&mut self, thinking: bool) -> Result<Vec<u32>> {
+        let model = crate::model::model();
+        let instruct = model.instruct();
+        Ok(if thinking { instruct.cue() } else { instruct.cue_no_think() })
     }
 
     async fn seal(&mut self) -> Result<Vec<u32>> {

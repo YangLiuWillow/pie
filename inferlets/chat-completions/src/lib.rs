@@ -100,7 +100,7 @@ fn reject(status: u16, error_type: &str, message: &str) -> inferlet::Result<Stri
 
 /// Map one engine-free render op onto the WIT template surface.
 ///
-/// `Cue` renders through `chat::cue_no_think` — decision D1: this milestone
+/// `Cue` renders through `chat::cue(thinking)` — decision D1: this milestone
 /// always serves the no-think channel (matches the token-exact parity
 /// verdict against HF `enable_thinking=False`); a thinking channel would
 /// branch here on `req.no_think()` and route reasoning to
@@ -131,7 +131,7 @@ fn render_one(op: &RenderOp, out: &mut Vec<u32>) -> Result<(), String> {
             out.extend(tools::assistant_with_tool_calls(content.as_deref(), &wit_calls));
         }
         RenderOp::AnswerBatch(batch) => out.extend(tools::answer_batch(batch)),
-        RenderOp::Cue => out.extend(chat::cue_no_think()),
+        RenderOp::Cue(thinking) => out.extend(chat::cue(*thinking)),
     }
     Ok(())
 }
@@ -205,7 +205,7 @@ fn build_prompt(
     // Split the plan at its trailing `Cue`: the history is what gets addressed,
     // the cue is generation scaffolding and must not be.
     let (history_ops, cue_ops) = match ops.split_last() {
-        Some((RenderOp::Cue, head)) => (head, &ops[ops.len() - 1..]),
+        Some((RenderOp::Cue(_), head)) => (head, &ops[ops.len() - 1..]),
         _ => return Err(BuildError::Fault("render plan did not end with a cue".into())),
     };
     let (mut tokens, boundaries) = render_history(history_ops).map_err(BuildError::Fault)?;

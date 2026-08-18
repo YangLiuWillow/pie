@@ -17,13 +17,19 @@ interface chat {
     system-user: func(system: string, user: string) -> list<u32>;
     assistant: func(message: string) -> list<u32>;
 
-    /// Cue the model to generate (fills generation header)
-    cue: func() -> list<u32>;
-
-    /// The generation cue with the thinking channel explicitly closed
-    /// (the enable-thinking=false form; same as `cue` for models without
-    /// a thinking channel)
-    cue-no-think: func() -> list<u32>;
+    /// Cue the model to generate (fills generation header).
+    ///
+    /// `thinking` is the template's `enable_thinking`. It is a PARAMETER and
+    /// not a second function on purpose: this was `cue` plus `cue-no-think`,
+    /// which reified one template branch as API surface and then did not
+    /// generalise -- when the same distinction was needed for a REPLAYED
+    /// assistant turn there was nothing to reach for, and the turn silently
+    /// lost its reasoning block. vLLM, mlx-lm and llama.cpp all pass
+    /// `enable_thinking` as data into one render path; so does this now.
+    ///
+    /// For a model with no thinking channel both values render the same
+    /// bytes.
+    cue: func(thinking: bool) -> list<u32>;
 
     /// Seal the current turn (insert stop token)
     seal: func() -> list<u32>;

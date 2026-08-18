@@ -12,6 +12,6 @@
 //! surfaced as-is rather than remapped, so the caller decides.
 
 pub use crate::pie::inferlet::chat::{
-    Decoder, Event, assistant, cue, cue_no_think, first_user, seal, stop_tokens, system,
+    Decoder, Event, assistant, cue, first_user, seal, stop_tokens, system,
     system_user, user,
 };

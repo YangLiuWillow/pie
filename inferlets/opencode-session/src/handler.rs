@@ -671,7 +671,7 @@ impl Daemon {
 
 /// Map the engine-free render plan 1:1 onto the WIT template surface.
 ///
-/// `Cue` renders through `chat::cue_no_think` — this milestone always serves the
+/// `Cue` renders through `chat::cue(thinking)` — the mode travels on the op,
 /// no-think channel, matching the token-exact parity verdict against HF
 /// `enable_thinking=False`, and matching Strategy A so the A/B compares servers
 /// rather than renderers.
@@ -744,7 +744,7 @@ fn render_ops(ops: &[RenderOp]) -> Result<Vec<u32>, String> {
 
 /// Map one engine-free render op onto the WIT template surface.
 ///
-/// `Cue` renders through `chat::cue_no_think` — this milestone always serves the
+/// `Cue` renders through `chat::cue(thinking)` — the mode travels on the op,
 /// no-think channel, matching the token-exact parity verdict against HF
 /// `enable_thinking=False`, and matching Strategy A so the A/B compares servers
 /// rather than renderers.
@@ -774,7 +774,7 @@ fn render_one(op: &RenderOp, out: &mut Vec<u32>) -> Result<(), String> {
             out.extend(tools::assistant_with_tool_calls(content.as_deref(), &wit_calls));
         }
         RenderOp::AnswerBatch(batch) => out.extend(tools::answer_batch(batch)),
-        RenderOp::Cue => out.extend(chat::cue_no_think()),
+        RenderOp::Cue(thinking) => out.extend(chat::cue(*thinking)),
     }
     Ok(())
 }

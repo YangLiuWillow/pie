@@ -68,6 +68,30 @@ impl ChatCompletionRequest {
         self.stream_options.include_usage
     }
 
+    /// Did the caller explicitly ask for the thinking channel?
+    ///
+    /// Absent is treated as NO, which is not what the templates do — their
+    /// `enable_thinking` defaults to true — and is deliberate for now:
+    ///
+    ///   * every guest hardcoded the no-think cue until this change, so
+    ///     defaulting to thinking would silently flip the rendering of every
+    ///     existing client (opencode never sends the field at all); and
+    ///   * `generation_suffix` is still `""` for Qwen3.5/3.6, so the
+    ///     thinking-on cue currently renders a bare assistant header where the
+    ///     template renders `<think>\n`. Defaulting to thinking would default
+    ///     to the wrong cue. All 13 thinking cells of the parity matrix fail
+    ///     on exactly that.
+    ///
+    /// Flipping the default to match the templates is a separate, deliberate
+    /// change, and it is gated on that field being right.
+    pub fn thinking_requested(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|v| v.get("enable_thinking"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
     /// `chat_template_kwargs.enable_thinking == false` → render the
     /// no-think channel (`/no_think` per user turn, H17 discipline).
     pub fn no_think(&self) -> bool {

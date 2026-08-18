@@ -54,7 +54,12 @@ pub enum RenderOp {
     /// rendered names into results at all).
     AnswerBatch(Vec<(String, String)>),
     /// Generation cue (assistant header) — always last.
-    Cue,
+    ///
+    /// Carries the template's `enable_thinking`, read from the request's
+    /// `chat_template_kwargs`. It used to be a unit variant because the guest
+    /// picked between two WIT functions; the choice is data now, so it travels
+    /// with the op like every other rendering decision.
+    Cue(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +86,15 @@ impl std::error::Error for RenderError {}
 
 /// Plan the full conversation render for a request.
 pub fn plan_render(req: &ChatCompletionRequest) -> Result<Vec<RenderOp>, RenderError> {
-    plan_render_messages(&req.messages, tool_schema_envelopes(&req.tools))
+    // The knob vLLM, mlx-lm and llama.cpp all honour was parsed here and
+    // discarded, because every guest hardcoded the no-think cue. This is where
+    // it starts mattering — conservatively: absent means no-think, which is
+    // what pie rendered before. See `thinking_requested`.
+    plan_render_messages_with(
+        &req.messages,
+        tool_schema_envelopes(&req.tools),
+        req.thinking_requested(),
+    )
 }
 
 /// Plan from an explicit message slice + pre-built schema envelopes (the
@@ -95,7 +108,16 @@ pub fn plan_render_messages(
     messages: &[ChatMessage],
     tool_schemas: Vec<String>,
 ) -> Result<Vec<RenderOp>, RenderError> {
-    plan_from(messages, tool_schemas, std::collections::HashMap::new())
+    plan_render_messages_with(messages, tool_schemas, false)
+}
+
+/// [`plan_render_messages`] with the template's `enable_thinking` stated.
+pub fn plan_render_messages_with(
+    messages: &[ChatMessage],
+    tool_schemas: Vec<String>,
+    thinking: bool,
+) -> Result<Vec<RenderOp>, RenderError> {
+    plan_from(messages, tool_schemas, std::collections::HashMap::new(), thinking)
 }
 
 /// Plan the resume suffix `messages[split..]`, with `tool_call_id → name`
@@ -117,6 +139,15 @@ pub fn plan_render_suffix(
     messages: &[ChatMessage],
     split: usize,
 ) -> Result<Vec<RenderOp>, RenderError> {
+    plan_render_suffix_with(messages, split, false)
+}
+
+/// [`plan_render_suffix`] with the template's `enable_thinking` stated.
+pub fn plan_render_suffix_with(
+    messages: &[ChatMessage],
+    split: usize,
+    thinking: bool,
+) -> Result<Vec<RenderOp>, RenderError> {
     let split = split.min(messages.len());
     let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for m in &messages[..split] {
@@ -124,13 +155,14 @@ pub fn plan_render_suffix(
             names.insert(c.id.clone(), c.function.name.clone());
         }
     }
-    plan_from(&messages[split..], Vec::new(), names)
+    plan_from(&messages[split..], Vec::new(), names, thinking)
 }
 
 fn plan_from(
     messages: &[ChatMessage],
     tool_schemas: Vec<String>,
     mut call_names: std::collections::HashMap<String, String>,
+    thinking: bool,
 ) -> Result<Vec<RenderOp>, RenderError> {
     let mut ops = Vec::with_capacity(messages.len() + 2);
     let mut rest = messages;
@@ -222,7 +254,7 @@ fn plan_from(
         }
     }
 
-    ops.push(RenderOp::Cue);
+    ops.push(RenderOp::Cue(thinking));
     Ok(ops)
 }
 
@@ -281,7 +313,7 @@ mod tests {
             RenderOp::AnswerBatch(vec![("grep".into(), "out2".into()),
                                        ("read".into(), "out1".into())])
         );
-        assert_eq!(ops[4], RenderOp::Cue);
+        assert_eq!(ops[4], RenderOp::Cue(false));
     }
 
     #[test]
@@ -307,7 +339,7 @@ mod tests {
             suffix,
             vec![
                 RenderOp::AnswerBatch(vec![("read".into(), "out1".into())]),
-                RenderOp::Cue
+                RenderOp::Cue(false)
             ]
         );
 
@@ -317,7 +349,7 @@ mod tests {
             naive,
             vec![
                 RenderOp::AnswerBatch(vec![("".into(), "out1".into())]),
-                RenderOp::Cue
+                RenderOp::Cue(false)
             ]
         );
 
@@ -335,7 +367,7 @@ mod tests {
         }));
         assert_eq!(
             plan_render(&r).unwrap(),
-            vec![RenderOp::User("hi".into()), RenderOp::Cue]
+            vec![RenderOp::User("hi".into()), RenderOp::Cue(false)]
         );
     }
 
@@ -378,6 +410,30 @@ mod tests {
     /// opens with a reasoning block, so getting it wrong is four tokens per
     /// turn on Qwen3.5/3.6 -- eighty across a twenty-turn agent loop, and
     /// silent.
+    /// The cue carries `enable_thinking` as data, and the request is what
+    /// says so.
+    ///
+    /// `cue`/`cue-no-think` used to be two WIT functions, so the guest picked
+    /// the branch and `chat_template_kwargs` was parsed and thrown away.
+    #[test]
+    fn the_cue_carries_the_requested_thinking_mode() {
+        let msgs = serde_json::json!([{"role": "user", "content": "hi"}]);
+
+        // Absent: no-think, which is what every guest hardcoded before.
+        let r = req(serde_json::json!({"messages": msgs}));
+        assert_eq!(plan_render(&r).unwrap().last(), Some(&RenderOp::Cue(false)));
+
+        // Explicitly off.
+        let r = req(serde_json::json!({
+            "messages": msgs, "chat_template_kwargs": {"enable_thinking": false}}));
+        assert_eq!(plan_render(&r).unwrap().last(), Some(&RenderOp::Cue(false)));
+
+        // Explicitly on — the case that was unreachable.
+        let r = req(serde_json::json!({
+            "messages": msgs, "chat_template_kwargs": {"enable_thinking": true}}));
+        assert_eq!(plan_render(&r).unwrap().last(), Some(&RenderOp::Cue(true)));
+    }
+
     #[test]
     fn reasoning_header_marks_turns_after_the_last_user_query() {
         // user / assistant / user: the assistant PRECEDES the final query.

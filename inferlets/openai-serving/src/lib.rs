@@ -236,7 +236,7 @@ mod fixture_tests {
             }
             other => panic!("op3: {other:?}"),
         }
-        assert_eq!(ops[4], RenderOp::Cue);
+        assert_eq!(ops[4], RenderOp::Cue(false));
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod fixture_tests {
         let ops = plan_render(&req).unwrap();
         assert!(matches!(&ops[0],
             RenderOp::EquipAfterSystem { system: Some(_), tools } if tools.is_empty()));
-        assert_eq!(ops.last(), Some(&RenderOp::Cue));
+        assert_eq!(ops.last(), Some(&RenderOp::Cue(false)));
         // First turn: nothing to resume from.
         assert!(split_resume_point(&req.messages).is_none());
     }
