@@ -23,8 +23,10 @@ guest rounds its KV reservation up to 2048 of 2048 pages
   -> the client sees a bare 1006 and synthesizes "WebSocket connection closed"
 ```
 
-Fixed in `fcb1dc814` (the session-killing half) and `9dc2bd785` (the
-saturating reservation). What remains open is a *different* wall, §7.
+Fixed in `fcb1dc814` (the session-killing half), `9dc2bd785` (the saturating
+reservation) and `7b599454c` (the program-cache budget that the second of
+those overflowed). Reach: 55,099 -> **59,507** tokens, and the failure at the
+end is now the true pool limit rather than a premature one.
 
 ---
 
@@ -102,8 +104,9 @@ the refusal arrives **and** the socket still serves, then recovers on the same
 socket. It fails on the pre-fix code at exactly the socket-is-dead assertion.
 
 **`inferlets/opencode-session/src/engine.rs`** — the reservation keeps its
-coarse 256-page step while there is room, and narrows to 64 pages above 85% of
-the pool, so the rounding can never be what saturates it.
+coarse 256-page step while there is room, and narrows to 128 pages above 85%
+of the pool, so the rounding can never be what saturates it. The step is sized
+by the driver's program budget, not by taste — see §7.
 
 **`integrations/opencode/session_shim.py`** — delivers the refusal to the
 in-flight turn. It used to be failed as a side effect of the process dying.
@@ -114,7 +117,13 @@ in-flight turn. It used to be failed as a side effect of the process dying.
 |---|---|---|---|
 | before | 55,099 | 1006, no reason anywhere | **killed**, all retained KV lost |
 | gateway fix only | 55,099 | clean HTTP 503, reason stated | **survives** |
-| + reservation fix | **57,303** | see §7 | **survives** |
+| + reservation fix (64-page band) | 57,303 | DEGRADED empty completion (§7) | survives |
+| + 128-page band | **59,507** | clean 503 at the TRUE limit | **survives** |
+
+At 59,507 the next turn genuinely needs more than the pool holds
+(`n + max_tokens > 65,536`), so the refusal is correct rather than premature.
+51 of the driver's 64 program cache entries were used, with no cache-full
+event.
 
 Deterministic: two independent runs of the pre-fix build died at exactly
 55,099.
@@ -146,38 +155,53 @@ Note `PIE_PYTHON`: the shim needs the 3.12 venv at `~/.venvs/pie`. System
 `python3` is 3.9 and has no `msgpack`, and `boot_pie.sh` then fails with the
 server already up.
 
-## 7. STILL OPEN — the next wall: the Metal program cache
+## 7. The second wall: the Metal program cache holds a CROSS PRODUCT
 
-At 57,303 tokens the turn now fails a different way — a DEGRADED empty
-completion, session intact:
+Removing the phantom reservation moved the wall, and the next one was the
+driver's program cache — `kMaxProgramCacheEntries = 64` in
+`driver/metal/src/pipeline/m1_runtime.cpp`, which **never evicts**. This is the
+previously unexplained `status -5` at 45k–54k prefills.
+
+Logging every decoded container at the one funnel every program passes through
+(`driver/backend.rs::register_program`) shows what varies, in six turns:
 
 ```
-register_program: Metal M1 program executable cache is full
-(64 entries, cap 64, no eviction)
+Pages chan | fire token-counts registered
+       256 | [1024, 152, 5, 7, 1]
+       512 | [1024, 152, 3, 7, 1]
+       768 | [1024, 152, 3, 7, 1]
 ```
 
-This is the previously unexplained `status -5` from 45k–54k prefills. It says
-its own name now (`abi.cpp` logs `what()`; `m1_runtime.cpp` logs the count and
-the refused shape).
+The container binds the `pages_p` channel length **together with** the fire's
+token count, so the cache stores their cross product: five fire shapes
+re-register against every distinct pool size. The budget is
 
-Measured: **64 entries over 26 turns, ~2.5 new programs per turn**, each
-`stages=1 channels=10..11`. So it is a ceiling in **turns**, not tokens, and
-`kMaxProgramCacheEntries = 64` in
-`driver/metal/src/pipeline/m1_runtime.cpp` never evicts — once full, every new
-shape is refused for the rest of the process.
+```
+5 x (distinct pool reservations)   against a non-evicting cap of 64
+```
 
-Two things are needed and neither is done:
+not the "~2.5 new programs per turn" an earlier reading of this guessed.
 
-1. **Find the churn source.** `POOL_GRANULARITY` quantizes the pool-page
-   dimension, but something else in the fire container varies per turn — 13
-   distinct pool shapes cannot produce 64 registrations. Log the shape inputs
-   feeding `program_hash` and diff two consecutive turns.
-2. **Then decide eviction vs. churn.** Eviction is a driver-lifetime change
-   (entries are `shared_ptr`, so in-flight fires would keep theirs alive), and
-   it is the wrong fix if the churn is a bug rather than a cost.
+That indicted the §4 reservation fix itself. Its first tuning used a 64-page
+step near the top, producing 13 distinct pool sizes = **65 entries against a
+cap of 64** — an overflow by exactly one, surfacing as a DEGRADED empty
+completion at 57,303. The step is now 128 pages:
 
-Do not raise the cap without (1): a cap chosen against unmeasured churn just
-moves the wall.
+| quantization | pool sizes | programs | |
+|---|---|---|---|
+| 256 only (pre-fix) | 8 | 40 | fits |
+| 64-page band | 13 | **65** | **overflowed — shipped briefly** |
+| 128-page band | 10 | 50 | fits |
+
+`pool_shape_budget_fits_the_driver_program_cache` (in
+`inferlets/opencode-session/src/engine.rs`) enumerates the reservations one
+conversation makes and fails with the arithmetic spelled out, because this is a
+whole-process resource with no eviction, spent by a constant in a different
+crate, whose overflow appears eight minutes into a run as an empty completion.
+
+**The real repair is still open:** stop binding the pool size into the fire
+container, making the factor 1 instead of 5 and the cap a non-issue. That is a
+container-layout change; the test holds the line until then.
 
 ## 8. Ruled out, each by experiment
 
@@ -197,11 +221,13 @@ The unblocking condition is met for the failure this document was opened for:
 a saturated pool no longer destroys a session, and pie answers 503 instead of
 silently losing its KV and continuing with a worse patch.
 
-**But do not treat the arm as sound yet.** §7 still degrades a turn at ~26
-turns of growth on this workload, and a degraded turn is exactly the silent
-accuracy loss that made the original bug invisible. `tools/pie_watchdog.sh`
-keys on `terminal event error`, which will no longer fire — it should key on
-`cache is full` and on DEGRADED turns before the next long run.
+Both walls now fail cleanly rather than silently, and the program budget has a
+test holding it. **Two things still to do before a long run:**
+`tools/pie_watchdog.sh` keys on `terminal event error`, which the fix makes
+stop firing — it should key on `cache is full`, on `turn refused`, and on
+DEGRADED turns, since a degraded turn is exactly the silent accuracy loss that
+made the original bug invisible. And a conversation past ~59.5k tokens still
+ends in a 503; that is honest, but the harness must be seen to handle it.
 
 Strategy A is still **UNTESTED** against any of this. `ramp_context.py`
 against a `PIE_STRATEGY=a` boot would settle it cheaply.
