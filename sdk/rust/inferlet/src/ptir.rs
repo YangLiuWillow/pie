@@ -744,6 +744,26 @@ impl RsWorkingSet {
             rs: Rc::new(self.rs.fork(&on.wit)?),
         })
     }
+
+    /// Park this working set's FOLD under `key` — the recurrent half of the
+    /// explicit prefix index. The entry owns a fork, so the fold outlives
+    /// this instance; entries are LRU-evicted under slot pressure. Pair with
+    /// `KvWorkingSet::update_index` under the same address: on a hybrid,
+    /// parked KV without the fold is not the state
+    /// (`finding-apc-hybrid-fold.md`).
+    pub fn update_index(&self, on: &Pipeline, key: &[u8]) -> Result<(), String> {
+        self.rs.update_index(&on.wit, key)
+    }
+
+    /// Fork a parked fold back out; `None` on a miss or after eviction.
+    pub fn from_index(key: &[u8]) -> Result<Option<RsWorkingSet>, String> {
+        Ok(crate::working_set::RsWorkingSet::from_index(key)?.map(|rs| RsWorkingSet { rs: Rc::new(rs) }))
+    }
+
+    /// Remove the named entry; working sets already forked out stay valid.
+    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
+        crate::working_set::RsWorkingSet::remove_index(key)
+    }
 }
 
 impl Default for RsWorkingSet {

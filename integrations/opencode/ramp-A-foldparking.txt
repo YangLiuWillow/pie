@@ -1,0 +1,23 @@
+ramp: max_tokens=4096
+step 0: prompt=  2230 finish='stop'     ok
+step 1: prompt=  4451 finish='stop'     ok
+step 2: prompt=  6672 finish='stop'     ok
+step 3: prompt=  8893 finish='stop'     ok
+step 4: prompt= 11114 finish='stop'     ok
+step 5: prompt= 13335 finish='stop'     ok
+step 6: prompt= 15556 finish='stop'     ok
+step 7: prompt= 17777 finish='stop'     ok
+step 8: prompt= 19998 finish='stop'     ok
+step 9: prompt= 22219 finish='stop'     ok
+step 10: prompt= 24441 finish='stop'     ok
+step 11: prompt= 26663 finish='stop'     ok
+step 12: prompt= 28885 finish='stop'     ok
+step 13: prompt= 31107 finish='stop'     ok
+step 14: prompt= 33329 finish='stop'     ok
+step 15: prompt= 35551 finish='stop'     ok
+step 16: prompt= 37773 finish='stop'     ok
+step 17: prompt= 39995 finish='stop'     ok
+step 18: prompt= 42217 finish='stop'     ok
+step 19: prompt= 44439 finish='stop'     ok
+step 20: prompt= 46661 finish='stop'     ok
+step 21: DIED after last good prompt=46661  (HTTPError: HTTP Error 503: Service Unavailable)

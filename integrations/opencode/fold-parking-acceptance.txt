@@ -1,0 +1,10 @@
+C1 (cold)   : cached_tokens=0 prompt=9198 finish=length
+  text: 'The single most important invariant maintained by this file is that every logical page index within a WorkingSet must always correspond to a valid, live PhysicalKvPageId in the pool, ensuring that the'
+C2 (resumed): cached_tokens=9184 prompt=9198 finish=length
+  text: 'The single most important invariant maintained by this file is that every logical page index within a WorkingSet must always correspond to a valid, live PhysicalKvPageId in the pool, ensuring that the'
+C3 (resumed): cached_tokens=9184 prompt=9198 finish=length
+  text: 'The single most important invariant maintained by this file is that every logical page index within a WorkingSet must always correspond to a valid, live PhysicalKvPageId in the pool, ensuring that the'
+
+C1 == C2: True
+C2 == C3: True
+VERDICT: no divergence observed on this prompt

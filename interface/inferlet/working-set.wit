@@ -156,6 +156,24 @@ interface working-set {
         // Copy-on-write child sharing the folded state and buffered slabs,
         // ordered on `on`.
         fork: func(on: borrow<pipeline>) -> result<rs-working-set, error>;
+
+        // Park this working set's FOLD under `key`: the index owns a fork,
+        // so the folded slot outlives the publisher. The recurrent half of
+        // the explicit prefix index — on a hybrid model, parked KV alone is
+        // not the state, and resuming it without the fold serves fluent
+        // output from a recurrent state that covered only the suffix.
+        // Ordered on `on` like fork (RS mappings publish at prepare, so no
+        // drain is needed). Entries are evicted least-recently-used under
+        // slot pressure; a lookup after eviction returns none.
+        update-index: func(on: borrow<pipeline>, key: list<u8>) -> result<_, error>;
+
+        // Fork the parked fold back out. The caller owns the result; the
+        // entry keeps its own fork, so repeated lookups keep working and
+        // remove-index never invalidates a live resume.
+        from-index: static func(key: list<u8>) -> result<option<rs-working-set>, error>;
+
+        // Remove only the named entry. Returns false when absent.
+        remove-index: static func(key: list<u8>) -> result<bool, error>;
     }
 
 }
