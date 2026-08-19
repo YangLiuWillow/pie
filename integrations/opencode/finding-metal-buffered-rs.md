@@ -64,3 +64,60 @@ depends on the verify-fire row scaling they are already chasing.
 emits a launch with no `qo_indptr` and the driver poisons the epoch. Third
 member of the poison-epoch-producer family. Single-conversation serving never
 fires this shape; multi-request hybrid serving will.
+
+---
+
+## CORRECTION + the number, same day (hybrid-rows-probe)
+
+**The "WORKS" verdicts above are RING-PATH verdicts.** `gdn-foldcommit`'s
+prompt is "hello world" — a few tokens — so every mode ran the tiny-context
+M=1 ring path. The first buffered fire at a REAL context (paged path,
+ctx 7424, `hybrid-rows-probe`) exposed what the suite could not see:
+
+**The paged position record counts buffered rows, and nothing rewinds it.**
+`commit_paged_request_state` sets `resident_next_position` from the fire's
+last position unconditionally — a `fold_len=0` fire of r rows advances the
+record by r even though the fold did not move. `discard_buffered` empties the
+store's buffer and never reaches the driver. Measured, one step at a time
+(`cadence` mode):
+
+```
+window1 buffered(2) @7424   OK        (slot record -> 7426)
+window1 commit(1)  @7424    REFUSED   (async: "slot 0 is at position 7426,
+                                       this fire starts at 7424")
+window2                     dead      (inherits the pipeline failure)
+```
+
+So at real contexts the buffer→commit speculation cadence is **unusable on
+Metal today**, blocked not by compose.cpp's stated refusals but by paged
+continuation bookkeeping that treats buffered rows as folded ones. Second
+open defect from this probe (after the `mixed` qo_indptr poison). The fix
+direction is driver-side: the record must track the FOLD boundary, or fold
+and buffer extents separately, for `validate_linear_sequence_geometry` to
+compare against.
+
+**The rows curve exists anyway** — the timing loop advances its position per
+sample instead of committing, which fires identical workloads without
+tripping the record. ctx=7424, buffered verify fires, median of 10 after 2
+warmups per shape:
+
+| rows | median ms | ×fire(1) | beta(r) = (f(r)−f(1))/((r−1)·f(1)) |
+|---|---|---|---|
+| 1 | 12.07 | 1.00 | — |
+| 2 | 27.32 | 2.26 | 1.26 |
+| 3 | 31.36 | 2.60 | 0.80 |
+| 5 | 38.64 | 3.20 | 0.55 |
+| 8 | 50.32 | 4.17 | 0.45 |
+
+Shape: leaving the 1-row path costs ~15 ms flat, then ~3.9 ms per additional
+row. rows=2 LOSES to two sequential fires outright (27.3 vs 24.1 ms); only
+wide windows can win, and at rows=8 the break-even is ≈52% of the full
+window accepted (50.3 vs 8×12.07 ms), before commit costs. The curve's
+per-row slope is close to Coder-30B's despite head_dim 256 vs 128; the
+difference is the fixed multi-row penalty.
+
+**Bottom line for §3.3:** capability half-open (ring path yes, paged path
+blocked by the position record), and even once unblocked, speculation pays
+off only at wide windows and ≥~50% window acceptance. Both the blocker and
+the arithmetic are now specific enough to act on. Raw transcripts:
+`hybrid-cadence-7424.txt`, `hybrid-rows-7424.txt`.

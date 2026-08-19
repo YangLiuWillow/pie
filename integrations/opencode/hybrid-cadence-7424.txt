@@ -1,0 +1,6 @@
+Return:
+cadence ctx=7424
+window1 buffered(2) @ctx: OK
+window1 commit(1) @ctx: OK
+window2 buffered(2) @ctx+1: REFUSED — submit rows=2 ctx=7425: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+

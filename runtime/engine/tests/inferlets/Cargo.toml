@@ -12,6 +12,7 @@ members = [
     "rs-buffer-bench",
     "generate-gdn-frame",
     "gdn-foldcommit",
+    "hybrid-rows-probe",
     "grammar",
     "grammar-late",
     "grammar-wit-bench",

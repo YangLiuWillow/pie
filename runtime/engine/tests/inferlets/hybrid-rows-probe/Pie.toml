@@ -1,0 +1,4 @@
+[package]
+name = "hybrid-rows-probe"
+version = "0.1.0"
+description = "Times a k-row BUFFERED verify fire on a hybrid model at a given context, rows=1..8, so the speculation go/no-go is a slope instead of a guess"
