@@ -113,11 +113,22 @@ const PUBLISH_MAX: usize = if option_env!("APC_OFF").is_some() { 0 } else { 1 };
 /// policy instead of where the KV lives.
 pub const BOUNDARY_STRIDE: u32 = 256;
 
-/// A resume point: how many tokens of the render are already in KV, and the
-/// working set holding them.
+/// A resume point: how many tokens of the render are already in KV, the
+/// working set holding them, and the index address it was found under.
+///
+/// The address is not diagnostics — it is the lifecycle handle. The entry it
+/// names pins the PREVIOUS turn's page chain, and extending the resumed set
+/// privatizes the shared stratum, so while both live the pool carries two
+/// generations of the conversation. Measured: a single ramped conversation
+/// under strategy A died with a 503 at 30,855 tokens — half of B's 61,711 on
+/// the identical pool — with the live chain (30,855) plus the previous entry
+/// (28,640) plus the reservation summing to the pool exactly. The turn that
+/// successfully parks its own deeper cut must therefore REMOVE the entry it
+/// resumed from, which needs this address.
 pub struct Resume {
     pub cached_tokens: u32,
     pub ws: WorkingSet,
+    pub address: String,
 }
 
 /// The addressed cut ladder for one render.
@@ -166,6 +177,7 @@ impl Plan {
                     return Some(Resume {
                         cached_tokens: *cut,
                         ws,
+                        address: address.clone(),
                     });
                 }
                 Ok(None) => continue,

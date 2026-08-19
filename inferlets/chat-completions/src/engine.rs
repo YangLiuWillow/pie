@@ -268,6 +268,7 @@ macro_rules! define_generate {
             // Disagreement DROPS the resume and rebuilds, the session arm's
             // `kv_verify` discipline: a rebuild is slow, a wrong prefix is silent.
             // Not an error — a correct turn at full price is still a correct turn.
+            let mut resumed_address: Option<String> = None;
             let (ws, cached) = match apc.resume {
                 Some(r) => {
                     let have = r.ws.page_len();
@@ -275,6 +276,7 @@ macro_rules! define_generate {
                         && r.cached_tokens % page_t == 0
                         && have == r.cached_tokens / page_t
                     {
+                        resumed_address = Some(r.address);
                         (r.ws, r.cached_tokens)
                     } else {
                         eprintln!(
@@ -282,6 +284,15 @@ macro_rules! define_generate {
                              parked pages {have}); rebuilding",
                             r.cached_tokens
                         );
+                        // An entry that fails its own geometry is permanently
+                        // unusable — the address no longer describes the pages —
+                        // and it re-fails every later lookup while pinning its
+                        // chain. Removing it is the kv_verify discipline the
+                        // session arm applies to a bad branch: drop, don't hoard.
+                        match WorkingSet::remove_index(r.address.as_bytes()) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[apc] remove of bad entry failed: {e}"),
+                        }
                         (WorkingSet::new(), 0)
                     }
                 }
@@ -361,11 +372,39 @@ macro_rules! define_generate {
             // holds 64+ of them; a long conversation still lands on 256 or 512
             // and is unaffected.
             const POOL_FLOOR_PAGES: u32 = 8;
-            let pool_pages = (n + max_tokens as u32 + 2)
+            // ...EXCEPT near the top of the pool, where "at most 2x the need"
+            // stops being proportional waste and becomes the whole pool. On a
+            // hybrid the pool is exactly one max-length conversation
+            // (`context.cpp` clamps it to `ceil(max_model_len/page)`), so the
+            // first turn whose power of two lands on the full pool makes the
+            // pool report 100% occupied, the pressure bucket saturates, and
+            // the NEXT request is refused. Measured: a ramped conversation
+            // died 503 after 30,855 tokens — need crossed 1,024 pages, rounded
+            // to 2,048 of 2,048 — which is `9dc2bd785`'s phantom-reservation
+            // kill (B, at 55,099) reincarnated through coarser rounding. The
+            // session arm's fix ports directly: keep the coarse ladder while
+            // it cannot hurt, and narrow to a fine step once the power of two
+            // would eat the admission headroom (~94% pressure gate, mirrored
+            // as 6% kept free — same constant, same pointer as opencode-
+            // session's `enforce_retention`). The fine band adds at most a
+            // couple of 128-page shapes to the program-cache ladder.
+            const FINE_STEP_PAGES: u32 = 128;
+            let need = (n + max_tokens as u32 + 2)
                 .div_ceil(page_t)
-                .max(POOL_FLOOR_PAGES)
-                .next_power_of_two()
-                .max(have);
+                .max(POOL_FLOOR_PAGES);
+            let (_, pool_total) = kv_pool_status();
+            let p2 = need.next_power_of_two();
+            let band = pool_total.saturating_sub(pool_total / 100 * 6);
+            let pool_pages = if pool_total > 0 && p2 > band {
+                // Fine rounding, capped at the band — and never below the
+                // genuine need: a turn that truly requires more than the band
+                // reserves what it needs, and the refusal that may follow is
+                // the true pool limit speaking, not the rounding.
+                need.next_multiple_of(FINE_STEP_PAGES).min(band).max(need)
+            } else {
+                p2
+            }
+            .max(have);
             let mut pool_ids: Vec<u32> = (0..have).collect();
             if pool_pages > have {
                 let slots = ws.reserve(pool_pages - have).context("ws.reserve")?;
@@ -657,6 +696,35 @@ macro_rules! define_generate {
                     }
                 }
                 park.close();
+            }
+
+            // ─────────── 4. RETIRE THE ENTRY THIS TURN RESUMED FROM ───────────
+            // The parked entry pins the previous turn's page chain, and the
+            // extension above privatized the stratum it shared — so until the
+            // old entry goes, the pool holds TWO generations of this
+            // conversation. Measured before this existed: a single ramped
+            // conversation died 503 at 30,855 tokens, half of the session arm's
+            // 61,711 on the identical pool, with live chain + previous entry +
+            // reservation summing to the pool exactly. Under the agent
+            // benchmark that halved ceiling surfaced as 172 refusals in five
+            // instances (35% of calls) once real conversations passed ~30k.
+            //
+            // Removal is gated on this turn having PARKED a replacement
+            // (`published > 0`): a turn that failed to park must leave the old
+            // entry resumable, or the next turn pays a full cold rebuild for
+            // this turn's failure. And an address this turn re-published is
+            // skipped — `update_index` on the same key already replaced the
+            // entry, and removing it would delete the fresh park, turning
+            // every no-growth turn (a retry, an idempotent tool loop) into a
+            // permanent cache miss.
+            if let Some(addr) = resumed_address {
+                let republished = apc.publish.iter().any(|(_, a)| a == &addr);
+                if outcome.published > 0 && !republished {
+                    match WorkingSet::remove_index(addr.as_bytes()) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[apc] retire of superseded entry failed: {e}"),
+                    }
+                }
             }
 
             match decode_error {
