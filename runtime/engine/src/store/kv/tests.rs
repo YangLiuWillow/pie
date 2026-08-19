@@ -1592,3 +1592,84 @@ fn page_len_mirror_is_tombstoned_when_the_working_set_goes_away() {
     ));
     assert_eq!(mirror.load(Ordering::Acquire), u64::MAX);
 }
+
+/// The full-miss strand: a publisher parks a chain and never produces a
+/// matching lookup again (its conversation was compacted, its keys diverged).
+/// Before eviction existed the entry pinned its pages forever; measured on
+/// strategy A as a halved effective pool and a 10.3% refusal residue. A later
+/// publish under pool pressure must evict the strand, LRU-first, and never
+/// the entry it is itself publishing.
+#[test]
+fn index_evicts_lru_strand_under_pool_pressure() {
+    // Pool of 8; keep-free is 6% -> max(1) page.
+    let mut store = KvStore::new(8, h(7));
+
+    // The strand: 4 pages parked, publisher gone.
+    let stranded = store.create_working_set();
+    commit_fresh(&mut store, stranded, 4, 1);
+    store.update_index(b"strand".to_vec(), stranded).unwrap();
+    store.release_working_set(stranded, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 4, "strand pins its pages");
+
+    // A live conversation writes 4 more pages -> pool exhausted...
+    let live = store.create_working_set();
+    commit_fresh(&mut store, live, 4, 1);
+    assert_eq!(store.available_pages(), 0);
+
+    // ...and parks. The publish finds no headroom and evicts the strand —
+    // not the entry being published.
+    store.update_index(b"live".to_vec(), live).unwrap();
+    assert!(
+        store.from_index(b"strand", Default::default()).unwrap().is_none(),
+        "the stranded entry was evicted"
+    );
+    assert!(
+        store.from_index(b"live", Default::default()).unwrap().is_some(),
+        "the just-published entry survives"
+    );
+    store.retire_idle();
+    assert!(
+        store.available_pages() >= 4,
+        "the strand's pages came back (got {})",
+        store.available_pages()
+    );
+}
+
+/// Recency is what separates a strand from the working prefix of a LIVE
+/// conversation: a `from_index` hit must refresh the entry so the eviction
+/// order tracks use, not insertion.
+#[test]
+fn index_eviction_order_tracks_hits_not_insertion() {
+    let mut store = KvStore::new(8, h(9));
+
+    let old = store.create_working_set();
+    commit_fresh(&mut store, old, 3, 1);
+    store.update_index(b"old-but-hot".to_vec(), old).unwrap();
+    store.release_working_set(old, store.current_epoch());
+
+    let mid = store.create_working_set();
+    commit_fresh(&mut store, mid, 3, 1);
+    store.update_index(b"mid-and-cold".to_vec(), mid).unwrap();
+    store.release_working_set(mid, store.current_epoch());
+    store.retire_idle();
+
+    // A hit on the older entry refreshes it past the newer one.
+    let loaded = store.from_index(b"old-but-hot", Default::default()).unwrap().unwrap();
+    store.release_working_set(loaded, store.current_epoch());
+    store.retire_idle();
+
+    // Pressure via a publish: 2 more pages exhaust the pool.
+    let live = store.create_working_set();
+    commit_fresh(&mut store, live, 2, 1);
+    store.update_index(b"live".to_vec(), live).unwrap();
+
+    assert!(
+        store.from_index(b"mid-and-cold", Default::default()).unwrap().is_none(),
+        "the cold entry went first"
+    );
+    assert!(
+        store.from_index(b"old-but-hot", Default::default()).unwrap().is_some(),
+        "the hit-refreshed entry survived"
+    );
+}

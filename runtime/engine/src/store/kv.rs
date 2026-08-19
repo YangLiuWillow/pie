@@ -250,7 +250,18 @@ pub struct KvStore {
     cas: HashMap<Hash256, CasEntry>,
     /// Inferlet-owned opaque index. Values carry no token or layout meaning;
     /// each entry owns one cache-root lease for its snapshot terminal.
+    ///
+    /// A CACHE, and since 2026-08-19 it behaves like one: entries are evicted
+    /// least-recently-touched-first when a publish finds the pool pressed
+    /// (see [`Self::evict_index_under_pressure`]). Before that it had no
+    /// eviction at all, and a publisher that lost its key — a per-request
+    /// guest whose conversation was compacted, so the next lookup fully
+    /// missed — stranded the entry forever. Measured on strategy A: one
+    /// stranded ~50k-token chain halves the effective pool, and the residual
+    /// 10.3% refusal rate in the swe36 A arm was exactly this shape.
     indexes: HashMap<Vec<u8>, KvIndexEntry>,
+    /// Monotonic recency clock for [`Self::indexes`] (insert + hit).
+    index_clock: u64,
     /// Monotonic submission sequence: bumped per prepared write. Freed slots
     /// are recycled tagged with the current value and retired once the fire
     /// carrying that sequence completes (FIFO stream order), or immediately
@@ -279,6 +290,10 @@ struct CasEntry {
 #[derive(Debug, Clone, Copy)]
 struct KvIndexEntry {
     snapshot: IndexedWorkingSet,
+    /// Recency stamp from [`KvStore::index_clock`], bumped on insert and on
+    /// every [`KvStore::from_index`] hit. The eviction order under pool
+    /// pressure — see [`KvStore::evict_index_under_pressure`].
+    last_touch: u64,
 }
 
 #[derive(Debug)]
@@ -314,6 +329,7 @@ impl KvStore {
             #[cfg(test)]
             cas: HashMap::new(),
             indexes: HashMap::new(),
+            index_clock: 0,
             seq: 0,
             in_flight: 0,
             outstanding: std::collections::BTreeSet::new(),
@@ -433,11 +449,69 @@ in_flight={:<4} outstanding={:<4} seq={} pending_epochs={:?}",
         if let Some(root) = snapshot.terminal {
             self.table.lease_cache_root(root);
         }
-        let replaced = self.indexes.insert(key, KvIndexEntry { snapshot });
+        self.index_clock += 1;
+        let last_touch = self.index_clock;
+        let replaced = self
+            .indexes
+            .insert(key.clone(), KvIndexEntry { snapshot, last_touch });
         let freed = replaced.map_or(0, |entry| {
             self.release_index_entry(entry, self.current_epoch())
         });
+        self.evict_index_under_pressure(&key);
         Ok(freed)
+    }
+
+    /// How much of the pool must stay free before a publish keeps every
+    /// index entry. The engine's admission gate refuses turns at ~94%
+    /// pressure, so a cache that holds the pool past that line converts
+    /// itself from an optimisation into a denial of service — the guest-side
+    /// mirror of this constant (`opencode-session`'s `enforce_retention`,
+    /// `chat-completions`' reservation band) carries the same 6 and the same
+    /// pointer.
+    const INDEX_KEEP_FREE_PERCENT: u32 = 6;
+
+    /// Evict least-recently-touched index entries until the pool has
+    /// admission headroom again, never touching `protect` (the entry the
+    /// caller just published — evicting it would turn every publish under
+    /// pressure into a self-defeating no-op).
+    ///
+    /// This exists because the index outlives its publishers. A per-request
+    /// guest that parks a chain and then never produces a matching lookup —
+    /// the conversation was compacted, so every later address diverges —
+    /// leaves an entry NOTHING can remove: the guest is gone, the key is
+    /// unreconstructable, and the pages stay pinned. LRU-under-pressure is
+    /// the engine-side leave-room rule: recently useful entries survive, and
+    /// strands are exactly the entries that stop being touched.
+    ///
+    /// Evictions are LOUD (one warn per entry, with the freed page count):
+    /// a conversation whose entry was evicted pays a full re-prefill on its
+    /// next turn, and that cost should be attributable in the log rather
+    /// than surfacing as an unexplained slow turn.
+    fn evict_index_under_pressure(&mut self, protect: &[u8]) {
+        let capacity = self.pool.capacity() as usize;
+        if capacity == 0 {
+            return;
+        }
+        let keep_free = capacity * Self::INDEX_KEEP_FREE_PERCENT as usize / 100;
+        loop {
+            if self.pool.available() >= keep_free.max(1) {
+                return;
+            }
+            let victim = self
+                .indexes
+                .iter()
+                .filter(|(k, _)| k.as_slice() != protect)
+                .min_by_key(|(_, e)| e.last_touch)
+                .map(|(k, _)| k.clone());
+            let Some(key) = victim else { return };
+            let Some(entry) = self.indexes.remove(&key) else { return };
+            let freed = self.release_index_entry(entry, self.current_epoch());
+            tracing::warn!(
+                freed_pages = freed,
+                remaining_entries = self.indexes.len(),
+                "kv index: evicted least-recently-used entry under pool pressure"
+            );
+        }
     }
 
     /// Exact lookup of an opaque index key. The returned WorkingSet owns its
@@ -448,7 +522,12 @@ in_flight={:<4} outstanding={:<4} seq={} pending_epochs={:?}",
         prepared: PreparedWorkingSet,
     ) -> Result<Option<WorkingSetId>, KvStoreError> {
         Self::validate_index_key(key)?;
-        let Some(entry) = self.indexes.get(key).copied() else {
+        self.index_clock += 1;
+        let clock = self.index_clock;
+        let Some(entry) = self.indexes.get_mut(key).map(|e| {
+            e.last_touch = clock;
+            *e
+        }) else {
             return Ok(None);
         };
         let ws = self.table.from_index_snapshot(entry.snapshot);
