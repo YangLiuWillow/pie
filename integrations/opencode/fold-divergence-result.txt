@@ -1,0 +1,10 @@
+C1 (cold)   : cached_tokens=0 prompt=9105 finish=length
+  text: 'The KV store maintains the invariant that every logical page index within a working set is either backed by a live physical page ID or is explicitly marked as fresh/COW, ensuring that no logical index'
+C2 (resumed): cached_tokens=9088 prompt=9105 finish=length
+  text: 'The most important invariant maintained by this file is that the `KvStore` struct must always maintain a consistent relationship between its `table` (the radix-compressed mapping trie), its `pool` (th'
+C3 (resumed): cached_tokens=9088 prompt=9105 finish=length
+  text: 'The most important invariant maintained by this file is that the `KvStore` struct must always maintain a consistent relationship between its `table` (the radix-compressed mapping trie), its `pool` (th'
+
+C1 == C2: False
+C2 == C3: True
+VERDICT: systematic divergence — the resumed state is NOT the cold state
