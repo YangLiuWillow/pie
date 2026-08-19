@@ -270,8 +270,26 @@ async fn main(input: String) -> inferlet::Result<String> {
         &prompt.boundaries,
         inferlet::ptir::attention::prelude::kv_page_size(),
     );
-    let resume = plan.resume();
-    let publish = plan.publish_set();
+    // GATED OFF ATTENTION-ONLY MODELS. Parked KV is the WHOLE state only
+    // when KV is the whole state. On a hybrid, a resume grafts the attention
+    // half and silently rebuilds the recurrent half from zero over the
+    // suffix — the GDN layers then summarize a conversation that, as far as
+    // they know, just started. CONFIRMED at temp 0 (`tools/
+    // fold_divergence_probe.py`, `finding-apc-hybrid-fold.md`): cold and
+    // resumed answers to the same 9,105-token request diverge, and the two
+    // resumed runs agree byte-for-byte — systematic, not noise. Fluent,
+    // on-topic, and computed by a model that does not exist; no driver check
+    // can catch it, because the fresh instance's reset fire is legitimate.
+    //
+    // Publishing is gated too, not just the resume: the address hashes the
+    // MODEL ID, so a hybrid's parked entries can never be read by anything
+    // except the resume this gate just disabled — they would be pure page
+    // pressure and eviction churn. The real hybrid fix is fold parking at
+    // exact-tip cuts, which needs an engine-level index for recurrent
+    // state — see the finding's fix ladder.
+    let class_ok = model::pass_kind() == model::ForwardKind::Attention;
+    let resume = if class_ok { plan.resume() } else { None };
+    let publish = if class_ok { plan.publish_set() } else { Vec::new() };
 
     // Stop set: the model's chat stop tokens, plus the turn-START marker —
     // at t=0 a looping model starts simulating the next turn instead of
