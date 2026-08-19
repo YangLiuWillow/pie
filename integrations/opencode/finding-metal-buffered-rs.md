@@ -121,3 +121,15 @@ blocked by the position record), and even once unblocked, speculation pays
 off only at wide windows and ≥~50% window acceptance. Both the blocker and
 the arithmetic are now specific enough to act on. Raw transcripts:
 `hybrid-cadence-7424.txt`, `hybrid-rows-7424.txt`.
+
+**Break-even in closed form** (liszt-ai-00, from this table, recorded at
+their `a43604aec`): cost(k rows) ≈ 1 + (15.25 + 3.9·(k−1))/12.07 fires, so
+with expected tokens ≈ 1 + a·k the win condition is
+
+    a > (1.26 + 0.32·(k−1)) / k      → 0.56 at k=4, 0.44 at k=8
+
+before commit costs. Consequence: if the position-record fix lands, the
+hybrid needs the (fixed, slope) cost form and a LARGER draft window than
+Coder-30B's DRAFT_K=4 — small windows can never pay off the flat penalty.
+`draft::Policy` keeps `!recurrent` until the driver fix exists; nothing is
+wired speculatively.
