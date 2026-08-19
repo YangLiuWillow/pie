@@ -188,6 +188,45 @@ case "$PIE_MODEL" in
     *)                ARTIFACT="$PIE_MODEL" ;;
 esac
 
+# ── consistency: the client's believed context vs the server's real one ──────
+# opencode compacts a conversation at `limit.context - limit.output` FROM ITS
+# OWN CONFIG; nothing on the wire corrects it. When ./opencode.json understates
+# the server, every conversation is truncated years early — measured on the
+# 35B: the entry said 16384 (copy-pasted 2026-08-12 from the 0.6B beside it,
+# when the server default really was 16384) while the server ran 65536, so
+# opencode compacted at ~12.3k, one truncation per ~5-9 turns, each a full
+# cold re-prefill on a recurrent model (the fold cannot rewind). Nobody
+# noticed for five days because a premature compaction LOOKS like an agent
+# choosing to summarize.
+#
+# The convention, from the 61440 entries this repo already carries:
+#     limit.context = max_model_len - limit.output
+# which also keeps peak occupancy at 61440/65536 = 93.75%, just under the
+# gateway's ~94% admission watermark.
+#
+# A WARNING, not a failure: old profiles must still boot to reproduce old
+# results — but they must not do so silently.
+if [ -f "$HERE/opencode.json" ] && command -v python3 >/dev/null; then
+    python3 - "$HERE/opencode.json" "$PIE_MODEL" "$PIE_MAX_MODEL_LEN" << 'PYEOF' >&2 || true
+import json, sys
+cfg_path, model, served = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    limit = json.load(open(cfg_path))["provider"]["pie"]["models"][model]["limit"]
+except (KeyError, ValueError, OSError):
+    sys.exit(0)  # model not declared here; nothing to check
+context, output = int(limit.get("context", 0)), int(limit.get("output", 4096))
+want = served - output
+if context != want:
+    print(
+        f"⚠ opencode.json pie/{model}: limit.context={context} but the server "
+        f"serves max_model_len={served}; convention wants {want} "
+        f"(= {served} - {output} output reserve). opencode will "
+        f"{'truncate conversations early' if context < want else 'overrun the server'} "
+        f"— fix opencode.json or PIE_MAX_MODEL_LEN so they agree."
+    )
+PYEOF
+fi
+
 # ── config: argument, or a generated trimmed profile ─────────────────────────
 # One driver shape for every model here — these are the settings the 2026-08-12
 # results were produced under (`integrations/opencode/results-*.md`), for both

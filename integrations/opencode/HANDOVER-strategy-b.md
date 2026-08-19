@@ -201,6 +201,28 @@ id as an open driver bug blocking CoW branching. **Fixed** by
 
 ## 4. Config facts worth not rediscovering
 
+> **2026-08-18 addition — THE context-length chain, standardized.** Five
+> numbers, one per layer, each with its reason; keep them agreeing:
+>
+> | number | layer | why |
+> |---|---|---|
+> | 262,144 | model native (HF card; ~1M via YaRN) | not the binding constraint anywhere here |
+> | 131,072 | Metal driver cap for the hybrid | `kPhase1bRsSlots(64) × kMetalCtxTokensPerRequest(2048)` |
+> | 65,536 | deployed `max_model_len` | = total_pages(2048) × kv_page_size(32): on a hybrid this one number is BOTH the context ceiling and the whole KV pool; 65536 is what lets the configured 2048 pages materialize, and the 35B fits this box at 24.47 GiB peak |
+> | 61,440 | opencode `limit.context` | = 65,536 − 4,096 output reserve; also pins peak occupancy at 93.75%, under the ~94% admission watermark |
+> | 4,096 | opencode `limit.output` | the reserve the client subtracts before compacting |
+>
+> The pie/35B entry said 16384 (an Aug-12 copy-paste from the 0.6B beside
+> it) while the server served 65536, so opencode compacted at ~12.3k —
+> one truncation per ~5-9 turns, each a full cold re-prefill on a
+> recurrent model. Fixed to 61440; the 0.6B to 12288 by the same rule; and
+> `run_pie_opencode.sh` now WARNS at boot when the entry for `$PIE_MODEL`
+> disagrees with `PIE_MAX_MODEL_LEN − output` (warning, not failure, so
+> old profiles still boot reproducibly — loudly). NOTE for the benchmark:
+> every truncation-cadence number measured before this fix (43 refusals /
+> 3 runs, the 12.2-13.3k tips) was under the stale 16384 and will not
+> reproduce after it.
+
 - **For a hybrid the KV pool is `ceil(max_model_len / kv_page_size)` EXACTLY**;
   configured `total_pages` is ignored (`context.cpp:255`,
   `rs_cache_required ? ctx_pages : min(...)`). So the pool is one
