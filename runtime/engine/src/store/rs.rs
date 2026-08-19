@@ -286,6 +286,14 @@ pub struct RsStore {
     /// sequence below it has completed on the device, so anything freed at or
     /// before that epoch can no longer be referenced.
     outstanding: BTreeSet<u64>,
+    /// Parked folds by opaque key — see [`RsIndexEntry`]. A cache with an
+    /// eviction policy from day one: slots are the scarcest resource in the
+    /// system (64 on Metal, and admission seats far fewer), so
+    /// [`Self::update_index`] evicts LRU entries whenever free slots drop
+    /// below the admission complement.
+    indexes: HashMap<Vec<u8>, RsIndexEntry>,
+    /// Monotonic recency clock for [`Self::indexes`].
+    index_clock: u64,
 }
 
 impl RsStore {
@@ -296,6 +304,8 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             outstanding: BTreeSet::new(),
+            indexes: HashMap::new(),
+            index_clock: 0,
         }
     }
 
@@ -379,6 +389,89 @@ impl RsStore {
             occupancy,
             buffer_head,
         }))
+    }
+
+    /// Free slots the admission planner needs seated at any moment:
+    /// `max_concurrent_lanes(4) x seat_cost(2)` on the shipped profile —
+    /// see `bootstrap.rs`'s `rs_seat_cap`. Parked folds must never eat into
+    /// this band, or the cache becomes a denial of service against admission
+    /// (the exact failure the KV index's 6%-free mirror guards against; slots
+    /// are too few for a percentage to be meaningful, so the band is
+    /// absolute).
+    const INDEX_KEEP_FREE_SLOTS: usize = 8;
+
+    /// Park `ws`'s fold under `key`: the entry owns a fresh fork, so the
+    /// folded slot outlives the publisher by ordinary refcounting. Replacing
+    /// a key releases the previous entry's fork. Evicts LRU entries while
+    /// free slots sit below [`Self::INDEX_KEEP_FREE_SLOTS`] (never the entry
+    /// just parked).
+    pub fn update_index(&mut self, key: Vec<u8>, ws: RsWorkingSetId) -> Result<(), RsError> {
+        let fork = self.fork(ws)?;
+        self.index_clock += 1;
+        let last_touch = self.index_clock;
+        let replaced = self
+            .indexes
+            .insert(key.clone(), RsIndexEntry { ws: fork, last_touch });
+        if let Some(entry) = replaced {
+            let epoch = self.current_epoch();
+            self.release_working_set(entry.ws, epoch);
+            self.retire_idle();
+        }
+        self.evict_index_under_pressure(&key);
+        Ok(())
+    }
+
+    /// Fork the parked fold back out. The caller owns the returned working
+    /// set; the entry keeps its own, so repeated lookups keep working and
+    /// removal never invalidates a live resume.
+    pub fn from_index(&mut self, key: &[u8]) -> Result<Option<RsWorkingSetId>, RsError> {
+        self.index_clock += 1;
+        let clock = self.index_clock;
+        let Some(entry) = self.indexes.get_mut(key) else {
+            return Ok(None);
+        };
+        entry.last_touch = clock;
+        let ws = entry.ws;
+        self.fork(ws).map(Some)
+    }
+
+    /// Remove only the named entry. Returns whether it existed.
+    pub fn remove_index(&mut self, key: &[u8]) -> bool {
+        let Some(entry) = self.indexes.remove(key) else {
+            return false;
+        };
+        let epoch = self.current_epoch();
+        self.release_working_set(entry.ws, epoch);
+        self.retire_idle();
+        true
+    }
+
+    /// The engine-side leave-room rule for parked folds — the RS twin of
+    /// `KvStore::evict_index_under_pressure`, with an absolute band instead
+    /// of a percentage because the pool is 64 slots, not 65,536 tokens.
+    /// Loud, for the same reason: an evicted conversation pays a full cold
+    /// rebuild on its next turn and that cost must be attributable.
+    fn evict_index_under_pressure(&mut self, protect: &[u8]) {
+        loop {
+            self.retire_idle();
+            if self.pool.available() >= Self::INDEX_KEEP_FREE_SLOTS {
+                return;
+            }
+            let victim = self
+                .indexes
+                .iter()
+                .filter(|(k, _)| k.as_slice() != protect)
+                .min_by_key(|(_, e)| e.last_touch)
+                .map(|(k, _)| k.clone());
+            let Some(key) = victim else { return };
+            let Some(entry) = self.indexes.remove(&key) else { return };
+            let epoch = self.current_epoch();
+            self.release_working_set(entry.ws, epoch);
+            tracing::warn!(
+                remaining_entries = self.indexes.len(),
+                "rs index: evicted least-recently-used parked fold under slot pressure"
+            );
+        }
     }
 
     pub fn release_working_set(&mut self, ws: RsWorkingSetId, epoch: u64) {
@@ -1232,4 +1325,26 @@ fn page_span(
     let first = (start / page) as usize;
     let last = ((end - 1) / page) as usize;
     Ok((first, last))
+}
+
+// ---------------------------------------------------------------------------
+// Explicit fold index (fold parking)
+// ---------------------------------------------------------------------------
+
+/// One parked fold: the index owns a FORK of the published working set, so
+/// the folded slot survives the publisher's death by ordinary refcounting.
+///
+/// This is the recurrent half of the explicit prefix index. The KV half parks
+/// pages; without this, a per-request guest on a hybrid model could resume
+/// attention state but not the fold, and served fluent output computed from a
+/// recurrent state that covered only the suffix — measured at temp 0 as a
+/// systematic cold-vs-resumed divergence
+/// (`integrations/opencode/finding-apc-hybrid-fold.md`). vLLM ships the same
+/// idea as its experimental "align"-mode Mamba cache; here the parked fork
+/// stands at the exact publish position rather than a block boundary.
+struct RsIndexEntry {
+    ws: RsWorkingSetId,
+    /// Recency stamp from [`RsStore::index_clock`] — insert and every
+    /// [`RsStore::from_index`] hit. Eviction order under slot pressure.
+    last_touch: u64,
 }

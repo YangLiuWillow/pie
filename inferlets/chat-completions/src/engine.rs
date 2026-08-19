@@ -269,6 +269,7 @@ macro_rules! define_generate {
             // `kv_verify` discipline: a rebuild is slow, a wrong prefix is silent.
             // Not an error — a correct turn at full price is still a correct turn.
             let mut resumed_address: Option<String> = None;
+            let mut resumed_rs: Option<RsWorkingSet> = None;
             let (ws, cached) = match apc.resume {
                 Some(r) => {
                     let have = r.ws.page_len();
@@ -277,6 +278,7 @@ macro_rules! define_generate {
                         && have == r.cached_tokens / page_t
                     {
                         resumed_address = Some(r.address);
+                        resumed_rs = r.rs;
                         (r.ws, r.cached_tokens)
                     } else {
                         eprintln!(
@@ -293,6 +295,7 @@ macro_rules! define_generate {
                             Ok(_) => {}
                             Err(e) => eprintln!("[apc] remove of bad entry failed: {e}"),
                         }
+                        let _ = RsWorkingSet::remove_index(&crate::apc::rs_key(&r.address));
                         (WorkingSet::new(), 0)
                     }
                 }
@@ -416,12 +419,18 @@ macro_rules! define_generate {
             // chunks and the decode fires so decode continues the prefill's
             // state. `pass_kind() != Attention` is exactly the class predicate
             // the driver's rs arity check uses.
+            // On a resume the fold arrives WITH the KV (`apc::Resume.rs` —
+            // both halves or the cut was a miss), standing at exactly
+            // `cached`, so the first suffix fire is an ordinary paged
+            // continuation. Cold turns start a fresh fold at zero, exactly
+            // as before.
             let rs_ws: Vec<RsWorkingSet> =
                 if model::pass_kind() != model::ForwardKind::Attention {
-                    vec![RsWorkingSet::new()]
+                    vec![resumed_rs.take().unwrap_or_default()]
                 } else {
                     Vec::new()
                 };
+            drop(resumed_rs);
 
             // ── ONE PIPELINE: prefill chunks and decode are one sequential stream.
             let pipe = Pipeline::new();
@@ -435,13 +444,64 @@ macro_rules! define_generate {
             // attention (they are inside `readable_pages`) but never re-embedded,
             // never re-projected, and never rewritten.
             let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-            let spans = prefill_chunks(n - cached, None);
+            // ── The fold-park point. On a recurrent model the cut to be
+            // published needs the FOLD standing exactly there, and a fold
+            // only ever stands where the prefill has just put it — so the
+            // chunking must BREAK at the cut, and the fork is taken in the
+            // gap. This is the session arm's pre-scratch fork, relocated to
+            // mid-prefill: everything before the cut is the state to park,
+            // everything after (rest of history, cue, decode) runs on the
+            // parent, whose first post-fork write copies the slot (CoW).
+            //
+            // `cut >= cached` always: the resume cut is one of this render's
+            // own cuts, and the publish cut is the deepest. Equality (a
+            // no-growth turn) forks before any fire — the resumed fold
+            // already stands at the cut.
+            let park_cut: Option<u32> =
+                if model::pass_kind() != model::ForwardKind::Attention {
+                    apc.publish.first().map(|(c, _)| *c).filter(|&c| c >= cached)
+                } else {
+                    None
+                };
+            let mut park_rs: Option<RsWorkingSet> = None;
+            let mut spans: Vec<(u32, u32)> = Vec::new();
+            match park_cut {
+                Some(cut) if cut > cached => {
+                    spans.extend(prefill_chunks(cut - cached, None));
+                    let off = cut - cached;
+                    spans.extend(
+                        prefill_chunks(n - cut, None)
+                            .into_iter()
+                            .map(|(s, e)| (s + off, e + off)),
+                    );
+                }
+                _ => spans.extend(prefill_chunks(n - cached, None)),
+            }
+            if park_cut == Some(cached) {
+                match rs_ws.first().map(|r| r.fork(&pipe)) {
+                    Some(Ok(f)) => park_rs = Some(f),
+                    Some(Err(e)) => eprintln!("[apc] fold fork at cut {cached} failed: {e}"),
+                    None => {}
+                }
+            }
             let mut g0 = 0i32;
             for &(span_base, span_end) in &spans {
                 // `prefill_chunks` splits a LENGTH evenly; these are absolute
                 // positions in the prompt, which is what every channel below
                 // (tokens, positions, write descriptors) is indexed by.
                 let (base, end) = (span_base + cached, span_end + cached);
+                if park_cut == Some(base) && park_rs.is_none() {
+                    match rs_ws.first().map(|r| r.fork(&pipe)) {
+                        Some(Ok(f)) => park_rs = Some(f),
+                        Some(Err(e)) => {
+                            // No fork, no park: `publish` refuses a KV-only
+                            // entry on a recurrent model, so a failed fork
+                            // costs this turn's park, never correctness.
+                            eprintln!("[apc] fold fork at cut {base} failed: {e}");
+                        }
+                        None => {}
+                    }
+                }
                 let len = end - base;
                 let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
                 let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
@@ -691,7 +751,9 @@ macro_rules! define_generate {
             if !apc.publish.is_empty() {
                 let park = Pipeline::new();
                 for (cut, address) in &apc.publish {
-                    if crate::apc::publish(&park, &ws, *cut, address, page_t) {
+                    let rs_at_cut =
+                        if park_cut == Some(*cut) { park_rs.as_ref() } else { None };
+                    if crate::apc::publish(&park, &ws, rs_at_cut, *cut, address, page_t) {
                         outcome.published += 1;
                     }
                 }
@@ -720,6 +782,7 @@ macro_rules! define_generate {
             if let Some(addr) = resumed_address {
                 let republished = apc.publish.iter().any(|(_, a)| a == &addr);
                 if outcome.published > 0 && !republished {
+                    let _ = RsWorkingSet::remove_index(&crate::apc::rs_key(&addr));
                     match WorkingSet::remove_index(addr.as_bytes()) {
                         Ok(_) => {}
                         Err(e) => eprintln!("[apc] retire of superseded entry failed: {e}"),

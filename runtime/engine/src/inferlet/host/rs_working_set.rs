@@ -165,6 +165,76 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         }
     }
 
+    /// Park this working set's fold under `key`. Same scope/failure
+    /// discipline as `fork` (the store-level park IS a fork), same no-drain
+    /// rationale: RS mappings publish at prepare, in submission order.
+    async fn update_index(
+        &mut self,
+        this: Resource<RsWorkingSet>,
+        on: Resource<Pipeline>,
+        key: Vec<u8>,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let (failure, scope) = {
+            let pipeline = self.ctx().table.get(&on)?;
+            (pipeline.failure.clone(), pipeline.scope.clone())
+        };
+        let ws = self.ctx().table.get(&this)?.clone();
+        if let Err(owner) = ws.claim_pipeline_scope(&scope) {
+            return Ok(Err(format!(
+                "rs working set update-index: parent is scoped to pipeline {owner:#x}, \
+                 not supplied pipeline {:#x}",
+                scope.id()
+            )));
+        }
+        if let Some(reason) = failure.lock().unwrap().clone() {
+            return Ok(Err(format!(
+                "rs working set update-index: pipeline failed: {reason}"
+            )));
+        }
+        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let parked = stores.rs.lock().unwrap().update_index(key, ws.id);
+        match parked {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    /// Fork the parked fold back out (see the KV twin for the model-0
+    /// convention on statics). The caller owns the result; the entry keeps
+    /// its own fork.
+    async fn from_index(
+        &mut self,
+        key: Vec<u8>,
+    ) -> Result<Result<Option<Resource<RsWorkingSet>>, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let model = 0;
+        let caps = crate::model::model().rs_caps();
+        let geom = RsGeometry {
+            state_size: caps.state_size,
+            buffer_page_tokens: caps.buffer_page_size,
+            fold_granularity: caps.fold_granularity,
+        };
+        let stores = store_registry::get(model, 0);
+        let resumed = stores.rs.lock().unwrap().from_index(&key);
+        match resumed {
+            Ok(Some(id)) => {
+                let ws = RsWorkingSet::new(model, 0, id, geom);
+                self.register_rs_working_set(model, 0, id);
+                Ok(Ok(Some(self.ctx().table.push(ws)?)))
+            }
+            Ok(None) => Ok(Ok(None)),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn remove_index(&mut self, key: Vec<u8>) -> Result<Result<bool, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let stores = store_registry::get(0, 0);
+        let removed = stores.rs.lock().unwrap().remove_index(&key);
+        Ok(Ok(removed))
+    }
+
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         // `release` performs the exact `release_working_set` /

@@ -57,6 +57,7 @@
 //! and the caller is responsible for passing that boundary.
 
 use inferlet::ptir::attention::prelude::*;
+use inferlet::ptir::RsWorkingSet;
 use pie_openai_serving::{TEMPLATE_MARKER, prefix_addresses};
 
 /// How many aligned cuts to park per turn.
@@ -128,7 +129,21 @@ pub const BOUNDARY_STRIDE: u32 = 256;
 pub struct Resume {
     pub cached_tokens: u32,
     pub ws: WorkingSet,
+    /// The parked FOLD at exactly `cached_tokens`, present on recurrent
+    /// models. Resuming KV without it serves a model that does not exist
+    /// (`finding-apc-hybrid-fold.md`), so on a hybrid a cut whose fold is
+    /// missing is a MISS, not a partial hit.
+    pub rs: Option<RsWorkingSet>,
     pub address: String,
+}
+
+/// The recurrent half's index key for a cut address: same opaque namespace,
+/// disjoint from the KV key by suffix. One address, two entries, one
+/// lifecycle — publish both or neither, retire both.
+pub fn rs_key(address: &str) -> Vec<u8> {
+    let mut k = address.as_bytes().to_vec();
+    k.extend_from_slice(b"#rs");
+    k
 }
 
 /// The addressed cut ladder for one render.
@@ -171,12 +186,37 @@ impl Plan {
     /// pays a rebuild. The alternative — failing the request because the cache
     /// is unavailable — trades a slow answer for no answer.
     pub fn resume(&self) -> Option<Resume> {
+        let recurrent =
+            inferlet::model::pass_kind() != inferlet::model::ForwardKind::Attention;
         for (cut, address) in self.cuts.iter().rev() {
             match WorkingSet::from_index(address.as_bytes()) {
                 Ok(Some(ws)) => {
+                    // On a hybrid, KV alone is not the state: the fold must
+                    // be parked at this exact cut or the cut is a miss. The
+                    // KV entry without its fold half is garbage (nothing can
+                    // ever legally resume it), so drop it rather than let it
+                    // pin pages until pressure eviction gets around to it.
+                    let rs = if recurrent {
+                        match RsWorkingSet::from_index(&rs_key(address)) {
+                            Ok(Some(rs)) => Some(rs),
+                            Ok(None) => {
+                                let _ = WorkingSet::remove_index(address.as_bytes());
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[apc] rs from_index failed at cut {cut}: {e}; miss"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     return Some(Resume {
                         cached_tokens: *cut,
                         ws,
+                        rs,
                         address: address.clone(),
                     });
                 }
@@ -256,7 +296,14 @@ pub fn aligned_cuts(boundaries: &[u32], page: u32, history_len: u32) -> Vec<u32>
 /// Failure is logged and swallowed for the same reason a miss is: the turn is
 /// correct either way, and a cache that cannot park is a slow turn, not a
 /// wrong one.
-pub fn publish(pipe: &Pipeline, ws: &WorkingSet, cut: u32, address: &str, page: u32) -> bool {
+pub fn publish(
+    pipe: &Pipeline,
+    ws: &WorkingSet,
+    rs_at_cut: Option<&RsWorkingSet>,
+    cut: u32,
+    address: &str,
+    page: u32,
+) -> bool {
     if page == 0 || cut == 0 || cut % page != 0 {
         eprintln!("[apc] refusing to publish an unaligned cut {cut} (page {page})");
         return false;
@@ -269,9 +316,30 @@ pub fn publish(pipe: &Pipeline, ws: &WorkingSet, cut: u32, address: &str, page: 
         );
         return false;
     }
+    let recurrent =
+        inferlet::model::pass_kind() != inferlet::model::ForwardKind::Attention;
+    if recurrent && rs_at_cut.is_none() {
+        // The caller never crossed the cut with a live fold to fork (a
+        // degraded prefill, or a resume that landed past it). Publishing the
+        // KV half alone would recreate exactly the wrong-context entry this
+        // design exists to forbid.
+        eprintln!("[apc] refusing a KV-only park at cut {cut} on a recurrent model");
+        return false;
+    }
     match ws.slice(pipe, 0, pages) {
         Ok(prefix) => match prefix.update_index(address.as_bytes()) {
-            Ok(()) => true,
+            Ok(()) => {
+                if let Some(rs) = rs_at_cut {
+                    if let Err(e) = rs.update_index(pipe, &rs_key(address)) {
+                        // Both halves or neither: a KV entry whose fold
+                        // failed to park is the forbidden shape. Undo.
+                        eprintln!("[apc] rs update_index failed at cut {cut}: {e}; unparking KV");
+                        let _ = WorkingSet::remove_index(address.as_bytes());
+                        return false;
+                    }
+                }
+                true
+            }
             Err(e) => {
                 eprintln!("[apc] update_index failed at cut {cut}: {e}");
                 false

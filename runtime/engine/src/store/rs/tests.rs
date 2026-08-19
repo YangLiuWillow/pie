@@ -1030,3 +1030,81 @@ fn discarding_buffered_tokens_releases_content_but_not_capacity() {
     assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
     assert_eq!(s.buffer_size(ws).unwrap(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Fold index (fold parking)
+// ---------------------------------------------------------------------------
+
+/// The core promise: a parked fold outlives its publisher. Park, release the
+/// source working set entirely (the per-request guest died), and the fold is
+/// still there to fork out — sharing the slot, not copying it.
+#[test]
+fn parked_fold_survives_publisher_death() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    let slot = s.folded_slot(ws).unwrap().unwrap();
+
+    s.update_index(b"prefix".to_vec(), ws).unwrap();
+    s.release_working_set(ws, s.current_epoch());
+    s.retire_idle();
+    assert_eq!(s.available_slots(), 11, "the parked fork pins the slot");
+
+    let resumed = s.from_index(b"prefix").unwrap().unwrap();
+    assert_eq!(
+        s.folded_slot(resumed).unwrap(),
+        Some(slot),
+        "the resumed working set shares the parked slot"
+    );
+
+    // Removal frees nothing while the resumed handle lives...
+    assert!(s.remove_index(b"prefix"));
+    assert_eq!(s.folded_slot(resumed).unwrap(), Some(slot));
+    // ...and everything once it goes.
+    s.release_working_set(resumed, s.current_epoch());
+    s.retire_idle();
+    assert_eq!(s.available_slots(), 12);
+}
+
+/// Slot pressure evicts parked folds LRU-first and never the entry being
+/// published — the leave-room rule, sized to the admission complement.
+#[test]
+fn parked_folds_evict_lru_under_slot_pressure() {
+    // 12 slots; keep-free is 8, so a third park (3 pinned + 1 live write in
+    // flight is not even needed) crosses the band.
+    let mut s = store();
+    let mut park = |s: &mut RsStore, key: &[u8]| {
+        let ws = s.create_working_set(geom());
+        write_state(s, ws);
+        s.update_index(key.to_vec(), ws).unwrap();
+        s.release_working_set(ws, s.current_epoch());
+        s.retire_idle();
+    };
+    park(&mut s, b"a");
+    park(&mut s, b"b");
+    // Touch "a" so "b" is the LRU.
+    let touched = s.from_index(b"a").unwrap().unwrap();
+    s.release_working_set(touched, s.current_epoch());
+    s.retire_idle();
+
+    // Parking "c" leaves 9 free BEFORE eviction (12 - 3 pinned) ... which is
+    // above the band only until the NEXT park. Park "d" too: 8 free after it
+    // would be exactly the band, so drive one more to force eviction.
+    park(&mut s, b"c");
+    park(&mut s, b"d");
+    park(&mut s, b"e");
+
+    assert!(
+        s.from_index(b"b").unwrap().is_none(),
+        "the cold entry was evicted first"
+    );
+    assert!(
+        s.from_index(b"e").unwrap().is_some(),
+        "the just-parked entry survives"
+    );
+    assert!(
+        s.available_slots() >= 4,
+        "eviction restored headroom (got {})",
+        s.available_slots()
+    );
+}
