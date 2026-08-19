@@ -172,3 +172,35 @@ intact.
 
 See `driver/metal/docs/m5-pro-bringup-plan.md` for the active plan and
 `driver/metal/docs/` for the constants it produces.
+
+---
+
+## Verified against this clone (2026-08-19 /init pass)
+
+**The tree this file describes does not live on `dev`.** `origin/dev` last
+moved 2026-06-24 and contains none of: `compiler/`, `loader/`, `model/`, the
+Metal driver sources, `tests/gpu/`, or `benches/tune_device.py` /
+`three_way.py` / `mlx_bench.py`. Everything above that names those paths is
+true on the kernel branches instead:
+
+- **`liu/qwen38-27b`** — freshest tip (2026-08-19, merges `liu/a-fold-parking`);
+  full Metal driver, `device_tuning.cpp` with cases for Apple families 9 and 8
+  and **no M5 case** (confirming the plan's gap #1), all bench harnesses.
+- `liu/qwen3-coder-kernels`, `liu/a-fold-parking` — same tree, older tips.
+
+The `docs/m5-pro-bringup-plan` branch was cut from `dev` per setup
+instructions; the bring-up patch also applies cleanly onto `liu/qwen38-27b`
+(none of its four files exist there).
+
+Corrections found while verifying paths the plan cites:
+
+- Roofline/occupancy tooling is at **`driver/metal/tools/rawmetal/`**, not
+  `tools/rawmetal/`.
+- `tests/gpu` is crate `pie-gpu-tests`: integration tests only, no code of its
+  own, and the driver is selected by cargo feature. Run with
+  `--features driver-metal` — a bare `cargo test -p pie-gpu-tests -- --ignored`
+  builds the **dummy-driver fallback**, not Metal.
+- On the kernel branches `/docs/` is still gitignored, but `docs/HANDOVER.md`,
+  `docs/NEXT-decode-dispatch-count.md`, and `docs/plan-attention-depage.md`
+  are force-added and tracked; the prior session's handover is
+  `docs/HANDOVER.md` there.
