@@ -1,0 +1,27 @@
+===== mode '4' =====
+  [stderr] [GDN_FOLDCOMMIT]
+  [stderr] foldcommit prefill=1 buffered=4 committed=4 abandoned=0 g0=198 drafted=198 chained=n/a
+Return: foldcommit prefill=1 buffered=4 committed=4 abandoned=0 g0=198 drafted=198 chained=n/a
+===== mode '2' =====
+  [stderr] [GDN_FOLDCOMMIT]
+  [stderr] foldcommit prefill=1 buffered=4 committed=2 abandoned=2 g0=198 drafted=198 chained=n/a
+Return: foldcommit prefill=1 buffered=4 committed=2 abandoned=2 g0=198 drafted=198 chained=n/a
+===== mode '0' =====
+  [stderr] [GDN_FOLDCOMMIT]
+  [stderr] foldcommit prefill=1 buffered=4 committed=0 abandoned=4 g0=198 drafted=198 chained=n/a
+Return: foldcommit prefill=1 buffered=4 committed=0 abandoned=4 g0=198 drafted=198 chained=n/a
+===== mode 'chain' =====
+Error: chain submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'mixed' =====
+Error: prefill take: duo_peak take: channel is poisoned: driver published poison epoch 1
+===== mode 'behind' =====
+Error: B-append submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'empty' =====
+Error: C-commit submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'device' =====
+Error: B-append submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: driver published RETRY at frame settle; retry is not a v14 outcome (frame admission bounds every in-frame gate)
+===== mode 'interior' =====
+Error: arms disagree on the prefill token: 271 vs 198 vs 198
+===== mode 'inside' =====
+Error: arms disagree on the prefill token: 271 vs 198
+pie-client websocket listener stopped: ConnectionClosedError: sent 1000 (OK); no close frame received (close code 1006, reason '')

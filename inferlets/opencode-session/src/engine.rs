@@ -532,13 +532,21 @@ where
     // copy-on-write child can continue itself and forking is usable.
     //
     // Generation therefore FOLDS normally. The buffer-and-discard scheme this
-    // replaces was CUDA-only in a way nothing checked: Metal validates
-    // `rs_fold_lens` in `batch/compose.cpp` and then never reads it again, and
-    // refuses the buffer READ path outright, so every fire folded regardless
-    // and `discard_buffered` silently left the guest believing a state stood at
-    // `render_len` while the device had folded the whole scratch span. That is
-    // the bug this replaces; see `integrations/opencode/finding-hybrid-session-
-    // resume.md`.
+    // replaces was CUDA-only at the time: Metal then validated `rs_fold_lens`
+    // in `batch/compose.cpp` and never read it again, so every fire folded
+    // regardless and `discard_buffered` silently left the guest believing a
+    // state stood at `render_len` while the device had folded the whole
+    // scratch span (`integrations/opencode/finding-hybrid-session-resume.md`).
+    //
+    // MEASURED STALE 2026-08-18: Metal honours `fold_len` now — buffer
+    // without folding, commit-accepted and abandon-rejected all execute with
+    // pinned state parity (`gdn-foldcommit` on a real boot; see
+    // `finding-metal-buffered-rs.md`). The buffer READ path (appending to a
+    // non-empty buffer) is still refused on BOTH backends, which shapes any
+    // future speculation cadence but no longer forbids it. Retention stays on
+    // the fork: it is simpler, measured correct, and independent of buffer
+    // support. What the buffered path would buy is DECODE speculation, whose
+    // viability is the verify fire's multi-row arithmetic, not this fork.
     let ws = &state.ws;
     let rs = &state.rs[..];
     let pool_ids: Vec<u32> = (0..pool_pages).collect();

@@ -163,7 +163,22 @@ keeps the pipeline usable.
 Lands in the **TTFT** column, not the per-token rate — which matters because
 TTFT is what the A-vs-B comparison is quoted on.
 
-### 3.3 Sequential decode may not be necessary
+### 3.3 MEASURED 2026-08-18 — sequential decode is no longer driver-forced
+
+> The fold-position re-measurement ran (`gdn-foldcommit` suite against a
+> real Metal boot; see `finding-metal-buffered-rs.md`). The engine.rs claim
+> that Metal ignores `rs_fold_lens` and folds every fire is STALE: buffer
+> k without folding → commit accepted → abandon rejected WORKS on Metal
+> today, with state parity pinned by the `inside` mode. Still refused:
+> buffer append/replay (`chain`, same as CUDA), fold-behind, empty-row
+> commit, device fold-len, interior boundary. New defect: the `mixed`
+> shape (one row folds, one buffers) loses its `qo_indptr` on the wire and
+> POISONS the epoch — third member of that family. Whether buffered
+> speculation is worth building for B's decode is now purely the verify
+> fire's multi-row arithmetic (rows=8 = 4.1× a 1-row fire, the per-row KV
+> re-read) — liszt-ai-00's territory. The original section follows.
+
+### 3.3-as-handed-over: Sequential decode may not be necessary
 
 `engine.rs:24-45` rejects `run_ahead` because overshoot fires fold
 irreversibly. That reasoning came from the qwen-code port, which **sealed**;

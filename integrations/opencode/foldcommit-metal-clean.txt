@@ -1,0 +1,15 @@
+===== mode 'interior' =====
+Error: A submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'inside' =====
+  [stderr] [GDN_FOLDCOMMIT]
+  [stderr] foldthrough tokens=4 buffered=2 a_last=198 b_last=198 a_next=198 b_next=198 agree=yes
+Return: foldthrough tokens=4 buffered=2 a_last=198 b_last=198 a_next=198 b_next=198 agree=yes
+===== mode 'chain' =====
+Error: chain submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'behind' =====
+Error: B-append submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'empty' =====
+Error: C-commit submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: work item completion published Failed terminal outcome
+===== mode 'device' =====
+Error: B-append submit: pipeline: frame slot 0: pipeline: pipeline failed: pipeline: forward failed: driver published RETRY at frame settle; retry is not a v14 outcome (frame admission bounds every in-frame gate)
+pie-client websocket listener stopped: ConnectionClosedError: sent 1000 (OK); no close frame received (close code 1006, reason '')
