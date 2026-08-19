@@ -452,7 +452,19 @@ impl RsStore {
     /// Loud, for the same reason: an evicted conversation pays a full cold
     /// rebuild on its next turn and that cost must be attributable.
     fn evict_index_under_pressure(&mut self, protect: &[u8]) {
-        loop {
+        // AT MOST TWO victims per park, and this cap is load-bearing, not
+        // politeness. A released fold's slot returns only after its epoch
+        // SETTLES, so under a continuous fire stream an eviction moves
+        // `available()` by nothing right away — and a loop that keys on
+        // `available()` then evicts the ENTIRE index while relieving no
+        // pressure at all. Measured on the mono ramp: 21 evictions, the
+        // cache destroyed, and the turn still queued on the slot pool until
+        // the waiter clamp turned it into a 503 at 46,661 tokens. Two per
+        // park makes relief EVENTUAL (deferred frees land by the next park)
+        // while the index keeps its hot entries; the band still decides
+        // WHEN to evict, this decides how hard.
+        const MAX_VICTIMS_PER_PARK: usize = 2;
+        for _ in 0..MAX_VICTIMS_PER_PARK {
             self.retire_idle();
             if self.pool.available() >= Self::INDEX_KEEP_FREE_SLOTS {
                 return;
