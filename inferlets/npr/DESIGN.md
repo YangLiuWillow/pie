@@ -983,6 +983,20 @@ deadlock would *look* like a 100%-failure cliff.
 Workaround until fixed: keep peak concurrent KV demand under the pool
 (the diagnostic re-ran at concurrency 8 without issue).
 
+**Scoped 2026-08-20 — see `BUG16-SCOPE.md` (same directory).** The "prime
+suspect" above is partly right and materially incomplete. Five liveness holes
+are now established from the code, the sharpest being that the escape hatch is
+powered by the thing that stopped: `defaulted` (the flag that makes a context
+evictable regardless of bid) is written only by the market tick, and the market
+tick is sent only after `execute_batch` — so once no batch can be formed, rent
+stops, nobody defaults, and a bid standoff can never be broken. Rent is also
+charged only to *in-batch* contexts, so an idle page hoarder never defaults even
+while the clock runs. Which hole is the *entry* condition is still unknown;
+BUG16-SCOPE.md §6 registers the discriminating predictions in advance and §7
+notes that `SchedCounters` already tracks everything needed to tell them apart —
+its only dump site is commented out, which is why the 40-minute wedge left no
+evidence. **No reproduction has been attempted and no patch is proposed.**
+
 ### Measurement hygiene (cross-session lessons, 2026-08-14/16)
 
 Collected from this branch's sweeps and two parallel sessions' parity work
