@@ -31,19 +31,36 @@ document does, so it goes at the top.
 
 ### The four real gaps
 
+> **Correction (2026-08-19 verify pass).** Gaps 2 and 3 below were written
+> against an older snapshot and are **stale on this tree**. The branch this
+> plan now sits on carries the 2026-08-16 kernel work (`docs/HANDOVER.md`):
+> `mpp::tensor_ops::matmul2d` with cooperative-tensor accumulators is already
+> the substrate of `src/kernels/nax_frag.h`, and NAX kernels are **landed and
+> dispatched** — `sdpa_paged_nax` (prefill attention, 4.86× over
+> `sdpa_paged_mma`), `affine_qmm_t_nax` (dense, 2.72×), and
+> `affine_qmm_t_routed_nax` (routed MoE, 1.92–2.21×). `matrix_rate_probe`
+> already measured the two matrix units on this machine: **5.48 vs
+> 32.5 TFLOP/s** — Phase 2's headline ratio (~5.9×, far above the 1.2× gate)
+> already has an on-machine answer, and Phase 3's core port exists.
+> `roofline_probe` has also already put the streaming roof at 294–298 GB/s.
+> Phases 2 and 3 must be re-scoped against `docs/HANDOVER.md` before
+> execution; Phase 0 and Phase 1 stand as written. Gap 1 is real but
+> mis-stated: see the T0.2 correction below (an M5 selects the **case-9
+> M3/M4 block**, not the M1 Max default).
+
 1. **No M5 entry in `device_tuning.cpp`.** Apple families through M4 have
    overrides; an M5 falls back to M1 Max constants. The file's own header names
    this as the costly failure: "the GEMM crossover sits three rows too high, so
    the batches where the GEMM already wins are still served by the GEMV."
-2. **No cooperative-tensor compute path.** `mtl4_context.mm` uses the Metal 4
-   *command* API (MTL4CommandQueue, MTL4Compiler, MTL4ArgumentTable,
-   MTLResidencySet, timestamps) but every matmul goes through
-   `simdgroup_matrix`. `mpp::matmul2d` appears once, in a comment. On M5 the
-   Neural Accelerators are reachable only through the tensor API, and BaseRT
-   attributes up to 4× prefill to exactly this.
+   *(Verify pass: the fallback is the case-9 block, not the default — the
+   family probe in `device_tuning_apple.mm` stops at `MTLGPUFamilyApple9`, so
+   an M5 reports family 9. Still no M5-specific entry; T0.2 confirms which
+   block actually fires.)*
+2. **No cooperative-tensor compute path.** *(Stale — see correction above.)*
 3. **No narrow-type measurement on M5.** Whether fp8/int8 have a native path on
    the Neural Accelerators is unpublished anywhere. It decides whether W8A8 is
-   ever worth building for the batched-decode regime.
+   ever worth building for the batched-decode regime. *(Still open: the landed
+   NAX kernels are bf16-operand; no fp8/int8 rate has been taken.)*
 4. **Quality gating is cosine/tap-based, not divergence-based.** No
    per-category KL divergence against a bf16 reference.
 
@@ -77,36 +94,82 @@ Do not upgrade — see `CLAUDE.md`.
 ```sh
 cargo build --workspace --all-targets --exclude pie-server-py
 cargo test --workspace
-# on-device suite (mostly #[ignore]d)
-cargo test -p pie-gpu-tests -- --ignored
+
+# The Metal driver's on-device suite is CMake/ctest, NOT cargo. (`pie-gpu-tests`
+# is the CUDA/dummy e2e suite: every #[ignore]d test there boots a 4090 config;
+# `--features driver-metal` compiles the driver but runs no Metal test.)
+cargo rustc -p pie-loader-capi --lib --crate-type staticlib   # target/debug/libpie_loader_capi.a
+cmake -S driver/metal -B /tmp/metaltests -DCMAKE_BUILD_TYPE=Release -DPIE_METAL_BUILD_TOOLS=ON
+cmake --build /tmp/metaltests -j
+ctest --test-dir /tmp/metaltests --output-on-failure
 ```
+
+The loader staticlib is found automatically in `target/{debug,release}`;
+without it the `NEEDS_LOADER` tests (`llama_bench`, the forward tests) are
+skipped by name. The MLX-gated reference tests (`tests/` subdirectory) need
+`-DPIE_METAL_WITH_MLX=ON -DPIE_METAL_BUILD_TESTS=ON` and fetch MLX C++.
 
 **Success metric:** the Metal driver builds and the on-device tests pass on M5
 Pro. Any failure here is an M5 compatibility bug and is the first thing to fix —
 every later number depends on the driver being correct on this silicon.
+"Pass" means *matches the recorded baseline*: `llama_numerics_test` has a
+recorded 50 pass / 19 fail state (18 pre-existing MoE routing ties plus one
+deliberate row-gate tie — `docs/HANDOVER.md` §5.4); reproducing that is a pass,
+anything beyond it is the M5 bug this task exists to catch.
 
-**Knowledge needed:** `driver/metal/CMakeLists.txt`; `CLAUDE.md` build section.
+**Knowledge needed:** `driver/metal/CMakeLists.txt`; `CLAUDE.md` build section;
+`docs/HANDOVER.md` §6 (the suite states recorded on this machine).
 
 ---
 
 ## T0.2 — Record what the driver thinks this machine is
 
+The invocation this task originally named does not exist: `descriptor_facts`
+is `driver/metal/tests/descriptor_facts_test.cpp`, a **ModelFacts descriptor**
+parsing test — it never touches the device. Nothing in the tree prints
+`pie::metal::query_device_info()`; this task adds a small probe to
+`driver/metal/tools/rawmetal/` that calls the driver's own query and
+`tuning_for()` and prints what came back.
+
 ```sh
-# apple_family and gpu_core_count as the driver resolves them
-cargo test -p pie-gpu-tests descriptor_facts -- --ignored --nocapture
+cmake --build /tmp/metaltests -j --target device_identity_probe
+/tmp/metaltests/tools/rawmetal/device_identity_probe
 ```
+
+**Expectation, corrected:** not the M1 Max default. `query_apple_family()`
+probes newest-first but stops at `MTLGPUFamilyApple9` (the macOS 26.5 SDK does
+define `MTLGPUFamilyApple10`), so an M5 answers **family 9** and selects the
+**case-9 (M3/M4) block** in `tuning_for()` — wrong constants, but a different
+wrong than the plan assumed. The probe settles it.
 
 **Success metric:** `apple_family` and `gpu_core_count` recorded in
 `driver/metal/docs/m5-pro-measurements.md`, plus confirmation of **which**
-`DeviceTuning` block an M5 currently selects (expected: the default, i.e. M1 Max).
+`DeviceTuning` block an M5 currently selects.
 
 ---
 
 ## T0.3 — Three-way baseline
 
+`three_way.py` takes no defaults — `--mlx-model`, `--gguf` and `--label` are
+required, shapes are `shape:n:concurrency:max_tokens`, and prompt length is
+set in words (`--prompt-words`; actual per-engine prompt tokens are reported
+back). Its engine loop nests reps *inside* each engine, so the §Conventions
+"arms alternated, not batched" rule means `--repeats 1` and re-invoking the
+script once per repetition:
+
 ```sh
-python benches/three_way.py   # pie vs mlx vs llama.cpp, pinned versions
+# one repetition at one prompt length; run 5× per length, lengths 128..2048
+python benches/three_way.py \
+  --mlx-model ~/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/<hash> \
+  --gguf <q4_0 gguf> --label qwen3-0.6b \
+  --prompt-words 128 --shapes latency:8:1:128 --repeats 1 --out runs.jsonl
 ```
+
+The pie arm boots `pie_bench.py --driver metal` (needs the workspace built with
+`--features driver-metal` and the `tests/inferlets/text-completion-bench`
+inferlet); the mlx and llama.cpp arms use the pinned installs in
+`~/.cache/pie-metal/` (see `CLAUDE.md`). `--no-ignore-eos` is forced for all
+three, and per-engine prompt/output token counts are printed — record them.
 
 Models: start with the small dense ones so the variable is the driver, not the
 architecture.
@@ -160,8 +223,12 @@ M1 Max constants on this machine.*
 ## T1.1 — Sweep the crossovers
 
 ```sh
-python benches/tune_device.py            # prints a tuning_for() block
-python benches/tune_device.py --control  # same arms at a batch where they agree
+# --bench is required: the built llama_bench, a CMake target from the T0.1
+# configure (NEEDS_LOADER, so the loader staticlib must have been found).
+# --checkpoint-root is optional; it defaults to ~/.cache/huggingface/hub and
+# ~/.pie-bench, and knobs whose named checkpoints are absent are SKIPped.
+python benches/tune_device.py --bench /tmp/metaltests/llama_bench            # prints a tuning_for() block
+python benches/tune_device.py --bench /tmp/metaltests/llama_bench --control  # same arms at a batch where they agree
 ```
 
 Read the script header before running. Its documented methodology error is the
@@ -189,9 +256,20 @@ the actual delta on M5 and record it.
 ## T1.3 — Roofline constants
 
 ```sh
-./roofline_probe <kernels> 128 32     # see tools/rawmetal/roofline_probe.cpp
+# Both build under -DPIE_METAL_BUILD_TOOLS=ON (tools/rawmetal/CMakeLists.txt).
+# roofline_probe's signature is positional with defaults:
+#   roofline_probe [kernels_dir] [M=16] [BN=32] [SPLIT=1]
+# The kernels dir is compiled in (PIE_METAL_TOOL_KERNELS_DIR points at
+# src/kernels), so a bare invocation works; name it only to override.
+./roofline_probe                      # streaming roof + qmm/qmv at model shapes
+./roofline_probe <kernels_dir> 128 32 # the same at M=128 rows
 ./dvfs_probe                          # clock behaviour under sustained load
 ```
+
+Note this machine already has a recorded streaming roof — 294–298 GB/s
+(`docs/HANDOVER.md`, which calls `roofline_probe` "the bandwidth authority").
+T1.3 re-takes it under this plan's ±3%/5-runs protocol rather than trusting
+the prior session's number.
 
 Capture: peak sustained bandwidth (GB/s), peak achieved TFLOP/s, and the
 resulting ridge point `peak_FLOPS / peak_bandwidth`.
@@ -384,19 +462,39 @@ tensor-path verification is a result BaseRT structurally cannot produce.
 
 ---
 
-# Verify before executing
+# Verify before executing — answered (2026-08-19, against this tree)
 
-Read via a shallow clone of `dev` and a fetch of external docs, not by running
-anything. Confirm first:
+The five items below were confirmed by reading this working tree before
+anything was run. The corrected invocations are folded into the task sections
+above; this section records what was found.
 
-1. **Test target names** — `cargo test -p pie-gpu-tests descriptor_facts` and the
-   `--ignored` invocations are inferred from the workspace comment on
-   `tests/gpu`, not from a run. Check `tests/gpu/Cargo.toml`.
-2. **`roofline_probe` invocation** — `./roofline_probe <kernels> 128 32` is copied
-   from a comment in `quantized_qmm_t.metal`. Confirm against
-   `tools/rawmetal/CMakeLists.txt`.
-3. **`three_way.py` / `tune_device.py` arguments** — read `--help` before use.
-4. **Apple family for M5** — `device_tuning.cpp` resolves newest-first; confirm
-   which `MTLGPUFamilyApple<N>` an M5 answers before adding a `case`.
-5. **Whether a `model/qwen_3_6` descriptor is needed** — `model/qwen_3_5` exists;
-   3.6 may already be covered by it.
+1. **Test target names** — the inferred cargo invocations were wrong twice
+   over. `pie-gpu-tests` contains only CUDA/dummy e2e tests (every `#[ignore]`
+   names a 4090); nothing in it exercises Metal, with or without
+   `--features driver-metal`. And `descriptor_facts` exists but is a ModelFacts
+   descriptor-parsing test (`driver/metal/tests/descriptor_facts_test.cpp`),
+   not a device query. The Metal on-device suite is CMake/ctest, registered in
+   `driver/metal/CMakeLists.txt` — see the corrected T0.1 block.
+2. **`roofline_probe` invocation** — positional args with defaults:
+   `[kernels_dir] [M=16] [BN=32] [SPLIT=1]`; the kernels dir is compiled in,
+   so a bare run works. Built by `-DPIE_METAL_BUILD_TOOLS=ON`. Corrected in
+   T1.3.
+3. **`three_way.py` / `tune_device.py` arguments** — `three_way.py` requires
+   `--mlx-model`, `--gguf`, `--label`; `tune_device.py` requires `--bench`
+   (the built `llama_bench`). Both corrected in place. `three_way.py` batches
+   reps within each engine, so alternating arms means `--repeats 1` re-invoked.
+4. **Apple family for M5** — the macOS 26.5 SDK defines `MTLGPUFamilyApple10`,
+   but `query_apple_family()` (`device_tuning_apple.mm`) probes newest-first
+   from Apple9 down, so an M5 reports **9** and `tuning_for()` takes the
+   case-9 (M3/M4) block — not the default. Confirmed empirically in T0.2. Any
+   Phase 1 `case` for M5 therefore also needs the probe list extended to
+   Apple10, or the M5 is indistinguishable from an M3/M4.
+5. **Whether a `model/qwen_3_6` descriptor is needed** — there is no
+   `model/qwen_3_6` crate; `model/qwen_3_5` is the newest Qwen generation
+   crate, and the Metal driver's qwen3_5 family (plus
+   `qwen3_5_geometry_test.cpp`, which derives geometry from config) is what
+   already runs Qwen3.6-27B per **[DT]**. Definitive answer stays with Phase 5.
+
+One finding the checklist did not ask for, recorded because it re-scopes the
+plan: this tree already contains the cooperative-tensor work Phases 2–3
+propose — see the correction box under "The four real gaps".
