@@ -7,13 +7,16 @@ read IP PORT < "$NPR_STATE/pod-ssh.txt"; POD=$(cat "$NPR_STATE/pod-id.txt"); OUT
 EXPECT=${EXPECT_ROWS:-0}   # optional: row count that also counts as success
 SSHO="-n -i $HOME/.ssh/id_ed25519_runpod -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
 SCPO="-q -i $HOME/.ssh/id_ed25519_runpod -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-LASTST=""; LASTN=0; FAILS=0
+LASTST=""; LASTN=0; FAILS=0; LASTSELF=""
 for i in $(seq 1 250); do
   ST=$(ssh $SSHO -p $PORT root@$IP 'cat /workspace/CHAIN_STATUS 2>/dev/null' 2>/dev/null | head -1)
   if [ -z "$ST" ]; then FAILS=$((FAILS+1)); [ $FAILS -ge 5 ] && { echo "UNREACHABLE: ssh failed 5x"; FAILS=0; }; sleep 180; continue; fi
   FAILS=0
   scp $SCPO -P $PORT root@$IP:/workspace/pie/inferlets/npr/evals/results/$OUT "$LR/" 2>/dev/null
-  scp $SCPO -P $PORT "root@$IP:/workspace/sweep.log" "root@$IP:/workspace/selftest.log" "$NPR_STATE/" 2>/dev/null
+  scp $SCPO -P $PORT "root@$IP:/workspace/sweep.log" "root@$IP:/workspace/selftest.log" "root@$IP:/workspace/BUILD_SHA" "$NPR_STATE/" 2>/dev/null
+  # Surface the CUDA sentinel line the moment it lands — it gates the whole sweep.
+  ST_LINE=$(grep -h "selftest toplogits" "$NPR_STATE/selftest.log" 2>/dev/null | head -1)
+  if [ -n "$ST_LINE" ] && [ "$ST_LINE" != "$LASTSELF" ]; then echo "[$(date '+%H:%M')] $ST_LINE"; LASTSELF="$ST_LINE"; fi
   N=$(wc -l < "$LR/$OUT" 2>/dev/null | tr -d ' '); N=${N:-0}
   case "$ST" in
     DONE*)
@@ -23,6 +26,11 @@ for i in $(seq 1 250); do
       curl -s --max-time 60 -X DELETE https://rest.runpod.io/v1/pods/$POD -H "Authorization: Bearer $RUNPOD_API_KEY" -o /dev/null
       echo "SWEEP COMPLETE: $ST, rows=$N, pod $POD terminated"; exit 0;;
     SETUP_FAIL) echo "SETUP FAILED — pod $POD left up for inspection"; exit 1;;
+    SELFTEST_FAIL)
+      scp $SCPO -P $PORT "root@$IP:/workspace/serve.log" "$NPR_STATE/" 2>/dev/null
+      echo "CUDA SELFTEST FAILED — no sweep was run; pod $POD left up for diagnosis"
+      grep -h "selftest" "$NPR_STATE/selftest.log" 2>/dev/null | tail -5
+      exit 1;;
   esac
   if [ "$ST" != "$LASTST" ] || [ $((N - LASTN)) -ge 20 ]; then echo "[$(date '+%H:%M')] status=$ST rows=$N"; LASTST="$ST"; LASTN=$N; fi
   sleep 180
