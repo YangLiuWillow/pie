@@ -20,6 +20,9 @@ Fill the baseline tables in driver/metal/docs/m5-pro-measurements.md. Raw CSV
 from the harnesses stays local — *.csv is gitignored repo-wide; the committed
 record is the markdown table with its method.
 
+Deliver each task (T0.1, T0.2, …) as its own branch and PR per the
+"Workflow — one task, one branch, one PR" section in CLAUDE.md.
+
 Do not start Phase 1. Do not modify driver/metal/src/device_tuning.cpp.
 ```
 
