@@ -29,6 +29,43 @@ sits far inside noise. What this sweep can resolve is the mechanism, where the
 signal is much larger: the share of runs that escape the first block, the
 unanswered rate, and the token spend of the runs that do not.
 
+### What a *powered* mean would cost
+
+Worth stating precisely, because the obvious next question is "so run more".
+
+Priced as two independent proportions — `(1.96+0.84)^2 x (0.46x0.54 +
+0.504x0.496) / 0.044^2` — the answer is **2,021 runs per arm**, and that is the
+number to quote if the arms are compared as two marginal accuracies. It is also
+the wrong model for this design.
+
+Both arms run the *same* 25 problems, so the comparison is paired, and AIME
+difficulty is close to bimodal: from §11's rows the between-problem variance of
+latent `p_i` is 0.188 and the problem-level ICC is **0.767**. The model mostly
+either solves a problem or doesn't. That makes `p(1-p) = 0.248` — the per-run
+noise the unpaired formula charges — an overstatement of what a paired test
+fights, which is the *within-problem* variance `E[p(1-p)] = 0.248 - 0.188 =
+0.060`, **4.1x smaller**:
+
+| analysis | runs per arm for 80% power at 0.044 |
+|---|---|
+| unpaired, two marginal proportions | 2,021 |
+| unpaired but clustered (ICC 0.767, k=2) | ~3,570 |
+| **paired on per-problem differences** | **487** |
+| paired, if the effect clips near p=1 (realized 0.0335) | 838 |
+
+So a powered mean costs **~500-1,000 runs per arm** — 5-10x this sweep, roughly
+$15-25 of L40S time at the ~90 min/100 rows this sweep ran at. Affordable, not
+prohibitive. But it buys less than it looks: **the mean can only ever say the
+penalty worked, never which of the two failure populations below moved**, and
+that is what picks the next fix. The mechanism route is the better buy on
+information per dollar, not merely the fallback for a sweep that came up short.
+
+Two conditions on the larger sweep, if anyone runs it. It must be **analyzed
+paired** — 500 runs/arm compared as two independent Wilson intervals will
+overlap and be miscalled null, having paid for the data and discarded the
+design. And ignoring the pairing is worse than the naive figure suggests, not
+better: clustering inflates the k=2 design to ~3,570 runs/arm.
+
 ## The collapse has two causes, not one
 
 Every one of adopt's 23 `blocks<=1` runs reported `stop_reason=branch_terminal`,
@@ -42,6 +79,10 @@ of global budget". Their charge-to-budget ratios separate them:
 
 By contrast the `blocks>=2` stratum averages 0.455 of budget: runs that get out
 of the first block finish with more than half the ledger unspent.
+
+Closing 0.460 -> 0.504 through this channel requires **12.4% of the stranded
+runs to convert** to blocks>=2 — a concrete prediction the mechanism read can be
+scored against, and one the mean cannot express.
 
 The repetition penalty is a plausible fix for the first group only — §15's
 theory is that it shortens repetition-inflated branches. The second group is a
