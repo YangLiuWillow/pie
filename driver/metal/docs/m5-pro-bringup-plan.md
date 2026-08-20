@@ -102,9 +102,9 @@ cargo test --workspace --exclude pie-server-py
 # is the CUDA/dummy e2e suite: every #[ignore]d test there boots a 4090 config;
 # `--features driver-metal` compiles the driver but runs no Metal test.)
 cargo rustc -p pie-loader-capi --lib --crate-type staticlib   # target/debug/libpie_loader_capi.a
-cmake -S driver/metal -B /tmp/metaltests -DCMAKE_BUILD_TYPE=Release -DPIE_METAL_BUILD_TOOLS=ON
-cmake --build /tmp/metaltests -j
-ctest --test-dir /tmp/metaltests --output-on-failure
+cmake -S driver/metal -B build/metaltests -DCMAKE_BUILD_TYPE=Release -DPIE_METAL_BUILD_TOOLS=ON   # NOT /tmp: macOS purged /tmp/metaltests on reboot
+cmake --build build/metaltests -j
+ctest --test-dir build/metaltests --output-on-failure
 ```
 
 The loader staticlib is found automatically in `target/{debug,release}`;
@@ -135,8 +135,8 @@ parsing test — it never touches the device. Nothing in the tree prints
 `tuning_for()` and prints what came back.
 
 ```sh
-cmake --build /tmp/metaltests -j --target device_identity_probe
-/tmp/metaltests/tools/rawmetal/device_identity_probe
+cmake --build build/metaltests -j --target device_identity_probe
+build/metaltests/bin/device_identity_probe
 ```
 
 **Expectation, corrected:** not the M1 Max default. `query_apple_family()`
@@ -275,8 +275,8 @@ M1 Max constants on this machine.*
 # configure (NEEDS_LOADER, so the loader staticlib must have been found).
 # --checkpoint-root is optional; it defaults to ~/.cache/huggingface/hub and
 # ~/.pie-bench, and knobs whose named checkpoints are absent are SKIPped.
-python benches/tune_device.py --bench /tmp/metaltests/llama_bench            # prints a tuning_for() block
-python benches/tune_device.py --bench /tmp/metaltests/llama_bench --control  # same arms at a batch where they agree
+python benches/tune_device.py --bench build/metaltests/llama_bench          # prints a tuning_for() block
+python benches/tune_device.py --bench build/metaltests/llama_bench --control # same arms at a batch where they agree
 ```
 
 Read the script header before running. Its documented methodology error is the

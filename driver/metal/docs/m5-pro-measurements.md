@@ -9,7 +9,7 @@ a decimal point.
 
 | Field | Value | Method | Date |
 |---|---|---|---|
-| macOS / Darwin | macOS 26.5.1 (25F80), Darwin 25.5.0 | `sw_vers`, `uname -r`. Note: [M5] §4.1 ran Darwin 25.4 | 2026-08-19 |
+| macOS / Darwin | macOS 26.5.1 (25F80), Darwin 25.6.0 | `sw_vers`, `uname -r`. Note: [M5] §4.1 ran Darwin 25.4 | 2026-08-19 |
 | Toolchain | Apple clang 21.0.0 (CLT; no offline `metal` compiler — kernels compile at run time via `newLibraryWithSource`), cmake 4.4.2, rustc 1.97.1 | `c++ --version`; `xcrun -sdk macosx metal --version` fails, CLT-only install | 2026-08-19 |
 | `apple_family` | **9** as the driver sees it; the device itself answers **yes to Apple10** (and no to 11/12), which the driver never asks | `tools/rawmetal/device_identity_probe`, clean env (`env -i`) | 2026-08-19 |
 | `gpu_core_count` | **20** | same probe — IOKit `gpu-core-count` | 2026-08-19 |
