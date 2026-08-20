@@ -341,9 +341,9 @@ reporting to basecompute).
 | Gemma-4-E2B | — | _blocked: HF-gated, no catalog entry, no token_ | 149.8 | | | |
 | Gemma-4-26B-A4B | — | _blocked: same_ | 85.0 | | | |
 | Qwen3-30B-A3B | pull default (original HF repo, not the catalog's -Instruct-2507) | 105.8 | 105.1 | **+0.7%** | +0.2% | +1.3% ‡ |
-| Qwen3.5-35B-A3B | pull default | 109.5 | 110.6 | **−1.0%** | −1.6% | −10.2% § |
-| Qwen3.6-35B-A3B | — | _downloading_ | 110.7 | | | |
-| Qwen3.6-27B | pull default (f16 emb; insensitive here too) | 18.19 | 18.1 | **+0.5%** | −0.3% | −9.0% ‡ |
+| Qwen3.5-35B-A3B | pull default | 109.5 | 110.6 | **−1.0%** | −1.6% | −2.9% § (pp512 −0.6% after idle re-take) |
+| Qwen3.6-35B-A3B | **quant-from-quant** from cached mlx-community 4-bit (`--allow-quant-from-quant`; bf16 source not downloaded) | 109.3 | 110.7 | **−1.2%** | −31% ¶ | +4.2% |
+| Qwen3.6-27B | pull default (f16 emb; insensitive here too) | 18.19 | 18.1 | **+0.5%** | −0.3% | −9.0% ‡ (pp512 −1.8%, pp1024 −1.3% quiet) |
 
 ### 8-bit rows — all reproduce with pull/catalog defaults
 
@@ -395,6 +395,31 @@ ceiling; T1.3 should treat 309 GB/s as a measured lower bound on the real
 roof, and the earlier "impossible above the roof" arguments in this file
 should be read against per-shape achieved bandwidth (~250–260 GB/s for the
 1B-class decodes), which is what they actually used.
+
+¶ The one row whose prefill does NOT replicate at short prompts, and the
+one row converted from an already-quantized source. Under idle conditions
+(stddev ±1): pp128 936 vs 1361 (−31%), pp256 1371 vs 1831 (−25%), pp512
+1975 vs 2342 (−16%), pp1024 2525 vs 2736 (−7.7%), pp2048 2905 vs 2788
+(+4.2%); tg128 109.3 vs 110.7. The deficit is a near-constant **~40 ms per
+prefill call** that disappears into long prompts while the steady-state rate
+matches or beats publication — a per-call fixed cost, not a GEMM-rate gap,
+and it did not move between a loaded and an idle machine. The only variable
+this row does not share with the other twelve is its source: the
+`mlx-community` 4-bit checkpoint re-quantized via `--allow-quant-from-quant`
+(taken to avoid a 45 GB bf16 download, since bytes and kernels are the same
+either way). Bytes matched; something per-call did not — the converter's own
+warning, observed. **Open follow-up:** convert from the bf16 source
+(`Qwen/Qwen3.6-35B-A3B`, 10/26 shards cached) and re-bench pp128–512; until
+then this row's decode is replicated and its short prefill is not claimed.
+
+Post-reboot re-takes under a measured idle gate (5-min load < 2.5, no
+scanner > 25% CPU — post-update Xprotect/Spotlight housekeeping is a FOURTH
+pollution mode, and it adds a fixed CPU latency per call rather than a
+rate change): 3.5-35B pp512/pp2048 → 2503/3012 (−0.6%/−2.9%), resolving
+that row; 27B pp512/pp1024 → 485/492 (−1.8%/−1.3%); 27B pp2048 stayed
+437–452 across every attempt (−9 to −12%) — the most memory-intensive cell
+of the campaign (2048-token prefill over a 27 GB mapping in 48 GB) and the
+single long-prefill point that never cleared comfortably. Recorded as is.
 
 Full five-length pp values for every row are in the archived raw log; the
 committed anchors are pp128/pp512/pp2048 to keep this table readable.

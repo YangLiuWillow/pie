@@ -234,9 +234,14 @@ roof — an artifact that size *cannot* decode at the published rate.
 Three rules this leaves behind:
 
 1. **A comparison names the artifact, not the label.** Any Pie-vs-BaseRT (or
-   Pie-vs-anything) number must carry the quant profile and the weights
-   bytes. "q4 vs q4" hid a 30% decode gap; bytes/token would have shown it
-   in one line.
+   Pie-vs-anything) number must carry the quant profile, the weights bytes,
+   AND the source it was converted from. "q4 vs q4" hid a 30% decode gap;
+   bytes/token would have shown it in one line. And the source matters even
+   when the bytes match: the one artifact re-quantized from an
+   already-4-bit checkpoint (`--allow-quant-from-quant`, Qwen3.6-35B-A3B)
+   replicated decode and long-prompt prefill but carried a fixed ~40 ms
+   per-prefill-call penalty (−31% at pp128) that no machine condition
+   explained — see `m5-pro-measurements.md` ¶.
 2. **For pie's own kernels and future fusion work: on a small dense model,
    the tied lm_head is the decode.** Per token, Llama-1B's q4 body is
    ~547 MB and an f16 tied embedding is ~525 MB — the logits projection is
