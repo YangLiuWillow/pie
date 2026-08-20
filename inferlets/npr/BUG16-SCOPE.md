@@ -300,8 +300,9 @@ request and a temporarily-unsatisfiable one are handled identically.
 
 M1/M2/M3 are dead. M4 is real, reproduced, and deterministic — but whether it is
 what happened on the A40 is a further question (§6.4), and on the numbers it
-probably is not, on its own. **M4b**, the accumulation variant, is the live
-candidate for the A40 event and is untested.
+probably is not, on its own. **M4b**, the accumulation variant, was the bridge
+hypothesis for the A40 event — **refuted by measurement** (§6.4). The A40
+mechanism is open again.
 
 **Also unknown:**
 
@@ -506,11 +507,41 @@ across repeated deferrals until it exceeds the pool, at which point the context 
 in exactly the M4 terminal state **without any individual request ever having been
 oversized**. Call this **M4b**. It fits the A40 numbers where M4 does not.
 
-Discriminating test, not yet run: instrument `deferred_ops.len()` and the summed
-`required` over time in a cell where per-context footprint is comfortably *below*
-pool capacity (e.g. 24 contexts × 32 pages against a 128-page pool, run long). M4b
-predicts a wedge with `n_ops > 1` and `required` climbing past `total`; if no wedge
-appears, M4b is wrong and the A40 event needs a different explanation again.
+Discriminating test — **run, and M4b is refuted:**
+
+| cell | contexts | per-ctx pages | pool | oversubscribed | result | max `n_ops` | `EXCEEDS_DEVICE` |
+|---|---|---|---|---|---|---|---|
+| E | 24 | 32 | 128 | 6× | completes | 1 | 0 |
+| F | 48 | 32 | 128 | 12× | completes | 1 | 0 |
+| G | 24 | 60 | 256 | 5.6× | completes | 1 | 0 |
+
+`deferred_ops` never accumulated — `n_ops = 1` everywhere — so `required` never
+climbs the way M4b needs. Cell F is the sharpest: 1,176 restore rejections, 82
+evictions, and it still resolves. **Nothing milder than "a single request exceeds
+device capacity" wedges this harness.**
+
+So the boundary is exact and narrow, and it does not obviously reach the A40:
+
+- **wedges:** per-context footprint > pool (cells B, C, D)
+- **completes:** footprint ≤ pool, at any oversubscription tried (A, E, F, G — up
+  to 24× with a fitting footprint)
+
+**Where a single request gets its size.** `ensure_working_pages` computes
+`needed = target - physical` and passes it straight to `when_allocated`
+(`context.rs:1697`), so one call can ask for the entire remaining generation
+horizon at once — in cell D, 48 pages (768 tokens) in a single request. The size
+is guest-controlled and unbounded, which is what lets it exceed the device.
+
+**Status of the A40 question: open, with its one bridge hypothesis dead.** On the
+A40 numbers a single request would be ~1,875 pages (30,000-token horizon) against
+a ~6,700-page pool — large, but under capacity, so M4's exact condition does not
+appear to be met and M4b is now refuted. Either the A40 event is a third
+mechanism, or something about the real driver changes the arithmetic in a way this
+mock does not model. **This document should not be read as having explained the
+A40 wedge.** The next measurement is not another harness cell — cells E/F/G say
+that regime resolves — it is §7's instrumentation on a real pod run, recording the
+`num_pages` distribution at `when_allocated` and whether any request or
+`can_restore` requirement ever exceeded device capacity.
 
 ---
 
@@ -599,9 +630,12 @@ that fits completes in 313 ms; 24× with a footprint that does not, wedges.
 **This is not yet "bug 16 is solved."** §6.4 is the honest statement: same
 subsystem, same external signature, root-caused — but the A40 arithmetic (each
 context ~1,750 pages against a ~6,700-page pool) does not obviously admit a
-single oversized request. **M4b**, where `can_restore`'s sum over *accumulated*
-`deferred_ops` crosses total capacity without any individual request being
-oversized, fits those numbers and is the next test.
+single oversized request — and **M4b**, the one bridge hypothesis that did fit
+those numbers (`can_restore` summing *accumulated* `deferred_ops` past capacity
+without any individual request being oversized), has now also been refuted by
+measurement (§6.4). The A40 mechanism is **open**, and the next step for it is
+instrumentation on real hardware, not another mock cell: cells E/F/G establish
+that the mock resolves every regime short of an oversized request.
 
 What the whole exercise actually established, in order of confidence:
 
@@ -618,6 +652,11 @@ carefully, with citations — which is exactly what made them feel safe. The
 pre-registered predictions are what converted both into results instead of
 quietly wrong documentation, and they are the part of this method worth keeping.
 
-Remaining work, in order: run the M4b test (§6.4); then §7's instrumentation,
-which is worth doing regardless of which mechanism wins, because *both* of these
-wedges are invisible in the logs by construction.
+Refuted, in order: R1 (by the first run), M1/M2/M3 (by the wedge snapshot), M4b
+(by cells E/F/G). Confirmed: M4. Open: the A40 event itself.
+
+Remaining work: §7's instrumentation, now the *only* live path on the A40
+question — record the `num_pages` distribution at `when_allocated` and whether any
+request or `can_restore` requirement ever exceeds device capacity on a real pod
+run. Both wedges are invisible in today's logs by construction, which is why this
+took a purpose-built harness rather than a log grep.
