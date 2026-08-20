@@ -89,6 +89,48 @@ Two things the re-check turned up that the first pass did not:
   now name their counterpart explicitly. Worth knowing before assuming a
   `main` gap means nobody has looked at it.
 
+## Prior-art sweep — all five, all 428 upstream PR heads (2026-08-20)
+
+Two of the five turned out to have prior art that never reached `main`, both
+found before this sweep. That is a strong enough prior to check the other three
+properly rather than by keyword search, because "we already fixed that in #NNN"
+arriving as a maintainer comment on three PRs at once is the one outcome that
+makes a batch look careless.
+
+**Method.** `git fetch upstream '+refs/pull/*/head:refs/remotes/upstream-pr/*'`
+pulls every PR's head commit — **including PRs merged into branches that were
+later deleted**, which is exactly where the two known cases live and which no
+GitHub search surfaces. Then, per target file, group all 428 heads by that file's
+blob and inspect each distinct version that differs from `main`. `priorart.sh`
+(next to this README) does the grouping.
+
+**The first attempt was wrong, and the positive control is what caught it.**
+`git grep -l <pattern> $REFS -- <path>` over ~428 revisions silently returns
+nothing. It reported a clean null for all three files. Before believing it I ran
+it against the two PRs I already knew contained the changes — **#467 and #484 —
+and it found neither.** The null was an artifact of the instrument. The loop form
+above passes both controls and was used for the real sweep.
+
+That is the second false-negative search on this task (see BUG16-SCOPE.md R1, the
+`fn bid` grep). The lesson generalises: **a search that returns nothing is a
+measurement, and it needs a positive control before its null means anything.**
+
+**Result.**
+
+| PR | prior art | detail |
+|---|---|---|
+| 1 SDK destroy | **#484** | Same defect, fixed **host-side** (drop the `table.delete` from `HostContext::destroy`). Merged to `tts-arena/main`, since deleted; never reached `main`. No PR anywhere carries the SDK-side `mem::forget` fix. **Named in the body**; the two are alternatives and must not both land. |
+| 2 portable KV write index | **none** | Four distinct non-`main` blobs of `plan.cpp`; every one still computes the write index as `physical_idx(..., pos_i)`, and none introduces a slot-order variant. (One blob matched a `slot_i` grep — false positive, it was `rs_slot_ids`, recurrent-state slots, unrelated.) |
+| 3 runtime commit check | **none** | Eleven distinct non-`main` blobs of `runtime/src/context.rs`; every one still has the unconditional `for &pos in &positions` strict check, none mentions an explicit-mask exemption. |
+| 4 CUDA prefill OOB | **#467** | Same family, fixed by threading a **per-fire `emit_logits`** flag, plus a `test_executor_prefill_only.py`. Merged to `tts-arena/main`, since deleted; never reached `main`. No PR anywhere adds the `num_logit_rows == 0` guard. **Named in the body.** |
+| 5 graph cache slot count | **none** | Three distinct non-`main` blobs of `executor/executor.cpp`; the identifier `n_sample_slots` appears in none of them. Its sibling half is #426, already named in the body. |
+
+**The pattern worth carrying:** twice, a fix for one of these landed on a branch
+that was later deleted and never reached `main`. **A gap on `main` in this repo
+does not mean nobody has looked at the bug.** Both affected bodies name their
+counterpart and state that cherry-picking it supersedes ours, taking no position
+on which the maintainers prefer.
+
 ## Verification status
 
 | fix | compile | behaviour |
