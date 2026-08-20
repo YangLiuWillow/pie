@@ -379,7 +379,7 @@ async fn main(input: String) -> Result<String> {
     // Chat prompt via the thin `pie:inferlet/chat` bindings (the template
     // knowledge lives in the host runtime). `stop` is the chat-EOS set.
     let mut prompt = chat::system_user(SYSTEM, USER);
-    prompt.extend(chat::cue());
+    prompt.extend(chat::cue(true));
     if prompt.is_empty() {
         prompt.push(0); // tiny test tokenizers may drop every template char
     }

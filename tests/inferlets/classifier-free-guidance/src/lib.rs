@@ -91,7 +91,7 @@ async fn main(input: Input) -> Result<String> {
     let stop_tokens = chat::stop_tokens();
 
     let mut cond_prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
-    cond_prompt.extend(chat::cue());
+    cond_prompt.extend(chat::cue(true));
     if cond_prompt.is_empty() {
         cond_prompt.push(0);
     }
@@ -100,7 +100,7 @@ async fn main(input: Input) -> Result<String> {
     // "unconditional" ∅ context for an instruction-tuned model.
     let mut uncond_prompt =
         chat::system_user("You are a helpful assistant.", &input.negative_prompt);
-    uncond_prompt.extend(chat::cue());
+    uncond_prompt.extend(chat::cue(true));
     if uncond_prompt.is_empty() {
         uncond_prompt.push(0);
     }

@@ -93,7 +93,10 @@ Do not upgrade — see `CLAUDE.md`.
 
 ```sh
 cargo build --workspace --all-targets --exclude pie-server-py
-cargo test --workspace
+# The exclude is load-bearing for `test` too: pie-server-py hard-enables
+# driver-cuda, and feature unification then poisons pie-engine's lib test
+# with undefined CUDA symbols on macOS (found in T0.1).
+cargo test --workspace --exclude pie-server-py
 
 # The Metal driver's on-device suite is CMake/ctest, NOT cargo. (`pie-gpu-tests`
 # is the CUDA/dummy e2e suite: every #[ignore]d test there boots a 4090 config;

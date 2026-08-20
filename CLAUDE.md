@@ -37,7 +37,9 @@ is a *measurement*: re-measure rather than edit it to match what's installed.
 
 ```sh
 cargo build --workspace --all-targets --exclude pie-server-py
-cargo test  --workspace
+# The exclude matters for `test` too: pie-server-py hard-enables driver-cuda,
+# and feature unification then breaks pie-engine's test link on macOS.
+cargo test  --workspace --exclude pie-server-py
 
 # compiler crates are the only ones at zero warnings — CI gates them
 cargo clippy --no-deps -p pie-ir -p pie-plan -p pie-eval -p pie-codegen \
