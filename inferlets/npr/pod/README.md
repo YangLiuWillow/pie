@@ -73,6 +73,26 @@ rejected in about a minute. Bad hosts are the norm, not the exception here
 (HANDOVER §11: 3 of 4 community L40S hosts had broken CUDA), so the cost of
 finding a good pod is dominated by how fast you can discard a bad one.
 
+A pattern the probe does *not* match is not harmless — it falls through to the
+full `WAIT_MIN`. The matched set is `OCI runtime exec`, `is not running`,
+`Error response from daemon`, and a non-zero `cuInit`; extend it rather than
+letting a new failure string time out silently.
+
+### The image is part of the gate
+
+Three consecutive pods on `nvidia/cuda:12.8.1-devel-ubuntu22.04` came up with a
+container that never started. That image has `nvcc` but no sshd, and RunPod's
+`startSsh`/`PUBLIC_KEY` injection has to build the ssh environment itself. The
+`runpod/pytorch` images ship sshd *and* `/usr/local/cuda`, which is what
+HANDOVER §5 means by "a runpod/pytorch `*-devel` image" — and the account's own
+saved template for this project is `Pie-test-image`
+(`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`). That is now `hunt.sh`'s
+default, overridable with `IMAGE=`.
+
+`gate.sh` also checks for `nvcc` before accepting, because `driver/cuda` is
+built from source on the pod: a missing compiler is otherwise a ~25-minute
+bootstrap that ends in `SETUP_FAIL`.
+
 Whatever the path in, always confirm the account is actually empty when you are
 done — `curl -s https://rest.runpod.io/v1/pods -H "Authorization: Bearer $RUNPOD_API_KEY"`
 — rather than assuming a DELETE call worked.
