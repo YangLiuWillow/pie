@@ -18,8 +18,18 @@ sleep 45
 # CUDA sentinel: selftest prints "[npr] selftest toplogits: ids_match=true max_dev=... max_logit=...".
 # HARD GATE — a penalty path that is not CUDA-correct makes every A/B number meaningless,
 # so we refuse to spend the sweep on it (HANDOVER.md §12 check 1).
+#
+# Retry rather than trusting a fixed sleep: model load time is not a constant
+# (checkpoint size, page-cache state, host disk), and now that the gate is fatal
+# a server that was merely slow to come up would throw the pod away. Only a
+# selftest that actually ran and disagreed should stop the sweep.
 echo SELFTEST > /workspace/CHAIN_STATUS
-/workspace/venv/bin/python /workspace/pie/inferlets/npr/client.py --input '{"selftest": true}' > /workspace/selftest.log 2>&1
+for attempt in 1 2 3 4 5 6; do
+  /workspace/venv/bin/python /workspace/pie/inferlets/npr/client.py --input '{"selftest": true}' > /workspace/selftest.log 2>&1
+  grep -q "selftest toplogits:" /workspace/selftest.log && break
+  echo "[chain] selftest attempt $attempt produced no sentinel line; server may still be loading" >> /workspace/selftest-attempts.log
+  sleep 60
+done
 if ! grep -q "selftest toplogits: ids_match=true" /workspace/selftest.log; then
   echo SELFTEST_FAIL > /workspace/CHAIN_STATUS; exit 1
 fi
