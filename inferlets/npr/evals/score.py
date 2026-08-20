@@ -58,13 +58,36 @@ def mean(xs):
     return statistics.fmean(xs) if xs else float("nan")
 
 
+# Stop reasons that mean "ran out of global token budget" rather than "the
+# model stopped on its own". Mirrors `is_budget_stop` in src/lib.rs.
+BUDGET_STOPS = {"budget", "branch_budget"}
+
+
+def budget_exhausted(r: dict) -> bool | None:
+    """Did this run stop because it ran out of tokens?
+
+    Prefers the inferlet's own `budget_exhausted` flag; falls back to the
+    `stop_reason` label. Returns None for records written before the split,
+    whose `branch_terminal` conflates EOS with budget exhaustion and so
+    cannot answer the question at all.
+    """
+    if r.get("budget_exhausted") is not None:
+        return bool(r["budget_exhausted"])
+    stop = r.get("stop_reason")
+    if stop is None:
+        return None
+    if stop == "branch_terminal":
+        return None  # pre-split label: ambiguous by construction
+    return stop in BUDGET_STOPS
+
+
 def report(records: list[dict], by_problem: bool) -> None:
     arms = sorted({r["arm"] for r in records})
     print(
-        f"{'arm':<11} {'n':>4} {'avg@k':>7} {'pass@k':>7} {'fmt':>6} "
+        f"{'arm':<11} {'n':>4} {'avg@k':>7} {'pass@k':>7} {'fmt':>6} {'bud':>6} "
         f"{'err':>5} {'par%':>6} {'brnch':>6} {'gen tok':>8} {'chg tok':>8} {'wall s':>7} {'tok/s':>7}"
     )
-    print("-" * 96)
+    print("-" * 103)
     for arm in arms:
         rs = [r for r in records if r["arm"] == arm]
         per_problem: dict[str, list[bool]] = collections.defaultdict(list)
@@ -73,6 +96,7 @@ def report(records: list[dict], by_problem: bool) -> None:
         avg_at_k = mean([statistics.fmean(v) for v in per_problem.values()])
         pass_at_k = mean([1.0 if any(v) else 0.0 for v in per_problem.values()])
         fmt_fail = mean([1.0 if r.get("answer") in (None, "") else 0.0 for r in rs])
+        bud = mean([1.0 if budget_exhausted(r) else 0.0 for r in rs if budget_exhausted(r) is not None])
         errs = sum(1 for r in rs if r.get("error"))
         good = [r for r in rs if not r.get("error")]
         par = mean([1.0 if (r.get("parallel_blocks") or 0) > 0 else 0.0 for r in good])
@@ -88,15 +112,36 @@ def report(records: list[dict], by_problem: bool) -> None:
             ]
         )
         print(
-            f"{arm:<11} {len(rs):>4} {avg_at_k:>7.3f} {pass_at_k:>7.3f} {fmt_fail:>6.3f} "
+            f"{arm:<11} {len(rs):>4} {avg_at_k:>7.3f} {pass_at_k:>7.3f} {fmt_fail:>6.3f} {bud:>6.3f} "
             f"{errs:>5} {par:>6.3f} {branches:>6.1f} {gen:>8.0f} {chg:>8.0f} {wall:>7.1f} {toks:>7.1f}"
         )
     print(
         "\navg@k = mean per-problem accuracy over k samples; pass@k = any-correct."
-        "\nfmt = share with no \\boxed{}; par% = share that forked at least once."
+        "\nfmt = share with no \\boxed{} (the 'unanswered' column); par% = share that forked at least once."
+        "\nbud = share that ran out of token budget (stop_reason budget/branch_budget);"
+        "\n      nan on pre-split results, whose branch_terminal conflates EOS with exhaustion."
         "\nchg tok = ledger charge (branch tokens x parallel degree, NPR accounting)."
         "\nwall/tok-s are only comparable across arms when the sweep ran at concurrency 1."
     )
+
+    # Why the unanswered runs stopped. `fmt` alone cannot distinguish a run
+    # that reasoned to the end and never boxed an answer from one that was cut
+    # off mid-thought; the stop_reason split is what separates them, and it is
+    # the lever on the 20-26% unanswered rate the parallel arms carry.
+    print("\nunanswered runs (no \\boxed{}) by stop_reason")
+    print(f"{'arm':<11} {'n':>4}  reasons")
+    for arm in arms:
+        unans = [
+            r
+            for r in records
+            if r["arm"] == arm and not r.get("error") and r.get("answer") in (None, "")
+        ]
+        if not unans:
+            print(f"{arm:<11} {0:>4}  -")
+            continue
+        counts = collections.Counter(r.get("stop_reason") or "unknown" for r in unans)
+        detail = "  ".join(f"{k}={v}" for k, v in counts.most_common())
+        print(f"{arm:<11} {len(unans):>4}  {detail}")
 
     if by_problem:
         print("\nper-problem accuracy")

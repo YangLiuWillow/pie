@@ -504,6 +504,7 @@ async fn refill(p: &mut PCtx, tokens: &[u32], positions: &[u32], rows: &[Vec<u32
 // Segment decoding
 // =============================================================================
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Stop {
     /// The model just closed a `</guideline>` — fork point.
     GuidelineEnd,
@@ -513,12 +514,68 @@ enum Stop {
     Eos,
     /// Global token budget exhausted.
     Budget,
+    /// Test hook `max_step_tokens` capped this segment. Kept distinct from
+    /// `Budget` so a smoke-test cap never reports as real exhaustion.
+    StepCap,
 }
 
 struct Segment {
     tokens: Vec<u32>,
     bytes: Vec<u8>,
     stop: Stop,
+}
+
+/// Why a branch stopped without closing its `</step>`.
+///
+/// Budget exhaustion used to be folded into the same `terminal: bool` as
+/// end-of-turn, so a run that simply ran out of tokens was indistinguishable
+/// from one that genuinely finished — the `unanswered` column in the sweeps
+/// is exactly where that ambiguity hid. Keep the cause all the way to the
+/// output JSON so per-arm scoring can separate them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Terminal {
+    /// Chat-template end-of-turn inside the branch.
+    Eos,
+    /// The global token budget ran out mid-branch.
+    Budget,
+    /// The `max_step_tokens` test hook capped the branch.
+    StepCap,
+}
+
+impl Terminal {
+    /// Severity for the sibling fold: a block where any branch ran out of
+    /// budget is a budget failure, whatever the other branches did.
+    fn rank(self) -> u8 {
+        match self {
+            Terminal::Eos => 0,
+            Terminal::StepCap => 1,
+            Terminal::Budget => 2,
+        }
+    }
+
+    /// Fold two sibling outcomes, keeping the harsher cause.
+    fn merge(a: Option<Terminal>, b: Option<Terminal>) -> Option<Terminal> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(if y.rank() > x.rank() { y } else { x }),
+            (x, None) => x,
+            (None, y) => y,
+        }
+    }
+
+    /// Top-level `stop_reason` label for a run that ended in this state.
+    fn stop_reason(self) -> &'static str {
+        match self {
+            Terminal::Eos => "branch_terminal",
+            Terminal::Budget => "branch_budget",
+            Terminal::StepCap => "branch_step_cap",
+        }
+    }
+}
+
+/// True for the `stop_reason` labels that mean "ran out of global token
+/// budget" rather than "the model stopped on its own".
+fn is_budget_stop(stop_reason: &str) -> bool {
+    matches!(stop_reason, "budget" | "branch_budget")
 }
 
 /// splitmix64 — small deterministic RNG for the guest-side sampler.
@@ -646,9 +703,11 @@ async fn decode_segment(
         // primary is positional (longest path through the parallel structure);
         // the ×degree charge is the secondary, transient check.
         let degree_charge = inherited + (own_before + tokens.len()) * degree;
+        if token_cap.is_some_and(|cap| tokens.len() >= cap) {
+            break Stop::StepCap;
+        }
         if sh.ledger.borrow().position_exhausted(cur_pos)
             || degree_charge + 128 >= sh.ledger.borrow().budget
-            || token_cap.is_some_and(|cap| tokens.len() >= cap)
         {
             break Stop::Budget;
         }
@@ -717,8 +776,9 @@ struct BranchResult {
     /// contiguous content).
     tokens: Vec<u32>,
     bytes: Vec<u8>,
-    /// The branch ended on end-of-turn or budget instead of `</step>`.
-    terminal: bool,
+    /// `Some(cause)` when the branch ended on end-of-turn / budget / the
+    /// step cap instead of `</step>`; `None` when it closed cleanly.
+    terminal: Option<Terminal>,
 }
 
 enum ForkOutcome {
@@ -726,7 +786,8 @@ enum ForkOutcome {
     Forked {
         tokens: Vec<u32>,
         bytes: Vec<u8>,
-        terminal: bool,
+        /// Harshest terminal cause across the block's branches.
+        terminal: Option<Terminal>,
     },
     /// Malformed/over-budget/too-deep — caller keeps decoding sequentially
     /// (NPR resets `finished_reason` and lets the request continue).
@@ -841,7 +902,7 @@ fn try_fork<'a>(
                     base.ctx.append(&sibling.tokens);
                     tokens.extend_from_slice(&sibling.tokens);
                     bytes.extend_from_slice(&sibling.bytes);
-                    terminal |= sibling.terminal;
+                    terminal = Terminal::merge(terminal, sibling.terminal);
                     sibling.p.ctx.destroy();
                 }
                 let takeaway = sh.encode_with_tags("<takeaway>\n");
@@ -905,7 +966,7 @@ fn try_fork<'a>(
                     }
                     tokens.extend_from_slice(&sibling.tokens);
                     bytes.extend_from_slice(&sibling.bytes);
-                    terminal |= sibling.terminal;
+                    terminal = Terminal::merge(terminal, sibling.terminal);
                     sibling.p.ctx.destroy();
                 }
                 // 3. The Reduce stage: `<takeaway>\n` starts at
@@ -1042,7 +1103,7 @@ fn run_branch(
                         p,
                         tokens,
                         bytes,
-                        terminal: false,
+                        terminal: None,
                     });
                 }
                 Stop::GuidelineEnd => {
@@ -1056,28 +1117,34 @@ fn run_branch(
                         } => {
                             tokens.extend_from_slice(&join_tokens);
                             bytes.extend_from_slice(&join_bytes);
-                            if terminal {
+                            if terminal.is_some() {
                                 return Ok(BranchResult {
                                     p,
                                     tokens,
                                     bytes,
-                                    terminal: true,
+                                    terminal,
                                 });
                             }
                         }
                         ForkOutcome::Sequential => {}
                     }
                 }
-                Stop::Eos | Stop::Budget => {
+                Stop::Eos | Stop::Budget | Stop::StepCap => {
+                    let cause = match segment.stop {
+                        Stop::Budget => Terminal::Budget,
+                        Stop::StepCap => Terminal::StepCap,
+                        _ => Terminal::Eos,
+                    };
                     println!(
-                        "[npr] branch {label}: terminal (eos/budget) after {} tokens",
+                        "[npr] branch {label}: terminal ({}) after {} tokens",
+                        cause.stop_reason(),
                         tokens.len()
                     );
                     return Ok(BranchResult {
                         p,
                         tokens,
                         bytes,
-                        terminal: true,
+                        terminal: Some(cause),
                     });
                 }
             }
@@ -1586,10 +1653,13 @@ async fn main(input: Input) -> Result<String> {
                         bytes, terminal, ..
                     } => {
                         trajectory_bytes.extend_from_slice(&bytes);
-                        if terminal {
-                            // A branch hit EOS/budget inside the block; the
-                            // join completed but the run ends here.
-                            stop_reason = "branch_terminal";
+                        if let Some(cause) = terminal {
+                            // A branch stopped inside the block; the join
+                            // completed but the run ends here. The cause is
+                            // named (`branch_terminal` = EOS vs
+                            // `branch_budget` = out of tokens) so scoring can
+                            // tell a finished run from a starved one.
+                            stop_reason = cause.stop_reason();
                             break;
                         }
                     }
@@ -1609,6 +1679,12 @@ async fn main(input: Input) -> Result<String> {
                 stop_reason = "budget";
                 break;
             }
+            // Only reachable if a future caller passes a top-level token cap;
+            // the trunk decode passes `None`.
+            Stop::StepCap => {
+                stop_reason = "step_cap";
+                break;
+            }
         }
     }
 
@@ -1618,8 +1694,9 @@ async fn main(input: Input) -> Result<String> {
     let ledger = sh.ledger.borrow();
 
     println!(
-        "[npr] done: {} parallel blocks, {} branches, depth {}, {} fallbacks, \
+        "[npr] done: stop={}, {} parallel blocks, {} branches, depth {}, {} fallbacks, \
          {} tokens generated ({} charged of {} budget), {:?} elapsed",
+        stop_reason,
         stats.parallel_blocks,
         stats.branches_total,
         stats.max_depth_seen,
@@ -1643,6 +1720,9 @@ async fn main(input: Input) -> Result<String> {
         "join_ms": stats.join_ms,
         "prompt_cache": prompt_cache_state,
         "stop_reason": stop_reason,
+        // Derived from `stop_reason` so the eval/results path can split the
+        // `unanswered` column by cause without string-matching labels.
+        "budget_exhausted": is_budget_stop(stop_reason),
         "tokens_charged": ledger.charged,
         "token_budget": ledger.budget,
         "elapsed_ms": start.elapsed().as_millis() as u64,

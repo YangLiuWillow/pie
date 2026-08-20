@@ -29,6 +29,30 @@ inferlet's ledger), so a 5-way round burns budget 5× faster than sequential
 decoding does. `score.py` reports both `gen tok` (real tokens) and `chg tok`
 (ledger charge) so the accounting stays visible.
 
+## Why a run stopped
+
+Every result carries `stop_reason` (and the derived boolean `budget_exhausted`)
+straight from the inferlet, because the `fmt` column — the share of runs with no
+`\boxed{}`, the "unanswered" rate — cannot on its own tell a run that reasoned to
+the end and never boxed an answer from one that was cut off mid-thought:
+
+| `stop_reason` | meaning | `budget_exhausted` |
+|---|---|---|
+| `eos` | the trunk hit chat-template end-of-turn | false |
+| `step_end` | the trunk closed a `</step>` at top level | false |
+| `budget` | the trunk ran out of global token budget | **true** |
+| `branch_terminal` | a branch hit end-of-turn inside a parallel block | false |
+| `branch_budget` | a branch ran out of global token budget | **true** |
+| `branch_step_cap` | the `max_step_tokens` test hook capped a branch | false |
+| `step_cap` | the `max_step_tokens` test hook capped the trunk | false |
+
+`branch_budget` and `branch_step_cap` used to be folded into `branch_terminal`,
+so budget starvation was indistinguishable from a genuine finish. `score.py`
+prints a `bud` column (share exhausted) plus a per-arm breakdown of the
+unanswered runs by `stop_reason`. Results recorded **before** the split score
+`bud = nan` and show `branch_terminal`: that label is ambiguous by construction
+and must not be read as "not starved".
+
 ## Methodology
 
 **Accuracy and speed need different runs.** `elapsed_ms` is per-run wall clock;
