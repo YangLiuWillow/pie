@@ -274,3 +274,97 @@ sequential — per-`<step>` repetition penalty 1.02 is the remaining
 unimplemented NPR knob and the prime suspect. Pod hygiene for reruns: deploy
 with a volume, gate hosts on `cuInit(0)==0` (3 of 4 community L40S hosts had
 broken CUDA), stream results off-pod continuously.
+
+## 12. Frontier for a cold agent (2026-08-20): validate repetition penalty 1.02
+
+Commit `e14082eb0` implemented NPR's last knob — per-`<step>` repetition
+penalty 1.02, engine-faithful (DESIGN.md §15): off until the first fork, then
+on for every `<step>` child and the trunk after merge; HF semantics on **raw
+logits** (`l<0 → l·p`, `l>0 → l/p`), output tokens only. Raw logits come from a
+new `TopLogits { k }` probe (`sdk/rust/inferlet/src/sample.rs`) = the `dist`
+slot with sentinel `temperature == 0`, implemented in both drivers
+(`driver/portable/src/sampler.cpp`, `driver/cuda/src/response_subpass.cpp`).
+It is validated on Metal (selftest `ids_match=true max_dev=0.000000
+max_logit≈22`; AIME I/1 correct with 2 blocks). **Not yet done: CUDA
+validation and the quality A/B.** Nothing is running and no pods exist.
+
+### The run
+
+Pipeline scripts are durable in `inferlets/npr/pod/` (README there). Exact
+sequence:
+
+```bash
+cd inferlets/npr/pod
+export NPR_STATE=$HOME/.npr-pod
+bash hunt.sh                                   # cuInit + network gated, volume-backed pod
+bash launch.sh adopt,adopt_nopen aime25-pen-ab.jsonl   # == run_eval.py --arms adopt,adopt_nopen --k 2 --limit 25 --concurrency 8 --prompt-cache --abort-after 10 --out results/aime25-pen-ab.jsonl
+EXPECT_ROWS=100 python3 -c 'import subprocess,os; subprocess.Popen(["bash","poll.sh"],stdout=open(os.environ["NPR_STATE"]+"/poll.log","a"),stderr=subprocess.STDOUT,stdin=subprocess.DEVNULL,start_new_session=True)'
+tail -F $NPR_STATE/poll.log                    # ends with "SWEEP COMPLETE ... pod terminated"
+```
+
+`adopt` = KV-graft join with penalty 1.02 (default); `adopt_nopen` = same with
+`rep_penalty: 1.0` (the arm that produced §11's 0.460). 2 arms × 25 × k=2 =
+100 rows, ~1.5 h, ~$1.5 on an L40S. If the pod must clone the private repo,
+set `REPO=`/`REPO_RAW=` (chain.sh / pod-setup.sh honour them) — the defaults
+point at the public fork `YangLiuWillow/pie`.
+
+### Check 1 — CUDA sentinel (before trusting any number)
+
+`$NPR_STATE/selftest.log` (pulled by the poller) must contain
+
+```
+[npr] selftest toplogits: ids_match=true max_dev=0.00xxxx max_logit=2x.x
+```
+
+`ids_match` compares the `TopLogits{k:10}` ids against a `Distribution`
+probe on the same forward pass; `max_dev` is the max |softmax(logits) − prob|.
+On Metal it was exactly 0.000000; on CUDA expect ≤1e-3 (bf16→f32 widening on
+the host vs the softmax kernel). `ids_match=false` or `max_logit` ≈ 0–1 means
+the CUDA sentinel path is returning probabilities, not logits — stop and fix
+`compute_dist_slots` before running the sweep. The full selftest must still
+end with its normal pass line.
+
+### Check 2 — per-arm scoring
+
+```bash
+cd inferlets/npr/evals
+/Users/liuyang/Documents/Liszt_ai/npr-eval-venv/bin/python score.py results/aime25-pen-ab.jsonl               # avg@2 / pass@2 / unanswered / tokens per arm
+/Users/liuyang/Documents/Liszt_ai/npr-eval-venv/bin/python score.py results/aime25-pen-ab.jsonl --by-problem
+```
+
+and the collapse metric, which is the real question (§11 read 5; analysis in
+the session: correct runs are short and have `parallel_blocks=2`, every
+unanswered run had `parallel_blocks=1` and `stop_reason=branch_terminal`):
+
+```bash
+/Users/liuyang/Documents/Liszt_ai/npr-eval-venv/bin/python - <<'PY'
+import json,collections,sys; sys.path.insert(0,"."); from score import equal
+rows=[json.loads(l) for l in open("results/aime25-pen-ab.jsonl")]
+by=collections.defaultdict(list)
+for r in rows: by[r["arm"]].append(r)
+ok=lambda r: equal(r.get("answer"), r["gold"])
+un=lambda xs: sum(1 for r in xs if r.get("answer") in (None,""))/max(1,len(xs))
+acc=lambda xs: sum(map(ok,xs))/max(1,len(xs))
+for arm,rs in by.items():
+    b1=[r for r in rs if (r.get("parallel_blocks") or 0)<=1]; b2=[r for r in rs if (r.get("parallel_blocks") or 0)>=2]
+    print(f"{arm:12s} n={len(rs)} avg={acc(rs):.3f} unanswered={un(rs):.2f} | blocks<=1: n={len(b1)} acc={acc(b1):.2f} | blocks>=2: n={len(b2)} acc={acc(b2):.2f}")
+PY
+```
+
+(Row fields: `arm`, `gold`, `answer`, `parallel_blocks`, `stop_reason`,
+`tokens_generated`, …; `run_eval.py` is the source of truth. Use the eval venv —
+system python3 is too old for `score.py`'s type hints.) Baseline to
+beat (§11, no penalty): avg 0.460, unanswered 20%, blocks≤1 ≈5% correct vs
+blocks≥2 ≈80%. Success = penalty raises avg toward the paper's 0.504 by
+cutting the unanswered / blocks=1 share; neutral-or-worse = the penalty is not
+the lever and the next suspect is the `branch_terminal` budget-exhaustion path
+(§8). Either way: record the table in this file, update the artifact, and
+commit; `results/` stays gitignored (results live only on the local worktree +
+`$NPR_STATE`).
+
+### After the run
+
+- Pod terminated? `source pod/rp.sh; curl -s https://rest.runpod.io/v1/pods -H "Authorization: Bearer $RUNPOD_API_KEY"` — only terminate pods *you* created.
+- Open items unchanged: bug 16 deadlock (§7), split budget-exhaustion out of
+  `branch_terminal`, concurrency-1 speed pass, upstream PRs (bug fixes,
+  `adopt_kv`, `TopLogits`).
