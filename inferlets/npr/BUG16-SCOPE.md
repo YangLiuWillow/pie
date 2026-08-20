@@ -108,7 +108,23 @@ oversubscription, utilization sits pinned near capacity, so phase 2 returns
 early even when the alloc queue *is* empty. The two gates are independent; the
 absence of one does not imply progress.
 
-### 3.4 The escape hatch is unreachable, not merely frozen
+### 3.4 The escape hatch stops when the engine stops
+
+> **Correction, 2026-08-20, after running the harness.** An earlier revision of
+> this section claimed the escape hatch was *unreachable* — that rent was
+> identically zero because every context sits at `bid = 0.0`. **That was wrong,
+> and the first run of the mock harness refuted it in 85 milliseconds.** The
+> claim rested on a bad grep: I searched `sdk/rust/inferlet/src/context.rs` for
+> `fn bid`, found nothing, and concluded the SDK could not bid. The method is
+> `set_bid` (`context.rs:243`), and more importantly **the `Generator` auto-bids
+> on every step** — `compute_bid` at `context.rs:51`, called from
+> `generation.rs:98` at construction and `generation.rs:447` from the step loop
+> (`generation.rs:316`). Measured evidence is in §6.1. The refuted claims are
+> retained as **R1** in §5 rather than deleted, because what they got wrong is
+> more instructive than what they got right.
+
+What survives is (a) below. What does not is the "rent is always zero" half.
+
 
 `find_eviction_victim` (`sched.rs:881`) rejects a candidate unless
 `ctx.defaulted || ctx.bid <= requester_bid` (`sched.rs:912`). `defaulted` is the
@@ -130,52 +146,33 @@ So the moment no batch can be formed, rent stops being charged and the only
 mechanism that can break a standoff is frozen *by the same condition it exists
 to resolve*. That is what makes the state **absorbing** rather than merely slow.
 
-**(b) Even while the clock runs, rent is identically zero here.** The clearing
-price is the **minimum** bid across GPU-resident contexts on the driver:
+**(b) The market is live, and that matters for what a fix can assume.** The
+clearing price is the **minimum** bid among GPU-resident contexts on the driver
+(`sched.rs:464`, `sched.rs:483`), and bids are neither zero nor uniform: the
+`Generator` sets a truthful budget-exhausting bid at construction and recomputes
+it every step,
 
-```rust
-// runtime/src/context/sched.rs:464, 483
-min_bid = min_bid.min(ctx.bid);
-...
-let clearing_price = if contended && min_bid != f64::MAX { min_bid } else { 0.0 };
+```text
+bid = (B/μ + d) / (p + μ(1 + cv²) / (2s))      // sdk/.../context.rs:51
 ```
 
-Every context is constructed with `bid: 0.0` (`context.rs:1101`), the NPR
-inferlet never changes it, and **this branch's Rust SDK exposes no `bid` method
-at all** (`sdk/rust/inferlet/src/context.rs` has none). So `min_bid = 0.0`,
-`clearing_price = 0.0`, `payment = clearing_price * eff = 0.0`, and
-`defaulted = proc.balance < payment` reduces to `balance < 0.0` — which can
-never hold, because `actual = payment.min(proc.balance)` keeps balances
-non-negative (`sched.rs:538`).
+with `B` = credit balance, `μ` = expected remaining steps, `p` = pages held,
+`s` = page size. Two consequences worth holding onto:
 
-**No context in this workload can ever be flagged `defaulted`**, whatever the
-clock does. And because the clearing price is a *minimum*, a single zero-bid
-resident context zeroes the rent for every other context on the driver — so this
-is not a quirk of NPR, it is the default state of any deployment where one
-resident context has not bid.
+- **The bid falls as balance falls and as pages held rise.** The long-running,
+  page-heavy contexts — precisely the ones creating the pressure — drift toward
+  the *lowest* bids, which makes them the preferred eviction victims and the
+  first to default. The market is aimed correctly at this failure.
+- **A parked context stops recomputing.** `recompute_bid` is driven from the
+  Generator's step loop (`generation.rs:316`), so a context waiting on pages
+  holds a stale bid while everyone still running updates theirs. Whether that
+  matters is untested — flagged, not claimed.
 
-The market layer is therefore **inert in both directions** here: the bid gate
-never rejects a victim (§3.5) and defaulting never rescues one. Eviction
-degenerates to "the most-recently-spawned on-GPU context with pages that is not
-`pending_suspend`" — the FCFS tiebreaker at `sched.rs:928` — because `defaulted`
-and `bid` are constant across every candidate.
+So the escape hatch is real and does fire (§6.1 measures six defaulting events
+in an 85 ms run). Its weakness is **(a)**: it is clocked by `execute_batch`, so
+it works right up until the moment it is needed and then stops.
 
-### 3.5 With uniform bids, both bid gates are vacuous
-
-Both comparisons are **strict**, and every context carries the same `0.0`:
-
-- eviction eligibility, `sched.rs:912`: `ctx.bid > requester_bid` → `0.0 > 0.0` → false.
-  The bid gate **never rejects a victim**.
-- priority gate, `sched.rs:759`: `requester_bid < top_bid` → `0.0 < 0.0` → false.
-  The priority gate **never fires**; `priority_gate_suspends` is necessarily 0.
-
-This eliminates a whole branch of the candidate tree: nothing in the observed
-wedge can be explained by "a high bidder blocked eviction" or "the requester
-yielded to a higher-bidding restore head". Whatever emptied the eligible-victim
-set did it through `pending_suspend`, `is_off_gpu`, or `pages == 0` — the only
-remaining filters in `find_eviction_victim`.
-
-### 3.5b Idle page hoarding is free
+### 3.5 Idle page hoarding is free
 
 A third gap, which would matter if (b) above were fixed by giving contexts real
 bids: rent is charged only to contexts that were in the batch,
@@ -240,14 +237,26 @@ the engine is not failing, it is waiting, correctly, forever.
 - E6. `suspend()` always frees GPU pages, whether or not the CPU spill
   succeeds — `free(&working)` at `sched.rs:1143` and `release(&committed_hashes)` at `sched.rs:1160` are both outside the `cpu_offload` guard. *(This refutes an attractive alternative: the
   deadlock is not "suspension failed to free anything".)*
-- E7. **The clearing price is the minimum resident bid, every context is born at
-  `bid = 0.0`, and this branch's SDK cannot change it — so rent is identically
-  zero and `defaulted` can never be set.** — `sched.rs:464`, `sched.rs:483`,
-  `context.rs:1101`. Strictly stronger than E4: the escape hatch is unreachable
-  even while the clock is running.
-- E8. **Both bid comparisons are strict, so at uniform bids both gates are
-  vacuous** — eviction never rejects on bid (`sched.rs:912`), the priority gate
-  never fires (`sched.rs:759`).
+- E7. The clearing price is the **minimum** resident bid on the driver
+  (`sched.rs:464`, `sched.rs:483`), so the most-exhausted context sets the rent
+  for every other context sharing the driver.
+- E8. Bids are **auto-set and heterogeneous**: `Generator` calls `compute_bid`
+  at construction (`generation.rs:98`) and again every step
+  (`generation.rs:316` → `:447`), giving
+  `bid = (B/μ + d) / (p + μ(1+cv²)/(2s))`. Both bid comparisons are therefore
+  live, not vacuous.
+
+**Refuted, and kept on the record:**
+
+- **R1 — "rent is identically zero, so `defaulted` can never be set, so the
+  market layer is inert in both directions."** This was E7/E8 in the revision of
+  this document committed at `cf204689a`, and it was **wrong**. It rested on a
+  grep for `fn bid` in the SDK's `context.rs` that missed `set_bid`
+  (`context.rs:243`) and missed the `Generator` auto-bid entirely. The first run
+  of the mock harness refuted it in 85 ms: six defaulting events, bids spanning
+  ~870× (§6.1). The correction matters beyond bookkeeping — it moves the whole
+  weight of the economic argument onto E4, and it puts the bid gate and the
+  priority gate *back* into the candidate tree after I had eliminated them.
 
 **Not established.** Which of these actually fired on the A40 is **unknown**, and
 E1–E5 are individually sufficient to explain a stall, so "they're all true" is
@@ -261,13 +270,15 @@ not the same as "here is what happened". Three live candidates:
   between the count and the suspend raises a prefix's refcount and those pages
   never arrive. The requester then waits on a number that was true when it was
   taken.
-- **M2 — empty eligible-victim set.** Every on-GPU holder is `pending_suspend`,
-  so new requesters find no victim, self-suspend, and land in a restore queue
-  that E2 or E3 has frozen. **Narrowed by E8:** bid protection is *not* available
-  as an explanation — `pending_suspend` is the only filter left that can empty
-  the set while pages are still held. That in turn requires at least one context
-  to stay Pinned indefinitely, which is itself unexplained and is the sharpest
-  open question in this document.
+- **M2 — empty eligible-victim set.** New requesters find no victim, self-suspend,
+  and land in a restore queue that E2 or E3 has frozen. Three filters can empty
+  the set, and **R1 restored the third one after I had wrongly ruled it out**:
+  `pending_suspend` (requires a context stuck Pinned — unexplained), `is_off_gpu`,
+  and **bid protection** (`ctx.bid > requester_bid`, live per E8). The bid-protection
+  route is now the more plausible of the two: a fresh context has a *high* bid
+  (full balance, no pages held), so it should evict easily — but a fresh context
+  is also the one observed to hang, so if bid protection is the barrier the
+  arithmetic has to be checked, not assumed.
 - **M3 — restore pause latch.** Utilization stays above 0.85 because the
   remaining holders are parked rather than progressing, so phase 2 never runs
   even when the alloc queue drains.
@@ -278,12 +289,11 @@ the others become unrecoverable. The interesting question is which one is the
 
 **Also unknown:**
 
-- ~~Whether bids are heterogeneous in this workload.~~ **Settled** — see E7/E8.
-  Every context is born at `bid = 0.0`, NPR never changes it, and the SDK on this
-  branch has no `bid` method, so the bid gate, the priority gate and defaulting
-  are all provably inert. This eliminated one branch of the tree at the cost of a
-  grep, and it invalidated one of this document's own first-draft predictions
-  (see X5 below) — recorded here rather than quietly corrected.
+- ~~Whether bids are heterogeneous in this workload.~~ **Settled by measurement,
+  in the opposite direction to the first answer.** They are heterogeneous and
+  auto-set (E8, R1, §6.1). The grep that said otherwise was wrong; the run that
+  said so took 85 ms. Nothing in this document's candidate tree should be pruned
+  on a grep again without a run behind it.
 - **Whether any context was still Pinned at the time of the stall.** Required by
   M2, and now the load-bearing unknown: with E8 removing bid protection,
   `pending_suspend` is the only way the victim set empties, and it persists only
@@ -315,28 +325,65 @@ fixture, and building it is the first task, not an afterthought.
 | X1 | Instrument (§7) and re-run the wedge in the mock harness. | `alloc_queue` non-empty with a head whose `num_pages > available()`, `restore_queue` non-empty, `available()` stable > 0 | `alloc_queue` **empty**, `restore_queue` non-empty, all on-GPU ctxs `pending_suspend` | both queues non-empty, utilization pinned > 0.85, `restore_rejections` climbing |
 | X2 | Raise `restore_pause_at_utilization` to 1.0. | no effect | no effect | **wedge clears or moves** |
 | X3 | Make phase 1 work-conserving (skip an un-servable head, serve smaller requests behind it) — *diagnostic only, not a proposed fix*. | **wedge clears** | no effect | no effect |
-| X4 | ~~Log `ctx.bid` at wedge time.~~ | — | — | — |
-| X5 | Drive `tick` from a timer **and** give contexts non-zero bids — *diagnostic only*. | wedge persists; rent accrues, defaulting eventually frees victims ⇒ **self-heals slowly** | same | same |
-| X6 | Log `state` for every context at wedge time (Active / Pinned / Suspended / Stashed) and the eligible-victim count. | some Active with pages, none needed | **≥1 context stuck Pinned**, eligible-victim count 0 | mixture, utilization > 0.85 |
+| X4 | Observe `ctx.bid` spread and defaulting events under load. | — | — | — |
+| X5 | Drive `tick` from a timer instead of `execute_batch` — *diagnostic only*. | wedge persists; rent keeps accruing, defaulting frees victims ⇒ **self-heals slowly** | same | same |
+| X6 | Log `state` for every context at wedge time (Active / Pinned / Suspended / Stashed) and the eligible-victim count. | some Active with pages, none needed | **≥1 context stuck Pinned** *or* every holder bid-protected; eligible-victim count 0 | mixture, utilization > 0.85 |
 
-**X4 has already been run, and it was a grep.** See E7/E8: bids are uniformly
-`0.0`, so the bid gate and priority gate are both provably inert and no further
-measurement is needed. This is recorded as a completed experiment rather than
-deleted, because its result is what narrowed M2.
+**X4 has been run — see §6.1. It refuted the answer I had reached by grep**, and
+with it E7/E8 as first written (R1). X5's prediction is now back to its original
+form, because rent does accrue: a timer-driven clock really would keep defaulting
+alive through a stall. That prediction has been rewritten twice, once wrongly, and
+both revisions are visible above on purpose.
 
-**X5's prediction had to be corrected before it was ever run.** The first draft
-of this document predicted that decoupling the clock from `execute_batch` would
-let rent accrue and defaulting free victims. E7 says otherwise: with
-`clearing_price = min_bid = 0.0`, rent is zero no matter how often the clock
-ticks, so a timer-driven tick alone changes nothing. The experiment only
-discriminates if bids are made non-zero *as well* — which is why the row above
-now says both. Registering the prediction in advance is what caught this;
-DESIGN.md hygiene item 4 earned its keep here.
+X6 remains the cheapest high-value experiment, and R1 widened it: it must now
+distinguish *two* ways the victim set can empty (a stuck-Pinned context versus
+bid protection), where the previous revision had wrongly reduced it to one.
 
-X5 remains the experiment that separates "what started the stall" from "what made
-it permanent". X6 is now the cheapest high-value one, because M2 is the only
-candidate E8 leaves standing on the victim-set side and X6 tests its one
-load-bearing premise directly.
+### 6.1 First harness run — no wedge, and one refutation
+
+`runtime/tests/bug16_wedge.rs` on branch `scratch/bug16-repro` (not merged): mock
+GPU, no model, 1 driver × 32 pages, `page_size = 16`, 6 concurrent `grow`
+contexts each reaching ~32 pages — **6.0× oversubscribed**, the same ratio as the
+A40 observation.
+
+**Result: no wedge.** All six branches completed in **82 ms**. Final counters:
+
+```text
+ticks=1540  evict_susp=5  prio_gate_susp=0  no_victim_susp=0
+restores=5  restore_rej=10  defaults=6  evict_searches=0  drains=5
+```
+
+What that establishes and what it does not:
+
+- **The contention machinery engages and resolves at this scale.** Five
+  evictions, five restores, ten restore rejections — the paths under suspicion
+  are all exercised, and they recover. So the oversubscription *ratio* alone is
+  not sufficient; the A40 wedge took ~40 minutes, and this run took 82 ms. Scale,
+  duration, or per-step timing is doing work that this parameterisation does not
+  capture. **No conclusion about the mechanism can be drawn from this run.**
+- **`defaults=6` is what refuted R1.** Instrumenting the defaulting branch printed
+  balances, payments and bids directly:
+
+  ```text
+  [BUG16-DEFAULT] ctx=5 balance=0.00501 payment=0.03009 clearing_price=0.00094 bid=0.00094
+  [BUG16-DEFAULT] ctx=2 balance=0.02087 payment=0.05165 clearing_price=0.00161 bid=0.00161
+  [BUG16-DEFAULT] ctx=1 balance=23.98009 payment=26.07440 clearing_price=0.81482 bid=0.81482
+  ```
+
+  Bids span ~870× across six contexts in a single run, the clearing price tracks
+  the minimum bid exactly, and contexts do default. The market is live.
+- **`prio_gate_susp=0`** — the priority gate did not fire here. That is an
+  observation about this run, not a property of the system; with heterogeneous
+  bids it *can* fire, which is why X6 still has to test for it.
+- **`evict_searches=0` alongside `evict_susp=5` — the counter is dead.**
+  `sched_counters.eviction_searches` is declared and never incremented anywhere
+  in the runtime. Minor, but it is one of the seven counters §7 proposes to dump,
+  and a dumped counter that is always zero is worse than no counter at all.
+
+Next parameterisations to try, in order of expected information: many more
+concurrent contexts (24, matching the A40), far longer runs, a slower mock
+backend so that rent and bid dynamics have real time to evolve between
+allocations, and a smaller pool relative to a single context's footprint.
 
 **Pre-registered negative:** if X1 shows `alloc_queue` empty *and* utilization
 below 0.85 *and* an eligible victim available, then every mechanism in this
@@ -389,38 +436,55 @@ none should be written before X1 names the entry condition.
 - **Escalate from the queue**: let phase 1 attempt eviction for a head that has
   waited too long. Directly closes E1, but re-entrancy into the eviction loop
   from inside a drain needs care.
-- **Decouple the market clock from batch execution** (X5): closes E4. **Not
-  sufficient on its own** — E7 means rent stays zero however often the clock
-  ticks, so this only helps in combination with the next item.
-- **Make the clearing price something other than the minimum resident bid**
-  (E7): the market cannot price scarcity when one un-bid context sets the price
-  for everyone, and on this branch no inferlet *can* bid. Any fix that relies on
-  `defaulted` firing has to close this first, or it is relying on a flag that is
-  never set.
-- **Charge residency, not just compute** (E5/§3.5b): the deeper fix, and the
-  largest change — the current market prices the wrong resource for this failure.
+- **Decouple the market clock from batch execution** (X5): closes E4, and with
+  R1 corrected this is now the *strongest* economic candidate — rent does accrue
+  and contexts do default, so a clock that keeps running through a stall keeps
+  the escape hatch alive. Requires deciding what rent means when nothing is
+  computing.
+- **Charge residency, not just compute** (E5/§3.5): a parked page-holder pays
+  nothing even under a live market, so the thing being priced is not the thing
+  that is scarce. Larger change, deeper fix.
+- **Revisit the min-bid clearing price** (E7): the most-exhausted context sets
+  the rent for everyone on the driver. Not implicated in any current candidate —
+  listed because it surprised me and may surprise the next reader.
 
 ---
 
 ## 9. Status
 
 Mechanism: **structurally characterised, not identified.** Eight facts (E1–E8)
-are established from the code; which one fired is unknown; three candidates and
-the experiments that separate them are above, with predictions registered before
-any run. No reproduction has been attempted by this session. No patch is
-proposed.
+are established from the code; one earlier claim (R1) was established from the
+code and then **refuted by measurement**; which mechanism actually fired is
+unknown. Three candidates and the experiments that separate them are above, with
+predictions registered before each run.
 
-Two things moved during the writing of this document and are worth carrying
-forward as findings in their own right:
+A reproduction harness now exists (`scratch/bug16-repro`, unmerged): mock GPU, no
+model, no CUDA, plus a `debug_snapshot` probe that answers through the actor
+mailbox — which works precisely because this class of deadlock leaves the actor
+healthy. **It does not yet reproduce the wedge** at 6× oversubscription; §6.1 has
+the numbers and the next parameterisations to try. No patch is proposed.
 
-- The market layer is **inert in both directions** for any workload that does not
-  bid — which, on this branch, is every workload, because the SDK has no bid
-  method (E7/E8). "The eviction economics are supposed to break it and evidently
-  do not" (DESIGN §16) understates the case: they cannot, and the reason is two
-  strict comparisons and a `min`.
-- One of this document's own predictions was wrong and was caught by having been
-  written down first (X5). That is the practice working, and it is the reason the
-  remaining predictions should be treated as falsifiable rather than decorative.
+The most useful thing to carry forward is the shape of the error, not the
+conclusion:
+
+- I eliminated a whole branch of the candidate tree — the bid gate, the priority
+  gate, and defaulting — on the strength of a grep, wrote it up as two
+  established facts, and committed it. The first run of the harness refuted it in
+  85 milliseconds. The grep was for `fn bid` in the SDK; the method is `set_bid`,
+  and the `Generator` auto-bids on every step, so the thing I declared impossible
+  happens six times in a tenth of a second.
+- DESIGN.md's hygiene list already names this species: an untraced,
+  mechanism-shaped story that survives because it is coherent. Being derived from
+  code rather than from imagination is **not** the protection it feels like — a
+  grep is a measurement, and it has a false-negative rate.
+- The practice that caught it was cheap: build the harness, run it, print the
+  numbers that the story says cannot exist. Eighty-five milliseconds of engine
+  time against a claim that had already been committed to two remotes.
+
+The single most valuable next step is still §7's instrumentation plus a
+parameterisation that actually wedges. Every remaining question in §5 is answered
+by one wedged run that can talk — and, on the evidence above, by very little
+that is not a run.
 
 The single most valuable next step is **not** a fix — it is §7's instrumentation
 plus X1, because every remaining question in §5 is answered by one wedged run

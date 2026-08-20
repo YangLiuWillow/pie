@@ -984,28 +984,33 @@ Workaround until fixed: keep peak concurrent KV demand under the pool
 (the diagnostic re-ran at concurrency 8 without issue).
 
 **Scoped 2026-08-20 — see `BUG16-SCOPE.md` (same directory).** The "prime
-suspect" above is partly right and materially incomplete. Eight facts are now
-established from the code; the sharpest is that **the eviction economics cannot
-break the deadlock, rather than merely failing to.** `defaulted` — the flag that
-makes a context evictable regardless of bid — is set only when
-`proc.balance < clearing_price * eff`; the clearing price is the *minimum* bid
-among resident contexts; every context is born at `bid = 0.0`; and this branch's
-Rust SDK exposes no way to change it. So rent is identically zero, no context can
-ever default, and (since both bid comparisons are strict) the bid gate and the
-priority gate are vacuous too — the whole market layer is inert in both
-directions. Separately, the market clock is driven only by `execute_batch`, so it
-also stops when the engine does, and rent reaches only *in-batch* contexts, never
-an idle page hoarder. On the mechanical side, `drain_queues` phase 1 waits for
-free pages without ever escalating to eviction (`find_eviction_victim` has one
-call site, in `when_allocated_inner`), and restores are gated on that queue being
-empty — so one un-servable head freezes every suspended context.
+suspect" above is partly right and materially incomplete. The mechanical findings
+are the solid ones: `drain_queues` phase 1 waits for free pages and **never
+escalates to eviction** (`find_eviction_victim` has exactly one call site, in
+`when_allocated_inner`), so a context parked in `alloc_queue` waits on a purely
+passive condition; restores are gated on that queue being empty, so **one
+un-servable head freezes every suspended context**; and there is a second,
+independent restore gate at 0.85 utilization. On the economic side, the market
+clock is driven only by `execute_batch`, so the escape hatch — `defaulted`, which
+makes a context evictable regardless of bid — stops exactly when the engine
+stops; and rent reaches only *in-batch* contexts, never an idle page hoarder.
 
-Which hole is the *entry* condition is still unknown. BUG16-SCOPE.md §6 registers
-the discriminating predictions in advance (one of them was already falsified
-during writing, by E7), and §7 notes that `SchedCounters` already tracks
-everything needed to tell them apart — its only dump site is commented out, which
-is why the 40-minute wedge left no evidence. **No reproduction has been attempted
-and no patch is proposed.**
+**One claim in the first revision of that document was wrong, and a mock-GPU
+harness refuted it in 85 ms.** It asserted that rent is identically zero (every
+context born at `bid = 0.0`, SDK unable to bid), so `defaulted` could never be
+set and the market layer was inert. In fact the SDK's `Generator` **auto-bids on
+every step** via `compute_bid`, bids span ~870× across concurrent contexts, and
+six defaulting events fired in a tenth of a second. The market is live; its
+weakness is the clock, not the arithmetic. BUG16-SCOPE.md keeps the refuted claim
+as R1 rather than deleting it.
+
+Which hole is the *entry* condition is still unknown. §6 registers the
+discriminating predictions in advance; §6.1 has the first harness run (6×
+oversubscribed, **no wedge**, 82 ms — so the ratio alone is not sufficient and no
+mechanism conclusion follows); §7 notes that `SchedCounters` already tracks
+everything needed to tell the candidates apart, and that its only dump site is
+commented out — which is why the 40-minute wedge left no evidence.
+**No patch is proposed.**
 
 ### Measurement hygiene (cross-session lessons, 2026-08-14/16)
 
