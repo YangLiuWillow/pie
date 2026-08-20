@@ -128,6 +128,22 @@ def main() -> None:
         "\nAt n=50 per arm a 10-point avg move is roughly the resolution limit."
     )
 
+    # Token spend by stratum. §14's decomposition said the quality gap is token
+    # starvation under the x-degree ledger, and §15's theory of the penalty is
+    # that it shortens repetition-inflated branches. If that is the mechanism,
+    # the penalty arm spends fewer generated tokens per run, not just more of
+    # them well.
+    print("\nmean tokens_generated / charged (runs without an error):")
+    for arm in sorted(by):
+        good = [r for r in by[arm] if not r.get("error")]
+        for label, sel in (("b<=1", lambda r: blocks(r) <= 1), ("b>=2", lambda r: blocks(r) >= 2)):
+            xs = [r for r in good if sel(r)]
+            g = [r.get("tokens_generated") for r in xs if r.get("tokens_generated")]
+            c = [r.get("tokens_charged") for r in xs if r.get("tokens_charged")]
+            gm = sum(g) / len(g) if g else float("nan")
+            cm = sum(c) / len(c) if c else float("nan")
+            print(f"  {arm:<13} {label}  n={len(xs):>3}  gen={gm:>8.0f}  charged={cm:>8.0f}")
+
     # stop_reason x blocks, the mechanism behind the collapse
     print("\nstop_reason x parallel_blocks (count, correct):")
     for arm in sorted(by):
