@@ -350,6 +350,54 @@ unimplemented NPR knob and the prime suspect. Pod hygiene for reruns: deploy
 with a volume, gate hosts on `cuInit(0)==0` (3 of 4 community L40S hosts had
 broken CUDA), stream results off-pod continuously.
 
+### What these 50-run arms can and cannot resolve
+
+The `adopt` arm's accuracy is a mixture, and the mixture is exact:
+`share(b>=2) x acc|b>=2 + share(b<=1) x acc|b<=1 = 0.540 x 0.815 + 0.460 x
+0.043 = 0.460`. Accuracy here is almost entirely *how often a run escapes its
+first parallel block*, and barely at all how well it reasons once there. So
+reaching the paper's 0.504 with both conditionals held needs `share(b>=2)` to go
+0.540 -> 0.597 — **+2.2 correct runs out of 50**, against a Wilson half-width of
+0.133. **No 25 x k=2 sweep can answer a 0.044 question through the mean.**
+
+Pricing a sweep that could, because the obvious response is "run more":
+
+| analysis | runs per arm for 80% power at 0.044 |
+|---|---|
+| unpaired, two marginal proportions | 2,021 |
+| unpaired but clustered (ICC 0.767, k=2) | ~3,570 |
+| **paired on per-problem differences** | **487** |
+| paired, if the effect clips near p=1 | 838 |
+
+The unpaired figure is the right arithmetic for the wrong design: both arms run
+the same problems, and AIME difficulty is near-bimodal (between-problem variance
+of latent `p_i` = 0.188, problem-level ICC = **0.767**), so a paired test fights
+the within-problem variance `E[p(1-p)] = 0.060`, not the `p(1-p) = 0.248` the
+unpaired formula charges. **Two conditions travel with that recommendation and
+are part of what would be authorized, not downstream analysis choices:**
+
+1. **It must be analyzed paired**, on per-problem differences. Buying 500
+   runs/arm and then comparing two marginal Wilson intervals will produce
+   overlapping intervals and a spurious null — paying for the data and
+   discarding the design that made it affordable.
+2. **Ignoring the pairing costs more than the naive figure suggests**, not
+   less: analyzed as unpaired-but-clustered, ICC 0.767 inflates the k=2 design
+   to ~3,570 runs/arm.
+
+And it is an overnight run, not a piggyback: ~974 rows at this sweep's ~100
+rows/90 min is **~15 hours** of pod time and 15 hours of exposure to pod death.
+The resume story is real but manual — `run_eval.py --resume` (default) skips
+keys already in the `--out` file, and the poller streams that file off-pod every
+3 minutes, so a pod lost at hour 9 costs at most one poll interval *provided the
+streamed copy is pushed back to the replacement pod's `$STATE/results/` before
+relaunching*. Errored rows are deliberately not counted as seen, so they retry.
+
+**The mean is purchasable for ~$15-25; it is not unreachable.** But it can only
+say *whether* the penalty worked, never *which* of the two failure populations
+moved — and that is what picks the next fix. The mechanism route is the better
+buy on information per dollar, not the consolation prize for an underpowered
+sweep.
+
 ## 12. Frontier for a cold agent (2026-08-20): validate repetition penalty 1.02
 
 Commit `e14082eb0` implemented NPR's last knob — per-`<step>` repetition
