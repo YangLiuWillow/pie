@@ -108,13 +108,13 @@ async fn main(input: Input) -> Result<String> {
         "Answer using only the provided context.",
         &with_context_text,
     );
-    cond_prompt.extend(chat::cue());
+    cond_prompt.extend(chat::cue(true));
     if cond_prompt.is_empty() {
         cond_prompt.push(0);
     }
     let mut uncond_prompt =
         chat::system_user("Answer using only the provided context.", &input.query);
-    uncond_prompt.extend(chat::cue());
+    uncond_prompt.extend(chat::cue(true));
     if uncond_prompt.is_empty() {
         uncond_prompt.push(0);
     }

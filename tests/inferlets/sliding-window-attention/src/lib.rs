@@ -40,7 +40,7 @@ async fn main(input: Input) -> Result<String> {
     let window = input.window_size.max(1);
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
-    prompt.extend(chat::cue());
+    prompt.extend(chat::cue(true));
     if prompt.is_empty() {
         prompt.push(0);
     }

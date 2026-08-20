@@ -78,7 +78,7 @@ async fn main(input: Input) -> Result<String> {
 
     // Chat-template the system and user messages, then add the assistant cue.
     let mut prompt_tokens = chat::system_user(&input.system, &input.prompt);
-    prompt_tokens.extend(chat::cue());
+    prompt_tokens.extend(chat::cue(true));
     if prompt_tokens.is_empty() {
         prompt_tokens.push(0);
     }

@@ -175,7 +175,7 @@ async fn main(input: Input) -> Result<Output> {
     let page_size = kv_page_size();
 
     let mut committed = chat::system_user("Continue the requested text.", &input.prompt);
-    committed.extend(chat::cue());
+    committed.extend(chat::cue(true));
     if committed.is_empty() {
         committed.push(0);
     }

@@ -272,7 +272,7 @@ macro_rules! define_run_one {
                 tokens.to_vec()
             } else {
                 let mut p = chat::system_user(&input.system, prompt);
-                p.extend(chat::cue());
+                p.extend(chat::cue(true));
                 p
             };
             step(&mut prologue_us, input.report_timing); // [1] tokenize
@@ -827,7 +827,7 @@ async fn main(input: Input) -> Result<Output> {
                         .map(String::as_str)
                         .unwrap_or(input.prompt.as_str());
                     let mut pt = chat::system_user(&input.system, prompt);
-                    pt.extend(chat::cue());
+                    pt.extend(chat::cue(true));
                     prepared_prompt_tokens.push(pt);
                 }
             }

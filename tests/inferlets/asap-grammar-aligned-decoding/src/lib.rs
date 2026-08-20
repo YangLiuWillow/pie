@@ -220,7 +220,7 @@ async fn main(input: Input) -> Result<Output> {
         "Generate only the requested JSON value, with no markdown or explanation.",
         &input.prompt,
     );
-    prompt.extend(chat::cue());
+    prompt.extend(chat::cue(true));
     if prompt.is_empty() {
         prompt.push(0);
     }

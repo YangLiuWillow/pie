@@ -85,7 +85,7 @@ async fn main(input: Input) -> Result<String> {
     // form, plus the assistant cue. The cue is identical for every candidate so
     // it folds into the shared prefill.
     let mut prefix = chat::system_user(SYSTEM_PROMPT, &question);
-    prefix.extend(chat::cue());
+    prefix.extend(chat::cue(true));
     if prefix.is_empty() {
         prefix.push(0);
     }

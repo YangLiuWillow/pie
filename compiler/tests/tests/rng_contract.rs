@@ -213,19 +213,29 @@ fn rng_magic_is_owned_by_the_contract() {
         // golden-ratio word again, and nothing to do with the PTIR stream.
         Path::new("driver/cuda/src/ops/gemm.cpp"),
         Path::new("driver/cuda/src/ops/tuning_cache.hpp"),
+        // FNV session fingerprint salted with the golden-ratio word; not a
+        // keyed-RNG transcription.
+        Path::new("inferlets/openai-serving/src/session.rs"),
     ];
     let unrelated_mask_users = [
         Path::new("driver/cuda/tests/ptir_tier0_test.cu"),
         Path::new("runtime/grammar/src/brle.rs"),
     ];
+    let unrelated_shift_users = [
+        // murmur3-style finalizer for deterministic test weights: takes the
+        // top 24 bits of its own 64-bit hash. Different hash, different
+        // constants; not a transcription of the PTIR uniform mapping.
+        Path::new("driver/metal/tests/llama_numerics_test.cpp"),
+    ];
     let stride = ["9e37", "79b9", "7f4a", "7c15"].concat();
     let ambient_mask = ["a5a5", "a5a5"].concat();
+    let shift = [">>", "40"].concat();
     let magic = [
         ["3c79", "ac49", "2ba7", "b653"].concat(),
         ["1c69", "b3f7", "4ac4", "ae35"].concat(),
         stride.clone(),
         ambient_mask.clone(),
-        [">>", "40"].concat(),
+        shift.clone(),
         ["16777216", ".0"].concat(),
     ];
 
@@ -244,6 +254,9 @@ fn rng_magic_is_owned_by_the_contract() {
                 continue;
             }
             if needle == &ambient_mask && unrelated_mask_users.contains(&relative.as_path()) {
+                continue;
+            }
+            if needle == &shift && unrelated_shift_users.contains(&relative.as_path()) {
                 continue;
             }
             panic!(

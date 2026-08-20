@@ -63,7 +63,7 @@ async fn main(input: Input) -> Result<String> {
     let w = k + 1;
 
     let mut prompt = chat::system_user("Continue the requested text.", &input.prompt);
-    prompt.extend(chat::cue());
+    prompt.extend(chat::cue(true));
     if prompt.is_empty() {
         prompt.push(0);
     }
