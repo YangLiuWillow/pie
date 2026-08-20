@@ -948,7 +948,7 @@ charged-token budget. Finish-rate ↑ with avg@8 → 40s ⇒ mostly accounting;
 finish-rate ↑ with avg@8 stalling ⇒ the repetition penalty's share is large.
 Partial sweep rows: `evals/results/aime25-a40.jsonl`.
 
-### Engine bug 16 — silent whole-engine deadlock under sustained page oversubscription
+### Engine bug 16 — silent whole-engine deadlock under sustained page oversubscription (**OPEN — mechanism unknown**)
 
 Found by the 90k-budget diagnostic (A40, ~6,700-page pool ≈ 214k tokens):
 24 concurrent runs each growing toward ~28k generated tokens stalled the
@@ -983,53 +983,126 @@ deadlock would *look* like a 100%-failure cliff.
 Workaround until fixed: keep peak concurrent KV demand under the pool
 (the diagnostic re-ran at concurrency 8 without issue).
 
-**Scoped 2026-08-20 — see `BUG16-SCOPE.md` (same directory).** The "prime
-suspect" above is partly right and materially incomplete. The mechanical findings
-are the solid ones: `drain_queues` phase 1 waits for free pages and **never
-escalates to eviction** (`find_eviction_victim` has exactly one call site, in
-`when_allocated_inner`), so a context parked in `alloc_queue` waits on a purely
-passive condition; restores are gated on that queue being empty, so **one
-un-servable head freezes every suspended context**; and there is a second,
-independent restore gate at 0.85 utilization. On the economic side, the market
-clock is driven only by `execute_batch`, so the escape hatch — `defaulted`, which
-makes a context evictable regardless of bid — stops exactly when the engine
-stops; and rent reaches only *in-batch* contexts, never an idle page hoarder.
+**Status: OPEN. Scoped 2026-08-20 — see `BUG16-SCOPE.md` (same directory).**
+A reproduced, root-caused allocator wedge came out of that scoping work, but it
+is **a different bug** — see **engine bug 17** below. Bug 16 is the *A40 event*,
+and nothing yet explains it. Do not close this entry when 17 is fixed.
 
-**One claim in the first revision of that document was wrong, and a mock-GPU
-harness refuted it in 85 ms.** It asserted that rent is identically zero (every
-context born at `bid = 0.0`, SDK unable to bid), so `defaulted` could never be
-set and the market layer was inert. In fact the SDK's `Generator` **auto-bids on
-every step** via `compute_bid`, bids span ~870× across concurrent contexts, and
-six defaulting events fired in a tenth of a second. The market is live; its
-weakness is the clock, not the arithmetic. BUG16-SCOPE.md keeps the refuted claim
-as R1 rather than deleting it.
+What the scoping established that applies here — all from reading the runtime,
+none of it yet tied to the A40 event:
 
-**A silent permanent deadlock is now reproduced and root-caused** — on a mock
-GPU, no model, no CUDA, in seconds (`runtime/tests/bug16_wedge.rs` on branch
-`scratch/bug16-repro`). The cause is **not** any of the three mechanisms the
-first revision proposed; the wedge snapshot refuted all three at once (empty
-alloc queue, idle unpaused device, nothing Pinned). What actually happens:
-**an allocation larger than the entire device pool is deferred rather than
-rejected.** No eviction can satisfy it — evicting everything yields less than the
-request — so `when_allocated_inner` self-suspends the context with the impossible
-op parked on it, and `can_restore` then sums that op into `required` and returns
-false *forever*, even against a completely empty device. Nothing on either path
-compares a request to device **capacity**, so "not yet" and "not ever" travel the
-same code path. The discriminating variable is per-context footprint vs pool
-size, not the oversubscription ratio: 24× oversubscribed with a footprint that
-fits completes in 313 ms; 24× with one that does not, wedges.
+- `drain_queues` phase 1 waits for free pages and **never escalates to
+  eviction** (`find_eviction_victim` has exactly one call site, in
+  `when_allocated_inner`), so a context parked in `alloc_queue` waits on a purely
+  passive condition;
+- restores are gated on that queue being empty, so **one un-servable head freezes
+  every suspended context**, and there is a second independent restore gate at
+  0.85 utilization;
+- the market clock is driven only by `execute_batch`, so the escape hatch —
+  `defaulted`, which makes a context evictable regardless of bid — stops exactly
+  when the engine stops; and rent reaches only *in-batch* contexts, never an idle
+  page hoarder.
 
-**This is not yet "bug 16 is solved."** Same subsystem, same signature, but the
-A40 arithmetic (~1,750 pages per context against a ~6,700-page pool) does not
-obviously admit a single oversized request. The live candidate for the A40 event
-is the accumulation variant — `can_restore` sums *all* `deferred_ops`, and that
-Vec grows on every deferral, so `required` can cross total capacity without any
-individual request being oversized. Untested; BUG16-SCOPE.md §6.4 has the test.
+The "prime suspect" paragraph above is therefore partly right and materially
+incomplete — but note that **the three mechanisms the scoping document derived
+from that suspicion were all refuted by measurement** (BUG16-SCOPE.md §6.2), as
+was a fourth claim about the market being inert (R1) and a fifth bridging
+hypothesis (M4b, §6.4). The A40 mechanism is open with no live candidate.
 
-The fix for the reproduced bug is small (compare against capacity, not just
-availability, and fail loudly), and it lives in `runtime/`, not in NPR code — so
-it is upstream-relevant. **No patch is written.** §7's instrumentation is still
-worth doing regardless: both wedges are invisible in the logs by construction.
+**What would settle it** (BUG16-SCOPE.md §7.1 — built, validated, and applied to
+nothing: `bug17/bug17-instrumentation.patch` + `bug17/RUNBOOK.md` on
+`scratch/bug16-repro`, same change as commits on `scratch/bug17-instrumentation`): a real pod run recording the `num_pages` distribution at
+`when_allocated`, and whether any single request or `can_restore` requirement ever
+exceeds device capacity. Another mock cell is *not* the next move — the harness
+resolves every regime short of an oversized request (§6.4, cells E/F/G), so the
+answer is not in the mock.
+
+Workaround is unchanged: keep peak concurrent KV demand under the pool.
+
+### Engine bug 17 — an allocation larger than the device wedges the engine, silently and permanently
+
+**Reproduced, deterministic, root-caused, unfixed.** Found 2026-08-20 while
+scoping bug 16; **same subsystem and same external signature as 16, identity
+unproven — and M4's precondition is NOT met by the A40 arithmetic**, so these are
+tracked separately. Full analysis in `BUG16-SCOPE.md` §6.3.
+
+Reproduction: `runtime/tests/bug16_wedge.rs` on branch `scratch/bug16-repro` —
+mock GPU, **no model, no CUDA, no pod**, wedges in seconds.
+
+```bash
+cargo test -p pie --test bug16_wedge -- --ignored --nocapture     # defaults wedge
+BUG16_N_CTX=4 BUG16_POOL_PAGES=16 BUG16_STEPS=768 \
+  cargo test -p pie --test bug16_wedge -- --ignored --nocapture   # minimal cell
+```
+
+**Mechanism.** A context issues one page allocation larger than the *entire*
+device pool. `when_allocated_inner` has **no device-capacity check anywhere**: it
+tries the free pool, then the eviction loop — which cannot possibly succeed, since
+evicting everything yields only `total` < `num_pages` — finds no victim, and falls
+through to its step-6 self-suspend with the impossible op parked on
+`ctx.deferred_ops`. `can_restore` then sums that op into `required` and compares
+against `available()`; because `required > total` it is **false forever**, no
+matter how idle the device becomes. The device empties completely and the context
+still cannot be restored. Every context that does this joins the same restore
+queue; nothing errors, nothing logs, and the engine sits at 0%.
+
+An impossible request and a temporarily-unsatisfiable one travel the *identical*
+code path. That is the whole bug: the runtime has no notion of "this can never be
+satisfied", so it waits for it.
+
+**The request size is guest-controlled and unbounded.** `ensure_working_pages`
+computes `needed = target - physical` and passes it straight to `when_allocated`
+(`runtime/src/context.rs:1697`), so a single call can reserve an entire generation
+horizon at once — in the minimal cell, 48 pages (768 tokens) in one request
+against a 16-page device.
+
+**The discriminating variable is per-context footprint vs pool size, not the
+oversubscription ratio** — which is the opposite of what the bug-16 note above
+assumes:
+
+| cell | contexts | per-ctx pages | pool | oversubscribed | result |
+|---|---|---|---|---|---|
+| A | 24 | 32 | 32 | 24× | completes, 313 ms |
+| B | 24 | 128 | 64 | 48× | **wedge** |
+| C | 8 | 516 | 32 | 129× | **wedge** |
+| D | 48 | 64 | 16 | 192× | **wedge** |
+| E | 24 | 32 | 128 | 6× | completes |
+| F | 48 | 32 | 128 | 12× | completes (1,176 restore rejections, 82 evictions) |
+| G | 24 | 60 | 256 | 5.6× | completes |
+
+Every wedge has footprint > pool; every completion has footprint ≤ pool.
+
+**Fix shape** (deliberately unwritten pending a decision): compare the request
+against device *capacity*, not just current availability, and fail it loudly
+instead of deferring it. The same check belongs in `can_restore`, where
+`required > total` means "this context can never come back" — today that returns
+`false` and is retried forever, silently, at every drain. Whether the right
+failure is an error to the guest, a chunked fill, or a refusal at admission is a
+design call. It lives in `runtime/`, not in NPR code, so it is upstream-relevant.
+
+### Engine bugs 18 and 19 — the allocator cannot be diagnosed from its own logs
+
+Two small, independent, genuinely upstreamable defects, found while scoping 16.
+Neither causes a wedge; together they are why a 40-minute one left an evidence
+log with nothing in it about the allocator.
+
+**18 — `SchedCounters` is never printed.** `runtime/src/context.rs:1154` tracks
+exactly what diagnosing this family needs — `eviction_suspends`,
+`priority_gate_suspends`, `no_victim_suspends`, `restores`, `restore_rejections`,
+`defaults_flagged`, `eviction_searches` — and the only dump site in the runtime is
+commented out (`runtime/src/context.rs:2727`). Every one of those counters was
+decisive in the bug-17 work, and none of them is observable in a shipped build.
+
+**19 — `eviction_searches` is a dead counter.** Declared, never incremented
+anywhere in the runtime. Measured directly: a run with `eviction_suspends = 5`
+reports `eviction_searches = 0`. If anyone uncommented the dump in 18, this would
+report "no eviction searches happened" as a fact — worse than no counter at all.
+Fix 19 before or with 18, never 18 alone.
+
+Both are addressed by the instrumentation patch in BUG16-SCOPE.md §7.1, which
+also replaces 18's commented-out dump with a watchdog that still speaks *during*
+a wedge — a drain-driven dump cannot, because `drain_queues` stops being called
+exactly when it is needed.
 
 ### Measurement hygiene (cross-session lessons, 2026-08-14/16)
 

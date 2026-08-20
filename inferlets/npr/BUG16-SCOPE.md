@@ -396,6 +396,8 @@ What that establishes and what it does not:
   `sched_counters.eviction_searches` is declared and never incremented anywhere
   in the runtime. Minor, but it is one of the seven counters §7 proposes to dump,
   and a dumped counter that is always zero is worse than no counter at all.
+  **Filed as engine bug 19** (see §7); the never-printed counters are **bug 18**.
+  Both are small, independent and upstreamable in their own right.
 
 Next parameterisations to try, in order of expected information: many more
 concurrent contexts (24, matching the A40), far longer runs, a slower mock
@@ -449,7 +451,15 @@ mechanism in this document is wrong."* It does, so they are. Registering that
 sentence in advance is the only reason this run reads as a result rather than as
 a confusing pile of counters.
 
-### 6.3 The actual mechanism — M4
+### 6.3 The actual mechanism — M4, tracked as **engine bug 17**
+
+> **Numbering, decided 2026-08-20.** What follows is filed as **engine bug 17**,
+> not as the answer to bug 16, and DESIGN.md now carries it as its own entry with
+> bug 16 left explicitly **OPEN**. The reason is concrete: if this were numbered
+> 16, fixing it would close 16, and the A40 event — still unexplained, still able
+> to eat 40 minutes of pod time — would silently leave the bug list. Numbering it
+> 16 would encode exactly the identity claim §6.4 refuses to make.
+
 
 Instrumenting the two decision points names it in one line each:
 
