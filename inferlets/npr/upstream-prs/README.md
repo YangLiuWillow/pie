@@ -68,8 +68,51 @@ macOS caps POSIX shm names at 31 characters and the test helper builds longer
 ones (`shm_open` → `ENAMETOOLONG`). Confirmed identical on a clean
 `upstream/main` checkout, so it is not fallout from any of these fixes.
 
-## Opening them
+## Opening them — currently blocked on the credential
 
-`gh pr create` does not work on this host — the fine-grained PAT cannot run
-GraphQL mutations ("Resource not accessible"). `open-prs.sh` uses
-`gh api -X POST repos/pie-project/pie/pulls` instead.
+**`gh` on this host cannot open a PR against `pie-project/pie` by any API.**
+The binding constraint is the token type's *repository reach*, not the endpoint
+— an earlier note in this project claimed the problem was GraphQL mutations
+specifically and that `gh api -X POST` was the workaround. That is wrong for
+repos we do not own.
+
+`gh` is authenticated with a **fine-grained** PAT, which reaches only repos
+owned by the token owner or granted by an org. Against `pie-project/pie` it is
+public-read:
+
+```
+$ gh api repos/pie-project/pie --jq .permissions
+{"admin":false,"maintain":false,"pull":true,"push":false,"triage":false}
+```
+
+so both of these return `403 Resource not accessible by personal access token`:
+
+```
+gh pr create ...                                        # GraphQL
+gh api -X POST repos/pie-project/pie/pulls ...          # REST
+```
+
+**One-step diagnostic:** `gh api -i user | grep -i x-oauth-scopes` — **no
+`X-OAuth-Scopes` header means the token is fine-grained.** Classic tokens
+always emit it.
+
+To unblock, either:
+
+1. **Re-auth** — `gh auth login` (web flow; the OAuth app token carries `repo`
+   scope and works across public repos), or a **classic** PAT with the
+   `public_repo` scope. Then run `open-prs.sh`, **one call at a time**, checking
+   the returned PR number before firing the next. A retry after a partial
+   success is how duplicate PRs get opened on someone else's repo.
+2. **Open them from the GitHub UI** — the branches are live on the fork, so each
+   is one click plus a paste of the matching body file. Base must be `main` on
+   every one.
+
+   - https://github.com/pie-project/pie/compare/main...YangLiuWillow:pie:fix/sdk-context-destroy-trap?expand=1
+   - https://github.com/pie-project/pie/compare/main...YangLiuWillow:pie:fix/portable-kv-write-index?expand=1
+   - https://github.com/pie-project/pie/compare/main...YangLiuWillow:pie:fix/runtime-explicit-mask-commit?expand=1
+   - https://github.com/pie-project/pie/compare/main...YangLiuWillow:pie:fix/cuda-prefill-logits-oob?expand=1
+   - https://github.com/pie-project/pie/compare/main...YangLiuWillow:pie:fix/portable-graph-cache-slot-count?expand=1
+
+Titles are in `open-prs.sh`. Commits are authored as Liu with no AI co-author
+trailers — verified on the pushed `fork` refs before the first attempt, since
+that is the one thing that cannot be corrected afterwards without a force-push.
