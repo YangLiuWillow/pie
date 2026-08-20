@@ -111,6 +111,7 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Logits {}
     impl Sealed for super::Distribution {}
+    impl Sealed for super::TopLogits {}
     impl Sealed for super::Logprob {}
     impl Sealed for super::Logprobs {}
     impl Sealed for super::Entropy {}
@@ -128,6 +129,23 @@ pub struct Logits;
 #[derive(Copy, Clone, Debug)]
 pub struct Distribution {
     pub temperature: f32,
+    pub k: u32,
+}
+
+/// Top-`k` token ids paired with their **raw, pre-softmax logits** (no
+/// temperature, no normalization). `k = 0` returns the full vocabulary.
+///
+/// Reads back through the same accessor as [`Distribution`]
+/// (`output.distribution(h)`) — the second element holds logit values
+/// rather than probabilities. On the wire this is the `dist` slot with the
+/// sentinel `temperature == 0`, which has no meaningful softmax reading.
+///
+/// Motivating use: guest-side samplers that need absolute logit values —
+/// e.g. an HF-style repetition penalty (`l < 0 → l·p`, `l > 0 → l/p`),
+/// which is not computable from softmax outputs because the logsumexp
+/// constant cancels out of every probability.
+#[derive(Copy, Clone, Debug)]
+pub struct TopLogits {
     pub k: u32,
 }
 
@@ -160,6 +178,15 @@ impl Probe for Distribution {
     type Out = Distribution;
     fn into_wit(self) -> WitSampler {
         WitSampler::Dist((self.temperature, self.k))
+    }
+}
+
+impl Probe for TopLogits {
+    /// Same output shape as [`Distribution`] — read via
+    /// `output.distribution(h)`; values are raw logits.
+    type Out = Distribution;
+    fn into_wit(self) -> WitSampler {
+        WitSampler::Dist((0.0, self.k))
     }
 }
 

@@ -525,6 +525,19 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         self
     }
 
+    /// Query index of the last pending input token this step — the position
+    /// the auto-sampler would attach to (`execute`'s `sample_idx`). Use as
+    /// the `index` for a [`probe`](Self::probe) that replaces the sampler
+    /// after [`clear_sampler`](Self::clear_sampler). 0 when the step has no
+    /// pending input (host samples off the last cached position).
+    pub fn last_query_index(&self) -> u32 {
+        if self.pending.is_empty() {
+            0
+        } else {
+            (self.pending.len() - 1) as u32
+        }
+    }
+
     /// Attach an extra probe at `index`. Returns a typed handle.
     pub fn probe<P: Probe>(&mut self, index: u32, probe: P) -> ProbeHandle<P::Out> {
         // Slot count: sampler (if not cleared) + step-probes + earlier

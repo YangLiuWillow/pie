@@ -211,14 +211,19 @@ void compute_dist_slots(
     const auto* h_sptr = ctx.sampling_indptr.data();
     const auto* h_sidx = ctx.sampling_indices.data();
 
-    std::vector<std::int32_t> dist_rows;
-    std::vector<float> dist_temps;
-    std::vector<std::int32_t> dist_topk;
-    std::vector<int> dist_req_idx;
-    dist_rows.reserve(ctx.num_sampling);
-    dist_temps.reserve(ctx.num_sampling);
-    dist_topk.reserve(ctx.num_sampling);
-    dist_req_idx.reserve(ctx.num_sampling);
+    // Sentinel: `temperature == 0` means "top-K raw logits" — the values
+    // returned are the model's pre-softmax logits, not probabilities (SDK
+    // `TopLogits` probe). Softmax slots and raw slots take different device
+    // paths, so collect all TYPE_DIST slots in slot order first and merge
+    // results back in that order — a request may mix both kinds.
+    struct DistSlot {
+        std::int32_t row;
+        float temp;
+        std::int32_t topk;
+        int req;
+    };
+    std::vector<DistSlot> slots;
+    slots.reserve(ctx.num_sampling);
 
     for (int r = 0; r < ctx.R; ++r) {
         const std::uint32_t lo = h_sptr[r];
@@ -230,35 +235,85 @@ void compute_dist_slots(
             // once more for safety.
             const std::int32_t Tk =
                 (ctx.per_slot_top_k[k] <= 0) ? V : ctx.per_slot_top_k[k];
-            dist_rows.push_back(static_cast<std::int32_t>(qo_lo + h_sidx[k]));
-            dist_temps.push_back(ctx.per_slot_temp[k]);
-            dist_topk.push_back(Tk);
-            dist_req_idx.push_back(r);
+            slots.push_back({static_cast<std::int32_t>(qo_lo + h_sidx[k]),
+                             ctx.per_slot_temp[k], Tk, r});
         }
     }
-    if (dist_rows.empty()) return;
+    if (slots.empty()) return;
 
-    const std::size_t nd = dist_rows.size();
-    auto d_dist_rows  = DeviceBuffer<std::int32_t>::from_host(
-        std::span<const std::int32_t>(dist_rows));
-    auto d_dist_temps = DeviceBuffer<float>::from_host(
-        std::span<const float>(dist_temps));
-    auto d_dist_probs = DeviceBuffer<float>::alloc(nd * static_cast<std::size_t>(V));
+    std::vector<std::size_t> soft_idx;
+    std::vector<std::size_t> raw_idx;
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        (slots[i].temp == 0.0f ? raw_idx : soft_idx).push_back(i);
+    }
 
-    kernels::launch_softmax_temp_bf16(
-        ctx.ws.logits.data(), d_dist_rows.data(), d_dist_temps.data(),
-        d_dist_probs.data(), static_cast<int>(nd), V, /*stream=*/nullptr);
+    // Per-slot result rows, indexed like `slots`; merged at the end so
+    // `per_req[..].dists` keeps slot order.
+    std::vector<std::vector<float>> values(slots.size());
 
-    const std::vector<float> h_dist_probs = d_dist_probs.to_host();
+    if (!soft_idx.empty()) {
+        std::vector<std::int32_t> rows;
+        std::vector<float> temps;
+        rows.reserve(soft_idx.size());
+        temps.reserve(soft_idx.size());
+        for (const auto i : soft_idx) {
+            rows.push_back(slots[i].row);
+            temps.push_back(slots[i].temp);
+        }
+        auto d_rows  = DeviceBuffer<std::int32_t>::from_host(
+            std::span<const std::int32_t>(rows));
+        auto d_temps = DeviceBuffer<float>::from_host(
+            std::span<const float>(temps));
+        auto d_probs = DeviceBuffer<float>::alloc(
+            soft_idx.size() * static_cast<std::size_t>(V));
+
+        kernels::launch_softmax_temp_bf16(
+            ctx.ws.logits.data(), d_rows.data(), d_temps.data(),
+            d_probs.data(), static_cast<int>(soft_idx.size()), V,
+            /*stream=*/nullptr);
+
+        std::vector<float> h_probs = d_probs.to_host();
+        for (std::size_t j = 0; j < soft_idx.size(); ++j) {
+            values[soft_idx[j]].assign(h_probs.begin() + j * V,
+                                       h_probs.begin() + (j + 1) * V);
+        }
+    }
+
+    if (!raw_idx.empty()) {
+        std::vector<std::int32_t> rows;
+        rows.reserve(raw_idx.size());
+        for (const auto i : raw_idx) rows.push_back(slots[i].row);
+        auto d_rows   = DeviceBuffer<std::int32_t>::from_host(
+            std::span<const std::int32_t>(rows));
+        auto d_packed = DeviceBuffer<std::uint16_t>::alloc(
+            raw_idx.size() * static_cast<std::size_t>(V));
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(ctx.ws.logits.data()),
+            d_rows.data(), d_packed.data(),
+            static_cast<int>(raw_idx.size()), V, /*stream=*/nullptr);
+        const std::vector<std::uint16_t> h_packed = d_packed.to_host();
+
+        // bf16 → f32 widening: bf16 bits in the high 16 bits of the f32
+        // (same convention as the RawLogits sub-pass).
+        for (std::size_t j = 0; j < raw_idx.size(); ++j) {
+            const std::uint16_t* src = h_packed.data() + j * V;
+            auto& dst = values[raw_idx[j]];
+            dst.resize(V);
+            auto* bits = reinterpret_cast<std::uint32_t*>(dst.data());
+            for (int v = 0; v < V; ++v) {
+                bits[v] = static_cast<std::uint32_t>(src[v]) << 16;
+            }
+        }
+    }
 
     std::vector<std::pair<float, std::uint32_t>> scratch(V);
-    for (std::size_t i = 0; i < nd; ++i) {
-        const auto* row = h_dist_probs.data() + i * V;
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        const auto& row = values[i];
         for (int j = 0; j < V; ++j) {
             scratch[j] = {row[j], static_cast<std::uint32_t>(j)};
         }
-        const int K = dist_topk[i] < V ? dist_topk[i] : V;
-        // Partial sort: top-K by prob descending; tie-break by lower
+        const int K = slots[i].topk < V ? slots[i].topk : V;
+        // Partial sort: top-K by value descending; tie-break by lower
         // id (matches torch.topk's stable behavior).
         std::partial_sort(
             scratch.begin(), scratch.begin() + K, scratch.end(),
@@ -267,13 +322,12 @@ void compute_dist_slots(
                 return a.second < b.second;
             });
         std::vector<std::uint32_t> ids(K);
-        std::vector<float> probs(K);
+        std::vector<float> vals(K);
         for (int kk = 0; kk < K; ++kk) {
-            ids[kk]   = scratch[kk].second;
-            probs[kk] = scratch[kk].first;
+            ids[kk]  = scratch[kk].second;
+            vals[kk] = scratch[kk].first;
         }
-        per_req[dist_req_idx[i]].dists.emplace_back(
-            std::move(ids), std::move(probs));
+        per_req[slots[i].req].dists.emplace_back(std::move(ids), std::move(vals));
     }
 }
 

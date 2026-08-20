@@ -50,11 +50,11 @@
 
 use futures::future;
 use inferlet::model::{Model, Tokenizer};
-use inferlet::sample::{Distribution, Sampler};
+use inferlet::sample::{Distribution, Sampler, TopLogits};
 use inferlet::{Context, Result, chat, runtime};
 use serde::Deserialize;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -127,6 +127,18 @@ struct Input {
     /// boundary — the generation cue is never captured. Off by default.
     #[serde(default)]
     prompt_cache: bool,
+    /// Repetition penalty applied from the first fork onward, mirroring the
+    /// NPR engine (`schedule_batch.py:1614` hardcodes 1.02 at fork time):
+    /// every request penalizes the tokens it has generated itself —
+    /// HF/sglang logit scaling (`l < 0 → l·p`, `l > 0 → l/p`) before
+    /// temperature/top-p. `1.0` disables (pre-fork decode is always
+    /// penalty-free, like the reference).
+    #[serde(default = "default_rep_penalty")]
+    rep_penalty: f32,
+    /// Base seed for the guest-side penalized sampler. 0 (default) derives
+    /// a seed from the question text.
+    #[serde(default)]
+    seed: u64,
 }
 
 fn default_question() -> String {
@@ -146,6 +158,9 @@ fn default_max_depth() -> usize {
 }
 fn default_min_fork_budget() -> usize {
     1024
+}
+fn default_rep_penalty() -> f32 {
+    1.02
 }
 fn default_temperature() -> f32 {
     1.0
@@ -245,6 +260,10 @@ struct Shared {
     min_fork_budget: usize,
     max_step_tokens: Option<usize>,
     join_mode: JoinMode,
+    rep_penalty: f32,
+    /// Seed source for per-request penalized-sampler RNGs; bumped once per
+    /// activation so trunk and every branch get distinct streams.
+    pen_seed: Cell<u64>,
     ledger: RefCell<Ledger>,
     stats: RefCell<Stats>,
 }
@@ -303,6 +322,12 @@ impl Shared {
             min_fork_budget: input.min_fork_budget,
             max_step_tokens: input.max_step_tokens,
             join_mode,
+            rep_penalty: input.rep_penalty,
+            pen_seed: Cell::new(if input.seed != 0 {
+                input.seed
+            } else {
+                fnv64(0xcbf29ce484222325, input.question.as_bytes())
+            }),
             ledger: RefCell::new(Ledger {
                 budget: input.max_new_tokens,
                 charged: 0,
@@ -316,6 +341,17 @@ impl Shared {
         Sampler::TopP {
             temperature: self.temperature,
             p: self.top_p,
+        }
+    }
+
+    /// Fresh penalty state for a newly-activated request (trunk at its
+    /// first fork; every branch at birth). Distinct RNG stream per call.
+    fn fresh_pen(&self) -> Pen {
+        let s = self.pen_seed.get().wrapping_add(0x9E3779B97F4A7C15);
+        self.pen_seed.set(s);
+        Pen {
+            set: HashSet::new(),
+            rng: s,
         }
     }
 
@@ -379,14 +415,32 @@ impl Shared {
 /// Invariant: every token that enters KV at slot `s` (from now until the
 /// next join changes it) carries position id `s + delta`. `delta` is 0
 /// until the first refill join compresses positions.
+/// Per-request repetition-penalty state, mirroring the reference engine's
+/// per-request cumulated penalty row: activated at the first fork (or at
+/// branch birth), it collects the tokens *this* request has generated since
+/// activation — never the prompt, never siblings' output.
+struct Pen {
+    set: HashSet<u32>,
+    rng: u64,
+}
+
 struct PCtx {
     ctx: Context,
     delta: i64,
+    /// `Some` once the repetition penalty is active for this request.
+    /// Deliberately NOT inherited by `fork()` — the reference gives every
+    /// new request a fresh penalty row; activation is explicit at the
+    /// fork site.
+    pen: Option<Pen>,
 }
 
 impl PCtx {
     fn new(ctx: Context) -> Self {
-        PCtx { ctx, delta: 0 }
+        PCtx {
+            ctx,
+            delta: 0,
+            pen: None,
+        }
     }
 
     /// KV slot the next buffered/generated token will occupy.
@@ -408,6 +462,7 @@ impl PCtx {
         Ok(PCtx {
             ctx: self.ctx.fork()?,
             delta: self.delta,
+            pen: None,
         })
     }
 }
@@ -466,6 +521,88 @@ struct Segment {
     stop: Stop,
 }
 
+/// splitmix64 — small deterministic RNG for the guest-side sampler.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Penalized top-p sample over a top-K raw-logit probe, replicating the
+/// reference sampling pipeline (sglang penaltylib + top-p):
+///
+/// 1. HF-style repetition penalty on raw logits for tokens in `set`:
+///    `l < 0 → l·p`, `l ≥ 0 → l/p` — sign-dependent scaling, which is why
+///    this needs logits (the `TopLogits` probe) and cannot be computed
+///    from softmax outputs.
+/// 2. Softmax at `temperature` over the K candidates.
+/// 3. Nucleus filter: keep the smallest prob-descending prefix whose
+///    cumulative mass reaches `top_p` (a token is kept iff the mass
+///    before it is < `top_p`); renormalize; multinomial draw.
+///
+/// Truncation to K candidates is the one approximation vs. the reference
+/// (which filters the full vocabulary): with top_p = 0.7 and K = 128 the
+/// nucleus lives far inside the candidate set, and the penalty only
+/// *demotes* candidates, so mass outside K is negligible.
+fn sample_penalized(
+    ids: &[u32],
+    logits: &[f32],
+    pen: &mut Pen,
+    penalty: f32,
+    temperature: f32,
+    top_p: f32,
+) -> Option<u32> {
+    if ids.is_empty() {
+        return None;
+    }
+    let mut cand: Vec<(u32, f32)> = ids
+        .iter()
+        .zip(logits)
+        .map(|(&id, &l)| {
+            let l = if pen.set.contains(&id) {
+                if l < 0.0 { l * penalty } else { l / penalty }
+            } else {
+                l
+            };
+            (id, l)
+        })
+        .collect();
+    // Prob-descending == logit-descending (softmax is monotone).
+    cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let inv_t = 1.0 / temperature.max(1e-5);
+    let m = cand[0].1;
+    let mut probs: Vec<f32> = cand
+        .iter()
+        .map(|&(_, l)| ((l - m) * inv_t).exp())
+        .collect();
+    let total: f32 = probs.iter().sum();
+    for p in &mut probs {
+        *p /= total;
+    }
+    // Nucleus cut, then a single multinomial draw over the kept prefix.
+    let mut kept = 0usize;
+    let mut kept_mass = 0.0f32;
+    for &p in &probs {
+        if kept > 0 && kept_mass >= top_p {
+            break;
+        }
+        kept += 1;
+        kept_mass += p;
+    }
+    let u = (splitmix64(&mut pen.rng) >> 11) as f64 / (1u64 << 53) as f64;
+    let mut acc = 0.0f64;
+    let target = u * kept_mass as f64;
+    for i in 0..kept {
+        acc += probs[i] as f64;
+        if acc >= target {
+            return Some(cand[i].0);
+        }
+    }
+    Some(cand[kept - 1].0)
+}
+
 /// Decode one segment: until a watched tag closes, the turn ends, or the
 /// budget runs out. Tag tokens stay in the stream (NPR `no_stop_trim`
 /// semantics): the Generator has no tag stops, so the tag token is
@@ -491,6 +628,10 @@ async fn decode_segment(
     // advances by exactly one per generated token. Tracked locally because
     // the generator holds the &mut borrow of the context.
     let mut cur_pos = p.next_pos();
+    // Repetition-penalty state is taken out of the PCtx for the duration of
+    // the generator borrow and restored on every exit path below.
+    let mut pen = p.pen.take();
+    let penalty_on = pen.is_some() && sh.rep_penalty != 1.0;
     // Pass-level speculation (run-ahead staging) is disabled throughout:
     // staged passes assume plain causal continuation, and stale staged
     // entries for destroyed branch contexts can race the join's refills.
@@ -500,7 +641,7 @@ async fn decode_segment(
         .stop(&sh.chat_stops)
         .position_offset(delta)
         .disable_pass_speculation();
-    loop {
+    let stop = loop {
         // Engine-faithful finish checks (`schedule_batch.py::check_finished`):
         // primary is positional (longest path through the parallel structure);
         // the ×degree charge is the secondary, transient check.
@@ -509,18 +650,43 @@ async fn decode_segment(
             || degree_charge + 128 >= sh.ledger.borrow().budget
             || token_cap.is_some_and(|cap| tokens.len() >= cap)
         {
-            return Ok(Segment {
-                tokens,
-                bytes,
-                stop: Stop::Budget,
-            });
+            break Stop::Budget;
         }
-        let Some(token) = generator.next_token().await? else {
-            return Ok(Segment {
-                tokens,
-                bytes,
-                stop: Stop::Eos,
-            });
+        let token = if penalty_on {
+            // Penalized path: probe top-K raw logits, sample guest-side
+            // (see `sample_penalized`), feed the pick back via `accept`.
+            let pen = pen.as_mut().expect("penalty state present");
+            let Some(mut step) = generator.next()? else {
+                break Stop::Eos;
+            };
+            step.clear_sampler();
+            let h = step.probe(step.last_query_index(), TopLogits { k: 128 });
+            let out = step.execute().await?;
+            let Some((ids, logits)) = out.distribution(h) else {
+                break Stop::Eos;
+            };
+            let Some(t) = sample_penalized(
+                &ids,
+                &logits,
+                pen,
+                sh.rep_penalty,
+                sh.temperature,
+                sh.top_p,
+            ) else {
+                break Stop::Eos;
+            };
+            if generator.accept(&[t]).is_empty() {
+                // The pick was a chat stop — end of turn, token excluded
+                // from the stream (same contract as `next_token`).
+                break Stop::Eos;
+            }
+            pen.set.insert(t);
+            t
+        } else {
+            match generator.next_token().await? {
+                Some(t) => t,
+                None => break Stop::Eos,
+            }
         };
         tokens.push(token);
         bytes.extend_from_slice(sh.bytes_of(token));
@@ -528,20 +694,15 @@ async fn decode_segment(
         sh.ledger.borrow_mut().charged += degree;
         sh.stats.borrow_mut().tokens_generated += 1;
         if bytes.ends_with(TAG_GUIDELINE_END) {
-            return Ok(Segment {
-                tokens,
-                bytes,
-                stop: Stop::GuidelineEnd,
-            });
+            break Stop::GuidelineEnd;
         }
         if watch_step && bytes.ends_with(TAG_STEP_END) {
-            return Ok(Segment {
-                tokens,
-                bytes,
-                stop: Stop::StepEnd,
-            });
+            break Stop::StepEnd;
         }
-    }
+    };
+    drop(generator);
+    p.pen = pen;
+    Ok(Segment { tokens, bytes, stop })
 }
 
 // =============================================================================
@@ -616,10 +777,27 @@ fn try_fork<'a>(
             plans
         );
 
+        // Engine parity (`schedule_batch.py:1614`): the moment a block
+        // actually forks, repetition penalty switches on for the rest of the
+        // trajectory — children are born with fresh penalty rows; the trunk
+        // resumes with its own row after the merge. Guarded refusals above
+        // (malformed/over-budget/too-deep) do NOT activate it, matching the
+        // reference's recover path.
+        if sh.rep_penalty != 1.0 && p.pen.is_none() {
+            println!(
+                "[npr] repetition penalty {} active from first fork (guest-side sampler)",
+                sh.rep_penalty
+            );
+            p.pen = Some(sh.fresh_pen());
+        }
+
         let charged_before_block = sh.ledger.borrow().charged;
         let mut branch_futures = Vec::with_capacity(degree);
         for label in plans {
-            let child = p.fork()?;
+            let mut child = p.fork()?;
+            if sh.rep_penalty != 1.0 {
+                child.pen = Some(sh.fresh_pen());
+            }
             branch_futures.push(run_branch(sh.clone(), child, label, depth, degree));
         }
         let results = future::join_all(branch_futures).await;
@@ -753,6 +931,11 @@ fn try_fork<'a>(
 
         sh.stats.borrow_mut().join_ms += join_start.elapsed().as_millis() as u64;
 
+        // The merged context continues the *trunk* request: it carries the
+        // trunk's penalty row (accumulated trunk outputs since activation),
+        // not branch 1's — the reference parent resumes with its own
+        // cumulated row after the merge.
+        base.pen = p.pen.take();
         // The pre-fork parent context is superseded by the merged branch.
         let merged = std::mem::replace(p, base);
         // (merged is the old parent PCtx; drop its context explicitly.)
@@ -996,8 +1179,33 @@ async fn fill_and_probe(
             k: 10,
         },
     );
+    // Cross-check the `TopLogits` probe (temp-0 dist sentinel) against the
+    // softmax probe on the same forward: same ids in the same order, and
+    // softmax over the returned raw logits must reproduce the probs. Zero
+    // extra passes; prints one diagnostic line per probe.
+    let hl = pass.probe(b.len() as u32 - 1, TopLogits { k: 10 });
     let out = pass.execute().await?;
     let (ids, probs) = out.distribution(h).ok_or("selftest: probe missing")?;
+    if let Some((lids, logits)) = out.distribution(hl) {
+        let ids_match = lids == ids;
+        let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
+        let z: f32 = exps.iter().sum();
+        // Compare renormalized top-10 masses: the softmax probe normalizes
+        // over the full vocab, the logits reconstruction only over the 10
+        // candidates, so compare shape, not absolute mass.
+        let pk: f32 = probs.iter().sum();
+        let max_dev = exps
+            .iter()
+            .zip(probs.iter())
+            .map(|(e, p)| (e / z - p / pk).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "[npr] selftest toplogits: ids_match={ids_match} max_dev={max_dev:.6} max_logit={m:.3}"
+        );
+    } else {
+        println!("[npr] selftest toplogits: probe missing");
+    }
     Ok((ids.to_vec(), probs.to_vec()))
 }
 

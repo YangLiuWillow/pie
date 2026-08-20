@@ -55,6 +55,10 @@ ARMS = {
     "adopt": {"join_mode": "adopt"},
     "textual": {"join_mode": "textual"},
     "sequential": {"join_mode": "refill", "max_plans": 0},
+    # Ablation arms: the inferlet defaults to the engine-faithful repetition
+    # penalty 1.02 (activated at the first fork); `*_nopen` disables it.
+    "adopt_nopen": {"join_mode": "adopt", "rep_penalty": 1.0},
+    "refill_nopen": {"join_mode": "refill", "rep_penalty": 1.0},
 }
 
 

@@ -1065,3 +1065,57 @@ invalidated) a real experiment:
    calibrated claim hardened into a flat one purely by being restated.
    "Deterministic, unexplained" is a respectable resting state; it tells
    the next person there is something to find.
+
+## 15. Repetition penalty 1.02 — the last NPR knob (2026-08-19)
+
+**Reference semantics** (verified in the release engine, not the paper): the
+eval CLI exposes `--repetition_penalty` but `eval.sh` never passes it — the
+penalty is *hardcoded in the scheduler*. At the moment a request forks
+(`schedule_batch.py:1614`), the parent's `sampling_params` object is mutated
+to `repetition_penalty = 1.02` and shared by reference with every `<step>`
+child; the parent resumes with it after the merge. So: **off until the first
+fork, on for the rest of the trajectory**. The penalizer
+(`penaltylib/repetition_penalty.py`) cumulates **output tokens only**, per
+request, set-semantics, from when the penalizer is prepared — a branch
+penalizes only its own step tokens; the trunk penalizes trunk tokens emitted
+after activation; nothing inherits anything.
+
+**Why probabilities are not enough**: sglang applies the penalty to raw
+logits (`l < 0 → l·p`, `l ≥ 0 → l/p`). Top logits for NPR-4B measured ≈ 22
+(selftest), so 1.02 cuts a repeated top token by `exp(−0.02·22)` ≈ 35%.
+Every softmax-derived probe (dist/logprobs at any temperature set) loses the
+logsumexp constant, which makes the sign and magnitude of `l`
+unrecoverable — a logprob-scaling approximation would be ~20× too weak.
+
+**Engine primitive — `TopLogits` probe**: `dist` slot with sentinel
+`temperature == 0` now returns top-K ids + raw bf16→f32 logits instead of a
+(degenerate) softmax. Chosen over a new ABI kind because every runtime
+passthrough (chunking, speculator skip, WIT, demux) already routes Dist;
+temp-0 previously produced a useless near-one-hot, so the sentinel claims no
+meaningful behavior. Portable: skip `softmax_with_temperature`. CUDA:
+temp-0 slots take the `gather_bf16_rows` path (same widening convention as
+RawLogits) with an order-preserving merge so mixed-slot requests keep
+`per_req.dists` slot order. SDK: `sample::TopLogits { k }`, read via the
+existing `output.distribution(h)` accessor; `GenStep::last_query_index()`
+added for sampler-replacing probes.
+
+**Guest-side sampler** (`sample_penalized`): probe TopLogits k=128 each
+step (`clear_sampler` + `accept`), penalize candidates in the request's own
+generated-token set, softmax at temp, nucleus top-p over the candidates,
+splitmix64 draw (seeded from the question hash; `seed` input overrides).
+One approximation vs the reference: the nucleus is computed over 128
+candidates, not the full vocab — with top_p 0.7 the nucleus lives far inside
+K, and the penalty only demotes candidates. Activation mirrors the engine:
+`try_fork` arms the trunk's `Pen` and gives each branch a fresh one; the
+merged context carries the *trunk's* set forward (`base.pen = p.pen.take()`),
+not branch 1's.
+
+**Validation (Metal)**: selftest cross-probe — TopLogits ids identical to
+the Distribution probe, softmax(logits) reproduces probs to max_dev 0.000000,
+max_logit ≈ 22; full selftest still passes (adopt TV 0.0008, controls fail as
+required). E2e AIME 2025 I/1, adopt + penalty: 2 blocks, 5 branches, 0
+fallbacks, answer 70 (correct), penalty active from first fork. Eval arms
+`adopt_nopen` / `refill_nopen` (rep_penalty 1.0) added for the ablation; the
+motivating metric is §14's blocks=1 collapse (5% correct at 1 block vs 80%
+at 2): the penalty exists to stop loops that strand trajectories in their
+first block.
