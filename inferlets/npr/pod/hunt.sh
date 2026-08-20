@@ -45,6 +45,14 @@ for round in $(seq 1 20); do
       fi
       sleep 15
     done
+    # The wait loop can exhaust without ever getting an IP/port (RunPod hands
+    # back a RUNNING pod whose networking never materializes). Falling through
+    # to the next GPU would leave that pod billing unattended, so reap any pod
+    # we deployed and did not accept.
+    if [ ! -s "$NPR_STATE/pod-id.txt" ] || [ "$(cat "$NPR_STATE/pod-id.txt")" != "$ID" ]; then
+      echo "unaccepted; terminating $ID"
+      curl -s --max-time 30 -X DELETE https://rest.runpod.io/v1/pods/$ID -H "Authorization: Bearer $RUNPOD_API_KEY" -o /dev/null
+    fi
   done
   sleep 45
 done
