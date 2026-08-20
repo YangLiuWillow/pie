@@ -137,6 +137,13 @@ def main() -> None:
                          "(--mixed-phase, --shared-prefix-words, --arrival-rate, "
                          "--output-spread), so they are passed rather than "
                          "reimplemented.")
+    ap.add_argument("--pie-extra", default="",
+                    help="Space-separated flags forwarded to pie_bench.py ONLY. "
+                         "Exists because pie has engine knobs the other two do "
+                         "not (e.g. --default-endowment-pages, whose 64-page "
+                         "default caps a request at exactly 2048 tokens and "
+                         "silently fails the 2048-token arm of the standard "
+                         "prompt sweep).")
     args = ap.parse_args()
 
     prompt = ["--prompt", " ".join(["the quick brown fox jumps over the lazy dog"] *
@@ -153,8 +160,16 @@ def main() -> None:
             for rep in range(args.repeats):
                 print(f"  {args.label} {spec} {engine} rep{rep}", flush=True)
                 if engine == "pie":
+                    # `--max-model-len` goes to pie for the same reason it goes
+                    # to llama.cpp below: pie_bench's own default is 2048, which
+                    # sizes the Metal KV ring at exactly 64 pages -- so the
+                    # 2048-token arm of the standard prompt sweep is refused
+                    # ("allocation of 65 units can never fit") while the other
+                    # two engines run it. Same knob, same value, all engines.
                     cmd = [PIE_PY, "pie_bench.py"] + base + [
-                        "--driver", "metal", "--inferlet-dir", args.inferlet_dir]
+                        "--driver", "metal", "--inferlet-dir", args.inferlet_dir,
+                        "--max-model-len", str(args.max_model_len)]
+                    cmd += args.pie_extra.split() if args.pie_extra else []
                     env = {"PYTHONPATH": f"{ROOT.parent}/client/python/src:"
                                          f"{ROOT.parent}/sdk/python-server/python"}
                 elif engine == "mlx":
