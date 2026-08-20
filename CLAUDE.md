@@ -121,10 +121,20 @@ Use them rather than writing new ones.
 | llama.cpp | build **b9960** |
 | mlx-lm | **0.31.3** |
 | MLX | **0.32.0** |
+| BaseRT | **v0.1.6** |
 
-These match BaseRT §4.1. Upgrading any of them silently invalidates comparison
-against their published tables. If a newer version is needed for something
-unrelated, use a separate checkout.
+These match BaseRT §4.1, confirmed against the paper's own wording ("mlx-lm
+0.31.3 (MLX 0.32.0)", llama.cpp b9960, BaseRT v0.1.6). Upgrading any of them
+silently invalidates comparison against their published tables. If a newer
+version is needed for something unrelated, use a separate checkout.
+
+Note: `docs/plan-attention-depage.md` twice says "MLX 0.31.3" — that conflates
+mlx-lm's version with MLX's. The pins above are the paper-confirmed ones.
+Local copies of both BaseRT papers live in `docs/papers/` (gitignored):
+`basert-2607.00501.pdf`, `basert-m5-2607.19438.pdf`.
+
+None of these baselines are installed on this machine yet (fresh after the
+machine switch) — install them at exactly the pinned versions before T0.3.
 
 **Protocol** (also BaseRT §4.1, so results stay comparable): prompt lengths
 128/256/512/1024/2048; 128 generated tokens; 5 repetitions; report mean ± stddev.
