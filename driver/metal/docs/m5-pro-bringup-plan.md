@@ -102,9 +102,9 @@ cargo test --workspace --exclude pie-server-py
 # is the CUDA/dummy e2e suite: every #[ignore]d test there boots a 4090 config;
 # `--features driver-metal` compiles the driver but runs no Metal test.)
 cargo rustc -p pie-loader-capi --lib --crate-type staticlib   # target/debug/libpie_loader_capi.a
-cmake -S driver/metal -B /tmp/metaltests -DCMAKE_BUILD_TYPE=Release -DPIE_METAL_BUILD_TOOLS=ON
-cmake --build /tmp/metaltests -j
-ctest --test-dir /tmp/metaltests --output-on-failure
+cmake -S driver/metal -B build/metaltests -DCMAKE_BUILD_TYPE=Release -DPIE_METAL_BUILD_TOOLS=ON   # NOT /tmp: macOS purged /tmp/metaltests on reboot
+cmake --build build/metaltests -j
+ctest --test-dir build/metaltests --output-on-failure
 ```
 
 The loader staticlib is found automatically in `target/{debug,release}`;
@@ -135,8 +135,8 @@ parsing test — it never touches the device. Nothing in the tree prints
 `tuning_for()` and prints what came back.
 
 ```sh
-cmake --build /tmp/metaltests -j --target device_identity_probe
-/tmp/metaltests/tools/rawmetal/device_identity_probe
+cmake --build build/metaltests -j --target device_identity_probe
+build/metaltests/bin/device_identity_probe
 ```
 
 **Expectation, corrected:** not the M1 Max default. `query_apple_family()`
@@ -216,7 +216,52 @@ empirically whether BaseRT handles GatedDeltaNet.
 > **Licensing.** BaseRT's engine is proprietary and binary-only. Do not vendor or
 > disassemble it. Read the EULA before publishing comparative numbers.
 
----
+### T0.4 finding — "q4" is a profile, not a number (measured 2026-08-19)
+
+Recorded here because it changes how every later phase compares and builds.
+Full tables and the elimination record: `m5-pro-measurements.md` §T0.4.
+
+BaseRT's Llama-3.2-1B decode measured **240 tok/s against a published 342**
+while everything else reproduced within ±3%. The cause was inside "4-bit":
+`basert pull`'s auto-selected `default-q4` profile keeps `embed_tokens.weight`
+at **f16**, and Llama ties embeddings — so the lm_head matmul re-reads a
+525 MB bf16 tensor every token. Rebuilding with the repo's own
+`default-q4-embq6` profile (embedding at q6, 761 MB total) hits 325 tok/s,
+−5% of publication. The roofline arithmetic called it before the experiment
+did: 342 tok/s × 1.073 GB/token = 367 GB/s, above this machine's ~295 GB/s
+roof — an artifact that size *cannot* decode at the published rate.
+
+Three rules this leaves behind:
+
+1. **A comparison names the artifact, not the label.** Any Pie-vs-BaseRT (or
+   Pie-vs-anything) number must carry the quant profile, the weights bytes,
+   AND the source it was converted from. "q4 vs q4" hid a 30% decode gap;
+   bytes/token would have shown it in one line. And the source matters even
+   when the bytes match: the one artifact re-quantized from an
+   already-4-bit checkpoint (`--allow-quant-from-quant`, Qwen3.6-35B-A3B)
+   replicated decode and long-prompt prefill but carried a fixed ~40 ms
+   per-prefill-call penalty (−31% at pp128) that no machine condition
+   explained. Converting the same model from its bf16 source replicated
+   every cell (tg exact, pp within ±6%) — and the two artifacts differ
+   STRUCTURALLY (733 tensors / no `HAS_MOE` vs 693 / `HAS_MOE`): a
+   quant-from-quant conversion can change which dispatch path a runtime
+   takes, not only the numerics. See `m5-pro-measurements.md` ¶.
+2. **For pie's own kernels and future fusion work: on a small dense model,
+   the tied lm_head is the decode.** Per token, Llama-1B's q4 body is
+   ~547 MB and an f16 tied embedding is ~525 MB — the logits projection is
+   half the bandwidth budget by itself. When we build pie's fused decode
+   epilogue (lm_head GEMV + sampling), the wins in order: keep the lm_head
+   quantized (never materialize/read it wide), and fuse the readout so the
+   [vocab]-sized logits never round-trip device memory. The roofline check
+   (bytes-that-must-move × tok/s vs measured roof) is the design gate — it
+   predicted this finding exactly and costs nothing to run on paper.
+3. **Below some size, decode is a dispatch-floor problem, not a bandwidth
+   one.** BaseRT's Qwen3-0.6B decodes at ~533–546 tok/s whether the artifact
+   is 646 MB or 410 MB — file size doesn't reach the number, so the floor is
+   per-token launch/dispatch cost, not bytes. That is the same regime pie's
+   T0.3 small-model numbers live in: for sub-1B decode, fusing to *fewer
+   dispatches* pays where quantizing further does not. Measure which regime
+   a model is in before choosing which fusion to build.
 
 # Phase 1 — Characterize M5 Pro and land the tuning entry
 
@@ -230,8 +275,8 @@ M1 Max constants on this machine.*
 # configure (NEEDS_LOADER, so the loader staticlib must have been found).
 # --checkpoint-root is optional; it defaults to ~/.cache/huggingface/hub and
 # ~/.pie-bench, and knobs whose named checkpoints are absent are SKIPped.
-python benches/tune_device.py --bench /tmp/metaltests/llama_bench            # prints a tuning_for() block
-python benches/tune_device.py --bench /tmp/metaltests/llama_bench --control  # same arms at a batch where they agree
+python benches/tune_device.py --bench build/metaltests/llama_bench          # prints a tuning_for() block
+python benches/tune_device.py --bench build/metaltests/llama_bench --control # same arms at a batch where they agree
 ```
 
 Read the script header before running. Its documented methodology error is the
