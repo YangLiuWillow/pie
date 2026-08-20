@@ -35,6 +35,23 @@ Both are reachable from ordinary guest code: any inferlet that writes tokens at 
 1. Write index = slot: `kv_before_r + (i - qo_start)` where `kv_before_r = seq_len - n_tok` (the pre-pass KV length, i.e. the first new token's slot). Position ids stay in `plan.positions_i32` for RoPE. The old `pos_i >= seq_len` check is replaced by a check that the request actually has room for its tokens.
 2. Custom BRLE rows are no longer clamped at `p_i` — the runs alone define visibility, since the runtime emits rows whose true-runs never extend past the slots a token may legitimately see. **The synthesized causal default keeps its clamp**, so default-mask behaviour is byte-identical.
 
+## The other clamp in this file is correct — do not "fix" it too
+
+`plan.cpp` contains a second `std::min(n_kv - 1, p_i)` at line 38, in
+`build_phi3small_blocksparse_mask_f16`. This PR deliberately leaves it alone, and
+a reviewer checking for a missed instance of the same pattern should know why.
+
+That builder *synthesizes* a causal blocksparse mask. It takes no
+`per_token_runs` parameter, so it has no custom-BRLE path at all — every row it
+writes is causal by construction, and clamping at the token's own position is
+exactly right there. It is the same reason this PR keeps the clamp on the
+synthesized-causal branch of `build_attn_mask_f16` and removes it only from the
+custom-rows branch.
+
+The defect is not "the file clamps"; it is "the file clamps *guest-supplied
+slot-space rows* as though they were positions". There is one such site, and this
+PR changes that one.
+
 ## Verification
 
 - Numeric oracle: an isolation-matrix selftest in which a sibling sequence is refilled at positions overlapping a shared prefix, behind explicit hole masks, and its next-token distribution compared against the same text decoded alone off that prefix. **TV = 0.0000** on Qwen3-0.6B with the fix; garbage output without it. A deliberately causal control in the same harness differs by TV 0.22–0.55, confirming the masks actually bite rather than the test being insensitive.
