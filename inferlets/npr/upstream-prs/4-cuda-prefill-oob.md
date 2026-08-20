@@ -40,6 +40,41 @@ The three other meanings of `num_logit_rows` are preserved exactly:
 
 So the only behaviour that changes is the case that was previously an OOB write into a buffer nobody was going to read.
 
+## Relationship to #467, and to the existing `emit_logits` knob
+
+Two things a reviewer will reasonably ask about.
+
+**#467 ("Restore validated CUDA forward fixes") addressed this family, and never
+reached `main`.** It threads a *per-fire* `emit_logits` flag from the request into
+`LlamaLikeForwardCfg`:
+
+```cpp
+LlamaLikeForwardCfg fwd = fwd_cfg_;
+fwd.emit_logits = in.emit_logits;
+```
+
+and adds `driver/cuda/tests/test_executor_prefill_only.py`. It merged into
+`tts-arena/main` — a branch that no longer exists — so none of it is on `main`:
+`LlamaLikeModel::body` there still passes `fwd_cfg_` unchanged, and that test file
+is absent. If you would rather have #467's design than this guard, cherry-picking
+it onto `main` supersedes this PR; I have no stake in which. (This is the second
+case I hit of a fix merging to a now-deleted branch and not reaching `main` — see
+also #484, referenced from the SDK-destroy PR in this series.)
+
+**`fwd_cfg.emit_logits` already exists on `main`, and does not cover this.** Two
+reasons:
+
+1. It is a **static** config field, not per-fire, so a serving configuration that
+   needs logits at all has it `true` for every batch — including the prefill-only
+   fills that then overflow.
+2. It gates only the `else if (fwd_cfg.emit_logits)` branch. The `use_tp_greedy`
+   branch immediately above it is **not** gated by `emit_logits`, computes
+   `lm_head_rows = N` on the same `compact_logits == false` path, and writes into
+   the same `ws.logits`. So the overflow is reachable there regardless.
+
+The guard in this PR sits before `use_tp_greedy` is computed, so it covers both
+branches. That placement is deliberate, not incidental.
+
 ## Verification
 
 - Read against current `main`: `ws.logits` is planned at `max_logit_rows = output_rows`; with `num_logit_rows == 0` and `N > R0` the GEMM writes past it. The guard is the first thing between the decoder loop and the lm_head, so no other path is affected.

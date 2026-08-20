@@ -52,6 +52,43 @@ still calls `table.delete(this)?`. The two fixes are **alternatives**: applying
 both leaves nothing to delete the table entry, leaking a slot per destroyed
 context. The PR body says so and names #484.
 
+## Re-verified 2026-08-20 (post-preparation drift check)
+
+`upstream/main` is unmoved at `202f5405b` — **0 commits** since the branches were
+cut — and each branch is exactly one commit whose parent *is* that tip, with
+`fork/<branch>` matching local. So mergeability is clean by construction, not by
+inference.
+
+More importantly, all five bugs were re-read on current `main` rather than assumed
+from a clean cherry-pick:
+
+| fix | still live on `main`? | evidence |
+|---|---|---|
+| SDK destroy | yes | `api/context.rs:172` still `table.delete(this)?`; SDK `destroy` still bare `self.inner.destroy()` |
+| portable KV write index | yes | `plan.cpp:290` still `physical_idx(..., pos_i)`; custom-row clamp still at `:67` |
+| runtime commit check | yes | `context.rs:1754` still `for &pos in &positions` with no explicit-mask exemption |
+| CUDA prefill OOB | yes | no `num_logit_rows == 0` guard anywhere in `llama_like.cpp` |
+| portable graph cache | yes | no `n_sample_slots` anywhere in `executor/executor.cpp` |
+
+No `main`-targeted PR since the survey touches these areas (the recent ones are
+all closed-unmerged dependabot chores), and `author:YangLiuWillow` still returns 0
+PRs, so nothing of ours exists to duplicate.
+
+Two things the re-check turned up that the first pass did not:
+
+- **`plan.cpp` has a second `std::min(n_kv - 1, p_i)` clamp** at `:38`, in
+  `build_phi3small_blocksparse_mask_f16`. It is **correct there** and must not be
+  touched: that builder synthesizes a causal blocksparse mask and takes no
+  `per_token_runs`, so it has no custom-BRLE path — the same reason our fix keeps
+  the clamp on the synthesized causal branch. Checked because an incomplete fix
+  would have been worse than none.
+- **PR #467 addressed the CUDA prefill family and never reached `main`** (merged
+  to `tts-arena/main`, now deleted), via a per-fire `emit_logits` flag plus a
+  `test_executor_prefill_only.py`. Neither is on `main`. This is the **second**
+  instance of the pattern — see also #484 for the SDK destroy trap. Both PR bodies
+  now name their counterpart explicitly. Worth knowing before assuming a
+  `main` gap means nobody has looked at it.
+
 ## Verification status
 
 | fix | compile | behaviour |
