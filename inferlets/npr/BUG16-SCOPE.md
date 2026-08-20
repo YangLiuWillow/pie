@@ -258,9 +258,16 @@ the engine is not failing, it is waiting, correctly, forever.
   weight of the economic argument onto E4, and it puts the bid gate and the
   priority gate *back* into the candidate tree after I had eliminated them.
 
-**Not established.** Which of these actually fired on the A40 is **unknown**, and
-E1–E5 are individually sufficient to explain a stall, so "they're all true" is
-not the same as "here is what happened". Three live candidates:
+**Not established.** Which of these actually fired on the A40 is still
+**unknown**. E1–E5 are individually sufficient to explain a stall, so "they're all
+true" is not the same as "here is what happened".
+
+> **All three candidates below were refuted by measurement — see §6.2.** They are
+> kept because the refutation is the useful part: the wedge snapshot shows an
+> empty alloc queue, an idle unpaused device, and nothing Pinned, which is the
+> pre-registered negative from §6 and rules out every mechanism I had reasoned my
+> way to. The mechanism that *does* fire is **M4** (§6.3), and I did not predict
+> it. The three dead candidates:
 
 - **M1 — alloc-queue head starvation.** One entry demands N pages the pool never
   passively reaches; E1+E2 do the rest. Sub-variant worth noting: the eviction
@@ -283,9 +290,18 @@ not the same as "here is what happened". Three live candidates:
   remaining holders are parked rather than progressing, so phase 2 never runs
   even when the alloc queue drains.
 
-M1/M2/M3 are not exclusive, and E4 says that once *any* of them stops batching,
-the others become unrecoverable. The interesting question is which one is the
-*entry* condition, because that is what a fix has to target.
+**M4 — an allocation larger than the entire device is deferred, not rejected.**
+Established by reproduction (§6.3): the request cannot be satisfied by evicting
+everything, so `when_allocated_inner` falls to its no-victim self-suspend path
+with the impossible op parked on the context; `can_restore` then adds those pages
+to `required` and is false forever, even against a completely empty device. There
+is no device-capacity check on the allocation path at all, so an impossible
+request and a temporarily-unsatisfiable one are handled identically.
+
+M1/M2/M3 are dead. M4 is real, reproduced, and deterministic — but whether it is
+what happened on the A40 is a further question (§6.4), and on the numbers it
+probably is not, on its own. **M4b**, the accumulation variant, is the live
+candidate for the A40 event and is untested.
 
 **Also unknown:**
 
@@ -391,6 +407,111 @@ document is wrong and the cause is somewhere I have not looked — most likely i
 `inference/scheduler.rs` batch formation rather than in the context actor at all.
 That outcome is a result, not a failure, and it should be recorded as one.
 
+### 6.2 Second run: reproduced, and every candidate in this document refuted
+
+Sweeping the harness over four parameterisations (`sweep.sh` on
+`scratch/bug16-repro`), 120 s timeout each:
+
+| cell | contexts | per-ctx pages | pool | oversubscribed | result |
+|---|---|---|---|---|---|
+| A | 24 | 32 | 32 | 24× | **completes** in 313 ms |
+| B | 24 | 128 | 64 | 48× | **WEDGE** |
+| C | 8 | 516 | 32 | 129× | **WEDGE** |
+| D | 48 | 64 | 16 | 192× | **WEDGE** |
+
+**The oversubscription ratio is not the variable.** Cell A is 24× oversubscribed
+and finishes in a third of a second. The three that wedge all share one property
+cell A lacks: **a single context's footprint exceeds the whole device pool**
+(128 > 64, 516 > 32, 64 > 16), where cell A's exactly fits (32 = 32).
+
+The wedge snapshot (cell D) refutes all three candidates:
+
+```text
+counters: ticks=0 no_victim_susp=48 restores=0 restore_rej=1176 drains=48
+queues:   alloc_queue=0  restore_queue=48
+alloc_head: <empty>
+driver0:  used=0 total=16 available=16 util=0.000 paused=false
+contexts: total=48 active=0 pinned=0 off_gpu=48 pending_suspend=0
+```
+
+- `alloc_queue = 0` → **M1 refuted.** There is no starved alloc-queue head.
+- `paused = false`, utilization `0.000` → **M3 refuted.** The 0.85 restore pause
+  is not engaged.
+- `pinned = 0`, `pending_suspend = 0` → **M2's premise refuted.** Nothing is
+  stuck Pinned.
+- `used = 0`, `available = 16 / 16` → **the device is completely empty**, and
+  `restore_rej` is climbing anyway.
+
+This is precisely the pre-registered negative from §6: *"if X1 shows alloc_queue
+empty and utilization below 0.85 and an eligible victim available, then every
+mechanism in this document is wrong."* It does, so they are. Registering that
+sentence in advance is the only reason this run reads as a result rather than as
+a confusing pile of counters.
+
+### 6.3 The actual mechanism — M4
+
+Instrumenting the two decision points names it in one line each:
+
+```text
+[BUG16-NOVICTIM]    ctx=3 wants=48 available=16 total=16 EXCEEDS_DEVICE=true
+[BUG16-CANRESTORE]  ctx=3 required=48 available=16 total=16 impossible_forever=true
+                          (working=0 replay=0 deferred=48 n_ops=1)
+```
+
+**M4 — an allocation larger than the entire device is deferred, not rejected,
+and then becomes permanently unsatisfiable.**
+
+1. A context issues **one** page allocation bigger than the whole pool (48 pages
+   on a 16-page device; `n_ops=1`, so this is a single request, not an
+   accumulation).
+2. `when_allocated_inner` has **no device-capacity check anywhere**. It tries the
+   free pool, then the eviction loop — which cannot possibly succeed, since
+   evicting *everything* yields only `total` < `num_pages` — finds no victim, and
+   falls through to step 6: `suspend` + `enqueue_restore`, with the impossible op
+   parked on `ctx.deferred_ops`.
+3. `can_restore` sums the deferred ops into `required` and compares against
+   `available()`. Because `required > total`, it is **false forever** — no matter
+   how idle the device becomes. The device empties completely and the context
+   still cannot be restored.
+4. Every context that does this joins the same queue. Nothing errors, nothing
+   retries differently, nothing logs. The engine goes to 0% and stays there.
+
+An impossible request and a temporarily-unsatisfiable one travel the *identical*
+code path. That is the whole bug: the runtime has no notion of "this can never
+be satisfied", so it waits for it.
+
+Every element of the §16 signature falls out: silent (it is a deferral, not a
+failure), 0% GPU (everything is off-GPU), zero errors, heartbeats fine (the actor
+is healthy), and in cell B a fresh request hangs too — `prio_gate_susp=359` shows
+new arrivals yielding to the higher-bidding restore head and joining the same
+queue.
+
+### 6.4 Is M4 the A40 bug? Unproven, and probably not on its own
+
+**This must not be written up as "bug 16 is solved".** What has been reproduced
+is *a* silent permanent deadlock, in the same subsystem, with the same external
+signature, root-caused to a line. Whether it is the same event as the A40 wedge
+is a separate question, and the arithmetic does not obviously fit:
+
+- A40: pool ≈ 6,700 pages, each context growing toward ~1,750 pages. A context's
+  whole footprint is about a quarter of the pool, so a *single* request larger
+  than the device seems unlikely.
+
+There is a plausible bridge, and it is **untested**: `can_restore` sums **all**
+deferred ops (`ctx.deferred_ops.iter().map(|op| op.num_pages).sum()`), and
+`deferred_ops` is a `Vec` that gains an entry on every deferral — including at the
+residency check at the top of `when_allocated_inner`, which a suspended context
+hits for every further operation sent to it. So `required` can grow without bound
+across repeated deferrals until it exceeds the pool, at which point the context is
+in exactly the M4 terminal state **without any individual request ever having been
+oversized**. Call this **M4b**. It fits the A40 numbers where M4 does not.
+
+Discriminating test, not yet run: instrument `deferred_ops.len()` and the summed
+`required` over time in a cell where per-context footprint is comfortably *below*
+pool capacity (e.g. 24 contexts × 32 pages against a 128-page pool, run long). M4b
+predicts a wedge with `n_ops > 1` and `required` climbing past `total`; if no wedge
+appears, M4b is wrong and the A40 event needs a different explanation again.
+
 ---
 
 ## 7. The observability gap is itself a finding
@@ -426,8 +547,21 @@ hang into a loud one. That is a large improvement and a small change.
 
 ## 8. Shape of a fix — deliberately not proposed here
 
-Recorded only so the scope is legible; each has a cost that needs thought, and
-none should be written before X1 names the entry condition.
+**For M4, which is now reproduced, the fix is small and the shape is clear:**
+compare the request against *device capacity*, not just against current
+availability, and fail it loudly instead of deferring it. `when_allocated_inner`
+already has `gpu_stores[driver_idx].stats()` in reach; a request exceeding `total`
+can never be satisfied by any amount of eviction, so deferring it is never
+correct. The same check belongs in `can_restore`, where `required > total` means
+"this context can never come back" — today that returns `false` and is retried
+forever, silently, at every drain.
+
+Whether the right failure is an error to the guest, a chunked fill, or a refusal
+at admission is a design call I am deliberately not making here. But *something*
+must distinguish "not yet" from "not ever", and today nothing does.
+
+The remaining items are for the mechanisms that are still open; each has a cost
+that needs thought.
 
 - **Work-conserving phase 1** (X3): serve requests behind an un-servable head.
   Cheap, but changes fairness and may starve large requests indefinitely — the
@@ -452,40 +586,38 @@ none should be written before X1 names the entry condition.
 
 ## 9. Status
 
-Mechanism: **structurally characterised, not identified.** Eight facts (E1–E8)
-are established from the code; one earlier claim (R1) was established from the
-code and then **refuted by measurement**; which mechanism actually fired is
-unknown. Three candidates and the experiments that separate them are above, with
-predictions registered before each run.
+**A silent permanent deadlock is reproduced, deterministic, and root-caused.**
+`runtime/tests/bug16_wedge.rs` on `scratch/bug16-repro` wedges the engine in
+seconds on a mock GPU with no model and no CUDA, and the cause is named to a
+line: **M4** (§6.3) — an allocation larger than the entire device pool is
+deferred rather than rejected, then becomes permanently unsatisfiable in
+`can_restore`, because nothing on either path compares a request against device
+*capacity*. The discriminating variable is per-context footprint versus pool
+size, **not** the oversubscription ratio: 24× oversubscribed with a footprint
+that fits completes in 313 ms; 24× with a footprint that does not, wedges.
 
-A reproduction harness now exists (`scratch/bug16-repro`, unmerged): mock GPU, no
-model, no CUDA, plus a `debug_snapshot` probe that answers through the actor
-mailbox — which works precisely because this class of deadlock leaves the actor
-healthy. **It does not yet reproduce the wedge** at 6× oversubscription; §6.1 has
-the numbers and the next parameterisations to try. No patch is proposed.
+**This is not yet "bug 16 is solved."** §6.4 is the honest statement: same
+subsystem, same external signature, root-caused — but the A40 arithmetic (each
+context ~1,750 pages against a ~6,700-page pool) does not obviously admit a
+single oversized request. **M4b**, where `can_restore`'s sum over *accumulated*
+`deferred_ops` crosses total capacity without any individual request being
+oversized, fits those numbers and is the next test.
 
-The most useful thing to carry forward is the shape of the error, not the
-conclusion:
+What the whole exercise actually established, in order of confidence:
 
-- I eliminated a whole branch of the candidate tree — the bid gate, the priority
-  gate, and defaulting — on the strength of a grep, wrote it up as two
-  established facts, and committed it. The first run of the harness refuted it in
-  85 milliseconds. The grep was for `fn bid` in the SDK; the method is `set_bid`,
-  and the `Generator` auto-bids on every step, so the thing I declared impossible
-  happens six times in a tenth of a second.
-- DESIGN.md's hygiene list already names this species: an untraced,
-  mechanism-shaped story that survives because it is coherent. Being derived from
-  code rather than from imagination is **not** the protection it feels like — a
-  grep is a measurement, and it has a false-negative rate.
-- The practice that caught it was cheap: build the harness, run it, print the
-  numbers that the story says cannot exist. Eighty-five milliseconds of engine
-  time against a claim that had already been committed to two remotes.
+1. M4 is a real engine deadlock with a small, clear fix (§8). It is in
+   `runtime/`, not in NPR code, so it is upstream-relevant.
+2. Every mechanism I derived by reading the code — M1, M2, M3 — was **wrong**,
+   and the wedge snapshot refuted all three at once.
+3. One claim I had promoted to an established fact (R1: "the market layer is
+   inert") was **also wrong**, refuted 85 ms into the first run.
 
-The single most valuable next step is still §7's instrumentation plus a
-parameterisation that actually wedges. Every remaining question in §5 is answered
-by one wedged run that can talk — and, on the evidence above, by very little
-that is not a run.
+Two of the three things I was most confident about did not survive contact with a
+test that takes under a second to run. Both errors were derived from source code,
+carefully, with citations — which is exactly what made them feel safe. The
+pre-registered predictions are what converted both into results instead of
+quietly wrong documentation, and they are the part of this method worth keeping.
 
-The single most valuable next step is **not** a fix — it is §7's instrumentation
-plus X1, because every remaining question in §5 is answered by one wedged run
-that can talk.
+Remaining work, in order: run the M4b test (§6.4); then §7's instrumentation,
+which is worth doing regardless of which mechanism wins, because *both* of these
+wedges are invisible in the logs by construction.

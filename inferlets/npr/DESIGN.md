@@ -1004,13 +1004,32 @@ six defaulting events fired in a tenth of a second. The market is live; its
 weakness is the clock, not the arithmetic. BUG16-SCOPE.md keeps the refuted claim
 as R1 rather than deleting it.
 
-Which hole is the *entry* condition is still unknown. §6 registers the
-discriminating predictions in advance; §6.1 has the first harness run (6×
-oversubscribed, **no wedge**, 82 ms — so the ratio alone is not sufficient and no
-mechanism conclusion follows); §7 notes that `SchedCounters` already tracks
-everything needed to tell the candidates apart, and that its only dump site is
-commented out — which is why the 40-minute wedge left no evidence.
-**No patch is proposed.**
+**A silent permanent deadlock is now reproduced and root-caused** — on a mock
+GPU, no model, no CUDA, in seconds (`runtime/tests/bug16_wedge.rs` on branch
+`scratch/bug16-repro`). The cause is **not** any of the three mechanisms the
+first revision proposed; the wedge snapshot refuted all three at once (empty
+alloc queue, idle unpaused device, nothing Pinned). What actually happens:
+**an allocation larger than the entire device pool is deferred rather than
+rejected.** No eviction can satisfy it — evicting everything yields less than the
+request — so `when_allocated_inner` self-suspends the context with the impossible
+op parked on it, and `can_restore` then sums that op into `required` and returns
+false *forever*, even against a completely empty device. Nothing on either path
+compares a request to device **capacity**, so "not yet" and "not ever" travel the
+same code path. The discriminating variable is per-context footprint vs pool
+size, not the oversubscription ratio: 24× oversubscribed with a footprint that
+fits completes in 313 ms; 24× with one that does not, wedges.
+
+**This is not yet "bug 16 is solved."** Same subsystem, same signature, but the
+A40 arithmetic (~1,750 pages per context against a ~6,700-page pool) does not
+obviously admit a single oversized request. The live candidate for the A40 event
+is the accumulation variant — `can_restore` sums *all* `deferred_ops`, and that
+Vec grows on every deferral, so `required` can cross total capacity without any
+individual request being oversized. Untested; BUG16-SCOPE.md §6.4 has the test.
+
+The fix for the reproduced bug is small (compare against capacity, not just
+availability, and fail loudly), and it lives in `runtime/`, not in NPR code — so
+it is upstream-relevant. **No patch is written.** §7's instrumentation is still
+worth doing regardless: both wedges are invisible in the logs by construction.
 
 ### Measurement hygiene (cross-session lessons, 2026-08-14/16)
 
