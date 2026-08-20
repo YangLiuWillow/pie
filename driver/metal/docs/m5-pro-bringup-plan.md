@@ -216,7 +216,43 @@ empirically whether BaseRT handles GatedDeltaNet.
 > **Licensing.** BaseRT's engine is proprietary and binary-only. Do not vendor or
 > disassemble it. Read the EULA before publishing comparative numbers.
 
----
+### T0.4 finding — "q4" is a profile, not a number (measured 2026-08-19)
+
+Recorded here because it changes how every later phase compares and builds.
+Full tables and the elimination record: `m5-pro-measurements.md` §T0.4.
+
+BaseRT's Llama-3.2-1B decode measured **240 tok/s against a published 342**
+while everything else reproduced within ±3%. The cause was inside "4-bit":
+`basert pull`'s auto-selected `default-q4` profile keeps `embed_tokens.weight`
+at **f16**, and Llama ties embeddings — so the lm_head matmul re-reads a
+525 MB bf16 tensor every token. Rebuilding with the repo's own
+`default-q4-embq6` profile (embedding at q6, 761 MB total) hits 325 tok/s,
+−5% of publication. The roofline arithmetic called it before the experiment
+did: 342 tok/s × 1.073 GB/token = 367 GB/s, above this machine's ~295 GB/s
+roof — an artifact that size *cannot* decode at the published rate.
+
+Three rules this leaves behind:
+
+1. **A comparison names the artifact, not the label.** Any Pie-vs-BaseRT (or
+   Pie-vs-anything) number must carry the quant profile and the weights
+   bytes. "q4 vs q4" hid a 30% decode gap; bytes/token would have shown it
+   in one line.
+2. **For pie's own kernels and future fusion work: on a small dense model,
+   the tied lm_head is the decode.** Per token, Llama-1B's q4 body is
+   ~547 MB and an f16 tied embedding is ~525 MB — the logits projection is
+   half the bandwidth budget by itself. When we build pie's fused decode
+   epilogue (lm_head GEMV + sampling), the wins in order: keep the lm_head
+   quantized (never materialize/read it wide), and fuse the readout so the
+   [vocab]-sized logits never round-trip device memory. The roofline check
+   (bytes-that-must-move × tok/s vs measured roof) is the design gate — it
+   predicted this finding exactly and costs nothing to run on paper.
+3. **Below some size, decode is a dispatch-floor problem, not a bandwidth
+   one.** BaseRT's Qwen3-0.6B decodes at ~533–546 tok/s whether the artifact
+   is 646 MB or 410 MB — file size doesn't reach the number, so the floor is
+   per-token launch/dispatch cost, not bytes. That is the same regime pie's
+   T0.3 small-model numbers live in: for sub-1B decode, fusing to *fewer
+   dispatches* pays where quantizing further does not. Measure which regime
+   a model is in before choosing which fusion to build.
 
 # Phase 1 — Characterize M5 Pro and land the tuning entry
 

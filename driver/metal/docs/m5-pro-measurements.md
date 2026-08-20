@@ -201,4 +201,179 @@ decode 354.4 vs 351.9 ± 6.4 — so pre-fix cells stand.
 | Qwen3.6-27B | q4 | pie (M5 entry) | _TBD_ | _TBD_ | |
 
 BaseRT's own published figures are in **[M5] Tables 1–3**; ±10% reproduction
-with BaseRT's own instrument is the T0.4 gate (next section when measured).
+with BaseRT's own instrument is the T0.4 gate, measured below.
+
+## BaseRT reproduction (T0.4, 2026-08-19)
+
+**Method.** `basert bench <model> -p {128,256,512,1024,2048} -n 128`,
+BaseRT v0.1.6 (`~/.basert`), 5 timed reps per point (bench default), adaptive
+warmup (bench default). Quiet GPU (same coordinated window as T0.3).
+Darwin **25.5.1** here vs the paper's **25.4** — the one uncontrolled
+variable. Models: `Qwen/Qwen3-0.6B` convert-on-pull default-q4 (623.5 MB
+.base, 28 layers, BaseQ4, tied embeddings) and
+`unsloth/Llama-3.2-1B-Instruct` (1.0 GB, 16 layers — `meta-llama/…` answers
+401 without an HF token; unsloth is the weight-identical mirror), each
+cross-checked against the pre-converted catalog artifact
+(`basecompute/Qwen3-0.6B` 410 MB, `basecompute/Llama-3.2-1B-Instruct`
+1.0 GB). Raw log: `docs/bench-archives/t04.log` (local).
+
+### Qwen3-0.6B q4 — reproduces: every point within ±3% ⇒ **gate PASSED**
+
+| Metric | Measured | [M5] published | Δ |
+|---|---|---|---|
+| pp128 | 12207 ± 28 | 11873 | +2.8% |
+| pp256 | 17602 ± 49 | 17575 | +0.2% |
+| pp512 | 20353 ± 154 | 20706 | −1.7% |
+| pp1024 | 20844 ± 28 | 21213 | −1.7% |
+| pp2048 | 20111 ± 19 | 20105 | +0.0% |
+| tg128 | 536.9 (526.5–545.9 across the five runs); catalog artifact 532.7 | 530.8 | +1.1% |
+
+Observed oddity, recorded without interpretation: the 410 MB catalog artifact
+and the 623 MB local conversion decode at the same rate (532.7 vs 536.9).
+
+### Llama-3.2-1B q4 — reproduces **only at matched quantization profile**
+
+**Resolved (same day).** The −30% decode shortfall below is a quantization
+*profile* mismatch inside "4-bit", not an engine or machine problem. The
+converter's `default-q4` profile (and the current catalog artifact) pins
+`embed_tokens.weight` at **f16**; with tied embeddings that is a 525 MB bf16
+lm_head read per decoded token. The weights-bytes arithmetic is exact:
+1073 MB = 547 MB (973M non-embedding params at q4) + 525 MB (262.7M-param
+embedding × 2 B). A bandwidth-bound decode of that artifact tops out at
+240 tok/s (258 GB/s effective, 87% of the machine roof) — the published
+342.1 would need 367 GB/s, **above the roof**, so the paper cannot have
+measured this artifact. Rebuilding from the same bf16 source with the
+repo's own `default-q4-embq6` profile (embedding at q6; Apache-2.0
+converter, profile fetched from `basecompute/baseRT`) gives a 761 MB
+artifact and:
+
+| Metric | f16-embedding artifact (pull default) | embq6 artifact | [M5] published | Δ (embq6) |
+|---|---|---|---|---|
+| tg128 | 238–240.8 (every rep, both artifacts) | **325.1 ± 0.4 / 324.4 ± 0.9** | 342.1 | **−5.0% ⇒ gate PASSED** |
+| pp128 | 8033 ± 67 | 8740 ± 14 | 8936 | −2.2% |
+| pp2048 | 12313 ± 12 | 12399 ± 12 | 12451 | −0.4% |
+
+Two consequences worth keeping: (1) anyone reproducing [M5] via
+`basert pull` gets the f16-embedding artifact and lands 30% under Table 1 on
+llama-arch decode — the paper's "matched quantisation" (their ~4.9 bpw
+effective ≈ GGUF Q4_0's 730 MB) holds only with an embedding-quantized
+profile; (2) Qwen decode is *insensitive* to this (646 MB f16-emb and 410 MB
+catalog artifacts decode identically at ~533–546), i.e. the 0.6B decode is
+not bandwidth-bound — it sits on a dispatch/latency floor, which is exactly
+the regime pie's T0.3 decode numbers live in too.
+
+The elimination record below is kept as the process that got there.
+
+#### The original finding (pull-default artifact) — decode 30% under Table 1
+
+| Metric | Measured | [M5] published | Δ |
+|---|---|---|---|
+| pp128 | 8033 ± 67 | 8936 | −10.1% (at the gate edge) |
+| pp256 | 10758 ± 21 | 11032 | −2.5% |
+| pp512 | 11743 ± 14 | 12134 | −3.2% |
+| pp1024 | 11854 ± 11 | 12084 | −1.9% |
+| pp2048 | 12313 ± 12 | 12451 | −1.1% |
+| tg128 | 238.2 (236.4–239.5) | 342.1 | −30.4% (see resolution above) |
+
+**The discrepancy, identified as far as a binary-only engine permits.**
+Eliminated, each by measurement:
+
+- *Thermal / machine state*: our independent llama.cpp b9960 tg128 on the
+  same weights, same machine, same session (T0.3) is **267.1 vs the paper's
+  267.1 — exact**; mlx-lm 281.6 vs 298.0 (−5.5%). A thermal or OS-load
+  problem would move every engine, and it moved none of them 30%.
+- *Conversion*: the catalog's own pre-converted artifact decodes at 240.1.
+- *KV mode*: `--paged-kv` decodes at 240.2.
+- *Prompt length*: tg128 is 236–240 for every `-p` from 0 to 2048.
+- *Noise*: stddev ≤ 1.5% on every run.
+
+Remaining candidates, not distinguishable from outside the engine: a Darwin
+25.4 → 25.5 change in something BaseRT's llama-arch decode leans on, or an
+unpublished engine configuration behind the paper's Llama rows. v0.1.6 ships
+no `basert-profile`, so the per-op split is unreachable without vendor input.
+
+*Re-measured on request, same day, two fresh alternated rounds with the
+27B download suspended (`kill -STOP`) for clean arms:* BaseRT Llama tg128
+**240.8 ± 0.2 / 239.9 ± 0.4** (catalog artifact; local conversion 240.8) —
+stable at −29.8%. In the same rounds, `llama-bench` (llama.cpp's own
+instrument, same GGUF) gave tg128 275.1/275.4 vs the paper's 267.1 (+3%),
+and BaseRT Qwen gave 545.3/546.4 vs 530.8 (+2.8%). Both controls sit within
++3% of publication while the Llama decode sits 30% under it, in the same
+minutes on the same silicon.
+
+**Consequence (superseded by the resolution above):** the gate now passes
+for both models; the standing rule it leaves behind is narrower — any
+Pie-vs-BaseRT comparison must name the BaseRT **artifact** (profile + bytes),
+not just "q4", because the pull default and the paper's artifact differ by
+30% on llama-arch decode. The published cross-engine rows themselves
+validated against our independent T0.3 numbers (llama.cpp exact,
+mlx-lm −5.5%).
+
+## Full [M5] Table 1–2 replication (T0.4 extension, 2026-08-19)
+
+Requested extension: replicate every BaseRT pp/tg figure in [M5] Tables 1–3.
+Same instrument and protocol as above (`basert bench -p {128…2048} -n 128`,
+5 reps, adaptive warmup, quiet GPU — concurrent downloads suspended via
+SIGSTOP around every bench). Raw log: `docs/bench-archives/t04_matrix_a.log`.
+
+**The finding that decides which artifact to bench, confirmed on every dense
+model tried:** the paper's "4-bit" is *all*-q4 — embedding included. A
+`default-q4-embq4` profile (the repo's `default-q4-embq6` with the embedding
+rules set to `base_q4`, archived in `docs/bench-archives/`) reproduces every
+4-bit row; the pull-default / catalog q4 artifacts (f16 embedding) cannot
+physically reach the published decode on tied-embedding models. The q8 rows
+reproduce with pull defaults directly (the catalog's q8 artifacts quantize
+the embedding; its q4 artifacts do not — an upstream inconsistency worth
+reporting to basecompute).
+
+### 4-bit rows (tg128, with pp128/pp2048 as prefill anchors)
+
+| Model | Artifact | tg128 ours | published | Δ | pp128 Δ | pp2048 Δ |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | pull default (f16 emb; insensitive — see dispatch-floor note) | 536.9 | 530.8 | +1.1% | +2.8% | +0.0% |
+| Llama-3.2-1B | **embq4 rebuild** | 355.1 | 342.1 | **+3.7%** | −0.6% | +0.1% |
+| Llama-3.2-1B | pull default / catalog (f16 emb) | 240 | 342.1 | −30% | — | — |
+| Qwen3.5-2B | **embq4 rebuild** | 217.1 | 219.6 | **−1.2%** | −0.6% | −0.2% |
+| Qwen3.5-2B | pull default (f16 emb) | 137.3 | 219.6 | −37% | −8.5% | −8.0% |
+| Qwen3.5-2B | embq6 rebuild | 197.1 | 219.6 | −10% | −1.8% | −0.3% |
+| Llama-3.2-3B | catalog (f16 emb) | 109.1 | 137.0 | −20.6% | −5.5% | −4.1% |
+| Llama-3.2-3B | **embq4 rebuild** | 139.2 | 137.0 | **+1.7%** | −0.3% | +6.4% |
+| Gemma-4-E2B | — | _blocked: HF-gated, no catalog entry, no token_ | 149.8 | | | |
+| Gemma-4-26B-A4B | — | _blocked: same_ | 85.0 | | | |
+| Qwen3-30B-A3B | — | _downloading (original HF repo; catalog only has -Instruct-2507)_ | 105.1 | | | |
+| Qwen3.5-35B-A3B | — | _queued_ | 110.6 | | | |
+| Qwen3.6-35B-A3B | — | _queued_ | 110.7 | | | |
+| Qwen3.6-27B | pull default (f16 emb; insensitive here too) | 18.19 | 18.1 | **+0.5%** | −0.3% | −9.0% ‡ |
+
+### 8-bit rows — all reproduce with pull/catalog defaults
+
+| Model | tg128 ours | published | Δ | pp128 Δ | pp512 Δ | pp2048 Δ |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 370.7 | 365.6 | +1.4% | +1.5% | +0.8% | +0.6% |
+| Llama-3.2-1B | 210.6 | 204.4 | +2.9% | −1.4% | +0.5% | +0.4% |
+| Qwen3.5-2B | 132.2 | 132.4 | −0.1% | −0.5% | −0.1% | −0.2% |
+| Llama-3.2-3B | 80.6 | 79.6 | +1.2% | −0.0% | −4.6% † | +0.2% † |
+
+† Llama-3B q8's long prefill first measured −10%/−11.5% (pp1024/pp2048) at
+the tail of a long hot bench sequence; re-run after a cool-down it lands
++0.4%/+0.2% of publication. Thermal sequence-position, not a finding — and a
+live demonstration of the protocol's "alternate arms, don't batch" rule.
+
+‡ 27B prefill drifts from −0.3% (pp128) to −9.0% (pp2048) across a
+back-to-back sweep — inside the gate, same in-sequence thermal signature the
+3B q8 row showed; a cold pp2048 re-run is the check if the margin ever
+matters.
+
+**Two 27B side-findings.** (1) BaseRT handles GatedDeltaNet: the artifact
+identifies as arch `qwen35`, 64 layers, and decodes at the published rate —
+the plan's "does BaseRT run GDN" question is answered empirically. (2) Its
+decode implies **≥309 GB/s effective DRAM read** (16.99 GB weights ×
+18.19 tok/s) — *above* the 294–298 GB/s `roofline_probe` streaming figure.
+The probe's number is one kernel's achieved bandwidth, not the hardware
+ceiling; T1.3 should treat 309 GB/s as a measured lower bound on the real
+roof, and the earlier "impossible above the roof" arguments in this file
+should be read against per-shape achieved bandwidth (~250–260 GB/s for the
+1B-class decodes), which is what they actually used.
+
+Full five-length pp values for every row are in the archived raw log; the
+committed anchors are pp128/pp512/pp2048 to keep this table readable.
