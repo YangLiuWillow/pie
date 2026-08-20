@@ -64,18 +64,23 @@ void build_attn_mask_f16(std::vector<std::uint16_t>& dst,
     for (std::int32_t i = 0; i < n_tokens; ++i) {
         const std::int32_t p_i = positions[i];
         std::uint16_t* row = dst.data() + static_cast<std::size_t>(i) * n_kv;
-        const std::int32_t hi = std::min(n_kv - 1, p_i);
         // Sliding window cuts off the past below `p_i - W + 1`.
         const std::int32_t lo =
             (sliding_window > 0) ? std::max(0, p_i - sliding_window + 1) : 0;
 
         if (!per_token_runs || per_token_runs[i].n_runs == 0) {
+            const std::int32_t hi = std::min(n_kv - 1, p_i);
             for (std::int32_t j = lo; j <= hi; ++j) row[j] = zero;
             continue;
         }
 
-        // Custom BRLE over [0, p_i]. Anything past p_i stays -INF. SWA
-        // also clips below `lo`.
+        // Custom BRLE over KV slots [0, n_kv): the runs alone define
+        // visibility. Position ids may be deliberately decoupled from
+        // slot order (e.g. parallel-branch refill at overlapped
+        // positions), so no causal clamp at `p_i` here — the runtime
+        // emits rows whose true-runs never extend past the slots the
+        // token may legitimately see. SWA still clips below `lo`.
+        const std::int32_t hi = n_kv - 1;
         const auto* runs   = per_token_runs[i].runs;
         const auto  n_runs = per_token_runs[i].n_runs;
         bool is_true = false;
@@ -276,19 +281,27 @@ void plan_single_request(const PlanArrays& a,
             " wire sampling indices");
     }
 
-    // Per-token: tokens, positions, and write idxs.
+    // Per-token: tokens, positions, and write idxs. The KV write target is
+    // the token's *slot* — append order after the pre-pass KV — NOT its
+    // position id. Position ids feed RoPE only and may be deliberately
+    // decoupled from slot order (e.g. parallel-branch refill at overlapped
+    // positions); using them as write indices would overwrite live KV.
+    // `seq_len` is the post-pass KV length, so the pre-pass length (= the
+    // first new token's slot) is `seq_len - n_tok`.
+    const std::int32_t kv_before_r = seq_len - n_tok;
+    if (kv_before_r < 0) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) + " has " +
+            std::to_string(n_tok) + " tokens but only " +
+            std::to_string(seq_len) + " KV slots");
+    }
     for (std::int32_t i = qo_start; i < qo_end; ++i) {
-        const std::int32_t pos_i = static_cast<std::int32_t>(a.position_ids[i]);
-        if (pos_i >= seq_len) {
-            throw std::runtime_error(
-                "plan: request " + std::to_string(r) +
-                " token at position " + std::to_string(pos_i) +
-                " exceeds seq_len " + std::to_string(seq_len));
-        }
+        const std::int32_t pos_i  = static_cast<std::int32_t>(a.position_ids[i]);
+        const std::int32_t slot_i = kv_before_r + (i - qo_start);
         plan.tokens_i32[i]    = static_cast<std::int32_t>(a.token_ids[i]);
         plan.positions_i32[i] = pos_i;
         plan.kv_idxs_i64[i] = physical_idx(a.kv_page_indices.data(),
-                                           pages_off, page_size, pos_i);
+                                           pages_off, page_size, slot_i);
     }
 
     Executor::ReqPlan rp;
