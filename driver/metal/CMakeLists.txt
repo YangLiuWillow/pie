@@ -602,4 +602,35 @@ if(APPLE)
       set_tests_properties(${t} PROPERTIES RESOURCE_LOCK metal_gpu_heap)
     endif()
   endforeach()
+
+  # Tests that cannot run without a Metal 4 device: each creates a
+  # `RawMetalContext`, and `RawMetalContext::create` refuses any device that
+  # does not answer `MTLGPUFamilyMetal4` (mtl4_context.mm) -- there is no
+  # older-Metal fallback, by design. GitHub's hosted macOS runners expose an
+  # 'Apple Paravirtual device' that answers no, so CI probes the device and
+  # runs `ctest -LE needs-metal4-device` when it is absent; the hosted job
+  # then measures what that machine CAN check (the host-only tests) instead
+  # of failing on hardware it does not have. On a real M-series machine the
+  # label changes nothing. Label any new test whose main creates a context
+  # and does not already SKIP itself when creation fails.
+  set(PIE_METAL_DEVICE_TESTS
+    argtable_capacity_test
+    commit_batch_feedback_test
+    decode_step_mb_test
+    gemma4_prefill_test
+    gemma4_pso_test
+    kv_append_paged_pso_test
+    kv_pool_lifecycle_test
+    llama_pso_test
+    loader_fill_test
+    msl_compile_test
+    pso_archive_test
+    ptir_m0_device_test
+    router_topk_test
+    run_segments_test)
+  foreach(t IN LISTS PIE_METAL_DEVICE_TESTS)
+    if(TEST ${t})
+      set_property(TEST ${t} APPEND PROPERTY LABELS needs-metal4-device)
+    endif()
+  endforeach()
 endif()
