@@ -133,6 +133,37 @@ on the same control). **`adopt` and `refill` agree to 1.5e-5 of each other**,
 which is the phase-3 KV-graft join reproducing the refill join's distribution on
 CUDA rather than merely compiling there.
 
+## Pre-registered prediction
+
+**Committed before the sweep's rows landed** (this sweep was at 11/100 rows at
+the time of this commit; `git log` on this file establishes the ordering, and
+the raw JSONL was not inspected beyond counting lines). Stated so a reader can
+tell it was not fitted after the fact.
+
+From the baseline decomposition, if the repetition penalty closes 0.460 -> 0.504
+through the collapse channel — i.e. by un-stranding trajectories rather than by
+making reasoning better once parallel — then:
+
+> **12.4% of the `blocks<=1` runs must convert to `blocks>=2`**, moving
+> `share(b>=2)` from 0.540 to 0.597, while `acc|b<=1` (0.043) and `acc|b>=2`
+> (0.815) stay put.
+
+Three outcomes, distinguished in advance:
+
+1. **`share(b>=2)` rises by roughly the predicted amount and the conditionals
+   hold** — the penalty works, by the mechanism §15 claims.
+2. **`share(b>=2)` is flat** — the penalty is not the lever; the next suspect is
+   the budget-exhaustion path, and `budget_exhausted` on these rows says which
+   half of the stranded population is which.
+3. **A conditional moves instead** — the penalty is changing reasoning quality,
+   not the block mix, which is not what §15 predicts and would need explaining.
+
+At n=50/arm, a move of 5.7 points in `share(b>=2)` is ~3 runs and will not be
+separable from noise. So the honest reading is directional: the prediction is
+falsifiable in *sign and rough size*, not in significance, and the writeup below
+says which of the three it landed on without dressing a directional read as a
+conclusion.
+
 ## Method
 
 - 2 arms x 25 problems (AIME 2025, `--limit 25`) x k=2 = 100 runs, `--concurrency 8`,
