@@ -55,6 +55,43 @@ This is also why the sweep runs on `a35a68ac9`+ rather than §11's code: the
 `branch_terminal` / `branch_budget` split lands the starved-vs-EOS distinction
 directly in the rows instead of inferring it from a charge ratio.
 
+## CUDA validation of the penalty path (settled)
+
+`e14082eb0` shipped the `TopLogits` raw-logit probe validated on Metal only.
+It is now validated on CUDA, on an L40S (46,068 MiB, driver 570.124.06), build
+`cf204689a` — whose `inferlets/npr/src/lib.rs` is blob-identical to the audited
+`a35a68ac9`:
+
+```
+[npr] selftest toplogits: ids_match=true max_dev=0.000000 max_logit=21.875
+```
+
+`ids_match` compares the `TopLogits{k:10}` ids against a `Distribution` probe on
+the *same* forward pass; `max_dev` is the max |softmax(logits) - prob| over the
+renormalised top-10. §12 expected `max_dev <= 1e-3` on CUDA (bf16->f32 widening
+on the host vs the softmax kernel) and allowed for drift; it came back exactly
+**0.000000**, matching Metal. `max_logit = 21.875` is a real logit magnitude,
+not the 0-1 that would mean the sentinel path returned probabilities — so
+`compute_dist_slots`' temp-0 `gather_bf16_rows` branch is correct on CUDA.
+
+The full selftest passes alongside it (`selftest_pass: true`):
+
+| equivalence | TV |
+|---|---|
+| `mask`, `mask_4run`, `positions`, `noise_floor` | 0.0000 (exact) |
+| `hole_natural` | 0.0047 |
+| `refill_short` | 0.0062 |
+| `refill` | 0.0269 |
+| `adopt` | 0.0269 |
+| `control` (causal, must differ) | 0.5512 |
+| `adopt_control` (causal, must differ) | 0.6468 |
+
+`refill`/`adopt` at 0.027 sit inside the 0.001-0.03 CUDA kernel-noise band §3
+documents, and the two controls confirm the masks bite (the H200 measured 0.55
+on the same control). **`adopt` and `refill` agree to 1.5e-5 of each other**,
+which is the phase-3 KV-graft join reproducing the refill join's distribution on
+CUDA rather than merely compiling there.
+
 ## Method
 
 - 2 arms x 25 problems (AIME 2025, `--limit 25`) x k=2 = 100 runs, `--concurrency 8`,
