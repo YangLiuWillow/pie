@@ -109,20 +109,96 @@ the `device_tuning.hpp` house style before it goes into the source.
 | routed / MoE crossovers | _see [DT]_ | _TBD_ | | |
 | `sdpa_tile_min_rows_per_request` | _see [DT]_ | _TBD_ | | |
 
-## Model throughput
+## Model throughput — three-way baseline (T0.3, 2026-08-19)
 
-Protocol: prompts 128/256/512/1024/2048; 128 generated tokens; 5 reps; mean ±
-stddev; AC power; arms alternated.
+**Method.** `benches/three_way.py`, one invocation per (rep, prompt length,
+model): every invocation runs one rep of each engine back to back (arms
+alternated), 5 invocations per cell, reps outermost. Each invocation runs two
+latency-mode shapes of 4 sequential requests (warmup 2): `max_tokens=1` and
+`max_tokens=128`. Per rep, from mean request latencies:
+
+    prefill tok/s = prompt_tokens / lat(mt=1)              # launch-inclusive
+    decode  tok/s = Δoutput_tokens / (lat(mt=128) − lat(mt=1))
+
+Cells are mean ± stddev over the 5 reps. Checkpoints: `mlx-community/…-4bit`
+served by pie and mlx-lm 0.31.3 (MLX 0.32.0); `unsloth/…-Q4_0.gguf` by
+llama.cpp b9960 (`Q4_0` is the closest bpw match — see `three_way.py`'s
+header). Machine gate before the sweep: `roofline_probe` streaming roof
+283 GB/s cold one-shot (recorded warm roof 294–298); GPU tenancy held
+exclusively (peer sessions coordinated off the device). pie ring sized by
+`--max-model-len 16384` — see the harness-fix note below. Raw JSONL + sweep
+log: `docs/bench-archives/t03_*` (local, gitignored).
+
+**Read the numbers with three caveats.**
+
+1. Prefill is **TTFT-derived and launch-inclusive** — engine-server overhead
+   is in the denominator. It is comparable across these engines at the same
+   length; it is NOT comparable to [M5] Tables 2–3, whose pp is bench-style
+   raw batch prefill (T0.4 reproduces BaseRT with its own instrument instead).
+2. All runs are `--no-ignore-eos` (mlx-lm cannot pin output length). On
+   Llama-3.2-1B the engines EOS at different points (actual-work table
+   below), so its decode cells average over fewer tokens and carry more
+   noise; Qwen ran the full 128 everywhere.
+3. pie applies its own chat template (~2 extra prompt tokens here; per-engine
+   prompt counts recorded below).
+
+### Prefill tok/s (launch-inclusive)
+
+| Model | Engine | pp128 | pp256 | pp512 | pp1024 | pp2048 |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B q4 | pie | 5274 ± 32 | 6235 ± 47 | 6703 ± 34 | 7101 ± 48 | 7108 ± 11 |
+| Qwen3-0.6B q4 | mlx-lm | 1794 ± 18 | 3337 ± 14 | 5314 ± 203 | 7964 ± 204 | 9467 ± 99 |
+| Qwen3-0.6B q4 | llama.cpp | 8053 ± 533 | 10389 ± 489 | 10759 ± 433 | 11141 ± 226 | 9554 ± 112 |
+| Llama-3.2-1B q4 | pie | 3108 ± 18 | 3278 ± 18 | 3351 ± 14 | 3419 ± 12 | 3347 ± 26 |
+| Llama-3.2-1B q4 | mlx-lm | 2486 ± 4 | 3366 ± 732 | 5575 ± 31 | 7589 ± 45 | 8454 ± 291 |
+| Llama-3.2-1B q4 | llama.cpp | 6574 ± 272 | 7459 ± 332 | 8054 ± 180 | 8435 ± 50 | 7776 ± 284 |
+
+### Decode tok/s
+
+| Model | Engine | pp128 | pp256 | pp512 | pp1024 | pp2048 |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B q4 | pie | **379.5 ± 1.5** | **368.1 ± 3.4** | **351.9 ± 6.4** | **327.2 ± 2.6** | **285.6 ± 2.9** |
+| Qwen3-0.6B q4 | mlx-lm | 345.6 ± 2.4 | 296.7 ± 88.9 | 325.1 ± 6.0 | 291.7 ± 2.6 | 252.5 ± 2.8 |
+| Qwen3-0.6B q4 | llama.cpp | 349.9 ± 1.5 | 330.0 ± 26.3 | 330.6 ± 3.1 | 310.3 ± 1.6 | 283.2 ± 2.2 |
+| Llama-3.2-1B q4 | pie | **291.6 ± 2.9** | **281.3 ± 6.2** | 269.3 ± 3.7 | 246.8 ± 0.8 | 196.7 ± 29.5 |
+| Llama-3.2-1B q4 | mlx-lm | 281.6 ± 3.2 | 373.8 ± 214.1 | 269.5 ± 4.5 | 262.5 ± 1.9 | 238.1 ± 26.9 |
+| Llama-3.2-1B q4 | llama.cpp | 267.1 ± 5.4 | 279.7 ± 14.9 | 267.3 ± 7.9 | 260.3 ± 2.8 | 235.4 ± 38.9 |
+
+### Actual work per cell (mean prompt tokens / mean output tokens at mt=128)
+
+| Model | Engine | pp128 | pp256 | pp512 | pp1024 | pp2048 |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B q4 | pie / mlx / ll.cpp | 152/128 all | 278/128 all | 530/128 all | 1043/128 all | 2069/128 all |
+| Llama-3.2-1B q4 | pie | 177/128 | 303/128 | 555/128 | 1068/128 | 2094/128 |
+| Llama-3.2-1B q4 | mlx-lm | 175/84 | 301/22 | 553/128 | 1066/48 | 2092/99 |
+| Llama-3.2-1B q4 | llama.cpp | 175/49 | 301/8 | 553/19 | 1066/46 | 2092/88 |
+
+**What the table says.** pie holds the best decode at every Qwen cell
+(+8–13% over mlx-lm, +1–9% over llama.cpp) and the short-context Llama cells;
+its long-context Llama decode trails (196.7 at pp2048, noisy — the unequal
+EOS behaviour makes that cell soft for every engine). pie's launch-inclusive
+prefill is flat with length (~7.1k on 0.6B, ~3.4k on 1B): fastest startup at
+short prompts (24 ms TTFT at pp128 vs mlx-lm's 71 ms) but a per-layer
+dispatch-bound plateau that mlx-lm passes by pp1024. This is the small-dense
+regime — the same tree measured the opposite prefill ordering on the 30B MoE
+(`docs/HANDOVER.md`) — and it is the M1-constants baseline that Phase 1's
+tuning entry and T5.1 re-measure.
+
+**Harness fix this task required** (in `benches/three_way.py`, same PR):
+pie_bench's own `--max-model-len` default (2048) sizes the Metal KV ring at
+exactly 64 pages, so the 2048-token arm was refused ("allocation of 65 units
+can never fit") while the other engines ran it. `three_way.py` now forwards
+its `--max-model-len` to pie exactly as it already did to llama.cpp, and
+grew a `--pie-extra` passthrough for pie-only knobs. Ring-size control: one
+qwen/pp512 pie rep under the new ring — prefill 6716 vs recorded 6702 ± 34,
+decode 354.4 vs 351.9 ± 6.4 — so pre-fix cells stand.
+
+### Qwen3.6-27B (deferred to Phase 1/5)
 
 | Model | Quant | Engine | Prefill tok/s | Decode tok/s | Date |
 |---|---|---|---|---|---|
-| Qwen3-0.6B | q4 | pie | _TBD_ | _TBD_ | |
-| Qwen3-0.6B | q4 | mlx-lm 0.31.3 | _TBD_ | _TBD_ | |
-| Qwen3-0.6B | q4 | llama.cpp b9960 | _TBD_ | _TBD_ | |
-| Qwen3-0.6B | q4 | BaseRT | _TBD_ | _TBD_ | |
-| Llama-3.2-1B | q4 | … | | | |
-| Qwen3.6-27B | q4 | pie (M1 constants) | _TBD_ | _TBD_ | |
+| Qwen3.6-27B | q4 | pie (case-9 constants) | _TBD_ | _TBD_ | |
 | Qwen3.6-27B | q4 | pie (M5 entry) | _TBD_ | _TBD_ | |
 
-BaseRT's own published figures for its configs are in **[M5] Tables 1–3**;
-±10% reproduction is the T0.4 gate.
+BaseRT's own published figures are in **[M5] Tables 1–3**; ±10% reproduction
+with BaseRT's own instrument is the T0.4 gate (next section when measured).
