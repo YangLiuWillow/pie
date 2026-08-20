@@ -60,6 +60,18 @@ def fmt(k: int, n: int) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+")
+    ap.add_argument("--data", default="aime25.jsonl",
+                    help="dataset the sweep drew from, to know which problems "
+                         "should be present at all")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="problems the sweep was limited to (--limit in run_eval)")
+    ap.add_argument(
+        "--expect",
+        type=int,
+        default=0,
+        help="runs expected per arm; flags an incomplete sweep instead of "
+        "silently reporting a mean over whatever survived",
+    )
     ap.add_argument(
         "--baseline",
         default="adopt_nopen",
@@ -80,6 +92,40 @@ def main() -> None:
     by = collections.defaultdict(list)
     for r in records.values():
         by[r["arm"]].append(r)
+
+    # Completeness, stated rather than assumed. A sweep that died at row 87
+    # produces a file that scores perfectly happily and reports a mean over
+    # whatever survived — the failure has no output of its own, so it reads as
+    # a normal result. Print the shape and name what is missing.
+    expected = args.expect  # runs per arm; 0 disables the check
+    problems = sorted({r["problem_id"] for r in records.values()})
+    errs = [r for r in records.values() if r.get("error")]
+    print(f"[rows] {len(records)} runs, {len(by)} arms, {len(problems)} problems"
+          + (f", {len(errs)} errored" if errs else ""))
+    if expected:
+        for arm in sorted(by):
+            got = len(by[arm])
+            if got != expected:
+                print(f"[INCOMPLETE] arm {arm!r}: {got}/{expected} runs — "
+                      f"means below are over what survived, not the design")
+        # The expected problem list has to come from the dataset, not from the
+        # file: a sweep that died early is missing whole problems, and those are
+        # invisible to a check that only looks at rows it already has.
+        ks = sorted({r.get("sample") for r in records.values()})
+        want = problems
+        data = pathlib.Path(args.data)
+        if data.exists():
+            ids = [json.loads(l)["id"] for l in data.read_text().splitlines() if l.strip()]
+            want = ids[: args.limit] if args.limit else ids
+        for arm in sorted(by):
+            have = {(r["problem_id"], r.get("sample")) for r in by[arm]}
+            missing = [f"{p}/{k}" for p in want for k in ks if (p, k) not in have]
+            if missing:
+                print(f"[INCOMPLETE] arm {arm!r} missing {len(missing)}: "
+                      + ", ".join(missing[:6]) + (" ..." if len(missing) > 6 else ""))
+    if errs:
+        kinds = collections.Counter(str(r["error"]).split(":")[0] for r in errs)
+        print(f"[errors] {dict(kinds)} — these score as wrong and as unanswered")
 
     ok = lambda r: equal(r.get("answer"), r["gold"])  # noqa: E731
     blocks = lambda r: r.get("parallel_blocks") or 0  # noqa: E731
