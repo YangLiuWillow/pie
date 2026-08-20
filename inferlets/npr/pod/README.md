@@ -43,11 +43,35 @@ GPU type — and left the first pod billing at $0.99/hr with nobody watching it.
 Two fixes:
 
 * `hunt.sh` now terminates any pod it deployed and did not accept.
-* `gate.sh POD_ID [WAIT_MIN]` runs the gates against a pod you already have, and
-  remembers the last non-empty ip/port instead of resetting when the REST view
-  flaps. Use it to adopt a pod after an interrupted hunt, or to re-gate one
-  by hand. It terminates the pod on any rejection, so a rejected pod never
-  becomes a leak.
+* `gate.sh POD_ID [WAIT_MIN]` owns the whole accept/reject decision, and
+  `hunt.sh` now just deploys and hands each pod to it. It also remembers the
+  last non-empty ip/port instead of resetting when the REST view flaps. Use it
+  directly to adopt a pod after an interrupted hunt, or to re-gate one by hand.
+  It terminates the pod on any rejection, so a rejected pod never becomes a leak.
+
+### Fail fast on a broken container
+
+`gate.sh` probes RunPod's SSH proxy (`<podHostId>@ssh.runpod.io`, from GraphQL
+`machine { podHostId }`) before waiting on a public IP. The proxy answers as
+soon as the pod is rented — often long before `publicIp`/`portMappings` appear,
+and it still answers when they never do. It needs a PTY (`-tt`; without one it
+replies `Error: Your SSH client doesn't support PTY`) and supports no scp, so
+it is a diagnostic channel only: the pipeline still moves files over direct IP.
+
+What it buys is separating *still booting* from *never going to start*. Two
+consecutive pods on 2026-08-20 sat at `desiredStatus: RUNNING` with
+`runtime.ports: null` and answered the proxy with
+
+```
+OCI runtime exec failed: exec failed: unable to start container process:
+error writing config to pipe: write init-p: broken pipe: unknown
+```
+
+— the container process could not start at all. Without the probe each of those
+costs a full `WAIT_MIN` of billing before the gate gives up; with it they are
+rejected in about a minute. Bad hosts are the norm, not the exception here
+(HANDOVER §11: 3 of 4 community L40S hosts had broken CUDA), so the cost of
+finding a good pod is dominated by how fast you can discard a bad one.
 
 Whatever the path in, always confirm the account is actually empty when you are
 done — `curl -s https://rest.runpod.io/v1/pods -H "Authorization: Bearer $RUNPOD_API_KEY"`

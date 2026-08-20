@@ -23,6 +23,33 @@ reject() {  # $1 = reason
   exit 1
 }
 
+# --- Fast container-health probe via RunPod's SSH proxy -----------------------
+# The proxy (ssh.runpod.io) is reachable as soon as the pod is rented, long
+# before publicIp/portMappings appear -- and it answers even when they never do.
+# It needs a PTY (`-tt`), and it is only a diagnostic channel: no scp, so the
+# real pipeline still runs over direct IP. What it buys is telling
+# "still booting" apart from "this container will never start", which
+# otherwise costs a full WAIT_MIN of billing per broken host. Observed
+# 2026-08-20 on two consecutive pods: `OCI runtime exec failed ... write
+# init-p: broken pipe` -- the container process could not start at all.
+PROXY=$(curl -s --max-time 30 https://api.runpod.io/graphql \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -d "{\"query\":\"query { pod(input: {podId: \\\"$ID\\\"}) { machine { podHostId } } }\"}" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); p=((d.get('data') or {}).get('pod') or {}).get('machine') or {}; print(p.get('podHostId') or '')" 2>/dev/null)
+if [ -n "$PROXY" ]; then
+  for t in $(seq 1 8); do
+    OUT=$(ssh -tt -i $HOME/.ssh/id_ed25519_runpod -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 "$PROXY@ssh.runpod.io" \
+          'python3 -c "import ctypes; print(\"cuInit\", ctypes.CDLL(\"libcuda.so.1\").cuInit(0))"' </dev/null 2>&1)
+    case "$OUT" in
+      *"cuInit 0"*)          echo "proxy: container healthy, cuInit=0"; break;;
+      *"OCI runtime exec"*)  reject "container process will not start (proxy: OCI runtime exec failed)";;
+      *"cuInit "*)           reject "cuInit != 0 via proxy (dead CUDA device)";;
+    esac
+    sleep 20
+  done
+fi
+
 DEADLINE=$(( $(date +%s) + WAIT_MIN * 60 ))
 IP=""; PORT=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
