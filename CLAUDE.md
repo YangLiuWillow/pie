@@ -102,11 +102,13 @@ configuration BaseRT evaluated on (arXiv:2607.19438 §4.1). Prefer Metal over
 CUDA in suggestions, and assume a real device is available for `tests/gpu`.
 
 **`device_tuning.cpp` has no M5 entry.** Apple families through M4 have
-overrides; an M5 currently falls back to the M1 Max constants — which is exactly
-the failure mode the file's own header warns about ("the GEMM crossover sits
-three rows too high, so the batches where the GEMM already wins are still served
-by the GEMV"). Measuring and adding that entry is the highest-value,
-lowest-effort work available on this machine.
+overrides; measured in T0.2 (`device_identity_probe`), an M5 reports
+**family 9** — the driver's probe list stops at Apple9 even though the device
+answers yes to Apple10 — and so selects the **case-9 (M3/M4) block**
+(`qmm_bn_crossover_tg` = 96, rest at M1 Max defaults). Not the M1 Max
+fallback previously assumed, but still another machine's constants. Measuring
+and adding a real M5 entry (which also means extending the family probe to
+Apple10) is the highest-value, lowest-effort work available on this machine.
 
 ---
 

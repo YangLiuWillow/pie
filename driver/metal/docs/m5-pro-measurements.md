@@ -11,9 +11,9 @@ a decimal point.
 |---|---|---|---|
 | macOS / Darwin | macOS 26.5.1 (25F80), Darwin 25.5.0 | `sw_vers`, `uname -r`. Note: [M5] §4.1 ran Darwin 25.4 | 2026-08-19 |
 | Toolchain | Apple clang 21.0.0 (CLT; no offline `metal` compiler — kernels compile at run time via `newLibraryWithSource`), cmake 4.4.2, rustc 1.97.1 | `c++ --version`; `xcrun -sdk macosx metal --version` fails, CLT-only install | 2026-08-19 |
-| `apple_family` | _TBD_ | T0.2 `device_identity_probe` (driver's `query_device_info()`; probe list stops at Apple9) | |
-| `gpu_core_count` | _TBD_ | T0.2 probe — IOKit `gpu-core-count` (System Profiler says 20) | |
-| `DeviceTuning` block selected | _TBD_ | T0.2 — expected per source: **case 9 (M3/M4)**, not the default | |
+| `apple_family` | **9** as the driver sees it; the device itself answers **yes to Apple10** (and no to 11/12), which the driver never asks | `tools/rawmetal/device_identity_probe`, clean env (`env -i`) | 2026-08-19 |
+| `gpu_core_count` | **20** | same probe — IOKit `gpu-core-count` | 2026-08-19 |
+| `DeviceTuning` block selected | **case 9 (M3/M4)**: `qmm_bn_crossover_tg` = 96, everything else at M1 Max defaults. NOT the M1 Max default block the plan expected — the family probe stops at Apple9, so an M5 is indistinguishable from an M3/M4 until the probe list is extended to Apple10 (Phase 1) | same probe: selected vs default-constructed fields | 2026-08-19 |
 
 ## Suite state (T0.1)
 

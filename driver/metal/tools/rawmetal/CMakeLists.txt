@@ -65,6 +65,13 @@ add_executable(device_caps device_caps.mm)
 set_source_files_properties(device_caps.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(device_caps PRIVATE "-framework Metal" "-framework Foundation")
 
+# What the DRIVER thinks this machine is: query_device_info() and the
+# DeviceTuning block it selects, printed rather than deduced from reading
+# tuning_for(). Links the driver lib because the point is the driver's own
+# answer; device_caps above stays framework-only on purpose.
+add_rawmetal_tool(device_identity_probe device_identity_probe.mm)
+set_source_files_properties(device_identity_probe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+
 add_executable(dvfs_probe dvfs_probe.mm)
 set_source_files_properties(dvfs_probe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(dvfs_probe PRIVATE

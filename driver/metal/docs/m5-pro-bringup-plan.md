@@ -442,7 +442,7 @@ tensor-path verification is a result BaseRT structurally cannot produce.
 
 | Risk | Signal | Mitigation |
 |---|---|---|
-| M5 falls back to M1 constants indefinitely | T0.2 confirms default block selected | Phase 1 is first for this reason |
+| M5 runs another machine's constants indefinitely | T0.2 measured: the case-9 (M3/M4) block is selected, family probe capped at Apple9 | Phase 1 is first for this reason, and must extend the probe to Apple10 |
 | Tensor path is a dud on M5 Pro | T2.1 ratio ≲ 1.2× | Phase 3 is gated. Cheaper to learn in Phase 2 than Phase 3. |
 | Breaking the `device_tuning` invariant | default constants change | it is a test, not a convention — assert it |
 | Deleting "dead" kernel instantiations | undispatched templates in `quantized_qmm_t.metal` | they keep closed sweeps re-runnable; documented in `CLAUDE.md` |
