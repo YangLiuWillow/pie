@@ -984,18 +984,28 @@ Workaround until fixed: keep peak concurrent KV demand under the pool
 (the diagnostic re-ran at concurrency 8 without issue).
 
 **Scoped 2026-08-20 — see `BUG16-SCOPE.md` (same directory).** The "prime
-suspect" above is partly right and materially incomplete. Five liveness holes
-are now established from the code, the sharpest being that the escape hatch is
-powered by the thing that stopped: `defaulted` (the flag that makes a context
-evictable regardless of bid) is written only by the market tick, and the market
-tick is sent only after `execute_batch` — so once no batch can be formed, rent
-stops, nobody defaults, and a bid standoff can never be broken. Rent is also
-charged only to *in-batch* contexts, so an idle page hoarder never defaults even
-while the clock runs. Which hole is the *entry* condition is still unknown;
-BUG16-SCOPE.md §6 registers the discriminating predictions in advance and §7
-notes that `SchedCounters` already tracks everything needed to tell them apart —
-its only dump site is commented out, which is why the 40-minute wedge left no
-evidence. **No reproduction has been attempted and no patch is proposed.**
+suspect" above is partly right and materially incomplete. Eight facts are now
+established from the code; the sharpest is that **the eviction economics cannot
+break the deadlock, rather than merely failing to.** `defaulted` — the flag that
+makes a context evictable regardless of bid — is set only when
+`proc.balance < clearing_price * eff`; the clearing price is the *minimum* bid
+among resident contexts; every context is born at `bid = 0.0`; and this branch's
+Rust SDK exposes no way to change it. So rent is identically zero, no context can
+ever default, and (since both bid comparisons are strict) the bid gate and the
+priority gate are vacuous too — the whole market layer is inert in both
+directions. Separately, the market clock is driven only by `execute_batch`, so it
+also stops when the engine does, and rent reaches only *in-batch* contexts, never
+an idle page hoarder. On the mechanical side, `drain_queues` phase 1 waits for
+free pages without ever escalating to eviction (`find_eviction_victim` has one
+call site, in `when_allocated_inner`), and restores are gated on that queue being
+empty — so one un-servable head freezes every suspended context.
+
+Which hole is the *entry* condition is still unknown. BUG16-SCOPE.md §6 registers
+the discriminating predictions in advance (one of them was already falsified
+during writing, by E7), and §7 notes that `SchedCounters` already tracks
+everything needed to tell them apart — its only dump site is commented out, which
+is why the 40-minute wedge left no evidence. **No reproduction has been attempted
+and no patch is proposed.**
 
 ### Measurement hygiene (cross-session lessons, 2026-08-14/16)
 
