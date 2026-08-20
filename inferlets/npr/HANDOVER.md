@@ -110,6 +110,81 @@ cap, so it affects far more than NPR), and `b5380d3` (portable sampling reshape 
 aborts the whole server process on any batch that mixes a prefill with decodes,
 so it hits any concurrent workload, not just NPR).
 
+### 4.1 Upstreaming those five (state as of 2026-08-20)
+
+**Prepared, not yet opened.** Branches are cut, committed, pushed and verified;
+opening the PRs is blocked on a credential, see "Blocker" below. The full PR
+bodies, the exact titles, an `open-prs.sh`, and the analysis behind all of this
+live in **`inferlets/npr/upstream-prs/`** — read that directory before redoing
+any of this work.
+
+**They target upstream `main`, NOT `dev`.** This is the finding that would
+otherwise cost a round of confused review:
+
+- `94043eb12`, the base of `npr-inferlet`, is on `fork/dev`
+  (`YangLiuWillow/pie`) and on **no** `pie-project/pie` branch at all.
+- Upstream `dev` is a **different codebase generation** — a rewrite carrying
+  `runtime/engine/`, `compiler/`, `controller/`, `model/`, `worker/`, and
+  **no `driver/portable`**, no `sdk/rust/inferlet/src/context.rs`. Four of the
+  five fixes have no file to apply to there.
+- Every file these fixes touch exists on upstream **`main`**, which is also the
+  repo's default branch; `.github/workflows/ci.yml` runs only on PRs into
+  `main` (made explicit upstream in #516).
+- Merge-base of `fork/dev` with upstream is `8824d3e5b`, on both `main` and
+  `dev`.
+
+**`b5380d3` is half obsolete — do not cherry-pick it whole.** Upstream already
+merged its `ggml_reshape_3d` half as **PR #426** ("key uniform-sample reshape on
+slot count, not request count"); all five graph builders on `main` now derive
+`n_slots` from `probs->ne[1]`. What is still live upstream is the *other* half
+of the same defect: `GraphCache::matches()` does not compare the sampling-slot
+count, so a cached graph can be reused at a count its `out_idx` — sized to
+exactly `plan.sampling_pos_i32.size()` — was never built for, and
+`upload_graph_inputs` then overruns it (more slots) or leaves stale entries
+(fewer). That half was rebased on its own; the branch is named for what it
+actually does. It fails **silently** (wrong tokens) where #426's half failed
+loudly (`GGML_ASSERT`).
+
+**`c0218d2` overlaps an upstream fix that never reached `main`.** PR **#484**
+fixes the same defect host-side (drop `table.delete(this)?` from
+`HostContext::destroy`, let the ordinary resource drop own deletion). It merged
+into `tts-arena/main`, a branch that no longer exists; `main`'s `destroy` still
+calls `table.delete(this)?`. The two are **alternatives** — applying both leaves
+nothing to delete the table entry, leaking a slot per destroyed context. The PR
+body says this and names #484.
+
+| branch on `fork` | from | PR | applies to `upstream/main` |
+|---|---|---|---|
+| `fix/sdk-context-destroy-trap` | `c0218d2` | not yet opened | clean |
+| `fix/portable-kv-write-index` | `e10b9ac` | not yet opened | clean |
+| `fix/runtime-explicit-mask-commit` | `86ed682` | not yet opened | clean |
+| `fix/cuda-prefill-logits-oob` | `8de3f5e` | not yet opened | clean |
+| `fix/portable-graph-cache-slot-count` | `b5380d3` | not yet opened | **rebased, see above** |
+
+All five: one focused commit, authored as Liu, no AI co-author trailers, base
+`main`. Each was confirmed to fix code that is **still live on current `main`**
+by reading `main`, not merely by getting a clean cherry-pick.
+
+**Blocker.** `gh` on this host is authenticated with a **fine-grained** PAT
+(`gh api -i user` returns no `X-OAuth-Scopes` header). Fine-grained PATs only
+reach repos owned by the token owner or granted by an org, so on
+`pie-project/pie` it has public-read only — `permissions: {pull: true, push:
+false, ...}`. Creating a PR fails with `403 Resource not accessible by personal
+access token` on **both** `gh pr create` (GraphQL) and
+`gh api -X POST repos/pie-project/pie/pulls` (REST). The endpoint choice is not
+the issue; the token type is. To unblock, either re-auth with `gh auth login`
+(web flow) or use a **classic** PAT with `public_repo` scope — then run
+`inferlets/npr/upstream-prs/open-prs.sh`, one call at a time, checking the
+returned number before firing the next. Alternatively open them from the GitHub
+UI; the compare URLs are in that directory's README.
+
+**Unrelated, found while verifying:** `cargo test --workspace` is **red out of
+the box on macOS** on unmodified upstream `main` — 7 `pie-bridge` shmem tests
+fail because macOS caps POSIX shm names at 31 characters, so `shm_open` returns
+`ENAMETOOLONG`. Reproduced on a clean detached `upstream/main` checkout, so it
+is not fallout from any of these fixes. Noted in PR 3's verification section;
+deliberately not opened as a sixth PR.
+
 ## 5. How to run it (from zero, on a GPU pod)
 
 ```bash
