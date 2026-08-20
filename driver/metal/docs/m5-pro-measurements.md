@@ -342,7 +342,8 @@ reporting to basecompute).
 | Gemma-4-26B-A4B | — | _blocked: same_ | 85.0 | | | |
 | Qwen3-30B-A3B | pull default (original HF repo, not the catalog's -Instruct-2507) | 105.8 | 105.1 | **+0.7%** | +0.2% | +1.3% ‡ |
 | Qwen3.5-35B-A3B | pull default | 109.5 | 110.6 | **−1.0%** | −1.6% | −2.9% § (pp512 −0.6% after idle re-take) |
-| Qwen3.6-35B-A3B | **quant-from-quant** from cached mlx-community 4-bit (`--allow-quant-from-quant`; bf16 source not downloaded) | 109.3 | 110.7 | **−1.2%** | −31% ¶ | +4.2% |
+| Qwen3.6-35B-A3B | **pull default from bf16 source** (693 tensors, `HAS_MOE`) | 110.7 | 110.7 | **+0.0%** | −2.1% | +6.2% |
+| Qwen3.6-35B-A3B | quant-from-quant from mlx-community 4-bit (733 tensors, no `HAS_MOE`) | 109.3 | 110.7 | −1.2% | −31% ¶ | +4.2% |
 | Qwen3.6-27B | pull default (f16 emb; insensitive here too) | 18.19 | 18.1 | **+0.5%** | −0.3% | −9.0% ‡ (pp512 −1.8%, pp1024 −1.3% quiet) |
 
 ### 8-bit rows — all reproduce with pull/catalog defaults
@@ -396,7 +397,18 @@ roof, and the earlier "impossible above the roof" arguments in this file
 should be read against per-shape achieved bandwidth (~250–260 GB/s for the
 1B-class decodes), which is what they actually used.
 
-¶ The one row whose prefill does NOT replicate at short prompts, and the
+¶ **Resolved.** The quant-from-quant artifact is structurally different,
+not just numerically: converted from the `mlx-community` 4-bit checkpoint it
+has **733 tensors and no `HAS_MOE` flag**; converted from the bf16 source
+(the paper's method) it has **693 tensors with `HAS_MOE`** — identical to
+its Qwen3.5-35B sibling — and replicates every cell: tg128 110.7 (exact),
+pp128/256/512/1024/2048 = 1333/1787/2345/2773/2962 vs 1361/1831/2342/2736/
+2788 (−2.1%/−2.4%/+0.1%/+1.4%/+6.2%). Forty extra tensors = one per layer,
+and a model the runtime does not know is MoE takes a different dispatch
+path — the ~40 ms per-call penalty was ~1 ms × 40 layers of that. Kept
+below as the record of how it was found. Original note:
+
+The one row whose prefill did NOT replicate at short prompts, and the
 one row converted from an already-quantized source. Under idle conditions
 (stddev ±1): pp128 936 vs 1361 (−31%), pp256 1371 vs 1831 (−25%), pp512
 1975 vs 2342 (−16%), pp1024 2525 vs 2736 (−7.7%), pp2048 2905 vs 2788

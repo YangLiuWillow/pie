@@ -241,7 +241,11 @@ Three rules this leaves behind:
    already-4-bit checkpoint (`--allow-quant-from-quant`, Qwen3.6-35B-A3B)
    replicated decode and long-prompt prefill but carried a fixed ~40 ms
    per-prefill-call penalty (−31% at pp128) that no machine condition
-   explained — see `m5-pro-measurements.md` ¶.
+   explained. Converting the same model from its bf16 source replicated
+   every cell (tg exact, pp within ±6%) — and the two artifacts differ
+   STRUCTURALLY (733 tensors / no `HAS_MOE` vs 693 / `HAS_MOE`): a
+   quant-from-quant conversion can change which dispatch path a runtime
+   takes, not only the numerics. See `m5-pro-measurements.md` ¶.
 2. **For pie's own kernels and future fusion work: on a small dense model,
    the tied lm_head is the decode.** Per token, Llama-1B's q4 body is
    ~547 MB and an f16 tied embedding is ~525 MB — the logits projection is
