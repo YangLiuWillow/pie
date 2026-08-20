@@ -93,6 +93,33 @@ default, overridable with `IMAGE=`.
 built from source on the pod: a missing compiler is otherwise a ~25-minute
 bootstrap that ends in `SETUP_FAIL`.
 
+### Resuming after a pod death (`resume.sh`)
+
+`run_eval.py --resume` (the default) decides what to skip by reading the
+`--out` file **on the pod**. The poller streams that file to the local worktree
+every 3 minutes, so a dead pod costs at most one interval of rows — but only if
+those rows get back onto the replacement pod before the sweep restarts.
+Otherwise the restart silently redoes everything, which on a multi-hour sweep is
+the difference between losing 3 minutes and losing the run.
+
+```bash
+bash hunt.sh                                    # fresh pod
+bash resume.sh adopt,adopt_nopen aime25-pen-ab.jsonl
+```
+
+It seeds the local rows onto the new pod, verifies the line count matches before
+spending any pod time (a truncated upload otherwise looks like a partial sweep),
+and hands off to `launch.sh`. Verified behaviour, tested against a real partial
+file with an errored row appended: 15 lines in, 14 counted as done, 86 of 100
+runs queued — **errored rows are deliberately not counted as done**, so they are
+retried rather than silently dropped.
+
+What a restart actually costs, on top of the ≤1 poll interval of lost rows: the
+fresh pod redoes bootstrap — engine build, 15 GB checkout download, bf16 cast —
+which is ~25-35 min, plus the hunt. It does *not* redo the sshd/MooseFS triage,
+because the image default and the BUILD/STATE split above are now in the
+scripts.
+
 Whatever the path in, always confirm the account is actually empty when you are
 done — `curl -s https://rest.runpod.io/v1/pods -H "Authorization: Bearer $RUNPOD_API_KEY"`
 — rather than assuming a DELETE call worked.
