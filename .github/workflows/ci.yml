@@ -437,7 +437,28 @@ jobs:
             -DPIE_METAL_BUILD_TESTS=ON \
             -DPIE_METAL_BUILD_PARITY=ON
           cmake --build target/metal-mlx
-          ctest --test-dir target/metal-mlx --output-on-failure
+
+          # Same Metal 4 gate as the entrypoint step above; the probe binary
+          # is reused when that step already built it on this runner.
+          if [ ! -x /tmp/metal4_probe ]; then
+            cat > /tmp/metal4_probe.m <<'EOF'
+          #import <Metal/Metal.h>
+          int main(void) {
+            id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+            if (d == nil) return 2;
+            return [d supportsFamily:MTLGPUFamilyMetal4] ? 0 : 1;
+          }
+          EOF
+            clang -fobjc-arc -framework Metal -framework Foundation \
+              -o /tmp/metal4_probe /tmp/metal4_probe.m
+          fi
+          if /tmp/metal4_probe; then
+            ctest --test-dir target/metal-mlx --output-on-failure
+          else
+            echo "::notice::no Metal 4 device on this runner; excluding needs-metal4-device tests"
+            ctest --test-dir target/metal-mlx --output-on-failure \
+              -LE needs-metal4-device
+          fi
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
