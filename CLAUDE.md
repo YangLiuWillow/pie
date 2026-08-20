@@ -189,6 +189,35 @@ See `driver/metal/docs/m5-pro-bringup-plan.md` for the active plan and
 
 ---
 
+## Workflow — one task, one branch, one PR
+
+Every task in the bring-up plan (T0.1, T1.2, …) is delivered as its own PR on
+`YangLiuWillow/pie`, so progress is reviewable on GitHub, including from a
+phone. The integration branch is **`docs/m5-pro-bringup-plan`** — task PRs
+target it, never `main` or `dev`.
+
+1. **Branch** off `docs/m5-pro-bringup-plan`, named `m5/t<phase>-<n>-<slug>`
+   (e.g. `m5/t0-2-descriptor-facts`, `m5/t1-1-crossover-sweep`).
+2. **Do the task there**, including the record its success metric names —
+   measurements land in `driver/metal/docs/m5-pro-measurements.md` in the same
+   PR as the change they justify, and a tuning constant lands in the same PR
+   as its measurement table.
+3. **Push and open the PR** with title `[T<n>.<m>] <what it did>`. The body
+   states the task's success metric from the plan and the measured numbers
+   that satisfy it. A task without its number is not done — do not present
+   the PR as done without it.
+4. **Report the PR link** in the session, then **merge** once the metric is
+   met and the relevant tests pass: `gh pr merge --squash --delete-branch`.
+   If something is worth a look first (a surprise, a judgment call), say so
+   and leave the PR open for review instead of merging.
+5. **Phase gates** (e.g. Phase 3 gated on T2.1's ratio) get decided in the
+   gating task's PR description, so the decision sits next to its number.
+
+Tooling on this machine: `gh` is at `~/.local/bin/gh` (needs a one-time
+`gh auth login`); plain `git push` to origin already works via the keychain.
+
+---
+
 ## Verified against this clone (2026-08-19 /init pass)
 
 **The tree this file describes does not live on `dev`.** `origin/dev` last
