@@ -20,7 +20,10 @@ for i in $(seq 1 250); do
   # Surface the CUDA sentinel line the moment it lands — it gates the whole sweep.
   ST_LINE=$(grep -h "selftest toplogits" "$NPR_STATE/selftest.log" 2>/dev/null | head -1)
   if [ -n "$ST_LINE" ] && [ "$ST_LINE" != "$LASTSELF" ]; then echo "[$(date '+%H:%M')] $ST_LINE"; LASTSELF="$ST_LINE"; fi
-  N=$(wc -l < "$LR/$OUT" 2>/dev/null | tr -d ' '); N=${N:-0}
+  # The results file does not exist until the sweep's first row lands; treat a
+  # missing file as zero rather than letting the redirect error into the log.
+  if [ -f "$LR/$OUT" ]; then N=$(wc -l < "$LR/$OUT" 2>/dev/null | tr -d ' '); else N=0; fi
+  N=${N:-0}
   case "$ST" in
     DONE*)
       if [ "$ST" != "DONE exit=0" ] && { [ "$EXPECT" -eq 0 ] || [ "$N" -lt "$EXPECT" ]; }; then
