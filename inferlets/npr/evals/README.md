@@ -11,6 +11,7 @@ NPR Engine quality and speed?*
 | `aime25.jsonl` | 30 problems (AIME 2025 I + II) from `math-ai/aime25`, `{id, problem, answer}` |
 | `run_eval.py` | concurrent sweep driver over a running `pie serve` |
 | `score.py` | avg@k / pass@k plus parallelism + throughput stats |
+| `collapse.py` | per-arm `blocks<=1` vs `blocks>=2` split — the mixture the penalty A/B turns on |
 | `results/` | JSONL output, one line per run (gitignored except committed summaries) |
 
 ## Arms
@@ -19,6 +20,8 @@ NPR Engine quality and speed?*
 |---|---|---|
 | `refill` | `join_mode=refill` | the faithful join: sibling KV refilled at overlapping positions behind BRLE hole masks — numerically equivalent to NPR Engine's page stitching |
 | `textual` | `join_mode=textual` | phase-1 baseline: sibling steps concatenated causally at sequential positions. Off-distribution for the RL'd model (DESIGN.md §6.5); the A/B quantifies how much the faithful join buys |
+| `adopt` | `join_mode=adopt` | the same faithful join done as a device-side KV row copy instead of recomputation (`adopt_kv`, DESIGN.md §13). §11 found it identical to `refill` on quality and 2.2x faster on join latency, so it is the default arm for quality work |
+| `adopt_nopen` / `refill_nopen` | `rep_penalty=1.0` | ablation of NPR's per-`<step>` repetition penalty 1.02 (DESIGN.md §15), which is otherwise on by default from the first fork onward. Pair either against its penalised namesake to isolate the penalty |
 | `sequential` | `max_plans=0` | never forks. The model still emits `<guideline>/<plan>/<step>`, but decodes the whole trace in one causal stream — NPR's own degrade-to-sequential path. The speed reference |
 
 The sequential arm is the same checkpoint and the same schema, so accuracy
@@ -85,6 +88,15 @@ python evals/run_eval.py --arms refill,sequential --k 1 --limit 8 \
 
 python evals/score.py evals/results/aime25.jsonl --by-problem
 python evals/score.py evals/results/speed.jsonl
+```
+
+For an ablation A/B, score the mixture as well as the mean — an arm's accuracy
+is `P(b>=2)·acc|b>=2 + P(b<=1)·acc|b<=1`, and the two halves are ~80% and ~5%
+correct respectively (§11 read 5), so a change in the *block mix* and a change
+in *conditional quality* are different findings that the mean cannot tell apart:
+
+```bash
+python evals/collapse.py evals/results/aime25-pen-ab.jsonl --baseline adopt_nopen
 ```
 
 `run_eval.py` appends and resumes: re-running skips keys already recorded (pass
