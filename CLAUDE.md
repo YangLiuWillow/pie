@@ -133,8 +133,12 @@ mlx-lm's version with MLX's. The pins above are the paper-confirmed ones.
 Local copies of both BaseRT papers live in `docs/papers/` (gitignored):
 `basert-2607.00501.pdf`, `basert-m5-2607.19438.pdf`.
 
-None of these baselines are installed on this machine yet (fresh after the
-machine switch) — install them at exactly the pinned versions before T0.3.
+All four are installed at exactly the pinned versions (2026-08-19):
+mlx/mlx-lm in `~/.cache/pie-metal/mlxenv` (python 3.14.7, per the parity
+requirements header); llama.cpp built from tag b9960 (commit a935fbf, Metal
+backend) in `~/.cache/pie-metal/llama.cpp-b9960` with `llama-server`/
+`llama-cli`/`llama-bench` symlinked into `~/.local/bin`; BaseRT v0.1.6 in
+`~/.basert` (not on PATH — export it or invoke `~/.basert/basert`).
 
 **Protocol** (also BaseRT §4.1, so results stay comparable): prompt lengths
 128/256/512/1024/2048; 128 generated tokens; 5 repetitions; report mean ± stddev.
