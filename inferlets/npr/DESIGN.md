@@ -1086,12 +1086,24 @@ Two small, independent, genuinely upstreamable defects, found while scoping 16.
 Neither causes a wedge; together they are why a 40-minute one left an evidence
 log with nothing in it about the allocator.
 
-**18 — `SchedCounters` is never printed.** `runtime/src/context.rs:1154` tracks
-exactly what diagnosing this family needs — `eviction_suspends`,
-`priority_gate_suspends`, `no_victim_suspends`, `restores`, `restore_rejections`,
-`defaults_flagged`, `eviction_searches` — and the only dump site in the runtime is
-commented out (`runtime/src/context.rs:2727`). Every one of those counters was
-decisive in the bug-17 work, and none of them is observable in a shipped build.
+**18 — `SchedCounters` is never printed, and un-commenting the dump would not
+have helped.** `runtime/src/context.rs:1154` tracks exactly what diagnosing this
+family needs — `eviction_suspends`, `priority_gate_suspends`,
+`no_victim_suspends`, `restores`, `restore_rejections`, `defaults_flagged`,
+`eviction_searches` — and the only dump site in the runtime is commented out
+(`runtime/src/context.rs:2727`). Every one of those counters was decisive in the
+bug-17 work; none is observable in a shipped build.
+
+The important half is *why the obvious fix is not the fix*. That dump site is
+driven from the drain/tick path, and **`drain_queues` stops being called exactly
+when it matters** — in a wedge there are no allocations to drain and no batches to
+tick, so a restored dump site goes silent precisely during the event it exists to
+explain. A fixed print would have produced nothing during the A40 wedge either.
+What does work is a **timer** that asks the context actor for a snapshot: this
+failure is an allocation standoff, not a hung task, so the actor's mailbox stays
+healthy and answers throughout. So 18 is not "a missing print" — it is "a print
+that would not have helped", and the fix has to change *what drives* the
+observation, not just uncomment it.
 
 **19 — `eviction_searches` is a dead counter.** Declared, never incremented
 anywhere in the runtime. Measured directly: a run with `eviction_suspends = 5`
@@ -1100,9 +1112,8 @@ report "no eviction searches happened" as a fact — worse than no counter at al
 Fix 19 before or with 18, never 18 alone.
 
 Both are addressed by the instrumentation patch in BUG16-SCOPE.md §7.1, which
-also replaces 18's commented-out dump with a watchdog that still speaks *during*
-a wedge — a drain-driven dump cannot, because `drain_queues` stops being called
-exactly when it is needed.
+fixes 19 and supersedes 18 with the actor-polled watchdog described above rather
+than restoring the commented-out dump.
 
 ### Measurement hygiene (cross-session lessons, 2026-08-14/16)
 
