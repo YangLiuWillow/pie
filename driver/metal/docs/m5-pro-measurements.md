@@ -340,9 +340,9 @@ reporting to basecompute).
 | Llama-3.2-3B | **embq4 rebuild** | 139.2 | 137.0 | **+1.7%** | −0.3% | +6.4% |
 | Gemma-4-E2B | — | _blocked: HF-gated, no catalog entry, no token_ | 149.8 | | | |
 | Gemma-4-26B-A4B | — | _blocked: same_ | 85.0 | | | |
-| Qwen3-30B-A3B | — | _downloading (original HF repo; catalog only has -Instruct-2507)_ | 105.1 | | | |
-| Qwen3.5-35B-A3B | — | _queued_ | 110.6 | | | |
-| Qwen3.6-35B-A3B | — | _queued_ | 110.7 | | | |
+| Qwen3-30B-A3B | pull default (original HF repo, not the catalog's -Instruct-2507) | 105.8 | 105.1 | **+0.7%** | +0.2% | +1.3% ‡ |
+| Qwen3.5-35B-A3B | pull default | 109.5 | 110.6 | **−1.0%** | −1.6% | −10.2% § |
+| Qwen3.6-35B-A3B | — | _downloading_ | 110.7 | | | |
 | Qwen3.6-27B | pull default (f16 emb; insensitive here too) | 18.19 | 18.1 | **+0.5%** | −0.3% | −9.0% ‡ |
 
 ### 8-bit rows — all reproduce with pull/catalog defaults
@@ -362,7 +362,28 @@ live demonstration of the protocol's "alternate arms, don't batch" rule.
 ‡ 27B prefill drifts from −0.3% (pp128) to −9.0% (pp2048) across a
 back-to-back sweep — inside the gate, same in-sequence thermal signature the
 3B q8 row showed; a cold pp2048 re-run is the check if the margin ever
-matters.
+matters. 30B's pp1024/pp2048 were −5.1%/−12.6% in the hot sweep and
+−0.2%/+1.3% after a cool-down (the values in the table).
+
+§ Long-prefill points on the ≥17 GB models carry a third pollution mode
+beyond thermal drift and GPU tenancy: **page-cache contention**. A 70 GB
+source download streaming through the filesystem cache while a 21–27 GB
+model is mapped evicts the model mid-bench — measured directly when a 27B
+"cold re-run" during the download came back 370–390 pp with ±25 stddev
+against 452–462 clean. Benches from that point on ran with the download
+pipeline SIGSTOPped (`bench_clean.sh`, archived); 35B's pp512/pp2048
+(−9.9%/−10.2%, elevated stddev) are still marked for an idle-machine
+re-take once all downloads have settled.
+
+And the damage does not undo by pausing the writer: a suspended-download
+27B re-take still measured pp512/1024/2048 at 450/430/425 — *below* the
+original download-free sweep (462/458/452), after ~130 GB of sources had
+churned the cache. The original sweep stands as the 27B record. Standing
+rule for big-model benching on a 48 GB machine: take the numbers BEFORE
+queueing bulk downloads, or after a reboot — mid-campaign cache state is a
+one-way ratchet that SIGSTOP does not release. (The affected long-prefill
+cells here are all decode-irrelevant: tg128 reproduced within ±1% under
+every cache condition tried.)
 
 **Two 27B side-findings.** (1) BaseRT handles GatedDeltaNet: the artifact
 identifies as arch `qwen35`, 64 layers, and decodes at the published rate —
