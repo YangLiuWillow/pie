@@ -418,12 +418,19 @@ arms** — identical counts, not a noisy null, on precisely the metric DESIGN.md
 *more*) and did not cut the unanswered rate (0.220 vs 0.200).
 
 The +4.0 pp on avg is **3 runs**, all inside the `b>=2` stratum (21/27 vs
-18/27), with Wilson intervals overlapping across most of their range. The arm
-reads 0.520, nominally past the paper's 0.504 — **do not quote that as a pass**:
-the same-sweep control is 0.480 and the mechanism is flat. Correct statement:
-quality-neutral within resolution, mechanistically inert. This outcome was
-pre-registered before the rows landed (see the artifact; commit `bd311c642` at
-11/100 rows).
+18/27), with Wilson intervals overlapping across most of their range.
+**Always write it as "0.520 against a same-sweep control of 0.480" — one
+sentence, both halves.** A caveat on an adjacent line will eventually be dropped,
+and 0.520 alone reads as the penalty clearing the paper's 0.504, the inverse of
+the finding. Correct statement: quality-neutral within resolution,
+mechanistically inert. Pre-registered before the rows landed (commit
+`bd311c642`, at 11/100).
+
+**This is answered, not underpowered.** An underpowered result is one more data
+would resolve. Three independent channels came back flat — `share(b>=2)`
+identical at 27/50, budget exhaustion identical at 21/50, and the penalty
+failing its own stated mechanism. A powered mean sharpens an estimate; it cannot
+make a flat channel non-flat.
 
 **Correction to §11's reading, from `pr-split`'s `stop_reason` split.** I had
 inferred from charge-to-budget ratios that the `blocks<=1` population was ~14
@@ -434,13 +441,32 @@ proxy failed because the ledger's primary check is **positional**
 well below it — **15 of the 42 had charge ratios below 0.90, as low as 0.517**.
 The collapse is one phenomenon, budget exhaustion, not two.
 
-**Next lever, and it is cheap.** 42 of 46 stranded runs died of budget/positional
-exhaustion and the sampler does not touch that. §14's second suspect is now the
-leading explanation for the residual gap to 0.504: whether the paper's 30,000
-budget is ledger-charged x degree (as we replicate) or effectively per-sequence
-in their eval path — a ~3.5x difference in effective budget. Re-running one arm
-at a per-sequence-equivalent budget tests it for the cost of a single arm, and
-is a far better buy than the powered mean priced above.
+**Next experiment — one pod, two questions (proposed 2026-08-21, not started).**
+42 of 46 stranded runs died of budget/positional exhaustion and no sampler
+touches that, so §14's second suspect is now the leading explanation for the
+residual gap to 0.504.
+
+*Primary — the budget question.* NPR charges each branch token x its parallel
+degree against `max_new_tokens` (`schedule_batch.py:693-697`, replicated in the
+inferlet's ledger). At the observed mean of ~4.3 branches, a 30,000 *charged*
+budget leaves only ~7k *generated* tokens along the critical path, so if the
+paper's 30,000 is effectively **per-sequence** in their eval path rather than
+ledger-charged, their effective budget is **~3.5x ours** — which would explain
+the whole residual gap without any quality difference. Test: re-run one
+`adopt_nopen` arm at a per-sequence-equivalent budget and see whether the
+`blocks<=1` population survives. **One arm, ~1/4 the cost of a powered mean, and
+unlike the mean it can change the answer rather than measure it more precisely.**
+
+*Rider — `pr-split`'s bug-17 §7 instrumentation.* One patched build, one run,
+a pre-registered discriminating outcome either way; see `bug17/RUNBOOK.md`.
+
+**Both need a CUDA pod, so they should be one pod, not two.** That is cheaper
+than either alone and removes any reason to hold a pod open at the end of a
+sweep. `pod/resume.sh` makes a mid-run pod death cost ~45 min rather than the
+run, and `pod/gate.sh` plus the `runpod/pytorch` image default keep the hunt from
+repeating the sshd/MooseFS triage. A powered paired mean (§11 above, ~24 h,
+~$15-25) is **not** the recommended spend: the mechanism question is already
+answered, and the budget question is both cheaper and live.
 
 ## 12. Frontier for a cold agent (2026-08-20): validate repetition penalty 1.02
 

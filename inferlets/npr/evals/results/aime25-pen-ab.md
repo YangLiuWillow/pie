@@ -218,12 +218,22 @@ inside-noise move the method section said the mean could not resolve — it land
 in the predicted direction and remains unresolvable, which is why the mechanism
 was pre-registered as the deciding metric rather than the mean.
 
-So: **does the penalty close 0.460 -> 0.504?** The arm reads 0.520, nominally
-past the paper. That number should not be quoted as a pass. The control in the
-same sweep reads 0.480, the gap is 3 runs, and the channel that would have to
-carry a real improvement is provably flat. The honest statement is that the
-penalty is **quality-neutral within this sweep's resolution and mechanistically
-inert** on the collapse.
+So: **does the penalty close 0.460 -> 0.504?** No. The penalty arm reads
+**0.520 against a same-sweep control of 0.480** — that pairing is the number,
+and neither half should ever be quoted without the other in the same sentence,
+because 0.520 alone reads as the penalty clearing the paper, which is the
+inverse of the finding. The gap between them is 3 runs, and the channel that
+would have to carry a real improvement is provably flat. The honest statement is
+that the penalty is **quality-neutral within this sweep's resolution and
+mechanistically inert** on the collapse.
+
+**This is answered, not underpowered.** The distinction matters: an
+underpowered result is one where more data would resolve it. Here three
+independent channels came back flat — `share(b>=2)` identical at 27/50, budget
+exhaustion identical at 21/50, and the penalty failing its own stated mechanism
+by generating *more* tokens in the stranded stratum. A powered mean sharpens an
+estimate; it cannot make a flat channel non-flat. More runs would refine the
++4.0 pp and change nothing about the conclusion.
 
 ### Correction: the collapse has one cause, not two
 
