@@ -180,4 +180,78 @@ conclusion.
 
 ## Result
 
-Pending — sweep in flight. Numbers land here with the build sha and GPU.
+L40S (46,068 MiB, driver 570.124.06), build `cf204689a` (`lib.rs` blob-identical
+to the audited `a35a68ac9`), 100/100 rows, **zero engine errors**, 2026-08-21.
+
+| arm | n | avg@2 | pass@2 | unanswered | budget-exhausted | share b>=2 | acc \| b<=1 | acc \| b>=2 | gen tok |
+|---|---|---|---|---|---|---|---|---|---|
+| `adopt` (penalty 1.02) | 50 | **0.520** | 0.560 | 0.220 | 0.420 | **0.540** | 0.217 | 0.778 | 18,547 |
+| `adopt_nopen` (penalty 1.0) | 50 | **0.480** | 0.520 | 0.200 | 0.420 | **0.540** | 0.261 | 0.667 | 19,436 |
+| delta (pp) | | +4.0 | +4.0 | +2.0 | **+0.0** | **+0.0** | -4.3 | +11.1 | -889 |
+
+**Replication check first:** `adopt_nopen` is §11's configuration, and it
+reproduces §11's `adopt` at 0.460 with 0.480 — inside noise. The baseline holds,
+so the comparison below is against a control that behaves as expected.
+
+### Pre-registered prediction: outcome 2 — the share is flat
+
+The prediction required `share(b>=2)` to move 0.540 -> 0.597. It moved
+**0.540 -> 0.540**. Not "within noise of no change": the counts are *identical*,
+**27/50 in both arms**. So is budget exhaustion — **21/50 in both arms**. On the
+metric §15 says the penalty exists to move, the penalty did exactly nothing.
+
+Two further checks, both against the penalty:
+
+* **It did not shorten stranded branches.** §15's mechanism is that repetition
+  inflates branch length and burns the x-degree ledger. In the `blocks<=1`
+  stratum the penalty arm generated **25,926** mean tokens against the control's
+  **25,378** — slightly *more*, not less.
+* **The unanswered rate did not fall** (0.220 vs 0.200), and every unanswered run
+  in both arms is `branch_budget` — 11 and 10 respectively.
+
+### Where the +4.0 came from, and why it is not a result
+
+Entirely from `acc|b>=2`: 21/27 correct vs 18/27, **+3 runs**. Wilson intervals
+[0.59, 0.89] against [0.48, 0.81] overlap across most of their range. `acc|b<=1`
+moved the other way (5/23 vs 6/23). At n=50 this is exactly the ~3-run,
+inside-noise move the method section said the mean could not resolve — it landed
+in the predicted direction and remains unresolvable, which is why the mechanism
+was pre-registered as the deciding metric rather than the mean.
+
+So: **does the penalty close 0.460 -> 0.504?** The arm reads 0.520, nominally
+past the paper. That number should not be quoted as a pass. The control in the
+same sweep reads 0.480, the gap is 3 runs, and the channel that would have to
+carry a real improvement is provably flat. The honest statement is that the
+penalty is **quality-neutral within this sweep's resolution and mechanistically
+inert** on the collapse.
+
+### Correction: the collapse has one cause, not two
+
+The pre-sweep section above split the `blocks<=1` population into ~14 starved
+and ~9 killed by early branch EOS, inferred from charge-to-budget ratios on
+§11's rows. **The `stop_reason` split refutes that.** With real labels, of 46
+`blocks<=1` runs across both arms: **42 `branch_budget`, 3 `eos`, 1
+`branch_terminal`.**
+
+The proxy failed for a reason worth recording: the ledger's primary check is
+**positional**, not charge-based (`Ledger::position_exhausted`), so a run can
+exhaust its budget positionally while `tokens_charged` sits well below it.
+**15 of the 42 `branch_budget` runs had charge ratios under 0.90, as low as
+0.517** — every one of which my proxy would have called an early EOS. The
+conclusion moves accordingly: the collapse is *one* phenomenon, budget
+exhaustion, and the "9 early-EOS runs" were never there.
+
+This is `pr-split`'s `stop_reason` split (`a35a68ac9`) paying for itself
+immediately: it turned an inference that was wrong into a measurement, on the
+first sweep that carried it.
+
+### What this points at next
+
+The lever is not the sampler. **42 of 46 stranded runs died of budget/positional
+exhaustion**, unchanged by the penalty, and §14's second suspect — whether the
+paper's 30,000-token evaluation budget is ledger-charged x degree as we
+replicate it, or effectively per-sequence in their eval path — is now the
+leading explanation for the remaining gap to 0.504. That is a
+configuration question answerable far more cheaply than a powered A/B: re-run
+one arm at a per-sequence-equivalent budget and see whether the `blocks<=1`
+population survives.

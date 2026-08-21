@@ -398,10 +398,57 @@ moved — and that is what picks the next fix. The mechanism route is the better
 buy on information per dollar, not the consolation prize for an underpowered
 sweep.
 
+## 11b. Repetition-penalty A/B (2026-08-21, L40S, `results/aime25-pen-ab.jsonl`)
+
+AIME 2025, 25 problems x k=2 per arm, 30k budget, concurrency 8, prompt cache on,
+100/100 rows, **zero engine errors**. Build `cf204689a` (`lib.rs` blob-identical
+to `a35a68ac9`). Full writeup + method: `evals/results/aime25-pen-ab.md`.
+
+| arm | avg@2 | pass@2 | unans | bud | share b>=2 | acc\|b<=1 | acc\|b>=2 | gen tok |
+|---|---|---|---|---|---|---|---|---|
+| `adopt` (penalty 1.02) | 0.520 | 0.560 | 0.220 | 0.420 | 0.540 | 0.217 | 0.778 | 18.5k |
+| `adopt_nopen` (penalty 1.0) | 0.480 | 0.520 | 0.200 | 0.420 | 0.540 | 0.261 | 0.667 | 19.4k |
+
+**The penalty is not the lever.** `adopt_nopen` replicates §11's 0.460 at 0.480,
+so the control is sound. Against it the penalty leaves `share(b>=2)` at
+**exactly 27/50 in both arms** and budget exhaustion at **exactly 21/50 in both
+arms** — identical counts, not a noisy null, on precisely the metric DESIGN.md
+§15 says the penalty exists to move. It also did not shorten stranded branches
+(25,926 vs 25,378 mean generated tokens in the `blocks<=1` stratum — slightly
+*more*) and did not cut the unanswered rate (0.220 vs 0.200).
+
+The +4.0 pp on avg is **3 runs**, all inside the `b>=2` stratum (21/27 vs
+18/27), with Wilson intervals overlapping across most of their range. The arm
+reads 0.520, nominally past the paper's 0.504 — **do not quote that as a pass**:
+the same-sweep control is 0.480 and the mechanism is flat. Correct statement:
+quality-neutral within resolution, mechanistically inert. This outcome was
+pre-registered before the rows landed (see the artifact; commit `bd311c642` at
+11/100 rows).
+
+**Correction to §11's reading, from `pr-split`'s `stop_reason` split.** I had
+inferred from charge-to-budget ratios that the `blocks<=1` population was ~14
+starved and ~9 killed by early branch EOS. The labels refute it: of 46
+`blocks<=1` runs, **42 are `branch_budget`, 3 `eos`, 1 `branch_terminal`**. The
+proxy failed because the ledger's primary check is **positional**
+(`position_exhausted`), so a run exhausts budget while `tokens_charged` sits
+well below it — **15 of the 42 had charge ratios below 0.90, as low as 0.517**.
+The collapse is one phenomenon, budget exhaustion, not two.
+
+**Next lever, and it is cheap.** 42 of 46 stranded runs died of budget/positional
+exhaustion and the sampler does not touch that. §14's second suspect is now the
+leading explanation for the residual gap to 0.504: whether the paper's 30,000
+budget is ledger-charged x degree (as we replicate) or effectively per-sequence
+in their eval path — a ~3.5x difference in effective budget. Re-running one arm
+at a per-sequence-equivalent budget tests it for the cost of a single arm, and
+is a far better buy than the powered mean priced above.
+
 ## 12. Frontier for a cold agent (2026-08-20): validate repetition penalty 1.02
 
 Commit `e14082eb0` implemented NPR's last knob — per-`<step>` repetition
-penalty 1.02, engine-faithful (DESIGN.md §15): off until the first fork, then
+penalty 1.02, engine-faithful (DESIGN.md §15). **Both halves of this section are
+now done — see §11b: CUDA-validated (selftest `ids_match=true max_dev=0.000000
+max_logit=21.875`) and A/B'd (quality-neutral, mechanistically inert).** Original
+text follows. Off until the first fork, then
 on for every `<step>` child and the trunk after merge; HF semantics on **raw
 logits** (`l<0 → l·p`, `l>0 → l/p`), output tokens only. Raw logits come from a
 new `TopLogits { k }` probe (`sdk/rust/inferlet/src/sample.rs`) = the `dist`
