@@ -446,16 +446,37 @@ The collapse is one phenomenon, budget exhaustion, not two.
 touches that, so §14's second suspect is now the leading explanation for the
 residual gap to 0.504.
 
-*Primary — the budget question.* NPR charges each branch token x its parallel
-degree against `max_new_tokens` (`schedule_batch.py:693-697`, replicated in the
-inferlet's ledger). At the observed mean of ~4.3 branches, a 30,000 *charged*
-budget leaves only ~7k *generated* tokens along the critical path, so if the
-paper's 30,000 is effectively **per-sequence** in their eval path rather than
-ledger-charged, their effective budget is **~3.5x ours** — which would explain
-the whole residual gap without any quality difference. Test: re-run one
-`adopt_nopen` arm at a per-sequence-equivalent budget and see whether the
-`blocks<=1` population survives. **One arm, ~1/4 the cost of a powered mean, and
-unlike the mean it can change the answer rather than measure it more precisely.**
+*Primary — which budget cap actually binds.* **Correction to what this section
+said first, and to §14's arithmetic:** §14 framed the suspect as "our ledger
+charges x degree, the paper's may be per-sequence, so their effective budget is
+~3.5x ours". **That is no longer true of this code.** `Ledger::refund_join`
+gives back the `(degree-1)x` multiplier when a block closes, so the multiplier
+is only ever *transient, inside an open block*. Measured on all 100 rows of this
+sweep — including 54 multi-block runs averaging **5.2 branches** —
+`tokens_charged == tokens_generated` **exactly, in every single row**. The
+cumulative x-degree starvation §14 diagnosed (78% of runs unanswered) was fixed
+by that refund; do not re-derive it as if it were still live.
+
+So the live question is narrower and better: `decode_segment` breaks to
+`Stop::Budget` on **either** the engine-faithful **positional** cap
+(`position_exhausted`: `next_pos - prompt_end_pos + 128 >= budget`, metering the
+longest path through the parallel structure) **or** the transient **x-degree
+charge** against the ledger — and one label covers both. Given the refund, the
+positional cap is the likely binder for the 42 `branch_budget` runs, and the
+question worth a pod is whether our positional semantics match the reference's.
+
+**`tokens_charged` cannot answer this and never could.** It is the *post-refund*
+value, so the transient peak — the thing the charge cap actually tests — is
+never recorded. That is the real reason the charge-ratio proxy misclassified 15
+runs, and why the split below is the only way to recover the distinction.
+
+*Two label/instrumentation changes that must land BEFORE the next patched CUDA
+build, or they cost a second pod.* (a) `pr-split`'s split of `branch_budget`
+into `branch_budget_positional` / `branch_budget_charge` (trunk equivalents too,
+`budget_exhausted` staying true for both so nothing downstream shifts meaning);
+and (b) record the **high-water mark of the transient x-degree charge**, because
+with (a) alone you learn which cap fired but not how close the other one came —
+and the post-refund `tokens_charged` cannot tell you afterwards.
 
 *Rider — `pr-split`'s bug-17 §7 instrumentation.* One patched build, one run,
 a pre-registered discriminating outcome either way; see `bug17/RUNBOOK.md`.

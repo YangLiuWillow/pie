@@ -257,11 +257,25 @@ first sweep that carried it.
 
 ### What this points at next
 
-The lever is not the sampler. **42 of 46 stranded runs died of budget/positional
-exhaustion**, unchanged by the penalty, and §14's second suspect — whether the
-paper's 30,000-token evaluation budget is ledger-charged x degree as we
-replicate it, or effectively per-sequence in their eval path — is now the
-leading explanation for the remaining gap to 0.504. That is a
-configuration question answerable far more cheaply than a powered A/B: re-run
-one arm at a per-sequence-equivalent budget and see whether the `blocks<=1`
-population survives.
+The lever is not the sampler: **42 of 46 stranded runs died of budget exhaustion**,
+unchanged by the penalty.
+
+**But not for §14's reason, and that section should not be quoted as-is.** §14
+blamed cumulative x-degree ledger charging (~3.5x effective budget). Measured
+here on all 100 rows, including 54 multi-block runs averaging 5.2 branches,
+`tokens_charged == tokens_generated` **exactly in every row** —
+`Ledger::refund_join` gives the `(degree-1)x` multiplier back when a block
+closes, so the multiplier is only transient. That starvation was already fixed.
+
+The live question is which of the two caps inside `Stop::Budget` binds: the
+engine-faithful **positional** cap (`next_pos - prompt_end_pos + 128 >= budget`,
+metering the longest path through the parallel structure) or the transient
+**x-degree charge**. Given the refund, positional is the likely binder — and
+`tokens_charged` cannot settle it, because it is the *post-refund* value and the
+transient peak is never recorded. That is also the real reason the charge-ratio
+proxy above misclassified 15 runs.
+
+So the next experiment needs two cheap label/instrumentation changes in the tree
+*before* its build — splitting `branch_budget` by which cap fired, and recording
+the high-water mark of the transient charge — and then one arm on one pod. See
+HANDOVER §11b.
