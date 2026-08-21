@@ -43,9 +43,12 @@ the end and never boxed an answer from one that was cut off mid-thought:
 |---|---|---|
 | `eos` | the trunk hit chat-template end-of-turn | false |
 | `step_end` | the trunk closed a `</step>` at top level | false |
-| `budget` | the trunk ran out of global token budget | **true** |
+| `budget_positional` | the trunk hit the engine's **primary** positional cap | **true** |
+| `budget_charge` | the trunk hit the **secondary** ×degree charge cap | **true** |
 | `branch_terminal` | a branch hit end-of-turn inside a parallel block | false |
-| `branch_budget` | a branch ran out of global token budget | **true** |
+| `branch_budget_positional` | a branch hit the positional cap | **true** |
+| `branch_budget_charge` | a branch hit the ×degree charge cap | **true** |
+| `budget`, `branch_budget` | **pre-split**: budget exhaustion, cap unknown | **true** |
 | `branch_step_cap` | the `max_step_tokens` test hook capped a branch | false |
 | `step_cap` | the `max_step_tokens` test hook capped the trunk | false |
 
@@ -63,10 +66,10 @@ say otherwise: **42 of 46 stranded runs are `branch_budget`**, and the proxy
 misclassified 15 of them. The collapse is one phenomenon, not two. The reason the
 proxy failed is the subject of the next section.
 
-### Pending: `branch_budget` still covers two causes
+### The two budget caps, and why they are labelled separately
 
-**Pre-registered 2026-08-20, before the change is written and before the run that
-will read it.**
+**The prediction table below was pre-registered on 2026-08-20, before this change
+was written and before any run read it. It is left exactly as written.**
 
 `decode_segment` breaks to the same budget stop on either of two conditions:
 
@@ -87,7 +90,10 @@ ratios as low as 0.517** are (a) firing while (b) is nowhere near its cap — wh
 is also precisely why the charge-ratio proxy misread 15 runs. The planned split is
 `branch_budget_positional` / `branch_budget_charge` (and `budget_positional` /
 `budget_charge` for the trunk), with `budget_exhausted` staying **true** for all
-four so nothing downstream changes meaning.
+four so nothing downstream changes meaning. `score.py` reports a
+`budget exhaustion by cap:` line; rows written before this split count as
+`cause-unknown(pre-split)` there rather than being guessed at from charge ratios,
+which is the proxy this split exists to replace.
 
 **What each outcome will mean** — written down now so that a constant label is a
 result rather than a disappointment:

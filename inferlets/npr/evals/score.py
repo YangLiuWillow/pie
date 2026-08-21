@@ -60,7 +60,40 @@ def mean(xs):
 
 # Stop reasons that mean "ran out of global token budget" rather than "the
 # model stopped on its own". Mirrors `is_budget_stop` in src/lib.rs.
-BUDGET_STOPS = {"budget", "branch_budget"}
+#
+# `budget` / `branch_budget` are the pre-split labels: still unambiguously
+# budget exhaustion, but silent about WHICH cap bound. The `_positional` /
+# `_charge` pair separates the engine's primary positional check from the
+# secondary x-degree charge — they bind at different times (runs exhaust
+# positionally at charge ratios as low as 0.517), which is why a charge-ratio
+# proxy misread 15 of 46 stranded runs.
+BUDGET_STOPS = {
+    "budget",
+    "branch_budget",
+    "budget_positional",
+    "budget_charge",
+    "branch_budget_positional",
+    "branch_budget_charge",
+}
+
+# Which cap bound, for rows that say. None = the row predates the cause split.
+BUDGET_CAUSE = {
+    "budget_positional": "positional",
+    "branch_budget_positional": "positional",
+    "budget_charge": "charge",
+    "branch_budget_charge": "charge",
+}
+
+
+def budget_cause(r: dict) -> str | None:
+    """Which budget cap ended this run, or None if the row cannot say.
+
+    Returns None for pre-split rows (`budget` / `branch_budget`) as well as for
+    non-budget stops — the same refusal-to-guess as `budget_exhausted`. Do not
+    substitute a charge-ratio estimate here; that is the proxy this split exists
+    to replace.
+    """
+    return BUDGET_CAUSE.get(r.get("stop_reason") or "")
 
 
 def budget_exhausted(r: dict) -> bool | None:
@@ -128,6 +161,23 @@ def report(records: list[dict], by_problem: bool) -> None:
     # that reasoned to the end and never boxed an answer from one that was cut
     # off mid-thought; the stop_reason split is what separates them, and it is
     # the lever on the 20-26% unanswered rate the parallel arms carry.
+    # Which budget cap bound, across every run that says. Pre-registered in
+    # evals/README.md: a column that never varies is a result here, not a dud —
+    # "only positional" means the x-degree charge never binds in this workload.
+    causes = collections.Counter(
+        budget_cause(r) for r in records if not r.get("error") and budget_cause(r)
+    )
+    unknown = sum(
+        1
+        for r in records
+        if not r.get("error") and budget_exhausted(r) and not budget_cause(r)
+    )
+    if causes or unknown:
+        detail = "  ".join(f"{k}={v}" for k, v in causes.most_common())
+        if unknown:
+            detail += f"  cause-unknown(pre-split)={unknown}"
+        print(f"\nbudget exhaustion by cap: {detail}")
+
     print("\nunanswered runs (no \\boxed{}) by stop_reason")
     print(f"{'arm':<11} {'n':>4}  reasons")
     for arm in arms:

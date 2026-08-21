@@ -512,10 +512,18 @@ enum Stop {
     StepEnd,
     /// Chat-template end-of-turn.
     Eos,
-    /// Global token budget exhausted.
-    Budget,
-    /// Test hook `max_step_tokens` capped this segment. Kept distinct from
-    /// `Budget` so a smoke-test cap never reports as real exhaustion.
+    /// The engine's **primary** budget check tripped: the positional cap
+    /// (`right_most_pos - init_input_len >= max_new_tokens - 128`), which
+    /// meters the longest path through the parallel structure.
+    BudgetPositional,
+    /// The **secondary** budget check tripped: the ×degree charge against the
+    /// cumulative ledger. Kept distinct from `BudgetPositional` because the two
+    /// bind at different times — runs exhaust positionally at charge ratios as
+    /// low as 0.517, which is also why a charge-ratio proxy misclassified 15 of
+    /// 46 stranded runs. See `evals/README.md`, "Why a run stopped".
+    BudgetCharge,
+    /// Test hook `max_step_tokens` capped this segment. Kept distinct from the
+    /// budget stops so a smoke-test cap never reports as real exhaustion.
     StepCap,
 }
 
@@ -536,8 +544,10 @@ struct Segment {
 enum Terminal {
     /// Chat-template end-of-turn inside the branch.
     Eos,
-    /// The global token budget ran out mid-branch.
-    Budget,
+    /// The branch hit the engine's primary **positional** budget cap.
+    BudgetPositional,
+    /// The branch hit the secondary **×degree charge** cap.
+    BudgetCharge,
     /// The `max_step_tokens` test hook capped the branch.
     StepCap,
 }
@@ -545,11 +555,18 @@ enum Terminal {
 impl Terminal {
     /// Severity for the sibling fold: a block where any branch ran out of
     /// budget is a budget failure, whatever the other branches did.
+    /// Severity for the sibling fold. Both budget causes outrank a clean EOS or
+    /// a test-hook cap. Between them, positional outranks charge: it is the
+    /// engine's primary check and the one the evidence shows actually binds, so
+    /// reporting it is the less surprising default for a mixed block. The
+    /// per-branch causes stay visible in the trace regardless — this only picks
+    /// the block-level label.
     fn rank(self) -> u8 {
         match self {
             Terminal::Eos => 0,
             Terminal::StepCap => 1,
-            Terminal::Budget => 2,
+            Terminal::BudgetCharge => 2,
+            Terminal::BudgetPositional => 3,
         }
     }
 
@@ -566,7 +583,8 @@ impl Terminal {
     fn stop_reason(self) -> &'static str {
         match self {
             Terminal::Eos => "branch_terminal",
-            Terminal::Budget => "branch_budget",
+            Terminal::BudgetPositional => "branch_budget_positional",
+            Terminal::BudgetCharge => "branch_budget_charge",
             Terminal::StepCap => "branch_step_cap",
         }
     }
@@ -575,7 +593,10 @@ impl Terminal {
 /// True for the `stop_reason` labels that mean "ran out of global token
 /// budget" rather than "the model stopped on its own".
 fn is_budget_stop(stop_reason: &str) -> bool {
-    matches!(stop_reason, "budget" | "branch_budget")
+    matches!(
+        stop_reason,
+        "budget_positional" | "budget_charge" | "branch_budget_positional" | "branch_budget_charge"
+    )
 }
 
 /// splitmix64 — small deterministic RNG for the guest-side sampler.
@@ -706,10 +727,14 @@ async fn decode_segment(
         if token_cap.is_some_and(|cap| tokens.len() >= cap) {
             break Stop::StepCap;
         }
-        if sh.ledger.borrow().position_exhausted(cur_pos)
-            || degree_charge + 128 >= sh.ledger.borrow().budget
-        {
-            break Stop::Budget;
+        // Two distinct causes, reported separately: the positional cap is the
+        // engine's primary check, the ×degree charge its secondary one, and they
+        // bind at different times.
+        if sh.ledger.borrow().position_exhausted(cur_pos) {
+            break Stop::BudgetPositional;
+        }
+        if degree_charge + 128 >= sh.ledger.borrow().budget {
+            break Stop::BudgetCharge;
         }
         let token = if penalty_on {
             // Penalized path: probe top-K raw logits, sample guest-side
@@ -1129,9 +1154,10 @@ fn run_branch(
                         ForkOutcome::Sequential => {}
                     }
                 }
-                Stop::Eos | Stop::Budget | Stop::StepCap => {
+                Stop::Eos | Stop::BudgetPositional | Stop::BudgetCharge | Stop::StepCap => {
                     let cause = match segment.stop {
-                        Stop::Budget => Terminal::Budget,
+                        Stop::BudgetPositional => Terminal::BudgetPositional,
+                        Stop::BudgetCharge => Terminal::BudgetCharge,
                         Stop::StepCap => Terminal::StepCap,
                         _ => Terminal::Eos,
                     };
@@ -1675,8 +1701,12 @@ async fn main(input: Input) -> Result<String> {
                 stop_reason = "eos";
                 break;
             }
-            Stop::Budget => {
-                stop_reason = "budget";
+            Stop::BudgetPositional => {
+                stop_reason = "budget_positional";
+                break;
+            }
+            Stop::BudgetCharge => {
+                stop_reason = "budget_charge";
                 break;
             }
             // Only reachable if a future caller passes a top-level token cap;
