@@ -178,6 +178,34 @@ def report(records: list[dict], by_problem: bool) -> None:
             detail += f"  cause-unknown(pre-split)={unknown}"
         print(f"\nbudget exhaustion by cap: {detail}")
 
+    # How close the x-degree charge cap actually came. `tokens_charged` cannot
+    # answer this: `Ledger::refund_join` hands the (degree-1)x multiplier back
+    # when a block closes, so the reported value is POST-refund and the
+    # multiplied peak was never stored. `charge_peak` is the pre-refund
+    # high-water mark; headroom is `token_budget - charge_peak`, and the cap
+    # trips at headroom <= 128.
+    peaks = [
+        (r["token_budget"] - r["charge_peak"])
+        for r in records
+        if not r.get("error")
+        and r.get("charge_peak") is not None
+        and r.get("token_budget")
+    ]
+    if peaks:
+        peaks.sort()
+        print(
+            f"charge-cap headroom (token_budget - charge_peak): "
+            f"min={peaks[0]} p50={peaks[len(peaks) // 2]} max={peaks[-1]} "
+            f"n={len(peaks)}  (cap trips at <= 128)"
+        )
+    else:
+        n_old = sum(1 for r in records if not r.get("error"))
+        if n_old:
+            print(
+                "charge-cap headroom: unavailable — no row carries `charge_peak`. "
+                "Do not substitute `tokens_charged`; it is post-refund."
+            )
+
     print("\nunanswered runs (no \\boxed{}) by stop_reason")
     print(f"{'arm':<11} {'n':>4}  reasons")
     for arm in arms:

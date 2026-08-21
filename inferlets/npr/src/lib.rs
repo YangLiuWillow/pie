@@ -179,6 +179,17 @@ fn default_join_mode() -> String {
 struct Ledger {
     budget: usize,
     charged: usize,
+    /// High-water mark of `charged` **before any join refund**.
+    ///
+    /// `refund_join` gives back the `(degree-1)×` multiplier when a block
+    /// closes, so the multiplied charge exists only *transiently, inside an open
+    /// block* — and `charged` (hence the reported `tokens_charged`) is the
+    /// post-refund value. The transient peak was therefore never stored
+    /// anywhere and could not be recovered after the fact, which is why a proxy
+    /// reasoning from `tokens_charged` was reasoning from a number that had
+    /// already had the multiplier subtracted out of it. Recorded so the ×degree
+    /// cap's headroom is a measurement rather than an inference.
+    charge_peak: usize,
     /// Logical position right after the prompt — the engine's
     /// `init_input_len` in position space. Set once after the prompt fill.
     prompt_end_pos: u32,
@@ -330,6 +341,7 @@ impl Shared {
             }),
             ledger: RefCell::new(Ledger {
                 budget: input.max_new_tokens,
+                charge_peak: 0,
                 charged: 0,
                 prompt_end_pos: 0,
             }),
@@ -775,7 +787,12 @@ async fn decode_segment(
         tokens.push(token);
         bytes.extend_from_slice(sh.bytes_of(token));
         cur_pos += 1;
-        sh.ledger.borrow_mut().charged += degree;
+        {
+            let mut led = sh.ledger.borrow_mut();
+            led.charged += degree;
+            // Capture before any refund can take the multiplier back.
+            led.charge_peak = led.charge_peak.max(led.charged);
+        }
         sh.stats.borrow_mut().tokens_generated += 1;
         if bytes.ends_with(TAG_GUIDELINE_END) {
             break Stop::GuidelineEnd;
@@ -1754,6 +1771,10 @@ async fn main(input: Input) -> Result<String> {
         // `unanswered` column by cause without string-matching labels.
         "budget_exhausted": is_budget_stop(stop_reason),
         "tokens_charged": ledger.charged,
+        // Post-refund `tokens_charged` cannot show how close the ×degree cap
+        // came; `charge_peak` is the pre-refund high-water mark, so
+        // `token_budget - charge_peak` is the charge cap's actual headroom.
+        "charge_peak": ledger.charge_peak,
         "token_budget": ledger.budget,
         "elapsed_ms": start.elapsed().as_millis() as u64,
         "trajectory": trajectory,

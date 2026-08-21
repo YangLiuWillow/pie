@@ -85,9 +85,19 @@ max_new_tokens - 128`, metering the longest path through the parallel structure.
 `budget` / `branch_budget` and set `budget_exhausted: true`.
 
 This was deliberately *not* split when `branch_terminal` was, because there was no
-evidence the two behaved differently. There now is: runs exhausting at **charge
-ratios as low as 0.517** are (a) firing while (b) is nowhere near its cap — which
-is also precisely why the charge-ratio proxy misread 15 runs. The planned split is
+evidence the two behaved differently.
+
+> **Correction, same day, before any run used this.** An earlier revision of this
+> paragraph claimed that runs exhausting at **charge ratios as low as 0.517**
+> *are* (a) firing while (b) sits nowhere near its cap. **That does not follow.**
+> Those ratios are equally consistent with a charge peak that was refunded before
+> the row was written — see the `charge_peak` note below. They are a good reason
+> to *build* the discriminator; they are not evidence of its answer. The split is
+> the instrument, not a confirmation of something already believed. Left visible
+> rather than quietly rewritten, because the distinction between "motivates the
+> measurement" and "predicts its result" is the whole reason to pre-register one.
+
+The planned split is
 `branch_budget_positional` / `branch_budget_charge` (and `budget_positional` /
 `budget_charge` for the trunk), with `budget_exhausted` staying **true** for all
 four so nothing downstream changes meaning. `score.py` reports a
@@ -101,13 +111,39 @@ result rather than a disappointment:
 | observed | conclusion |
 |---|---|
 | both labels appear | both caps bind, at different times; per-arm counts say which dominates |
-| **only `*_positional`** | **the ×degree charge never binds in this workload** — a real answer to DESIGN.md §14, and *on the record rather than assumed*. The multiplied ledger is not what strands runs; the positional cap is, so a per-sequence budget interpretation would have to move the positional cap to change anything |
-| only `*_charge` | contradicts the 0.517 evidence — the positional check never fires and the charge-ratio inference was reading something else; the ledger needs re-examining before any budget conclusion stands |
+| **only `*_positional`** | **the ×degree charge never binds in this workload** — *on the record rather than assumed*. Read together with `charge_peak`: if headroom stayed large, the multiplied ledger is simply not a factor and the positional cap is the only thing stranding runs; if headroom came close, the two caps are in tension and the margin is worth knowing before any budget change |
+| only `*_charge` | the positional check never fires, and the reasoning that motivated this split was reading something else entirely; the ledger needs re-examining before any budget conclusion stands |
 | neither appears | the re-run eliminated budget exhaustion outright; the stranded population should vanish with it |
 
 A label whose value never varies is only wasted if nobody wrote down in advance
 that its constancy was informative. Same discipline as `over_device_capacity`
 in `BUG16-SCOPE.md` §7.1.
+
+### `charge_peak`, and why `tokens_charged` could not answer this
+
+`Ledger::refund_join` hands back the `(degree-1)×` multiplier when a parallel
+block closes, so the multiplied charge exists only **transiently, inside an open
+block**. `tokens_charged` in the result JSON is the **post-refund** value, and the
+transient peak was never stored anywhere — it could not be recovered after the
+fact by any amount of re-analysis.
+
+That is the real root of the misclassification above, and it is deeper than
+"positional versus charge": the proxy was not merely coarse, **the field it
+reasoned from had already had the multiplier subtracted out of it.**
+
+`charge_peak` records the pre-refund high-water mark, so
+`token_budget - charge_peak` is the ×degree cap's actual headroom (it trips at
+`<= 128`). `score.py` prints its min/median/max. With the label split alone you
+learn which cap fired; with `charge_peak` you also learn how close the other one
+came — which is the difference between one pod and two.
+
+**Note on framing:** this is *not* an investigation of §14's ×degree-versus-
+per-sequence budget question. That framing is dead — across all 100 rows of the
+penalty A/B, including 54 multi-block runs averaging 5.2 branches,
+`tokens_charged == tokens_generated` **exactly, every row**, so the cumulative
+×degree starvation §14 diagnosed was already fixed by that refund. The live
+question is narrower: **which of the two caps inside the budget stop actually
+binds**, and whether our positional semantics match the reference engine's.
 
 ## Methodology
 
