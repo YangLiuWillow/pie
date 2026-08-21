@@ -56,6 +56,53 @@ unanswered runs by `stop_reason`. Results recorded **before** the split score
 `bud = nan` and show `branch_terminal`: that label is ambiguous by construction
 and must not be read as "not starved".
 
+That split paid out on the first sweep that used it. The stranded (blocks≤1)
+population had been characterised from **charge ratios** as roughly two
+populations — some genuinely starved, some ending early on branch EOS. The labels
+say otherwise: **42 of 46 stranded runs are `branch_budget`**, and the proxy
+misclassified 15 of them. The collapse is one phenomenon, not two. The reason the
+proxy failed is the subject of the next section.
+
+### Pending: `branch_budget` still covers two causes
+
+**Pre-registered 2026-08-20, before the change is written and before the run that
+will read it.**
+
+`decode_segment` breaks to the same budget stop on either of two conditions:
+
+```rust
+if sh.ledger.borrow().position_exhausted(cur_pos)          // (a) positional cap
+    || degree_charge + 128 >= sh.ledger.borrow().budget    // (b) ×degree charge
+{ break Stop::Budget; }
+```
+
+(a) is the engine's **primary** check — `right_most_pos - init_input_len >=
+max_new_tokens - 128`, metering the longest path through the parallel structure.
+(b) is the ×degree charge against the cumulative ledger. Today both emit
+`budget` / `branch_budget` and set `budget_exhausted: true`.
+
+This was deliberately *not* split when `branch_terminal` was, because there was no
+evidence the two behaved differently. There now is: runs exhausting at **charge
+ratios as low as 0.517** are (a) firing while (b) is nowhere near its cap — which
+is also precisely why the charge-ratio proxy misread 15 runs. The planned split is
+`branch_budget_positional` / `branch_budget_charge` (and `budget_positional` /
+`budget_charge` for the trunk), with `budget_exhausted` staying **true** for all
+four so nothing downstream changes meaning.
+
+**What each outcome will mean** — written down now so that a constant label is a
+result rather than a disappointment:
+
+| observed | conclusion |
+|---|---|
+| both labels appear | both caps bind, at different times; per-arm counts say which dominates |
+| **only `*_positional`** | **the ×degree charge never binds in this workload** — a real answer to DESIGN.md §14, and *on the record rather than assumed*. The multiplied ledger is not what strands runs; the positional cap is, so a per-sequence budget interpretation would have to move the positional cap to change anything |
+| only `*_charge` | contradicts the 0.517 evidence — the positional check never fires and the charge-ratio inference was reading something else; the ledger needs re-examining before any budget conclusion stands |
+| neither appears | the re-run eliminated budget exhaustion outright; the stranded population should vanish with it |
+
+A label whose value never varies is only wasted if nobody wrote down in advance
+that its constancy was informative. Same discipline as `over_device_capacity`
+in `BUG16-SCOPE.md` §7.1.
+
 ## Methodology
 
 **Accuracy and speed need different runs.** `elapsed_ms` is per-run wall clock;
