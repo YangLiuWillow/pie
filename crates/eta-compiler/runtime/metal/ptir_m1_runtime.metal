@@ -1316,6 +1316,128 @@ inline void ptir_m1_execute(
                        o1, temporary, 0u, 1u);
 }
 
+// `m1_sort_better` as a fold: the better of two candidates, an absent one
+// losing to any present one. A strict total order, so a tree over any
+// partition lands on the same element the serial scan does.
+inline M1ArgmaxCandidate m1_sort_pick(M1ArgmaxCandidate left, M1ArgmaxCandidate right) {
+  if (right.have == 0u) return left;
+  if (left.have == 0u) return right;
+  return m1_sort_better(right.value, right.index, left.value, left.index) ? right : left;
+}
+
+// The descending-mass selection of `0x58` / `pred_tag == 1`, across a
+// threadgroup. Each pick is the best remaining element under
+// `m1_sort_better` — a strict total order, so the threadgroup's tree lands on
+// the element the serial scan lands on, and the keep bits and the running
+// mass come out bit-identical. The serial form visited the whole row once per
+// pick on one thread: at 171 picks over a 248,320-wide row that was 42M
+// dependent loads, most of a program's twelve seconds. Every thread runs every
+// iteration: the loop bounds are uniform, and the barriers inside are reached
+// by all of them.
+inline void m1_nucleus_select_mt(
+    const device uchar* a0,
+    const device uchar* a1,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  for (uint row = 0; row < d0.rows; ++row) {
+    const uint base = row * d0.last;
+    const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+    for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
+    threadgroup_barrier(mem_flags::mem_device);
+    float exclusive = 0.0f;
+    float prev_value = 0.0f;
+    uint prev_index = 0;
+    bool have_prev = false;
+    for (uint position = 0; position < d0.last && exclusive < threshold; ++position) {
+      M1ArgmaxCandidate best = {0.0f, 0u, 0u, 0u};
+      for (uint candidate = tid; candidate < d0.last; candidate += nthreads) {
+        const float value = m1_load_f(a0, base + candidate, d0.dtype);
+        if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate)) continue;
+        best = m1_sort_pick(best, M1ArgmaxCandidate{value, candidate, 1u, 0u});
+      }
+      tgbuf[tid] = best;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+        if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+          tgbuf[tid] = m1_sort_pick(tgbuf[tid], tgbuf[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const M1ArgmaxCandidate found = tgbuf[0];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (found.have == 0u) break;
+      if (tid == 0) m1_store_b(o0, base + found.index, exclusive < threshold);
+      exclusive += found.value;
+      prev_value = found.value;
+      prev_index = found.index;
+      have_prev = true;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+}
+
+// The radix top-k of `0x58` / `pred_tag == 0`, across a threadgroup: the
+// same four 8-bit passes over `m1_desc_key`, with the histogram built by
+// every thread through threadgroup atomics and the bucket scan repeated by
+// every thread (a uniform 256-step loop, cheaper than publishing one result).
+// Counts do not depend on visit order, so `prefix` and the keep bits are the
+// serial form's exactly. The histogram borrows the argmax buffer's storage.
+inline void m1_topk_select_mt(
+    const device uchar* a0,
+    const device uchar* a1,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  threadgroup atomic_uint* histogram = reinterpret_cast<threadgroup atomic_uint*>(tgbuf);
+  for (uint row = 0; row < d0.rows; ++row) {
+    const uint base = row * d0.last;
+    const int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
+    uint k = signed_k <= 0 ? 0u : uint(signed_k);
+    if (k > d0.last) k = d0.last;
+    if (k == 0u) {
+      for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
+      continue;
+    }
+    uint prefix = 0u;
+    uint target = k;
+    for (int pass = 0; pass < 4; ++pass) {
+      const int shift = 24 - 8 * pass;
+      const uint high_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+      for (uint bucket = tid; bucket < 256u; bucket += nthreads)
+        atomic_store_explicit(histogram + bucket, 0u, memory_order_relaxed);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint j = tid; j < d0.last; j += nthreads) {
+        const uint key = m1_desc_key(m1_load_f(a0, base + j, d0.dtype));
+        if ((key & high_mask) == (prefix & high_mask))
+          atomic_fetch_add_explicit(histogram + ((key >> shift) & 0xFFu), 1u,
+                                    memory_order_relaxed);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      uint run = 0u;
+      uint chosen = 255u;
+      for (uint bucket = 0u; bucket < 256u; ++bucket) {
+        const uint count = atomic_load_explicit(histogram + bucket, memory_order_relaxed);
+        if (run + count >= target) { chosen = bucket; break; }
+        run += count;
+      }
+      target -= run;
+      prefix |= chosen << shift;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = tid; i < d0.last; i += nthreads) {
+      const float value = m1_load_f(a0, base + i, d0.dtype);
+      m1_store_b(o0, base + i, !isnan(value) && m1_desc_key(value) <= prefix);
+    }
+  }
+}
+
 // The grouped region hands a lane a whole threadgroup. Every op whose
 // elements are independent is partitioned across it by `ptir_m1_execute_part`;
 // the two fixed-tree reductions are partitioned by a walk that reproduces the
@@ -1344,6 +1466,14 @@ inline void ptir_m1_execute_mt(
 
   if (p.tag == 0x33) {  // argmax: order-independent, so partition it
     m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
+    return;
+  }
+  if (p.tag == 0x58 && nthreads > 1u && p.pred_tag != 2) {
+    // The two selections that walk a row with state: their picks are
+    // total-order maxima and their counts are order-free, so both partition.
+    const M1ValueDesc d1 = descriptors[p.a1];
+    if (p.pred_tag == 0) m1_topk_select_mt(a0, a1, o0, d0, d1, tid, nthreads, tgbuf);
+    else m1_nucleus_select_mt(a0, a1, o0, d0, d1, tid, nthreads, tgbuf);
     return;
   }
   ptir_m1_execute_part(generated_tag, status, descriptors, params, a0, a1, a2, o0,
