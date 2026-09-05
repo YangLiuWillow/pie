@@ -4,7 +4,7 @@
 // one comparison over the vocabulary, then a Gumbel-max draw over the masked
 // logits.
 
-import { eta, model } from '@pie-project/inferlet';
+import { chat, eta, model } from '@pie-project/inferlet';
 
 const {
   Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, broadcast, cast, channelCapacity, constant, dtype, ge, gumbelMax,
@@ -50,7 +50,9 @@ export function main(input) {
   const pageSize = kvPageSize();
   if (maxTokens === 0) return { sampler: 'top-a', text: '', count: 0, a, mean_kept: 0, min_kept: 0, mean_mass: 0 };
 
-  let prompt = [...model.encode(promptText)];
+  // The model's opening (`<bos>` where it has one) before the raw text: a
+  // gemma without it answers noise.
+  let prompt = [...chat.prefix(), ...model.encode(promptText)];
   if (prompt.length === 0) prompt = [0];
   const n = prompt.length;
   const maxPages = Math.max(divCeil(n + maxTokens + 1, pageSize), 1);

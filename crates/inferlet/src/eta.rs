@@ -1365,12 +1365,25 @@ pub fn max_embed_length() -> usize {
     MAX_EMBED.with(|c| *c.get_or_init(|| crate::model::max_embed_length().max(1) as usize))
 }
 
+/// The prefill chunk the scheduler would like right now, in tokens: the
+/// forward token budget shared among the live processes, in whole KV pages
+/// (`model.prefill-chunk-hint`). Read per call — it moves as processes come
+/// and go. A hint: the runtime never splits a fire, and a program is free to
+/// chunk differently.
+pub fn prefill_chunk_hint() -> usize {
+    (crate::model::prefill_chunk_hint().max(1) as usize).min(max_embed_length())
+}
+
 /// The `[start, end)` spans a prompt of `n` tokens must be prefilled in,
-/// respecting [`max_embed_length`]. `cap` overrides the limit, `None` for default.
+/// respecting [`max_embed_length`]. `cap` overrides the limit; `None` takes
+/// [`prefill_chunk_hint`], so a prompt prefilled beside other live processes
+/// is cut into chunks that leave the step room for their decodes, and a
+/// prompt prefilled alone takes the whole budget.
 pub fn prefill_chunks(n: u32, cap: Option<u32>) -> Vec<(u32, u32)> {
     let cap = cap
-        .unwrap_or(u32::MAX)
-        .min(max_embed_length().max(1) as u32);
+        .unwrap_or_else(|| prefill_chunk_hint() as u32)
+        .min(max_embed_length().max(1) as u32)
+        .max(1);
     even_spans(n, cap)
 }
 
@@ -1427,9 +1440,21 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
-    // A pass that binds a dense device mask takes one slot per frame — see
-    // `Pass::binds_device_mask`.
-    let r = if pass.binds_device_mask() { 1 } else { frame_size() };
+    // Live slots per frame. A pass that binds a dense device mask takes one
+    // (see `Pass::binds_device_mask`). So does a pass on a recurrent or
+    // hybrid model: the frame's waves then carry the same sequence's state
+    // one into the next, and a frame of one live slot measured faster than a
+    // full one on Qwen3.5-0.8B at 16 lanes (627 vs 598 tok/s, the two shapes
+    // alternated over five passes on one binary) — the same fires stay in
+    // flight, spread over twice the frames. A dense attention pass fills the
+    // frame.
+    let r = if pass.binds_device_mask()
+        || crate::model::pass_kind() != crate::model::ForwardKind::Attention
+    {
+        1
+    } else {
+        frame_size()
+    };
     // THE WINDOW IS THE RUNTIME'S NUMBER, NOT RECOVERED FROM THE RING. The
     // runtime derives the ring size and the window from one source and
     // publishes both; a guest that re-derived one from the other believed a
@@ -1537,7 +1562,8 @@ impl Default for Pipeline {
 pub mod shared_prelude {
     pub use super::{
         Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length, prefill_chunks,
+        WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length,
+        prefill_chunk_hint, prefill_chunks,
     };
     /// Every inferlet returns `inferlet::Result` and uses `model`, so both ride the prelude.
     pub use crate::{Context, Result, model};

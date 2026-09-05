@@ -19,10 +19,13 @@ import pytest
 
 from inferlet.eta import intrinsics
 from inferlet.eta.builder import Builder, DslChannel
-from inferlet.eta.ir import Dtype, Port, Stage, dtype, fnv1a64
+from inferlet.eta.ir import Dtype, Port, Stage, dtype, fnv1a64, shape_of
 from inferlet.eta.value import (
+    ConstData,
+    pack_elems,
     Tensor,
     abs_,
+    broadcast,
     and_,
     cast,
     causal_mask,
@@ -500,3 +503,79 @@ def test_diffusion_step_matches_rust():
     for c in (canvas_out, argmax_out, stop, mean_out, tap_ids_out, tap_weights_out):
         c.note_host_take()
     check("diffusion_step", b.build())
+
+
+def test_beam_step_matches_rust():
+    """`sdk_goldens.rs::beam_step` — beam-search's epilogue: the `mask` port,
+    `from_shaped`, `capacity`, `top_k` / `gather` / `or_` over `[B, V]`."""
+    B = 2
+    pool_pages = 8
+    page_t = PAGE
+    pool_len = pool_pages * page_t
+    v = VOCAB
+    pool_ids = list(range(pool_pages))
+    tiled = [pool_ids[0]] * (B * pool_pages)
+    init_mask = [p == 0 for _ in range(B) for p in range(pool_len)]
+    mask = DslChannel.from_const(ConstData(shape_of([B, pool_len]), Dtype.BOOL, pack_elems(init_mask, Dtype.BOOL))).named("mask")
+    scores = ch_from([0.0, float("-inf")], dtype.f32, "scores")
+    toks = ch_from([1] * B, dtype.i32, "toks")
+    pos = ch_from([0] * B, dtype.u32, "pos")
+    fill = ch_from([1], dtype.u32, "fill")
+    klen = ch_from([1] * B, dtype.u32, "klen")
+    w_slot = ch_from([pool_ids[0]] * B, dtype.u32, "w_slot")
+    w_off = ch_from([0] * B, dtype.u32, "w_off")
+    pages = ch_from(tiled, dtype.u32, "pages")
+    page_indptr = ch_from(range(B + 1), dtype.u32, "page_indptr")
+    lanes_b = ch_from(range(B + 1), dtype.u32, "embed_indptr")
+    pool_ids_ch = ch_from(pool_ids, dtype.u32, "pool_ids")
+    out = ch_new([B], dtype.i32, "out").capacity(8)
+    out_par = ch_new([B], dtype.u32, "out_par").capacity(8)
+    out_scr = ch_new([B], dtype.f32, "out_scr").capacity(8)
+    out_greedy = ch_new([B], dtype.i32, "out_greedy").capacity(8)
+
+    b = Builder(VOCAB, PAGE)
+    for port, c in [
+        (Port.KV_LEN, klen), (Port.PAGES, pages), (Port.PAGE_INDPTR, page_indptr), (Port.W_SLOT, w_slot),
+        (Port.W_OFF, w_off), (Port.POSITIONS, pos), (Port.ATTN_MASK, mask),
+        (Port.EMBED_TOKENS, toks), (Port.EMBED_INDPTR, lanes_b),
+    ]:
+        b.bind_port(port, c)
+
+    def epilogue():
+        logits = reshape(intrinsics.logits(), [B, v])
+        cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(logits)
+        s, i = top_k(reshape(cand, [B * v]), B)
+        parent = i // v
+        tok_i = cast(i % v, dtype.i32)
+        base = fill.take()
+        lane = iota(B)
+        base_b = broadcast(reshape(base, [1]), [B])
+        wpos = base_b + lane
+        inherited = gather(mask.take(), parent)
+        col = broadcast(reshape(iota(pool_len), [1, pool_len]), [B, pool_len])
+        wpos_b = broadcast(reshape(wpos, [B, 1]), [B, pool_len])
+        newpos = eq(col, wpos_b)
+        mask.put_tensor(or_(inherited, newpos))
+        pids = pool_ids_ch.take()
+        logical_slot = wpos // page_t
+        w_slot_v = gather(pids, logical_slot)
+        w_off_v = wpos % page_t
+        w_slot.put_tensor(w_slot_v)
+        w_off.put_tensor(w_off_v)
+        filled = base + B
+        klen.put_tensor(broadcast(reshape(filled, [1]), [B]))
+        pos.put_tensor(pos.take() + 1)
+        fill.put_tensor(filled)
+        scores.put_tensor(s)
+        toks.put_tensor(tok_i)
+        page_count = filled.div_ceil(page_t)
+        pages.put_tensor(gather(pids, iota(B * pool_pages) % broadcast(page_count, [B * pool_pages])))
+        page_indptr.put_tensor(iota(B + 1) * broadcast(page_count, [B + 1]))
+        out.put_tensor(tok_i)
+        out_par.put_tensor(parent)
+        out_scr.put_tensor(s)
+        out_greedy.put_tensor(reshape(reduce_argmax(logits), [B]))
+        pool_ids_ch.put_tensor(pids)
+
+    b.stage(Stage.EPILOGUE, epilogue)
+    check("beam_step", b.build())

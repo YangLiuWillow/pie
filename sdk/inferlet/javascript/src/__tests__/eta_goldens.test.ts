@@ -15,12 +15,14 @@ import { describe, expect, it } from 'vitest';
 import { Builder, DslChannel, Traced } from '../eta/builder.js';
 import * as intrinsics from '../eta/intrinsics.js';
 import { entropyBoundAccept, stableAndConfident } from '../eta/diffusion.js';
-import { Dtype, Port, Stage, dtype, fnv1a64 } from '../eta/ir.js';
+import { Dtype, Port, Stage, dtype, fnv1a64, shapeOf } from '../eta/ir.js';
 import { TraceError } from '../eta/trace.js';
 import {
+  ConstData,
   Tensor,
   abs,
   and,
+  broadcast,
   cast,
   causalMask,
   constData,
@@ -53,6 +55,7 @@ import {
   not,
   nucleusSample,
   or,
+  packElems,
   pivotThreshold,
   probGe,
   rankLe,
@@ -463,5 +466,79 @@ describe('diffusion golden', () => {
     });
     for (const c of [canvasOut, argmaxOut, stop, meanOut, tapIdsOut, tapWeightsOut]) c.noteHostTake();
     check('diffusion_step', b.build());
+  });
+});
+
+describe('beam golden', () => {
+  it('beam_step matches sdk_goldens.rs', () => {
+    const B = 2;
+    const poolPages = 8;
+    const pageT = PAGE;
+    const poolLen = poolPages * pageT;
+    const v = VOCAB;
+    const poolIds = range(poolPages);
+    const tiled = new Array(B * poolPages).fill(poolIds[0]);
+    const initMask: boolean[] = [];
+    for (let b = 0; b < B; b++) for (let p = 0; p < poolLen; p++) initMask.push(p === 0);
+    const mask = DslChannel.fromConst(new ConstData(shapeOf([B, poolLen]), Dtype.BOOL, packElems(initMask, Dtype.BOOL))).named('mask');
+    const scores = chFrom([0.0, -Infinity], dtype.f32, 'scores');
+    const toks = chFrom(new Array(B).fill(1), dtype.i32, 'toks');
+    const pos = chFrom(new Array(B).fill(0), dtype.u32, 'pos');
+    const fill = chFrom([1], dtype.u32, 'fill');
+    const klen = chFrom(new Array(B).fill(1), dtype.u32, 'klen');
+    const wSlot = chFrom(new Array(B).fill(poolIds[0]), dtype.u32, 'w_slot');
+    const wOff = chFrom(new Array(B).fill(0), dtype.u32, 'w_off');
+    const pages = chFrom(tiled, dtype.u32, 'pages');
+    const pageIndptr = chFrom(range(B + 1), dtype.u32, 'page_indptr');
+    const lanesB = chFrom(range(B + 1), dtype.u32, 'embed_indptr');
+    const poolIdsCh = chFrom(poolIds, dtype.u32, 'pool_ids');
+    const out = chNew([B], dtype.i32, 'out').capacity(8);
+    const outPar = chNew([B], dtype.u32, 'out_par').capacity(8);
+    const outScr = chNew([B], dtype.f32, 'out_scr').capacity(8);
+    const outGreedy = chNew([B], dtype.i32, 'out_greedy').capacity(8);
+
+    const b = new Builder(VOCAB, PAGE);
+    bindGeometry(b, [
+      [Port.KV_LEN, klen], [Port.PAGES, pages], [Port.PAGE_INDPTR, pageIndptr], [Port.W_SLOT, wSlot],
+      [Port.W_OFF, wOff], [Port.POSITIONS, pos], [Port.ATTN_MASK, mask],
+      [Port.EMBED_TOKENS, toks], [Port.EMBED_INDPTR, lanesB],
+    ]);
+    b.stage(Stage.EPILOGUE, () => {
+      const logits = reshape(intrinsics.logits(), [B, v]);
+      const cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]).add(logSoftmax(logits));
+      const [s, i] = topK(reshape(cand, [B * v]), B);
+      const parent = i.div(v);
+      const tokI = cast(i.rem(v), dtype.i32);
+      const base = fill.take();
+      const lane = iota(B);
+      const baseB = broadcast(reshape(base, [1]), [B]);
+      const wpos = baseB.add(lane);
+      const inherited = gather(mask.take(), parent);
+      const col = broadcast(reshape(iota(poolLen), [1, poolLen]), [B, poolLen]);
+      const wposB = broadcast(reshape(wpos, [B, 1]), [B, poolLen]);
+      const newpos = eq(col, wposB);
+      mask.putTensor(or(inherited, newpos));
+      const pids = poolIdsCh.take();
+      const logicalSlot = wpos.div(pageT);
+      const wSlotV = gather(pids, logicalSlot);
+      const wOffV = wpos.rem(pageT);
+      wSlot.putTensor(wSlotV);
+      wOff.putTensor(wOffV);
+      const filled = base.add(B);
+      klen.putTensor(broadcast(reshape(filled, [1]), [B]));
+      pos.putTensor(pos.take().add(1));
+      fill.putTensor(filled);
+      scores.putTensor(s);
+      toks.putTensor(tokI);
+      const pageCount = filled.divCeil(pageT);
+      pages.putTensor(gather(pids, iota(B * poolPages).rem(broadcast(pageCount, [B * poolPages]))));
+      pageIndptr.putTensor(iota(B + 1).mul(broadcast(pageCount, [B + 1])));
+      out.putTensor(tokI);
+      outPar.putTensor(parent);
+      outScr.putTensor(s);
+      outGreedy.putTensor(reshape(reduceArgmax(logits), [B]));
+      poolIdsCh.putTensor(pids);
+    });
+    check('beam_step', b.build());
   });
 });
