@@ -71,6 +71,9 @@ async def bench(client, label: str, iid: str, n: int, args: dict, timeout: float
         f"{label:26s} n={n:3d}  ok={len(ok):3d}/{n:<3d} wall={wall:7.2f}s  tok/s={toks / wall:8.1f}  "
         f"lat p50={p50:6.2f}s p99={p99:6.2f}s  per-req tok/s={per_req:6.1f}"
     )
+    if errs:
+        # The first failure's text, once: a run that lost lanes should say why.
+        print(f"{'':26s} first error ({len(errs)} failed): {type(errs[0]).__name__}: {str(errs[0])[:300]}")
     for e in errs[:2]:
         print("   error:", str(e)[:300])
     return {"program": label, "n": n, "ok": len(ok), "wall": wall, "tokens": toks, "p50": p50, "p99": p99}
