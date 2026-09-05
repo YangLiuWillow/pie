@@ -34,7 +34,7 @@ struct Synthetic {
     /// Which real slot lends its page arithmetic.
     slot: u32,
     /// This lane's kv pages, packed from the front of the pool (see
-    /// [`Shell::synthetic_lanes_with`]); empty means the slot's own block.
+    /// [`Shell::synthetic_lanes_with`]).
     pages: Vec<u32>,
     /// [`Seated::held`]. `Some(0)` for every enumerated lane; only
     /// [`Shell::golden_real`] writes anything else.
@@ -525,14 +525,6 @@ impl Shell {
         // wide decode body and left those steps walking eagerly. A tabled
         // lane demands one past its highest page, so the whole synthetic
         // asks only for the pages its rows actually fill.
-        // `PIE_ARM_PACKED=1` turns the packed tables on. Off, every lane
-        // keeps its slot's block. Packed is the right sizing, and stays a
-        // diagnostic arm only because the wide mixed bodies it newly arms —
-        // `b512[c{0,2,3,5}:512 + c{1,4}:64]` and the mask+adapter
-        // three-class keys on gemma-4-E4B — fail the golden (their replay
-        // differs from the eager walk at every readout cell), and a load
-        // with the golden on would then refuse to boot.
-        let packed = std::env::var_os("PIE_ARM_PACKED").is_some();
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
@@ -560,9 +552,7 @@ impl Shell {
                 // Real slots, round-robin: the page arithmetic needs a slot
                 // that exists.
                 slot: (at as u32) % slots,
-                pages: if !packed {
-                    Vec::new()
-                } else {
+                pages: {
                     let pages = u64::from(rows).div_ceil(page_size).max(1);
                     let table: Vec<u32> = (next_page..next_page + pages)
                         .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
