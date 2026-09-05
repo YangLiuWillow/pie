@@ -17,7 +17,8 @@ use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
-use super::compile::{Form, Region};
+use super::compile::{Form, Region, StreamedStep};
+use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels, reduce_levels};
 use super::shared::SharedRing;
 
 /// The buffer index the first channel's committed cell binds at, below
@@ -648,6 +649,181 @@ pub struct Prepared {
     descriptor_bytes: Vec<u8>,
     param_bytes: Vec<u8>,
     offset_bytes: Vec<u8>,
+    /// The resolved value descriptors, for sizing a streamed region's grids.
+    descriptor_table: Vec<ValueDesc>,
+}
+
+/// `M4Step` — the streamed kernel's per-dispatch word, bound at 11 with
+/// `setBytes`. Spelled here and in `eta_compiler::codegen::metal::streamed`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+struct StepWord {
+    /// The op (`case`) this dispatch runs.
+    index: u32,
+    /// A reduction's level, or 0 / 1 for an argmax's partial / final pass.
+    level: u32,
+    /// How many groups the argmax's partial pass had, for its final pass.
+    groups: u32,
+    reserved: u32,
+}
+
+/// `PIE_SCRATCH_NO_ZERO=1`: skip the host memset of a fire's scratch, to
+/// measure what the host's touch of those pages costs the device.
+fn scratch_zeroing_skipped() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("PIE_SCRATCH_NO_ZERO").is_some_and(|v| v != "0"))
+}
+
+/// The streamed form's measurement knobs, read once. `PIE_STREAMED_GROUPS=n`
+/// caps the blocks a wide dispatch spreads over; `PIE_STREAMED_REPEAT=n`
+/// issues each wide dispatch n times (or each dispatch of the kind
+/// `PIE_STREAMED_REPEAT_KIND=wide|single|reduce|argmax`) — all are
+/// idempotent, so this prices a dispatch; `PIE_STREAMED_LIMIT=k` runs only
+/// the first k steps, which breaks the program and times what ran.
+#[derive(Clone, Copy, Debug)]
+struct StreamedKnobs {
+    max_groups: u32,
+    repeat: usize,
+    repeat_kind: Option<StepKind>,
+    limit: usize,
+}
+
+fn streamed_knobs() -> StreamedKnobs {
+    static KNOBS: std::sync::OnceLock<StreamedKnobs> = std::sync::OnceLock::new();
+    *KNOBS.get_or_init(|| StreamedKnobs {
+        max_groups: std::env::var("PIE_STREAMED_GROUPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(STREAMED_MAX_GROUPS),
+        repeat: std::env::var("PIE_STREAMED_REPEAT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1),
+        repeat_kind: match std::env::var("PIE_STREAMED_REPEAT_KIND").ok().as_deref() {
+            Some("wide") => Some(StepKind::Wide),
+            Some("single") => Some(StepKind::Single),
+            Some("reduce") => Some(StepKind::Reduce),
+            Some("argmax") => Some(StepKind::Argmax),
+            _ => None,
+        },
+        limit: std::env::var("PIE_STREAMED_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX),
+    })
+}
+
+/// Most element blocks one streamed dispatch spreads over: enough to fill
+/// the device, few enough that a partial table stays small.
+const STREAMED_MAX_GROUPS: u32 = 1024;
+
+/// The dispatches a streamed region's step table unfolds into for these
+/// descriptors: `(word, groups along x)`. A `Wide` step is one dispatch over
+/// its result's length; `Single` one group; `Reduce` one per tree level, each
+/// over that level's chunks; `Argmax` a partial pass over the row and a final
+/// pass over the partials.
+fn streamed_dispatches(
+    steps: &[StreamedStep],
+    descriptors: &[ValueDesc],
+    threads: u32,
+    temporary_bytes: u64,
+) -> Vec<(StepWord, u32)> {
+    let threads = threads.max(1);
+    let knobs = streamed_knobs();
+    let groups_for = |work: u32| -> u32 { work.div_ceil(threads).clamp(1, knobs.max_groups) };
+    let mut out = Vec::with_capacity(steps.len());
+    let repeats = |kind: StepKind| -> usize {
+        match knobs.repeat_kind {
+            Some(k) if k == kind => knobs.repeat,
+            Some(_) => 1,
+            None if kind == StepKind::Wide => knobs.repeat,
+            None => 1,
+        }
+    };
+    for step in steps.iter().take(knobs.limit) {
+        let word = StepWord {
+            index: step.node,
+            ..StepWord::default()
+        };
+        match step.kind {
+            StepKind::Wide => {
+                let len = descriptors
+                    .get(step.result as usize)
+                    .map_or(1, |desc| desc.len);
+                for _ in 0..repeats(StepKind::Wide) {
+                    out.push((word, groups_for(len)));
+                }
+            }
+            StepKind::Single => {
+                for _ in 0..repeats(StepKind::Single) {
+                    out.push((word, 1));
+                }
+            }
+            StepKind::Reduce => {
+                let desc = descriptors.get(step.input as usize).copied().unwrap_or_default();
+                // A dispatch folds level `l` (and `l + 1` inside the
+                // threadgroup); its groups cover level `l`'s chunks, one chunk
+                // per thread, per row.
+                let mut count = desc.last;
+                let mut at = 0u32;
+                // The runtime folds a second level in the threadgroup only when
+                // the width is a multiple of 32; otherwise every level is its
+                // own dispatch.
+                let levels: Vec<u32> = if threads % 32 == 0 {
+                    reduce_dispatch_levels(desc.last)
+                } else {
+                    (0..reduce_levels(desc.last)).collect()
+                };
+                for level in levels {
+                    while at < level {
+                        count = count.div_ceil(32);
+                        at += 1;
+                    }
+                    let chunks = count.div_ceil(32).max(1);
+                    let work = desc.rows.max(1).saturating_mul(chunks);
+                    for _ in 0..repeats(StepKind::Reduce) {
+                        out.push((
+                            StepWord {
+                                level,
+                                ..word
+                            },
+                            groups_for(work),
+                        ));
+                    }
+                }
+            }
+            StepKind::Argmax => {
+                let desc = descriptors.get(step.input as usize).copied().unwrap_or_default();
+                // One candidate per (row, group) lands in the temporary.
+                let candidate_bytes = 16u64;
+                let fit = (temporary_bytes / candidate_bytes / u64::from(desc.rows.max(1)))
+                    .clamp(1, u64::from(STREAMED_MAX_GROUPS)) as u32;
+                let groups = groups_for(desc.last).min(fit);
+                for _ in 0..repeats(StepKind::Argmax) {
+                    out.push((
+                        StepWord {
+                            level: 0,
+                            groups,
+                            ..word
+                        },
+                        groups,
+                    ));
+                    out.push((
+                        StepWord {
+                            level: 1,
+                            groups,
+                            ..word
+                        },
+                        1,
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// What two instances must agree on to share one [`Batch`]: the grouped
@@ -865,6 +1041,7 @@ impl Prepared {
             descriptor_bytes,
             param_bytes,
             offset_bytes,
+            descriptor_table: descriptors,
         })
     }
 
@@ -895,6 +1072,9 @@ impl Prepared {
     /// Errors when a stage-local slot names an uncarried channel.
     pub fn refresh(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
         self.refresh_cells(rings, cursors)?;
+        if scratch_zeroing_skipped() {
+            return Ok(());
+        }
         // Zeroed every fire: an unwritten slot would read back the last fire's leftovers.
         let bytes = self.scratch.bytes();
         self.scratch.zero_span(0, bytes)
@@ -1151,10 +1331,96 @@ impl Prepared {
     /// Encode one generated region into a pass someone else opened, and do
     /// not commit — safe to call inside `serve::enqueue`, unlike [`Prepared::launch_region`].
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
-        if region.form != Form::Fused {
-            return self.encode_grouped(frame, region);
+        match region.form {
+            Form::Fused => self.encode_fused(frame, region, &self.scratch, 0),
+            Form::Streamed => self.encode_streamed(frame, region),
+            Form::Grouped | Form::GroupedLibrary => self.encode_grouped(frame, region),
         }
-        self.encode_fused(frame, region, &self.scratch, 0)
+    }
+
+    /// Encode one streamed region for this instance alone: the grouped
+    /// bindings plus the step word, one dispatch per entry of the region's
+    /// table, a grid of `groups × 1`.
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    fn encode_streamed(&self, frame: &Frame, region: &Region) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2::runtime::ProtocolObject;
+            use objc2_metal::{
+                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
+            };
+            let grouped = self.grouped.as_ref().ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    "a region was compiled for the streamed form and this stage carries no \
+                     lane table; the plan said the grouped path could not cover it",
+                )
+            })?;
+            let layout = grouped
+                .layouts
+                .get(region.region_index as usize)
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::launch",
+                        format!("region {} has no group layout", region.region_index),
+                    )
+                })?;
+            let encoder = frame.encoder();
+            encoder.setComputePipelineState(region.pipeline());
+            // SAFETY: every reservation is retained by `self`; every offset is zero.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
+                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
+                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
+                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
+                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+            }
+            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
+                let resource: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(&**buffer.slab());
+                encoder.useResource_usage(resource, usage);
+            };
+            resident(
+                &self.status,
+                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            );
+            for cell in &self.bound {
+                resident(
+                    &cell.slab,
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
+            }
+            for held in self.intrinsics.iter().flatten() {
+                resident(&held.base, MTLResourceUsage::Read);
+            }
+            let threads = region
+                .pipeline()
+                .maxTotalThreadsPerThreadgroup()
+                .clamp(1, REGION_THREADS as usize);
+            let temporary_bytes = u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
+            dispatch_streamed(
+                encoder,
+                &streamed_dispatches(
+                    &region.steps,
+                    &self.descriptor_table,
+                    u32::try_from(threads).unwrap_or(1),
+                    temporary_bytes,
+                ),
+                threads,
+                GROUPED_LANES as usize,
+            );
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(Fault::Deviceless)
+        }
     }
 
     /// Encode one single-lane region with its values at `scratch_at` inside
@@ -1311,7 +1577,9 @@ impl Prepared {
             .get(region.region_index as usize)
             .map_or(1, |words| words.reserved1 as usize);
         let (groups, threads) = match region.form {
-            Form::Fused => unreachable!("`encode_into` routes the single-lane form"),
+            Form::Fused | Form::Streamed => {
+                unreachable!("`encode_into` routes the single-lane and streamed forms")
+            }
             Form::GroupedLibrary => ((GROUPED_LANES as usize) * rows, LIBRARY_SAMPLER_THREADS),
             Form::Grouped => (
                 GROUPED_LANES as usize,
@@ -1567,7 +1835,9 @@ impl Batch {
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
-        self.scratch.zero_span(0, u64::from(count) * stride)?;
+        if !scratch_zeroing_skipped() {
+            self.scratch.zero_span(0, u64::from(count) * stride)?;
+        }
         let vocab = members[0]
             .grouped
             .as_ref()
@@ -1654,9 +1924,101 @@ impl Batch {
                 Form::Grouped | Form::GroupedLibrary => {
                     self.encode_grouped(frame, region, members, count)?;
                 }
+                Form::Streamed => {
+                    self.encode_streamed(frame, region, members, count)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// One streamed region for every member: the batch's bindings, then one
+    /// dispatch per step over a grid of `groups × count`.
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    fn encode_streamed(
+        &self,
+        frame: &Frame,
+        region: &Region,
+        members: &[&mut Prepared],
+        count: u32,
+    ) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2::runtime::ProtocolObject;
+            use objc2_metal::{
+                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
+            };
+            let layout = self
+                .layouts
+                .get(region.region_index as usize)
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::launch",
+                        format!("region {} has no group layout in this batch", region.region_index),
+                    )
+                })?;
+            let encoder = frame.encoder();
+            encoder.setComputePipelineState(region.pipeline());
+            // SAFETY: every buffer is retained by `self`; every offset is zero.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
+                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
+                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
+                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
+                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
+            }
+            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
+                let resource: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(&**buffer.slab());
+                encoder.useResource_usage(resource, usage);
+            };
+            for member in members {
+                resident(
+                    &member.status,
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
+                for cell in &member.bound {
+                    resident(
+                        &cell.slab,
+                        MTLResourceUsage::Read | MTLResourceUsage::Write,
+                    );
+                }
+                for held in member.intrinsics.iter().flatten() {
+                    resident(&held.base, MTLResourceUsage::Read);
+                }
+            }
+            let template = members
+                .first()
+                .ok_or_else(|| Fault::program("program::launch", "a batch with no members"))?;
+            let threads = region
+                .pipeline()
+                .maxTotalThreadsPerThreadgroup()
+                .clamp(1, REGION_THREADS as usize);
+            let temporary_bytes =
+                u64::from(self.key.scratch_stride.saturating_sub(self.key.temporary_offset));
+            dispatch_streamed(
+                encoder,
+                &streamed_dispatches(
+                    &region.steps,
+                    &template.descriptor_table,
+                    u32::try_from(threads).unwrap_or(1),
+                    temporary_bytes,
+                ),
+                threads,
+                count as usize,
+            );
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(Fault::Deviceless)
+        }
     }
 
     /// One grouped region for every member: the batch's eleven bindings, a
@@ -1727,7 +2089,9 @@ impl Batch {
                 .get(region.region_index as usize)
                 .map_or(1, |words| words.reserved1 as usize);
             let (groups, threads) = match region.form {
-                Form::Fused => unreachable!("`Batch::encode` routes the single-lane form"),
+                Form::Fused | Form::Streamed => {
+                    unreachable!("`Batch::encode` routes the single-lane and streamed forms")
+                }
                 Form::GroupedLibrary => ((count as usize) * rows, LIBRARY_SAMPLER_THREADS),
                 Form::Grouped => (
                     count as usize,
@@ -1755,6 +2119,40 @@ impl Batch {
         {
             Err(Fault::Deviceless)
         }
+    }
+}
+
+/// Issue a streamed region's dispatches: the step word at 11, then a grid of
+/// `groups × lanes` threadgroups of `threads`.
+#[cfg(target_vendor = "apple")]
+fn dispatch_streamed(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    dispatches: &[(StepWord, u32)],
+    threads: usize,
+    lanes: usize,
+) {
+    use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+    for (word, groups) in dispatches {
+        // SAFETY: `word` lives for the call; Metal copies the bytes.
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                std::ptr::NonNull::from(word).cast(),
+                size_of::<StepWord>(),
+                11,
+            );
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (*groups).max(1) as usize,
+                height: lanes.max(1),
+                depth: 1,
+            },
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 }
 

@@ -108,6 +108,24 @@ pub enum Form {
     /// Grouped library sampler (nucleus/top-k): same eleven bindings, one
     /// threadgroup per (lane, row), requires exactly 256 threads.
     GroupedLibrary,
+    /// Streamed: the grouped bindings plus a step word at 11, dispatched once
+    /// per entry of [`Region::steps`] over a grid of (element blocks × lanes).
+    Streamed,
+}
+
+/// One dispatch of a streamed region, resolved from the emitted step table
+/// against the plan's ops: which op, how it runs, and the values whose
+/// descriptors size its grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamedStep {
+    /// The op this step runs (`M4Step::index`).
+    pub node: u32,
+    pub kind: eta_compiler::codegen::metal::StepKind,
+    /// The value whose length sizes a `Wide` grid: the op's result, or its
+    /// first operand for an op with none (a put).
+    pub result: u32,
+    /// The value a reduction folds, whose row width fixes its levels.
+    pub input: u32,
 }
 
 /// The include line every emitted kernel carries.
@@ -282,6 +300,8 @@ pub struct Region {
     /// Index into the plan's fused partition. The grouped emitter names its
     /// fused-region kernels at `singleton.len() + region_index`.
     pub region_index: u32,
+    /// The streamed form's dispatch table, in order; empty for every other form.
+    pub steps: Arc<Vec<StreamedStep>>,
     /// Which emitted form this region's pipeline was built from.
     pub form: Form,
     /// The compiled library and its pipeline.
@@ -519,6 +539,22 @@ impl Cache {
             }) {
                 continue;
             }
+            if let Some(region) =
+                self.streamed_region(context, stage_index, region_index, plan, index)?
+            {
+                if region_trace() {
+                    eprintln!(
+                        "region: stage {stage_index} region {region_index} takes the Streamed \
+                         form ({} step(s), {} op(s), widest value {} element(s)): {}",
+                        region.steps.len(),
+                        region_ops(plan, region_index),
+                        region_widest(plan, region_index),
+                        region_tags(plan, region_index),
+                    );
+                }
+                regions.push(region);
+                continue;
+            }
             let grouped_declined =
                 match self.grouped_region(context, stage_index, region_index, plan, index)? {
                     GroupedAnswer::Served(region) => {
@@ -547,7 +583,7 @@ impl Cache {
                 );
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
-                Slot::Kernel { source, entry } => (source, entry),
+                Slot::Kernel { source, entry, .. } => (source, entry),
                 // A declined region has no fallback path; skipping it would
                 // silently run with the fire's memset zeros.
                 Slot::Refused(why) => {
@@ -582,6 +618,7 @@ impl Cache {
             let module = self.region_module(context, entry, source)?;
             regions.push(Region {
                 region_index,
+                steps: Arc::new(Vec::new()),
                 form: Form::Fused,
                 module,
             });
@@ -667,7 +704,7 @@ impl Cache {
             }
         };
         let (source, entry) = match index.get(KERNEL_GROUPED, stage_index, slot) {
-            Slot::Kernel { source, entry } => (source, entry),
+            Slot::Kernel { source, entry, .. } => (source, entry),
             Slot::Refused(why) => {
                 return Ok(GroupedAnswer::Declined(format!(
                     "the grouped emitter declined it too ({why})"
@@ -701,11 +738,79 @@ impl Cache {
         }
         Ok(GroupedAnswer::Served(Region {
             region_index,
+            steps: Arc::new(Vec::new()),
             form: if library {
                 Form::GroupedLibrary
             } else {
                 Form::Grouped
             },
+            module,
+        }))
+    }
+
+    /// The streamed kernel for one fused region, when it applies: the region
+    /// holds a value of at least [`WIDE_REGION_ELEMENTS`], is not a library
+    /// sampler (those keep their hand-written kernels), the plan's grouped
+    /// path covers the stage (the streamed form shares its tables), and the
+    /// emitter answered a kernel with a step table. Otherwise `None`, and the
+    /// caller tries the grouped and single-lane forms as before.
+    fn streamed_region(
+        &mut self,
+        context: &Context,
+        stage_index: u32,
+        region_index: u32,
+        plan: &LaunchStagePlan,
+        index: &Emitted<'_>,
+    ) -> std::result::Result<Option<Region>, Failure> {
+        if !plan.needs.grouped_valid {
+            return Ok(None);
+        }
+        let Some(region) = plan.fused.get(region_index as usize) else {
+            return Ok(None);
+        };
+        if matches!(region.kind, RegionKind::Library(_)) {
+            return Ok(None);
+        }
+        let wide = region.nodes.iter().any(|&node| {
+            plan.ops
+                .get(node as usize)
+                .is_some_and(|op| op_width(op) >= WIDE_REGION_ELEMENTS)
+        });
+        if !wide {
+            return Ok(None);
+        }
+        let (source, entry, table) =
+            match index.get(KernelKind::Streamed, stage_index, region_index) {
+                Slot::Kernel {
+                    source,
+                    entry,
+                    steps,
+                } => (source, entry, steps),
+                _ => return Ok(None),
+            };
+        let mut steps = Vec::with_capacity(table.len());
+        for &word in table {
+            let node = eta_compiler::codegen::metal::step_node(word);
+            let Some(kind) = eta_compiler::codegen::metal::step_kind(word) else {
+                return Ok(None);
+            };
+            let Some(op) = plan.ops.get(node as usize) else {
+                return Ok(None);
+            };
+            let input = op.args.first().copied().unwrap_or(op.result_id);
+            let result = if op.result_count == 0 { input } else { op.result_id };
+            steps.push(StreamedStep {
+                node,
+                kind,
+                result,
+                input,
+            });
+        }
+        let module = self.region_module(context, entry, source)?;
+        Ok(Some(Region {
+            region_index,
+            steps: Arc::new(steps),
+            form: Form::Streamed,
             module,
         }))
     }
