@@ -289,8 +289,12 @@
 //! sealing, aggregate tok/s against plain: four lanes counting 60.9 / 40.7,
 //! prose 39.9 / 41.5, code 40.2 / 42.3; eight lanes 63.6 / 57.0, 47.6 / 60.2,
 //! 46.2 / 60.4. The structured prompt pays; the others cost 4-5% at four
-//! lanes and a fifth at eight (the warm-up rounds and the probes stepping out
-//! of the batch). `min_tokens_per_round = 1000` closes the gate for good.
+//! lanes and a fifth at eight — and at eight even a floor that never drafts
+//! after the warm-up reads 48-53, the warm-up rounds and the probes being
+//! the cost. So **eight lanes and up open no round at all** (`default_floor`:
+//! an infinite floor; measured 61.2 / 57.0 against plain 60.2 / 57.0), four
+//! and under take the floor of five. `min_tokens_per_round` states any of
+//! this explicitly; 1000 closes the gate for good at any crowd.
 //!
 //! **UNDER CONCURRENT LOAD THE PRICES LIE, SO `priced` IS OFF IN A CROWD.**
 //! Eight lanes held open (`pie_bench.py tput --num-requests 8 --concurrency
@@ -583,7 +587,20 @@ fn ngram_lookup(context: &[i32], n: u32, max: u32) -> Vec<i32> {
 /// than the one-lane three. The crowd is what the caller says it is; the
 /// guest has no other way to know it is one of several.
 fn default_floor(concurrency: u32) -> f64 {
-    if concurrency > 1 { 5.0 } else { 0.0 }
+    match concurrency {
+        // **EIGHT LANES AND UP DO NOT DRAFT AT ALL.** Measured on qwen38 at
+        // eight lanes against plain 57-60 tok/s: the crowd floor of five read
+        // 47.6 / 46.2 / 63.6 (prose / code / counting), a floor of eight 49.6
+        // / 46.7 / 49.5, and a floor of 1000 — which never drafts after the
+        // warm-up — 48.2 / 49.5 / 52.7. The loss is not the drafting
+        // decision: it is the eight warm-up rounds and the probes, each a
+        // lane stepping out of the batch its seven neighbours are in. An
+        // infinite floor opens no round, warms nothing up, probes nothing,
+        // and fires the plain geometry — the batch is the lever there.
+        c if c >= 8 => f64::INFINITY,
+        c if c > 1 => 5.0,
+        _ => 0.0,
+    }
 }
 
 fn default_concurrency() -> u32 {
@@ -1378,7 +1395,9 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             Vec::new()
         };
-        let planned = if ngram {
+        let planned = if floor.is_infinite() {
+            None
+        } else if ngram {
             // A match drafts as many rows as it found; none is a plain fire.
             (!ngram_props.is_empty()).then(|| (ngram_props.len() as u32 + 1).min(block))
         } else if priced {
