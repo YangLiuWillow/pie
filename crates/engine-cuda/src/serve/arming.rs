@@ -1034,9 +1034,14 @@ impl Shell {
                     }
                 }
             }
-            if key.is_some_and(|key| self.cache.body_armed(&key)) {
+            if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
+                if std::env::var_os("PIE_ARM_TRACE").is_some()
+                    && let Some(key) = key.as_ref()
+                {
+                    eprintln!("[arm-trace] armed {key}");
+                }
             } else if !admitted && !faulted && target.skips_on_present_set() {
                 // A tower target writes nothing here: its verdict is about a
                 // second rectangle token arms do not have.
@@ -1270,7 +1275,19 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
     let mut differing = 0usize;
     let mut total = 0usize;
     let mut worst = 0u32;
+    // The same distance in bf16 steps (the readout's own grain: a value
+    // whose low 16 bits are zero is a bf16 the head rounded to), so a
+    // dump says whether a disagreement is a rounding or a wrong number.
+    let mut worst_bf16 = 0u32;
+    let mut worst_bf16_at: Option<(usize, usize, f32, f32)> = None;
+    let mut beyond_one_bf16 = 0usize;
+    let mut beyond_eight_bf16 = 0usize;
+    let mut non_finite = (0usize, 0usize);
+    // Per lane: how many of its cells differ, so a dump says WHICH lanes a
+    // body gets wrong (all of them, a leading run, a trailing run).
+    let mut per_lane: Vec<usize> = Vec::with_capacity(walked.len());
     for (lane, (a, b)) in walked.iter().zip(replayed).enumerate() {
+        per_lane.push(0);
         if a.len() != b.len() {
             return Some(format!(
                 "lane {lane} answered {} and {} elements  class=structural",
@@ -1284,7 +1301,17 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
                 continue;
             }
             differing += 1;
+            per_lane[lane] += 1;
+            non_finite.0 += usize::from(!x.is_finite());
+            non_finite.1 += usize::from(!y.is_finite());
             worst = worst.max(ordered(x.to_bits()).abs_diff(ordered(y.to_bits())));
+            let steps = ordered(x.to_bits() & 0xffff_0000).abs_diff(ordered(y.to_bits() & 0xffff_0000)) >> 16;
+            beyond_one_bf16 += usize::from(steps > 1);
+            beyond_eight_bf16 += usize::from(steps > 8);
+            if steps > worst_bf16 {
+                worst_bf16 = steps;
+                worst_bf16_at = Some((lane, at, *x, *y));
+            }
             if first.is_none() {
                 first = Some((at, *x, *y));
             }
@@ -1293,9 +1320,37 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
     let (at, x, y) = first?;
     // Two ulp: the width of one bf16 rounding either way.
     let class = if worst <= 2 { "numeric" } else { "structural" };
+    // Lanes as runs of "differs"/"agrees": `lanes=[0..64 differ]`,
+    // `lanes=[0..3 agree, 3..64 differ]`, and so on.
+    let lane_runs = {
+        let mut runs: Vec<String> = Vec::new();
+        let mut start = 0usize;
+        while start < per_lane.len() {
+            let differs = per_lane[start] > 0;
+            let mut end = start;
+            while end < per_lane.len() && (per_lane[end] > 0) == differs {
+                end += 1;
+            }
+            let width = walked[start].len().max(1);
+            let mean = per_lane[start..end].iter().sum::<usize>() as f64
+                / ((end - start) as f64 * width as f64);
+            runs.push(if differs {
+                format!("{start}..{end} differ ({:.0}% of cells)", mean * 100.0)
+            } else {
+                format!("{start}..{end} agree")
+            });
+            start = end;
+        }
+        runs.join(", ")
+    };
+    let worst_bf16_line = worst_bf16_at.map_or(String::new(), |(lane, at, x, y)| {
+        format!("  worst_bf16=lane {lane} #{at} (walk={x}, body={y}, {worst_bf16} bf16 step(s))")
+    });
     Some(format!(
         "differs at #{at} (walk={x} {:#010x}, body={y} {:#010x})  n_diff={differing}/{total}  \
-         max_ulp={worst}  class={class}",
+         max_ulp={worst}  class={class}  beyond_1_bf16={beyond_one_bf16}  \
+         beyond_8_bf16={beyond_eight_bf16}  non_finite(walk,body)={non_finite:?}  \
+         lanes=[{lane_runs}]{worst_bf16_line}",
         x.to_bits(),
         y.to_bits(),
     ))

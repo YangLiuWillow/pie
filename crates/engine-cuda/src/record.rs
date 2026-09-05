@@ -1480,8 +1480,17 @@ fn walk_capture_units(
     units: Units,
     regions: Regions,
 ) -> Result<()> {
+    // `PIE_CAPTURE_SERIAL=1`: a diagnostic arm that captures on ONE stream
+    // — the fork/join event points the stream pass baked are not walked —
+    // while still writing the capture down. A body that agrees with its
+    // walk only under this flag names the stream plan as what it disagrees
+    // over.
+    let serial_capture = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_CAPTURE_SERIAL").is_some())
+    };
     let mut cursor = match (streams, at.lanes) {
-        (Streams::Forked, Some(lanes)) => Cursor::across(place, lanes),
+        (Streams::Forked, Some(lanes)) if !serial_capture => Cursor::across(place, lanes),
         _ => at.serial(place),
     };
     // Whether this walk is being written down is separate from whether it
