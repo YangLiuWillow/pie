@@ -98,6 +98,29 @@ impl Graph {
         self.raw
     }
 
+    /// Debug probe: write the graph as DOT (verbose, with kernel params and
+    /// attributes) to `path`. `false` when the runtime refused.
+    pub fn debug_dot(&self, path: &str) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+            let Ok(c_path) = std::ffi::CString::new(path) else {
+                return false;
+            };
+            // Verbose | KernelNodeParams | KernelNodeAttributes.
+            let flags = 1 | 4 | 512;
+            // SAFETY: `raw` is this graph's live handle; `c_path` outlives the call.
+            let code =
+                unsafe { rt::cudaGraphDebugDotPrint(self.raw.cast(), c_path.as_ptr(), flags) };
+            code == rt::cudaError_t::cudaSuccess
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
     /// How many nodes it recorded, or `None` when the driver would not say.
     ///
     /// `None` and `0` mean different things: a refused query (e.g. a node

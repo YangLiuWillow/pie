@@ -736,14 +736,193 @@ impl Shell {
             shell.device.synchronize()?;
             Ok(out)
         };
-        let walked = fire(self, Golden::Eager)
-            .map_err(|fault| refused(format!("the control arm would not fire: {fault}")))?;
+        if crate::record::ptr_traced(key) {
+            crate::record::PTR_TAG.store(2, std::sync::atomic::Ordering::Relaxed);
+        }
+        let walked = fire(self, Golden::Eager);
+        crate::record::PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
+        let walked =
+            walked.map_err(|fault| refused(format!("the control arm would not fire: {fault}")))?;
         let replayed = fire(self, Golden::Body)
             .map_err(|fault| refused(format!("the body arm would not fire: {fault}")))?;
         // Bit for bit, not `close`: no accumulation order to differ by.
         match evidence(&walked, &replayed) {
             None => Ok(()),
-            Some(why) => Err(refused(why)),
+            Some(why) => {
+                // `PIE_GOLDEN_PROBE=1`: on a disagreement, two more questions
+                // before the verdict — is each arm itself repeatable, and
+                // does the body's lane `i` answer some OTHER lane of the
+                // walk bit for bit (a lane order that moved, not a wrong
+                // number)?
+                if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+                    let walked_again = fire(self, Golden::Eager);
+                    let replayed_again = fire(self, Golden::Body);
+                    let same = |a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>| {
+                        evidence(a, b).map_or("identical".to_string(), |why| {
+                            why.split("  lanes=").next().unwrap_or(&why).to_string()
+                        })
+                    };
+                    if let Ok(w2) = &walked_again {
+                        eprintln!("[golden-probe] {key} walk vs walk: {}", same(&walked, w2));
+                    }
+                    if let Ok(b2) = &replayed_again {
+                        eprintln!("[golden-probe] {key} body vs body: {}", same(&replayed, b2));
+                    }
+                    // Bisect: launch the first `k` execs, walk the rest; the
+                    // first `k` that disagrees names the stretch.
+                    let script = self.cache.body_script(key);
+                    let execs = script.iter().filter(|(island, ..)| !island).count();
+                    let mut culprit = None;
+                    for k in 1..=execs {
+                        crate::record::REPLAY_UPTO.store(k, std::sync::atomic::Ordering::Relaxed);
+                        let partial = fire(self, Golden::Body);
+                        crate::record::REPLAY_UPTO
+                            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                        match partial {
+                            Ok(out) => {
+                                let agrees = evidence(&walked, &out).is_none();
+                                eprintln!(
+                                    "[golden-probe] {key} replay first {k} exec(s): {}",
+                                    if agrees {
+                                        "agrees with the walk"
+                                    } else {
+                                        "DIFFERS"
+                                    }
+                                );
+                                if !agrees {
+                                    culprit = Some(k);
+                                    break;
+                                }
+                            }
+                            Err(fault) => {
+                                eprintln!(
+                                    "[golden-probe] {key} replay first {k} exec(s): would not fire: {fault}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(k) = culprit {
+                        let mut seen = 0usize;
+                        for (at_step, (island, from, upto)) in script.iter().enumerate() {
+                            if *island {
+                                continue;
+                            }
+                            seen += 1;
+                            if seen == k {
+                                eprintln!(
+                                    "[golden-probe] {key} first disagreeing exec is step {at_step}: regions {from}..{upto}"
+                                );
+                                for region in *from..*upto {
+                                    if let Some(template) =
+                                        self.compiled.template().get(region as usize)
+                                    {
+                                        eprintln!(
+                                            "[golden-probe]   region {region}: nodes {:?} phase {:?} stream {} lowering {:?}",
+                                            template.nodes,
+                                            template.phase,
+                                            template.stream,
+                                            template.lowering
+                                        );
+                                        for node in template.nodes.clone() {
+                                            if let Some(held) = self.trace.nodes.get(node as usize)
+                                            {
+                                                let op = format!("{:?}", held.op);
+                                                let head: String = op.chars().take(90).collect();
+                                                eprintln!(
+                                                    "[golden-probe]     node {node} layer {:?}: {head}",
+                                                    held.layer
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Each exec alone: the ones before and after it walk.
+                    let mut nth = 0usize;
+                    for (at_step, (island, from, upto)) in script.iter().enumerate() {
+                        if *island {
+                            continue;
+                        }
+                        let j = nth;
+                        nth += 1;
+                        crate::record::REPLAY_FROM.store(j, std::sync::atomic::Ordering::Relaxed);
+                        crate::record::REPLAY_UPTO
+                            .store(j + 1, std::sync::atomic::Ordering::Relaxed);
+                        let alone = fire(self, Golden::Body);
+                        crate::record::REPLAY_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
+                        crate::record::REPLAY_UPTO
+                            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                        let verdict = match &alone {
+                            Ok(out) => match evidence(&walked, out) {
+                                None => "agrees".to_string(),
+                                Some(why) => format!(
+                                    "DIFFERS ({})",
+                                    why.chars().take(120).collect::<String>()
+                                ),
+                            },
+                            Err(fault) => format!("would not fire: {fault}"),
+                        };
+                        let nodes = self
+                            .compiled
+                            .template()
+                            .get(*from as usize)
+                            .map(|t| t.nodes.start)
+                            .unwrap_or(0);
+                        let nodes_end = self
+                            .compiled
+                            .template()
+                            .get((*upto as usize).saturating_sub(1))
+                            .map(|t| t.nodes.end)
+                            .unwrap_or(0);
+                        let layers: Vec<Option<u32>> = {
+                            let mut seen = Vec::new();
+                            for n in nodes..nodes_end {
+                                if let Some(h) = self.trace.nodes.get(n as usize) {
+                                    if seen.last() != Some(&h.layer) {
+                                        seen.push(h.layer);
+                                    }
+                                }
+                            }
+                            seen
+                        };
+                        eprintln!(
+                            "[golden-probe] {key} exec {j} alone (step {at_step}, regions {from}..{upto}, nodes {nodes}..{nodes_end}, layers {layers:?}): {verdict}"
+                        );
+                    }
+                    for (i, body_lane) in replayed.iter().enumerate() {
+                        let best = walked
+                            .iter()
+                            .enumerate()
+                            .map(|(j, walk_lane)| {
+                                let agree = body_lane
+                                    .iter()
+                                    .zip(walk_lane)
+                                    .filter(|(x, y)| x.to_bits() == y.to_bits())
+                                    .count();
+                                (agree, j)
+                            })
+                            .max()
+                            .unwrap_or((0, 0));
+                        eprintln!(
+                            "[golden-probe] {key} body lane {i} best matches walk lane {} ({} of {} cells bit-exact); head body={:?} walk[{}]={:?} walk[{i}]={:?}",
+                            best.1,
+                            best.0,
+                            body_lane.len(),
+                            &body_lane[..body_lane.len().min(4)],
+                            best.1,
+                            &walked[best.1][..walked[best.1].len().min(4)],
+                            &walked[i][..walked[i].len().min(4)],
+                        );
+                        if i >= 7 {
+                            break;
+                        }
+                    }
+                }
+                Err(refused(why))
+            }
         }
     }
 

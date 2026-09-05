@@ -721,6 +721,28 @@ impl AxisCarve<'_> {
     }
 }
 
+/// How many leading execs of a body a replay launches; the rest walk. The
+/// golden probe's bisection knob (`Shell::golden` under `PIE_GOLDEN_PROBE`);
+/// `usize::MAX` — every fire outside that probe — launches them all.
+pub static REPLAY_UPTO: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+/// The first exec a replay launches (the ones before it walk); with
+/// [`REPLAY_UPTO`] this isolates one exec. `0` outside the probe.
+pub static REPLAY_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `PIE_PTR_TRACE=<substring of a key>`: which walk the per-node pointer
+/// trace ([`crate::dispatch::custom`]'s probe) is inside — `1` the capture
+/// of a matching body, `2` its golden's eager arm, `0` neither.
+pub static PTR_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether `PIE_PTR_TRACE` names this key.
+pub fn ptr_traced(key: &BodyKey) -> bool {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    match WANT.get_or_init(|| std::env::var("PIE_PTR_TRACE").ok()) {
+        Some(want) => key.to_string().contains(want.as_str()),
+        None => false,
+    }
+}
+
 /// One step of a body's replay script — a stretch the graph holds, or a
 /// stretch it re-issues eagerly. No second vector: the sequence itself is
 /// the representation.
@@ -969,6 +991,24 @@ impl Bodies {
         armed
     }
 
+    /// A body's script as `(island, from, upto)` per step, for the golden
+    /// probe to name the stretch a bisection lands on. Empty for no body.
+    pub fn body_script(&self, key: &BodyKey) -> Vec<(bool, u32, u32)> {
+        self.map
+            .bodies
+            .get(key)
+            .map(|body| {
+                body.script
+                    .iter()
+                    .map(|step| match step {
+                        Step::Exec { cut, .. } => (false, cut.from, cut.upto),
+                        Step::Island(cut) => (true, cut.from, cut.upto),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Close the map — `Shell::arm_bodies`'s last line. Idempotent and one-way.
     pub fn seal_bodies(&mut self) {
         self.map.seal();
@@ -1046,6 +1086,13 @@ impl Bodies {
             self.recorder.bstats.sealed_short += 1;
         }
         let replays = !short && !moved && !empty;
+        if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+            let held = self.map.bodies.get(&key).map(|body| body.shape);
+            eprintln!(
+                "[body-probe] {key} eager_twin={} replays={replays} short={short} moved={moved} empty={empty} shape={shape:#x} held={held:x?}",
+                at.eager_twin
+            );
+        }
         if replays && let Some(body) = self.map.bodies.get_mut(&key) {
             // The hit path: one host for-loop over one stream, captured
             // stretches submitted and islands re-issued eagerly between
@@ -1082,11 +1129,24 @@ impl Bodies {
                  the readout rectangle held from the last fire that ran",
             );
             // The golden's control arm ([`Fire::eager_twin`]) walks what it
-            // would have launched instead of launching the exec.
+            // would have launched instead of launching the exec. The probe's
+            // bisection (`REPLAY_UPTO`) launches only the first `k` execs
+            // and walks the rest, so a disagreement names its stretch.
+            let upto = REPLAY_UPTO.load(std::sync::atomic::Ordering::Relaxed);
+            let from = REPLAY_FROM.load(std::sync::atomic::Ordering::Relaxed);
+            let mut nth = 0usize;
             for step in body.script.iter() {
                 match step {
-                    Step::Exec { exec, .. } if !at.eager_twin => exec.launch(at.stream)?,
-                    Step::Exec { cut, .. } | Step::Island(cut) => {
+                    Step::Exec { exec, cut } => {
+                        let launch = !at.eager_twin && nth >= from && nth < upto;
+                        nth += 1;
+                        if launch {
+                            exec.launch(at.stream)?;
+                        } else {
+                            walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
+                        }
+                    }
+                    Step::Island(cut) => {
                         walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                     }
                 }
@@ -1155,8 +1215,33 @@ impl Bodies {
                 steps.push(Step::Island(cut));
                 continue;
             }
-            let graph =
-                Graph::capture(at.stream, || walk_capture_cut(at, run, place, Streams::Forked, cut))?;
+            let graph = {
+                if ptr_traced(&key) {
+                    PTR_TAG.store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let captured = Graph::capture(at.stream, || {
+                    walk_capture_cut(at, run, place, Streams::Forked, cut)
+                });
+                PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
+                captured?
+            };
+            // `PIE_GRAPH_DOT=<dir>`: every exec of the `PIE_PTR_TRACE` key as DOT.
+            if let Some(dir) = std::env::var_os("PIE_GRAPH_DOT")
+                && ptr_traced(&key)
+            {
+                let nth = steps
+                    .iter()
+                    .filter(|step| matches!(step, Step::Exec { .. }))
+                    .count();
+                let path = format!("{}/exec{nth}.dot", dir.to_string_lossy());
+                let wrote = graph.debug_dot(&path);
+                eprintln!(
+                    "[graph-dot] {key} exec {nth} regions {}..{} -> {path} ({})",
+                    cut.from,
+                    cut.upto,
+                    if wrote { "written" } else { "REFUSED" }
+                );
+            }
             // Prepare-only stretches that recorded nothing are dropped
             // (`Some(0)`, not `== 0` — a refused query is not empty).
             // Capture-phase ones become islands instead, re-issued eagerly.
