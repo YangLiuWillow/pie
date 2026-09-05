@@ -1199,6 +1199,31 @@ impl Bodies {
             return Ok(());
         }
         let grids = launch_grids(at, run);
+        // `PIE_GRID_TRACE=<substring of a key>`: per launch of a matching
+        // body, the live span beside the ceiling grid it was captured at —
+        // the two numbers a replay disagreeing with its walk is read by.
+        if let Some(wanted) = std::env::var_os("PIE_GRID_TRACE")
+            && key.to_string().contains(wanted.to_string_lossy().as_ref())
+        {
+            let windows = run.windows();
+            let mut seen = 0usize;
+            for region in 0..at.compiled.template().len() as u32 {
+                if at.island(region) {
+                    continue;
+                }
+                let template = &at.compiled.template()[region as usize];
+                for at_run in 0..windows.runs(region) {
+                    let span = windows.at(region, at_run).span();
+                    let (rows, lanes) = grids.get(seen).copied().unwrap_or((0, 0));
+                    seen += 1;
+                    eprintln!(
+                        "[grid-trace] {key} r{region} run{at_run} nodes={:?} phase={:?} stream={} \
+                         live=({}, {}) grid=({rows}, {lanes})",
+                        template.nodes, template.phase, template.stream, span.rows, span.lanes
+                    );
+                }
+            }
+        }
         let _ = self.insert_body(key, Body {
             script: steps.into_boxed_slice(),
             grids,
