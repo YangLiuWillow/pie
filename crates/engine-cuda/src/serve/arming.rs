@@ -33,6 +33,9 @@ struct Synthetic {
     captures: bool,
     /// Which real slot lends its page arithmetic.
     slot: u32,
+    /// This lane's kv pages, packed from the front of the pool (see
+    /// [`Shell::synthetic_lanes_with`]); empty means the slot's own block.
+    pages: Vec<u32>,
     /// [`Seated::held`]. `Some(0)` for every enumerated lane; only
     /// [`Shell::golden_real`] writes anything else.
     held: Option<u32>,
@@ -514,6 +517,24 @@ impl Shell {
         media: &[(u32, u32)],
     ) -> Vec<Synthetic> {
         let slots = self.held.len().max(1) as u32;
+        // Packed page tables, not the slots' own blocks. A slot's block sits
+        // at `slot × pages_per_slot`, so a synthetic of `n` lanes admitted by
+        // block would demand a watermark of `n × context` tokens — a decode
+        // body for 64 lanes needed the pool to hold 64 × 4096 tokens, and on
+        // a pool sized for what the deployment serves that refused every
+        // wide decode body and left those steps walking eagerly. A tabled
+        // lane demands one past its highest page, so the whole synthetic
+        // asks only for the pages its rows actually fill.
+        // `PIE_ARM_PACKED=1` turns the packed tables on. Off, every lane
+        // keeps its slot's block. Packed is the right sizing, and stays a
+        // diagnostic arm only because the wide mixed bodies it newly arms —
+        // `b512[c{0,2,3,5}:512 + c{1,4}:64]` and the mask+adapter
+        // three-class keys on gemma-4-E4B — fail the golden (their replay
+        // differs from the eager walk at every readout cell), and a load
+        // with the golden on would then refuse to boot.
+        let packed = std::env::var_os("PIE_ARM_PACKED").is_some();
+        let page_size = u64::from(self.pools.paging().page_size).max(1);
+        let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let taps = self.patch_seat.map_or(0, |seat| seat.embed_taps) as usize;
         let weight_taps = self
@@ -539,6 +560,16 @@ impl Shell {
                 // Real slots, round-robin: the page arithmetic needs a slot
                 // that exists.
                 slot: (at as u32) % slots,
+                pages: if !packed {
+                    Vec::new()
+                } else {
+                    let pages = u64::from(rows).div_ceil(page_size).max(1);
+                    let table: Vec<u32> = (next_page..next_page + pages)
+                        .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
+                        .collect();
+                    next_page += pages;
+                    table
+                },
                 held: Some(0),
                 media: media
                     .get(at)
@@ -622,7 +653,7 @@ impl Shell {
                     word: lane.word,
                     tokens: &lane.tokens,
                 },
-                pages: &[],
+                pages: &lane.pages,
                 // A synthetic owns every row it reads: `Some(0)` for every
                 // enumerated lane, begins its slot's sequence.
                 // [`Shell::golden_real`] is the one caller that states
@@ -820,6 +851,13 @@ impl Shell {
         if ceiling == 0 {
             return Ok(());
         }
+        if std::env::var_os("PIE_ARM_TRACE").is_some() {
+            // What `c<n>` names in every line below: the requests that land
+            // in each class, the first being its representative.
+            for (class, requests) in self.landing.iter().enumerate() {
+                eprintln!("[arm-trace] class c{class}: {requests:?}");
+            }
+        }
         // No lattice: one key per row count. A lattice: each point at the
         // lane count a real fire of that rung can bring.
         let points: Vec<LatticePoint> = if self.budget.buckets.is_empty() {
@@ -954,6 +992,11 @@ impl Shell {
                 // quiet device to read a refusal as final.
                 let landed = self.device.synchronize();
                 if let Err(why) = fired.and(landed) {
+                    // Every refusal, not just the last, so a boot log lists
+                    // which compositions this deployment cannot arm.
+                    if std::env::var_os("PIE_ARM_TRACE").is_some() {
+                        eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                    }
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
                     faulted = true;
                     break;
@@ -971,14 +1014,34 @@ impl Shell {
                 && let Some(key) = key.as_ref()
                 && self.cache.holds_body(key)
             {
-                self.golden(key, &owned)?;
-                // And the same verdict over a composition a caller could
-                // have brought, which the synthetic cannot state.
-                self.golden_real(key, &owned)?;
+                let verdict = self
+                    .golden(key, &owned)
+                    // And the same verdict over a composition a caller could
+                    // have brought, which the synthetic cannot state.
+                    .and_then(|()| self.golden_real(key, &owned));
+                if let Err(fault) = verdict {
+                    // `PIE_GOLDEN_SKIP=1`: a diagnostic arm. The body that
+                    // disagreed is dropped and its key refused — the key walks
+                    // eagerly, as an unarmed one does — and the load goes on,
+                    // so one boot lists EVERY body the golden disagrees with
+                    // instead of stopping at the first. Off, the first
+                    // disagreement fails the load, as it always has.
+                    if std::env::var_os("PIE_GOLDEN_SKIP").is_some() {
+                        eprintln!("[arm-trace] golden refused {key}: {fault}");
+                        self.cache.body_drop(key);
+                    } else {
+                        return Err(fault);
+                    }
+                }
             }
-            if key.is_some_and(|key| self.cache.body_armed(&key)) {
+            if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
+                if std::env::var_os("PIE_ARM_TRACE").is_some()
+                    && let Some(key) = key.as_ref()
+                {
+                    eprintln!("[arm-trace] armed {key}");
+                }
             } else if !admitted && !faulted && target.skips_on_present_set() {
                 // A tower target writes nothing here: its verdict is about a
                 // second rectangle token arms do not have.
@@ -1212,7 +1275,19 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
     let mut differing = 0usize;
     let mut total = 0usize;
     let mut worst = 0u32;
+    // The same distance in bf16 steps (the readout's own grain: a value
+    // whose low 16 bits are zero is a bf16 the head rounded to), so a
+    // dump says whether a disagreement is a rounding or a wrong number.
+    let mut worst_bf16 = 0u32;
+    let mut worst_bf16_at: Option<(usize, usize, f32, f32)> = None;
+    let mut beyond_one_bf16 = 0usize;
+    let mut beyond_eight_bf16 = 0usize;
+    let mut non_finite = (0usize, 0usize);
+    // Per lane: how many of its cells differ, so a dump says WHICH lanes a
+    // body gets wrong (all of them, a leading run, a trailing run).
+    let mut per_lane: Vec<usize> = Vec::with_capacity(walked.len());
     for (lane, (a, b)) in walked.iter().zip(replayed).enumerate() {
+        per_lane.push(0);
         if a.len() != b.len() {
             return Some(format!(
                 "lane {lane} answered {} and {} elements  class=structural",
@@ -1226,7 +1301,17 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
                 continue;
             }
             differing += 1;
+            per_lane[lane] += 1;
+            non_finite.0 += usize::from(!x.is_finite());
+            non_finite.1 += usize::from(!y.is_finite());
             worst = worst.max(ordered(x.to_bits()).abs_diff(ordered(y.to_bits())));
+            let steps = ordered(x.to_bits() & 0xffff_0000).abs_diff(ordered(y.to_bits() & 0xffff_0000)) >> 16;
+            beyond_one_bf16 += usize::from(steps > 1);
+            beyond_eight_bf16 += usize::from(steps > 8);
+            if steps > worst_bf16 {
+                worst_bf16 = steps;
+                worst_bf16_at = Some((lane, at, *x, *y));
+            }
             if first.is_none() {
                 first = Some((at, *x, *y));
             }
@@ -1235,9 +1320,37 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
     let (at, x, y) = first?;
     // Two ulp: the width of one bf16 rounding either way.
     let class = if worst <= 2 { "numeric" } else { "structural" };
+    // Lanes as runs of "differs"/"agrees": `lanes=[0..64 differ]`,
+    // `lanes=[0..3 agree, 3..64 differ]`, and so on.
+    let lane_runs = {
+        let mut runs: Vec<String> = Vec::new();
+        let mut start = 0usize;
+        while start < per_lane.len() {
+            let differs = per_lane[start] > 0;
+            let mut end = start;
+            while end < per_lane.len() && (per_lane[end] > 0) == differs {
+                end += 1;
+            }
+            let width = walked[start].len().max(1);
+            let mean = per_lane[start..end].iter().sum::<usize>() as f64
+                / ((end - start) as f64 * width as f64);
+            runs.push(if differs {
+                format!("{start}..{end} differ ({:.0}% of cells)", mean * 100.0)
+            } else {
+                format!("{start}..{end} agree")
+            });
+            start = end;
+        }
+        runs.join(", ")
+    };
+    let worst_bf16_line = worst_bf16_at.map_or(String::new(), |(lane, at, x, y)| {
+        format!("  worst_bf16=lane {lane} #{at} (walk={x}, body={y}, {worst_bf16} bf16 step(s))")
+    });
     Some(format!(
         "differs at #{at} (walk={x} {:#010x}, body={y} {:#010x})  n_diff={differing}/{total}  \
-         max_ulp={worst}  class={class}",
+         max_ulp={worst}  class={class}  beyond_1_bf16={beyond_one_bf16}  \
+         beyond_8_bf16={beyond_eight_bf16}  non_finite(walk,body)={non_finite:?}  \
+         lanes=[{lane_runs}]{worst_bf16_line}",
         x.to_bits(),
         y.to_bits(),
     ))

@@ -110,8 +110,13 @@ fn cuda_budgets(
     patch_ceilings: (Option<u32>, Option<u32>),
 ) -> engine::Budgets {
     let page_size = opts.kv_page_size.unwrap_or(16).max(1);
-    // No CUDA knob states a context ceiling, so this is the contract's default.
-    let max_context = engine::Budgets::default().max_context;
+    // `max_model_len` when stated; else the contract's default. Beyond
+    // capping one sequence, this sizes the arming pass's synthetic lanes, so
+    // it decides which decode widths get an armed body on a small pool.
+    let max_context = opts
+        .max_model_len
+        .unwrap_or_else(|| engine::Budgets::default().max_context)
+        .max(page_size);
     let pages_per_slot = max_context.div_ceil(page_size).max(1);
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),

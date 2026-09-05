@@ -112,9 +112,8 @@ const TAIL: &str = r#"
 request_timeout = "120s"
 # submit_deadline          = "50ms"
 # silence_timeout          = "30s"
-# frame_size               = 2     # guest contract: moving it means
-# frame_submit_depth       = 3     # re-measuring frame_submit_depth
-# frame_dispatch_depth     = 2
+# frame_size               = 2     # guest contract: the submit depth is
+# frame_dispatch_depth     = 2     # derived from it, not a key of its own
 # max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
 
 [sandbox]
@@ -159,6 +158,10 @@ gpu_mem_utilization = 0.90
 # kv_page_size    = 32      # omit: the engine derives one
 # max_total_pages = 4096    # omit: derived from gpu_mem_utilization
 # max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256
+# max_model_len   = 4096    # the most tokens one sequence may hold; omit for
+#                           # 4096. State it at what you serve: a decode body
+#                           # for n lanes is armed only when the pool holds
+#                           # n x max_model_len tokens
 "#;
 
 // `test` as well as the cfg pair, for the same reason the CUDA block carries

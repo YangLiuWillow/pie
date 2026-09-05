@@ -74,6 +74,14 @@ pub struct CudaNativeEngineOptions {
     /// Recurrent-state seats (KDA/GDN and conv state), one sequence in flight
     /// each; absent takes 256. A model with no state rows seats by pages alone.
     pub max_state_slots: Option<u32>,
+    /// The most tokens one sequence may hold; absent takes the engine's
+    /// contract default (4096). It is also what the arming pass sizes every
+    /// synthetic lane at: a decode body for `n` lanes is armed only if the
+    /// pool can hold `n × max_model_len` tokens, so a deployment whose
+    /// `max_total_pages` is small next to `max_forward_requests × 4096 /
+    /// kv_page_size` gets no wide decode bodies — and runs its wide steps
+    /// eagerly — until this is stated at what it actually serves.
+    pub max_model_len: Option<u32>,
     /// HARD pin on the prefill token budget the forward step is built for.
     ///
     /// **Omit to let the memory planner choose.** Setting it collapses that
@@ -172,6 +180,7 @@ impl Default for CudaNativeEngineOptions {
             kv_page_size: None,
             max_total_pages: None,
             max_state_slots: None,
+            max_model_len: None,
             max_forward_tokens: None,
             max_forward_requests: None,
             device: String::new(),

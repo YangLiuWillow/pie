@@ -949,6 +949,16 @@ impl Bodies {
         }
     }
 
+    /// Drop a captured body and refuse its key: the arming pass's verdict on
+    /// a body whose golden disagreed, when the load is told to keep going
+    /// without it rather than fail. The key then walks eagerly for the life
+    /// of the load, as a refused key does.
+    pub fn body_drop(&mut self, key: &BodyKey) -> bool {
+        let dropped = self.map.drop_body(key);
+        self.body_refuse(key.clone());
+        dropped
+    }
+
     /// One more body the load armed: pinned in the map and counted ([`BodyTally::armed_at_load`]).
     /// Answers whether the key held a body to arm.
     pub fn body_armed(&mut self, key: &BodyKey) -> bool {
@@ -1189,6 +1199,31 @@ impl Bodies {
             return Ok(());
         }
         let grids = launch_grids(at, run);
+        // `PIE_GRID_TRACE=<substring of a key>`: per launch of a matching
+        // body, the live span beside the ceiling grid it was captured at —
+        // the two numbers a replay disagreeing with its walk is read by.
+        if let Some(wanted) = std::env::var_os("PIE_GRID_TRACE")
+            && key.to_string().contains(wanted.to_string_lossy().as_ref())
+        {
+            let windows = run.windows();
+            let mut seen = 0usize;
+            for region in 0..at.compiled.template().len() as u32 {
+                if at.island(region) {
+                    continue;
+                }
+                let template = &at.compiled.template()[region as usize];
+                for at_run in 0..windows.runs(region) {
+                    let span = windows.at(region, at_run).span();
+                    let (rows, lanes) = grids.get(seen).copied().unwrap_or((0, 0));
+                    seen += 1;
+                    eprintln!(
+                        "[grid-trace] {key} r{region} run{at_run} nodes={:?} phase={:?} stream={} \
+                         live=({}, {}) grid=({rows}, {lanes})",
+                        template.nodes, template.phase, template.stream, span.rows, span.lanes
+                    );
+                }
+            }
+        }
         let _ = self.insert_body(key, Body {
             script: steps.into_boxed_slice(),
             grids,
@@ -1271,6 +1306,15 @@ impl BodyMap {
     /// key was newly refused, so the caller counts compositions not traffic.
     fn refuse(&mut self, key: BodyKey) -> bool {
         self.bodies_refused.insert(key)
+    }
+
+    /// Forget a captured body outright — the arming pass's own verdict on a
+    /// body its golden disagreed with, before the map is sealed and before
+    /// anything launched it. Answers whether a body was there to drop.
+    fn drop_body(&mut self, key: &BodyKey) -> bool {
+        self.body_order.retain(|held| held != key);
+        self.body_warm.remove(key);
+        self.bodies.remove(key).is_some()
     }
 
     /// Is the map closed?
@@ -1461,8 +1505,17 @@ fn walk_capture_units(
     units: Units,
     regions: Regions,
 ) -> Result<()> {
+    // `PIE_CAPTURE_SERIAL=1`: a diagnostic arm that captures on ONE stream
+    // — the fork/join event points the stream pass baked are not walked —
+    // while still writing the capture down. A body that agrees with its
+    // walk only under this flag names the stream plan as what it disagrees
+    // over.
+    let serial_capture = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_CAPTURE_SERIAL").is_some())
+    };
     let mut cursor = match (streams, at.lanes) {
-        (Streams::Forked, Some(lanes)) => Cursor::across(place, lanes),
+        (Streams::Forked, Some(lanes)) if !serial_capture => Cursor::across(place, lanes),
         _ => at.serial(place),
     };
     // Whether this walk is being written down is separate from whether it
