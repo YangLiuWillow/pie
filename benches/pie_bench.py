@@ -773,6 +773,15 @@ async def run(args: argparse.Namespace):
                 "report_timing": args.report_timing,
                 "report_arrivals": args.report_arrivals,
                 "wait_for_start": args.defer_start,
+                # How many requests this harness holds open beside this one,
+                # so a loop that changes its policy in a crowd
+                # (`dflash-speculative-bench`'s gate) can know it is one of
+                # several. `--extra-input batch_concurrency=N` overrides.
+                **(
+                    {"batch_concurrency": args.concurrency}
+                    if getattr(args, "concurrency", 0) and args.concurrency > 0
+                    else {}
+                ),
                 # `--extra-input KEY=VALUE`: fields the inferlet under
                 # `--inferlet-dir` reads that this harness does not know
                 # (`k` for a speculative loop).
