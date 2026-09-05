@@ -954,6 +954,11 @@ impl Shell {
                 // quiet device to read a refusal as final.
                 let landed = self.device.synchronize();
                 if let Err(why) = fired.and(landed) {
+                    // Every refusal, not just the last, so a boot log lists
+                    // which compositions this deployment cannot arm.
+                    if std::env::var_os("PIE_ARM_TRACE").is_some() {
+                        eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                    }
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
                     faulted = true;
                     break;

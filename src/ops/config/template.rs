@@ -112,9 +112,8 @@ const TAIL: &str = r#"
 request_timeout = "120s"
 # submit_deadline          = "50ms"
 # silence_timeout          = "30s"
-# frame_size               = 2     # guest contract: moving it means
-# frame_submit_depth       = 3     # re-measuring frame_submit_depth
-# frame_dispatch_depth     = 2
+# frame_size               = 2     # guest contract: the submit depth is
+# frame_dispatch_depth     = 2     # derived from it, not a key of its own
 # max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
 
 [sandbox]

@@ -278,6 +278,14 @@ pub(crate) fn wave_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
 }
 
+/// Microseconds since the first trace line — every `[wave-trace]` line
+/// carries one, so a dump reads as a timeline (ramp, steady state, collapse)
+/// and not just as a sequence.
+pub(crate) fn wave_trace_us() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros()
+}
+
 /// Whether this request lowered its mask to rows the host can see. A mask
 /// lives on its lane (`Lane::mask`), so this asks whether any lane carries one.
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
@@ -2999,7 +3007,8 @@ impl BatchScheduler {
                     // in-flight-depth or seal hold.
                     if wave_trace() {
                         eprintln!(
-                            "[wave-trace] enq fire={} framed={} mask={} masks={} stm={} pipe={}",
+                            "[wave-trace] t={}us enq fire={} framed={} mask={} masks={} stm={} pipe={}",
+                            wave_trace_us(),
                             launch.logical_fire_id,
                             launch.frame.is_some(),
                             launch.request.has_user_mask,
@@ -3743,7 +3752,7 @@ impl BatchScheduler {
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
                 if wave_trace() {
-                    eprintln!("[wave-trace] rider fire={untracked}");
+                    eprintln!("[wave-trace] t={}us rider fire={untracked}", wave_trace_us());
                 }
                 vec![vec![untracked]]
             } else {
@@ -3756,7 +3765,8 @@ impl BatchScheduler {
                     FramePlan::Dispatch(waves) => {
                         if wave_trace() {
                             eprintln!(
-                                "[wave-trace] dispatch waves={:?}",
+                                "[wave-trace] t={}us dispatch waves={:?}",
+                                wave_trace_us(),
                                 waves.iter().map(Vec::len).collect::<Vec<_>>()
                             );
                         }
