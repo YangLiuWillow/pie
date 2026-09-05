@@ -435,6 +435,55 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
+    /// The staging half of [`Session::stage_into`] without the encode: the
+    /// gates, this fire's cursors and cells, the airborne mark. A
+    /// [`super::launch::Batch`] then encodes this instance's stages beside
+    /// its program's other instances, reading each stage through
+    /// [`Session::prepared_mut`]. The instance's own scratch is left alone —
+    /// its values live in the batch's pool this fire. Answers the refusal
+    /// when a gate refuses, `None` when the instance is airborne.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::stage_into`].
+    pub fn prepare_airborne(
+        &mut self,
+        compiled: &Compiled,
+        plan: &ExecPlan,
+    ) -> Result<Option<Fired>> {
+        if self.airborne.is_some() {
+            return Err(Fault::program(
+                "program::session",
+                "this instance already has a pass airborne: a second staging would \
+                 refresh the cells and the status word of stages whose first pass \
+                 has not been read, so both fires would report the second's verdict \
+                 and the first's commit would be lost",
+            ));
+        }
+        if let Some(refused) = self.gate(compiled, plan)? {
+            return Ok(Some(refused));
+        }
+        let cursors = self.cursors_now();
+        let mut launched = Vec::with_capacity(compiled.stages.len());
+        for (index, stage) in compiled.stages.iter().enumerate() {
+            let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            if stage.regions.is_empty() {
+                continue;
+            }
+            prepared.refresh_cells(&self.rings, &cursors)?;
+            launched.push(index);
+        }
+        self.airborne = Some(launched);
+        Ok(None)
+    }
+
+    /// One stage's prepared tables, for a batch to lay down and encode.
+    pub fn prepared_mut(&mut self, stage: usize) -> Option<&mut Prepared> {
+        self.prepared.get_mut(stage).and_then(Option::as_mut)
+    }
+
     /// The verdict half of an attached fire: read the status every staged
     /// stage left behind, and commit the cursors if they all agree. Caller
     /// must wait for the command buffer to land first, or this reads the

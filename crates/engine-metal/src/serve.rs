@@ -2936,6 +2936,7 @@ impl Shell {
         fire_lane: &[u32],
         owed: &mut Vec<u64>,
     ) -> Result<()> {
+        let mut staged = Vec::with_capacity(prepared.attachments.len());
         for attached in prepared
             .attachments
             .iter()
@@ -3158,17 +3159,28 @@ impl Shell {
                 )?;
             }
 
-            match self.programs.stage_into(frame, attached.instance)? {
-                crate::program::Launched::Airborne => owed.push(attached.instance),
+            staged.push(attached.instance);
+        }
+        // Every attached epilogue of this step, staged together: instances of
+        // one program share a lane table and a scratch pool, and each of the
+        // program's regions is one dispatch for all of them, rather than one
+        // per instance in a row.
+        let mut refusal = None;
+        for (instance, launched) in self.programs.stage_batched(&self.device, frame, &staged)? {
+            match launched {
+                crate::program::Launched::Airborne => owed.push(instance),
                 // Nothing was encoded and the verdict is already final. The
                 // gate asked about readiness before the forward ran, so a
                 // refusal here is a poisoned instance or a race the fence was
                 // supposed to have closed — either way it is this fire's
                 // fault and not the next one's.
                 crate::program::Launched::Refused(fired) => {
-                    return Err(refused(&fired, attached.instance));
+                    refusal.get_or_insert((instance, fired));
                 }
             }
+        }
+        if let Some((instance, fired)) = refusal {
+            return Err(refused(&fired, instance));
         }
         Ok(())
     }
