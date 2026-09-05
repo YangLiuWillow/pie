@@ -8,6 +8,7 @@ pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod kimi_k3;
 pub mod media;
+pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
 pub mod template;

@@ -463,6 +463,28 @@ impl TowerDims {
     }
 }
 
+const SLIDING: Option<u32> = Some(2_048);
+
+/// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
+/// trunk — six taps, a narrower MLP, theta 1e6, and the mask id 4 — read
+/// out through gemma's softcapped head (monotone, so the argmax is the
+/// head's own). The head is a Qwen3-style stack whatever the target.
+pub const GEMMA4_26B_A4B_DFLASH: dflash::Head = dflash::Head {
+    taps: &[1, 6, 11, 17, 22, 27],
+    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 5_632,
+    theta: 1_000_000.0,
+    block: 16,
+    mask_token: 4,
+    proposals_from: 1,
+    conv: None,
+    readout: dflash::Readout::Argmax,
+    attn_bias: false,
+};
+
 struct Dims {
     tower: Option<TowerDims>,
     /// Whether this text is DiffusionGemma's: the self-conditioning block
@@ -655,7 +677,7 @@ impl Model {
     /// (`gemma-4-26B-A4B-it-DFlash`). A separate row for the same reason.
     pub fn a4b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
-        d.dflash = Some(&dflash::GEMMA4_26B_A4B_DFLASH);
+        d.dflash = Some(&GEMMA4_26B_A4B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 

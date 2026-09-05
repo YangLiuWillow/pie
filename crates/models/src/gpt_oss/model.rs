@@ -109,13 +109,33 @@ struct Dims {
     norm_eps: f32,
 }
 
+/// `z-lab/gpt-oss-20b-DFlash`: block eight, EIGHT layers all full attention
+/// (bidirectional over the block), the trunk's own 64 × 64 query geometry
+/// over 8 kv heads — the first head whose attention is not 32 / 8 / 128 —
+/// biased projections, theta 150000, mask id 200000.
+pub const GPTOSS_20B_DFLASH: dflash::Head = dflash::Head {
+    taps: &[1, 6, 11, 16, 21],
+    windows: &[None; 8],
+    q_heads: 64,
+    kv_heads: 8,
+    head_dim: 64,
+    inter: 7_680,
+    theta: 150_000.0,
+    block: 8,
+    mask_token: 200_000,
+    proposals_from: 1,
+    conv: None,
+    readout: dflash::Readout::Argmax,
+    attn_bias: true,
+};
+
 impl Model {
     /// The 20B with z-lab's block drafter overlaid (`gpt-oss-20b-DFlash`).
     pub fn b20_dflash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut m = Model::b20(w, experts, kv, tp);
         let dense = crate::dense(w);
         m.dflash = Some(DFlash::declare(
-            &dflash::GPTOSS_20B_DFLASH,
+            &GPTOSS_20B_DFLASH,
             "aux",
             &dflash::Trunk {
                 hidden: u64::from(m.hidden),

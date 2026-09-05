@@ -1,7 +1,10 @@
-//! **DFlash, DFlash2 and DSpark** — the published block drafters, as model
-//! text any family can carry. A head's own numbers are a [`Head`] descriptor
-//! (one constant per published checkpoint); the family names one and spells
-//! the four hooks the module doc lists. This file is everything behind them.
+//! **THE DFLASH BLOCK DRAFTER**, in its three published shapes — v1 (DFlash),
+//! v2 (DFlash2: dynamic convolutions and a candidate selector) and DSpark (the
+//! v1 backbone with a markov readout) — as model text any family can carry.
+//! Nothing here names a trunk or a checkpoint: a head's own numbers arrive as
+//! a [`Head`] the family states beside its own dims, and the trunk's as a
+//! [`Trunk`]. The family spells the four hooks the module doc lists; this file
+//! is everything behind them.
 
 use checkpoint::contract::{Expr, TensorType};
 use checkpoint_dsl::{Builder, Error, extents};
@@ -25,7 +28,7 @@ pub struct Trunk {
     pub tp: u32,
 }
 
-/// **A DFlash block drafter** — the shape `z-lab/Qwen3.6-27B-DFlash` ships.
+/// **A DFlash block drafter**: a decoder stack of its own, fed by the trunk.
 ///
 /// Where a chained head fuses one hidden state with one token embedding and
 /// runs a single block chained a token at a time, this fuses
@@ -49,17 +52,16 @@ pub struct Trunk {
 ///   chained head splits its two-wide bank.
 /// * **The attention is NOT the family's site.** Its `q_proj` is
 ///   `[q_heads·head_dim, hidden]` with no gate to split off, and its
-///   geometry is its own (32 q heads, 8 kv, head dim 128 against a 27B
-///   trunk's 24/4/256). Its kv rows live in the trunk's page-id space at
-///   their own plane width — a space admits rows of any width.
-/// * **The v1 pass is bidirectional over the block.** Four of five layers
-///   are sliding-window; the mask that makes the block see itself is the
-///   guest's (`inputs.mask()`), not the model's. v2's layers are all sliding
-///   and causal inside the block, and it needs no mask.
+///   geometry is its own ([`Head`]'s, not the trunk's). Its kv rows live in
+///   the trunk's page-id space at their own plane width — a space admits
+///   rows of any width.
+/// * **A v1 pass is bidirectional over the block.** Its full-attention
+///   layers see the whole block, and the mask that makes them is the guest's
+///   (`inputs.mask()`), not the model's. v2's layers are all sliding and
+///   causal inside the block, and it needs no mask.
 pub struct DFlash {
     /// Which trunk layers feed the fusion, in the order their banks are
-    /// sliced out of `fc` — `[1, 16, 31, 46, 61]` for the v1 head, `[5, 19,
-    /// 33, 47, 61]` for v2.
+    /// sliced out of `fc` ([`Head::taps`]).
     pub taps: Vec<u32>,
     /// One `[hidden, hidden]` column slice of the stored `fc.weight` per tap.
     pub fc: Vec<Weight>,
@@ -183,11 +185,12 @@ pub struct DraftAttn {
 }
 
 /// **A PUBLISHED HEAD'S OWN NUMBERS** — its `config.json`. Every field is a
-/// fact about one published checkpoint and not a knob, so the heads this
-/// build knows are constants ([`QWEN36_27B_DFLASH`] and the rest below) and
-/// a family names one when it declares the drafter. Nothing here is about
-/// the trunk: a head's taps index the trunk's layers, and its `hidden` is
-/// the trunk's, read off [`Trunk`].
+/// fact about one published checkpoint and not a knob, so a head is a
+/// constant — stated by the FAMILY that carries it, beside the dims of the
+/// trunk it was trained against (`qwen_3::model::QWEN36_27B_DFLASH` and the
+/// like), never here: this module knows the shape of a head and no head in
+/// particular. Nothing in one is about the trunk: a head's taps index the
+/// trunk's layers, and its `hidden` is the trunk's, read off [`Trunk`].
 #[derive(Debug, PartialEq)]
 pub struct Head {
     /// The trunk layers whose hidden states feed the fusion, in the order
@@ -217,7 +220,7 @@ pub struct Head {
     pub conv: Option<Conv>,
     pub readout: Readout,
     /// Whether the head's attention projections carry biases
-    /// (`attention_bias`): the gpt-oss head does, as its trunk does.
+    /// (`attention_bias`) — a head trained against a biased trunk does.
     pub attn_bias: bool,
 }
 
@@ -244,126 +247,6 @@ pub enum Readout {
     /// acceptance only (the verify is what makes a round lossless).
     Markov { rank: u32, top_k: u32 },
 }
-
-const SLIDING: Option<u32> = Some(2_048);
-
-/// `z-lab/Qwen3.6-27B-DFlash`: block sixteen, four sliding layers then one
-/// full, bidirectional over the block, argmax readout.
-pub const QWEN36_27B_DFLASH: Head = Head {
-    taps: &[1, 16, 31, 46, 61],
-    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
-    q_heads: 32,
-    kv_heads: 8,
-    head_dim: 128,
-    inter: 17_408,
-    theta: 10_000_000.0,
-    block: 16,
-    mask_token: 248_070,
-    proposals_from: 1,
-    conv: None,
-    readout: Readout::Argmax,
-    attn_bias: false,
-};
-
-/// `z-lab/Qwen3.8-27B-DFlash2`: block eight, five sliding layers causal
-/// inside the block, a dynamic convolution around every sublayer, a
-/// candidate selector for the readout. Heads, widths, window, theta and the
-/// mask token are v1's.
-pub const QWEN38_27B_DFLASH2: Head = Head {
-    taps: &[5, 19, 33, 47, 61],
-    windows: &[SLIDING; 5],
-    q_heads: 32,
-    kv_heads: 8,
-    head_dim: 128,
-    inter: 17_408,
-    theta: 10_000_000.0,
-    block: 8,
-    mask_token: 248_070,
-    proposals_from: 1,
-    conv: Some(Conv { taps: 2, group: 16 }),
-    readout: Readout::Selector { rank: 256, top_k: 16 },
-    attn_bias: false,
-};
-
-/// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five plain
-/// layers) with every layer full attention and the block bidirectional, a
-/// block of fifteen whose EVERY row proposes (row `i` predicts position
-/// `i + 1`, the anchor's row included), its own mask id, and a markov bigram
-/// head for the readout. Its confidence head is not read yet.
-pub const QWEN38_27B_DSPARK: Head = Head {
-    taps: &[1, 16, 31, 46, 61],
-    windows: &[None; 5],
-    q_heads: 32,
-    kv_heads: 8,
-    head_dim: 128,
-    inter: 17_408,
-    theta: 10_000_000.0,
-    block: 15,
-    mask_token: 248_200,
-    proposals_from: 0,
-    conv: None,
-    readout: Readout::Markov { rank: 256, top_k: 16 },
-    attn_bias: false,
-};
-
-/// `z-lab/Qwen3.6-35B-A3B-DFlash`: the v1 shape against the 40-layer
-/// mixture — eight taps, six layers (five sliding at 4096, then one full),
-/// hidden 2048, MLP 6144, its own mask id.
-pub const QWEN36_35B_A3B_DFLASH: Head = Head {
-    taps: &[1, 6, 11, 16, 22, 27, 32, 37],
-    windows: &[Some(4_096), Some(4_096), Some(4_096), Some(4_096), Some(4_096), None],
-    q_heads: 32,
-    kv_heads: 8,
-    head_dim: 128,
-    inter: 6_144,
-    theta: 10_000_000.0,
-    block: 16,
-    mask_token: 248_077,
-    proposals_from: 1,
-    conv: None,
-    readout: Readout::Argmax,
-    attn_bias: false,
-};
-
-/// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
-/// trunk — six taps, a narrower MLP, theta 1e6, and the mask id 4 — read
-/// out through gemma's softcapped head (monotone, so the argmax is the
-/// head's own). The head is a Qwen3-style stack whatever the target.
-pub const GEMMA4_26B_A4B_DFLASH: Head = Head {
-    taps: &[1, 6, 11, 17, 22, 27],
-    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
-    q_heads: 32,
-    kv_heads: 8,
-    head_dim: 128,
-    inter: 5_632,
-    theta: 1_000_000.0,
-    block: 16,
-    mask_token: 4,
-    proposals_from: 1,
-    conv: None,
-    readout: Readout::Argmax,
-    attn_bias: false,
-};
-
-/// `z-lab/gpt-oss-20b-DFlash`: block eight, EIGHT layers all full attention
-/// (bidirectional over the block), the trunk's own 64 × 64 query geometry
-/// over 8 kv heads — the first head whose attention is not 32 / 8 / 128 —
-/// biased projections, theta 150000, mask id 200000.
-pub const GPTOSS_20B_DFLASH: Head = Head {
-    taps: &[1, 6, 11, 16, 21],
-    windows: &[None; 8],
-    q_heads: 64,
-    kv_heads: 8,
-    head_dim: 64,
-    inter: 7_680,
-    theta: 150_000.0,
-    block: 8,
-    mask_token: 200_000,
-    proposals_from: 1,
-    conv: None,
-    readout: Readout::Argmax,
-    attn_bias: true,
-};
 
 impl DFlash {
     /// Declare the head's planes under `prefix` (`aux` for an `--aux`
