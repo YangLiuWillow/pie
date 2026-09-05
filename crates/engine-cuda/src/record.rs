@@ -949,6 +949,16 @@ impl Bodies {
         }
     }
 
+    /// Drop a captured body and refuse its key: the arming pass's verdict on
+    /// a body whose golden disagreed, when the load is told to keep going
+    /// without it rather than fail. The key then walks eagerly for the life
+    /// of the load, as a refused key does.
+    pub fn body_drop(&mut self, key: &BodyKey) -> bool {
+        let dropped = self.map.drop_body(key);
+        self.body_refuse(key.clone());
+        dropped
+    }
+
     /// One more body the load armed: pinned in the map and counted ([`BodyTally::armed_at_load`]).
     /// Answers whether the key held a body to arm.
     pub fn body_armed(&mut self, key: &BodyKey) -> bool {
@@ -1271,6 +1281,15 @@ impl BodyMap {
     /// key was newly refused, so the caller counts compositions not traffic.
     fn refuse(&mut self, key: BodyKey) -> bool {
         self.bodies_refused.insert(key)
+    }
+
+    /// Forget a captured body outright — the arming pass's own verdict on a
+    /// body its golden disagreed with, before the map is sealed and before
+    /// anything launched it. Answers whether a body was there to drop.
+    fn drop_body(&mut self, key: &BodyKey) -> bool {
+        self.body_order.retain(|held| held != key);
+        self.body_warm.remove(key);
+        self.bodies.remove(key).is_some()
     }
 
     /// Is the map closed?

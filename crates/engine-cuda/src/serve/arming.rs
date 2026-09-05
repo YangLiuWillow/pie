@@ -33,6 +33,9 @@ struct Synthetic {
     captures: bool,
     /// Which real slot lends its page arithmetic.
     slot: u32,
+    /// This lane's kv pages, packed from the front of the pool (see
+    /// [`Shell::synthetic_lanes_with`]); empty means the slot's own block.
+    pages: Vec<u32>,
     /// [`Seated::held`]. `Some(0)` for every enumerated lane; only
     /// [`Shell::golden_real`] writes anything else.
     held: Option<u32>,
@@ -514,6 +517,24 @@ impl Shell {
         media: &[(u32, u32)],
     ) -> Vec<Synthetic> {
         let slots = self.held.len().max(1) as u32;
+        // Packed page tables, not the slots' own blocks. A slot's block sits
+        // at `slot × pages_per_slot`, so a synthetic of `n` lanes admitted by
+        // block would demand a watermark of `n × context` tokens — a decode
+        // body for 64 lanes needed the pool to hold 64 × 4096 tokens, and on
+        // a pool sized for what the deployment serves that refused every
+        // wide decode body and left those steps walking eagerly. A tabled
+        // lane demands one past its highest page, so the whole synthetic
+        // asks only for the pages its rows actually fill.
+        // `PIE_ARM_PACKED=1` turns the packed tables on. Off, every lane
+        // keeps its slot's block. Packed is the right sizing, and stays a
+        // diagnostic arm only because the wide mixed bodies it newly arms —
+        // `b512[c{0,2,3,5}:512 + c{1,4}:64]` and the mask+adapter
+        // three-class keys on gemma-4-E4B — fail the golden (their replay
+        // differs from the eager walk at every readout cell), and a load
+        // with the golden on would then refuse to boot.
+        let packed = std::env::var_os("PIE_ARM_PACKED").is_some();
+        let page_size = u64::from(self.pools.paging().page_size).max(1);
+        let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let taps = self.patch_seat.map_or(0, |seat| seat.embed_taps) as usize;
         let weight_taps = self
@@ -539,6 +560,16 @@ impl Shell {
                 // Real slots, round-robin: the page arithmetic needs a slot
                 // that exists.
                 slot: (at as u32) % slots,
+                pages: if !packed {
+                    Vec::new()
+                } else {
+                    let pages = u64::from(rows).div_ceil(page_size).max(1);
+                    let table: Vec<u32> = (next_page..next_page + pages)
+                        .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
+                        .collect();
+                    next_page += pages;
+                    table
+                },
                 held: Some(0),
                 media: media
                     .get(at)
@@ -622,7 +653,7 @@ impl Shell {
                     word: lane.word,
                     tokens: &lane.tokens,
                 },
-                pages: &[],
+                pages: &lane.pages,
                 // A synthetic owns every row it reads: `Some(0)` for every
                 // enumerated lane, begins its slot's sequence.
                 // [`Shell::golden_real`] is the one caller that states
@@ -820,6 +851,13 @@ impl Shell {
         if ceiling == 0 {
             return Ok(());
         }
+        if std::env::var_os("PIE_ARM_TRACE").is_some() {
+            // What `c<n>` names in every line below: the requests that land
+            // in each class, the first being its representative.
+            for (class, requests) in self.landing.iter().enumerate() {
+                eprintln!("[arm-trace] class c{class}: {requests:?}");
+            }
+        }
         // No lattice: one key per row count. A lattice: each point at the
         // lane count a real fire of that rung can bring.
         let points: Vec<LatticePoint> = if self.budget.buckets.is_empty() {
@@ -976,10 +1014,25 @@ impl Shell {
                 && let Some(key) = key.as_ref()
                 && self.cache.holds_body(key)
             {
-                self.golden(key, &owned)?;
-                // And the same verdict over a composition a caller could
-                // have brought, which the synthetic cannot state.
-                self.golden_real(key, &owned)?;
+                let verdict = self
+                    .golden(key, &owned)
+                    // And the same verdict over a composition a caller could
+                    // have brought, which the synthetic cannot state.
+                    .and_then(|()| self.golden_real(key, &owned));
+                if let Err(fault) = verdict {
+                    // `PIE_GOLDEN_SKIP=1`: a diagnostic arm. The body that
+                    // disagreed is dropped and its key refused — the key walks
+                    // eagerly, as an unarmed one does — and the load goes on,
+                    // so one boot lists EVERY body the golden disagrees with
+                    // instead of stopping at the first. Off, the first
+                    // disagreement fails the load, as it always has.
+                    if std::env::var_os("PIE_GOLDEN_SKIP").is_some() {
+                        eprintln!("[arm-trace] golden refused {key}: {fault}");
+                        self.cache.body_drop(key);
+                    } else {
+                        return Err(fault);
+                    }
+                }
             }
             if key.is_some_and(|key| self.cache.body_armed(&key)) {
                 armed += 1;
