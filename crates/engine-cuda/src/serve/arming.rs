@@ -1098,14 +1098,26 @@ impl Shell {
             mut targets,
             mut unfireable,
         } = found;
-        // Ascending bucket, so the budget is spent on the smallest first.
-        targets.sort_by_key(|(bucket, _)| *bucket);
-        // Top rung first, then ascending: a scratch slab grow retires the
-        // old block, so firing the largest rung first forces that growth
-        // before anything is recorded.
-        if let Some(top) = targets.last().map(|(bucket, _)| *bucket) {
-            targets.sort_by_key(|(bucket, _)| (*bucket != top, *bucket));
-        }
+        // The order the budget is spent in, since a belt or the ceiling's
+        // spare can stop the pass before the end. Top rung first: a scratch
+        // slab grow retires the old block, so firing the largest rung first
+        // forces that growth before anything is recorded. Then by kind —
+        // decode bodies serve every steady step of a generation, at every
+        // width, so they go before the prefill, mixed and fragmented bodies
+        // a ramp or a tail runs through — and ascending bucket within a
+        // kind, so a budget buys the most bodies.
+        let top = targets.iter().map(|(bucket, _)| *bucket).max();
+        let rank = |kind: Kind| match kind {
+            Kind::Decode => 0u8,
+            Kind::Ensemble => 1,
+            Kind::Mixed => 2,
+            Kind::Prefill => 3,
+            Kind::Fragmented => 4,
+            Kind::Tower => 5,
+        };
+        targets.sort_by_key(|(bucket, target)| {
+            (Some(*bucket) != top, rank(target.kind()), *bucket)
+        });
         if targets.is_empty() {
             return Ok(());
         }
@@ -1119,15 +1131,34 @@ impl Shell {
 
         let mut never = 0usize;
         let mut never_from = 0u32;
-        // Which of the two bounds stopped the pass.
+        // Which of the bounds stopped the pass.
         let mut belted = false;
+        let mut starved: Option<u64> = None;
+        // A body is driver memory outside the elastic pool, so every byte
+        // captured is a byte the pool's next recalibration no longer finds.
+        // The pass stops while the ceiling still holds the pool's declared
+        // growth plus a margin for what only traffic grows — scratch slabs
+        // for regions and streams the synthetics never touched, workspaces,
+        // the commit rounding of one wide fire — sixteen map units, or two
+        // bodies at the going price if that is more.
+        let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
         for (bucket, target) in targets {
             // Bytes, not seats: the live census reads device memory spent.
             let spent = self.cache.body_stats();
-            if spent.census.bodies >= record::MAX_BODIES || spent.census.bytes >= self.bodies_mem {
+            let spare = self.pools.spare_bytes().unwrap_or(u64::MAX);
+            let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
+            let margin = price.max(unit_margin);
+            let headroom = spare < margin;
+            if spent.census.bodies >= record::MAX_BODIES
+                || spent.census.bytes >= self.bodies_mem
+                || headroom
+            {
                 if never == 0 {
                     never_from = bucket;
                     belted = spent.census.bodies >= record::MAX_BODIES;
+                    if headroom && !belted && spent.census.bytes < self.bodies_mem {
+                        starved = Some(spare);
+                    }
                 }
                 never += 1;
                 continue;
@@ -1229,7 +1260,17 @@ impl Shell {
         } else {
             Seal::Partial { never }
         };
+        // The pool beside the bodies: what the deployment declared, what is
+        // mapped, and what the card still has beyond the two.
+        let pool_line = format!(
+            "pool declared {} MiB, high water {} MiB, committed {} MiB, spare under the ceiling {} MiB",
+            self.pools.declared_bytes() >> 20,
+            self.pools.high_water_bytes() >> 20,
+            self.pools.committed_bytes() >> 20,
+            self.pools.spare_bytes().map_or(0, |bytes| bytes >> 20),
+        );
         let report = Armed {
+            pool_line,
             wanted,
             armed,
             kinds: tally,
@@ -1243,6 +1284,7 @@ impl Shell {
             never,
             never_from,
             belted,
+            starved,
             declines: stats.tally.declines,
             refusals: stats.tally.refusals,
             seal,
@@ -1590,6 +1632,8 @@ mod tests {
 /// What the arming pass did, as the boot line says it.
 #[derive(Debug, Clone)]
 pub struct Armed {
+    /// The elastic pool beside the bodies, for the boot line.
+    pub pool_line: String,
     pub wanted: usize,
     pub armed: usize,
     /// Per [`Kind`], `(armed, wanted)`.
@@ -1604,6 +1648,9 @@ pub struct Armed {
     pub never: usize,
     pub never_from: u32,
     pub belted: bool,
+    /// `Some(bytes)` when the card's spare — beyond the elastic pool's own
+    /// growth — is what stopped the pass, with the spare it stopped at.
+    pub starved: Option<u64>,
     pub declines: u64,
     pub refusals: u64,
     /// What the seal stands for. See [`Seal`].
@@ -1651,6 +1698,7 @@ impl core::fmt::Display for Armed {
         if self.unweighed > 0 {
             write!(f, " ({} unweighed)", self.unweighed)?;
         }
+        write!(f, " ({})", self.pool_line)?;
         if let Some(why) = &self.last_refusal {
             write!(f, " (last refusal: {why})")?;
         }
@@ -1671,7 +1719,14 @@ impl core::fmt::Display for Armed {
                 f,
                 " [sealed partial: {never} key(s) never attempted, {} at bucket {}, and they \
                  walk eagerly for the life of this load]",
-                if self.belted { "record::MAX_BODIES" } else { "[engine] bodies_mem" },
+                match self.starved {
+                    Some(spare) => format!(
+                        "the ceiling's spare ran out ({} MiB left beyond the elastic pool's growth)",
+                        spare >> 20
+                    ),
+                    None if self.belted => "record::MAX_BODIES".to_string(),
+                    None => "[engine] bodies_mem".to_string(),
+                },
                 self.never_from,
             )?,
             Seal::Partial { .. } => write!(f, " [sealed partial: a key refused]")?,

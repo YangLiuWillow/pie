@@ -469,6 +469,54 @@ impl Pools {
             .sum()
     }
 
+    /// Bytes every arena holds at the watermarks the deployment declared — every kv page and state slot of the paging — summed as [`Pools::commit_to`] would. What the supply may still be asked to map is this less [`Pools::committed_bytes`].
+    #[must_use]
+    pub fn declared_bytes(&self) -> u64 {
+        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        let slots = self.paging.slots;
+        let page_size = self.paging.page_size;
+        // Per arena, rounded up to the map unit: a mapping is whole units,
+        // so a hundred arenas each a few bytes past one are a hundred more.
+        let unit = self.pool.map_unit_bytes().max(1);
+        let mapped = |bytes: u64| bytes.div_ceil(unit).saturating_mul(unit);
+        let rows: u64 = self
+            .rows
+            .iter()
+            .zip(self.shapes.iter())
+            .map(|(planes, shape)| {
+                (0..planes.len())
+                    .map(|at| mapped(watermark_bytes(shape, at, pages, slots, page_size)))
+                    .sum::<u64>()
+            })
+            .sum();
+        let pooled: u64 = self
+            .pooled
+            .iter()
+            .map(|row| {
+                mapped(row.watermark_bytes(pages, page_size)).saturating_mul(row.planes.len() as u64)
+            })
+            .sum();
+        rows.saturating_add(pooled)
+    }
+
+    /// Bytes one mapping takes — see [`PhysicalPool::map_unit_bytes`].
+    #[must_use]
+    pub fn map_unit_bytes(&self) -> u64 {
+        self.pool.map_unit_bytes()
+    }
+
+    /// What the card can still give outside this supply without starving it of the growth its declaration still allows — see [`PhysicalPool::spare_bytes`]. # Errors: the device query's.
+    pub fn spare_bytes(&self) -> Result<u64> {
+        // The higher of the declaration and the high water: a pass that
+        // already mapped past the declaration (a synthetic wider than the
+        // deployment states) must be able to get back there too.
+        let reserve = self
+            .declared_bytes()
+            .max(self.high_water_bytes())
+            .saturating_sub(self.committed_bytes());
+        self.pool.spare_bytes(reserve)
+    }
+
     /// Bytes actually under a mapping right now.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {

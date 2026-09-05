@@ -179,6 +179,45 @@ impl PhysicalPool {
         self.hard_pages
     }
 
+    /// Bytes one mapping takes: what a commit of any size is rounded up to,
+    /// per arena.
+    #[must_use]
+    pub const fn map_unit_bytes(&self) -> u64 {
+        self.handle_bytes
+    }
+
+    /// Bytes this process may still take under the operator's ceiling beyond
+    /// `reserve` — what the supply has yet to map on its way to the
+    /// watermarks the deployment declared or has already reached:
+    /// `(ceiling - used - floor) - reserve`, zero when the reserve alone
+    /// needs everything left. The arming pass reads it before each body it
+    /// captures: graph execs are allocated by the driver outside this pool,
+    /// so every byte they take is a byte the pool's next `recalibrate` no
+    /// longer finds.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] with no runtime, [`Fault::Device`] for the query.
+    pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+
+            let (mut free, mut total) = (0usize, 0usize);
+            // SAFETY: two live locals; the call only writes them.
+            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+            crate::device::ctx::check("cudaMemGetInfo", asked)?;
+            // The operator's ceiling, not the card's: what this process may
+            // still take is what `recalibrate` would hand the pool next.
+            Ok(budget_bytes(free as u64, total as u64, self.utilization).saturating_sub(reserve))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = reserve;
+            Err(Fault::Runtimeless)
+        }
+    }
+
     /// Logical pages under a mapping right now.
     #[must_use]
     pub const fn committed_pages(&self) -> u64 {
