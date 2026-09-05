@@ -83,6 +83,7 @@ async def main() -> int:
     ap.add_argument("--langs", default="rust,py,js")
     ap.add_argument("--n", default="1,8,32", help="concurrency levels, comma-separated")
     ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument("--prompt", default=None, help="override the programs' prompt (prefill-heavy runs)")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--json", action="store_true", help="also print the rows as JSON on stderr")
@@ -102,6 +103,8 @@ async def main() -> int:
                 await client.install_program(wasm, manifest, force_overwrite=True)
                 iid = inferlet_id(manifest)
                 args = {**INPUTS.get(which, {"prompt": "The capital of France is"}), "max_tokens": a.max_tokens}
+                if a.prompt is not None:
+                    args["prompt"] = a.prompt
                 try:
                     await run_one(client, iid, args, a.timeout)  # warm-up: compile + program cache
                 except Exception as e:
