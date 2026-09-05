@@ -17,10 +17,11 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 28, 0x7c99_21ae_b678_f7ec),
-    // 44 -> 45 -> 46: `ptir_m1_runtime.metal` (spliced into every emitted
-    // kernel) grew the threadgroup-partitioned op walk, then the partitioned
-    // nucleus and top-k selections, so every emitted byte moved each time.
-    ("metal", 46, 0xbbfb_949d_4091_ed62),
+    // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
+    // emitted kernel) grew the threadgroup-partitioned op walk, then the
+    // partitioned selections, then the streamed form's level reductions and
+    // its own `ptir_m4` kernels joined the table.
+    ("metal", 47, 0x74bc_eef5_8e19_8649),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

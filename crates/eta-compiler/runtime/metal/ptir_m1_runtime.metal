@@ -1438,6 +1438,321 @@ inline void m1_topk_select_mt(
   }
 }
 
+// ── The streamed form's multi-dispatch shapes ──────────────────────────────
+//
+// A streamed region runs each op as its own dispatch over a grid; a fixed-tree
+// reduction cannot cross threadgroups inside one dispatch, so it runs as one
+// dispatch per level. Level `l` reads what level `l - 1` wrote and folds every
+// 32-wide chunk of it pairwise from offset 16 down — the same chunks, the same
+// lanes, the same folds as `m1_reduce_float`, so the result is bit-identical;
+// only which thread folds which chunk changes. Levels alternate between two
+// planes of `temporary`, pitched per row by the level-0 chunk count.
+
+inline uint m4_reduce_count(uint last, uint level) {
+  uint count = last;
+  for (uint l = 0; l < level; ++l) count = (count + 31u) / 32u;
+  return count;
+}
+
+inline void m4_reduce_level(
+    uint tag,
+    const device uchar* input,
+    device uchar* output,
+    device uchar* temporary,
+    const M1ValueDesc d,
+    uint level,
+    uint gtid,
+    uint gthreads) {
+  const uint count = m4_reduce_count(d.last, level);
+  const uint chunks = (count + 31u) / 32u;
+  const uint pitch = (d.last + 31u) / 32u;
+  const bool is_float = d.dtype == 0;
+  const bool is_signed = d.dtype == 1;
+  if (count == 0u) {  // an empty row: the identity, once
+    if (gtid == 0) {
+      for (uint row = 0; row < d.rows; ++row) {
+        if (is_float) {
+          reinterpret_cast<device float*>(output)[row] =
+              tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY);
+        } else if (is_signed) {
+          reinterpret_cast<device int*>(output)[row] =
+              tag == 0x30 ? 0 : (tag == 0x31 ? INT_MIN : INT_MAX);
+        } else {
+          reinterpret_cast<device uint*>(output)[row] = tag == 0x32 ? UINT_MAX : 0u;
+        }
+      }
+    }
+    return;
+  }
+  const bool final_level = chunks == 1u;
+  // `count == 1` only at level 0 with a one-element row: the serial walk
+  // copies it through `work` untouched, so it is copied, not folded.
+  if (count == 1u) {
+    for (uint row = gtid; row < d.rows; row += gthreads) {
+      const uint src_index = level == 0u ? row * d.last : row * pitch;
+      const device uint* src_bits = level == 0u
+          ? reinterpret_cast<const device uint*>(input)
+          : reinterpret_cast<const device uint*>(temporary) + ((level - 1u) & 1u) * d.rows * pitch;
+      reinterpret_cast<device uint*>(output)[row] = src_bits[src_index];
+    }
+    return;
+  }
+  device uint* plane_bits = reinterpret_cast<device uint*>(temporary);
+  const device uint* src_plane = level == 0u
+      ? reinterpret_cast<const device uint*>(input)
+      : plane_bits + ((level - 1u) & 1u) * d.rows * pitch;
+  device uint* dst_plane = plane_bits + (level & 1u) * d.rows * pitch;
+  const uint src_pitch = level == 0u ? d.last : pitch;
+  for (uint index = gtid; index < d.rows * chunks; index += gthreads) {
+    const uint row = index / chunks;
+    const uint chunk = index - row * chunks;
+    const device uint* src = src_plane + row * src_pitch;
+    if (is_float) {
+      const float identity = tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY);
+      float lanes[32];
+      for (uint lane = 0; lane < 32; ++lane) {
+        const uint at = chunk * 32u + lane;
+        lanes[lane] = at < count ? as_type<float>(src[at]) : identity;
+      }
+      for (uint offset = 16; offset > 0; offset >>= 1) {
+        for (uint lane = 0; lane < offset; ++lane) {
+          if (tag == 0x30) lanes[lane] += lanes[lane + offset];
+          else if (tag == 0x31) lanes[lane] = m1_canonical_max(lanes[lane], lanes[lane + offset]);
+          else lanes[lane] = m1_canonical_min(lanes[lane], lanes[lane + offset]);
+        }
+      }
+      if (final_level) reinterpret_cast<device float*>(output)[row] = lanes[0];
+      else dst_plane[row * pitch + chunk] = as_type<uint>(lanes[0]);
+    } else {
+      uint identity;
+      if (tag == 0x30) identity = 0u;
+      else if (is_signed) identity = tag == 0x31 ? uint(INT_MIN) : uint(INT_MAX);
+      else identity = tag == 0x31 ? 0u : UINT_MAX;
+      uint lanes[32];
+      for (uint lane = 0; lane < 32; ++lane) {
+        const uint at = chunk * 32u + lane;
+        lanes[lane] = at < count ? src[at] : identity;
+      }
+      for (uint offset = 16; offset > 0; offset >>= 1) {
+        for (uint lane = 0; lane < offset; ++lane) {
+          if (tag == 0x30) lanes[lane] += lanes[lane + offset];
+          else if (is_signed) {
+            const int left = int(lanes[lane]), right = int(lanes[lane + offset]);
+            lanes[lane] = uint(tag == 0x31 ? max(left, right) : min(left, right));
+          } else {
+            lanes[lane] = tag == 0x31 ? max(lanes[lane], lanes[lane + offset])
+                                      : min(lanes[lane], lanes[lane + offset]);
+          }
+        }
+      }
+      if (final_level) reinterpret_cast<device uint*>(output)[row] = lanes[0];
+      else dst_plane[row * pitch + chunk] = lanes[0];
+    }
+  }
+}
+
+// Two tree levels in one dispatch. Threadgroup `group` owns level-`level`
+// chunks `[group * T, (group + 1) * T)` — one per thread — and folds each
+// exactly as `m4_reduce_level` does, into threadgroup memory. `T` being a
+// multiple of 32, the group also owns whole level-`level + 1` chunks (its
+// own 32-runs of results), so threads `0 .. T / 32` fold those too and write
+// them, saving a dispatch. A group narrower than a multiple of 32 folds one
+// level. Same chunks, same lanes, same folds: bit-identical to the serial
+// tree. Rows are walked in a uniform outer loop.
+inline void m4_reduce_two_levels(
+    uint tag,
+    const device uchar* input,
+    device uchar* output,
+    device uchar* temporary,
+    const M1ValueDesc d,
+    uint level,
+    uint group,
+    uint groups,
+    uint tid,
+    uint threads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  const uint count = m4_reduce_count(d.last, level);
+  const uint chunks = (count + 31u) / 32u;
+  const uint pitch = (d.last + 31u) / 32u;
+  const bool is_float = d.dtype == 0;
+  const bool is_signed = d.dtype == 1;
+  if (count <= 1u) {
+    // An empty or one-element row: `m4_reduce_level` has the two arms.
+    if (group == 0) m4_reduce_level(tag, input, output, temporary, d, level, tid, threads);
+    return;
+  }
+  uint identity;
+  if (is_float) identity = as_type<uint>(tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY));
+  else if (tag == 0x30) identity = 0u;
+  else if (is_signed) identity = tag == 0x31 ? uint(INT_MIN) : uint(INT_MAX);
+  else identity = tag == 0x31 ? 0u : UINT_MAX;
+  device uint* plane_bits = reinterpret_cast<device uint*>(temporary);
+  const device uint* src_plane = level == 0u
+      ? reinterpret_cast<const device uint*>(input)
+      : plane_bits + ((level - 1u) & 1u) * d.rows * pitch;
+  const uint src_pitch = level == 0u ? d.last : pitch;
+  threadgroup uint* tg = reinterpret_cast<threadgroup uint*>(tgbuf);
+  // Level `level + 1` is folded here only if it exists and the width allows.
+  const bool second = chunks > 1u && (threads % 32u) == 0u;
+  const uint next_chunks = (chunks + 31u) / 32u;
+  for (uint row = 0; row < d.rows; ++row) {
+    const device uint* src = src_plane + row * src_pitch;
+    const uint chunk = group * threads + tid;
+    uint folded = identity;
+    if (chunk < chunks) {
+      if (is_float) {
+        float lanes[32];
+        for (uint lane = 0; lane < 32; ++lane) {
+          const uint at = chunk * 32u + lane;
+          lanes[lane] = at < count ? as_type<float>(src[at]) : as_type<float>(identity);
+        }
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+          for (uint lane = 0; lane < offset; ++lane) {
+            if (tag == 0x30) lanes[lane] += lanes[lane + offset];
+            else if (tag == 0x31) lanes[lane] = m1_canonical_max(lanes[lane], lanes[lane + offset]);
+            else lanes[lane] = m1_canonical_min(lanes[lane], lanes[lane + offset]);
+          }
+        }
+        folded = as_type<uint>(lanes[0]);
+      } else {
+        uint lanes[32];
+        for (uint lane = 0; lane < 32; ++lane) {
+          const uint at = chunk * 32u + lane;
+          lanes[lane] = at < count ? src[at] : identity;
+        }
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+          for (uint lane = 0; lane < offset; ++lane) {
+            if (tag == 0x30) lanes[lane] += lanes[lane + offset];
+            else if (is_signed) {
+              const int left = int(lanes[lane]), right = int(lanes[lane + offset]);
+              lanes[lane] = uint(tag == 0x31 ? max(left, right) : min(left, right));
+            } else {
+              lanes[lane] = tag == 0x31 ? max(lanes[lane], lanes[lane + offset])
+                                        : min(lanes[lane], lanes[lane + offset]);
+            }
+          }
+        }
+        folded = lanes[0];
+      }
+    }
+    if (!second) {
+      if (chunk < chunks) {
+        if (chunks == 1u) reinterpret_cast<device uint*>(output)[row] = folded;
+        else plane_bits[(level & 1u) * d.rows * pitch + row * pitch + chunk] = folded;
+      }
+      continue;
+    }
+    tg[tid] = folded;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Level `level + 1`: thread `t < T / 32` folds the group's 32-run `t`.
+    if (tid < threads / 32u) {
+      const uint next_chunk = group * (threads / 32u) + tid;
+      if (next_chunk < next_chunks) {
+        uint out_bits;
+        if (is_float) {
+          float lanes[32];
+          for (uint lane = 0; lane < 32; ++lane) {
+            const uint at = next_chunk * 32u + lane;
+            lanes[lane] = at < chunks ? as_type<float>(tg[tid * 32u + lane]) : as_type<float>(identity);
+          }
+          for (uint offset = 16; offset > 0; offset >>= 1) {
+            for (uint lane = 0; lane < offset; ++lane) {
+              if (tag == 0x30) lanes[lane] += lanes[lane + offset];
+              else if (tag == 0x31) lanes[lane] = m1_canonical_max(lanes[lane], lanes[lane + offset]);
+              else lanes[lane] = m1_canonical_min(lanes[lane], lanes[lane + offset]);
+            }
+          }
+          out_bits = as_type<uint>(lanes[0]);
+        } else {
+          uint lanes[32];
+          for (uint lane = 0; lane < 32; ++lane) {
+            const uint at = next_chunk * 32u + lane;
+            lanes[lane] = at < chunks ? tg[tid * 32u + lane] : identity;
+          }
+          for (uint offset = 16; offset > 0; offset >>= 1) {
+            for (uint lane = 0; lane < offset; ++lane) {
+              if (tag == 0x30) lanes[lane] += lanes[lane + offset];
+              else if (is_signed) {
+                const int left = int(lanes[lane]), right = int(lanes[lane + offset]);
+                lanes[lane] = uint(tag == 0x31 ? max(left, right) : min(left, right));
+              } else {
+                lanes[lane] = tag == 0x31 ? max(lanes[lane], lanes[lane + offset])
+                                          : min(lanes[lane], lanes[lane + offset]);
+              }
+            }
+          }
+          out_bits = lanes[0];
+        }
+        if (next_chunks == 1u) reinterpret_cast<device uint*>(output)[row] = out_bits;
+        else plane_bits[((level + 1u) & 1u) * d.rows * pitch + row * pitch + next_chunk] = out_bits;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// The f32 argmax in two dispatches: every threadgroup folds its grid-strided
+// share of a row to one candidate in `temporary` (order-free: the combine is
+// a strict total order), then one threadgroup folds the candidates.
+inline void m4_argmax_partial(
+    const device uchar* input,
+    device uchar* temporary,
+    const M1ValueDesc d,
+    uint group,
+    uint groups,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  device M1ArgmaxCandidate* partials = reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
+  const device float* values = reinterpret_cast<const device float*>(input);
+  const uint span = groups * nthreads;
+  const uint begin = group * nthreads + tid;
+  for (uint row = 0; row < d.rows; ++row) {
+    const uint base = row * d.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = begin; i < d.last; i += span) {
+      const float value = values[base + i];
+      best = m1_argmax_combine(best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads)
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) partials[row * groups + group] = tgbuf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+inline void m4_argmax_final(
+    const device uchar* temporary,
+    device uchar* output,
+    const M1ValueDesc d,
+    uint groups,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  const device M1ArgmaxCandidate* partials =
+      reinterpret_cast<const device M1ArgmaxCandidate*>(temporary);
+  device int* result = reinterpret_cast<device int*>(output);
+  for (uint row = 0; row < d.rows; ++row) {
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint j = tid; j < groups; j += nthreads)
+      best = m1_argmax_combine(best, partials[row * groups + j]);
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads)
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) result[row] = int(tgbuf[0].index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 // The grouped region hands a lane a whole threadgroup. Every op whose
 // elements are independent is partitioned across it by `ptir_m1_execute_part`;
 // the two fixed-tree reductions are partitioned by a walk that reproduces the

@@ -32,6 +32,9 @@ pub enum KernelKind {
     Readiness = 3,
     /// The commit control kernel.
     Commit = 4,
+    /// The streamed launch: one kernel per fused region, dispatched once per
+    /// step of its table over a grid of (element blocks × lanes).
+    Streamed = 5,
 }
 
 /// One emitted kernel, or the reason it could not be emitted — the record
@@ -53,6 +56,11 @@ pub struct EmittedKernel {
     /// The refusal text when emission failed, empty on success; copied across
     /// the C boundary for a human to read.
     pub error: String,
+    /// `KernelKind::Streamed` only: the dispatches this kernel is run as, in
+    /// order, each `node << 8 | kind` per `crate::codegen::metal::streamed`.
+    /// Empty for every other kind.
+    #[serde(default)]
+    pub steps: Vec<u32>,
 }
 
 impl EmittedKernel {
@@ -77,6 +85,7 @@ impl EmittedKernel {
             } else {
                 entry_name
             },
+            steps: Vec::new(),
             source,
             error,
         }
@@ -258,6 +267,24 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
 
     // Shared across a group, so named by emitter version, not program; sit
     // at region 0 (the per-program single-lane forms are region 1).
+    for (region_index, region) in stage.fused.regions.iter().enumerate() {
+        let entry = format!("ptir_m4_{signature}_r{region_index}");
+        let (emitted, steps) =
+            match crate::codegen::metal::emit_streamed_region(&entry, stage, region) {
+                Ok((source, steps)) => (Ok(source), steps),
+                Err(error) => (Err(error), Vec::new()),
+            };
+        let mut kernel = EmittedKernel::new(
+            KernelKind::Streamed,
+            stage_index,
+            region_index,
+            entry,
+            emitted,
+        );
+        kernel.steps = steps;
+        out.push(kernel);
+    }
+
     let version = crate::codegen::metal::METAL_M1_EMITTER_VERSION;
     let ready = format!("ptir_m3_generic_ready_v{version}");
     let source = crate::codegen::metal::emit_grouped_readiness(&ready);

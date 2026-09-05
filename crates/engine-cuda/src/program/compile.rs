@@ -902,7 +902,7 @@ impl Cache {
                 continue;
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
-                Slot::Kernel { source, entry } => (source, entry),
+                Slot::Kernel { source, entry, .. } => (source, entry),
                 // Not a `continue`: this shell has no fallback path for a
                 // declined region, so skipping it would silently drop the
                 // region's ops while the plan still budgets their scratch —
