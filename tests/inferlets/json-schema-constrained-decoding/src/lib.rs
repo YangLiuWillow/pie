@@ -70,6 +70,9 @@ async fn main(input: Input) -> Result<String> {
                     .into(),
             );
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let page_size = kv_page_size();
     let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);

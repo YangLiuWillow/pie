@@ -14,7 +14,7 @@ from rich.panel import Panel
 from .console import console
 import typer
 
-INFERLET_VERSION = "0.4.0"
+INFERLET_VERSION = "0.5.0"
 
 
 def get_template(name: str) -> Template:
@@ -100,27 +100,27 @@ def generate_rust_lib(project_dir: Path, name: str) -> None:
 
 def generate_rust_cargo_toml(project_dir: Path, name: str) -> None:
     """Generate the Cargo.toml file for Rust inferlet."""
-    # Use crates.io path if not in dev mode
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        inferlet_dep = f'{{ path = "{pie_sdk}/rust/inferlet" }}'
+    # A checkout of pie (or `PIE_SDK=<checkout>`) supplies the crate by path;
+    # anywhere else, the published one.
+    pie_sdk = os.environ.get("PIE_SDK")
+    roots = [Path(pie_sdk)] if pie_sdk else [Path.cwd(), *Path.cwd().parents]
+    for root in roots:
+        crate = root / "crates" / "inferlet"
+        if (crate / "Cargo.toml").exists():
+            inferlet_dep = f'{{ path = "{os.path.relpath(crate.resolve(), project_dir.resolve())}" }}'
+            break
     else:
-        # Try to find relative paths
-        current_dir = Path.cwd()
-        for parent in [current_dir] + list(current_dir.parents):
-            if (parent / "sdk" / "rust" / "inferlet").exists():
-                rel_path = (
-                    parent.relative_to(project_dir.parent)
-                    if project_dir.parent != parent
-                    else Path("..")
-                )
-                inferlet_dep = f'{{ path = "{rel_path}/sdk/rust/inferlet" }}'
-                break
-        else:
-            inferlet_dep = f'"{INFERLET_VERSION}"'
+        inferlet_dep = f'"{INFERLET_VERSION}"'
 
     template = get_template("rust/Cargo.toml.template")
     content = template.substitute(name=name, inferlet_dep=inferlet_dep)
     (project_dir / "Cargo.toml").write_text(content)
+
+
+def generate_py_main(project_dir: Path, name: str) -> None:
+    """Generate main.py for a Python project."""
+    template = get_template("python/main.py.template")
+    (project_dir / "main.py").write_text(template.substitute(name=name))
 
 
 def generate_pie_toml(project_dir: Path, name: str, language: str) -> None:
@@ -139,6 +139,7 @@ def handle_create_command(
     name: str,
     rust: bool = False,
     output: Optional[Path] = None,
+    python: bool = False,
 ) -> None:
     """Handle the `bakery create` command.
 
@@ -170,7 +171,23 @@ def handle_create_command(
     # Create project directory
     project_dir.mkdir(parents=True)
 
-    language = "rust" if rust else "typescript"
+    language = "rust" if rust else "python" if python else "typescript"
+
+    if python:
+        generate_py_main(project_dir, project_name)
+        generate_pie_toml(project_dir, project_name, language)
+        console.print(
+            Panel(
+                f"Created Python inferlet project: [bold]{project_name}[/bold]\n\n"
+                f"[blue]{project_dir}/main.py[/blue]\n"
+                f"[blue]{project_dir}/Pie.toml[/blue]",
+                title="[green]✅ Project Created[/green]",
+                border_style="green",
+            )
+        )
+        console.print("\n[bold]Next steps:[/bold]")
+        console.print(f"   bakery build {project_dir} -o {project_name.replace('-', '_')}.wasm")
+        return
 
     if rust:
         # Generate Rust project
@@ -212,18 +229,4 @@ def handle_create_command(
         )
 
         console.print("\n[bold]Next steps:[/bold]")
-        console.print(f"   cd {project_dir}")
-        console.print("   npm install")
-        console.print(f"   bakery build . -o {project_name}.wasm")
-
-        # Say plainly that this scaffold cannot run a model, rather than
-        # letting the user find out when they go looking for a `generate`.
-        console.print(
-            "\n[yellow]Note:[/yellow] the JavaScript SDK does not expose the "
-            "forward-pass surface yet, so this scaffold reads model info and "
-            "builds a prompt but does not generate text."
-        )
-        console.print(
-            "   For anything that runs a model, drop [bold]--ts[/bold] and "
-            "scaffold in Rust."
-        )
+        console.print(f"   bakery build {project_dir} -o {project_name.replace('-', '_')}.wasm")

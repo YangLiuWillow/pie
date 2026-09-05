@@ -9,13 +9,28 @@ over that single bound model (no ``model`` resource handle)::
     print(model.name())
 
 The tokenizer surface (encode/decode/vocabs/special_tokens/split_regex)
-moved to the sibling :mod:`inferlet.tokenizer` module when the WIT split
-separated the two interfaces.
+lives in the sibling :mod:`inferlet.tokenizer` module and is re-exported
+here, so ``model.encode``/``model.decode`` read off ``model`` in inferlet
+source the way they do in the Rust SDK.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from wit_world.imports import model as _model
+
+ForwardKind = _model.ForwardKind
+
+from .tokenizer import (  # noqa: F401 — re-exported, as the Rust `model` module does
+    encode,
+    decode,
+    vocabs,
+    split_regex,
+    special_tokens,
+    token_bytes,
+    tokens_with_prefix,
+)
 
 
 def name() -> str:
@@ -33,9 +48,58 @@ def default_system_speculation() -> bool:
     return _model.default_system_speculation()
 
 
+def mtp_depth() -> int:
+    """The draft head's chain depth; 0 for a model with no draft head."""
+    return _model.mtp_depth()
+
+
+def submit_deadline_us() -> int:
+    """How long a pipeline may hold a frame's wait-set, in microseconds."""
+    return _model.submit_deadline_us()
+
+
 def is_linear() -> bool:
-    """Whether the bound model carries irreversibly-folded recurrent state."""
-    return _model.is_linear()
+    """Whether the bound model carries irreversibly-folded recurrent state
+    (a ``RECURRENT`` or ``HYBRID`` pass kind)."""
+    return _model.pass_kind() in (ForwardKind.RECURRENT, ForwardKind.HYBRID)
+
+
+@dataclass(frozen=True)
+class BlockDrafter:
+    """What a guest needs to seed a BLOCK drafter's draft pass."""
+
+    rows: int
+    mask_token: int
+    bidirectional: bool
+    proposals_from: int
+
+
+def draft_block() -> BlockDrafter | None:
+    """The bound model's block drafter, if it carries one."""
+    d = _model.draft_block()
+    return BlockDrafter(d.rows, d.mask_token, d.bidirectional, d.proposals_from) if d is not None else None
+
+
+@dataclass(frozen=True)
+class CanvasShape:
+    """The canvas a diffusion model denoises: tokens per block, the trunk's
+    hidden width, and how many ``(id, weight)`` self-conditioning taps a
+    canvas row takes."""
+
+    length: int
+    hidden: int
+    self_cond_taps: int
+
+
+def canvas() -> CanvasShape | None:
+    """The diffusion canvas; ``None`` for every other pass kind."""
+    c = _model.canvas()
+    return CanvasShape(c.length, c.hidden, c.self_cond_taps) if c is not None else None
+
+
+def run_ahead_window() -> int:
+    """Fires one lane may have submitted and not yet taken."""
+    return _model.run_ahead_window()
 
 
 def pass_kind() -> _model.ForwardKind:

@@ -90,6 +90,9 @@ async fn main(input: Input) -> Result<String> {
                     .into(),
             );
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let slots = ws
         .reserve(pool_pages)

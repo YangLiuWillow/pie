@@ -88,6 +88,7 @@ fn rs_for_sequence() -> Result<Vec<RsWorkingSet>> {
         model::ForwardKind::Recurrent => Err(
             "classifier-free guidance has no recurrent-only path: it reads two KV streams".into(),
         ),
+        model::ForwardKind::Diffusion => Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into()),
     }
 }
 

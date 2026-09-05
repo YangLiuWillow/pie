@@ -189,6 +189,9 @@ async fn main(input: Input) -> Result<Output> {
                 "this program has no recurrent-only path (it samples off a KV cache)".into(),
             );
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let page_size = kv_page_size();
 

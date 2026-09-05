@@ -121,6 +121,9 @@ async fn main(input: Input) -> Result<String> {
                         .into(),
                 );
             }
+            model::ForwardKind::Diffusion => {
+                return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            }
         };
         let rs_prefix = &rs_ws[..rs_ws.len().min(1)];
         let slots = ws.reserve(pool_pages).context("ws.reserve")?;

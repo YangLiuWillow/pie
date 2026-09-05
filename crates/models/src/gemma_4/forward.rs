@@ -16,6 +16,8 @@ pub struct Facts {
     pub captures_scores: bool,
     /// The rows are a block drafter's proposal — see [`Facts::block_draft`].
     pub block_draft: bool,
+    /// The rows are a block-diffusion denoiser's canvas — see [`Facts::denoise`].
+    pub denoise: bool,
 }
 
 impl Facts {
@@ -60,6 +62,14 @@ impl Facts {
     pub fn block_draft() -> Predicate {
         Predicate::fact(6)
     }
+
+    /// Rows read as a block-diffusion denoiser's canvas: their embedding
+    /// is the denoiser's input (`Model::self_cond`), not the encoder's. Bit
+    /// 7 of the fact word; split on only by a text that declares the block,
+    /// so an autoregressive Gemma 4 never carves a class for it.
+    pub fn denoise() -> Predicate {
+        Predicate::fact(7)
+    }
 }
 
 impl Classify for Facts {
@@ -72,6 +82,7 @@ impl Classify for Facts {
             drafts: r.drafts(),
             captures_scores: r.captures_scores(),
             block_draft: r.drafts_a_block(),
+            denoise: r.denoise(),
         }
     }
 
@@ -83,6 +94,7 @@ impl Classify for Facts {
             | (u64::from(self.drafts) << 4)
             | (u64::from(self.captures_scores) << 5)
             | (u64::from(self.block_draft) << 6)
+            | (u64::from(self.denoise) << 7)
     }
 }
 
@@ -226,6 +238,39 @@ impl ForwardHybrid for Model {
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
 
+        // The denoiser's input (see `model::SelfCond`): the self-conditioning
+        // MLP over the previous step's soft embedding, added to the token
+        // embedding, then a scale-free norm over the sum. The soft embedding
+        // is a weighted gather of the guest's taps; zero weights make the
+        // MLP exactly zero and leave only the norm, which is the
+        // reference's own first step. Encode rows pass through untouched.
+        if let Some(sc) = &m.self_cond {
+            let (den, enc) = y.split(&Facts::denoise());
+            let (input_den, _) = inputs.split(&Facts::denoise());
+            let soft = ops::layout::embed_weighted(
+                &input_den.self_cond_rows(sc.taps),
+                &input_den.self_cond_weights(sc.taps),
+                &m.embed,
+                m.vocab,
+            ) * (m.hidden as f32).sqrt();
+            let normed = ops::elemwise::rmsnorm(&soft, &sc.pre_norm, sc.norm_eps);
+            let act = ops::linear::mlp_geglu_tanh_packed(
+                &ops::linear::matmul(&normed, &sc.gate_up),
+                sc.inter,
+            );
+            let signal = ops::linear::matmul(&act, &sc.down);
+            let signal = if m.tp > 1 {
+                ops::collective::all_reduce(&signal)
+            } else {
+                signal
+            };
+            let den = ops::elemwise::rmsnorm_no_scale(
+                &ops::elemwise::residual_add(&den, &signal),
+                m.hidden,
+                sc.norm_eps,
+            );
+            y = Value::merge(vec![den, enc]);
+        }
         // **THE BLOCK DRAFTER'S ROWS LEAVE HERE**, before the first layer,
         // and are the drafter's input as they are: the reference feeds it
         // the target's `embed_tokens`, which for gemma carries the √hidden

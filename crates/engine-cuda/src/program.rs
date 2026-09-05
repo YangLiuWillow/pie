@@ -121,6 +121,9 @@ pub struct Plane {
     /// [`wave`]. Long-lived so its device arena is a high-water mark rather
     /// than per-boundary; empty between batches.
     wave: Wave,
+    /// A tensor-parallel follower's plane: sessions bind as shadows of
+    /// rank 0's (see [`Session`]).
+    shadow: bool,
 }
 
 impl Default for Plane {
@@ -144,7 +147,25 @@ impl Plane {
             next_instance: 1,
             staged: Vec::new(),
             wave: Wave::default(),
+            shadow: false,
         }
+    }
+
+    /// Makes every session bound from now on a tensor-parallel follower's:
+    /// its host-ended rings are rank 0's endpoints, read and never written.
+    pub fn set_shadow(&mut self, shadow: bool) {
+        self.shadow = shadow;
+    }
+
+    /// Every instance's predicted cursors, in instance order. The ranks of a
+    /// tensor-parallel group compare these after a frame: a difference is a
+    /// gate that decided differently on one rank.
+    #[must_use]
+    pub fn predictions(&self) -> Vec<(u64, Vec<Cursor>)> {
+        self.instances
+            .iter()
+            .map(|(id, bound)| (*id, bound.session.predictions()))
+            .collect()
     }
 
     /// What the compile tiers have been doing.
@@ -239,6 +260,7 @@ impl Plane {
             seeds,
             extents,
             endpoints,
+            self.shadow,
         ) {
             Ok(session) => session,
             Err(why) => {
@@ -677,6 +699,22 @@ impl Plane {
         // Seats go back; a shared ring's `Arc` is also held by the engine's
         // channel table, so it survives this drop.
         release_seats(&bound.endpoints);
+        // The program's last instance takes its stage scratch with it. The
+        // program itself stays (its modules are the compile cache, and a
+        // re-run binds warm), but its per-extents batches are per-lane
+        // scratch a canvas program measures in hundreds of megabytes, and a
+        // handful of distinct guest programs left resident would exhaust
+        // the device. Nothing recorded holds these addresses — bodies are
+        // keyed by the model's composition, not by a guest program — and a
+        // `Buffer` frees through `cudaFree`, which waits for any launch
+        // still reading it. The next bind cuts the batch again.
+        let orphaned = !self
+            .instances
+            .values()
+            .any(|other| other.program_id == bound.program_id);
+        if orphaned && let Some(program) = self.programs.get_mut(&bound.program_id) {
+            program.batches.clear();
+        }
         Ok(())
     }
 

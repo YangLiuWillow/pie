@@ -134,6 +134,14 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="If set, write each test's captured inferlet output to "
                              "<dir>/<test-name>.txt (one file per test, multiple "
                              "run_inferlet calls concatenated with separators).")
+    # Attach to a `pie serve` that is already up instead of booting the
+    # embedded engine: the model is then whatever that server was started
+    # with, and every other option about the engine is ignored. What it buys
+    # is iteration speed -- a boot is minutes, a test is seconds -- and a
+    # harness that needs no `pie-server` wheel.
+    parser.add_argument("--attach", default=None, metavar="URI",
+                        help="Run against a live `pie serve` at URI (e.g. ws://127.0.0.1:8080) "
+                             "instead of booting the embedded engine")
     return parser
 
 
@@ -182,10 +190,18 @@ def _build_guests():
     the run kept failing with `pipeline is closed` and the blame went to the
     engine for two sessions.
 
+    The Python and JavaScript twins (`<name>-py`, `<name>-js`) are not in the
+    cargo workspace; they are componentized with `bakery build` into the flat
+    `<dir>/target/<name>.wasm` the artifact search below knows. Same rule:
+    a twin whose SDK was fixed must not be tested in its old shape -- which
+    is exactly what happened once the SDK ports landed, when two rounds of
+    "E2E after the refactor" ran against wasm built that morning.
+
     Skipped when `PIE_INFERLETS_NO_BUILD` is set, for runs against artifacts
     that were built elsewhere (a cross-compiled or vendored guest).
     """
     import os
+    import shutil
     import subprocess
 
     if os.environ.get("PIE_INFERLETS_NO_BUILD"):
@@ -202,8 +218,77 @@ def _build_guests():
         # have usable artifacts, and a stale run says more than no run.
         print("Guests: BUILD FAILED -- testing whatever artifacts exist")
         print(result.stderr.strip()[-2000:])
+    else:
+        print("Guests: built from source")
+
+    twins = sorted(
+        d
+        for d in INFERLETS_DIR.iterdir()
+        if d.is_dir() and d.name.endswith(("-py", "-js")) and (d / "Pie.toml").exists()
+    )
+    if not twins:
         return
-    print("Guests: built from source")
+    # `bakery` on PATH, else the module the harness's own interpreter can see
+    # (`uv run` / a venv with the bakery package installed).
+    bakery = [shutil.which("bakery")] if shutil.which("bakery") else [sys.executable, "-m", "bakery"]
+    probe = subprocess.run([*bakery, "--help"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        print(f"Guests: bakery not available -- {len(twins)} Python/JS twin(s) tested as previously built")
+        return
+    failed = []
+    for d in twins:
+        out = d / "target" / f"{d.name.replace('-', '_')}.wasm"
+        r = subprocess.run([*bakery, "build", str(d), "-o", str(out)], capture_output=True, text=True)
+        if r.returncode != 0:
+            failed.append(d.name)
+            print(f"Guests: {d.name} BUILD FAILED -- testing whatever artifact exists")
+            print((r.stderr or r.stdout).strip()[-1500:])
+    built = len(twins) - len(failed)
+    print(f"Guests: {built} Python/JS twin(s) built with bakery" + (f", {len(failed)} failed" if failed else ""))
+
+
+def find_artifact(name: str) -> tuple[Path, Path]:
+    """The `.wasm` and `Pie.toml` of the curated inferlet `name` -- the
+    NEWEST artifact among the places a build leaves one.
+
+    Rust workspace artifacts live under this directory's target/ (release or
+    debug); the member paths are fallbacks for inferlets built outside the
+    curated workspace; JS (bakery build) / Python (componentize-py) leave a
+    flat `<dir>/target/<name>.wasm`.
+
+    Newest wins, not first: `_build_guests` builds DEBUG -- no `--release` --
+    so a release artifact built once, by hand or by an older harness, would
+    otherwise shadow every rebuild this harness does afterwards, silently and
+    for good. That failure mode is a source edit that appears to have no
+    effect, which is indistinguishable from a correct program, and it is how
+    a mutation test once came back "the mutation survived" against a guest
+    that had never been rebuilt.
+    """
+    wasm_name = name.replace("-", "_")
+    inferlet_dir = INFERLETS_DIR / name
+    candidates = [
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / f"{wasm_name}.wasm",
+    ]
+    present = [p for p in candidates if p.exists()]
+    wasm_path = max(present, key=lambda p: p.stat().st_mtime, default=None)
+    manifest_path = inferlet_dir / "Pie.toml"
+    if wasm_path is None:
+        raise FileNotFoundError(
+            f"No WASM binary for {name} (tried: {', '.join(str(p) for p in candidates)})"
+        )
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
+    return wasm_path, manifest_path
+
+
+def inferlet_id(manifest_path: Path) -> str:
+    """`name@version` from a `Pie.toml`, the id `launch_process` takes."""
+    manifest = tomllib.loads(manifest_path.read_text())
+    return f"{manifest['package']['name']}@{manifest['package']['version']}"
 
 
 async def run_inferlet(
@@ -221,51 +306,9 @@ async def run_inferlet(
     """
     if extra_args is None:
         extra_args = []
-    wasm_name = name.replace("-", "_")
-    # Rust workspace artifacts live under this directory's target/. Keep the member
-    # paths as fallbacks for inferlets built outside the curated workspace.
-    # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
-    inferlet_dir = INFERLETS_DIR / name
-    candidates = [
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / f"{wasm_name}.wasm",
-    ]
-    # The NEWEST of the ones that exist, not the first.
-    #
-    # The list is a preference order and was read as one, which is wrong here
-    # for a reason that cost real time: `_build_guests` above builds DEBUG --
-    # no `--release` -- while this list prefers release. So a release artifact
-    # built once, by hand or by an older harness, shadows every rebuild this
-    # harness does afterwards, silently and for good. The failure mode is a
-    # source edit that appears to have no effect, which is indistinguishable
-    # from a correct program, and it is how a mutation test came back "the
-    # mutation survived" against a guest that had never been rebuilt.
-    #
-    # Newest-wins keeps every path working -- a vendored or cross-built guest
-    # is still found, and a deliberate release build is still preferred right
-    # after it is made -- while making the thing just built the thing that
-    # runs.
-    present = [p for p in candidates if p.exists()]
-    wasm_path = max(present, key=lambda p: p.stat().st_mtime, default=None)
-    manifest_path = inferlet_dir / "Pie.toml"
-
-    if wasm_path is None:
-        raise FileNotFoundError(
-            f"No WASM binary for {name} (tried: {', '.join(str(p) for p in candidates)})"
-        )
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
-
-    manifest = tomllib.loads(manifest_path.read_text())
-    pkg_name = manifest["package"]["name"]
-    version = manifest["package"]["version"]
-    inferlet_id = f"{pkg_name}@{version}"
-
+    wasm_path, manifest_path = find_artifact(name)
     await client.install_program(wasm_path, manifest_path, force_overwrite=True)
-    process = await client.launch_process(inferlet_id, input=extra_args)
+    process = await client.launch_process(inferlet_id(manifest_path), input=extra_args)
 
     output_parts: list[str] = []
     start = time.time()
@@ -298,6 +341,17 @@ TestFn = Callable[..., Coroutine]
 
 
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
+    # Attached: no embedded engine, no `pie-server` wheel needed.
+    if args.attach:
+        from pie_client import PieClient
+
+        _build_guests()
+        print(f"Server: {args.attach} (attached; its model is whatever it was started with)")
+        print()
+        async with PieClient(args.attach) as client:
+            await client.authenticate("default")
+            return await _run_tests_on(client, tests, args)
+
     from pie.server import Server
     from pie.config import (
         Config, ModelConfig, ServerConfig, TelemetryConfig,
@@ -368,55 +422,59 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             ),
         ),
     )
+    async with Server(cfg) as server:
+        client = await server.connect()
+        return await _run_tests_on(client, tests, args)
+
+
+async def _run_tests_on(client, tests: list[TestFn], args: argparse.Namespace) -> int:
+    """Run `tests` against a connected client; the per-test loop and summary."""
     out_dir = Path(args.output_dir) if args.output_dir else None
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
+    results: list[tuple[str, str, str]] = []
 
-    async with Server(cfg) as server:
-        client = await server.connect()
-        results: list[tuple[str, str, str]] = []
+    for test_fn in tests:
+        name = test_fn.__name__.removeprefix("test_").replace("_", "-")
+        print(f"🔄 {name:30s} ", end="", flush=True)
+        start = time.time()
+        _captured.clear()
 
-        for test_fn in tests:
-            name = test_fn.__name__.removeprefix("test_").replace("_", "-")
-            print(f"🔄 {name:30s} ", end="", flush=True)
-            start = time.time()
-            _captured.clear()
+        try:
+            await test_fn(client, args)
+            elapsed = time.time() - start
+            print(f"✅ ({elapsed:.1f}s)")
+            results.append((name, "PASS", ""))
+        except FileNotFoundError as e:
+            elapsed = time.time() - start
+            print(f"⏭️  ({elapsed:.1f}s) SKIPPED")
+            results.append((name, "SKIP", str(e)))
+        except Exception as e:
+            elapsed = time.time() - start
+            detail = str(e)[:300]
+            print(f"❌ ({elapsed:.1f}s)")
+            print(f"   {detail}")
+            if args.verbose and hasattr(e, "output"):
+                for line in e.output.splitlines()[:20]:
+                    print(f"   | {line}")
+            results.append((name, "FAIL", detail))
 
-            try:
-                await test_fn(client, args)
-                elapsed = time.time() - start
-                print(f"✅ ({elapsed:.1f}s)")
-                results.append((name, "PASS", ""))
-            except FileNotFoundError as e:
-                elapsed = time.time() - start
-                print(f"⏭️  ({elapsed:.1f}s) SKIPPED")
-                results.append((name, "SKIP", str(e)))
-            except Exception as e:
-                elapsed = time.time() - start
-                detail = str(e)[:300]
-                print(f"❌ ({elapsed:.1f}s)")
-                print(f"   {detail}")
-                if args.verbose and hasattr(e, "output"):
-                    for line in e.output.splitlines()[:20]:
-                        print(f"   | {line}")
-                results.append((name, "FAIL", detail))
+        if out_dir is not None and _captured:
+            _dump_captured(out_dir / f"{name}.txt", _captured)
 
-            if out_dir is not None and _captured:
-                _dump_captured(out_dir / f"{name}.txt", _captured)
+    # Summary
+    print(f"\n{'─' * 70}")
+    print(f"{'Inferlet':30s} {'Status':10s} {'Detail'}")
+    print(f"{'─' * 70}")
+    for name, status, detail in results:
+        icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(status, "?")
+        print(f"{name:30s} {icon} {status:6s}  {detail[:50]}")
+    print(f"{'─' * 70}")
 
-        # Summary
-        print(f"\n{'─' * 70}")
-        print(f"{'Inferlet':30s} {'Status':10s} {'Detail'}")
-        print(f"{'─' * 70}")
-        for name, status, detail in results:
-            icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(status, "?")
-            print(f"{name:30s} {icon} {status:6s}  {detail[:50]}")
-        print(f"{'─' * 70}")
-
-        passed = sum(1 for _, s, _ in results if s == "PASS")
-        total = sum(1 for _, s, _ in results if s != "SKIP")
-        print(f"\n{passed}/{total} passed")
-        return 0 if passed >= total else 1
+    passed = sum(1 for _, s, _ in results if s == "PASS")
+    total = sum(1 for _, s, _ in results if s != "SKIP")
+    print(f"\n{passed}/{total} passed")
+    return 0 if passed >= total else 1
 
 
 #: Engine capabilities that NO engine in this repository advertises.

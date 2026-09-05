@@ -1,19 +1,10 @@
 """
-Unit tests for the inferlet SDK's hand-written layer.
+Unit tests for the inferlet SDK's hand-written layer, against the stub
+`wit_world` in `conftest.py`.
 
-SCOPE NOTE: these cover the non-forward interfaces only. That is not an
-omission -- it is the SDK's entire surface right now. The forward-pass
-interfaces (`forward` / `forward-recurrent` / `forward-hybrid` plus `channel`,
-`working-set`, `pipeline`) have no Python counterpart, because the guest now
-ships ETA container bytes and the encoder that produces them exists only in
-Rust. `scripts/check-sdk-interfaces.sh` fails on exactly that, deliberately,
-and blocks publishing until it is fixed.
-
-The previous version of this file tested `Sampler`, `Forward`, `Generator` and
-`Context` against a mock of `pie:core/inference` -- an interface that had
-already been deleted from the runtime. It passed the whole time. Keep the
-stubs in `conftest.py` narrow, and treat the componentize-py build (see that
-file's docstring) as the check that the world is real.
+The non-forward interfaces are covered here; the forward-pass surface — the
+`eta` port of the tracing eDSL and container encoder — is covered by
+`test_eta_goldens.py`, which pins its bytes to the Rust encoder's.
 """
 
 from __future__ import annotations
@@ -52,10 +43,15 @@ class TestPackageSurface:
 
         assert set(inferlet.__all__) == {
             "chat",
+            "eta",
+            "grammar",
+            "mask",
+            "media",
             "model",
             "reasoning",
             "session",
             "tokenizer",
+            "tools",
         }
 
     def test_forward_surface_is_absent(self):
@@ -123,13 +119,13 @@ class TestModel:
         ids, _ = tokenizer.vocabs()
         assert model.output_vocab_size() > len(ids)
 
-    def test_tokenizer_surface_moved_off_model(self):
-        """It lives in `tokenizer` now; leaving an alias on `model` would hide
-        the interface split from anyone reading the SDK."""
-        from inferlet import model
+    def test_tokenizer_surface_rides_model_too(self):
+        """It lives in `tokenizer`, and `model` re-exports it so inferlet
+        source reads `model.encode` the way the Rust SDK's does."""
+        from inferlet import model, tokenizer
 
-        for gone in ("encode", "decode", "vocabs", "split_regex", "special_tokens"):
-            assert not hasattr(model, gone)
+        for name in ("encode", "decode", "vocabs", "split_regex", "special_tokens"):
+            assert getattr(model, name) is getattr(tokenizer, name)
 
 
 # =============================================================================
@@ -355,3 +351,44 @@ class TestReasoningDecoder:
 
         dec = self._decoder([ReasoningComplete("done")])
         assert dec.feed([1]) == reasoning.Event.End("done")
+
+
+class TestForwardPassKinds:
+    def test_per_kind_binders_refuse_the_wrong_pass(self):
+        from inferlet.eta import ForwardKind, ForwardPass, InferletError
+
+        hybrid = ForwardPass(ForwardKind.HYBRID)
+        with pytest.raises(InferletError, match="attention binds"):
+            hybrid.attention(None, None)  # type: ignore[arg-type]
+        with pytest.raises(InferletError, match="bind_recurrent binds"):
+            hybrid.bind_recurrent([], None)  # type: ignore[arg-type]
+        attention = ForwardPass(ForwardKind.ATTENTION)
+        with pytest.raises(InferletError, match="bind_hybrid binds"):
+            attention.bind_hybrid(None, [], None)  # type: ignore[arg-type]
+
+
+class TestDiffusionSurface:
+    def test_model_facts(self):
+        from inferlet import model
+
+        assert model.canvas() == model.CanvasShape(32, 2560, 4)
+        assert model.draft_block() is None
+        assert model.run_ahead_window() == 4
+        assert model.is_linear()  # the stub is a hybrid model
+
+    def test_diffusion_pass_binds_canvas_and_taps(self):
+        from inferlet.eta import ForwardKind, ForwardPass, InferletError, diffusion
+
+        fwd = ForwardPass(ForwardKind.DIFFUSION)
+        fwd.canvas(diffusion.Mode.DENOISE)
+        fwd.self_conditioning([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
+        assert fwd.wit.mode is diffusion.Mode.DENOISE
+        assert fwd.wit.self_cond == ([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
+        with pytest.raises(InferletError, match="canvas binds"):
+            ForwardPass(ForwardKind.ATTENTION).canvas(diffusion.Mode.ENCODE)
+
+    def test_linear_temperature_is_the_reference_schedule(self):
+        from inferlet.eta.diffusion import linear_temperature
+
+        assert linear_temperature(4, 4, 1.0, 0.2) == pytest.approx(1.0)
+        assert linear_temperature(1, 4, 1.0, 0.2) == pytest.approx(0.4)

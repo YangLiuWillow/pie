@@ -264,6 +264,9 @@ async fn main(input: Input) -> Result<Output> {
         model::ForwardKind::Recurrent => {
             return Err("a block drafter reads attention kv; a recurrent-only text has none".into());
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
         model::ForwardKind::Hybrid => {
             let rs = RsWorkingSet::new();
             rs.alloc_buffer(2 * block.div_ceil(rs_page).max(1))

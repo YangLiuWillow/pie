@@ -151,6 +151,9 @@ async fn main(input: Input) -> Result<Output> {
                     .into(),
             );
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let rgb = if input.image_b64.is_some() {
         [0, 0, 0]

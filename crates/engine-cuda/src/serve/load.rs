@@ -22,7 +22,7 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// The cold prefix both doors run: bind the device, settle the compiler's
 /// inputs, bake the artifact. `boot` is widened in place (its lattice).
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
-    let device = Context::bind(boot.ordinal)?;
+    let device = Context::bind(boot.ordinal, boot.comm)?;
 
     // One-shot: whichever load arrives first states the kernel cache root.
     kernels_cuda::disk::install(boot.cache_dir);
@@ -167,6 +167,11 @@ impl Shell {
             boot.checkpoint,
             boot.residency.clone(),
             device.stream(),
+            checkpoint::plan::StorageTarget::for_backend(
+                checkpoint::types::BackendKind::Cuda,
+                boot.world.rank,
+                boot.world.size,
+            ),
         )?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
@@ -221,6 +226,12 @@ impl Shell {
                 })
             })
         });
+        // The self-conditioning gather's width, when the plan reads one.
+        let self_cond_taps = u32::try_from(declared_width(
+            &boot.trace,
+            model_ir::RuntimeInput::SelfCondRows,
+        ))
+        .unwrap_or(u32::MAX);
         let mrope_seat = boot.trace.values.iter().any(|decl| {
             matches!(
                 decl.def,
@@ -247,6 +258,7 @@ impl Shell {
             boot.runahead,
             patch_seat,
             mrope_seat,
+            u64::from(self_cond_taps),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -291,6 +303,7 @@ impl Shell {
             budgets,
             patch_seat,
             mrope_seat,
+            self_cond_taps,
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,

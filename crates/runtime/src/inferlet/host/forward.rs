@@ -13,7 +13,7 @@ use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
 use crate::pipeline::instance::{
-    AttentionBinding, BoundForwardPass, EmbedBinding, PassKind, RsGeometryBinding,
+    AttentionBinding, BoundForwardPass, CanvasMode, EmbedBinding, PassKind, RsGeometryBinding,
 };
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
@@ -30,6 +30,9 @@ type Anyhow<T> = anyhow::Result<T>;
 /// (`host/model.rs`).
 fn model_pass_kind() -> PassKind {
     let model = crate::model::model();
+    if model.diffusion().is_some() {
+        return PassKind::Diffusion;
+    }
     match (model.kv_page_size() > 0, model.rs_caps().state_size > 0) {
         (_, false) => PassKind::Attention,
         (true, true) => PassKind::Hybrid,
@@ -288,6 +291,57 @@ async fn materialize_channel(
     }
 }
 
+/// `take-blocking` / `read-blocking`: the same polling loop as
+/// [`materialize_channel`], driven from a plain `async fn(&mut self)` host
+/// import rather than an `Accessor`. Holding the store across the awaits is
+/// what "blocking" means here: the guest's task is suspended inside the
+/// call, nothing else in the instance runs, and every await below is on
+/// engine-side progress (fire settlement, the reader wait slot) that never
+/// needs the store to advance.
+async fn materialize_channel_blocking(
+    ctx: &mut ProcessCtx,
+    this: Resource<Channel>,
+    mode: ChannelReadMode,
+) -> Anyhow<Result<Vec<u8>, String>> {
+    let mut settle_ready_take = true;
+    loop {
+        let state = poll_channel(ctx, &this, mode, false, settle_ready_take)?;
+        let state = match state {
+            ChannelPoll::Pending {
+                fires: Some(fires), ..
+            } => {
+                let _finalize_guard = fires.finalize_guard().await;
+                let state = poll_channel(ctx, &this, mode, true, settle_ready_take)?;
+                match state {
+                    ChannelPoll::Finalize(op) => {
+                        let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
+                        crate::pipeline::fire::complete_finalize(ctx, finalized);
+                        settle_ready_take = false;
+                        continue;
+                    }
+                    state => state,
+                }
+            }
+            state => state,
+        };
+
+        match state {
+            ChannelPoll::Ready(value) => {
+                return Ok(value);
+            }
+            ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
+            ChannelPoll::Pending { cell, fires, .. } => {
+                settle_ready_take = true;
+                if let Err(error) =
+                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
+                {
+                    return Ok(Err(error));
+                }
+            }
+        }
+    }
+}
+
 // `add_to_linker` requires the interface-level `Host` bound even though
 // `channel` declares no free functions, so this impl is empty by construction.
 impl pie::inferlet::channel::Host for ProcessCtx {}
@@ -365,6 +419,16 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
             .set(value)
             .map_err(|error| error.to_string());
         Ok(result)
+    }
+
+    /// The sync-lowerable `take`; see the WIT door for who needs it.
+    async fn take_blocking(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
+        materialize_channel_blocking(self, this, ChannelReadMode::Take).await
+    }
+
+    /// The sync-lowerable `read`.
+    async fn read_blocking(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
+        materialize_channel_blocking(self, this, ChannelReadMode::Read).await
     }
 
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {
@@ -536,6 +600,91 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
+    /// `forward-diffusion.canvas`: which reading the pass runs. Set once,
+    /// before `program`; a pass keeps one mode for its life.
+    async fn core_canvas(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mode: CanvasMode,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.canvas.is_some() {
+            return Ok(Err(
+                "forward pass canvas mode is already set; a pass keeps one reading for its life"
+                    .to_string(),
+            ));
+        }
+        pass.bindings.canvas = Some(mode);
+        Ok(Ok(()))
+    }
+
+    /// `forward-diffusion.self-conditioning`: stage the taps the pass's next
+    /// submit consumes. Checked here against the model's canvas, so a
+    /// malformed payload is refused at the call and never reaches a lane.
+    async fn core_self_conditioning(
+        &mut self,
+        this: Resource<ForwardPass>,
+        rows: Vec<u32>,
+        weights: Vec<f32>,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let Some(shape) = crate::model::model().diffusion() else {
+            return Ok(Err(
+                "self-conditioning is a diffusion model's input; this model states no canvas"
+                    .to_string(),
+            ));
+        };
+        let vocab = crate::model::model().vocab_size();
+        let cells = shape.canvas as usize * shape.self_cond_taps as usize;
+        if rows.len() != cells || weights.len() != cells {
+            return Ok(Err(format!(
+                "self-conditioning takes {cells} ids and {cells} weights ({} canvas rows x {} \
+                 taps, row major); {} ids and {} weights were staged",
+                shape.canvas,
+                shape.self_cond_taps,
+                rows.len(),
+                weights.len()
+            )));
+        }
+        if let Some(bad) = rows.iter().find(|&&id| id >= vocab) {
+            return Ok(Err(format!(
+                "self-conditioning tap id {bad} is outside the model's {vocab}-wide table"
+            )));
+        }
+        if weights.iter().any(|w| !w.is_finite()) {
+            return Ok(Err("self-conditioning weights must be finite".to_string()));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.bindings.canvas != Some(CanvasMode::Denoise) {
+            return Ok(Err(
+                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first, and \
+                 never stage it on an encode pass"
+                    .to_string(),
+            ));
+        }
+        if pass.bindings.self_cond.is_some() {
+            return Ok(Err(
+                "a self-conditioning payload is already staged for this pass's next submit; \
+                 staging another would lose it"
+                    .to_string(),
+            ));
+        }
+        pass.bindings.self_cond = Some(crate::pipeline::instance::SelfCondPayload {
+            taps: shape.self_cond_taps,
+            rows,
+            weights,
+        });
+        Ok(Ok(()))
+    }
+
     async fn core_readout(
         &mut self,
         this: Resource<ForwardPass>,
@@ -653,6 +802,13 @@ impl ProcessCtx {
                     "forward pass attention binding must be attached before program".to_string(),
                 ));
             };
+            // Neither reading is a default the host may pick for the guest.
+            if pass.kind == PassKind::Diffusion && pass.bindings.canvas.is_none() {
+                return Ok(Err(
+                    "forward pass canvas mode must be set before program on a diffusion pass"
+                        .to_string(),
+                ));
+            }
             (
                 embed,
                 attention,
@@ -1562,6 +1718,83 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
             return Ok(Err(error));
         }
         self.core_set_rs_working_sets(this, rs, geometry).await
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// pie:inferlet/forward-diffusion — paged KV plus a canvas denoised in place.
+// ---------------------------------------------------------------------------
+
+impl pie::inferlet::forward_diffusion::Host for ProcessCtx {
+    async fn submit(
+        &mut self,
+        on: Resource<crate::pipeline::Pipeline>,
+        slots: Vec<Option<Resource<ForwardPass>>>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_submit(on, slots).await
+    }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
+    }
+}
+
+impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
+    forward_pass_common!(forward_diffusion, PassKind::Diffusion);
+
+    /// The attention interface's `media`, same host half and same span type.
+    async fn media(
+        &mut self,
+        this: Resource<ForwardPass>,
+        spans: Vec<pie::inferlet::forward_diffusion::MediaSpan>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_media(this, spans).await
+    }
+
+    async fn attention(
+        &mut self,
+        this: Resource<ForwardPass>,
+        kv: Resource<crate::store::kv::working_set::KvWorkingSet>,
+        geom: pie::inferlet::forward_diffusion::KvGeometry,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_attention(
+            this,
+            kv,
+            geom.readable_pages,
+            geom.writable_pages,
+            geom.kv_len,
+            geom.pages,
+            geom.page_indptr,
+            geom.w_slot,
+            geom.w_off,
+            geom.positions,
+            geom.mask,
+        )
+        .await
+    }
+
+    async fn self_conditioning(
+        &mut self,
+        this: Resource<ForwardPass>,
+        rows: Vec<u32>,
+        weights: Vec<f32>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_self_conditioning(this, rows, weights).await
+    }
+
+    /// The reading: the one call the other three interfaces do not have.
+    async fn canvas(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mode: pie::inferlet::forward_diffusion::Mode,
+    ) -> Anyhow<Result<(), String>> {
+        use pie::inferlet::forward_diffusion::Mode;
+        let mode = match mode {
+            Mode::Encode => CanvasMode::Encode,
+            Mode::Denoise => CanvasMode::Denoise,
+        };
+        self.core_canvas(this, mode).await
     }
 }
 

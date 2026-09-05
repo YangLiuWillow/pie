@@ -328,6 +328,9 @@ async fn main(input: Input) -> Result<Output> {
                     .into(),
             );
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let page_size = kv_page_size();
 

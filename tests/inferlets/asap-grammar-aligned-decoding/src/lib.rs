@@ -251,6 +251,9 @@ async fn main(input: Input) -> Result<Output> {
                     "ASAp needs a KV cache; this model's forward pass is recurrent-only".into(),
                 );
             }
+            model::ForwardKind::Diffusion => {
+                return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            }
         };
         let page_size = kv_page_size();
         let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);

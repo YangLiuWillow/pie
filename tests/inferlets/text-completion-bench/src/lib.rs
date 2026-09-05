@@ -428,6 +428,9 @@ async fn run_one(
                     .into(),
             );
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
 
     // One pipeline for the whole prefill+decode program, created here so
