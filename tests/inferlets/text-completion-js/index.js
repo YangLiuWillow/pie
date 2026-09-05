@@ -6,7 +6,7 @@
 // to the Rust inferlet's, so both share one program-cache entry. Host reads
 // block (`takeScalar`), since a JS guest cannot lower `async func` imports.
 
-import { model, eta } from '@pie-project/inferlet';
+import { chat, eta, model } from '@pie-project/inferlet';
 
 const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, dtype, indptr, intrinsics, kvPageSize, prefillChunks, reduceArgmax, reshape } = eta;
 
@@ -31,7 +31,9 @@ export function main(input) {
 
   if (maxTokens === 0) return { text: '', count: 0, tokens: [] };
 
-  let prompt = [...model.encode(promptText)];
+  // The model's opening (`<bos>` where it has one) before the raw text: a
+  // gemma without it answers noise.
+  let prompt = [...chat.prefix(), ...model.encode(promptText)];
   if (prompt.length === 0) prompt = [0];
   const n = prompt.length;
   const maxPages = Math.max(divCeil(n + maxTokens + 1, pageSize), 1);

@@ -874,7 +874,12 @@ async def run_ahead(
     Returns the run count."""
     if budget == 0:
         return 0
-    r = 1 if fwd.binds_device_mask() else frame_size()
+    # Live slots per frame. A pass that binds a dense device mask takes one;
+    # so does a pass on a recurrent or hybrid model, whose frame's waves carry
+    # the same sequence's state one into the next (a frame of one live slot
+    # measured faster than a full one on Qwen3.5-0.8B). A dense attention
+    # pass fills the frame.
+    r = 1 if fwd.binds_device_mask() or fwd.kind != ForwardKind.ATTENTION else frame_size()
     window_frames = max((channel_capacity() - 1) // max(r, 1), 1)
     submitted = 0
     consumed = 0

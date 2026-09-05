@@ -814,7 +814,12 @@ export function submitFrame(on: Pipeline, slots: (ForwardPass | undefined)[]): v
  */
 export function runAhead(on: Pipeline, fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
   if (budget === 0) return 0;
-  const r = fwd.bindsDeviceMask() ? 1 : frameSize();
+  // Live slots per frame. A pass that binds a dense device mask takes one;
+  // so does a pass on a recurrent or hybrid model, whose frame's waves carry
+  // the same sequence's state one into the next (a frame of one live slot
+  // measured faster than a full one on Qwen3.5-0.8B). A dense attention pass
+  // fills the frame.
+  const r = fwd.bindsDeviceMask() || fwd.kind !== 'attention' ? 1 : frameSize();
   const windowFrames = Math.max(Math.floor((channelCapacity() - 1) / Math.max(r, 1)), 1);
   let submitted = 0;
   let consumed = 0;

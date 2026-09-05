@@ -6,7 +6,7 @@ masked logits. Exercises `softmax`/`reduce_max`/`ge`/`select`/`cast`/
 `broadcast` and the two f32 stat drains beside the token channel.
 """
 
-from inferlet import model
+from inferlet import chat, model
 from inferlet.eta import (
     Channel,
     ForwardKind,
@@ -73,7 +73,9 @@ async def main(input: dict) -> dict:
     if max_tokens == 0:
         return {"sampler": "top-a", "text": "", "count": 0, "a": a, "mean_kept": 0.0, "min_kept": 0, "mean_mass": 0.0}
 
-    prompt = model.encode(prompt_text) or [0]
+    # The model's opening (`<bos>` where it has one) before the raw text: a
+    # gemma without it answers noise.
+    prompt = (chat.prefix() + model.encode(prompt_text)) or [0]
     n = len(prompt)
     max_pages = max(-(-(n + max_tokens + 1) // page_size), 1)
     ws.reserve(max_pages)
