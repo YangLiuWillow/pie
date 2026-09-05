@@ -515,7 +515,62 @@ struct Input {
     /// closes when that rung loses. Off, the loop is the header's.
     #[serde(default)]
     priced: Option<bool>,
+    /// **WHICH DRAFTER**: `head` (the load's block drafter, the default) or
+    /// `ngram` — prompt-lookup decoding, no model at all: the last `ngram_n`
+    /// tokens are looked up in the context (prompt and everything committed)
+    /// and the tokens that followed their most recent earlier occurrence are
+    /// the proposals, up to `ngram_max`. No draft fire, so a round costs the
+    /// verify alone; a round with no match is a plain fire. The arm
+    /// llama.cpp's `ngram-mod` is compared against, in the loop pie prices
+    /// its verify fires with.
+    #[serde(default = "default_drafter")]
+    drafter: String,
+    #[serde(default = "default_ngram_n")]
+    ngram_n: u32,
+    #[serde(default = "default_ngram_max")]
+    ngram_max: u32,
 }
+
+fn default_drafter() -> String {
+    "head".into()
+}
+
+fn default_ngram_n() -> u32 {
+    3
+}
+
+fn default_ngram_max() -> u32 {
+    7
+}
+
+/// Prompt-lookup: the tokens that followed the most recent earlier occurrence
+/// of the context's last `n` tokens (falling back to shorter keys), at most
+/// `max` of them. Empty when nothing repeats.
+fn ngram_lookup(context: &[i32], n: u32, max: u32) -> Vec<i32> {
+    let len = context.len();
+    for k in (1..=n as usize).rev() {
+        if len <= k {
+            continue;
+        }
+        let key = &context[len - k..];
+        // Most recent earlier occurrence: scan back from the end, skipping
+        // the key's own position.
+        let mut start = len - k;
+        while start > 0 {
+            start -= 1;
+            if &context[start..start + k] == key {
+                let from = start + k;
+                let to = (from + max as usize).min(len);
+                if to > from {
+                    return context[from..to].to_vec();
+                }
+                break;
+            }
+        }
+    }
+    Vec::new()
+}
+
 
 /// The floor this file ships when none is stated. **Alone, none**: the
 /// prices gate the lone lane (`priced`), and a yield floor beside them
@@ -1107,7 +1162,7 @@ const MASK_TOKEN: i32 = 248_070;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::mtp_depth() == 0 {
+    if model::mtp_depth() == 0 && input.drafter != "ngram" {
         return Err("this SKU ships no draft head".into());
     }
     // **THE HEAD'S FACTS COME OFF THE LOAD.** The block the head was trained
@@ -1313,7 +1368,18 @@ async fn main(input: Input) -> Result<Output> {
         // first compiles and is dropped, `Prices::keep`), and cost the two
         // tokens they emit. Then the rung — or no round — is the prices'
         // choice; without prices, the stated gate's and ladder's.
-        let planned = if priced {
+        let ngram = input.drafter == "ngram";
+        let ngram_props: Vec<i32> = if ngram {
+            let mut context: Vec<i32> = prompt_i32.clone();
+            context.extend(generated.iter().map(|&t| t as i32));
+            ngram_lookup(&context, input.ngram_n, input.ngram_max)
+        } else {
+            Vec::new()
+        };
+        let planned = if ngram {
+            // A match drafts as many rows as it found; none is a plain fire.
+            (!ngram_props.is_empty()).then(|| (ngram_props.len() as u32 + 1).min(block))
+        } else if priced {
             if since_priced >= REPRICE {
                 since_priced = 0;
                 owed_plain = 2;
@@ -1371,6 +1437,9 @@ async fn main(input: Input) -> Result<Output> {
         if !drafting {
             verify = 1;
             plain_fires += 1;
+        } else if ngram {
+            // No draft fire: the proposals are the lookup's.
+            proposals_owned = ngram_props[..verify as usize - 1].to_vec();
         } else {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]` ──────────
         let mut ids = vec![mask_token; block as usize];
