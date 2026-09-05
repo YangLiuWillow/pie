@@ -168,6 +168,20 @@ async def test_top_a_sampling_twins_agree(client, args):
     assert abs(rust["mean_kept"] - py["mean_kept"]) < 1e-6 and abs(rust["mean_mass"] - py["mean_mass"]) < 1e-6, (rust, py)
 
 
+async def test_beam_search_twins_agree(client, args):
+    """On-device beam search — the widest surface of the twins: the `mask`
+    port, `from_shaped`, `capacity`, `top_k` / `gather` / `or` over a `[B, V]`
+    block, `run_ahead` (attention) or per-lane `RsWorkingSet.fork` + rebind
+    (hybrid). Every beam starts from BOS, so the whole report line is exact."""
+    for inputs in ({"max_tokens": 6, "beams": 3}, {"max_tokens": 6, "beams": 1}):
+        py = await run_inferlet(client, "beam-search-py", inputs, timeout=args.timeout)
+        js = await run_inferlet(client, "beam-search-js", inputs, timeout=args.timeout)
+        rust = await run_inferlet(client, "beam-search", inputs, timeout=args.timeout)
+        assert f"[beam] width={inputs['beams']}" in rust, rust
+        assert py.strip() == rust.strip(), f"python twin diverged:\n{py}\nvs\n{rust}"
+        assert js.strip() == rust.strip(), f"javascript twin diverged:\n{js}\nvs\n{rust}"
+
+
 def tests():
     return [
         test_text_completion_twins_agree,
@@ -176,6 +190,7 @@ def tests():
         test_constrained_decoding_twins_agree,
         test_prefix_tree_twins_agree,
         test_top_a_sampling_twins_agree,
+        test_beam_search_twins_agree,
     ]
 
 
