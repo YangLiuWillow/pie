@@ -281,17 +281,16 @@
 //! warm-up rounds at eight rows on a prose that closes at once cost 5%).
 //!
 //! **THE DEFAULTS FOLLOW THE CROWD** (`batch_concurrency`, which
-//! `benches/pie_bench.py` passes): alone, the prices gate and no floor; in a
-//! crowd, no prices and a floor of five with four narrow probes to reopen and
-//! a probe cadence that backs off per probe. Measured at four lanes under
-//! strict sealing on qwen38 (aggregate tok/s, plain 40 on every prompt):
-//! counting 68, code 39, prose 28 — and prose is the honest number: with the
-//! floor at 2.5 it read 31, with probes every sixteen fires 24-28, with the
-//! cadence backing off 37 once and 28 the next time. Four lanes of a
-//! low-yield prompt lose 25-30% to the warm-up rounds and the probes falling
-//! out of the batch, whatever this gate does, and the plain loop is the
-//! right one for them; the crowd default keeps the counting gain (1.6x) and
-//! pays that. `min_tokens_per_round = 1000` closes the gate for good.
+//! `benches/pie_bench.py` passes to every launched inferlet since
+//! `911f9d177` — before that every harness run took the lone-lane defaults
+//! under load): alone, the prices gate and no floor; in a crowd, no prices
+//! and a floor of five with four narrow probes to reopen and a probe cadence
+//! that backs off per probe. Measured with the crowd stated, qwen38, strict
+//! sealing, aggregate tok/s against plain: four lanes counting 60.9 / 40.7,
+//! prose 39.9 / 41.5, code 40.2 / 42.3; eight lanes 63.6 / 57.0, 47.6 / 60.2,
+//! 46.2 / 60.4. The structured prompt pays; the others cost 4-5% at four
+//! lanes and a fifth at eight (the warm-up rounds and the probes stepping out
+//! of the batch). `min_tokens_per_round = 1000` closes the gate for good.
 //!
 //! **UNDER CONCURRENT LOAD THE PRICES LIE, SO `priced` IS OFF IN A CROWD.**
 //! Eight lanes held open (`pie_bench.py tput --num-requests 8 --concurrency
