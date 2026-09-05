@@ -271,7 +271,7 @@ pub(crate) fn build_frame_submission(
                 tokens += usage.forward_tokens;
                 page_refs += usage.page_refs;
             }
-            eprintln!(
+            super::worker::wave_trace_emit(format!(
                 "[step-lanes] members={} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={}",
                 group.len(),
                 build.lanes.len(),
@@ -282,7 +282,7 @@ pub(crate) fn build_frame_submission(
                     .flat_map(|req| req.request.lanes.iter().map(|lane| lane.kv.pages.len()))
                     .max()
                     .unwrap_or(0)
-            );
+            ));
         }
         // One instance id per lane, not per member.
         let mut instances = Vec::with_capacity(build.lanes.len());

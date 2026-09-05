@@ -278,6 +278,37 @@ pub(crate) fn wave_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
 }
 
+/// One `[wave-trace]` line out. `PIE_WAVE_TRACE=buffer` parks lines in
+/// memory and a thread flushes them once a second: a direct `eprintln!` per
+/// enqueue costs ~10 µs on the worker's path, and 64 of them per step is a
+/// delay of the same order as a guest's turnaround — enough to move what
+/// the trace is meant to show.
+pub(crate) fn wave_trace_emit(line: String) {
+    static BUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let buffered = *BUFFERED.get_or_init(|| {
+        let on = std::env::var_os("PIE_WAVE_TRACE").is_some_and(|v| v == "buffer");
+        if on {
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let drained: Vec<String> =
+                        std::mem::take(&mut *LINES.lock().unwrap_or_else(|e| e.into_inner()));
+                    for line in drained {
+                        eprintln!("{line}");
+                    }
+                }
+            });
+        }
+        on
+    });
+    if buffered {
+        LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
 /// Microseconds since the first trace line — every `[wave-trace]` line
 /// carries one, so a dump reads as a timeline (ramp, steady state, collapse)
 /// and not just as a sequence.
@@ -3006,7 +3037,7 @@ impl BatchScheduler {
                     // even while it sits in `pending` behind an
                     // in-flight-depth or seal hold.
                     if wave_trace() {
-                        eprintln!(
+                        wave_trace_emit(format!(
                             "[wave-trace] t={}us enq fire={} framed={} mask={} masks={} stm={} pipe={}",
                             wave_trace_us(),
                             launch.logical_fire_id,
@@ -3015,7 +3046,7 @@ impl BatchScheduler {
                             has_wire_masks(&launch.request),
                             launch.request.single_token_mode,
                             launch.pipeline_id.is_some()
-                        );
+                        ));
                     }
                     if let Some(stamp) = launch.frame {
                         frame_policy.on_fire_enqueued(
@@ -3752,7 +3783,7 @@ impl BatchScheduler {
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
                 if wave_trace() {
-                    eprintln!("[wave-trace] t={}us rider fire={untracked}", wave_trace_us());
+                    wave_trace_emit(format!("[wave-trace] t={}us rider fire={untracked}", wave_trace_us()));
                 }
                 vec![vec![untracked]]
             } else {
@@ -3764,11 +3795,11 @@ impl BatchScheduler {
                 ) {
                     FramePlan::Dispatch(waves) => {
                         if wave_trace() {
-                            eprintln!(
+                            wave_trace_emit(format!(
                                 "[wave-trace] t={}us dispatch waves={:?}",
                                 wave_trace_us(),
                                 waves.iter().map(Vec::len).collect::<Vec<_>>()
-                            );
+                            ));
                         }
                         waves
                     }
@@ -4002,6 +4033,13 @@ impl BatchScheduler {
                 _ => None,
             };
             let mut retired = in_flight_launches.pop_front().expect("front batch exists");
+            if wave_trace() {
+                wave_trace_emit(format!(
+                    "[wave-trace] t={}us retire lanes={}",
+                    wave_trace_us(),
+                    retired.requests.len()
+                ));
+            }
             // The runtime has answered these lanes: re-arm their submit
             // deadline from here so the wave they waited on is not charged
             // to them (see `FramePolicy::on_frame_retired`).

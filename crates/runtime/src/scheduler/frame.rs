@@ -1049,6 +1049,26 @@ impl FramePolicy {
                     .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
                 return None;
             }
+            if super::worker::wave_trace() {
+                let complete = self
+                    .lanes
+                    .values()
+                    .filter(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
+                    .count();
+                let awaited = self.lanes.values().filter(|lane| lane.awaited).count();
+                super::worker::wave_trace_emit(format!(
+                    "[wave-trace] t={}us seal partition={} fresh={} continuing={} complete_left={} awaited={} lanes={} in_flight={} mid_boundary={mid_boundary} executing={}",
+                    super::worker::wave_trace_us(),
+                    members.len(),
+                    fresh.len(),
+                    continuing.len(),
+                    complete,
+                    awaited,
+                    self.lanes.len(),
+                    self.in_flight_lanes.len(),
+                    self.executing_now
+                ));
+            }
             if !mid_boundary {
                 self.open_boundary();
             }
@@ -1384,6 +1404,16 @@ ready_age_newest={}us",
                 expired.sort_unstable();
                 expired.dedup();
                 return FramePlan::Terminate(expired);
+            }
+            if super::worker::wave_trace() {
+                super::worker::wave_trace_emit(format!(
+                    "[wave-trace] t={}us gate missing={missing} executing={executing} candidate={} in_flight={} awaited={} lanes={}",
+                    super::worker::wave_trace_us(),
+                    self.have_seal_candidate(),
+                    self.in_flight_lanes.len(),
+                    self.lanes.values().filter(|lane| lane.awaited).count(),
+                    self.lanes.len()
+                ));
             }
             // A joiner never holds the seal: it is not a wait-set member
             // yet, so sealing without it excludes nobody.
