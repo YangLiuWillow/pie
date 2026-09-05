@@ -566,6 +566,30 @@ impl Session {
         for (channel, cursor) in before.iter().enumerate() {
             let slot = channel as u32;
             let shape = self.shapes[channel];
+
+            // A tensor-parallel FOLLOWER's session ignores host-facing channels
+            // entirely: they are rank 0's to publish/consume and the runtime
+            // pumps only rank 0's rings. The follower advances neither their
+            // prediction nor their device word (mismatching the two is the
+            // "cursors advanced between the two" refusal). Device-only channels
+            // (e.g. the decode `tok_in` handoff) are NOT host-facing and run
+            // normally, which is the whole reason the follower runs the guest.
+            //
+            // Skipped BEFORE the cursor is even validated: a host-facing ring's
+            // `head` is read off the SHARED endpoint (which rank 0's host
+            // draining advances) while its `tail` is this follower's frozen
+            // local prediction, so `merge` hands back a `head` that has run
+            // past a `tail` that never moves — a cursor this rank must not
+            // read, let alone fault on.
+            if self.shadow
+                && self
+                    .rings
+                    .endpoint(channel)
+                    .is_some_and(|endpoint| endpoint.role() != HostRole::None)
+            {
+                continue;
+            }
+
             if cursor.tail < cursor.head {
                 return Err(format!("channel {channel}: tail precedes head at mint"));
             }
@@ -579,22 +603,6 @@ impl Session {
                 .rings
                 .endpoint(channel)
                 .is_some_and(|endpoint| endpoint.role() == HostRole::None);
-
-            // A tensor-parallel FOLLOWER's session ignores host-facing channels
-            // entirely: they are rank 0's to publish/consume and the runtime
-            // pumps only rank 0's rings. The follower advances neither their
-            // prediction nor their device word (mismatching the two is the
-            // "cursors advanced between the two" refusal). Device-only channels
-            // (e.g. the decode `tok_in` handoff) are NOT host-facing and run
-            // normally, which is the whole reason the follower runs the guest.
-            if self.shadow
-                && self
-                    .rings
-                    .endpoint(channel)
-                    .is_some_and(|endpoint| endpoint.role() != HostRole::None)
-            {
-                continue;
-            }
 
             let mut used = cursor.tail - cursor.head;
             let mut moved_head = false;

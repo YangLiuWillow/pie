@@ -394,6 +394,13 @@ impl Shell {
         }
         // The arming pass is the last thing the load does; only the golden can fail it.
         shell.arm_bodies()?;
+        // A tensor-parallel follower runs the guest as a shadow of rank 0's:
+        // it fires the same boundaries (so its device-only `tok_in` handoff
+        // feeds its own pipelined decode step), but its host-ended rings are
+        // rank 0's, read and never written. See `program::Session`.
+        if boot.world.rank != 0 {
+            shell.programs.set_shadow(true);
+        }
         Ok(shell)
     }
 }

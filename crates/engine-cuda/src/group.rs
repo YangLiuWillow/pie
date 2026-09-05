@@ -25,6 +25,7 @@ use engine::load::{LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle, StateCopy};
 use engine::fire::MediaEncode;
+use eta_ir::container::HostRole;
 
 use crate::api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
 use crate::comm::{Comm, Id};
@@ -99,20 +100,6 @@ pub fn open_group(
 
 
 
-
-/// A copy of `frame` with guest attachments removed (model lanes+media only).
-/// A follower runs this; the guest plane is rank 0's. NOTE: drops the pipelined
-/// decode-token carrier (device-only `tok_in`), so tp2 decode is wrong on the
-/// follower — see the tp-verification memo for the open fix.
-fn strip_guest(frame: &FrameSubmission) -> FrameSubmission {
-    FrameSubmission {
-        steps: frame.steps.iter().map(|step| Step {
-            lanes: step.lanes.clone(),
-            attachments: Vec::new(),
-            media: step.media.clone(),
-        }).collect(),
-    }
-}
 
 impl Group {
     /// How many ranks this group is.
@@ -250,26 +237,52 @@ impl Engine for Group {
         // token. Sampling (`argmax`) is deterministic over the full,
         // replicated logits, so every rank samples the same token; only the
         // host-facing streaming (take_channel) is read from rank 0.
-        self.on(0, |rank| rank.register_program(registration))
+        self.lead(|rank| rank.register_program(registration))
     }
 
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
     ) -> EngineResult<RegisteredChannel> {
-        self.on(0, |rank| rank.register_channel(registration))
+        // Rank 0 owns the host end and the runtime pumps its mirror. A
+        // follower shares rank 0's endpoint for a host-facing ring — its
+        // shadow session pulls the guest's cells out of the same pinned
+        // mirror and never writes a word or cell of it — but registers its
+        // OWN device-only ring (e.g. the decode `tok_in` handoff), which
+        // lives on the follower's device and carries no host end to share.
+        let registered = self.on(0, |rank| rank.register_channel(registration))?;
+        if registration.host_role == HostRole::None {
+            for rank in 1..self.ranks.len() {
+                self.on(rank, |shell| {
+                    shell.register_channel(registration).map(|_| ())
+                })?;
+            }
+        } else {
+            let endpoint = self
+                .on(0, |rank| Ok(rank.endpoint(registration.id)))?
+                .expect("rank 0 just registered this channel");
+            let id = registration.id;
+            for rank in 1..self.ranks.len() {
+                let endpoint = endpoint.clone();
+                self.on(rank, move |shell| shell.adopt_channel(id, endpoint).map(|_| ()))?;
+            }
+        }
+        Ok(registered)
     }
 
     fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        self.on(0, |rank| rank.bind_instance(binding))
+        // Every rank binds its own session over the same instance id (each
+        // shell's counter is deterministic); a follower binds as a shadow of
+        // rank 0's (`Plane::set_shadow`, armed at load).
+        self.lead(|rank| rank.bind_instance(binding))
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        self.on(0, |rank| rank.close_instance(id))
+        self.lead(|rank| rank.close_instance(id))
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.on(0, |rank| rank.close_channel(id))
+        self.lead(|rank| rank.close_channel(id))
     }
 
     fn publish_channel(
@@ -286,18 +299,20 @@ impl Engine for Group {
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        self.on(0, |rank| rank.register_adapter(registration))
+        // The adapter is a weight bank sharded like the rest of the stack, so
+        // every rank lands its band.
+        self.lead(|rank| rank.register_adapter(registration))
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        // Rank 0 runs the whole fire — the model forward AND the guest
-        // boundaries attached to it. A follower runs only the model: the
-        // same lanes drive the same SPMD forward and the same collectives,
-        // but the guest attachments (host I/O, sampling) are rank 0's, so
-        // they are stripped from the followers' frame. Rank 0's ticket is
-        // the group's; a follower's readouts land in its own arena, unread.
-        let follower = strip_guest(frame);
-        self.each(|rank| rank.submit(if rank.rank() == 0 { frame } else { &follower }))
+        // Every rank runs the whole fire — the SPMD model forward, its
+        // collectives, AND the guest boundaries attached to it. A follower's
+        // guest is a shadow: it samples the same token off its own replicated
+        // logits and feeds its own device-only `tok_in` for the next
+        // pipelined step, but its host-facing rings are rank 0's, pulled and
+        // never written. Rank 0's ticket is the group's; a follower's
+        // host-facing readouts are never taken.
+        self.each(|rank| rank.submit(frame))
             .map(|mut tickets| tickets.swap_remove(0))
     }
 
