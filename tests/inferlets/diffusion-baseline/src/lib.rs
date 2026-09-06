@@ -72,6 +72,8 @@ struct Output {
     steps: Vec<u32>,
     /// Mean per-position entropy at each canvas's last step.
     final_entropy: Vec<f32>,
+    /// Mean per-position entropy after every step of every canvas.
+    entropy_trace: Vec<Vec<f32>>,
 }
 
 /// Host-side uniform ids for a fresh canvas: xorshift32, seeded per block.
@@ -114,6 +116,7 @@ async fn main(input: Input) -> Result<Output> {
             tokens: Vec::new(),
             steps: Vec::new(),
             final_entropy: Vec::new(),
+            entropy_trace: Vec::new(),
         });
     }
     let canvases = (max_tokens as u32).div_ceil(length);
@@ -142,6 +145,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated: Vec<u32> = Vec::new();
     let mut steps_taken: Vec<u32> = Vec::new();
     let mut final_entropy: Vec<f32> = Vec::new();
+    let mut entropy_trace: Vec<Vec<f32>> = Vec::new();
     let bound = input.entropy_bound;
     let confidence = input.confidence;
 
@@ -162,19 +166,30 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off");
         let kv_len = Channel::from([end]).named("kv_len");
         let readout = Channel::from_iter(0..length).named("readout");
-        // Control word: the step's temperature, host-`set` before each submit.
-        let temp = Channel::from([input.t_max]).named("temperature");
+        // The step counter, device-carried: the temperature schedule is
+        // computed from it in the epilogue (the same `linear_temperature`
+        // arithmetic the host would do), so a step needs no host `set`.
+        let step_index = Channel::from([0u32]).named("step_index");
+        let max_steps = input.max_steps.max(1);
+        let (t_max, t_min) = (input.t_max, input.t_min);
         let rng_state = Channel::from([input.seed ^ block, 0]).named("rng");
         // The previous step's argmax canvas, device-carried; -1 means none.
         let history = Channel::from(vec![-1i32; length as usize]).named("argmax_history");
-        let canvas_out = Channel::new([length], dtype::i32).named("canvas_out");
-        let argmax_out = Channel::new([length], dtype::i32).named("argmax_out");
-        let stop = Channel::new([1], dtype::bool).named("stop");
-        let mean_out = Channel::new([1], dtype::f32).named("mean_entropy");
+        // The step's one word to the host: the argmax canvas, the stop
+        // verdict and the mean entropy, packed into one f32 row so the
+        // step costs one host read (each read is a scheduler round trip,
+        // and three of them were most of the seam between steps).
+        let step_out = Channel::new([length + 2], dtype::f32).named("step_out");
         // The next step's self-conditioning taps: per row, the top ids of
-        // this step's distribution and their probabilities.
-        let tap_ids_out = Channel::new([length, taps], dtype::u32).named("tap_ids");
-        let tap_weights_out = Channel::new([length, taps], dtype::f32).named("tap_weights");
+        // this step's distribution and their probabilities. Loop-carried on
+        // the device (the epilogue takes the previous step's and puts this
+        // step's), read by the model straight off the channel at every
+        // submit (`self_conditioning_from`); seeded with zeros, which is
+        // the reference's "no signal" first step. The host never sees them.
+        let tap_ids_out =
+            Channel::from_shaped([length, taps], vec![0u32; (length * taps) as usize]).named("tap_ids");
+        let tap_weights_out =
+            Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize]).named("tap_weights");
 
         let fwd = ForwardPass::new();
         fwd.canvas(Mode::Denoise)?;
@@ -194,18 +209,41 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.readout(&readout)?;
+        fwd.self_conditioning_from(&tap_ids_out, &tap_weights_out)
+            .context("bind self-conditioning to the tap channels")?;
         fwd.epilogue(move || {
-            // The geometry is the same every step; consumed ports go back.
+            // The geometry is the same every step; consumed ports go back —
+            // the kv length too, so the whole geometry is the device's
+            // (the runtime's decode envelope) and the canvas need never
+            // cross the host.
             positions.put(positions.take());
             w_slot.put(w_slot.take());
             w_off.put(w_off.take());
+            kv_len.put(kv_len.take());
 
             let r = rng_state.take();
-            let t = reshape(temp.read(), []);
+            // `t = t_min + (t_max - t_min) * (remaining / max_steps)`, with
+            // `remaining = max_steps - step`, spelled in the host's own f32
+            // order so the schedule is the same numbers it would have set.
+            let i = step_index.take();
+            let remaining = cast(&(max_steps - &i), dtype::f32);
+            let t = reshape(&(&(&remaining / (max_steps as f32)) * (t_max - t_min)) + t_min, []);
+            step_index.put(&(&i + 1u32));
             let logits = intrinsics::logits(); // [length, vocab]
             let scaled = &logits / &t;
-            let probs = softmax(&scaled);
-            let h = entropy(&probs); // [length]
+            // The entropy off the scaled row alone, by the log-sum-exp
+            // identity `H = log Z + m - Σ x·e^(x-m) / Z`: no `[length,
+            // vocab]` probability tensor is ever materialised, so the
+            // epilogue's scratch holds one vocab-wide value (`scaled`)
+            // instead of three, and the taps below are priced off `m`
+            // and `z` too. Same numbers as `entropy(softmax(scaled))` to
+            // rounding.
+            let m = reduce_max(&scaled); // [length]
+            let m_wide = broadcast(reshape(&m, [length, 1]), [length, vocab]);
+            let e = exp(&scaled - &m_wide);
+            let z = reduce_sum(&e); // [length]
+            let weighted = reduce_sum(&(&scaled - &m_wide) * &e); // Σ (x-m)·e
+            let h = &log(&z) - &(&weighted / &z); // [length]
             let sampled = gumbel_max(&scaled, &r);
             let argmax = reduce_argmax(&scaled);
 
@@ -218,45 +256,53 @@ async fn main(input: Input) -> Result<Output> {
             history.put(&argmax);
             let done = stable_and_confident(&argmax, &previous, &h, confidence);
 
-            let (tap_weights, tap_ids) = top_k(&probs, taps);
+            // The taps: the top ids of the scaled row (the same ids as of
+            // its softmax) and their probabilities `exp(v - m) / z`. Read
+            // off `scaled`, which the later streams read anyway and so
+            // already lands in scratch: a `top_k` of the logits would make
+            // the emitter land a second `[length, vocab]` plane (the
+            // intrinsic copied out for the library op) beside it.
+            let (top_vals, tap_ids) = top_k(&scaled, taps);
+            let tap_weights = &exp(&top_vals - &broadcast(reshape(&m, [length, 1]), [length, taps]))
+                / &broadcast(reshape(&z, [length, 1]), [length, taps]);
+            // Loop-carried: this step's taps replace the previous step's.
+            let _ = tap_ids_out.take();
+            let _ = tap_weights_out.take();
             tap_ids_out.put(&tap_ids);
             tap_weights_out.put(&tap_weights);
 
-            canvas_out.put(&next);
-            argmax_out.put(&argmax);
-            stop.put(reshape(done, [1]));
-            mean_out.put(reshape(&reduce_sum(&h) / (length as f32), [1]));
+            // The canvas the next step embeds — on the device, never drained.
+            toks.put(&next);
+            let mean = reshape(&reduce_sum(&h) / (length as f32), [1]);
+            let word = scatter_set(broadcast(0f32, [length + 2]), iota(length), cast(&argmax, dtype::f32));
+            let word = scatter_set(&word, &(&iota(1) + length), cast(reshape(&done, [1]), dtype::f32));
+            let word = scatter_set(&word, &(&iota(1) + (length + 1)), &mean);
+            step_out.put(&word);
             rng_state.put(&(&r_noise + iota(2)));
         });
 
         let mut argmax_canvas: Vec<i32> = Vec::new();
         let mut steps = 0u32;
         let mut mean = f32::NAN;
+        let mut trace: Vec<f32> = Vec::new();
         for remaining in (1..=input.max_steps).rev() {
-            let t = linear_temperature(remaining, input.max_steps, input.t_max, input.t_min);
-            if steps > 0 {
-                temp.set([t]).context("set temperature")?;
-            }
             fwd.submit(&pipe).with_context(|| format!("denoise submit block {block} step {steps}"))?;
             steps += 1;
-            let next = canvas_out.take_host::<Vec<i32>>().await.context("canvas drain")?;
-            argmax_canvas = argmax_out.take_host::<Vec<i32>>().await.context("argmax drain")?;
-            let done = stop.take_host::<bool>().await.context("stop drain")?;
-            mean = mean_out.take_host::<f32>().await.context("entropy drain")?;
-            let tap_ids = tap_ids_out.take_host::<Vec<u32>>().await.context("tap ids drain")?;
-            let tap_weights = tap_weights_out
-                .take_host::<Vec<f32>>()
-                .await
-                .context("tap weights drain")?;
+            // The one host read a step. The canvas and the taps stay on the
+            // device; the argmax ids ride as exact f32 (the vocab is under
+            // 2^24).
+            let word = step_out.take_host::<Vec<f32>>().await.context("step drain")?;
+            argmax_canvas = word[..length as usize].iter().map(|&v| v as i32).collect();
+            let done = word[length as usize] != 0.0;
+            mean = word[length as usize + 1];
+            trace.push(mean);
             if done || remaining == 1 {
                 break;
             }
-            toks.put(next);
-            fwd.self_conditioning(&tap_ids, &tap_weights)
-                .context("stage self-conditioning")?;
         }
         steps_taken.push(steps);
         final_entropy.push(mean);
+        entropy_trace.push(trace);
 
         // ── 3. Commit: the argmax canvas, read causally, becomes the prefix.
         encode(&ws, &pipe, &argmax_canvas, base, max_pages, page_size)
@@ -284,6 +330,7 @@ async fn main(input: Input) -> Result<Output> {
         tokens: generated,
         steps: steps_taken,
         final_entropy,
+        entropy_trace,
     })
 }
 

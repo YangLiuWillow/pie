@@ -316,7 +316,14 @@ impl Block<'_> {
                 let done = or(&and(&ge(&run_next, stability), &confident), &all_frozen);
 
                 if let (Some(ids_out), Some(weights_out)) = (&tap_ids_out, &tap_weights_out) {
-                    let (tap_weights, tap_ids) = top_k(&probs, taps_used);
+                    // Top ids of the scaled row (the softmax's ids) and their
+                    // probabilities off the row's max and partition sum, so
+                    // `probs` need not be read by a library op here.
+                    let m = reduce_max(&scaled);
+                    let z = reduce_sum(&exp(&scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])));
+                    let (top_vals, tap_ids) = top_k(&scaled, taps_used);
+                    let tap_weights = &exp(&top_vals - &broadcast(reshape(&m, [length, 1]), [length, taps_used]))
+                        / &broadcast(reshape(&z, [length, 1]), [length, taps_used]);
                     ids_out.put(&tap_ids);
                     weights_out.put(&tap_weights);
                 }
