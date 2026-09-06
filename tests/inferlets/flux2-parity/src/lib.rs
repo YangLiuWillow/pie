@@ -152,8 +152,11 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipe: &Pipeline) -> Res
     text.reading(reading)?;
     text.stream(LaneStream::Text)?;
     text.group(group)?;
-    let ctx = Channel::from_shaped([case.text_rows, case.context_width], case.context.as_slice())
-        .named("context");
+    let ctx = Channel::from_shaped(
+        [case.text_rows, case.context_width],
+        case.context.as_slice(),
+    )
+    .named("context");
     let txt_pos =
         Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
             .named("txt_pos");
@@ -187,8 +190,8 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipe: &Pipeline) -> Res
     image.stream(LaneStream::Image)?;
     image.group(group)?;
     let x = Channel::from_shaped([rows, width], case.latents.as_slice()).named("latents");
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
-        .named("img_pos");
+    let img_pos =
+        Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice()).named("img_pos");
     image.input(&ports.latents, &x)?;
     image.input(&ports.positions, &img_pos)?;
     scalars(&image, ports, case, "img")?;
@@ -209,7 +212,9 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipe: &Pipeline) -> Res
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if model::pass_kind() != model::ForwardKind::Attention {
-        return Err("flux_2 is an attention-kind pass with no kv bound on its denoise reading".into());
+        return Err(
+            "flux_2 is an attention-kind pass with no kv bound on its denoise reading".into(),
+        );
     }
     let pieces: String = [
         &input.case_0,
@@ -257,7 +262,9 @@ async fn main(input: Input) -> Result<Output> {
     }
     let ports = ports(&reading)?;
     if ports.guidance.is_none() && case.guidance != 0.0 {
-        return Err("the case carries a guidance scale and this row declares no guidance port".into());
+        return Err(
+            "the case carries a guidance scale and this row declares no guidance port".into(),
+        );
     }
     let pipe = Pipeline::new();
     let velocity = step(&case, &ports, &reading.name, &pipe).await?;

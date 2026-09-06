@@ -124,9 +124,9 @@ impl Model {
         layout: Layout,
     ) -> Result<ModelContract, Error> {
         let mut b = Builder::new(src, self.tp, platform);
-        dit(&mut b, &self.dit, self.dims.dim, layout)?;
+        dit(&mut b, src, &self.dit, self.dims.dim, layout)?;
         if let Some(te) = &self.te {
-            text_encoder(&mut b, te, layout)?;
+            text_encoder(&mut b, src, te, layout)?;
         }
         if let Some(vae) = &self.vae {
             self::vae(&mut b, src, vae, layout)?;
@@ -135,7 +135,13 @@ impl Model {
     }
 }
 
-fn dit(b: &mut Builder, m: &Dit, dim: u32, layout: Layout) -> Result<(), Error> {
+fn dit(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    m: &Dit,
+    dim: u32,
+    layout: Layout,
+) -> Result<(), Error> {
     let at = |tail: &str| layout.dit(tail);
     let w = |tail: &str| at(&format!("{tail}.weight"));
 
@@ -215,15 +221,9 @@ fn dit(b: &mut Builder, m: &Dit, dim: u32, layout: Layout) -> Result<(), Error> 
         // `to_out` `[dim, dim + inter]`: the attention columns, then the
         // MLP's.
         let out = format!("{stem}.to_out.weight");
-        let inter = block.out_mlp.shape[1];
-        b.read_expr(
-            &block.out_attn,
-            Expr::src(out.clone()).slice(1, 0, i64::from(dim)),
-        )?;
-        b.read_expr(
-            &block.out_mlp,
-            Expr::src(out).slice(1, i64::from(dim), inter as i64),
-        )?;
+        let inter = block.out_mlp.shape[1] as i64;
+        column_block(b, src, &block.out_attn, &out, 0, i64::from(dim))?;
+        column_block(b, src, &block.out_mlp, &out, i64::from(dim), inter)?;
     }
 
     b.read(&m.norm_out, w("norm_out.linear"))?;
@@ -270,7 +270,12 @@ fn reordered(b: &mut Builder, w: &Weight, from: &str, slices: u32, dim: u32) -> 
 /// The encoder: `Qwen3ForCausalLM`'s `model.*` names under `te.`, the
 /// first `TE_LAYERS` layers only, no final norm, no head; plus
 /// `context_embedder` cut into its three tap blocks.
-fn text_encoder(b: &mut Builder, te: &TextEncoder, layout: Layout) -> Result<(), Error> {
+fn text_encoder(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    te: &TextEncoder,
+    layout: Layout,
+) -> Result<(), Error> {
     let at = |tail: &str| layout.component("te.model.", tail);
     b.read(&te.embed, at("embed_tokens.weight")?)?;
     for (l, w) in te.layers.iter().enumerate() {
@@ -292,11 +297,38 @@ fn text_encoder(b: &mut Builder, te: &TextEncoder, layout: Layout) -> Result<(),
     let embedder = layout.dit("context_embedder.weight");
     for (i, w) in te.context_embed.iter().enumerate() {
         let start = i64::from(TE_HIDDEN) * i as i64;
-        b.read_expr(
-            w,
-            Expr::src(embedder.clone()).slice(1, start, i64::from(TE_HIDDEN)),
-        )?;
+        column_block(b, src, w, &embedder, start, i64::from(TE_HIDDEN))?;
     }
+    Ok(())
+}
+
+/// Columns `[start, start + len)` of a stored `[rows, cols]` plane as `w`.
+/// A column slice is a strided walk of the checkpoint, and the executor
+/// casts only a compact block, so where the row's dtype is not the
+/// checkpoint's the slice lands first as an internal plane in the stored
+/// dtype and the cast is a second step over it (the `read_over` shape).
+fn column_block(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    w: &Weight,
+    from: &str,
+    start: i64,
+    len: i64,
+) -> Result<(), Error> {
+    let stored = stored_encoding(src, from)?;
+    let want = encoding(w.dtype);
+    let sliced = Expr::src(from.to_string()).slice(1, start, len);
+    if stored == want {
+        return b.read_expr(w, sliced);
+    }
+    let staged = format!("{}.read", w.name);
+    b.push(TensorContract::new(staged.clone(), sliced, extents(w), stored).internal());
+    b.push(TensorContract::new(
+        w.name.clone(),
+        Expr::out(staged).cast(want.clone()),
+        extents(w),
+        want,
+    ));
     Ok(())
 }
 
