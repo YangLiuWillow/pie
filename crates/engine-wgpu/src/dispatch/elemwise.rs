@@ -106,7 +106,8 @@ impl Run<'_> {
             // CUDA's load-time chain fusions (`model_ir::fuse::residual_chains`);
             // this engine never runs that pass, so it never sees these.
             | Elementwise::RmsnormResidualAdd { .. }
-            | Elementwise::EmbedScaleAdd { .. } => {
+            | Elementwise::EmbedScaleAdd { .. }
+            | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
 

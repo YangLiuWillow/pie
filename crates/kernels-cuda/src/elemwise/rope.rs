@@ -193,6 +193,67 @@ pub fn partial_q(
     rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta)
 }
 
+/// `y = rope_partial_q(rmsnorm_per_head(x, weight))`, one launch per fire:
+/// the KV-sharing layers' q path (`model_ir::fuse::q_norm_rope`).
+///
+/// # Errors
+///
+/// [`Error::Refused`] for a row that is not whole heads of `head_dim`, a
+/// `rotary_dim` past the head or odd, or a launch the runtime refused.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_rope_partial_q(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    head_dim: u32,
+    eps: f32,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_rope_partial_q";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    positions_stream(OP, positions, &x);
+    if head_dim == 0
+        || head_dim % 2 != 0
+        || y.width % head_dim != 0
+        || rotary_dim > head_dim
+        || rotary_dim % 2 != 0
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "wants whole even heads and an even rotary width within them, and was handed \
+                 width={}, head_dim={head_dim}, rotary_dim={rotary_dim}",
+                y.width
+            ),
+        ));
+    }
+    let heads = y.width / head_dim;
+    if y.rows == 0 || heads == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::elemwise::q_rmsnorm_rope_partial<128>")
+            .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            weight.arg(),
+            positions.arg(),
+            y.arg(),
+            stated(OP, head_dim)?.arg(),
+            stated(OP, heads)?.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            theta.arg(),
+            eps.arg(),
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
+            ctx.stage(),
+        ],
+    )
+}
+
 /// Partial rope over the last `rotary_dim` lanes of each head.
 /// The YaRN ramp a partial rope states beside its theta (the IR's
 /// `elemwise::Yarn`, restated here because this crate names no IR).

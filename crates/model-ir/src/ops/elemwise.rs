@@ -265,6 +265,19 @@ pub enum Elementwise {
         theta: f32,
         q_out: ValueId,
     },
+    /// `RmsnormPerHead` then the `RopePartialQ` over its result, one node
+    /// (`fuse::q_norm_rope`); `q_out` aliases `y`.
+    RmsnormRopePartialQ {
+        x: ValueId,
+        weight: ValueId,
+        head_dim: u32,
+        eps: f32,
+        positions: ValueId,
+        rotary_dim: u32,
+        theta: f32,
+        y: ValueId,
+        q_out: ValueId,
+    },
     /// Partial rope over the last `rotary_dim` lanes of each head.
     ///
     /// **`inverse` UNROTATES** — the angle is negated — for the one place a
@@ -487,6 +500,12 @@ impl Operands for Elementwise {
             Self::RopePartial { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::RopeMrope { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::RopePartialQ { q, positions, .. } => sink.extend([*q, *positions]),
+            Self::RmsnormRopePartialQ {
+                x,
+                weight,
+                positions,
+                ..
+            } => sink.extend([*x, *weight, *positions]),
             Self::RopePartialLast { q, positions, .. } => sink.extend([*q, *positions]),
             Self::RopeYarn { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::GateSigmoidMul { x, gate, .. } => sink.extend([*x, *gate]),
@@ -555,6 +574,7 @@ impl Operands for Elementwise {
             Self::RopePartial { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::RopeMrope { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::RopePartialQ { q_out, .. } => sink.push(*q_out),
+            Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::RopePartialLast { q_out, .. } => sink.push(*q_out),
             Self::RopeYarn { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::GateSigmoidMul { x_out, .. } => sink.push(*x_out),
@@ -603,6 +623,7 @@ impl Operands for Elementwise {
                 sink.extend([(*q_out, *q), (*k_out, *k)]);
             }
             Self::RopePartialQ { q_out, q, .. } => sink.push((*q_out, *q)),
+            Self::RmsnormRopePartialQ { q_out, y, .. } => sink.push((*q_out, *y)),
             Self::RopePartialLast { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::RopeYarn { q_out, q, k_out, k, .. } => sink.extend([(*q_out, *q), (*k_out, *k)]),
             Self::GateSigmoidMul { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -645,6 +666,7 @@ impl Operands for Elementwise {
             Self::RopePartial { .. } => "elementwise.rope_partial",
             Self::RopeMrope { .. } => "elementwise.rope_mrope",
             Self::RopePartialQ { .. } => "elementwise.rope_partial_q",
+            Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
             Self::RopePartialLast { .. } => "elementwise.rope_partial_last",
             Self::RopeYarn { .. } => "elementwise.rope_yarn",
             Self::GateSigmoidMul { .. } => "elementwise.gate_sigmoid_mul",

@@ -492,6 +492,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Elementwise::RopePartialQ { .. } | Elementwise::RopePartialLast { .. } => {
                 &[(In(1), I32)]
             }
+            Elementwise::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
             // The mix projection is f32 end to end — the operand the norm
             // widened, the dynamic plane, and the row the sinkhorn splits.
