@@ -751,7 +751,12 @@ impl Session {
     }
 
     /// Send file chunks from server to client (inferlet → client download).
-    pub(super) async fn send_file_download(&mut self, process_id: ProcessId, data: Bytes) {
+    pub(super) async fn send_file_download(
+        &mut self,
+        process_id: ProcessId,
+        data: Bytes,
+        name: Option<String>,
+    ) {
         let file_hash = blake3::hash(&data).to_hex().to_string();
         let total_chunks = data.len().div_ceil(client::message::CHUNK_SIZE_BYTES);
 
@@ -764,9 +769,9 @@ impl Session {
                 chunk_index: i,
                 total_chunks,
                 chunk_data: chunk.to_vec(),
+                name: name.clone(),
             })
             .await;
         }
     }
 }
-

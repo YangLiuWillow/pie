@@ -140,5 +140,13 @@ pub enum ServerMessage {
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
         chunk_data: Vec<u8>,
+        /// The name the inferlet suggested for this file, when it named one
+        /// (`session.send-frames` / `send-pcm` do; `send-file` does not).
+        ///
+        /// `#[serde(default)]` rather than a bare field: the enum is
+        /// internally tagged, so it goes on the wire as a map and a client
+        /// built before this key existed keeps decoding these frames.
+        #[serde(default)]
+        name: Option<String>,
     },
 }
