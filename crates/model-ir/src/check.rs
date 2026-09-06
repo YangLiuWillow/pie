@@ -607,6 +607,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // not fixed; the output grid is the last input.
             Spatial::Conv3d { .. } => &[(In(1), I32)],
             Spatial::GroupNorm { .. } => &[(In(1), I32), (In(2), F32), (In(3), F32)],
+            Spatial::Attention { .. } => &[(In(3), I32)],
             Spatial::UpsampleNearest { .. }
             | Spatial::PixelShuffle { .. }
             | Spatial::PixelUnshuffle { .. }

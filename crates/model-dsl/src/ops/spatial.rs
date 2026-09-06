@@ -77,9 +77,15 @@ pub struct Conv {
     pub k: [u32; 3],
     /// `[st, sh, sw]`.
     pub stride: [u32; 3],
-    /// `[pt, ph, pw]`, symmetric zero padding; under `causal_t` `pt` is the
-    /// front-only time padding.
+    /// `[pt, ph, pw]`, the zero padding in FRONT of each axis; under
+    /// `causal_t` `pt` is the front-only time padding.
     pub pad: [u32; 3],
+    /// The zero padding BEHIND each axis — `pad` again for the symmetric
+    /// convolutions every constructor here states; [`Conv::pad_back`]
+    /// makes it asymmetric (diffusers' `Downsample2D`: `F.pad(x, (0, 1, 0,
+    /// 1))` then a stride-2 3x3 with no padding is `conv2d([3, 3], [2, 2],
+    /// [0, 0]).pad_back([0, 1, 1])`).
+    pub pad_back: [u32; 3],
     /// Time padded in front only (from the cache when one is given).
     pub causal_t: bool,
     /// What the front frames read under `causal_t` with no cache.
@@ -94,6 +100,7 @@ impl Conv {
             k: [1, k[0], k[1]],
             stride: [1, stride[0], stride[1]],
             pad: [0, pad[0], pad[1]],
+            pad_back: [0, pad[0], pad[1]],
             causal_t: false,
             time_pad: TimePad::Zero,
         }
@@ -106,9 +113,18 @@ impl Conv {
             k,
             stride,
             pad,
+            pad_back: pad,
             causal_t: false,
             time_pad: TimePad::Zero,
         }
+    }
+
+    /// The same convolution with the padding BEHIND each axis restated:
+    /// `[t, h, w]` zero voxels after the box (the front stays `pad`).
+    #[must_use]
+    pub const fn pad_back(mut self, back: [u32; 3]) -> Conv {
+        self.pad_back = back;
+        self
     }
 
     /// The box-keeping 3×3×3: stride 1, pad 1 everywhere.
@@ -123,6 +139,7 @@ impl Conv {
     pub const fn causal(mut self, time_pad: TimePad) -> Conv {
         self.causal_t = true;
         self.pad[0] = self.k[0] - 1;
+        self.pad_back[0] = 0;
         self.time_pad = time_pad;
         self
     }
@@ -140,6 +157,7 @@ impl Conv {
             k: self.k,
             stride: self.stride,
             pad: self.pad,
+            pad_back: self.pad_back,
             causal_t: self.causal_t,
         }
     }
@@ -226,6 +244,7 @@ pub fn conv3d(
             k: conv.k,
             stride: conv.stride,
             pad: conv.pad,
+            pad_back: conv.pad_back,
             causal_t: conv.causal_t,
             time_pad: conv.time_pad,
             cache,
@@ -280,6 +299,44 @@ pub fn group_norm(
             y: y.id(),
         },
         &[x, grid],
+    );
+    y
+}
+
+/// The conv VAE's mid-block attention (`Spatial::Attention`): one head as
+/// wide as the row, per clip over every voxel of the clip — `y =
+/// softmax(q·kᵀ · sm_scale) · v`. `q`, `k`, `v` are `[rows, C]` bf16 on
+/// the voxel axis at one type and grid; fresh `y` at `q`'s type. Not
+/// `attn::ragged`, whose kernel is stamped at head widths 64/128/256 over
+/// token-axis CSRs; a VAE's head is its whole channel row.
+#[must_use]
+pub fn attention(q: &Value, k: &Value, v: &Value, grid: &Value, sm_scale: f32) -> Value {
+    expect_voxels("`spatial::attention`'s query", q);
+    expect_grid("`spatial::attention`'s grid", grid);
+    assert!(
+        q.ty() == k.ty() && q.ty() == v.ty(),
+        "`spatial::attention` reads q, k and v at one type; got {:?}, {:?}, {:?}",
+        q.ty(),
+        k.ty(),
+        v.ty()
+    );
+    assert_eq!(
+        q.dtype(),
+        Dtype::Bf16,
+        "`spatial::attention` reads bf16 rows"
+    );
+    let r = q.rec();
+    let y = r.fresh(q.ty().clone());
+    r.push(
+        Spatial::Attention {
+            q: q.id(),
+            k: k.id(),
+            v: v.id(),
+            grid: grid.id(),
+            sm_scale,
+            y: y.id(),
+        },
+        &[q, k, v, grid],
     );
     y
 }
