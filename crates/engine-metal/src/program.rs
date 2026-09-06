@@ -237,6 +237,13 @@ impl Plane {
         self.channels.remove(&id).is_some()
     }
 
+    /// The ring registered under `id`, if any — what a fire reads a lane's
+    /// channel-fed input off.
+    #[must_use]
+    pub fn channel(&self, id: u64) -> Option<&Arc<SharedRing>> {
+        self.channels.get(&id)
+    }
+
     /// Which other instances share a ring with one of `instances` — the
     /// set a fence must widen to, since a shared ring's counters advance
     /// a frame after the fire that moved them.
@@ -468,7 +475,7 @@ impl Plane {
     pub fn stage_batched(
         &mut self,
         device: &Context,
-        frame: &Frame,
+        frame: &mut Frame,
         ids: &[u64],
     ) -> Result<Vec<(u64, Launched)>> {
         let mut results = Vec::with_capacity(ids.len());

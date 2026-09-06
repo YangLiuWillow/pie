@@ -17,6 +17,7 @@
 
 mod arming;
 mod boot;
+pub(crate) mod btrace;
 mod enqueue;
 mod lanes;
 mod load;
@@ -151,6 +152,8 @@ pub struct Shell {
     armed_body: Option<record::BodyKey>,
     /// The segmentation of every key this load has derived one for.
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
+    /// The last few resolved window tables, by what they were resolved from.
+    windows_memo: Vec<prepare::WindowsMemo>,
     /// What the last fire's window table cost.
     last: FireCost,
     cache: GraphCache,

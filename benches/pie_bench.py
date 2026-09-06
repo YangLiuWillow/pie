@@ -730,7 +730,7 @@ async def run(args: argparse.Namespace):
     prompt_token_ids: list[list[int]] | None = None
     if args.pretokenized_prompts:
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
-            args.model, args.system, prompts
+            args.model, args.system, prompts, getattr(args, "think", None)
         )
     wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
 

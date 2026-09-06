@@ -54,7 +54,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # `--engine vulkan` run with the default stops before the first inferlet
     # rather than reporting thirty-nine failures. The CUDA engines take the
     # unquantised release as it is, which is why this default is what it is.
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
+    parser.add_argument("--model", default=parser_default_model(), help="HuggingFace model ID")
     # WHICH ROW OF THAT CHECKPOINT (`[model] sku`). A vision artifact fits its
     # family's text row and its own, and the load identifies the cheap one
     # first -- deliberately, because a two-unit load stands the fold down. A
@@ -340,13 +340,42 @@ async def run_inferlet(
 TestFn = Callable[..., Coroutine]
 
 
+def parser_default_model() -> str:
+    return "Qwen/Qwen3-0.6B"
+
+
+def _served_model_from_local_config() -> str | None:
+    """`[model] model` (or `sku`'s model) of the pie config a local server
+    was started from, or `None` when there is no such file."""
+    import os
+    import tomllib
+    from pathlib import Path
+
+    home = Path(os.environ.get("PIE_HOME", Path.home() / ".pie"))
+    try:
+        config = tomllib.loads((home / "config.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    model = config.get("model", {})
+    name = model.get("model") if isinstance(model, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     # Attached: no embedded engine, no `pie-server` wheel needed.
     if args.attach:
         from pie_client import PieClient
 
         _build_guests()
-        print(f"Server: {args.attach} (attached; its model is whatever it was started with)")
+        # The geometry helpers (`_adapter_geometry`, `_score_geometry`) read
+        # the served model's HF config, so an attached run must know which
+        # model that is. With `--model` left at its default, take it from the
+        # local server's own config; a remote server still wants `--model`.
+        if args.model == parser_default_model():
+            served = _served_model_from_local_config()
+            if served:
+                args.model = served
+        print(f"Server: {args.attach} (attached; geometry read as {args.model})")
         print()
         async with PieClient(args.attach) as client:
             await client.authenticate("default")

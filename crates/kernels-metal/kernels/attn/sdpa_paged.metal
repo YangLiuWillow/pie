@@ -92,8 +92,12 @@ inline void sdpa_paged_decode_body(
   // is authoritative and the causal upper bound must not apply — a
   // bidirectional read, which a block drafter's full-attention layer needs.
   // The lower bound is the window's either way.
-  const bool wide      = window < 0;
-  const int  extent    = wide ? (-window - 1) : window;
+  // A ROW'S OWN MASK WORD says the same thing per row: 0 no mask, 1 a mask
+  // under the causal bound, 2 a mask that is authoritative — a bidirectional
+  // lane (a denoiser's canvas) beside causal lanes in one fire.
+  const int mask_word  = FAST_FULL ? 0 : int(attention_mask_enabled[row]);
+  const bool wide      = window < 0 || mask_word == 2;
+  const int  extent    = window < 0 ? (-window - 1) : window;
   const int kv_start   =
       FAST_FULL ? 0 : ((extent > 0 && q_pos >= extent) ? (q_pos - extent + 1) : 0);
   const int page_base  = int(kv_page_indptr[r]);
@@ -108,7 +112,7 @@ inline void sdpa_paged_decode_body(
   U max_score = NEG_INF;
   U sum_exp_score = 0;
 
-  const bool masked = !FAST_FULL && attention_mask_enabled[row] != 0;
+  const bool masked = mask_word != 0;
 
   auto absorb = [&](size_t slot) {
     const device T* kptr =
@@ -423,10 +427,13 @@ inline void sdpa_paged_tiled_body(
   const int q_pos     = live ? position_ids[row] : 0;
   // The window int's negative half says the row's mask is authoritative and
   // the causal upper bound must not apply; see the decode body above.
-  const bool wide     = window < 0;
-  const int  extent   = wide ? (-window - 1) : window;
+  // Mask word 2: this row's mask is authoritative, no causal upper bound
+  // (a bidirectional lane); see the entry above.
+  const int mask_word = live ? int(attention_mask_enabled[row]) : 0;
+  const bool wide     = window < 0 || mask_word == 2;
+  const int  extent   = window < 0 ? (-window - 1) : window;
   const int my_start  = (extent > 0 && q_pos >= extent) ? (q_pos - extent + 1) : 0;
-  const bool masked   = live && attention_mask_enabled[row] != 0;
+  const bool masked   = mask_word != 0;
 
   U max_score = NEG_INF;
   U sum_exp_score = 0;
@@ -441,14 +448,17 @@ inline void sdpa_paged_tiled_body(
     // position; when the mask is authoritative it runs to the end of this
     // request's pages and the mask does the bounding (the decode body above
     // says why that is safe).
-    const bool wide_here = window < 0;
-    const int extent_here = wide_here ? (-window - 1) : window;
+    // The group's walk runs to the request's page extent when the node reads
+    // wide or any row of the group carries mask word 2.
+    bool wide_here = window < 0;
+    const int extent_here = window < 0 ? (-window - 1) : window;
     int kp_hi = 0;
     int kp_lo = 0x7fffffff;
     for (int i = sub; i < sub_hi; i++) {
       const int p = position_ids[row_lo + i];
       kp_hi = max(kp_hi, p);
       kp_lo = min(kp_lo, (extent_here > 0 && p >= extent_here) ? (p - extent_here + 1) : 0);
+      wide_here = wide_here || attention_mask_enabled[row_lo + i] == 2;
     }
     const int page_base = int(kv_page_indptr[r]);
     if (wide_here) {

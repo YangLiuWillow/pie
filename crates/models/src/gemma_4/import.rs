@@ -167,14 +167,20 @@ impl Model {
                 b.read(&x.pre_ffw_norm_2, n("pre_feedforward_layernorm_2.weight"))?;
                 b.read(&x.post_ffw_norm_1, n("post_feedforward_layernorm_1.weight"))?;
                 b.read(&x.post_ffw_norm_2, n("post_feedforward_layernorm_2.weight"))?;
-                // Two spellings of the expert banks: transformers 5 stores
+                // Three spellings of the expert banks: transformers 5 stores
                 // them fused (`experts.gate_up_proj`, `[experts, 2 * inter,
-                // hidden]`, gate first — the declared layout exactly);
+                // hidden]`, gate first — the declared layout exactly); an
+                // `mlx_lm` quantization of that export keeps the fused shape
+                // under `experts.gate_up_proj.weight` (+ scales, biases);
                 // older exports split them under `switch_glu`.
                 let fused = n("experts.gate_up_proj");
+                let fused_quantized = n("experts.gate_up_proj.weight");
                 if src.get(&fused).is_some() {
                     b.read(&x.gate_up, fused)?;
                     b.read(&x.down, n("experts.down_proj"))?;
+                } else if src.get(&fused_quantized).is_some() {
+                    b.read(&x.gate_up, fused_quantized)?;
+                    b.read(&x.down, n("experts.down_proj.weight"))?;
                 } else {
                     b.read_concat(
                         &x.gate_up,

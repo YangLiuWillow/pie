@@ -47,6 +47,12 @@ pub const PUBLISHED: &[Published] = &[
         sku: "qwen36-35b-a3b-dflash-u4g64-kv-bf16",
     },
     Published {
+        target: "mlx-community/Qwen3.5-9B-4bit",
+        head: "z-lab/Qwen3.5-9B-DFlash",
+        drafter: "dflash",
+        sku: "qwen35-d9b-dflash-u4g64-kv-bf16",
+    },
+    Published {
         target: "mlx-community/gpt-oss-20b-MXFP4-Q4",
         head: "z-lab/gpt-oss-20b-DFlash",
         drafter: "dflash",

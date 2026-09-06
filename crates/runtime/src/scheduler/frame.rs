@@ -1504,6 +1504,11 @@ ready_age_newest={}us",
     }
 
     /// Probe/diagnostic summary line.
+    /// Whether any lane holds a queued frame.
+    pub fn has_queued_frames(&self) -> bool {
+        self.lanes.values().any(|lane| !lane.frames.is_empty())
+    }
+
     pub fn debug_summary(&self) -> String {
         use std::fmt::Write as _;
         let mut out = format!(

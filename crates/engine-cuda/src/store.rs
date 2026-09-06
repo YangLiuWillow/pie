@@ -297,6 +297,12 @@ pub struct Pools {
     committed_kv_pages: u32,
     /// The state-slot watermark, likewise.
     committed_state_slots: u32,
+    /// Page ids every kv plane has backed since the last release, as a
+    /// bitmap. A frame whose ranges all sit in it, under the committed
+    /// watermarks, is admitted without touching the arenas — the steady
+    /// decode case, where the walk over every plane's units for every
+    /// range cost ~110 us a frame before answering "already mapped".
+    backed_pages: Vec<u64>,
 }
 
 impl Pools {
@@ -416,6 +422,7 @@ impl Pools {
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
+            backed_pages: Vec::new(),
         })
     }
 
@@ -885,9 +892,42 @@ impl Pools {
         demand: engine::frame::Demand,
         kv_ranges: &[(u64, u64)],
     ) -> Result<()> {
+        if demand.kv_pages <= self.committed_kv_pages
+            && demand.state_slots <= self.committed_state_slots
+            && kv_ranges
+                .iter()
+                .all(|&(first, count)| self.pages_backed(first, count))
+        {
+            return Ok(());
+        }
         match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
-            Commit::Committed => Ok(()),
+            Commit::Committed => {
+                self.note_backed(kv_ranges);
+                Ok(())
+            }
             refusal => Err(refuse(&self.pool, refusal)),
+        }
+    }
+
+    /// Whether every page in `[first, first + count)` is in the backed bitmap.
+    fn pages_backed(&self, first: u64, count: u64) -> bool {
+        (first..first.saturating_add(count)).all(|page| {
+            self.backed_pages
+                .get((page / 64) as usize)
+                .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
+        })
+    }
+
+    /// Record `ranges` as backed on every kv plane (after a committed frame).
+    fn note_backed(&mut self, ranges: &[(u64, u64)]) {
+        for &(first, count) in ranges {
+            for page in first..first.saturating_add(count) {
+                let (word, bit) = ((page / 64) as usize, page % 64);
+                if self.backed_pages.len() <= word {
+                    self.backed_pages.resize(word + 1, 0);
+                }
+                self.backed_pages[word] |= 1u64 << bit;
+            }
         }
     }
 
@@ -964,6 +1004,9 @@ impl Pools {
         }
         self.committed_kv_pages = kv_pages;
         self.committed_state_slots = state_slots;
+        // Units past the new watermarks are gone; the bitmap no longer
+        // knows which pages survived, so every page proves itself again.
+        self.backed_pages.clear();
     }
 }
 

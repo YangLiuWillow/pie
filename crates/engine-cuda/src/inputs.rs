@@ -944,9 +944,11 @@ impl Inputs {
         } = self;
         let host = staging[slot.at() as usize].host();
 
-        // SAFETY (every `copy` below): source is this slot's pinned allocation, alive until the `SlotGuard` drops; destination span is checked by `Buffer::stage_from`.
+        // The spans, gathered and issued as ONE batched copy at the end (source is this slot's pinned allocation, alive until the `SlotGuard` drops; destination spans are checked by `Buffer::stage_batch_from`).
+        let mut spans: Vec<(u64, *const u8, usize)> = Vec::with_capacity(24);
         let mut copy = |offset: u64, len: usize| -> Result<()> {
-            unsafe { store.stage_from(stream, offset, host.wrapping_add(offset as usize), len) }
+            spans.push((offset, host.wrapping_add(offset as usize), len));
+            Ok(())
         };
 
         copy(at_tokens, rows as usize * 4)?;
@@ -987,6 +989,9 @@ impl Inputs {
                 write_offset: i32s(base + at.write_offset, rows),
             });
         }
+
+        // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
+        unsafe { store.stage_batch_from(stream, &spans)? };
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),

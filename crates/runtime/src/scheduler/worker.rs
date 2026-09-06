@@ -2673,6 +2673,25 @@ impl BatchScheduler {
                 let control_park = idle_park && in_flight_control.holds_launches();
                 let park_began = Instant::now();
                 let parked = rx.recv_timeout(recv_wait);
+                // `PIE_CONTENTION_TRACE_EVENTS=1`: while nothing arrives and
+                // something is still owed, say what the policy holds — a
+                // stalled gather is otherwise silent.
+                if parked.is_err() && crate::planner::trace_enabled() {
+                    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+                    let mut last = LAST.lock().unwrap();
+                    let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
+                    let owed = frame_policy.has_queued_frames() || !pending.is_empty() || !in_flight_launches.is_empty();
+                    if due && owed {
+                        *last = Some(Instant::now());
+                        println!(
+                            "[sched-stall t_us={}] pending={} in_flight={} {}",
+                            crate::scheduler::fire_timing_now_us(),
+                            pending.len(),
+                            in_flight_launches.len(),
+                            frame_policy.debug_summary()
+                        );
+                    }
+                }
                 if idle_park {
                     let slept = park_began.elapsed().as_micros() as u64;
                     use std::sync::atomic::Ordering::Relaxed;

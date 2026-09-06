@@ -178,9 +178,7 @@ async def run(args: argparse.Namespace):
         batch = max(1, args.num_requests)
     else:
         batch = args.concurrency
-    prompts, prompt_counts = hf_chat_prompts_and_counts(
-        args.model, args.system, make_prompts(args, n + args.warmup)
-    )
+    prompts, prompt_counts = hf_chat_prompts_and_counts(args.model, args.system, make_prompts(args, n + args.warmup), getattr(args, 'think', None))
     gate = asyncio.Semaphore(batch)
     retries = [0]
     async with maybe_server(args, batch) as base_url:

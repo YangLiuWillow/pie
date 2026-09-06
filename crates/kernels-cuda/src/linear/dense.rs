@@ -20,9 +20,12 @@ use cudarc::cublas::sys::{
 use cudarc::cublaslt::sys as lt;
 use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
-    cudaEventRecord, cudaEventSynchronize, cudaFree, cudaGetDevice, cudaGetLastError, cudaMalloc,
-    cudaMemsetAsync, cudaStreamCaptureStatus,
-    cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamNonBlocking, cudaStreamSynchronize,
+    cudaEventRecordExternal, cudaEventRecordWithFlags, cudaEventSynchronize, cudaFree,
+    cudaGetDevice, cudaGetLastError, cudaGraph_t, cudaGraphDestroy, cudaGraphExec_t,
+    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc,
+    cudaMemsetAsync, cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamCaptureStatus,
+    cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamEndCapture, cudaStreamNonBlocking,
+    cudaStreamSynchronize,
 };
 
 use super::gemv::gemv_bf16;
@@ -446,6 +449,73 @@ fn build_lt_plan(
         return None;
     }
     heuristics.truncate((returned as usize).min(HEURISTICS));
+    // The heuristic rarely offers split-K for a skinny decode GEMM, and a
+    // 64-row `[20480 x 2560]` runs at 78% of the card's bandwidth as one
+    // wave and a half of 128x64 tiles. So every heuristic that supports it
+    // is also offered split 2, 4 and 8 ways (reduced in the compute type),
+    // each checked by cuBLASLt for this shape and workspace; the tuner races
+    // them with the rest. Fixed order behind the heuristics, since the disk
+    // cache names a tactic by its index here.
+    let mut augmented: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
+    for heuristic in &heuristics {
+        let mut supports: i32 = 0;
+        let mut written: usize = 0;
+        let asked = unsafe {
+            lt::cublasLtMatmulAlgoCapGetAttribute(
+                std::ptr::from_ref(&heuristic.algo),
+                lt::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_SPLITK_SUPPORT,
+                std::ptr::from_mut(&mut supports).cast(),
+                std::mem::size_of::<i32>(),
+                &raw mut written,
+            )
+        };
+        if asked != ok || supports == 0 {
+            continue;
+        }
+        for split in [2i32, 4, 8] {
+            let mut algo = heuristic.algo;
+            let scheme = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+            let set_split = unsafe {
+                lt::cublasLtMatmulAlgoConfigSetAttribute(
+                    &raw mut algo,
+                    lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                    std::ptr::from_ref(&split).cast(),
+                    std::mem::size_of::<i32>(),
+                )
+            };
+            let set_scheme = unsafe {
+                lt::cublasLtMatmulAlgoConfigSetAttribute(
+                    &raw mut algo,
+                    lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                    std::ptr::from_ref(&scheme).cast(),
+                    std::mem::size_of::<lt::cublasLtReductionScheme_t>(),
+                )
+            };
+            if set_split != ok || set_scheme != ok {
+                continue;
+            }
+            let mut result: lt::cublasLtMatmulHeuristicResult_t = unsafe { core::mem::zeroed() };
+            let checked = unsafe {
+                lt::cublasLtMatmulAlgoCheck(
+                    lt_handle,
+                    plan.op_desc,
+                    plan.a_desc,
+                    plan.b_desc,
+                    plan.c_desc,
+                    plan.c_desc,
+                    &raw const algo,
+                    &raw mut result,
+                )
+            };
+            if checked != ok || result.state != ok || result.workspaceSize > workspace_bytes {
+                clear_error();
+                continue;
+            }
+            result.algo = algo;
+            augmented.push(result);
+        }
+    }
+    heuristics.extend(augmented);
     plan.heuristics = heuristics;
     Some(plan)
 }
@@ -629,14 +699,22 @@ fn tune(
     plan: Option<&LtPlan>,
     call: Call,
 ) -> Tactic {
+    // Ties go to the earlier candidate, so the order is a preference:
+    // `GemmEx` LAST. Under stream capture `cublasGemmEx` records a memory
+    // node for its own workspace (~10 MiB a body on gemma-4-E4B), and the
+    // arming pass pays that off the ceiling's spare — 173 bodies took
+    // 1.8 GiB and left the wide compositions unarmed. An explicit Lt
+    // algorithm runs in the slab the handle was given and records nothing,
+    // so `GemmEx` wins only where it is more than 2% faster than every
+    // explicit form.
     let mut candidates = Vec::new();
     if call.m == 1 {
         candidates.push(Tactic::Gemv);
     }
-    candidates.push(Tactic::GemmEx);
     if let Some(plan) = plan {
         candidates.extend((0..plan.heuristics.len()).map(Tactic::Lt));
     }
+    candidates.push(Tactic::GemmEx);
 
     let mut arena = TuneArena::empty();
     if !arena.init(handle, caller_stream, lt.workspace_bytes, call) {
@@ -797,8 +875,20 @@ impl TuneArena {
         true
     }
 
-    /// Times one tactic on the bench: warmup fires, then the best of the
-    /// event-timed fires. Blocks the host between phases.
+    /// Times one tactic on the bench **as a graph replays it**: the flush,
+    /// a timing event, the fire and a second timing event are captured into
+    /// one graph, instantiated, replayed to warm up, then replayed timed;
+    /// the best of the timed replays is the answer.
+    ///
+    /// Captured, not streamed, because that is how a decode step runs it.
+    /// A cuBLASLt split-K algorithm that reduces in-kernel zeroes its
+    /// semaphores with a `cudaMemsetAsync` first, which a stream absorbs
+    /// for ~2 µs and a graph turns into a memset NODE costing ~6 µs of
+    /// dependency latency in front of the kernel (56 of them a step on
+    /// gemma-4-E4B at 64 lanes, 0.34 ms of a 17 ms step). Stream timing
+    /// could not see that; the graph pays exactly what the body will.
+    ///
+    /// Blocks the host between phases.
     fn time(
         &self,
         tactic: Tactic,
@@ -823,35 +913,72 @@ impl TuneArena {
                 self.workspace_bytes,
             )
         };
-        for _ in 0..3 {
-            if !fire() {
-                let _ = unsafe { cudaStreamSynchronize(self.stream.cast()) };
-                clear_error();
-                return None;
-            }
-        }
-        if unsafe { cudaStreamSynchronize(self.stream.cast()) } != cudaError::cudaSuccess {
+        let stream = self.stream.cast();
+        // One eager fire first: a tactic the backend refuses outright fails
+        // here, with nothing captured to unwind.
+        if !fire() {
+            let _ = unsafe { cudaStreamSynchronize(stream) };
             clear_error();
             return None;
         }
+        if unsafe { cudaStreamSynchronize(stream) } != cudaError::cudaSuccess {
+            clear_error();
+            return None;
+        }
+
+        // Capture: flush, start, fire, stop — a linear chain, so the stop
+        // event lands behind every node the fire recorded.
+        let mut graph: cudaGraph_t = std::ptr::null_mut();
+        let mut exec: cudaGraphExec_t = std::ptr::null_mut();
+        let captured = unsafe {
+            cudaStreamBeginCapture(stream, cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal)
+                == cudaError::cudaSuccess
+                && cudaMemsetAsync(self.flush, 0, self.flush_bytes, stream) == cudaError::cudaSuccess
+                && cudaEventRecordWithFlags(self.start, stream, cudaEventRecordExternal)
+                    == cudaError::cudaSuccess
+                && fire()
+                && cudaEventRecordWithFlags(self.stop, stream, cudaEventRecordExternal)
+                    == cudaError::cudaSuccess
+        };
+        // End the capture whatever happened inside it, or the stream stays
+        // in capture and every later call on it is refused.
+        let ended =
+            unsafe { cudaStreamEndCapture(stream, &raw mut graph) } == cudaError::cudaSuccess;
+        if !captured || !ended || graph.is_null() {
+            if !graph.is_null() {
+                let _ = unsafe { cudaGraphDestroy(graph) };
+            }
+            let _ = unsafe { cudaStreamSynchronize(stream) };
+            clear_error();
+            return None;
+        }
+        let instantiated = unsafe { cudaGraphInstantiateWithFlags(&raw mut exec, graph, 0) }
+            == cudaError::cudaSuccess;
+        let _ = unsafe { cudaGraphDestroy(graph) };
+        if !instantiated || exec.is_null() {
+            clear_error();
+            return None;
+        }
+
         let mut best: Option<f32> = None;
-        for _ in 0..7 {
-            let _ = unsafe { cudaMemsetAsync(self.flush, 0, self.flush_bytes, self.stream.cast()) };
-            let _ = unsafe { cudaEventRecord(self.start, self.stream.cast()) };
-            if !fire() {
-                let _ = unsafe { cudaStreamSynchronize(self.stream.cast()) };
+        // Three warm replays, then seven timed.
+        for round in 0..10 {
+            if unsafe { cudaGraphLaunch(exec, stream) } != cudaError::cudaSuccess
+                || unsafe { cudaEventSynchronize(self.stop) } != cudaError::cudaSuccess
+            {
+                let _ = unsafe { cudaStreamSynchronize(stream) };
+                let _ = unsafe { cudaGraphExecDestroy(exec) };
                 clear_error();
                 return None;
             }
-            let _ = unsafe { cudaEventRecord(self.stop, self.stream.cast()) };
-            if unsafe { cudaEventSynchronize(self.stop) } != cudaError::cudaSuccess {
-                clear_error();
-                return None;
+            if round < 3 {
+                continue;
             }
             let mut ms = 0.0f32;
             if unsafe { cudaEventElapsedTime(&raw mut ms, self.start, self.stop) }
                 != cudaError::cudaSuccess
             {
+                let _ = unsafe { cudaGraphExecDestroy(exec) };
                 clear_error();
                 return None;
             }
@@ -859,6 +986,8 @@ impl TuneArena {
                 best = Some(ms);
             }
         }
+        let _ = unsafe { cudaStreamSynchronize(stream) };
+        let _ = unsafe { cudaGraphExecDestroy(exec) };
         best
     }
 }
@@ -984,7 +1113,7 @@ fn signature() -> String {
         .to_string_lossy()
         .into_owned();
     format!(
-        "# pie-dense-gemm v4 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v6 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }

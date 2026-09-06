@@ -223,13 +223,21 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     }
                 }
                 Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
+                    // A turn the cluster would not take (admission, no route) is
+                    // that turn's failure, not the connection's: the other turns
+                    // this socket carries keep streaming, and the client may
+                    // retry. Closing here lost every in-flight process's events
+                    // to one transient "saturated".
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => live.push(new_rx),
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Message::Text(error_json(&e.to_string()).into()))
-                                .await;
-                            break;
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     },
                     Ok(Incoming::Cancel) => handle.cancel().await,
@@ -242,10 +250,13 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => live.push(new_rx),
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Message::Text(error_json(&e.to_string()).into()))
-                                .await;
-                            break;
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     },
                     Ok(Incoming::Cancel) => handle.cancel().await,

@@ -129,6 +129,9 @@ def main() -> None:
     ap.add_argument("--label", required=True)
     ap.add_argument("--inferlet-dir", default=str(ROOT.parent / "tests/inferlets/text-completion-bench"))
     ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--prompt", default=None, help="The user turn every request asks (default: the harnesses' own)")
+    ap.add_argument("--think", action=argparse.BooleanOptionalAction, default=None,
+                    help="Forwarded to every harness: the Qwen3-family template's enable_thinking switch")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--prompt-words", type=int, default=0,
                     help="Prepend this many words so the per-engine template "
@@ -160,6 +163,10 @@ def main() -> None:
     prompt = ["--prompt", " ".join(["the quick brown fox jumps over the lazy dog"] *
                                    max(1, args.prompt_words // 9))] if args.prompt_words else []
     common = ["--no-ignore-eos", "--warmup", str(args.warmup)]
+    if args.prompt is not None:
+        common += ["--prompt", args.prompt]
+    if args.think is not None:
+        common += ["--think" if args.think else "--no-think"]
     common += args.extra.split() if args.extra else []
     model_of = {"pie": args.pie_model or args.mlx_model, "mlx": args.mlx_model, "llamacpp": args.mlx_model}
     gguf_size = os.path.getsize(args.gguf) / (1 << 30)

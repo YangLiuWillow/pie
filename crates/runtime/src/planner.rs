@@ -17,7 +17,7 @@ use crate::store::kv::page_table::ReclaimQuote;
 
 /// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`), not `tracing` —
 /// the embedded server installs no subscriber.
-pub(crate) fn trace_enabled() -> bool {
+pub fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("PIE_CONTENTION_TRACE_EVENTS")
@@ -2970,6 +2970,34 @@ impl ResidencyPlanner {
 
     /// Coarse pressure signal for the worker heartbeat. Pool stats plus two
     /// lock-free flags — never the full [`Self::diagnostics`] snapshot.
+    /// The wait queue as text, for the contention trace: each entry's key,
+    /// process and kind.
+    pub fn debug_queue(&self) -> String {
+        self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .map(|(key, waiter)| {
+                    let kind = match &waiter.kind {
+                        WaitKind::Allocation { demand, outcome, yielded, .. } => format!(
+                            "alloc kv={} rs={} outcome={} yielded={yielded}",
+                            demand.kv_pages,
+                            demand.rs_slots,
+                            match outcome {
+                                None => "none",
+                                Some(Ok(_)) => "granted",
+                                Some(Err(_)) => "err",
+                            }
+                        ),
+                        WaitKind::Restore { demand } => format!("restore kv={demand}"),
+                    };
+                    format!("{key:?} pid={} {kind}", waiter.pid)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
     pub fn kv_pressure_bucket(&self) -> u8 {
         let (device_free, device_total) = self.port.device_stats();
         let (host_free, host_total) = self.port.host_stats();
@@ -2983,11 +3011,17 @@ impl ResidencyPlanner {
         let mut bucket = (ratio(device_free, device_total).max(ratio(host_free, host_total))
             * 255.0)
             .round() as u8;
-        if self.nonresident.load(Ordering::Acquire) != 0 {
+        // Both flags are pressure, not saturation: a parked ask or an
+        // evicted process says this worker should be routed to last, not
+        // that the gateway should refuse work at the door. The gateway's
+        // saturation line is 240; pinning it here on every ordinary park —
+        // and holding it for a report interval after the park cleared —
+        // refused every launch that followed a moment of contention on a
+        // one-worker box (sep-4 §7.15).
+        if self.nonresident.load(Ordering::Acquire) != 0
+            || self.waiters.load(Ordering::Acquire) != 0
+        {
             bucket = bucket.max(224);
-        }
-        if self.waiters.load(Ordering::Acquire) != 0 {
-            bucket = bucket.max(240);
         }
         bucket
     }

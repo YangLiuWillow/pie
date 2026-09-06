@@ -244,6 +244,21 @@ pub fn conversion_contract(
                 continue;
             }
         };
+        // A row that reads the source only by quantizing its stored codes a
+        // second time (an 8-bit conversion under a 4-bit row) is pinned, not
+        // identified: the first such row would otherwise win over the row
+        // that reads the codes as they are. `models::identify` says the same.
+        if pinned.is_none()
+            && let Some(plane) = models::requantizes(&contract)
+        {
+            if trace {
+                eprintln!(
+                    "identify: {} reads it only by re-quantizing `{plane}`; not by identification",
+                    sku.name
+                );
+            }
+            continue;
+        }
         match checkpoint::plan::compile(metadata, &contract, target.clone()) {
             Ok(_) => return Some((&sku.name, contract)),
             Err(why) => {

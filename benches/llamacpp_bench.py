@@ -113,9 +113,7 @@ async def maybe_server(args: argparse.Namespace, slot_ctx: int | None = None):
 
 async def run(args: argparse.Namespace):
     n = args.requests if args.mode == "latency" else args.num_requests
-    prompts, prompt_counts = hf_chat_prompts_and_counts(
-        args.model, args.system, make_prompts(args, n + args.warmup)
-    )
+    prompts, prompt_counts = hf_chat_prompts_and_counts(args.model, args.system, make_prompts(args, n + args.warmup), getattr(args, 'think', None))
     # `--concurrency` has to mean the same thing it means to the harnesses it is
     # compared against, and here it meant nothing: the client gathered every
     # request at once and only the server's `--parallel` bounded the batch. A

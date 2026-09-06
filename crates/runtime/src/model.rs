@@ -146,6 +146,12 @@ pub const ROWS: &[Row] = &[
         arch: "diffusion_gemma",
     },
     Row {
+        id: "diffusiongemma-26b-a4b-u8g64-u4g64-u4g64-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "diffusion_gemma",
+    },
+    Row {
         id: "diffusiongemma-26b-a4b-bf16-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,
@@ -399,6 +405,24 @@ pub const ROWS: &[Row] = &[
     Row {
         id: "qwen35-d0.8b-u4g64-kv-bf16",
         layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d2b-u4g64-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d9b-u4g64-kv-bf16",
+        layers: 32,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d9b-dflash-u4g64-kv-bf16",
+        layers: 32,
         vocab: 248_320,
         arch: "qwen3_5",
     },

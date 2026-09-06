@@ -3,7 +3,7 @@
 
 use kernels_metal::linear;
 use model_exec::{DispatchLinear, KernelError};
-use model_ir::Linear;
+use model_ir::{Linear, Operands};
 
 use crate::run::Run;
 
@@ -118,6 +118,10 @@ impl Run<'_> {
                 self.tensor(*x),
                 self.tensor(*y),
             ),
+            // Fused by the CUDA load only (`model_ir::fuse::gemm_epilogues`).
+            Linear::MatmulGeglu { .. } | Linear::LmHeadSoftcap { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,

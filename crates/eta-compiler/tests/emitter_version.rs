@@ -35,8 +35,9 @@ const PINNED: &[(&str, u16, u64)] = &[
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and
     // its own `ptir_m4` kernels joined the table. 49 -> 50 (merged with 45):
-    // the normalization fold reaches the metal output too.
-    ("metal", 50, 0xafea_077e_140a_1a97),
+    // the normalization fold reaches the metal output too. 50 -> 51: a
+    // gather is a direct op, a scalar runs mid-dispatch, a scatter splits.
+    ("metal", 51, 0x63b4_f718_bf13_f781),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

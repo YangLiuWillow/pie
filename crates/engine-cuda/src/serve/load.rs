@@ -63,6 +63,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // lands the traced launches instead.
     if fuse_chains() {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
+        boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
+    }
+    if std::env::var_os("PIE_TRACE_CENSUS").is_some() {
+        let mut census: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for node in &boot.trace.nodes {
+            *census
+                .entry(model_ir::Operands::name(&node.op))
+                .or_insert(0) += 1;
+        }
+        eprintln!(
+            "[trace-census] {} nodes: {census:?}",
+            boot.trace.nodes.len()
+        );
     }
     // `PTIR_GUMBEL_DIRECT=0`: keep a program's Gumbel-max head as the
     // launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
@@ -364,6 +378,7 @@ impl Shell {
             arming: false,
             armed_body: None,
             segments: std::collections::HashMap::new(),
+            windows_memo: Vec::new(),
             last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();

@@ -63,6 +63,26 @@ pub enum Linear {
         intermediate: u32,
         y: ValueId,
     },
+    /// `Matmul` into `packed` and `MlpGegluTanhPacked` out of it, one node
+    /// (`fuse::gemm_epilogues`). A backend may land `y` straight off the
+    /// accumulator and leave `packed` unwritten: the pass folds only a
+    /// `packed` nothing else reads.
+    MatmulGeglu {
+        act: ValueId,
+        w: ValueId,
+        intermediate: u32,
+        packed: ValueId,
+        y: ValueId,
+    },
+    /// `LmHead` and the `LogitSoftcap` over its logits, one node
+    /// (`fuse::gemm_epilogues`); `y_out` aliases `y`.
+    LmHeadSoftcap {
+        act: ValueId,
+        w: ValueId,
+        cap: f32,
+        y: ValueId,
+        y_out: ValueId,
+    },
     MlpSitu {
         packed: ValueId,
         intermediate: u32,
@@ -257,6 +277,9 @@ impl Operands for Linear {
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
+            Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
+                sink.extend([*act, *w]);
+            }
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
@@ -301,6 +324,8 @@ impl Operands for Linear {
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
             Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
+            Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
+            Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MlpSitu { y, .. } => sink.push(*y),
             Self::MoeTopkSoftmax { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSoftmaxScaled { routes, weights, .. } => sink.extend([*routes, *weights]),
@@ -323,6 +348,8 @@ impl Operands for Linear {
         match self {
             // Writes through the output it corrects: one arena slot.
             Self::LoraCorrect { y, y_out, .. } => sink.push((*y_out, *y)),
+            // The softcap writes the logits in place, as the traced pass did.
+            Self::LmHeadSoftcap { y, y_out, .. } => sink.push((*y_out, *y)),
             Self::Matmul { .. }
             | Self::LmHead { .. }
             | Self::MlpSwiglu { .. }
@@ -332,6 +359,7 @@ impl Operands for Linear {
             | Self::MlpGegluTanh { .. }
             | Self::MlpGeluTanh { .. }
             | Self::MlpGegluTanhPacked { .. }
+            | Self::MatmulGeglu { .. }
             | Self::MlpSitu { .. }
             | Self::MoeTopkSoftmax { .. }
             | Self::MoeTopkSoftmaxScaled { .. }
@@ -360,6 +388,8 @@ impl Operands for Linear {
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
             Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
+            Self::MatmulGeglu { .. } => "linear.matmul_geglu",
+            Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
             Self::MlpSitu { .. } => "linear.mlp_situ",
             Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",
             Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",

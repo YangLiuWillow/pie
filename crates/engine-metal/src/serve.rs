@@ -562,6 +562,17 @@ pub struct Seated<'a> {
     /// whose presence disagrees with the lane's own word
     /// ([`Fault::MaskWord`]).
     pub mask: Option<&'a Masking>,
+    /// Every row of this lane attends every key of its extent — a
+    /// denoiser's reading of a canvas. Lifted on the masked arm, so the lane
+    /// carries a mask (`engine::fire::Lane::validate_for` insists); the
+    /// expansion leaves the causal bound out and the rows' mask word says
+    /// so ([`crate::mask::LaneMask::bidirectional`]).
+    pub bidirectional: bool,
+    /// The denoiser's self-conditioning taps for this lane's rows, staged
+    /// into `RuntimeInput::SelfCondRows/Weights` when the plan reads them.
+    /// Channel-fed taps ([`engine::fire::SelfCondInput::channels`]) are
+    /// refused: this shell advances no channel on the device.
+    pub self_cond: Option<&'a engine::fire::SelfCondInput>,
     /// Which adapter bank row this lane's tokens route to (design §8), or
     /// `None` for the base model.
     ///
@@ -685,6 +696,8 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             mask: None,
+            bidirectional: false,
+            self_cond: None,
             adapter: None,
             positions: &[],
             readout: None,
@@ -858,6 +871,13 @@ pub struct Shell {
     /// Rows harvested and not yet taken, by step sequence. Bounded — see
     /// [`Shell::harvest_one`].
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
+    /// Whether a step's last-row logits are copied to the host at harvest.
+    /// Nothing in the runtime reads them any more — guests read logits on
+    /// the device through the `out` seam — and the copy was 16 blits, a
+    /// 7.9 MB read and a 4M-element bf16→f32 conversion per fire: 3–7 ms
+    /// of host time between one fire's device-done and the next's commit,
+    /// most of the idle in a 16-lane decode. `PIE_HOST_ROWS=1` turns it on.
+    host_rows: bool,
     /// What the plan restates about its own caches: per cache ROW (the bytes
     /// one page holds) and per PLAN VALUE (the reading one schedule carves).
     ///
@@ -899,6 +919,10 @@ pub struct Shell {
     /// triple-wide stream, which is staged for every fire of such a plan and
     /// for no fire of any other.
     states_mrope: bool,
+    /// The width of `RuntimeInput::SelfCondRows` the plan declares — a
+    /// denoiser's self-conditioning taps per row, staged for every fire of
+    /// such a plan (zeros for a lane carrying none) — or 0.
+    self_cond_taps: u32,
 
     // fallback.copy — the A/B switch and the one number it moves.
     /// **DOES THIS SHELL SERVE `Fallback::Copy`?** OFF at load, and that is
@@ -1358,17 +1382,15 @@ impl Shell {
         // alone: a plan declaring it stages one stream every fire, image or
         // no image, because `(p, p, p)` is what a text row rotates by.
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
-        // A block-diffusion text's denoiser input: this shell stages no seat
-        // for it (and lifts no causal bound), so the plan is refused here
-        // rather than at its first denoise fire.
-        if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
-            return Err(Fault::Program {
-                at: "serve::load",
-                why: "this plan reads a self-conditioning input (a block-diffusion text), \
-                      which this shell stages no seat for"
-                    .to_string(),
-            });
-        }
+        // A block-diffusion text's denoiser input: `[rows, taps]` ids and
+        // weights, a seat reserved when the plan declares the width.
+        let self_cond_taps =
+            u32::try_from(declared_width(&boot.trace, RuntimeInput::SelfCondRows)).map_err(|_| {
+                Fault::Program {
+                    at: "serve::load",
+                    why: "the self-conditioning tap width does not fit u32".to_string(),
+                }
+            })?;
         // **HOW MANY PATCH ROWS ONE OUTPUT ROW COSTS**, read off the folds the
         // plan states. `1` for a plan that folds nothing, which is every
         // pre-campaign plan and every tower whose pooler is the identity.
@@ -1390,6 +1412,7 @@ impl Shell {
                     gathers,
                     patch_seat,
                     states_mrope,
+                    self_cond_taps,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1584,10 +1607,12 @@ impl Shell {
             inflight: VecDeque::new(),
             grafted: None,
             landed: BTreeMap::new(),
+            host_rows: std::env::var_os("PIE_HOST_ROWS").is_some_and(|v| v != "0"),
             patch_seat,
             patch_fold,
             drops_patch_rows,
             states_mrope,
+            self_cond_taps,
             facts,
             spaces,
             // fallback.copy — off until a caller turns it on.
@@ -2801,18 +2826,23 @@ impl Shell {
             }
         }
 
-        let width = self.out_width as usize;
-        let mut raw = vec![0u8; flight.lanes * width * 2];
-        self.readout[flight.arm].read(0, &mut raw)?;
-        let rows: Vec<Vec<f32>> = raw
-            .chunks_exact(width.max(1) * 2)
-            .take(flight.lanes)
-            .map(|row| {
-                row.chunks_exact(2)
-                    .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
-                    .collect()
-            })
-            .collect();
+        let rows: Vec<Vec<f32>> = if self.host_rows {
+            let width = self.out_width as usize;
+            let mut raw = vec![0u8; flight.lanes * width * 2];
+            self.readout[flight.arm].read(0, &mut raw)?;
+            raw.chunks_exact(width.max(1) * 2)
+                .take(flight.lanes)
+                .map(|row| {
+                    row.chunks_exact(2)
+                        .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
+                        .collect()
+                })
+                .collect()
+        } else {
+            // Filed empty, so `rows_of` answers the step and the readout ABI
+            // keeps its shape; the seat was never written.
+            vec![Vec::new(); flight.lanes]
+        };
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
         self.landed.insert(flight.seq, rows);
@@ -2933,7 +2963,7 @@ impl Shell {
     #[allow(clippy::too_many_arguments)]
     fn stage_epilogues(
         &mut self,
-        frame: &Frame,
+        frame: &mut Frame,
         prepared: &Prepared<'_>,
         base: u64,
         width: u64,
@@ -4168,6 +4198,7 @@ impl Shell {
                 mask: masking,
                 have,
                 rows: row.rows,
+                bidirectional: seated.bidirectional,
             });
             // THE ADAPTER AND THE WORD, CHECKED AGAINST EACH OTHER, ONCE —
             // the mask's rule one block up, restated for the axis beside it,
@@ -4694,6 +4725,68 @@ impl Shell {
             }
         }
 
+        // 4d'. **THE DENOISER'S SELF-CONDITIONING TAPS**, `taps` ids and
+        //      weights per TOKEN row — staged for every fire of a plan that
+        //      declares the input, zeros for a lane that carries none (an
+        //      encode lane, a lane arming a synthetic). Channel-fed taps
+        //      need the device to advance the rings; this shell does not.
+        let taps = self.self_cond_taps as usize;
+        let mut self_cond_rows = vec![0i32; rows as usize * taps];
+        let mut self_cond_weights = vec![0f32; rows as usize * taps];
+        let mut self_cond_feeds: Vec<(u64, u64, u64, u64)> = Vec::new();
+        if taps > 0 {
+            for row in composition.lanes() {
+                let Some(sc) = lanes[row.source as usize].self_cond else {
+                    continue;
+                };
+                let cells = row.rows as usize * taps;
+                if let Some((rows_channel, weights_channel)) = sc.channels {
+                    // Fed off the lane's own channels: zeros are staged here
+                    // and the committed cells are blitted over them once the
+                    // command buffer opens, ordered behind the fire that
+                    // wrote them. The rings advance on the host on this
+                    // plane, so the cell read is the one the last take
+                    // committed — the step the guest waited for.
+                    if sc.taps as usize != taps {
+                        return Err(Fault::Program {
+                            at: "serve::prepare",
+                            why: format!(
+                                "lane {} states {} taps and this plan reads {taps}",
+                                row.source, sc.taps
+                            ),
+                        });
+                    }
+                    self_cond_feeds.push((
+                        u64::from(row.row_offset) * taps as u64 * 4,
+                        cells as u64 * 4,
+                        rows_channel,
+                        weights_channel,
+                    ));
+                    continue;
+                }
+                if sc.taps as usize != taps || sc.rows.len() != cells || sc.weight_bits.len() != cells {
+                    return Err(Fault::Program {
+                        at: "serve::prepare",
+                        why: format!(
+                            "lane {} states self-conditioning taps of width {} over {} ids, and \
+                             this plan reads {taps} taps over the lane's {} rows",
+                            row.source,
+                            sc.taps,
+                            sc.rows.len(),
+                            row.rows
+                        ),
+                    });
+                }
+                let at = row.row_offset as usize * taps;
+                for (i, &id) in sc.rows.iter().enumerate() {
+                    self_cond_rows[at + i] = id as i32;
+                }
+                for (i, &bits) in sc.weight_bits.iter().enumerate() {
+                    self_cond_weights[at + i] = f32::from_bits(bits);
+                }
+            }
+        }
+
         // 4d. **THE RECURRENT SEAT'S TABLES AND SCRATCH** (`crate::rs`). The
         //     two per-lane words go into the arm's plane with everything else;
         //     the extended rows need a scratch sized for THIS fire, grown when
@@ -4743,6 +4836,8 @@ impl Shell {
                     embed_weights: &patch_embed_weights,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
+                self_cond_rows: (taps > 0).then_some(self_cond_rows.as_slice()),
+                self_cond_weights: (taps > 0).then_some(self_cond_weights.as_slice()),
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
@@ -4821,6 +4916,8 @@ impl Shell {
             // And the trunk's, on the token axis: bound for every fire of a
             // plan that declares the rotation, image or no image.
             mrope_positions: bound.mrope_positions,
+            self_cond_rows: bound.self_cond_rows,
+            self_cond_weights: bound.self_cond_weights,
             geometry,
             tables: FireTables {
                 request_of_token: bound.request_of_token,
@@ -4874,6 +4971,7 @@ impl Shell {
 
         Ok(Prepared {
             lanes,
+            self_cond_feeds,
             attachments,
             done,
             arm,
@@ -4905,6 +5003,52 @@ impl Shell {
     ///
     /// [`Fault::Fire`] for a dispatch this plane refuses, [`Fault::Device`]
     /// for a pass the command buffer would not open.
+    /// **THE CHANNEL-FED TAPS, INTO THE SEAT**: one blit per lane and plane
+    /// from the ring's committed cell into this fire's arm, at the head of
+    /// the command buffer so the forward reads them. The cell is the one the
+    /// lane's epilogue takes this fire — the ring's head, which the harvest
+    /// of the last fire advanced before the guest could see that fire's
+    /// output and submit this one. Refused when a channel is not a ring this
+    /// plane registered or its cell is narrower than the lane's rows.
+    ///
+    /// Under `PIE_KERNEL_PROFILE` every dispatch commits in its own command
+    /// buffer ahead of this frame, so the feed lands AFTER the forward read
+    /// the seat: the profile's kernel times hold, its samples do not (a
+    /// denoiser runs unconditioned and does not converge).
+    fn feed_self_cond(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.self_cond_feeds.is_empty() {
+            return Ok(());
+        }
+        let (store, at_ids, at_ws) = self.inputs[p.arm].self_cond_seat().ok_or_else(|| Fault::Program {
+            at: "serve::feed_self_cond",
+            why: "a lane feeds self-conditioning taps and this plan reserved no seat".to_string(),
+        })?;
+        for &(first, bytes, rows_channel, weights_channel) in &p.self_cond_feeds {
+            for (channel, at) in [(rows_channel, at_ids), (weights_channel, at_ws)] {
+                let ring = self.programs.channel(channel).ok_or_else(|| Fault::Program {
+                    at: "serve::feed_self_cond",
+                    why: format!("channel {channel} is not a ring this plane registered"),
+                })?;
+                if (ring.cell_bytes() as u64) < bytes {
+                    return Err(Fault::Program {
+                        at: "serve::feed_self_cond",
+                        why: format!(
+                            "channel {channel} holds {} bytes a cell and the lane's taps take {bytes}",
+                            ring.cell_bytes()
+                        ),
+                    });
+                }
+                let slab = ring.slab();
+                let committed = ring.cell_offset(ring.cursor().head);
+                frame.copy(slab.slab(), committed, store.slab(), at + first, bytes)?;
+            }
+        }
+        // The copies ran in a blit pass; the forward wants its compute pass
+        // back open, ordered behind them.
+        frame.next_pass()?;
+        Ok(())
+    }
+
     fn walk_once(&self, p: &Prepared<'_>, mode: Mode) -> Result<Walked> {
         // The one piece of state between the two halves of the walk: the
         // sink writes which region is running and which run of its window,
@@ -4916,10 +5060,13 @@ impl Shell {
         // touch no compute pass, and a frame opened and dropped without a
         // commit is an encoder Metal expects to be ended — so the modes differ
         // here, in the one place they can, and nowhere above it.
-        let frame = match mode {
+        let mut frame = match mode {
             Mode::Encode => Some(self.device.frame()?),
             Mode::Record | Mode::Build { .. } | Mode::Replay => None,
         };
+        if let Some(frame) = frame.as_mut() {
+            self.feed_self_cond(frame, p)?;
+        }
         let sink = match mode {
             Mode::Encode => Encoded::Live(Sink::new(
                 &self.device,
@@ -5067,9 +5214,11 @@ impl Shell {
         }
 
         let place = At::new();
+        let mut frame = self.device.frame()?;
+        self.feed_self_cond(&mut frame, p)?;
         let sink = Encoded::Live(Sink::streaming(
             &self.device,
-            self.device.frame()?,
+            frame,
             &self.pipelines,
             &self.handles,
             crate::encode::Cuts::new(
@@ -5389,6 +5538,11 @@ pub struct StepView<'a> {
 /// structural possibility rather than a discipline somebody maintains.
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
+    /// Lanes whose self-conditioning taps live on two of their channels:
+    /// `(first byte of the lane's rows in the seat, bytes, ids channel,
+    /// weights channel)`. Blitted from each ring's committed cell into the
+    /// seat at the head of the fire's command buffer (`feed_self_cond`).
+    self_cond_feeds: Vec<(u64, u64, u64, u64)>,
     /// The attachments this step's gate admitted, epilogues and all. Held
     /// rather than re-derived because `enqueue` binds each one's intrinsic at
     /// a rectangle only the composition knows, and the gate that checked them
@@ -5648,16 +5802,18 @@ impl engine::frame::Shell for Shell {
             })?;
             (row.slab().clone(), row.offset())
         };
-        let seat = self.readout[prepared.arm].slab().clone();
-        for row in prepared.composition.lanes() {
-            let last = row.row_offset + row.rows - 1;
-            frame.copy(
-                &source,
-                base + u64::from(last) * width * 2,
-                &seat,
-                u64::from(row.source) * width * 2,
-                width * 2,
-            )?;
+        if self.host_rows {
+            let seat = self.readout[prepared.arm].slab().clone();
+            for row in prepared.composition.lanes() {
+                let last = row.row_offset + row.rows - 1;
+                frame.copy(
+                    &source,
+                    base + u64::from(last) * width * 2,
+                    &seat,
+                    u64::from(row.source) * width * 2,
+                    width * 2,
+                )?;
+            }
         }
 
         // ── **THE ATTACHED EPILOGUES, ENCODED INTO THIS SAME COMMAND

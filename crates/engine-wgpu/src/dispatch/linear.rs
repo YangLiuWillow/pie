@@ -1,6 +1,6 @@
 use kernels_wgpu::linear;
 use model_exec::{DispatchLinear, KernelError};
-use model_ir::Linear;
+use model_ir::{Linear, Operands};
 
 use crate::run::Run;
 
@@ -120,6 +120,10 @@ impl Run<'_> {
             ),
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
+            }
+            // Fused by the CUDA load only (`model_ir::fuse::gemm_epilogues`).
+            Linear::MatmulGeglu { .. } | Linear::LmHeadSoftcap { .. } => {
+                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
             Linear::MlpGegluTanhPacked {
                 packed,

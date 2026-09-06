@@ -376,6 +376,11 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
     p.add_argument("--prompt", default=BENCH_PROMPT)
     p.add_argument("--system", default=BENCH_SYSTEM)
+    p.add_argument(
+        "--think", action=argparse.BooleanOptionalAction, default=None,
+        help="Pass enable_thinking to the chat template (Qwen3 family): --think / --no-think; "
+             "absent, the template's own default applies.",
+    )
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
@@ -742,7 +747,7 @@ def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
     return [args.prompt for _ in range(n)]
 
 
-def _render_chat(tok, system: str, prompts: list[str]) -> list[str]:
+def _render_chat(tok, system: str, prompts: list[str], enable_thinking: bool | None = None) -> list[str]:
     """Chat-render `prompts`, falling back to plain text when the tokenizer
     ships no chat template.
 
@@ -753,12 +758,16 @@ def _render_chat(tok, system: str, prompts: list[str]) -> list[str]:
     either way, so the comparison stays honest.
     """
     if getattr(tok, "chat_template", None):
+        # `enable_thinking` is the Qwen3-family template switch; `None` leaves
+        # the template's own default (on for Qwen3.6/3.8, off for Qwen3.5).
+        extra = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         return [
             tok.apply_chat_template(
                 [{"role": "system", "content": system},
                  {"role": "user", "content": p}],
                 tokenize=False,
                 add_generation_prompt=True,
+                **extra,
             )
             for p in prompts
         ]
@@ -766,22 +775,22 @@ def _render_chat(tok, system: str, prompts: list[str]) -> list[str]:
 
 
 def hf_chat_prompts_and_counts(
-    model: str, system: str, prompts: list[str]
+    model: str, system: str, prompts: list[str], enable_thinking: bool | None = None
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    rendered = _render_chat(tok, system, prompts)
+    rendered = _render_chat(tok, system, prompts, enable_thinking)
     counts = [len(tok.encode(p, add_special_tokens=False)) for p in rendered]
     return rendered, counts
 
 
 def hf_chat_token_ids_and_counts(
-    model: str, system: str, prompts: list[str]
+    model: str, system: str, prompts: list[str], enable_thinking: bool | None = None
 ) -> tuple[list[list[int]], list[int]]:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    rendered = _render_chat(tok, system, prompts)
+    rendered = _render_chat(tok, system, prompts, enable_thinking)
     token_ids = [tok.encode(p, add_special_tokens=False) for p in rendered]
     return token_ids, [len(ids) for ids in token_ids]
 

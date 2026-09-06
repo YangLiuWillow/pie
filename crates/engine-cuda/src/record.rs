@@ -1086,7 +1086,11 @@ impl Bodies {
             self.recorder.bstats.sealed_short += 1;
         }
         let replays = !short && !moved && !empty;
-        if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+        let probing = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("PIE_GOLDEN_PROBE").is_some())
+        };
+        if probing {
             let held = self.map.bodies.get(&key).map(|body| body.shape);
             eprintln!(
                 "[body-probe] {key} eager_twin={} replays={replays} short={short} moved={moved} empty={empty} shape={shape:#x} held={held:x?}",
@@ -1132,6 +1136,7 @@ impl Bodies {
             // would have launched instead of launching the exec. The probe's
             // bisection (`REPLAY_UPTO`) launches only the first `k` execs
             // and walks the rest, so a disagreement names its stretch.
+            crate::serve::btrace::mark("body_lookup");
             let upto = REPLAY_UPTO.load(std::sync::atomic::Ordering::Relaxed);
             let from = REPLAY_FROM.load(std::sync::atomic::Ordering::Relaxed);
             let mut nth = 0usize;
@@ -1141,7 +1146,9 @@ impl Bodies {
                         let launch = !at.eager_twin && nth >= from && nth < upto;
                         nth += 1;
                         if launch {
+                            crate::serve::btrace::mark("pre_launch");
                             exec.launch(at.stream)?;
+                            crate::serve::btrace::mark("launch");
                         } else {
                             walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                         }
@@ -1431,6 +1438,10 @@ impl BodyMap {
 
     /// Move a body to the back of the eviction order.
     fn touch(&mut self, key: &BodyKey) {
+        // The steady state is the same body every step: already last.
+        if self.body_order.last() == Some(key) {
+            return;
+        }
         if let Some(at) = self.body_order.iter().position(|held| held == key) {
             let key = self.body_order.remove(at);
             self.body_order.push(key);

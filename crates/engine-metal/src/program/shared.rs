@@ -100,6 +100,25 @@ impl SharedRing {
         self.counters.cursor()
     }
 
+    /// Bytes one cell holds, and bytes from one cell to the next.
+    #[must_use]
+    pub fn cell_bytes(&self) -> usize {
+        self.shape.cell_bytes()
+    }
+
+    #[must_use]
+    pub fn cell_stride(&self) -> usize {
+        self.shape.cell_stride()
+    }
+
+    /// The byte offset of sequence number `sequence`'s cell in the slab: the
+    /// ring is `capacity + 1` cells and a sequence wraps over them.
+    #[must_use]
+    pub fn cell_offset(&self, sequence: u64) -> u64 {
+        let cells = u64::from(self.shape.capacity) + 1;
+        (sequence % cells) * self.cell_stride() as u64
+    }
+
     /// Advance the committed front by one — a take that committed.
     pub fn bump_head(&self) {
         self.counters.bump_head();

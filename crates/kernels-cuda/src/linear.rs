@@ -11,6 +11,8 @@ pub mod gemm;
 
 #[cfg(feature = "cuda")]
 mod gemv;
+/// The skinny bf16 projection with its epilogue folded in.
+pub mod skinny;
 
 /// The correction class: `y += B[a]·(A[a]·x)` over a routed adapter bank.
 pub mod lora;

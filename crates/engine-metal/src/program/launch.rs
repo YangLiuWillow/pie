@@ -1875,7 +1875,7 @@ impl Batch {
     /// the key, when there are more members than lanes, or on a device fault.
     pub fn encode(
         &mut self,
-        frame: &Frame,
+        frame: &mut Frame,
         regions: &[Region],
         members: &mut [&mut Prepared],
     ) -> Result<()> {
@@ -1897,8 +1897,20 @@ impl Batch {
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
         if !scratch_zeroing_skipped() {
+            // On the device, not the host: a `memset` of the pool through the
+            // shared mapping was a third of a millisecond of host time per
+            // fire for a vocabulary-wide program, on the critical path between
+            // one fire's readout and the next's commit. The blit is ordered by
+            // the command buffer and costs the device a fraction of that.
+            #[cfg(target_vendor = "apple")]
+            {
+                frame.fill(self.scratch.slab(), 0, u64::from(count) * stride)?;
+                frame.next_pass()?;
+            }
+            #[cfg(not(target_vendor = "apple"))]
             self.scratch.zero_span(0, u64::from(count) * stride)?;
         }
+        let frame: &Frame = frame;
         let vocab = members[0]
             .grouped
             .as_ref()

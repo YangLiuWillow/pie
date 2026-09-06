@@ -3,11 +3,16 @@
 //! Each previously generated token deterministically partitions the vocabulary
 //! into a green and red list. Green-token logits receive a configurable bias
 //! before Gumbel-max sampling.
+//!
+//! The partition is drawn on the device: the engine's counter-based rng keyed
+//! by `[salt, previous token]` gives every vocabulary entry a uniform that is
+//! a pure function of (previous token, entry), and `uniform < gamma` is the
+//! greenlist. Hashing the vocabulary on the host cost five milliseconds a
+//! token — most of the token — and pinned the loop to one fire in flight.
 
 use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
-use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Deserialize)]
 struct Input {
@@ -37,16 +42,15 @@ fn default_delta() -> f32 {
     2.0
 }
 
-fn green_mask(vocab: u32, previous_token: u32, gamma: f32) -> Vec<bool> {
-    let threshold = (gamma * u64::MAX as f32) as u64;
-    (0..vocab)
-        .map(|token| {
-            let mut hasher = DefaultHasher::new();
-            previous_token.hash(&mut hasher);
-            token.hash(&mut hasher);
-            hasher.finish() <= threshold
-        })
-        .collect()
+/// Keeps the greenlist's rng stream apart from the sampler's.
+const GREEN_SALT: u32 = 0x67ee_7157;
+
+/// The greenlist keyed on the previous token (a `[1]` u32): entry `t` is
+/// green when its keyed uniform falls below `gamma`.
+fn green_mask(previous: &Tensor, gamma: f32, vocab: u32) -> Tensor {
+    let is_counter = eq(iota(2), broadcast(1u32, [2]));
+    let state = select(&is_counter, broadcast(previous, [2]), broadcast(GREEN_SALT, [2]));
+    lt(rng(&state, [vocab]), broadcast(gamma, [vocab]))
 }
 
 fn watermarked_sample(
@@ -100,6 +104,8 @@ async fn main(input: Input) -> Result<String> {
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
     let delta = input.delta;
+    let gamma = input.gamma;
+    let last_prompt = *prompt.last().unwrap_or(&0);
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
     ws.reserve(max_pages).context("reserve KV")?;
 
@@ -111,7 +117,6 @@ async fn main(input: Input) -> Result<String> {
         Channel::from([0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
     let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("prefill_w_slot");
     let prefill_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("prefill_w_off");
-    let prefill_green = Channel::new([vocab], dtype::bool).named("prefill_green");
     let prefill_rng = Channel::from([0x51ed_u32, 0]).named("prefill_rng");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
@@ -140,17 +145,16 @@ async fn main(input: Input) -> Result<String> {
         },
     )?;
     prefill.epilogue(move || {
-        let green = prefill_green.take();
+        let green = green_mask(&broadcast(last_prompt, [1]), gamma, vocab);
         let rng = prefill_rng.take();
         let token = watermarked_sample(&intrinsics::logits(), &green, &rng, delta, vocab);
         first_out.put(&token);
         prefill_rng.put(&rng + iota(2));
     });
 
-    prefill_green.put(green_mask(vocab, *prompt.last().unwrap_or(&0), input.gamma));
     // ONE pipeline for the whole stream (R4-4): prefill and decode are one
     // sequential stream. The host round-trip on `first` stays — it seeds the
-    // decode channels and the first green mask below.
+    // decode channels.
     let pipeline = Pipeline::new();
     prefill.submit(&pipeline).context("watermark prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
@@ -164,7 +168,6 @@ async fn main(input: Input) -> Result<String> {
 
     if generated.len() < input.max_tokens && !stop_tokens.contains(&first) {
         let token_in = Channel::from([first as i32]).named("token_in");
-        let green = Channel::new([vocab], dtype::bool).named("green");
         let rng = Channel::from([0x9e37_u32, 0]).named("rng");
         let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
         let positions = Channel::from([n]).named("positions");
@@ -202,15 +205,11 @@ async fn main(input: Input) -> Result<String> {
         )?;
         decode.epilogue(move || {
             let length = kv_len.take();
-            let green_value = green.take();
+            // The token this step embedded is the previous output: the key.
+            let previous = cast(token_in.take(), dtype::u32);
+            let green = green_mask(&previous, gamma, vocab);
             let rng_value = rng.take();
-            let token = watermarked_sample(
-                &intrinsics::logits(),
-                &green_value,
-                &rng_value,
-                delta,
-                vocab,
-            );
+            let token = watermarked_sample(&intrinsics::logits(), &green, &rng_value, delta, vocab);
             let next_length = &length + 1u32;
             let page_count = next_length.div_ceil(page_size);
 
@@ -224,20 +223,13 @@ async fn main(input: Input) -> Result<String> {
             rng.put(&rng_value + iota(2));
         });
 
-        // The greenlist is keyed on the PREVIOUS OUTPUT token, so the host
-        // cannot supply fire k+1's mask until fire k has settled: this loop is
-        // inherently depth-1. Running ahead would submit fires whose Writer
-        // channel has no published value and fail the fire outright.
-        let mut previous = first;
         let budget = input.max_tokens.saturating_sub(generated.len());
         let mut submitted = 0usize;
 
         while submitted < budget {
-            green.put(green_mask(vocab, previous, input.gamma));
             decode.submit(&pipeline).context("watermark decode")?;
             submitted += 1;
             let token = token_out.take_host::<i32>().await? as u32;
-            previous = token;
             if stop_tokens.contains(&token) {
                 break;
             }

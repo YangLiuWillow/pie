@@ -112,6 +112,10 @@ pub struct Handles {
     /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]`, the trunk's
     /// triple-wide position stream. `None` for a plan with no `rope_mrope`.
     pub mrope_positions: Option<Tensor>,
+    /// `RuntimeInput::SelfCondRows` / `SelfCondWeights`: `i32` and `f32`,
+    /// `[rows, taps]`; `None` for a plan that reads no self-conditioning.
+    pub self_cond_rows: Option<Tensor>,
+    pub self_cond_weights: Option<Tensor>,
     /// `i32`, `[lanes]`: buffered tokens each lane replays ahead of its rows,
     /// and the rows of its extended run whose recurrent state persists
     /// (`crate::rs`). `None` for a fire every lane of which folds.
@@ -186,6 +190,10 @@ pub struct Fire<'a> {
     /// The trunk's `(t, h, w)` stream, three per TOKEN row in fire row order,
     /// or `None` for a plan that declares no `rope_mrope`.
     pub mrope_positions: Option<&'a [i32]>,
+    /// The denoiser's self-conditioning taps, `taps` ids and weights per
+    /// TOKEN row in fire row order, or `None` for a plan that reads none.
+    pub self_cond_rows: Option<&'a [i32]>,
+    pub self_cond_weights: Option<&'a [f32]>,
     /// The recurrent seat's two per-lane tables (`crate::rs`), or `None` for
     /// a fire every lane of which folds in the forward.
     pub rs_replay: Option<&'a [i32]>,
@@ -238,6 +246,10 @@ pub struct Inputs {
     /// `RuntimeInput::MropePositions`' region, or `None` for a plan that
     /// declares no multimodal rotation. `rows * 3` `i32` at the ceiling.
     mrope: Option<u64>,
+    /// `RuntimeInput::SelfCondRows/Weights`' regions and the plan's tap
+    /// width, or `None` for a plan that reads no self-conditioning.
+    /// `rows * taps` `i32` and as many `f32` at the ceiling.
+    self_cond: Option<(u64, u64, u64)>,
     /// The recurrent seat's per-lane tables, `lanes` `i32` each. Reserved
     /// unconditionally: two words a lane.
     rs_replay: u64,
@@ -264,6 +276,7 @@ impl Inputs {
         gathered: usize,
         patch: Option<PatchSeat>,
         mrope: bool,
+        self_cond_taps: u32,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -328,6 +341,10 @@ impl Inputs {
             seat,
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
+        let self_cond = (self_cond_taps > 0).then(|| {
+            let taps = u64::from(self_cond_taps);
+            (take(rows * taps * 4), take(rows * taps * 4), taps)
+        });
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
         let total = at;
@@ -351,9 +368,19 @@ impl Inputs {
             spaces,
             patch,
             mrope,
+            self_cond,
             rs_replay,
             rs_commit,
         })
+    }
+
+    /// The self-conditioning seat: the store and the byte offsets of its
+    /// `[rows, taps]` ids and weights regions, or `None` for a plan that
+    /// reads none. A fire blits channel-fed taps into it device-side.
+    #[must_use]
+    pub fn self_cond_seat(&self) -> Option<(&Buffer, u64, u64)> {
+        self.self_cond
+            .map(|(at_ids, at_ws, _)| (&self.store, at_ids, at_ws))
     }
 
     /// The patch element this load computes in, or `None` for a plan that
@@ -585,6 +612,40 @@ impl Inputs {
             }
         };
 
+        // `[rows, taps]` `i32` ids and `f32` weights. A plan that reads no
+        // self-conditioning binds nothing.
+        let (self_cond_rows, self_cond_weights) =
+            match (fire.self_cond_rows, fire.self_cond_weights, self.self_cond) {
+                (Some(ids), Some(ws), Some((at_ids, at_ws, taps))) => {
+                    let ceiling = u64::from(rows) * taps;
+                    if ids.len() as u64 > ceiling || ws.len() != ids.len() {
+                        return Err(Fault::Ceiling {
+                            what: "self-conditioning taps",
+                            need: ids.len().max(ws.len()) as u64,
+                            have: ceiling,
+                        });
+                    }
+                    self.store.write(at_ids, bytes_of(ids))?;
+                    self.store.write(at_ws, f32_bytes_of(ws))?;
+                    let per_row = ids.len() as u32 / taps as u32;
+                    (
+                        Some(Tensor::new(
+                            handles.bind(&self.store, at_ids, ids.len() as u64 * 4)?,
+                            per_row,
+                            taps as u32,
+                            Dtype::I32,
+                        )),
+                        Some(Tensor::new(
+                            handles.bind(&self.store, at_ws, ws.len() as u64 * 4)?,
+                            per_row,
+                            taps as u32,
+                            Dtype::F32,
+                        )),
+                    )
+                }
+                _ => (None, None),
+            };
+
         let mut spaces = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
@@ -655,6 +716,8 @@ impl Inputs {
             mask_stride: stride,
             patches,
             mrope_positions,
+            self_cond_rows,
+            self_cond_weights,
             rs_replay: if rs_tables {
                 Some(i32s(handles, &self.store, self.rs_replay, lanes)?)
             } else {
