@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -82,6 +83,22 @@ def unpatchify(tokens: np.ndarray, c: int, hs: int, ws: int, p: int) -> np.ndarr
 # ----------------------------------------------------------------------------
 # the case
 # ----------------------------------------------------------------------------
+
+def numbered(out: str, stem: str, euler: bool) -> list[str]:
+    """`<out>/<stem>[_euler]_<b>.json` for every batch element `b`, in order.
+
+    Matched by pattern and not by prefix: `pie_euler_0.json` starts with
+    `pie_`, so a prefix test folds the four-step run's files into the
+    one-step run's and stacks a batch of four against a golden of two.
+    """
+    pattern = re.compile(rf"^{re.escape(stem)}{'_euler' if euler else ''}_(\d+)\.json$")
+    found = []
+    for name in os.listdir(out):
+        match = pattern.match(name)
+        if match:
+            found.append((int(match.group(1)), os.path.join(out, name)))
+    return [path for _, path in sorted(found)]
+
 
 def config(golden: str) -> dict:
     with open(os.path.join(golden, "config.json")) as f:
@@ -176,11 +193,7 @@ def wasm(inferlet: str) -> str:
 
 
 def run(args) -> None:
-    paths = sorted(
-        os.path.join(args.out, name)
-        for name in os.listdir(args.out)
-        if name.startswith(f"case{'_euler' if args.euler else ''}_") and name.endswith(".json")
-    )
+    paths = numbered(args.out, "case", args.euler)
     if not paths:
         raise SystemExit(f"{args.out}: no case JSON; run `case` first")
     pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
@@ -242,12 +255,7 @@ def collect(args) -> str:
     cfg = config(args.golden)
     p = cfg["patch_size"]
     c, hs, ws = cfg["latent_shape"]
-    stem = f"pie{'_euler' if args.euler else ''}_"
-    paths = sorted(
-        os.path.join(args.out, name)
-        for name in os.listdir(args.out)
-        if name.startswith(stem) and name.endswith(".json")
-    )
+    paths = numbered(args.out, "pie", args.euler)
     if not paths:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     docs = [document(path) for path in paths]
