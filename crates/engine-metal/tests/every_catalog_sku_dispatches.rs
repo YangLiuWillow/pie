@@ -115,6 +115,58 @@ const REFUSED: &[Refusal] = &[
         file: "src/dispatch/custom.rs",
         needle: "Unsupported",
     },
+    // M0 (`crates/model-ir/IMAGEGEN_CONTRACT.md`): the image/video substrate's
+    // ops are CUDA-first this phase, and every arm below refuses by name in
+    // its own `M0: ...` block. `engine-vulkan` and `engine-wgpu` refuse them
+    // identically.
+    Refusal {
+        op: "attention.ragged",
+        why: "the M0 ragged attention (D2) is CUDA-first this phase",
+        file: "src/dispatch/attn.rs",
+        needle: "Attention::Ragged { .. } => {",
+    },
+    Refusal {
+        op: "layout.pack_rows",
+        why: "the M0 row packing (D2) is CUDA-first this phase",
+        file: "src/dispatch/layout.rs",
+        needle: "Layout::PackRows { .. } | Layout::UnpackRows { .. }",
+    },
+    Refusal {
+        op: "layout.unpack_rows",
+        why: "the M0 row packing (D2) is CUDA-first this phase",
+        file: "src/dispatch/layout.rs",
+        needle: "Layout::PackRows { .. } | Layout::UnpackRows { .. }",
+    },
+    Refusal {
+        op: "elementwise.modulate",
+        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
+        file: "src/dispatch/elemwise.rs",
+        needle: "| Elementwise::Modulate { .. }",
+    },
+    Refusal {
+        op: "elementwise.gated_residual_add",
+        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
+        file: "src/dispatch/elemwise.rs",
+        needle: "| Elementwise::GatedResidualAdd { .. }",
+    },
+    Refusal {
+        op: "elementwise.sinusoid",
+        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
+        file: "src/dispatch/elemwise.rs",
+        needle: "| Elementwise::Sinusoid { .. }",
+    },
+    Refusal {
+        op: "elementwise.silu",
+        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
+        file: "src/dispatch/elemwise.rs",
+        needle: "| Elementwise::Silu { .. }",
+    },
+    Refusal {
+        op: "elementwise.rope_axes",
+        why: "the M0 axis rope (D7) is CUDA-first this phase",
+        file: "src/dispatch/elemwise.rs",
+        needle: "| Elementwise::RopeAxes { .. }",
+    },
 ];
 
 /// Rows this backend cannot serve, each with EVERY op that stops it — the set
@@ -148,6 +200,23 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
     (
         "gemma4-e4b-vision-bf16-kv-bf16",
         &["elementwise.clamp_learned"],
+    ),
+    // TODO(R2-ENGINE): the synthetic generative row names every M0 op at once,
+    // which is what it is for, plus the centred LayerNorm this shell has never
+    // shipped a shader for. Drop the M0 names when this shell's arms land.
+    (
+        "mini-dit-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
     ),
 ];
 
