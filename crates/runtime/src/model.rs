@@ -564,6 +564,24 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "z_image",
     },
+    // FLUX.2 klein-4B (M2). `layers` is the encoder's depth the plan runs
+    // (the last of its three `hidden` taps is addressed by layer, at 26);
+    // `vocab` is Qwen3-4B's embedding width, which the `text` reading
+    // embeds by — no reading of this family has logits.
+    Row {
+        id: "flux2-klein-4b-bf16-kv-bf16",
+        layers: 27,
+        vocab: 151_936,
+        arch: "flux_2",
+    },
+    // The miniature: no encoder, so no vocabulary; two double-stream and
+    // two single-stream blocks.
+    Row {
+        id: "flux2-mini-bf16-kv-bf16",
+        layers: 4,
+        vocab: 0,
+        arch: "flux_2",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
