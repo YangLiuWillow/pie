@@ -387,6 +387,38 @@ Runs 64 target tokens + **2 references of 64 tokens** at RoPE `T = 10` and `T = 
 | `flux2_mini.safetensors` | 26,422,928 | `c8127a7a22a40e2c863e48a45ed80b62` |
 | `flux2_mini_config.json` | 4,530 | `0a80cb07bd98017049c77edcd9e2f79e` |
 
+#### `--vae` — the autoencoder alone
+
+`AutoencoderKLFlux2` in fp32 (`force_upcast`) over the centre **32x32 tokens**
+of `--full`'s `latent.final`.  Both sides cut at the **128-wide /16 grid** the
+transformer itself holds, which is where `models::flux_2::vae` puts its port:
+the VAE codes at 32 channels on a /8 grid and the pipeline packs a 2x2 block of
+those into one 128-channel cell (`_patchify_latents`), normalised by the frozen
+`BatchNorm2d(128)` (`(x - running_mean)/sqrt(running_var + eps)`).  There is no
+`scaling_factor`/`shift_factor` on this family.
+
+```text
+decode: latent * bn_std + bn_mean -> _unpatchify_latents -> vae.decode
+encode: vae.encode(...).mean      -> _patchify_latents   -> (x - bn_mean)/bn_std
+```
+
+`flux2_vae/{latent,pixels,mean}.f32` + `shapes.json` are the same planes as raw
+little-endian f32 rows of channels in `(h, w)` order — what the Rust gate loads:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python flux2_golden.py --vae
+# the gate reads the row's ARTIFACT, not the snapshot: a serving load may not
+# apply the `Unary` the BatchNorm planes are stated through
+pie model import <the FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 \
+    --out ~/.cache/pie-imagegen/flux2-klein-4b.zt --force
+CUDA_VISIBLE_DEVICES=2 cargo test -p engine-cuda --features cuda \
+    --test the_flux_2_vae_answers_the_reference -- --nocapture
+```
+
+Measured (bf16 pie vs the fp32 golden): decode `[1,32,32] -> [1,512,512]` cos
+0.999994, mean |err| 0.0017, max 0.040 (not one of 786 432 values past 0.05);
+encode `[1,512,512] -> [1,32,32]` cos 0.999957, mean |err| 0.0069, max 0.115.
+
 #### The pie side — `flux2_parity.py`
 
 `tests/inferlets/flux2-parity` is the `flux2-mini` row's guest: one denoise

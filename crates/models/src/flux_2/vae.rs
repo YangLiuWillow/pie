@@ -323,7 +323,8 @@ impl Vae {
                     .then(|| ConvW::at(&format!("{name}.downsample"), c, c, TAPS3, banks)),
             });
         }
-        let bn = |tail: &str| Weight::sym(format!("vae.bn.{tail}"), [u64::from(IN_CHANNELS)], dense);
+        let bn =
+            |tail: &str| Weight::sym(format!("vae.bn.{tail}"), [u64::from(IN_CHANNELS)], dense);
         Vae {
             bn_zero: bn("zero"),
             bn_scale: bn("scale"),

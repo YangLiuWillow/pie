@@ -404,19 +404,18 @@ fn the_flagship_reads_the_real_snapshot() {
     );
     assert_eq!(te_want.len(), 1 + 11 * model::TE_LAYERS as usize);
 
-    // The VAE: the decoder side, the post-quant conv and the BatchNorm
-    // statistics; nothing of the encoder.
+    // The VAE: the whole autoencoder but the frozen BatchNorm's step
+    // counter (`tests/the_flux_2_vae_bakes.rs` states the shape of those
+    // reads; here only that this import performs them).
     let vae_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("vae.")).collect();
     let vae_want: BTreeSet<&String> = index
         .iter()
-        .filter(|n| {
-            n.starts_with("vae.decoder.")
-                || n.starts_with("vae.post_quant_conv.")
-                || n.as_str() == "vae.bn.running_mean"
-                || n.as_str() == "vae.bn.running_var"
-        })
+        .filter(|n| n.starts_with("vae.") && n.as_str() != "vae.bn.num_batches_tracked")
         .collect();
-    assert_eq!(vae_read, vae_want, "the VAE planes read are the decoder's");
+    assert_eq!(
+        vae_read, vae_want,
+        "the VAE planes read are every one but the BatchNorm's step counter"
+    );
 
     // Every other tensor exactly once.
     let odd: BTreeSet<&String> = counts

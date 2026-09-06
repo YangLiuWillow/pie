@@ -123,6 +123,28 @@ impl Model {
         })
     }
 
+    /// The autoencoder's contract alone, over a diffusers pipeline name
+    /// space (`vae.` prefix): what a load of the VAE by itself — the
+    /// parity gate `engine-cuda/tests/the_flux_2_vae_answers_the_reference`
+    /// — reads, with the same reads the whole-model import states.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Illegible`] for a row with no VAE, or any read's refusal.
+    pub fn import_vae(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        let v = self.vae.as_ref().ok_or_else(|| Error::Illegible {
+            name: "vae".to_string(),
+            detail: "this row declares no VAE".to_string(),
+        })?;
+        let mut b = Builder::new(src, self.tp, platform);
+        vae(&mut b, src, v, Layout::Diffusers)?;
+        Ok(b.build())
+    }
+
     fn import_from(
         &self,
         src: &ztensor::Source,
@@ -527,10 +549,7 @@ fn batch_norm(
         )
         .internal(),
     );
-    for (plane, op) in [
-        (&v.bn_scale, UnaryOp::Sqrt),
-        (&v.bn_rscale, UnaryOp::Rsqrt),
-    ] {
+    for (plane, op) in [(&v.bn_scale, UnaryOp::Sqrt), (&v.bn_rscale, UnaryOp::Rsqrt)] {
         let root = format!("{}.of_var", plane.name);
         b.push(
             TensorContract::new(
