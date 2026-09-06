@@ -445,8 +445,13 @@ async fn resolve(target: Target, registry: &str) -> Result<(Target, String)> {
     }
 }
 
-/// Boot, run, print, exit.
-pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate::ui::Answer> {
+/// Boot, run, print, exit. `diag` is `--diag`'s word list, stated into
+/// `[engine] diagnostics` for this run alone.
+pub async fn run(
+    global: &bootstrap::GlobalArgs,
+    args: RunArgs,
+    diag: Option<&str>,
+) -> Result<crate::ui::Answer> {
     let (cfg_path, origin) = bootstrap::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
@@ -463,7 +468,11 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate:
         |path| std::fs::read_to_string(path).map_err(Into::into),
     )?;
 
-    let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
+    let (controller, gateway, mut worker) = crate::derive::derive_standalone(&content)?;
+    // For this run alone: the file on disk is not touched.
+    if let Some(words) = diag {
+        worker.state_diagnostics(words)?;
+    }
     let registry = worker.server.registry.clone();
     let model = worker.model.name.clone();
 

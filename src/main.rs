@@ -34,6 +34,21 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Turn engine diagnostics on for this run, as a comma-separated word
+    /// list: `--diag golden-probe,arm-trace`, `--diag ptr-trace=decode`.
+    ///
+    /// It fills `[engine] diagnostics` in the config this command just read,
+    /// so nothing is edited and nothing is rebuilt. The words are the
+    /// engine's own (`engine_cuda::Diagnostics`); one it does not speak is
+    /// refused at boot, by name, with the vocabulary. Only `serve` and `run`
+    /// boot an engine, so only they read this.
+    //
+    // Global for the same reason `--json` is: `pie run --diag x` and `pie
+    // --diag x run` both read as the same wish, and a flag whose position
+    // matters is a flag people get wrong.
+    #[arg(long, global = true, value_name = "WORDS")]
+    diag: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -139,7 +154,7 @@ async fn run() -> anyhow::Result<ExitCode> {
     // `init` (banner, config, metrics) rather than the light CLI one, and it
     // ends on a signal rather than with an answer.
     if let Command::Serve = cli.command {
-        return serve(cli.global).await;
+        return serve(cli.global, cli.diag.as_deref()).await;
     }
 
     // Once, for every op, rather than at the head of each arm.
@@ -173,7 +188,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
 
         // Async: these reach the engine or the registry over the network.
-        Command::Run(args) => ops::run::run(&cli.global, args).await?,
+        Command::Run(args) => ops::run::run(&cli.global, args, cli.diag.as_deref()).await?,
         Command::Config { cmd } => ops::config::run(cmd, &cli.global).await?,
         Command::Inferlet { cmd } => ops::inferlet::run(cmd, &cli.global).await?,
     };
@@ -186,12 +201,17 @@ async fn run() -> anyhow::Result<ExitCode> {
 /// The `serve` path: full daemon `init` → derive the three typed role Configs
 /// from the standalone TOML → boot the in-proc cluster → run until
 /// SIGINT/SIGTERM, then drain.
-async fn serve(global: bootstrap::GlobalArgs) -> anyhow::Result<ExitCode> {
+async fn serve(global: bootstrap::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
     let ctx = bootstrap::init(
         bootstrap::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
-    let (controller, gateway, worker) = derive::derive_standalone(ctx.config_str())?;
+    let (controller, gateway, mut worker) = derive::derive_standalone(ctx.config_str())?;
+    // `--diag` states `[engine] diagnostics` for this boot alone; the file on
+    // disk is not touched.
+    if let Some(words) = diag {
+        worker.state_diagnostics(words)?;
+    }
     // Provision the embedded Python-WASM runtime before booting — the worker
     // daemon never downloads, so the standalone root does it. Only when
     // the config asks for Python at all, so an offline or Rust-only deployment

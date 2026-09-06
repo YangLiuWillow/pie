@@ -305,7 +305,7 @@ impl<'a> Sink<'a> {
         if let Some(tier) = cuts.tier {
             tier.borrow_mut().note_wait(waited.as_nanos() as u64);
         }
-        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+        if crate::diag::on().cut_trace {
             eprintln!("cut-wait: {:.1} ms", waited.as_secs_f64() * 1e3);
         }
 
@@ -324,7 +324,7 @@ impl<'a> Sink<'a> {
         let window = cuts.windows.at(region, cuts.place.run.get());
         let span = window.span;
         let pass = (window.pass, window.passes);
-        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+        if crate::diag::on().cut_trace {
             eprintln!(
                 "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {}; pass {} of {})",
                 cuts.place.run.get(),
@@ -357,7 +357,7 @@ impl<'a> Sink<'a> {
     }
 }
 
-/// **THE KERNEL PROFILE** — `PIE_KERNEL_PROFILE=1`.
+/// **THE KERNEL PROFILE** — `diagnostics = "kernel-profile"`.
 ///
 /// With it set, every dispatch is committed in its own command buffer and
 /// timed on the device (`GPUEndTime - GPUStartTime`), and the time is
@@ -372,12 +372,11 @@ static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64,
 
 #[cfg(target_vendor = "apple")]
 fn profiling() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_KERNEL_PROFILE").is_some_and(|v| v != "0"))
+    crate::diag::on().kernel_profile.on()
 }
 
 /// Every entrypoint the profile has timed: `(name, device ns, launches)`,
-/// most device time first. Empty unless `PIE_KERNEL_PROFILE` is set.
+/// most device time first. Empty unless `diagnostics = "kernel-profile"`.
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
@@ -399,13 +398,11 @@ pub fn reset_kernel_profile() {
 }
 
 #[cfg(target_vendor = "apple")]
-/// `PIE_KERNEL_PROFILE=2`: the key carries the launch's scalar arguments
-/// (a matvec's K and N, a router's expert count…), so one entrypoint's time
+/// `kernel-profile=2`: the key carries the launch's scalar arguments (a
+/// matvec's K and N, a router's expert count…), so one entrypoint's time
 /// splits by shape.
 fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
-    static SHAPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let shaped = *SHAPED.get_or_init(|| std::env::var("PIE_KERNEL_PROFILE").is_ok_and(|v| v == "2"));
-    if !shaped {
+    if !crate::diag::on().kernel_profile.shaped() {
         return entrypoint.to_string();
     }
     let scalars: Vec<String> = args

@@ -99,7 +99,9 @@ pub fn open_group(
         ));
     }
     let size32 = u32::try_from(size).map_err(|_| "more ranks than a u32 counts".to_string())?;
-    let id = Id::new().map_err(|fault| fault.to_string())?;
+    // Rank 0's word: every rank of a group is booted from one `[engine]`
+    // table, and NCCL's environment is the process's, not a rank's.
+    let id = Id::new(boots[0].knobs.nccl_transport).map_err(|fault| fault.to_string())?;
     // Every rank opens its communicator on a thread bound to its own device;
     // `ncclCommInitRank` returns only once the whole group has arrived, so
     // the opens run concurrently — and a rank that never arrives would hold

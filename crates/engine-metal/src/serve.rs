@@ -876,7 +876,7 @@ pub struct Shell {
     /// the device through the `out` seam — and the copy was 16 blits, a
     /// 7.9 MB read and a 4M-element bf16→f32 conversion per fire: 3–7 ms
     /// of host time between one fire's device-done and the next's commit,
-    /// most of the idle in a 16-lane decode. `PIE_HOST_ROWS=1` turns it on.
+    /// most of the idle in a 16-lane decode. `host-rows` turns it on.
     host_rows: bool,
     /// What the plan restates about its own caches: per cache ROW (the bytes
     /// one page holds) and per PLAN VALUE (the reading one schedule carves).
@@ -1008,7 +1008,7 @@ pub struct Shell {
     run_caps: Vec<u32>,
     /// Per region, the expert-major passes a capped run is walked in
     /// (`ceil(experts / slots)` after a streamed router; `0` elsewhere).
-    /// `PIE_EXPERT_PASSES=0` turns the passes off and cuts rows instead.
+    /// `expert-passes=off` turns the passes off and cuts rows instead.
     run_passes: Vec<u32>,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
@@ -1232,7 +1232,7 @@ impl Shell {
             .collect();
         // Expert-major passes for the same regions: one group of the slab's
         // seats per pass, at most the whole expert set.
-        let passes_on = std::env::var("PIE_EXPERT_PASSES").map_or(true, |v| v != "0");
+        let passes_on = crate::diag::on().expert_passes;
         let run_passes: Vec<u32> = (0..compiled.template().len())
             .map(|region| {
                 let routes = region
@@ -1255,7 +1255,7 @@ impl Shell {
                 }
             })
             .collect();
-        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+        if crate::diag::on().cut_trace {
             let capped: Vec<(usize, u32, u32)> = run_caps
                 .iter()
                 .zip(&run_passes)
@@ -1609,7 +1609,7 @@ impl Shell {
             inflight: VecDeque::new(),
             grafted: None,
             landed: BTreeMap::new(),
-            host_rows: std::env::var_os("PIE_HOST_ROWS").is_some_and(|v| v != "0"),
+            host_rows: crate::diag::on().host_rows,
             patch_seat,
             patch_fold,
             drops_patch_rows,
@@ -4282,12 +4282,10 @@ impl Shell {
                 row.source,
                 ports.as_ref().and_then(crate::program::ports::LanePorts::fold_len),
             )?;
-            // `PIE_RS_TRACE=1`: print every non-fold lane plan — the one place
-            // the resolved fold length, the replayed run and the scattered run
+            // `rs-trace`: print every non-fold lane plan — the one place the
+            // resolved fold length, the replayed run and the scattered run
             // can be read off a serving fire.
-            if !matches!(seated.rs, engine::fire::RsVerb::Fold)
-                && std::env::var_os("PIE_RS_TRACE").is_some_and(|v| v != "0")
-            {
+            if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
                     row.source, row.rows, plan.replay, plan.commit, plan.gather, plan.scatter
@@ -5015,7 +5013,7 @@ impl Shell {
     /// output and submit this one. Refused when a channel is not a ring this
     /// plane registered or its cell is narrower than the lane's rows.
     ///
-    /// Under `PIE_KERNEL_PROFILE` every dispatch commits in its own command
+    /// Under `kernel-profile` every dispatch commits in its own command
     /// buffer ahead of this frame, so the feed lands AFTER the forward read
     /// the seat: the profile's kernel times hold, its samples do not (a
     /// denoiser runs unconditioned and does not converge).
@@ -5624,19 +5622,16 @@ pub struct Landed {
 
 /// One committed step the host has not caught up with, as the in-flight ring
 /// holds it.
-/// `PIE_FIRE_TRACE=1`: one line per fire at enqueue, at device completion
-/// and after the readout, with a monotonic microsecond clock — so a served
-/// run's host time between fires can be read off a log rather than inferred
-/// from tok/s. Prefixed `[fire ` because `benches/pie_bench.py` surfaces
-/// exactly that prefix from the server's stdout.
+/// `fire-trace`: one line per fire at enqueue, at device completion and after
+/// the readout, with a monotonic microsecond clock — so a served run's host
+/// time between fires can be read off a log rather than inferred from tok/s.
+/// Prefixed `[fire ` because `benches/pie_bench.py` surfaces exactly that
+/// prefix from the server's stdout.
 fn fire_trace(line: impl FnOnce() -> String) {
     use std::sync::OnceLock;
     use std::time::Instant;
-    static ON: OnceLock<bool> = OnceLock::new();
     static BEGAN: OnceLock<Instant> = OnceLock::new();
-    if !*ON.get_or_init(|| {
-        std::env::var_os("PIE_FIRE_TRACE").is_some_and(|v| v != "0")
-    }) {
+    if !crate::diag::on().fire_trace {
         return;
     }
     let began = BEGAN.get_or_init(Instant::now);
@@ -5722,11 +5717,11 @@ impl engine::frame::Shell for Shell {
         // prices what that costs). Everything below this line is identical for
         // both — the tail segment is a `Frame` like any other.
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
-            // `PIE_TIER_TRACE=1`: what this fire cost the streamed tier — seat
+            // `tier-trace`: what this fire cost the streamed tier — seat
             // copies, cuts, hits/misses and the host time inside the cuts —
             // as deltas, one line a fire. The counters exist for the gates;
             // this is the serving-side reading of them.
-            let trace = std::env::var_os("PIE_TIER_TRACE").is_some_and(|v| v != "0");
+            let trace = crate::diag::on().tier_trace;
             let before = trace.then(|| {
                 (self.expert_motion(), self.expert_hits(), self.expert_host_time(), std::time::Instant::now())
             });
@@ -5753,14 +5748,15 @@ impl engine::frame::Shell for Shell {
         } else {
             self.walk_once(&prepared, Mode::Encode)?
         };
-        // `PIE_KERNEL_PROFILE=1`: the device time of this fire by entrypoint,
-        // top ten, then the tally starts over — resident or streamed alike.
+        // `kernel-profile`: the device time of this fire by entrypoint, top
+        // ten (sixty under `=2`), then the tally starts over — resident or
+        // streamed alike.
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
         if !profile.is_empty() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
             eprintln!("kernels: fire of {} row(s), {:.1} ms on the device:", prepared.descriptor.rows, total as f64 / 1e6);
-            for (name, ns, launches) in profile.iter().take(if std::env::var("PIE_KERNEL_PROFILE").is_ok_and(|v| v == "2") { 60 } else { 10 }) {
+            for (name, ns, launches) in profile.iter().take(crate::diag::on().kernel_profile.rows()) {
                 eprintln!("  {:>9.1} ms  {:>5} launch(es)  {name}", *ns as f64 / 1e6, launches);
             }
             crate::encode::reset_kernel_profile();

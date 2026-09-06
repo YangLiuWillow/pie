@@ -896,12 +896,12 @@ impl Shell {
         match evidence(&walked, &replayed) {
             None => Ok(()),
             Some(why) => {
-                // `PIE_GOLDEN_PROBE=1`: on a disagreement, two more questions
+                // `golden-probe`: on a disagreement, two more questions
                 // before the verdict — is each arm itself repeatable, and
                 // does the body's lane `i` answer some OTHER lane of the
                 // walk bit for bit (a lane order that moved, not a wrong
                 // number)?
-                if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+                if super::diag::on().golden_probe {
                     let walked_again = fire(self, Golden::Eager);
                     let replayed_again = fire(self, Golden::Body);
                     let same = |a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>| {
@@ -1177,7 +1177,7 @@ impl Shell {
         if ceiling == 0 {
             return Ok(());
         }
-        if std::env::var_os("PIE_ARM_TRACE").is_some() {
+        if super::diag::on().arm_trace {
             // What `c<n>` names in every line below: the requests that land
             // in each class, the first being its representative.
             for (class, requests) in self.landing.iter().enumerate() {
@@ -1380,7 +1380,7 @@ impl Shell {
                 if let Err(why) = fired.and(landed) {
                     // Every refusal, not just the last, so a boot log lists
                     // which compositions this deployment cannot arm.
-                    if std::env::var_os("PIE_ARM_TRACE").is_some() {
+                    if super::diag::on().arm_trace {
                         eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
                     }
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
@@ -1406,13 +1406,13 @@ impl Shell {
                     // have brought, which the synthetic cannot state.
                     .and_then(|()| self.golden_real(key, &owned));
                 if let Err(fault) = verdict {
-                    // `PIE_GOLDEN_SKIP=1`: a diagnostic arm. The body that
+                    // `golden-skip`: a diagnostic arm. The body that
                     // disagreed is dropped and its key refused — the key walks
                     // eagerly, as an unarmed one does — and the load goes on,
                     // so one boot lists EVERY body the golden disagrees with
                     // instead of stopping at the first. Off, the first
                     // disagreement fails the load, as it always has.
-                    if std::env::var_os("PIE_GOLDEN_SKIP").is_some() {
+                    if super::diag::on().golden_skip {
                         eprintln!("[arm-trace] golden refused {key}: {fault}");
                         self.cache.body_drop(key);
                     } else {
@@ -1423,7 +1423,7 @@ impl Shell {
             if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
-                if std::env::var_os("PIE_ARM_TRACE").is_some()
+                if super::diag::on().arm_trace
                     && let Some(key) = key.as_ref()
                 {
                     eprintln!("[arm-trace] armed {key}");

@@ -207,6 +207,7 @@ fn fire(
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
+        deferred_tier: true,
         world: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })

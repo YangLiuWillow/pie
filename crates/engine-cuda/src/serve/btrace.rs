@@ -1,4 +1,5 @@
-//! `PIE_BOUNDARY_TRACE=1`: where the host spends the frame boundary.
+//! `[engine] diagnostics = "boundary-trace"`: where the host spends the frame
+//! boundary.
 //!
 //! The device is idle from the moment a step lands until the next step's
 //! first kernel starts, and everything in between is host work on the engine
@@ -8,15 +9,13 @@
 //! bookkeeping. This module stamps those phases and prints one line per
 //! frame, so the split can be read off a serve log instead of guessed at.
 //!
-//! Off (the default) it is one relaxed atomic load per mark.
+//! Off (the default) it is one acquire load and a branch per mark.
 
 use std::cell::RefCell;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_BOUNDARY_TRACE").is_some())
+    super::diag::on().boundary_trace
 }
 
 thread_local! {

@@ -99,6 +99,35 @@ impl Config {
         Ok(cfg)
     }
 
+    /// State a diagnostics word list into `[model.engine.options] diagnostics`
+    /// — what `pie serve --diag …` / `pie run --diag …` does to the config it
+    /// just read, so a person debugging never edits a file to turn a trace on.
+    ///
+    /// The words themselves are the shell's vocabulary and are parsed there
+    /// (`engine_cuda::Diagnostics`, `engine_metal::Diagnostics`), at boot,
+    /// where an unknown one refuses by name.
+    ///
+    /// # Errors
+    ///
+    /// An engine flavor with no diagnostics record. A flag that quietly did
+    /// nothing would be the same silence the typed record exists to end.
+    pub fn state_diagnostics(&mut self, words: &str) -> Result<()> {
+        match self.model.engine.kind {
+            EngineKind::CudaNative | EngineKind::Metal => {
+                self.model.engine.options.insert(
+                    "diagnostics".to_string(),
+                    toml::Value::String(words.to_string()),
+                );
+                Ok(())
+            }
+            other => anyhow::bail!(
+                "`--diag` names engine diagnostics and the {} engine has no \
+                 diagnostics record; the cuda and metal shells do",
+                other.as_str()
+            ),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.model.validate()?;
         self.server.validate()?;
@@ -503,6 +532,18 @@ pub struct ModelConfig {
     /// (tier T1), written with its unit (`"64GiB"`). Omit for uncapped.
     #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
+    /// planes are verified where they lie in the artifact and served from
+    /// there while a background thread builds the page-locked copy, so the
+    /// load answers sooner and the first fires take page faults until the
+    /// fill lands. `false` is the eager arm: the page-locked image is built
+    /// before the load answers.
+    ///
+    /// Needs a device that reports `pageableMemoryAccess` (CUDA 12.2+ HMM);
+    /// where it does not, the eager path is what happens whatever this says.
+    /// This key was `PIE_CUDA_DEFERRED_TIER=0` before it was a key.
+    #[serde(default = "default_deferred_tier")]
+    pub deferred_tier: bool,
     /// The most patch rows one fire may carry, over every image of every lane
     /// in it. Omit it: a vision SKU derives a ceiling from the checkpoint's
     /// own shapes, and a text-only SKU wants no ladder at all.
@@ -520,6 +561,11 @@ pub struct ModelConfig {
 
 fn default_weight_dtype() -> String {
     "bfloat16".to_string()
+}
+
+/// `[model] deferred_tier` when nobody wrote it: the warm boot defers.
+fn default_deferred_tier() -> bool {
+    true
 }
 
 // -----------------------------------------------------------------------------
@@ -612,13 +658,15 @@ impl ModelConfig {
         (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
     }
 
-    /// The two weight budgets, in the form the engine's load contract states
-    /// them. Both absent is [`engine::Residency::uncapped`].
+    /// The two weight budgets and the tier arm, in the form the engine's load
+    /// contract states them. Both budgets absent and the arm on is
+    /// [`engine::Residency::uncapped`].
     #[must_use]
     pub fn residency(&self) -> engine::Residency {
         engine::Residency {
             device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
+            deferred_tier: self.deferred_tier,
         }
     }
 
@@ -1061,6 +1109,51 @@ device = ["cpu"]
         assert!(
             err.contains("must not be shorter than submit_deadline"),
             "got: {err}"
+        );
+    }
+
+    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
+    /// diagnostics record says so instead of swallowing the flag.
+    #[test]
+    fn the_diag_flag_states_the_engines_diagnostics_key() {
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.state_diagnostics("tier-trace,kernel-profile=2")
+            .expect("the metal shell has a diagnostics record");
+        assert_eq!(
+            cfg.model
+                .engine
+                .options
+                .get("diagnostics")
+                .and_then(toml::Value::as_str),
+            Some("tier-trace,kernel-profile=2"),
+            "the words reach the engine's own options table"
+        );
+
+        let vulkan = MINIMAL_METAL.replace("type = \"metal\"", "type = \"vulkan\"");
+        let mut cfg: Config = toml::from_str(&vulkan).unwrap();
+        let why = cfg
+            .state_diagnostics("tier-trace")
+            .expect_err("the vulkan shell has none");
+        assert!(
+            why.to_string().contains("vulkan"),
+            "and the refusal names the flavor: {why}"
+        );
+    }
+
+    /// The word list is the shell's, so this side keeps it whole rather than
+    /// parsing it — a config that states one is the string it stated.
+    #[test]
+    fn a_stated_diagnostics_key_survives_the_reshape() {
+        let toml = format!("{MINIMAL_METAL}\n[engine]\ndiagnostics = \"cut-trace\"\n");
+        let cfg = Config::parse(&toml).expect("an [engine] table beside [model.engine]");
+        assert_eq!(
+            cfg.model
+                .engine
+                .options
+                .get("diagnostics")
+                .and_then(toml::Value::as_str),
+            Some("cut-trace"),
+            "`[engine] diagnostics` lands in the engine-specific options bag"
         );
     }
 

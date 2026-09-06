@@ -270,7 +270,9 @@ pub mod open {
 /// ordinal does `cuda:1` name" is a CUDA naming fact no other crate should
 /// re-derive.
 #[cfg(feature = "cuda")]
-pub use engine_cuda::{DeviceBoot, Graphs, Knobs, ordinal_of, Recording, World};
+pub use engine_cuda::comm::Transport;
+#[cfg(feature = "cuda")]
+pub use engine_cuda::{DeviceBoot, Diagnostics, Graphs, Knobs, ordinal_of, Recording, World};
 
 // `open::metal` is TARGET-gated as well as feature-gated, for the plainest
 // reason there is: there is a shell behind that door and it binds an
