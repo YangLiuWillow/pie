@@ -118,6 +118,8 @@ pub struct Handles {
     pub group_of_lane: Option<Tensor>,
     /// One entry per selection the load carved, in the load's order.
     pub packings: Vec<PackingHandles>,
+    /// `GeomKind::RequestOfToken`: `[rows]` i32, the fire lane of every row (lane 0 past the live rows).
+    pub lane_of_row: Tensor,
 }
 
 /// Numbers per multimodal position: `(t, h, w)`. `RuntimeInput::PatchPositions` and `RuntimeInput::MropePositions` are the same triple over two rectangles.
@@ -269,6 +271,8 @@ pub struct Fire<'a> {
     pub mask: Option<&'a crate::mask::Staged>,
     /// How many of [`tokens`](Fire::tokens) are this fire's own — the rest is carve padding — or `0` for "all of them".
     pub live_rows: u32,
+    /// `[rows]`: the fire lane of every row, `0` over the carve's padding — `GeomKind::RequestOfToken`, staged by every fire.
+    pub lane_of_row: &'a [i32],
     /// `[fire lanes]` group ids; empty for a plan that reads no packing table.
     pub group_of_lane: &'a [i32],
     /// One per selection the load carved, in the load's order; empty stages none.
@@ -414,6 +418,8 @@ pub struct Inputs {
     self_cond_bytes: u64,
     /// The float ports' rectangles, below the line like the patch seat.
     ports: Vec<PortAt>,
+    /// `GeomKind::RequestOfToken`, in the staged prefix, `[max_tokens]` i32.
+    lane_of_row: u64,
     /// `GeomKind::GroupOfLane`, in the staged prefix, `[max_lanes]` i32.
     group_of_lane: u64,
     /// One packing per selection the plan reads, in the staged prefix.
@@ -501,7 +507,8 @@ impl Inputs {
                 write_offset: take(rows * 4),
             })
             .collect();
-        // The D2 packing tables ride the staged prefix like the geometry vectors: the group table once, five tables per selection the plan reads.
+        // The row-to-lane map every fire stages (a modulation vector's broadcast reads it), then the D2 packing tables riding the staged prefix like the geometry vectors: the group table once, five tables per selection the plan reads.
+        let lane_of_row = take(rows * 4);
         let group_of_lane = take(lanes * 4);
         let packings: Vec<PackingAt> = (0..selections)
             .map(|_| PackingAt {
@@ -619,6 +626,7 @@ impl Inputs {
             self_cond_taps,
             self_cond_bytes: if self_cond.is_some() { rows * self_cond_taps * 4 } else { 0 },
             ports,
+            lane_of_row,
             group_of_lane,
             packings,
             spaces,
@@ -793,6 +801,17 @@ impl Inputs {
         let mut valid = vec![1u8; live as usize];
         valid.resize(rows as usize, 0);
         put(self.row_valid, &valid, "staged row_valid")?;
+        if fire.lane_of_row.len() != rows as usize {
+            return Err(crate::error::Fault::program(
+                "inputs::write_host",
+                format!(
+                    "this fire stages {} lane-of-row entries for {rows} rows; the map is one \
+                     lane per staged row, padding included",
+                    fire.lane_of_row.len()
+                ),
+            ));
+        }
+        put(self.lane_of_row, bytes_of(fire.lane_of_row), "staged lane of row")?;
         put(self.slot_ids, bytes_of(fire.slot_ids), "staged slot ids")?;
         // Lanes a ceiling plan names but this fire did not bring are padded with `-1`: without it the device tail is whatever the last fire left, and `attn/ssm.cuh`'s `if (slot < 0) return` cannot refuse valid-looking stale ids.
         if space_lanes > lanes {
@@ -1129,6 +1148,7 @@ impl Inputs {
         let (at_routes, at_mask, at_mask_indptr) =
             (self.adapter_routes, self.mask_bits, self.mask_indptr);
         let places: Vec<SpaceAt> = self.spaces.clone();
+        let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
         // Split borrow: the ring is read, the device store is written.
@@ -1155,6 +1175,7 @@ impl Inputs {
             copy(at_live, *words * 4)?;
         }
         copy(at_row_valid, rows as usize)?;
+        copy(at_lane_of_row, rows as usize * 4)?;
         // Copied at `space_lanes`, with every other per-lane table: the host vector was `-1`-padded to that reach (see `write_host`).
         copy(at_slot_ids, space_lanes as usize * 4)?;
         if let Some(routes) = adapter_rows {
@@ -1220,6 +1241,7 @@ impl Inputs {
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
             packings,
+            lane_of_row: i32s(base + at_lane_of_row, rows),
         })
     }
 

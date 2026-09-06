@@ -5,9 +5,10 @@
 //! numbers are read and no expert is promoted. Nothing it does can fail the
 //! load except [`Shell::golden`].
 //!
-//! [`Kind`] names the six composition kinds; [`ARMS`] is one enumerator per
-//! kind, and the tally and the boot line iterate [`Kind::ALL`]. A seventh
-//! kind costs a `BodySynth` variant, a `Kind`, an enumerator and one entry.
+//! [`Kind`] names the seven composition kinds; [`ARMS`] is one enumerator
+//! per kind, and the tally and the boot line iterate [`Kind::ALL`]. An
+//! eighth kind costs a `BodySynth` variant, a `Kind`, an enumerator and one
+//! entry.
 
 use engine::fire::{Mask, Masking, RsReset, RsVerb};
 use model_compiler::CompiledModel;
@@ -97,6 +98,14 @@ enum BodySynth {
     /// SKU's decode traffic actually brings, and [`BodySynth::Decode`]'s
     /// singleton cannot name. One row per lane, split across the words.
     Ensemble { lanes: Vec<(usize, u32)> },
+    /// Every class one JOINT region spans, present at once — the MM-DiT
+    /// fire (design D2): a text lane and an image lane of one request, two
+    /// prefill classes whose windows one `attention.ragged` region stands
+    /// over. One lane per class, the bucket's rows spread evenly. The
+    /// synthetic lanes are each a group of their own; the group tables are
+    /// per-fire data the body replays over, so one body serves every
+    /// grouping.
+    Joint { lanes: Vec<(usize, u32)> },
 }
 
 impl BodySynth {
@@ -106,9 +115,9 @@ impl BodySynth {
         let mut classes = match self {
             BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => vec![*class],
             BodySynth::Mixed { decode, class, .. } => vec![*decode, *class],
-            BodySynth::Fragmented { lanes } | BodySynth::Ensemble { lanes } => {
-                lanes.iter().map(|(class, _)| *class).collect()
-            }
+            BodySynth::Fragmented { lanes }
+            | BodySynth::Ensemble { lanes }
+            | BodySynth::Joint { lanes } => lanes.iter().map(|(class, _)| *class).collect(),
             BodySynth::Tower { class, .. } => vec![*class],
         };
         classes.sort_unstable();
@@ -124,6 +133,7 @@ impl BodySynth {
             BodySynth::Fragmented { .. } => Kind::Fragmented,
             BodySynth::Tower { .. } => Kind::Tower,
             BodySynth::Ensemble { .. } => Kind::Ensemble,
+            BodySynth::Joint { .. } => Kind::Joint,
         }
     }
 
@@ -152,7 +162,9 @@ impl BodySynth {
                     .collect(),
                 Vec::new(),
             ),
-            BodySynth::Fragmented { lanes } => (lanes.clone(), Vec::new()),
+            BodySynth::Fragmented { lanes } | BodySynth::Joint { lanes } => {
+                (lanes.clone(), Vec::new())
+            }
             BodySynth::Tower {
                 class,
                 rows,
@@ -189,11 +201,13 @@ pub enum Kind {
     /// count means seats under the lattice, a short `ensemble` count means
     /// hybrid decode traffic has no key at all.
     Ensemble,
+    /// [`BodySynth::Joint`]: the multi-stream fire of a generative plan.
+    Joint,
 }
 
 impl Kind {
     /// The tally's width, and [`ARMS`]'s.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 
     /// In the order the boot line and [`ARMS`] use; [`Kind::at`] indexes
     /// the tally by discriminant.
@@ -204,6 +218,7 @@ impl Kind {
         Kind::Fragmented,
         Kind::Tower,
         Kind::Ensemble,
+        Kind::Joint,
     ];
 
     /// Its slot in a per-kind tally.
@@ -221,6 +236,7 @@ impl core::fmt::Display for Kind {
             Kind::Fragmented => "fragmented",
             Kind::Tower => "tower",
             Kind::Ensemble => "ensemble",
+            Kind::Joint => "joint",
         })
     }
 }
@@ -250,6 +266,8 @@ struct Deployment {
     media: Vec<usize>,
     /// The minimal present sets that break a window ([`Shell::fragmenting`]).
     fragmenting: Vec<Vec<usize>>,
+    /// The present sets one joint region spans ([`Shell::joining`]).
+    joining: Vec<Vec<usize>>,
     /// Same classes as `decoders`, as a `ClassSet` for membership tests.
     decoding: model_ir::ClassSet,
     seats: u32,
@@ -448,8 +466,29 @@ fn ensemble_lanes(deployment: &Deployment, lanes: u32) -> Option<Vec<(usize, u32
     )
 }
 
-/// The whole key space, one function per kind, in [`Kind::ALL`]'s order. A
-/// seventh composition kind is a [`BodySynth`] variant, a [`Kind`], an
+/// One joint key per lattice point per joint present set
+/// ([`BodySynth::Joint`]): the bucket's rows split evenly over the classes,
+/// each class's share spread over as many lanes as the seats allow — the
+/// widest lane count, as the prefill arm does, since a body's lane column
+/// is carved at the count it was recorded with.
+fn joint_keys(deployment: &Deployment, into: &mut Targets) {
+    for point in deployment.buckets.iter().copied() {
+        for present in &deployment.joining {
+            match joint_rows(deployment, present, point) {
+                Some(lanes) => into.targets.push((point, BodySynth::Joint { lanes })),
+                None => into.unfireable.push(unfireable_line(
+                    deployment,
+                    &format!("joint {present:?}"),
+                    &format!("bucket {point}"),
+                    None,
+                )),
+            }
+        }
+    }
+}
+
+/// The whole key space, one function per kind, in [`Kind::ALL`]'s order. An
+/// eighth composition kind is a [`BodySynth`] variant, a [`Kind`], an
 /// enumerator and one entry here — nothing else.
 const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
     decode_keys,
@@ -458,6 +497,7 @@ const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
     fragmented_keys,
     tower_keys,
     ensemble_keys,
+    joint_keys,
 ];
 
 impl core::fmt::Display for BodySynth {
@@ -493,6 +533,16 @@ impl core::fmt::Display for BodySynth {
                         f.write_str("+")?;
                     }
                     write!(f, "c{class} x{count}")?;
+                }
+                Ok(())
+            }
+            BodySynth::Joint { lanes } => {
+                write!(f, "joint ")?;
+                for (at, (class, rows)) in lanes.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str("+")?;
+                    }
+                    write!(f, "c{class}:{rows}")?;
                 }
                 Ok(())
             }
@@ -1096,6 +1146,7 @@ impl Shell {
                 .collect(),
             media: self.media.iter().collect(),
             fragmenting: self.fragmenting(),
+            joining: self.joining(),
             decoding: self.decoding.clone(),
             seats,
             context,
@@ -1124,8 +1175,9 @@ impl Shell {
             Kind::Ensemble => 1,
             Kind::Mixed => 2,
             Kind::Prefill => 3,
-            Kind::Fragmented => 4,
-            Kind::Tower => 5,
+            Kind::Joint => 4,
+            Kind::Fragmented => 5,
+            Kind::Tower => 6,
         };
         targets.sort_by_key(|(bucket, target)| {
             (Some(*bucket) != top, rank(target.kind()), *bucket)
@@ -1347,6 +1399,30 @@ impl Shell {
         found
     }
 
+    /// The present sets a JOINT fire brings: for every template region whose
+    /// mask spans two or more non-decode, text-only classes (a merged
+    /// rectangle's consumer — the `attention.ragged` of a multi-stream
+    /// plan), that mask's classes, ascending. Empty for a plan whose every
+    /// region stands over one class, which is every language SKU.
+    fn joining(&self) -> Vec<Vec<usize>> {
+        let mut found: Vec<Vec<usize>> = Vec::new();
+        for region in self.compiled.template() {
+            if region.mask.len() < 2 {
+                continue;
+            }
+            let present: Vec<usize> = region.mask.iter().collect();
+            if present
+                .iter()
+                .any(|class| self.decoding.contains(*class) || self.media.contains(*class))
+                || found.contains(&present)
+            {
+                continue;
+            }
+            found.push(present);
+        }
+        found
+    }
+
     /// The three classes that witness one separator breaking one mask, or
     /// `None` when the separator does not stand between two of the mask's
     /// classes at all (it sits in front of, or behind, all of them — which
@@ -1420,6 +1496,33 @@ impl Shell {
                 .collect(),
         )
     }
+}
+
+/// The lanes of one joint composition: every class of `present` present,
+/// the bucket's rows split evenly over the classes and each class's share
+/// spread over its equal share of `min(seats, max_lanes)` lanes, or `None`
+/// for a set this deployment cannot seat.
+fn joint_rows(
+    deployment: &Deployment,
+    present: &[usize],
+    bucket: u32,
+) -> Option<Vec<(usize, u32)>> {
+    let width = present.len() as u32;
+    let seats = deployment.seats.min(deployment.max_lanes);
+    if width < 2 || seats < width || bucket < width {
+        return None;
+    }
+    let lanes_per_class = (seats / width).max(1);
+    let mut lanes = Vec::new();
+    let base = bucket / width;
+    let over = bucket % width;
+    for (at, class) in present.iter().enumerate() {
+        let rows = base + u32::from((at as u32) < over);
+        for share in Shell::spread(rows, lanes_per_class, deployment.context)? {
+            lanes.push((*class, share));
+        }
+    }
+    Some(lanes)
 }
 
 /// One lane per class of a fragmenting present set, at row counts that

@@ -91,3 +91,5 @@ tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
+# A scratch directory for the artifact a hand-written miniature loads from.
+tempfile = "3"

@@ -439,6 +439,12 @@ impl FrameShell for Shell {
                     .iter()
                     .find(|feed| feed.kind == seat.kind && feed.port == seat.port)
                 else {
+                    // The arming pass feeds nothing: its synthetics compute
+                    // nobody's numbers, and the rectangle stands as the load
+                    // left it (zeros) or the last fire's.
+                    if arming {
+                        continue;
+                    }
                     return Err(Fault::program(
                         "serve::ports",
                         format!(
@@ -466,14 +472,20 @@ impl FrameShell for Shell {
                     })?;
                 let rows = if seat.per_lane() { 1 } else { row.rows };
                 let bytes = u64::from(rows) * seat.row_bytes();
+                // A cell in the port's own element copies; an f32 cell into
+                // a bf16 port (design D3: latents stay f32 masters on the
+                // ring, a text may read them in bf16) is cast on the way.
+                let f32_bytes = u64::from(rows) * u64::from(seat.width) * 4;
                 let cell = self.programs.feed_cell_bytes(instance, feed.channel)?;
-                if cell != bytes {
+                let cast = cell != bytes && seat.dtype == model_ir::Dtype::Bf16 && cell == f32_bytes;
+                if cell != bytes && !cast {
                     return Err(Fault::program(
                         "serve::ports",
                         format!(
                             "lane {} feeds {:?} port {} off channel {} whose cell is {cell} \
                              bytes, and the port wants {rows} row(s) x {} {:?} = {bytes} \
-                             bytes (the lane's rows by the port's width)",
+                             bytes (the lane's rows by the port's width; an f32 cell of \
+                             {f32_bytes} bytes would be cast)",
                             row.source, seat.kind, seat.port, feed.channel, seat.width, seat.dtype
                         ),
                     ));
@@ -485,7 +497,9 @@ impl FrameShell for Shell {
                     } else {
                         row.row_offset
                     },
+                    rows,
                     bytes,
+                    cast,
                     channel: feed.channel,
                     instance,
                 });
@@ -1244,6 +1258,14 @@ impl FrameShell for Shell {
         } else {
             composition.rows()
         };
+        // The row-to-lane map, `[carve rows]`: each lane's rows name its fire
+        // lane; the carve's padding names lane 0, a lane that exists, so a
+        // padded row a retirement misses still reads a real vector.
+        let mut lane_of_row: Vec<i32> = Vec::with_capacity(carve_rows as usize);
+        for (fire_lane, row) in composition.lanes().iter().enumerate() {
+            lane_of_row.extend(std::iter::repeat_n(fire_lane as i32, row.rows as usize));
+        }
+        lane_of_row.resize(carve_rows as usize, 0);
         if carve_rows > rows {
             tokens.resize(carve_rows as usize, 0);
             positions.resize(carve_rows as usize, 0);
@@ -1322,6 +1344,7 @@ impl FrameShell for Shell {
                 // How far this fire's own rows go before the bucket's
                 // padding starts.
                 live_rows: rows,
+                lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
             },

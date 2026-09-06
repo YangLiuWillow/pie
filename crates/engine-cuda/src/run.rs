@@ -302,6 +302,8 @@ pub struct FireBindings {
     /// `RuntimeInput::SelfCondWeights`: `f32`, `[token rows, taps]`, beside the rows.
     pub self_cond_weights: Option<Tensor>,
 
+    /// `GeomKind::RequestOfToken`: `i32`, `[rows]`, the fire lane of every row — a lane vector's broadcast map. Staged by every fire.
+    pub lane_of_row: Tensor,
     /// `GeomKind::GroupOfLane`: `i32`, `[lanes]` at the lane tables' reach. `None` for a plan that reads no packing table.
     pub group_of_lane: Option<Tensor>,
     /// The D2 packing tables, one per selection the plan reads: the two CSRs, the reference tails and the two row tables, handed to the arms whole (their values are fire-absolute).
@@ -1253,8 +1255,9 @@ impl<'c> Run<'c> {
                 self.port(at, engine::fire::PortKind::AxisPositions, *port)
             }
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
-                // The packing kinds need no cache seat: a denoiser declares no kv space at all.
+                // The packing kinds and the row-to-lane map need no cache seat: a denoiser declares no kv space at all.
                 match kind {
+                    GeomKind::RequestOfToken => return self.fire.lane_of_row,
                     GeomKind::GroupOfLane => {
                         return self.fire.group_of_lane.unwrap_or_else(|| {
                             panic!("value {at} reads the group table, which this fire staged none of")
@@ -1275,7 +1278,7 @@ impl<'c> Run<'c> {
                     GeomKind::LastPageLen => seat.last_page_len,
                     GeomKind::KvLen => seat.kv_len,
                     GeomKind::RowValid => seat.row_valid,
-                    GeomKind::RequestOfToken => seat.request_of_token,
+                    GeomKind::RequestOfToken => unreachable!("the row-to-lane map returns early"),
                     GeomKind::WritePage => seat.write_page,
                     GeomKind::WriteOffset => seat.write_offset,
                     // Answered above, before the cache seat was asked for.

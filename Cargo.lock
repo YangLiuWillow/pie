@@ -1633,6 +1633,7 @@ dependencies = [
  "model-ir",
  "models",
  "serde_json",
+ "tempfile",
  "tokenizer",
  "toml",
  "ztensor",

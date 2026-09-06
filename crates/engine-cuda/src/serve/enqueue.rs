@@ -291,12 +291,21 @@ impl FireCtx<'_> {
                     ),
                 })?;
             let at = rectangle.ptr + u64::from(feed.first) * feed.seat.row_bytes();
-            crate::device::alloc::copy_any(
-                self.device.stream(),
-                at,
-                source,
-                usize::try_from(feed.bytes).unwrap_or(usize::MAX),
-            )?;
+            if feed.cast {
+                kernels_cuda::linear::quant::cast_fp32_to(
+                    self.device.ctx(),
+                    kernels_cuda::Tensor::new(source, feed.rows, feed.seat.width, Dtype::F32),
+                    &mut kernels_cuda::Tensor::new(at, feed.rows, feed.seat.width, Dtype::Bf16),
+                )
+                .map_err(Fault::from)?;
+            } else {
+                crate::device::alloc::copy_any(
+                    self.device.stream(),
+                    at,
+                    source,
+                    usize::try_from(feed.bytes).unwrap_or(usize::MAX),
+                )?;
+            }
         }
 
         // A bodied fire carves both columns at the key's bucket, so a replay's
@@ -458,6 +467,7 @@ impl FireCtx<'_> {
             mrope_positions: staged.mrope,
             self_cond_rows: staged.self_cond.map(|(rows, _)| rows),
             self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
+            lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
             packings: p
                 .packings

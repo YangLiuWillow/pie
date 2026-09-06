@@ -566,7 +566,12 @@ pub(crate) struct PortFeedPlan {
     /// The first fire row (token ports) or the fire lane (a lane vector)
     /// the cell lands at.
     pub(crate) first: u32,
+    /// How many rows of the rectangle the cell fills.
+    pub(crate) rows: u32,
+    /// The rectangle bytes those rows are.
     pub(crate) bytes: u64,
+    /// The cell is f32 and the port bf16: cast on the way rather than copied.
+    pub(crate) cast: bool,
     /// The engine-registered channel id.
     pub(crate) channel: u64,
     /// The instance the channel is read through.
