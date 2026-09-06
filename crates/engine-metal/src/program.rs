@@ -468,7 +468,7 @@ impl Plane {
     pub fn stage_batched(
         &mut self,
         device: &Context,
-        frame: &Frame,
+        frame: &mut Frame,
         ids: &[u64],
     ) -> Result<Vec<(u64, Launched)>> {
         let mut results = Vec::with_capacity(ids.len());

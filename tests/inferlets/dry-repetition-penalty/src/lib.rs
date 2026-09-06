@@ -269,6 +269,16 @@ fn step(
     (token, hist_next, count, peak)
 }
 
+/// Three `[1]` f32 values as one `[3]` cell.
+fn pack3(a: &Tensor, b: &Tensor, c: &Tensor) -> Tensor {
+    let lane = iota(3);
+    select(
+        &eq(&lane, broadcast(0u32, [3])),
+        broadcast(a, [3]),
+        select(&eq(&lane, broadcast(1u32, [3])), broadcast(b, [3]), broadcast(c, [3])),
+    )
+}
+
 /// Longest verbatim n-gram repeated anywhere in `toks`, measured on the host so
 /// the device statistic can be checked against ground truth.
 fn longest_repeat(toks: &[u32]) -> usize {
@@ -366,8 +376,6 @@ async fn main(input: Input) -> Result<Output> {
     history.resize(cfg.capacity as usize, -1);
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut counts: Vec<f32> = Vec::with_capacity(max_tokens);
-    let mut peaks: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
@@ -430,8 +438,13 @@ async fn main(input: Input) -> Result<Output> {
     let c0 = cnt_out_p.take_host::<f32>().await?;
     let k0 = peak_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
-    counts.push(c0);
-    peaks.push(k0);
+    // The per-step statistics accumulate on the device — a running sum of
+    // penalized counts and a running peak — and ride out beside the token in
+    // one `[3]` cell, so a token costs one host round trip, not three.
+    let cnt_sum = Channel::from([c0]).named("cnt_sum");
+    let peak_max = Channel::from([k0]).named("peak_max");
+    let mut total_penalized = c0;
+    let mut peak = k0;
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
@@ -443,15 +456,9 @@ async fn main(input: Input) -> Result<Output> {
         let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let hist_c = Channel::from(history.clone()).named("hist");
         let hlen_c = Channel::from([n + 1]).named("hlen");
-        let tok_out = Channel::new([1], dtype::i32)
+        let out = Channel::new([3], dtype::f32)
             .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let cnt_out = Channel::new([1], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("cnt_out");
-        let peak_out = Channel::new([1], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("peak_out");
+            .named("out");
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from([n]).named("positions");
         let pages = Channel::from_iter(0..max_pages).named("pages");
@@ -486,6 +493,8 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
             let length = kv_len.take();
+            let cnt_so_far = cnt_sum.take();
+            let peak_so_far = peak_max.take();
             let r = rng.take();
             let hist = hist_c.take();
             let hlen = hlen_c.take();
@@ -502,9 +511,11 @@ async fn main(input: Input) -> Result<Output> {
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
             page_indptr.put(indptr(1, &page_count));
-            tok_out.put(&token);
-            cnt_out.put(&count);
-            peak_out.put(&peak);
+            let cnt_next = &cnt_so_far + &count;
+            let peak_next = max_elem(&peak_so_far, &peak);
+            out.put(pack3(&cast(reshape(&token, [1]), dtype::f32), &cnt_next, &peak_next));
+            cnt_sum.put(&cnt_next);
+            peak_max.put(&peak_next);
             hist_c.put(&hist_next);
             hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
@@ -512,21 +523,13 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
-            let t = tok_out
-                .take_host::<i32>()
+            let v = out
+                .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let c = cnt_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let k = peak_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            generated.push(t as u32);
-            counts.push(c);
-            peaks.push(k);
+            generated.push(v[0] as u32);
+            total_penalized = v[1];
+            peak = v[2];
             Ok(ControlFlow::Continue(()))
         })
         .await?;
@@ -536,12 +539,7 @@ async fn main(input: Input) -> Result<Output> {
     // The history is device state, so prove the scan actually saw it: with a
     // stuck `hist` channel no suffix could ever grow and the penalty would stay
     // pinned at its prompt-only value forever.
-    let peak = peaks.iter().fold(0.0f32, |a, &b| a.max(b));
-    if cfg.multiplier > 0.0
-        && generated.len() > 8
-        && peak == 0.0
-        && counts.iter().all(|&c| c == 0.0)
-    {
+    if cfg.multiplier > 0.0 && generated.len() > 8 && peak == 0.0 && total_penalized == 0.0 {
         return Err(
             "no token was ever penalized — the history channel is not advancing".to_string(),
         );
@@ -557,7 +555,7 @@ async fn main(input: Input) -> Result<Output> {
         base: cfg.base,
         allowed_length: cfg.allowed_length,
         max_ngram: cfg.max_ngram,
-        mean_penalized: counts.iter().sum::<f32>() / counts.len() as f32,
+        mean_penalized: total_penalized / generated.len() as f32,
         peak_penalty: peak,
         longest_repeat: longest_repeat(&full),
     })

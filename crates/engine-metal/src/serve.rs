@@ -2933,7 +2933,7 @@ impl Shell {
     #[allow(clippy::too_many_arguments)]
     fn stage_epilogues(
         &mut self,
-        frame: &Frame,
+        frame: &mut Frame,
         prepared: &Prepared<'_>,
         base: u64,
         width: u64,
