@@ -29,10 +29,10 @@
 //!   C_in·k²]` rectangle `Weight::conv_taps_major` declares (a transmute:
 //!   same bytes, the shell relabels at load); conv biases and group-norm
 //!   affines are cast to f32;
-//! * the frozen BatchNorm becomes the two `[128]` planes `standardize`
-//!   reads: `scale = √(var + eps)`, `bias = −mean · (var + eps)^−½` —
-//!   `UnaryOp::{Sqrt, Rsqrt}` over `bn.running_var + eps`, then one
-//!   per-element `Scale` of the stored mean by the reciprocal;
+//! * the frozen BatchNorm becomes three `[128]` planes: the deviation
+//!   `√(var + eps)` (`UnaryOp::Sqrt` over `bn.running_var + eps`) as
+//!   `standardize`'s scale, a zero fill as its bias, and the stored mean
+//!   as the `add_bias` after it;
 //! * the miniature ships fp32 and every bank is declared bf16, so each of
 //!   its reads is a cast;
 //! * the encoder's last nine layers and final norm are not read
@@ -42,7 +42,8 @@
 //! yet — `forward.rs`), and `vae.bn.num_batches_tracked`.
 
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType, UnaryOp};
-use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
+use checkpoint::types::Encoding;
+use checkpoint_dsl::{Builder, Error, encoding, extents, stored_encoding};
 use model_dsl::{Platform, Weight};
 
 use super::model::{
@@ -376,9 +377,9 @@ fn mid_attention(b: &mut Builder, a: &MidAttention, stem: &str) -> Result<(), Er
     Ok(())
 }
 
-/// The frozen BatchNorm as `standardize`'s planes: `scale = √(var + eps)`
-/// and `bias = −mean · (var + eps)^−½`, the reciprocal an internal plane
-/// stated once in the checkpoint's own dtype.
+/// The frozen BatchNorm's three planes: `scale = √(var + eps)`, the zero
+/// bias `standardize` reads beside it (a fill in the declared dtype), and
+/// the mean.
 fn batch_norm(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -386,26 +387,58 @@ fn batch_norm(
     mean: &str,
     var: &str,
 ) -> Result<(), Error> {
+    // `√(var + eps)` is two kernels, and the load plan lowers a kernel only
+    // at the root of a step: the sum is one internal plane, the root another
+    // over it, and the published plane is that root, cast where the row's
+    // dtype is not the checkpoint's.
     let stored = stored_encoding(src, var)?;
-    let eps = f64::from(VAE_BN_EPS) as f32;
-    let rstd = format!("{}.rstd", v.bn_bias.name);
+    let shape = extents(&v.bn_scale);
+    let var_eps = format!("{}.var_eps", v.bn_scale.name);
+    let std = format!("{}.std", v.bn_scale.name);
     b.push(
         TensorContract::new(
-            rstd.clone(),
-            Expr::src(var.to_string()).bias(eps).unary(UnaryOp::Rsqrt),
-            extents(&v.bn_bias),
-            stored,
+            var_eps.clone(),
+            Expr::src(var.to_string()).bias(VAE_BN_EPS),
+            shape.clone(),
+            stored.clone(),
         )
         .internal(),
     );
-    b.read_expr(
-        &v.bn_scale,
-        Expr::src(var.to_string()).bias(eps).unary(UnaryOp::Sqrt),
-    )?;
-    b.read_expr(
-        &v.bn_bias,
-        Expr::src(mean.to_string())
-            .scale(-1.0)
-            .scale_per_block(Expr::out(rstd)),
-    )
+    b.push(
+        TensorContract::new(
+            std.clone(),
+            Expr::out(var_eps).unary(UnaryOp::Sqrt),
+            shape.clone(),
+            stored.clone(),
+        )
+        .internal(),
+    );
+    let want = encoding(v.bn_scale.dtype);
+    let published = if want == stored {
+        Expr::out(std)
+    } else {
+        Expr::out(std).cast(want.clone())
+    };
+    b.push(TensorContract::new(
+        v.bn_scale.name.clone(),
+        published,
+        shape,
+        want,
+    ));
+    b.read(&v.bn_mean, mean.to_string())?;
+    let want = encoding(v.bn_zero.dtype);
+    let Encoding::Raw(dtype) = want.clone() else {
+        return Err(Error::Illegible {
+            name: v.bn_zero.name.clone(),
+            detail: format!("a zero plane is stated raw, not {want:?}"),
+        });
+    };
+    let shape = extents(&v.bn_zero);
+    b.push(TensorContract::new(
+        v.bn_zero.name.clone(),
+        Expr::fill(0.0, TensorType::raw(shape.clone(), dtype)),
+        shape,
+        want,
+    ));
+    Ok(())
 }

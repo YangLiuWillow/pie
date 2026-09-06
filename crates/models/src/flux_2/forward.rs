@@ -738,7 +738,8 @@ fn vae_decode(arm: &Input<Facts>, vae: &Vae) {
     // the rows are copied first — a factor-1 nearest upsample is the one
     // fresh box-keeping copy the voxel axis has.
     let (z, g0) = spatial::upsample_nearest(&z, &g0, [1, 1, 1], false);
-    let z = ops::elemwise::standardize(&z, &vae.bn_bias, &vae.bn_scale);
+    let z = ops::elemwise::standardize(&z, &vae.bn_zero, &vae.bn_scale);
+    let z = ops::elemwise::add_bias(&vae.bn_mean, &z);
     let (z, g) = spatial::pixel_shuffle(&z, &g0, [1, PACK, PACK]);
     let (z, g) = conv(&z, &g, &vae.post_quant_conv);
     let (mut x, mut g) = conv(&z, &g, &vae.conv_in);

@@ -536,12 +536,15 @@ pub struct UpBlock {
 /// The `AutoencoderKLFlux2` decoder side: the frozen BatchNorm's affine,
 /// `post_quant_conv`, and the conv decoder from 32 latent channels to RGB.
 pub struct Vae {
-    /// The BatchNorm denormalisation `z·√(var+eps) + mean` as the
-    /// `standardize` op reads it, `(x − bias)·scale`: `scale = √(var+eps)`,
-    /// `bias = −mean/√(var+eps)`, both `[128]`, derived at import from
-    /// `bn.running_{mean,var}`.
-    pub bn_bias: Weight,
+    /// The BatchNorm denormalisation `z·√(var+eps) + mean` as two ops read
+    /// it: `standardize` (`(x − bias)·scale`) with a ZERO bias and `scale =
+    /// √(var+eps)`, then `add_bias` of `mean` — all `[128]`, the deviation
+    /// derived at import from `bn.running_var`, the zero a fill. (The
+    /// one-op form `bias = −mean/√(var+eps)` wants a quotient of two planes
+    /// the contract algebra does not state.)
+    pub bn_zero: Weight,
     pub bn_scale: Weight,
+    pub bn_mean: Weight,
     pub post_quant_conv: Conv,
     pub conv_in: Conv,
     pub mid: MidBlock,
@@ -581,8 +584,9 @@ impl Vae {
             })
             .collect();
         Vae {
-            bn_bias: Weight::sym("vae.bn.bias", [u64::from(IN_CHANNELS)], dense),
+            bn_zero: Weight::sym("vae.bn.zero", [u64::from(IN_CHANNELS)], dense),
             bn_scale: Weight::sym("vae.bn.scale", [u64::from(IN_CHANNELS)], dense),
+            bn_mean: Weight::sym("vae.bn.mean", [u64::from(IN_CHANNELS)], dense),
             post_quant_conv: Conv::at("vae.post_quant", VAE_CHANNELS, VAE_CHANNELS, 1, banks),
             conv_in: Conv::at("vae.conv_in", top, VAE_CHANNELS, 3, banks),
             mid: MidBlock {

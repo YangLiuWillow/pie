@@ -365,7 +365,8 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
 fn every_rope_turns_four_axes_of_the_whole_head_interleaved() {
     let plan = trace(KLEIN, Platform::Cuda);
     let dims = model::Dims::klein_4b();
-    let ropes: Vec<([u32; 4], [f32; 4], RopeForm, u32, u32)> = plan
+    type Rope = ([u32; 4], [f32; 4], RopeForm, u32, u32);
+    let ropes: Vec<Rope> = plan
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
