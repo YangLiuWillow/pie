@@ -154,6 +154,7 @@ export function maxLatentRows(): number {
 }
 
 export type {
+  AxisRole,
   BlockDrafter,
   CanvasShape,
   ForwardKind,
@@ -161,6 +162,7 @@ export type {
   LatentSpace,
   PortFact,
   PortKind,
+  PositionConvention,
   ReadingFact,
   ReadoutKind,
   ScheduleFact,

@@ -150,6 +150,7 @@ impl Model {
                 takes_tokens: true,
                 streams: vec![Stream::Text],
                 ports: vec![],
+                positions: None,
                 readout: ReadoutKind::Hidden,
                 readout_width: TE_HIDDEN,
             });
@@ -171,6 +172,14 @@ impl Model {
                     &[Stream::Video],
                 ),
             ],
+            // NO CONVENTION STATED. `PositionConvention`'s image half is a
+            // 2-D `(h, w)` grid and a Wan token is `(t, h, w)` over a
+            // `T' x H/2 x W/2` volume; its text half does not apply either
+            // (the context lane binds no positions — cross-attention has no
+            // rope). A video family fits once the convention grows a
+            // temporal extent; until then this is `none` and a guest of
+            // this row builds its own grid, which is what `none` means.
+            positions: None,
             readout: ReadoutKind::Velocity,
             readout_width: d.patch_out(),
         });
