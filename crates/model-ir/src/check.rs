@@ -492,6 +492,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Elementwise::RopePartialQ { .. } | Elementwise::RopePartialLast { .. } => {
                 &[(In(1), I32)]
             }
+            Elementwise::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
             // The mix projection is f32 end to end — the operand the norm
             // widened, the dynamic plane, and the row the sinkhorn splits.
@@ -500,7 +501,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The trunk collapse reads the f32 mix row and the f32 gate planes.
             Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
             // The fused per-layer input gathers by i32 token ids, as `Embed` does.
-            Elementwise::EmbedScaleAdd { .. } => &[(In(0), I32)],
+            Elementwise::EmbedScaleAdd { .. } | Elementwise::EmbedScaleAddSelect { .. } => {
+                &[(In(0), I32)]
+            }
             // Per-token math with nothing pinned: the norms, the residual and
             // scaling arithmetic, and the gate take and return the activation
             // dtype they are given.

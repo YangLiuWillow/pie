@@ -43,6 +43,45 @@ __global__ void embed_scale_add(
     y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
 }
 
+// `embed_scale_add` whose residual row is layer `col / width`'s slice of a
+// stacked `[rows][stacked_width]` table, read in place (the `select` that
+// copied the slice out folded away), and whose folded row lands in `y_out`.
+__global__ void embed_scale_add_select(
+    const i32* __restrict__ token_ids,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ e,
+    float a,
+    bf16* __restrict__ e_scaled,
+    const bf16* __restrict__ stacked,
+    int stacked_width,
+    int col,
+    bf16* __restrict__ y_out,
+    float b,
+    bf16* __restrict__ y_scaled,
+    int hidden, int vocab, int num_tokens,
+    const u32* __restrict__ win)
+{
+    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= num_tokens * hidden) return;
+    const int n = idx / hidden;
+    const int h = idx % hidden;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const i32 tid_raw = token_ids[plane_row];
+    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
+    const long long at = static_cast<long long>(plane_row) * hidden + h;
+    const bf16 ev = weight[static_cast<long long>(tid) * hidden + h];
+    e[at] = ev;
+    const float a_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(a));
+    const bf16 es = Elem<bf16>::from_f32(Elem<bf16>::to_f32(ev) * a_rounded);
+    e_scaled[at] = es;
+    const bf16 y0 = stacked[static_cast<long long>(plane_row) * stacked_width + col + h];
+    const bf16 yv = Elem<bf16>::from_f32(Elem<bf16>::to_f32(y0) + Elem<bf16>::to_f32(es));
+    y_out[at] = yv;
+    const float b_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(b));
+    y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
+}
+
 template <bool VEC>
 __global__ void embed(
     const i32* __restrict__ token_ids,

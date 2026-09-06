@@ -520,6 +520,82 @@ __global__ void rope_yarn(
     }
 }
 
+// `y = rope_partial_q(rmsnorm_per_head(x))`, one block per (row, head): the
+// head's moment, the weighted norm and the rotation of its first
+// `rotary_dim / 2` pairs at `positions[row]`, in registers — the two
+// launches of a KV-sharing layer's q path as one. The normed value is not
+// rounded to bf16 between the two, which the traced pair did.
+template <int BLOCK>
+__global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ weight,
+    const i32* __restrict__ positions,
+    bf16* __restrict__ y,
+    int head_dim,
+    int heads,
+    int rotary_dim,
+    float theta,
+    float eps,
+    const u32* __restrict__ win)
+{
+    static_assert(BLOCK % 32 == 0 && BLOCK <= 1024, "whole warps");
+    constexpr int kWarps = BLOCK / 32;
+    const int n = blockIdx.x;
+    // The staged-geometry seat (rope_partial's idiom).
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int head = blockIdx.y;
+    const long long at = (static_cast<long long>(row) * heads + head) * head_dim;
+    const bf16* xr = x + at;
+    bf16* yr = y + at;
+
+    float local = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
+        const float v = bf16_to_f32(xr[i]);
+        local += v * v;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local += __shfl_xor_sync(0xffffffffu, local, off);
+    }
+    __shared__ float partial[kWarps + 1];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (lane == 0) partial[warp] = local;
+    __syncthreads();
+    if (warp == 0) {
+        float v = threadIdx.x < kWarps ? partial[threadIdx.x] : 0.f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, off);
+        }
+        if (lane == 0) partial[kWarps] = v;
+    }
+    __syncthreads();
+    const float inv_rms = rsqrtf(partial[kWarps] / static_cast<float>(head_dim) + eps);
+
+    const int half = head_dim / 2;
+    const int rope_angles = rotary_dim / 2;
+    const int pos = positions[row];
+    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += BLOCK) {
+        const float a = bf16_to_f32(xr[dim_pair]) * inv_rms * bf16_to_f32(weight[dim_pair]);
+        const float b =
+            bf16_to_f32(xr[dim_pair + half]) * inv_rms * bf16_to_f32(weight[dim_pair + half]);
+        if (dim_pair < rope_angles) {
+            const float freq = powf(theta,
+                -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+            const float ang = static_cast<float>(pos) * freq;
+            float cos_v, sin_v;
+            __sincosf(ang, &sin_v, &cos_v);
+            yr[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
+            yr[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
+        } else {
+            yr[dim_pair] = f32_to_bf16(a);
+            yr[dim_pair + half] = f32_to_bf16(b);
+        }
+    }
+}
+
 template <class T>
 __global__ void rope_partial(
     T* __restrict__ q,
