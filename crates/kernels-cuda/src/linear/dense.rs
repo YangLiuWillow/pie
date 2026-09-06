@@ -158,7 +158,9 @@ pub(crate) fn act_x_wt(
 
     // The untuned ladder: the skinny kernel for a single row, GemmEx in its
     // tensor-op then plain spelling, then any Lt heuristic. First success
-    // wins; a shape walks this only until the tuner has seen it twice.
+    // wins. A shape reaches this only where the tuner cannot pin one — under
+    // capture, past the shape ceiling, or on an output too big to bench —
+    // and then it walks the same rungs every fire.
     if m == 1 && gemv_bf16(&unsafe { Ctx::on(stream) }, w, act, y, n, k).is_ok() {
         return Ok(());
     }
@@ -659,11 +661,18 @@ impl Device {
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
+        // **TUNED ON THE FIRST SIGHTING, AND THAT IS A REPRODUCIBILITY
+        // RULE.** This used to wait for the second (`if *seen < 2`), so a
+        // shape's FIRST gemm ran the untuned ladder below and every one after
+        // it ran the tuned tactic — two different kernels, whose sums round
+        // differently. The seam was visible from outside: a deployment's
+        // first fires answered ~1 bf16 ulp off its later ones, which is
+        // enough to flip a near-tie token, and whether it showed depended on
+        // whether this machine's disk cache already held the shape. Tuning
+        // here costs the bench one sighting earlier and buys one kernel per
+        // shape for the life of the process.
         let seen = self.seen.entry(key).or_insert(0);
         *seen += 1;
-        if *seen < 2 {
-            return None;
-        }
         let tactic = tune(handle, stream, &self.lt, plan, call);
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);
