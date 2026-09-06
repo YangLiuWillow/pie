@@ -1,23 +1,31 @@
 #pragma once
 
 // **THE CONV VAE'S MID-BLOCK ATTENTION: ONE HEAD AS WIDE AS THE ROW, PER
-// CLIP.** `y = softmax(q·kᵀ · scale) · v` over `[rows, C]` bf16 rectangles
-// on the voxel axis, every query of a lane attending every voxel of the
-// same lane and nothing else (the lane table says where a lane's rows
-// are). Not the ragged FA2 template: that is stamped at head widths
+// BLOCK.** `y = softmax(q·kᵀ · scale) · v` over `[rows, C]` bf16 rectangles
+// on the voxel axis, every query attending the voxels of its own block and
+// nothing else. A block is a whole lane (`seg_frames == 0`, the image
+// VAEs) or a run of `seg_frames` consecutive frames inside one (Wan 2.2's
+// mid block attends one frame at a time); the lane table says where a
+// lane's rows are and `segment_of` cuts the run out of it. Not the ragged
+// FA2 template: that is stamped at head widths
 // 64/128/256, and a VAE's head is its whole channel row (512 on the FLUX
 // VAE) at its lowest resolution (a few thousand voxels), where a plain
 // online-softmax walk over the keys is enough.
 //
 // **THE WALK.** One warp owns `QPW` consecutive query rows; lane `l` of the
 // warp holds channels `[l·CPL, (l+1)·CPL)` of each query in fp32. For every
-// key of the queries' lane the warp reads the key row once (each lane its
+// key of the queries' block the warp reads the key row once (each lane its
 // CPL channels as 16-byte words), reduces the `QPW` partial dots with
 // shuffles, updates each query's running max and sum (fp32, `exp2` on
 // pre-scaled logits), rescales the accumulators and folds the value row in.
-// A group of `QPW` rows that straddles two lanes is walked once per lane
+// A group of `QPW` rows that straddles two blocks is walked once per block
 // with the other rows masked. Rows no lane claims land zeros. fp32 scores,
 // fp32 softmax and accumulation, one rounding at the store.
+//
+// **REGISTERS.** `qreg` and `acc` are `QPW · C/32` fp32 each, so the caller
+// picks `QPW` against `C`: four queries a warp at C 256, two at 512, one at
+// 1024 — 64 registers of state either way, which is what keeps the 1024-wide
+// head (Wan's) off the local-memory spill path.
 
 #include "prelude/device.cuh"
 #include "spatial/grid.cuh"
@@ -56,6 +64,7 @@ __global__ __launch_bounds__(128) void attention(
     bf16* __restrict__ y,
     int lanes,
     int rows,
+    int seg_frames,
     float scale_log2)
 {
     constexpr int CPL = C / 32;
@@ -68,15 +77,20 @@ __global__ __launch_bounds__(128) void attention(
     if (first >= rows) return;
     const int col = lane * CPL;
 
-    // Which lane (clip) each query row belongs to, and its box.
+    // Which lane (clip) each query row belongs to, and which rows of it
+    // its attention block spans.
     int owner[QPW];
+    int seg_begin[QPW], seg_end[QPW];
     Lane box[QPW];
     float qreg[QPW][CPL];
 #pragma unroll
     for (int i = 0; i < QPW; ++i) {
         const int r = first + i;
         owner[i] = r < rows ? lane_of(grid, lanes, r, box[i]) : -2;
+        seg_begin[i] = 0;
+        seg_end[i] = 0;
         if (owner[i] >= 0) {
+            segment_of(box[i], r - box[i].off, seg_frames, seg_begin[i], seg_end[i]);
             const uint4* src = reinterpret_cast<const uint4*>(q + static_cast<size_t>(r) * C + col);
 #pragma unroll
             for (int w = 0; w < WORDS; ++w) {
@@ -101,7 +115,8 @@ __global__ __launch_bounds__(128) void attention(
         for (int c = 0; c < CPL; ++c) acc[i][c] = 0.f;
     }
 
-    // Walk each distinct lane among the group's rows once.
+    // Walk each distinct BLOCK among the group's rows once. Blocks are
+    // disjoint contiguous row ranges, so the begin row names one.
     bool done[QPW];
 #pragma unroll
     for (int i = 0; i < QPW; ++i) done[i] = owner[i] < 0;
@@ -110,16 +125,15 @@ __global__ __launch_bounds__(128) void attention(
 #pragma unroll
         for (int i = 0; i < QPW; ++i) if (pick < 0 && !done[i]) pick = i;
         if (pick < 0) break;
-        const int who = owner[pick];
-        const Lane g = box[pick];
+        const int who = seg_begin[pick];
         bool active[QPW];
 #pragma unroll
         for (int i = 0; i < QPW; ++i) {
-            active[i] = !done[i] && owner[i] == who;
+            active[i] = !done[i] && seg_begin[i] == who;
             if (active[i]) done[i] = true;
         }
-        const int begin = g.off;
-        const int end = g.off + g.voxels();
+        const int begin = who;
+        const int end = seg_end[pick];
         for (int j = begin; j < end; ++j) {
             const uint4* kp = reinterpret_cast<const uint4*>(k + static_cast<size_t>(j) * C + col);
             float s[QPW];

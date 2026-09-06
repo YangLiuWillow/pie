@@ -52,7 +52,11 @@ __global__ __launch_bounds__(256) void upsample_nearest(
 }
 
 /// Depth to space: `[rows, C * r1*r2*r3]` over `(t, h, w)` to `[rows *
-/// r1*r2*r3, C]` over `(t*r1, h*r2, w*r3)`. `c` is the OUTPUT width.
+/// r1*r2*r3, C]` over `(t*r1 - trim_t, h*r2, w*r3)`. `c` is the OUTPUT
+/// width. `trim_t` is a causal temporal upsampler's ANCHOR DROP: the first
+/// `trim_t` frames of the shuffled result are not emitted, so output frame
+/// `o.t` reads shuffled frame `o.t + trim_t` (LTX-2.5's
+/// `LTXVideoUpsampler3d`). `trim_t == 0` is the plain shuffle.
 template <class T>
 __global__ __launch_bounds__(256) void pixel_shuffle(
     const T* __restrict__ x,
@@ -64,6 +68,7 @@ __global__ __launch_bounds__(256) void pixel_shuffle(
     int r1,
     int r2,
     int r3,
+    int trim_t,
     long long total)
 {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -78,8 +83,9 @@ __global__ __launch_bounds__(256) void pixel_shuffle(
     }
     const Lane ig = lane_at(grid, l);
     const Voxel o = unravel(og, row - og.off);
-    const int src = ravel(ig, o.t / r1, o.h / r2, o.w / r3);
-    const int block = ((o.t % r1) * r2 + (o.h % r2)) * r3 + (o.w % r3);
+    const int ot = o.t + trim_t;
+    const int src = ravel(ig, ot / r1, o.h / r2, o.w / r3);
+    const int block = ((ot % r1) * r2 + (o.h % r2)) * r3 + (o.w % r3);
     const int c_in = c * (r1 * r2 * r3);
     y[e] = x[static_cast<long long>(src) * c_in + col * (r1 * r2 * r3) + block];
 }

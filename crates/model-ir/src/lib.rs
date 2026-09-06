@@ -21,11 +21,12 @@ pub use check::classes::{
 pub use check::{Fault, check, checked};
 pub use guard::Guard;
 pub use operands::Operands;
-pub use request::{ClassifyFn, Request, Stream};
 pub use ops::{
     Attention, Collective, CustomCuda, Elementwise, GateActivation, GridRule, Layout, Linear,
     ModulateForm, MropeForm, NormKind, Operation, RaggedMask, RopeForm, Spatial, TimePad,
+    VoxelSegment,
 };
+pub use request::{ClassifyFn, Request, Stream};
 pub use trace::{
     BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamSource, Platform, Seam, Shard, Trace,
 };

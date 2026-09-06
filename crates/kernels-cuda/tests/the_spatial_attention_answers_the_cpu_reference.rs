@@ -1,8 +1,9 @@
 //! **`spatial::attention` LANDS ONE SOFTMAX ATTENTION PER LANE, THE HEAD AS
-//! WIDE AS THE ROW** — at 256 and 512 channels, over two lanes of boxes
-//! whose voxel counts do not divide the warp's query group (so a group
-//! straddles the lane boundary), with padded rows past the last lane
-//! landing zeros; against an f64 host reference to bf16 tolerance.
+//! WIDE AS THE ROW** — at 256, 512 and **1024** channels (Wan 2.2's mid
+//! block is 1024 wide), over two lanes of boxes whose voxel counts do not
+//! divide the warp's query group (so a group straddles the lane boundary),
+//! with padded rows past the last lane landing zeros; against an f64 host
+//! reference to bf16 tolerance.
 //!
 //! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_spatial_attention_answers_the_cpu_reference`
 
@@ -13,7 +14,7 @@ mod common;
 use common::spatial::{Box3, table};
 use common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::spatial::attention;
+use kernels_cuda::spatial::{Segment, attention};
 use kernels_cuda::tensor::Tensor;
 
 /// The reference: per lane, `softmax(q kᵀ · scale) v` in f64.
@@ -80,6 +81,7 @@ fn check(c: usize) {
         t(k_at),
         t(v_at),
         Tensor::new(grid_at, boxes.len() as u32, 4, Dtype::I32),
+        Segment::Lane,
         // A sharper softmax than the head's own, so a wrong key order shows.
         scale * 4.0,
         &mut y,
@@ -111,7 +113,8 @@ fn check(c: usize) {
 }
 
 #[test]
-fn the_attention_answers_the_reference_at_256_and_512_channels() {
+fn the_attention_answers_the_reference_at_256_512_and_1024_channels() {
     check(256);
     check(512);
+    check(1024);
 }
