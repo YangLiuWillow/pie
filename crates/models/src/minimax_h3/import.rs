@@ -284,13 +284,7 @@ fn biased(b: &mut Builder, w: &Linear, stem: &str) -> Result<(), Error> {
 /// tensor, with the dtype adaptation above it
 /// ([`Builder::read_over`]'s contract), so a fp32 bank cast to bf16
 /// re-orders before it narrows.
-fn pairs(
-    b: &mut Builder,
-    w: &Linear,
-    stem: &str,
-    order: &[i64],
-    block: i64,
-) -> Result<(), Error> {
+fn pairs(b: &mut Builder, w: &Linear, stem: &str, order: &[i64], block: i64) -> Result<(), Error> {
     let rows = |e: &Expr| {
         Expr::concat(
             0,

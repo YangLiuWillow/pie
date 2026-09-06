@@ -369,8 +369,16 @@ impl Block {
         let width = u64::from(d.adaln_width());
         let t_dim = u64::from(d.t_dim);
         Block {
-            norm1: Weight::sym(format!("{prefix}.norm1"), [u64::from(d.dim)], crate::dense(banks)),
-            norm2: Weight::sym(format!("{prefix}.norm2"), [u64::from(d.dim)], crate::dense(banks)),
+            norm1: Weight::sym(
+                format!("{prefix}.norm1"),
+                [u64::from(d.dim)],
+                crate::dense(banks),
+            ),
+            norm2: Weight::sym(
+                format!("{prefix}.norm2"),
+                [u64::from(d.dim)],
+                crate::dense(banks),
+            ),
             attn: Attn::at(&format!("{prefix}.attn"), d, banks),
             mlp: Mlp::at(&format!("{prefix}.mlp"), d, banks),
             adaln: std::array::from_fn(|m| {
@@ -392,8 +400,16 @@ pub struct Refiner {
 impl Refiner {
     fn at(prefix: &str, d: &Dims, banks: Dtype) -> Refiner {
         Refiner {
-            norm1: Weight::sym(format!("{prefix}.norm1"), [u64::from(d.dim)], crate::dense(banks)),
-            norm2: Weight::sym(format!("{prefix}.norm2"), [u64::from(d.dim)], crate::dense(banks)),
+            norm1: Weight::sym(
+                format!("{prefix}.norm1"),
+                [u64::from(d.dim)],
+                crate::dense(banks),
+            ),
+            norm2: Weight::sym(
+                format!("{prefix}.norm2"),
+                [u64::from(d.dim)],
+                crate::dense(banks),
+            ),
             attn: Attn::at(&format!("{prefix}.attn"), d, banks),
             mlp: Mlp::at(&format!("{prefix}.mlp"), d, banks),
         }
@@ -570,8 +586,18 @@ impl Model {
             video_patch: Linear::at("dit.video_patch", dim, u64::from(VIDEO_FEATURES), banks),
             audio_patch: Linear::at("dit.audio_patch", dim, u64::from(AUDIO_CHANNELS), banks),
             condition: Linear::at("dit.condition", dim, u64::from(d.text_dim), banks),
-            t_in: Linear::at("dit.t_in", u64::from(d.t_hidden), u64::from(d.t_freq), banks),
-            t_out: Linear::at("dit.t_out", u64::from(d.t_dim), u64::from(d.t_hidden), banks),
+            t_in: Linear::at(
+                "dit.t_in",
+                u64::from(d.t_hidden),
+                u64::from(d.t_freq),
+                banks,
+            ),
+            t_out: Linear::at(
+                "dit.t_out",
+                u64::from(d.t_dim),
+                u64::from(d.t_hidden),
+                banks,
+            ),
             refine: (0..d.refiners)
                 .map(|i| Refiner::at(&format!("dit.refine.{i}"), &d, banks))
                 .collect(),

@@ -178,7 +178,12 @@ impl Model {
             readout: ReadoutKind::Hidden,
             readout_width: d.dim,
         });
-        let every = [Stream::Text, Stream::Video, Stream::Audio, Stream::Reference];
+        let every = [
+            Stream::Text,
+            Stream::Video,
+            Stream::Audio,
+            Stream::Reference,
+        ];
         readings.push(ReadingFact {
             name: "denoise",
             index: codes.denoise,
@@ -645,11 +650,15 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     let text_rows = ops::layout::unpack_rows(&ops::layout::pack_rows(&ctx, &ctx_perm), &ctx_perm);
     let video_rows = linear(
         &m.video_patch,
-        &sides[1].arm.latents(port::LATENTS, VIDEO_FEATURES, Dtype::Bf16),
+        &sides[1]
+            .arm
+            .latents(port::LATENTS, VIDEO_FEATURES, Dtype::Bf16),
     );
     let audio_rows = linear(
         &m.audio_patch,
-        &sides[2].arm.latents(port::AUDIO, AUDIO_CHANNELS, Dtype::Bf16),
+        &sides[2]
+            .arm
+            .latents(port::AUDIO, AUDIO_CHANNELS, Dtype::Bf16),
     );
     // A reference row is a video patch and runs the video projection.
     let reference_rows = linear(
