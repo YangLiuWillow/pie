@@ -79,7 +79,10 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
         // the loop below still turns once at zero rows.
         let unit = compiled.unit_of(index);
         let axis = compiled.axis_of(index);
-        match cut.iter().find(|(a, mask, _)| *a == axis && *mask == &region.mask) {
+        match cut
+            .iter()
+            .find(|(a, mask, _)| *a == axis && *mask == &region.mask)
+        {
             Some((_, _, spans)) => {
                 runs.clear();
                 runs.extend_from_slice(spans);
