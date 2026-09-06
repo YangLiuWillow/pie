@@ -146,9 +146,14 @@ pub(crate) fn validate_port_channel(
 /// match the latents'.
 pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
     let mut rows: Option<(u32, &str)> = None;
+    // Latents and positions state the lane's rows; a context port does too
+    // when it is the only row port a lane binds (a context-stream lane's
+    // rows ARE its context cell), but never overrules the others.
+    let mut context_rows: Option<u32> = None;
     for port in ports {
         let Some(these) = port.rows else { continue };
         if port.kind == ::engine::fire::PortKind::Context {
+            context_rows = context_rows.or(Some(these));
             continue;
         }
         match rows {
@@ -163,7 +168,7 @@ pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
             Some(_) => {}
         }
     }
-    Ok(rows.map(|(rows, _)| rows))
+    Ok(rows.map(|(rows, _)| rows).or(context_rows))
 }
 
 fn page_span(
@@ -1290,29 +1295,37 @@ impl ProcessCtx {
                 }
                 (None, false) => None,
             };
-            // Every port the reading declares is bound, and nothing else is.
+            // Every port the reading declares FOR THIS PASS'S STREAM is
+            // bound, and nothing else is: a port listing no stream is every
+            // lane's; one listing streams belongs to those lanes only (the
+            // image lane's latents are not the caption lane's to bind).
+            let pass_stream = pass.bindings.stream.unwrap_or_default();
+            let carried = |port: &models::PortFact| {
+                port.streams.is_empty() || port.streams.contains(&pass_stream)
+            };
             if let Some(reading) = reading {
                 if let Some((_, port)) = reading.ports_indexed().find(|(_, port)| {
-                    !pass
-                        .bindings
-                        .ports
-                        .iter()
-                        .any(|bound| bound.name == port.name)
+                    carried(port)
+                        && !pass
+                            .bindings
+                            .ports
+                            .iter()
+                            .any(|bound| bound.name == port.name)
                 }) {
                     return Ok(Err(format!(
-                        "reading `{}` declares port `{}` and this pass bound no channel to it; \
-                         call `input(\"{}\", channel)` before `program`",
+                        "reading `{}` declares port `{}` for this pass's stream and this pass \
+                         bound no channel to it; call `input(\"{}\", channel)` before `program`",
                         reading.name, port.name, port.name
                     )));
                 }
-                if let Some(bound) = pass
-                    .bindings
-                    .ports
-                    .iter()
-                    .find(|bound| reading.port(&bound.name).is_none())
-                {
+                if let Some(bound) = pass.bindings.ports.iter().find(|bound| {
+                    reading
+                        .port(&bound.name)
+                        .is_none_or(|(_, port)| !carried(port))
+                }) {
                     return Ok(Err(format!(
-                        "reading `{}` declares no port `{}`, but this pass bound one",
+                        "reading `{}` declares no port `{}` for this pass's stream, but this \
+                         pass bound one",
                         reading.name, bound.name
                     )));
                 }
@@ -2553,7 +2566,7 @@ mod tests {
     use eta_ir::types::Dtype;
 
     fn port(name: &'static str, kind: models::PortKind, width: u32) -> models::PortFact {
-        models::PortFact { name, kind, width }
+        models::PortFact { name, kind, width, streams: Vec::new() }
     }
 
     fn bound(name: &str, kind: ::engine::fire::PortKind, rows: Option<u32>) -> PortBinding {

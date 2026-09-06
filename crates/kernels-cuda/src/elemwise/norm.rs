@@ -589,12 +589,15 @@ pub fn rmsnorm_residual_add(
 /// `out += bias` per row, in place on `out`.
 pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";
-    let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    // f32 planes are the lane-axis vectors (a timestep MLP's rows): the same
+    // kernel body, one element type wider.
+    let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
+    let tb = dtype_dispatch!(OP, bias.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     nonzero(OP, "rows", out.rows)?;
     let width = stated(OP, nonzero(OP, "the biased row's width", out.width)?)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::add_bias<{t}>")))
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")))
             .apply(route_rows(out.rows, out.width)),
         &[
             out.arg(),

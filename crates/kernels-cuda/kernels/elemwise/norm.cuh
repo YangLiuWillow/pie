@@ -819,22 +819,25 @@ __global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n,
     x[at] = Elem<T>::from_f32(Elem<T>::to_f32(x[at]) * f);
 }
 
-template <class T>
+// The bias plane may be narrower than the rows it lands on: an f32 lane
+// vector (a timestep MLP) biased by the checkpoint's bf16 weight. Both are
+// read as f32 and the sum rounds once at the store.
+template <class T, class TB = T>
 __device__ __forceinline__ void add_bias_row(
     T* __restrict__ row,
-    const T* __restrict__ bias,
+    const TB* __restrict__ bias,
     int dim)
 {
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        const float v = Elem<T>::to_f32(row[d]) + Elem<T>::to_f32(bias[d]);
+        const float v = Elem<T>::to_f32(row[d]) + Elem<TB>::to_f32(bias[d]);
         row[d] = Elem<T>::from_f32(v);
     }
 }
 
-template <class T>
+template <class T, class TB = T>
 __global__ void add_bias(
     T* __restrict__ out,
-    const T* __restrict__ bias,
+    const TB* __restrict__ bias,
     int dim,
     const u32* __restrict__ win)
 {
@@ -847,7 +850,7 @@ __global__ void add_bias(
     // at its base, `bias` is one row wide and indexed by column.
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
-    add_bias_row<T>(out + static_cast<long long>(row) * dim, bias, dim);
+    add_bias_row<T, TB>(out + static_cast<long long>(row) * dim, bias, dim);
 }
 
 template <class T>

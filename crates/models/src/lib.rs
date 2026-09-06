@@ -181,6 +181,12 @@ pub struct PortFact {
     /// count for axis positions. Latents and context channels are
     /// `[rows, width]`; a lane vector is `[width]` or `[1, width]`.
     pub width: u32,
+    /// Which streams' lanes carry this port. A row port belongs to the one
+    /// stream whose rows it fills; a lane vector (a timestep) is read once
+    /// per lane by every class that modulates. EMPTY means every lane of the
+    /// reading. A pass on stream `s` must bind exactly the ports that list
+    /// `s` (or list nothing).
+    pub streams: Vec<Stream>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).

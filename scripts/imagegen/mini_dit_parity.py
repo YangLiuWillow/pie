@@ -214,10 +214,19 @@ def run(args) -> None:
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += [
-            "run", "--path", binary, "--manifest", manifest,
-            "--", "--case_file", os.path.basename(case),
-        ]
+        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        if args.case_file:
+            # the case as a file under the sandbox's per-process scratch dir
+            # (needs `[sandbox] allow_fs` and the file placed there by hand)
+            cmd += ["--case_file", os.path.basename(case)]
+        else:
+            # the case as eight argv pieces (`case_0..7`), each well under the
+            # kernel's 128 KiB single-argument ceiling; no sandbox fs needed
+            text = open(case).read()
+            n = 8
+            step = -(-len(text) // n)
+            for i in range(n):
+                cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
         if args.euler:
             cmd += ["--euler", "true"]
         print(f"[run] {' '.join(cmd)}")
@@ -331,6 +340,7 @@ def main() -> int:
                     help=f"the serving config; its `[model] model` must be the artifact "
                          f"`{DEFAULT_SKU}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
+    ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")
     ap.add_argument("--keys", action="append", default=None)
     args = ap.parse_args()
 

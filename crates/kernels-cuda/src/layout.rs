@@ -226,7 +226,9 @@ pub fn split_rows(
     right: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_rows";
-    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    // f32 rows (a lane vector's modulation slices) take the scalar path: the
+    // vector kernel moves eight bf16 per thread and is sized for that width.
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
     debug_assert_eq!(
         left.width, width,
         "the left half is the width this cut states"
@@ -238,14 +240,15 @@ pub fn split_rows(
     );
     let left_dim = stated(OP, nonzero(OP, "the left half of this cut", left.width)?)?;
     let right_dim = stated(OP, nonzero(OP, "the right half of this cut", right.width)?)?;
-    let vectors = left.width % VEC_WIDTH == 0
+    let vectors = x.dtype == Dtype::Bf16
+        && left.width % VEC_WIDTH == 0
         && right.width % VEC_WIDTH == 0
         && aligned16(x.ptr)
         && aligned16(left.ptr)
         && aligned16(right.ptr);
     let (entrypoint, launch) = if vectors {
         (
-            "::pie::layout::split_rows_vec8<::pie::bf16>",
+            "::pie::layout::split_rows_vec8<::pie::bf16>".to_string(),
             Launch::grid(
                 [(x.width / VEC_WIDTH).div_ceil(BLOCK), left.rows, 1],
                 [BLOCK, 1, 1],
@@ -253,13 +256,13 @@ pub fn split_rows(
         )
     } else {
         (
-            "::pie::layout::split_rows<::pie::bf16>",
+            format!("::pie::layout::split_rows<{t}>"),
             route_rows(left.rows, left.width),
         )
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, entrypoint).apply(launch),
+        Fire::at(FILE, symbol(&entrypoint)).apply(launch),
         &[
             x.arg(),
             left.arg(),

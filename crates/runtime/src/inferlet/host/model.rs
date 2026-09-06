@@ -58,6 +58,7 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
                 // Every float port is fed from an f32 channel: the WIT dtype
                 // set has no bf16, and the engine marshals at the feed.
                 dtype: pie::inferlet::types::Dtype::F32,
+                streams: port.streams.iter().copied().map(lane_stream).collect(),
             })
             .collect(),
         readout: match reading.readout {

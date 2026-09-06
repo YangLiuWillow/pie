@@ -127,6 +127,10 @@ interface model {
         kind: port-kind,
         width: u32,
         dtype: dtype,
+        // Which streams' lanes carry this port; empty means every lane of
+        // the reading. A pass on stream `s` binds exactly the ports that
+        // list `s` (or list nothing).
+        streams: list<lane-stream>,
     }
 
     // Which export seam a reading's epilogue reads: `logits()` for a text

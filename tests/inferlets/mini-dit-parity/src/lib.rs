@@ -156,7 +156,11 @@ async fn step(
     let tag = |what: &str| format!("{what}_g{group}");
     let rows = case.image_rows;
     let width = case.patch_features;
-    let t = Channel::from([timestep]).named(&tag("t"));
+    // One timestep cell PER PASS: a seeded channel attaches to one pass
+    // only (the runtime's channel-role rule), so the two modulating lanes
+    // each carry their own copy of the same scalar.
+    let t_txt = Channel::from([timestep]).named(&tag("t_txt"));
+    let t_img = Channel::from([timestep]).named(&tag("t_img"));
 
     // The caption lane. Its rows are fixed random 256-wide embeddings —
     // this family has no text encoder, which is what makes it an M0 fixture
@@ -172,7 +176,7 @@ async fn step(
             .named(&tag("txt_pos"));
     caption.input(&ports.text, &txt)?;
     caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &t)?;
+    caption.input(&ports.timestep, &t_txt)?;
 
     // The context lane: block 2's cross-attention keys and values, and
     // nothing else. No positions — the Wan contract gives cross-attention
@@ -199,7 +203,7 @@ async fn step(
         .named(&tag("img_pos"));
     image.input(&ports.latents, &x)?;
     image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &t)?;
+    image.input(&ports.timestep, &t_img)?;
     let velocity_width = ports.velocity_width;
     let readback = out.clone();
     image.epilogue(move || {
