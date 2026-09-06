@@ -683,6 +683,50 @@ The one host round trip is between `denoise` and `image.out`: the trunk hands
 back `[h*w + 1, D]` token rows and the voxel arm wants `[h, w, D]` without the
 `<timestep>` row, and dropping a row is not something the guest can spell on
 the device today. A production loop would carry it in an epilogue.
+#### Measured — `wan22_parity.py`
+
+```bash
+pie model import <dir with wan22_mini_d128.safetensors, a config.json and a tokenizer> \
+    --sku wan22-mini-d128-bf16-kv-bf16 --out ~/.cache/pie-imagegen/wan22-mini-d128.zt
+python wan22_parity.py all --out /tmp/wan22-parity --config ~/.pie/config.wan22-mini.toml
+python wan22_parity.py all --pertoken --out /tmp/wan22-parity --config ...
+```
+
+`d128`, both forwards: max-abs 0.01887, rel 0.01223, **cos 0.999925** — under the
+gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`). The per-token forward (two
+video lanes of one group, the conditioning frame at timestep 0) lands the same
+number. `conditioning` passes at a move of 0.0065.
+
+**The real row does NOT yet pass.** `wan22-ti2v-5b` against `dit.step0.out`
+answers **cos 0.2740** (std 0.159 against the golden's 1.117), and the forward is
+well conditioned — diffusers in fp32 against diffusers in bf16 is cos 0.999942 —
+so this is a defect, not drift. Bisected by importing the real checkpoint with
+chosen planes zeroed:
+
+| fixture | cos vs diffusers |
+|---|---|
+| all 30 blocks neutralised (`attn1/attn2/ffn` output projections zeroed) | **0.999998** |
+| one live self-attention block, modulation six distinct constants | **0.999991** |
+| 30 live self-attention blocks (cross-attn and FFN dead) | 0.098 |
+| 30 blocks, `condition_embedder.time_proj` zeroed | 0.233 |
+
+So `patch_embedding`, the whole timestep chain, the head's modulation,
+`norm_out`, `proj_out`, the velocity readback and the `(c, ph, pw)` row layout
+are EXACT, and so is a single block; the defect is in the blocks and grows with
+depth. Not the import: `dit.time_proj`, the block and head `scale_shift_table`s,
+`dit.head_proj` and `proj_out`'s row permutation all read back exactly as the
+plan states them, and the timestep chain recomputed from the artifact's own
+planes matches diffusers' `timestep_proj` at cos 0.9999986. Not the context
+lane either: dropping the prompt moves pie's velocity by 0.55 against the
+reference's 0.48.
+
+Two operational notes for the real row: `[engine] gpu_mem_utilization` must be
+0.95+ (every fire — a denoise step included — demands the VAE's whole
+causal-conv state watermark, ~6.4 GiB, and a co-tenanted card leaves the elastic
+pool less than that and refuses the pass by name), and the umT5 tokenizer is a
+SentencePiece Unigram model `pie model import` cannot compile, so the import
+needs a `tokenizer/` a BPE loader accepts (the row borrows `qwen_3`'s contract
+anyway — `models::wan_2::tokenizer`).
 
 ---
 

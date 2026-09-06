@@ -158,35 +158,21 @@ fn dit(
     biased(b, &m.time_embed.linear_2, &cond("time_embedder.linear_2"))?;
     // `linear_2` twice over, for the head's `[temb | temb]`.
     let l2 = cond("time_embedder.linear_2");
-    b.read_expr(
-        &m.head_proj.w,
-        Expr::concat(
-            0,
-            vec![
-                Expr::src(format!("{l2}.weight")),
-                Expr::src(format!("{l2}.weight")),
-            ],
-        ),
-    )?;
-    b.read_expr(
-        &m.head_proj.bias,
-        Expr::concat(
-            0,
-            vec![
-                Expr::src(format!("{l2}.bias")),
-                Expr::src(format!("{l2}.bias")),
-            ],
-        ),
-    )?;
+    let doubled = |e: Expr| Expr::concat(0, vec![e.clone(), e]);
+    b.read_over(&m.head_proj.w, format!("{l2}.weight"), doubled)?;
+    b.read_over(&m.head_proj.bias, format!("{l2}.bias"), doubled)?;
     // `time_proj`: six `dim`-row sets, `(shift, scale)` swapped in each.
     let proj = cond("time_proj");
-    b.read_expr(
+    let swap = |axis: u8, width: i64| move |e: Expr| slices_reordered(&e, MOD_SLICES, width, axis);
+    b.read_over(
         &m.time_proj.w,
-        slices_reordered(&format!("{proj}.weight"), MOD_SLICES, i64::from(dim), 0),
+        format!("{proj}.weight"),
+        swap(0, i64::from(dim)),
     )?;
-    b.read_expr(
+    b.read_over(
         &m.time_proj.bias,
-        slices_reordered(&format!("{proj}.bias"), MOD_SLICES, i64::from(dim), 0),
+        format!("{proj}.bias"),
+        swap(0, i64::from(dim)),
     )?;
 
     for (i, block) in m.blocks.iter().enumerate() {
@@ -197,21 +183,10 @@ fn dit(
     // shift]`, and `proj_out` with its rows brought to `(c, ph, pw)`.
     table(b, src, &m.head_table, &at("scale_shift_table"), HEAD_SLICES)?;
     let rows = head_rows(d.out_channels);
-    b.read_expr(&m.proj_out.w, rows_reordered(&at("proj_out.weight"), &rows))?;
-    b.read_expr(&m.proj_out.bias, rows_reordered(&at("proj_out.bias"), &rows))
-}
-
-/// Rows of axis 0 in the stated order, as a concatenation of one-row
-/// slices — the one row permutation the load ladder lowers under a cast
-/// (`Expr::gather` lands its plane sized in the source's bytes, which a
-/// following cast refuses).
-fn rows_reordered(from: &str, rows: &[i64]) -> Expr {
-    Expr::concat(
-        0,
-        rows.iter()
-            .map(|&r| Expr::src(from.to_string()).slice(0, r, 1))
-            .collect(),
-    )
+    b.read_over(&m.proj_out.w, at("proj_out.weight"), |e| {
+        e.gather(0, rows.clone())
+    })?;
+    b.read_over(&m.proj_out.bias, at("proj_out.bias"), |e| e.gather(0, rows))
 }
 
 /// One `WanTransformerBlock`'s planes under `stem`.
@@ -340,10 +315,8 @@ fn packed(b: &mut Builder, w: &Linear, stems: &[String]) -> Result<(), Error> {
 /// kernel as `[C_out, C_in·taps]`, a `[C, 1, 1, 1]` gain as `[C]`).
 fn transmuted(b: &mut Builder, src: &ztensor::Source, w: &Weight, name: &str) -> Result<(), Error> {
     let stored = stored_encoding(src, name)?;
-    b.read_expr(
-        w,
-        Expr::src(name.to_string()).transmute(TensorType::new(extents(w), stored)),
-    )
+    let shape = TensorType::new(extents(w), stored);
+    b.read_over(w, name.to_string(), |e| e.transmute(shape))
 }
 
 /// A `scale_shift_table` `[1, k, dim]` as the `[k·dim]` bias the plan
@@ -356,17 +329,17 @@ fn table(
     slices: u32,
 ) -> Result<(), Error> {
     let stored = stored_encoding(src, name)?;
-    b.read_expr(
-        w,
-        slices_reordered(name, slices, 1, 1).transmute(TensorType::new(extents(w), stored)),
-    )
+    let shape = TensorType::new(extents(w), stored);
+    b.read_over(w, name.to_string(), |e| {
+        slices_reordered(&e, slices, 1, 1).transmute(shape)
+    })
 }
 
 /// The permutation itself: `slices` consecutive `width`-wide blocks of
 /// `axis`, concatenated in the plan's order — every `(shift, scale)` pair
 /// exchanged, every gate left in place.
-fn slices_reordered(from: &str, slices: u32, width: i64, axis: u8) -> Expr {
-    let take = |i: i64| Expr::src(from.to_string()).slice(axis, i * width, width);
+fn slices_reordered(from: &Expr, slices: u32, width: i64, axis: u8) -> Expr {
+    let take = |i: i64| from.clone().slice(axis, i * width, width);
     let order: Vec<i64> = match slices {
         2 => vec![1, 0],
         6 => vec![1, 0, 2, 4, 3, 5],
@@ -426,16 +399,18 @@ fn conv(
     let name = format!("{stem}.weight");
     let stored = stored_encoding(src, &name)?;
     let shape = TensorType::new(extents(&c.w), stored);
+    let gathered = rows.clone();
+    b.read_over(&c.w, name, move |e| {
+        let kernel = match gathered {
+            Some(rows) => e.gather(0, rows),
+            None => e,
+        };
+        kernel.transmute(shape)
+    })?;
     let bias = format!("{stem}.bias");
     match rows {
-        Some(rows) => {
-            b.read_expr(&c.w, rows_reordered(&name, &rows).transmute(shape))?;
-            b.read_expr(&c.bias, rows_reordered(&bias, &rows))
-        }
-        None => {
-            b.read_expr(&c.w, Expr::src(name).transmute(shape))?;
-            b.read(&c.bias, bias)
-        }
+        Some(rows) => b.read_over(&c.bias, bias, move |e| e.gather(0, rows)),
+        None => b.read(&c.bias, bias),
     }
 }
 

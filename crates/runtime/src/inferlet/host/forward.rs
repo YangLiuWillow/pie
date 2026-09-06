@@ -633,10 +633,37 @@ impl ProcessCtx {
     }
 
     /// Interface-selection gate, checked on the first state-binding call since
-    /// `constructor()` is infallible in WIT.
-    fn core_gate(&mut self, this: &Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
+    /// `constructor()` is infallible in WIT. `named` is the reading the call
+    /// is in the act of setting, which the pass does not carry yet.
+    fn core_gate(
+        &mut self,
+        this: &Resource<ForwardPass>,
+        named: Option<&'static models::ReadingFact>,
+    ) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = model_pass_kind();
+        // AN ATTENTION PASS OVER A READING THAT BINDS NO KV SPACE IS NOT A KV
+        // ALGORITHM. A generative family's `denoise` reading binds neither
+        // tokens nor a KV space — its rows are a latents port's — so the
+        // attention interface's KV-editing verbs (`discard`, `fork`, `slice`)
+        // have nothing to act on and there is no fold to be wrong about. The
+        // kind above is `hybrid` or `recurrent` for ANY row that carries
+        // recurrent state, and `wan22-ti2v-5b` carries some: its VAE's causal
+        // convolutions each own a frame-cache slab, a fact about the decoder
+        // arms that says nothing about a denoise step. `validate_count`
+        // refuses a `kv` binding on such a pass, so the leniency ends where
+        // the KV does.
+        if kind == PassKind::Attention {
+            let reading = match named {
+                Some(reading) => Ok(Some(reading)),
+                None => reading_of(self.ctx().table.get(this)?),
+            };
+            if let Ok(Some(reading)) = reading
+                && !reading.has_kv
+            {
+                return Ok(Ok(()));
+            }
+        }
         // A HYBRID PASS WITH NO RECURRENT STATE IS AN ATTENTION PASS. The
         // hybrid interface already makes one half of its state optional
         // (`kv: none` for a recurrent-only fire); this is the other half. A
@@ -712,7 +739,7 @@ impl ProcessCtx {
         positions: Resource<Channel>,
         mask: Option<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let readable = match page_span(readable_pages) {
@@ -790,9 +817,6 @@ impl ProcessCtx {
         this: Resource<ForwardPass>,
         name: String,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
-            return Ok(Err(error));
-        }
         let model = crate::model::model();
         let Some(reading) = model.readings().iter().find(|reading| reading.name == name) else {
             return Ok(Err(if model.readings().is_empty() {
@@ -807,6 +831,12 @@ impl ProcessCtx {
                 )
             }));
         };
+        // The gate reads the reading this call is setting: which interface a
+        // pass belongs on is a fact about the reading it runs, and a pass that
+        // names one before binding anything must be judged by it.
+        if let Err(error) = self.core_gate(&this, Some(reading))? {
+            return Ok(Err(error));
+        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
@@ -864,7 +894,7 @@ impl ProcessCtx {
         port: String,
         channel: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let (shape, dtype, global_id) = {
@@ -962,7 +992,7 @@ impl ProcessCtx {
         this: Resource<ForwardPass>,
         stream: pie::inferlet::model::LaneStream,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let stream = super::model::catalog_stream(stream);
@@ -995,7 +1025,7 @@ impl ProcessCtx {
         this: Resource<ForwardPass>,
         id: u32,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let pass = self.ctx().table.get_mut(&this)?;
@@ -1016,7 +1046,7 @@ impl ProcessCtx {
         this: Resource<ForwardPass>,
         mode: CanvasMode,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let pass = self.ctx().table.get_mut(&this)?;
@@ -1042,7 +1072,7 @@ impl ProcessCtx {
         rows: Vec<u32>,
         weights: Vec<f32>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let Some(shape) = crate::model::model().diffusion() else {
@@ -1108,7 +1138,7 @@ impl ProcessCtx {
         rows: Resource<Channel>,
         weights: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         let Some(shape) = crate::model::model().diffusion() else {
@@ -2070,7 +2100,7 @@ impl ProcessCtx {
         rs_working_sets: Vec<Resource<RsWorkingSet>>,
         geometry: RsGeometryBinding,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this)? {
+        if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
         if rs_working_sets.is_empty() {
