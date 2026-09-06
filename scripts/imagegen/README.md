@@ -473,13 +473,34 @@ python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.t
 The config must be the run's OWN (its own `[server] port`), and
 `[engine] max_model_len` at least the sequence.
 
+Four fires, three claims: `A` prefill(prompt) then denoise(t0) — what the
+golden gates; `B` prefill(`<cfg>`-masked prompt) then denoise(t0) — THE PREFIX
+MATTERS; `C` denoise(t1) over A's pages and `D` denoise(t1) after a fresh
+prefill — THE PREFIX K/V IS REUSED EXACTLY.
+
 Measured 2026-09-06 (fp32 golden vs bf16 weights and bf16 activations):
 
 | tensor | shape | cos | max-abs |
 |---|---|---|---|
 | `denoise.hidden.image` | (64, 256) | 0.999996 | 0.0013 |
 | `denoise.hidden.timestep_row` | (256,) | 0.999993 | 0.00046 |
+| `uncond.hidden.image` | (64, 256) | 0.999996 | 0.0013 |
+| `uncond.hidden.timestep_row` | (256,) | 0.999993 | 0.00047 |
 | `encode.max` | (9,) | 0.999998 | 5.8e-05 |
+
+```
+[claim] PASS the prefix conditions the canvas: <cfg> moves the <timestep> row
+        rel 0.0214 (reference 0.0213, 0.1% off) and the image rows rel 0.0032
+        (reference 0.0020)
+[claim] PASS the prefix K/V is reused exactly: max-abs 0.000e+00
+```
+
+**The conditioning gate is stated against the reference, not as a constant.**
+On this two-layer random-init miniature the prompt moves the image rows by rel
+0.002 — below the bf16 parity floor — while it moves the `<timestep>` row,
+which is causal over the prefix and nothing else, by rel 0.021. A guessed
+absolute threshold would fail a correct model here and pass an unconditioned
+one on a deeper row.
 
 Not yet compared: the conv image head's two VOXEL arms (`image.in` =
 `patch_embed`, `image.out` = `final_layer`).  The SDK has no channel-fed

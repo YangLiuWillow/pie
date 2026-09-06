@@ -97,6 +97,8 @@ TEXT_IDS = [127958, 100, 200, 300, 400, 500, 128000, 128037, 128044]
 TIMESTEP_ID = 128017
 IMG_ID = 128006
 EOI_ID = 128001
+# `<cfg>`: what the unconditional branch writes over every prompt token.
+CFG_ID = 128010
 # `sigma' * 1000` at the first of eight shifted steps (shift 3).
 TIMESTEP = 750.0
 SEED = 0
@@ -246,6 +248,37 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
             "image_out.velocity.rows",
             v[0].reshape(v.shape[1], -1).transpose(0, 1),   # [n, C], raster order
         )
+
+        # ---- THE UNCONDITIONAL BRANCH -------------------------------------
+        # The same denoise step over the reference's own uncond prefix:
+        # every PROMPT token replaced by `<cfg>`, the `<bos>` and the three
+        # image-meta tokens kept, so the length, the mask and the rotary
+        # positions are identical (`tokenization:738-739`). This is the
+        # reference's own measurement of how much the canvas is
+        # CONDITIONED, and the parity gate reads it rather than guessing a
+        # constant: a denoise fire whose image rows attended only
+        # themselves would match the conditional dump inside tolerance on a
+        # random-init miniature.
+        alt = list(ids)
+        for i in range(1, t_at - 3):
+            alt[i] = CFG_ID
+        h_alt = model.model.wte(torch.tensor([alt], device=device)).to(dtype).clone()
+        h_alt[:, img_at : img_at + n] = rows
+        h_alt[:, t_at] = temb_tok
+        out_alt = model.model(
+            inputs_embeds=h_alt,
+            attention_mask=mask[None, None].to(device),
+            custom_pos_emb=(cos, sin),
+            use_cache=False,
+            return_dict=True,
+        )
+        hs_alt = out_alt.last_hidden_state
+        tap.put("uncond.ids", torch.tensor(alt, dtype=torch.int32))
+        tap.put("uncond.hidden.image", hs_alt[0, img_at : img_at + n])
+        tap.put("uncond.hidden.timestep_row", hs_alt[0, t_at])
+        moved = (hs_alt[0] - hs[0]).norm() / hs[0].norm()
+        tap.put("uncond.moved", float(moved))
+        print(f"  the prefix conditions the canvas: <cfg> moves it rel {float(moved):.4f}")
 
         # ---- encode: the causal text pass and its logits --------------------
         text_ids = torch.tensor([ids[: t_at]], device=device)

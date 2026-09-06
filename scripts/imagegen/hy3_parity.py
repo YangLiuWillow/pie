@@ -45,6 +45,20 @@ fp32 golden vs bf16 weights and bf16 activations):
     encode.max                  (9,)        cos 0.999998   max-abs 5.8e-05
     prefill argmax                          8 / 9 rows agree
 
+WHAT ELSE IS CLAIMED
+--------------------
+`[claim] the prefix conditions the canvas`  the same step over the reference's
+    own unconditional prefix (every prompt token replaced by `<cfg>`, so the
+    length, mask and rotary positions are identical) must move the canvas by
+    what it moves the REFERENCE. Without this a denoise fire whose image rows
+    attended only themselves would pass the golden diff on a random-init
+    miniature and be catastrophically wrong on the real row. `compare.py`
+    also diffs pie's uncond canvas against the reference's uncond canvas,
+    which is the airtight form of the same claim.
+`[claim] the prefix K/V is reused exactly`  step 1 over the frozen prefix
+    pages must equal step 1 after a fresh prefill, to `REUSE_MAX_ABS`. This
+    is design D10's whole claim: after step 0 the prefix is never recomputed.
+
 WHAT IS NOT
 -----------
 The two voxel arms (`image.in` = `patch_embed`, `image.out` = `final_layer`).
@@ -85,6 +99,27 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 # one flipped expert on one row is a big elementwise error and a tiny cosine
 # one, which is why the cosine gate carries the weight here.
 TOLERANCES = ["--tol", "0.2", "--rel-tol", "0.05", "--cos-tol", "0.999"]
+
+# `<cfg>` in the base repo's tokenizer -- the id the unconditional branch
+# writes over every prompt token.
+CFG_ID = 128010
+
+# The conditioning gate is stated AGAINST THE REFERENCE, never as a
+# constant: on a two-layer random-init miniature the prompt moves the image
+# rows by only rel 0.002 -- below the bf16 parity floor -- while it moves the
+# `<timestep>` row, which is causal over the prefix and nothing else, by rel
+# 0.021. A guessed absolute threshold would fail a correct model here and
+# pass an unconditioned one on a deeper row. So pie's own sensitivity is
+# compared to the reference's: within 25 % on the `<timestep>` row (the
+# clean signal) and within a factor of four on the image rows (whose signal
+# is at the noise floor on this fixture). The uncond canvas is ALSO diffed
+# against the reference's directly by `compare.py`, which is the airtight
+# form: pie matches both branches, and the two branches differ.
+COND_TIMESTEP_TOL = 0.25
+COND_IMAGE_FACTOR = 4.0
+# The KV-reuse gate: step 1 over the frozen prefix pages and step 1 from a
+# fresh prefill are the same arithmetic on the same bytes.
+REUSE_MAX_ABS = 1e-6
 
 
 def rope_x_scale(head_dim: int, theta: float = 10000.0) -> float:
@@ -136,8 +171,19 @@ def cases(args) -> list[str]:
     canvas_seq = [t_at] + list(range(img_at, img_at + n))
     canvas_pos = pos[canvas_seq]
 
+    # The reference's own unconditional branch: every PROMPT token replaced
+    # by `<cfg>`, the `<bos>` and the three image-meta tokens kept, so the
+    # length, the mask and the rotary positions are identical
+    # (`tokenization_hunyuan_image_3.py:738-739`). The control for "is the
+    # canvas conditioned at all".
+    cfg_id = int(cfg["config"].get("cfg_token_id", CFG_ID))
+    alt = list(prefix)
+    for i in range(1, len(alt) - 3):
+        alt[i] = cfg_id
+
     case = {
         "prefix": [int(i) for i in prefix],
+        "prefix_alt": [int(i) for i in alt],
         "prefix_positions": scaled(pos[:t_at]),
         "img_id": int(ids[img_at]),
         "timestep_id": int(ids[t_at]),
@@ -147,6 +193,9 @@ def cases(args) -> list[str]:
         "rows": dump["image_in.rows"].reshape(-1).astype(np.float32).tolist(),
         "hidden": hidden,
         "timestep": float(layout["timestep"]),
+        # Step 1's timestep: the two KV-reuse fires run at it, one over the
+        # frozen pages and one from a fresh prefill.
+        "timestep_next": float(layout["timestep"]) * 0.5,
     }
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, "case_0.json")
@@ -276,14 +325,19 @@ def collect(args) -> str:
     # distance between two ids says nothing (a flipped near-tie is a whole
     # vocabulary apart and a rounding error in the logits). It is reported
     # as an agreement COUNT beside the winning logit, which is comparable.
+    uncond = np.asarray(doc["canvas_hidden_uncond"], dtype=np.float32).reshape(n + 1, hidden)
     mine = {
         "denoise.hidden.image": rows[1:],
         "denoise.hidden.timestep_row": rows[0],
+        "uncond.hidden.image": uncond[1:],
+        "uncond.hidden.timestep_row": uncond[0],
         "encode.max": np.asarray(doc["encode_max"], dtype=np.float32),
     }
     theirs = {
         "denoise.hidden.image": dump["denoise.hidden.image"],
         "denoise.hidden.timestep_row": dump["denoise.hidden.timestep_row"],
+        "uncond.hidden.image": dump["uncond.hidden.image"],
+        "uncond.hidden.timestep_row": dump["uncond.hidden.timestep_row"],
         "encode.max": logits.max(axis=-1).astype(np.float32),
     }
     a = os.path.join(args.out, "hy3_mini_pie.npz")
@@ -297,6 +351,53 @@ def collect(args) -> str:
         f"prefill argmax {agree}/{len(theirs_argmax)} agree "
         f"({layout['token_h']}x{layout['token_w']} grid) -> {a}; golden -> {b}"
     )
+
+    # ---- the two claims the golden diff cannot make ---------------------
+    def moved(x, y):
+        return float(np.linalg.norm(np.asarray(y) - np.asarray(x)) / max(np.linalg.norm(x), 1e-30))
+
+    ok = True
+    ref_t = moved(theirs["denoise.hidden.timestep_row"], theirs["uncond.hidden.timestep_row"])
+    pie_t = moved(mine["denoise.hidden.timestep_row"], mine["uncond.hidden.timestep_row"])
+    ref_i = moved(theirs["denoise.hidden.image"], theirs["uncond.hidden.image"])
+    pie_i = moved(mine["denoise.hidden.image"], mine["uncond.hidden.image"])
+    off = abs(pie_t - ref_t) / max(ref_t, 1e-30)
+    if ref_t <= 0.0 or off > COND_TIMESTEP_TOL:
+        ok = False
+        print(
+            f"[claim] FAIL the prefix does not condition the canvas: replacing every "
+            f"prompt token with <cfg> moves the <timestep> row rel {pie_t:.4f} in pie "
+            f"and rel {ref_t:.4f} in the reference ({off:.0%} off). Those rows are "
+            f"not reading the prefix pages."
+        )
+    else:
+        print(
+            f"[claim] PASS the prefix conditions the canvas: <cfg> moves the <timestep> "
+            f"row rel {pie_t:.4f} (reference {ref_t:.4f}, {off:.1%} off) and the image "
+            f"rows rel {pie_i:.4f} (reference {ref_i:.4f})"
+        )
+    if ref_i > 0.0 and not (
+        ref_i / COND_IMAGE_FACTOR <= pie_i <= ref_i * COND_IMAGE_FACTOR
+    ):
+        ok = False
+        print(
+            f"[claim] FAIL the image rows' sensitivity to the prompt is {pie_i:.2e} and "
+            f"the reference's is {ref_i:.2e}, past a factor of {COND_IMAGE_FACTOR}"
+        )
+
+    reused = np.asarray(doc["canvas_hidden_reused"], dtype=np.float32)
+    fresh = np.asarray(doc["canvas_hidden_fresh"], dtype=np.float32)
+    drift = float(np.abs(reused - fresh).max())
+    if drift > REUSE_MAX_ABS:
+        ok = False
+        print(
+            f"[claim] FAIL step 1 over the frozen prefix pages differs from step 1 "
+            f"after a fresh prefill by {drift:.3e} (> {REUSE_MAX_ABS})"
+        )
+    else:
+        print(f"[claim] PASS the prefix K/V is reused exactly: max-abs {drift:.3e}")
+    if not ok:
+        raise SystemExit("a claim about the denoise step failed")
     return a
 
 
