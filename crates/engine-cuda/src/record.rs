@@ -1046,7 +1046,9 @@ impl Bodies {
             &mut prepare,
             Phases::Prepare,
         )?;
+        crate::serve::btrace::mark("walk");
         prepare.settle()?;
+        crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
         // The key, on every axis the artifact states. `towered` is a load
         // constant, not read off this fire, so a text lane of a vision SKU
@@ -1066,6 +1068,7 @@ impl Bodies {
         //    live-rows seat. Not a hit if the body is too short
         //    (`Body::grids`, falls through and re-captures at the larger
         //    count) or its shape hash moved (`BodyTally::reshapes`).
+        crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
         // Asked per launch, not off the fire's total.
         let (short, moved, empty) = match self.map.bodies.get(&key) {

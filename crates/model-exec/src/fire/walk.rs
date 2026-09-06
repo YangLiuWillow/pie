@@ -56,6 +56,11 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
     // One buffer for the whole walk, refilled per region, to avoid an
     // allocation per region.
     let mut runs: Vec<MaskSpan> = Vec::new();
+    // The spans of every (axis, class set) this walk has already cut: a
+    // template names a handful of distinct class sets across hundreds of
+    // regions, and cutting one is a bitset walk plus a sort — a third of a
+    // decode fire's host prepare, before this memo.
+    let mut cut: Vec<(model_ir::RowAxis, &model_ir::ClassSet, Vec<MaskSpan>)> = Vec::new();
     for (index, region) in compiled.template().iter().enumerate() {
         match region.phase {
             Phase::Prepare if captured => {
@@ -74,7 +79,16 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
         // the loop below still turns once at zero rows.
         let unit = compiled.unit_of(index);
         let axis = compiled.axis_of(index);
-        descriptor.table(axis).spans_into(&region.mask, &mut runs);
+        match cut.iter().find(|(a, mask, _)| *a == axis && *mask == &region.mask) {
+            Some((_, _, spans)) => {
+                runs.clear();
+                runs.extend_from_slice(spans);
+            }
+            None => {
+                descriptor.table(axis).spans_into(&region.mask, &mut runs);
+                cut.push((axis, &region.mask, runs.clone()));
+            }
+        }
 
         // Whether this pass dispatches this region at all — phase, unit and
         // span filters as one question, asked once.

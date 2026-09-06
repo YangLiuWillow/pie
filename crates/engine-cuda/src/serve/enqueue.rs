@@ -1121,6 +1121,7 @@ pub(super) fn reap_guest_fires(
         };
         let started = traced.then(std::time::Instant::now);
         landed.settle()?;
+        super::btrace::mark("landed");
         if let Some(started) = started {
             eprintln!(
                 "[reap-trace] {site}: waited {} us for batch seq {}",
@@ -1129,6 +1130,7 @@ pub(super) fn reap_guest_fires(
             );
         }
     }
+    super::btrace::mark("waited");
     let mut first: Option<crate::error::Fault> = None;
     for (lane, instance) in batch.launched {
         // **EVERY LANE IS SETTLED, EVEN AFTER ONE HAS FAULTED.** A session

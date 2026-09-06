@@ -358,6 +358,25 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
+    // Three driver calls a query, and every decode plan asks: memoised per
+    // instantiation and device.
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), Option<u32>>>,
+    > = std::sync::OnceLock::new();
+    let key = (head_dim, group_size, device.num_sm);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(known) = cache.lock().ok().and_then(|held| held.get(&key).copied()) {
+        return known;
+    }
+    let answer = decode_blocks_per_sm_uncached(head_dim, group_size, device);
+    if let Ok(mut held) = cache.lock() {
+        held.insert(key, answer);
+    }
+    answer
+}
+
+#[cfg(feature = "cuda")]
+fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
     use cudarc::driver::sys as dr;
 
     const OP: &str = "attention.plan_decode";
