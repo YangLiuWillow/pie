@@ -2,10 +2,8 @@
 //!
 //! The drafter searches the committed token history for the longest matching
 //! suffix and reuses the tokens that followed its previous occurrence. One
-//! target-model forward verifies the whole draft and supplies a correction or
-//! bonus token. This reference implementation rebuilds the target state for
-//! each verification window so rejected draft state can never leak into later
-//! steps.
+//! target-model forward per round verifies the whole window — the pending
+//! correct token, then the drafts — and supplies the next correction.
 //!
 //! ## The correctness property, and how to test it
 //!
@@ -15,28 +13,30 @@
 //! forward passes* run and nothing else about the output.
 //!
 //! `draft_length = 0` makes that testable without a second inferlet.
-//! `draft_from_cache` returns empty immediately, `verify` reduces to a
-//! one-row readout, and the loop degenerates to sequential greedy decoding —
-//! through the same prompt, the same stop tokens and the same `verify()`.
-//! Setting it to 0 versus 4 is therefore a controlled A/B in which the token
-//! sequence must come out **identical**. If the per-window rebuild ever
-//! stopped isolating rejected drafts, the two would diverge.
+//! `draft_from_cache` returns empty immediately, every window is one row, and
+//! the loop degenerates to sequential greedy decoding — through the same
+//! prompt, the same stop tokens and the same fire. Setting it to 0 versus 4
+//! is therefore a controlled A/B in which the token sequence must come out
+//! **identical**. If a rejected draft ever leaked into later state, the two
+//! would diverge.
 //!
-//! ## Why this runs on a hybrid model
+//! ## How the state is kept — and why nothing is rebuilt
 //!
-//! A recurrence is a fold, not an addressed cell: once a rejected draft token
-//! has been folded into a persisted state there is nothing to discard
-//! (`rs-speculative-decoding` is the buffer-then-fold shape that avoids it).
-//! This program never persists anything. Every window fires into a working
-//! set built for that window alone — a KV working set on every model, and on
-//! a hybrid model a fresh `RsWorkingSet` beside it — and drops both on
-//! return. The rejected tail is folded into a state that dies with the call,
-//! and the next window refolds the committed prefix from scratch. Each fire
-//! folds only its own new tokens over an empty buffer, so no replay is
-//! involved and the logits at every readout row are the full backbone's
-//! (`forward-hybrid.wit`, `rs-geometry.fold-len`). It is the O(n)-per-window
-//! price the header above already admits to, and it buys the same isolation
-//! on both kinds of state.
+//! One KV working set lives for the whole generation. A rejected draft's KV
+//! cells are addressed, so the next round simply overwrites them: its rows
+//! land at the positions the rejected tail occupied, and `kv_len` never
+//! counts past the committed prefix plus the window in flight.
+//!
+//! On a hybrid model the recurrence is a fold, not an addressed cell, so the
+//! window is *buffered* rather than folded (`forward-hybrid.wit`,
+//! `rs-geometry`): each fire folds the previously accepted run ahead of its
+//! own rows, replays those rows over the recurrent buffer, and the rejected
+//! tail is dropped from the buffer with `discard_buffered` before the next
+//! fire. The state that persists is exactly the state of the committed
+//! prefix — the same shape `rs-speculative-decoding` documents — and the
+//! per-window rebuild the previous revision paid for (O(n) per round) is gone.
+//! On a pure-attention model the recurrent binding is empty and the same
+//! loop is plain KV speculation.
 
 use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
@@ -81,11 +81,11 @@ struct Output {
     prompt_tokens: usize,
     count: usize,
     draft_length: usize,
-    /// Target-model forward passes actually run. At `draft_length = 0` this
-    /// is `count + stopped as usize`, which is precisely what makes that
-    /// setting a sequential greedy control: same prompt, same stop tokens,
-    /// same `verify()`, no speculation. Below `count` means speculation is
-    /// paying off.
+    /// Target-model forward passes actually run past the prefill. At
+    /// `draft_length = 0` this is `count + stopped as usize`, which is
+    /// precisely what makes that setting a sequential greedy control: same
+    /// prompt, same stop tokens, same fire, no speculation. Below `count`
+    /// means speculation is paying off.
     ///
     /// **THE `+ stopped` IS THE STOP TOKEN'S OWN PASS.** A run the model ends
     /// itself spends one forward pass producing the stop token, and that token
@@ -125,63 +125,55 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
     Vec::new()
 }
 
-/// The recurrent working set for ONE verification window on a hybrid model
-/// (the engine requires one per request row); none on a pure-attention one,
-/// where an empty binding IS the attention pass. Fresh every window: the fold
-/// reaches the rejected tail too, and this is the state it is confined to.
-fn window_rs() -> Result<Vec<RsWorkingSet>> {
-    match model::pass_kind() {
-        model::ForwardKind::Attention => Ok(Vec::new()),
-        model::ForwardKind::Hybrid => Ok(vec![RsWorkingSet::new()]),
-        model::ForwardKind::Recurrent => Err(
-            "this program has no recurrent-only path (no registered model reports that kind)"
-                .into(),
-        ),
-        model::ForwardKind::Diffusion => Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into()),
-    }
+/// The pages the recurrent buffer must hold for one fire: the survivors
+/// (at most a page's worth of head offset before them), plus the window.
+fn buffer_pages_for(survivors: u32, window: u32, page: u32) -> u32 {
+    (page.saturating_sub(1) + survivors + window).div_ceil(page.max(1)).max(1)
 }
 
-/// One verification window: the target's greedy pick at the last committed
-/// position and at every draft position, from state built for this window
-/// alone and dropped on return.
-async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<u32>> {
-    if committed.is_empty() {
-        return Err("cannot verify from an empty committed sequence".into());
-    }
+/// One fire over `rows` token ids at positions `base ..`, folding `fold`
+/// buffered tokens ahead of them and buffering the rows themselves;
+/// `fold == None` folds everything in the forward (the prefill's shape, and
+/// the only shape on a pure-attention model, where `rs` is empty).
+/// Answers the target's argmax at every row.
+#[allow(clippy::too_many_arguments)]
+async fn fire(
+    ws: &WorkingSet,
+    rs: &[RsWorkingSet],
+    pipeline: &Pipeline,
+    tokens: &[u32],
+    base: u32,
+    fold: Option<u32>,
+    buffer_pages: u32,
+    page_size: u32,
+) -> Result<Vec<u32>> {
+    let rows = tokens.len() as u32;
+    let total = base + rows;
+    let pages = total.div_ceil(page_size);
 
-    let mut input = committed.to_vec();
-    input.extend_from_slice(draft);
-    let total = input.len() as u32;
-    let rows = draft.len() as u32 + 1;
-    let readout_start = committed.len() as u32 - 1;
-    let readout = (readout_start..readout_start + rows).collect::<Vec<_>>();
-
-    let ws = WorkingSet::new();
-    let rs_ws = window_rs()?;
-    let max_pages = total.div_ceil(page_size);
-    ws.reserve(max_pages).context("reserve verification KV")?;
-    let tokens = Channel::from_iter(input.iter().map(|&token| token as i32));
-    let embed_indptr = Channel::from([0u32, total]).named("embed_indptr");
-    let positions = Channel::from_iter(0..total).named("positions");
-    let pages = Channel::from_iter(0..max_pages).named("pages");
-    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from_iter((0..total).map(|p| p / page_size)).named("w_slot");
-    let w_off = Channel::from_iter((0..total).map(|p| p % page_size)).named("w_off");
+    let ids = Channel::from_iter(tokens.iter().map(|&t| t as i32));
+    let embed_indptr = Channel::from([0u32, rows]).named("embed_indptr");
+    let positions = Channel::from_iter(base..total).named("positions");
+    let page_list = Channel::from_iter(0..pages).named("pages");
+    let page_indptr = Channel::from([0u32, pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((base..total).map(|p| p / page_size)).named("w_slot");
+    let w_off = Channel::from_iter((base..total).map(|p| p % page_size)).named("w_off");
     let kv_len = Channel::from([total]).named("kv_len");
-    let target_out = Channel::new([rows], dtype::i32).named("target_tokens");
-    let readout = Channel::from(readout).named("readout");
+    let readout = Channel::from_iter(0..rows).named("readout");
+    let truth_out = Channel::new([rows], dtype::i32).named("truth");
+    let fold_len = fold.map(|n| Channel::from([n]).named("fold_len"));
 
     let fwd = ForwardPass::new();
-    fwd.embed(&tokens, &embed_indptr)?;
+    fwd.embed(&ids, &embed_indptr)?;
     fwd.readout(&readout)?;
     fwd.attention(
         Some(KvBinding {
-            working_set: &ws,
+            working_set: ws,
             geometry: KvGeometry {
                 readable_pages: ..,
                 writable_pages: ..,
                 kv_len: &kv_len,
-                pages: &pages,
+                pages: &page_list,
                 page_indptr: &page_indptr,
                 w_slot: &w_slot,
                 w_off: &w_off,
@@ -189,92 +181,168 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
                 mask: None,
             },
         }),
-        &rs_ws,
+        rs,
         RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
+            fold_len: fold_len.as_ref(),
+            buffer: 0..buffer_pages,
         },
     )?;
     fwd.epilogue(move || {
-        target_out.put(reduce_argmax(intrinsics::logits()));
+        truth_out.put(reduce_argmax(intrinsics::logits()));
     });
+    fwd.submit(pipeline).context("verify-and-extend")?;
 
-    let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).context("verify cached draft")?;
-    let target = target_out
+    Ok(truth_out
         .take_host::<Vec<i32>>()
         .await?
         .into_iter()
-        .map(|token| token as u32)
-        .collect();
-    pipeline.close();
-    Ok(target)
+        .map(|t| t as u32)
+        .collect())
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
+    let empty = || Output {
+        sampler: "cacheback-speculative",
+        text: String::new(),
+        tokens: Vec::new(),
+        prompt_tokens: 0,
+        count: 0,
+        draft_length: input.draft_length,
+        verification_steps: 0,
+        stopped: false,
+        drafted: 0,
+        accepted: 0,
+        acceptance_rate: 0.0,
+    };
     if input.max_tokens == 0 {
-        return Ok(Output {
-            sampler: "cacheback-speculative",
-            text: String::new(),
-            tokens: Vec::new(),
-            prompt_tokens: 0,
-            count: 0,
-            draft_length: input.draft_length,
-            verification_steps: 0,
-            stopped: false,
-            drafted: 0,
-            accepted: 0,
-            acceptance_rate: 0.0,
-        });
+        return Ok(empty());
     }
-
-    let page_size = kv_page_size();
-
-    let mut committed = chat::system_user("Continue the requested text.", &input.prompt);
-    committed.extend(chat::cue());
-    if committed.is_empty() {
-        committed.push(0);
-    }
-    let prompt_len = committed.len();
-    let stop_tokens = chat::stop_tokens();
-    let mut generated = Vec::with_capacity(input.max_tokens);
-    let mut total_drafted = 0usize;
-    let mut total_accepted = 0usize;
-    let mut verification_steps = 0usize;
-    let mut stopped = false;
-
-    while generated.len() < input.max_tokens && !stopped {
-        let draft = draft_from_cache(&committed, input.draft_length, input.max_ngram);
-        total_drafted += draft.len();
-        verification_steps += 1;
-
-        let target = verify(&committed, &draft, page_size).await?;
-        if target.len() != draft.len() + 1 {
+    let hybrid = match model::pass_kind() {
+        model::ForwardKind::Attention => false,
+        model::ForwardKind::Hybrid => true,
+        other => {
             return Err(format!(
-                "verification returned {} tokens for a {}-token draft",
-                target.len(),
-                draft.len()
-            ));
+                "this program verifies drafts against a KV cache; the model's forward is {other:?}"
+            )
+            .into())
         }
+    };
 
-        let mut accepted = Vec::new();
-        let mut rejected = false;
-        for (index, &draft_token) in draft.iter().enumerate() {
-            if target[index] == draft_token {
-                accepted.push(draft_token);
-                total_accepted += 1;
-            } else {
-                accepted.push(target[index]);
-                rejected = true;
-                break;
+    let k = input.draft_length as u32;
+    let w_max = k + 1;
+    let page_size = kv_page_size();
+    let rs_page = model::rs_buffer_page_size().max(1);
+
+    let mut prompt = chat::system_user("Continue the requested text.", &input.prompt);
+    prompt.extend(chat::cue());
+    if prompt.is_empty() {
+        prompt.push(0);
+    }
+    let n = prompt.len() as u32;
+    let stop_tokens = chat::stop_tokens();
+
+    // One KV working set (and on a hybrid model one recurrent working set)
+    // for the whole generation. The KV lease covers the prompt, every token
+    // the host may keep, and a window whose drafts are all rejected.
+    let ws = WorkingSet::new();
+    let max_pages = (n + input.max_tokens as u32 + w_max).div_ceil(page_size).max(1);
+    ws.reserve(max_pages).context("reserve KV")?;
+    let rs: Vec<RsWorkingSet> = if hybrid { vec![RsWorkingSet::new()] } else { Vec::new() };
+    let pipeline = Pipeline::new();
+
+    // ── Prefill: folds everything, buffers nothing, and seeds the first window.
+    let mut first = 0u32;
+    let chunks = prefill_chunks(n, None);
+    for (at, &(from, to)) in chunks.iter().enumerate() {
+        let truth = fire(
+            &ws,
+            &rs,
+            &pipeline,
+            &prompt[from as usize..to as usize],
+            from,
+            None,
+            0,
+            page_size,
+        )
+        .await?;
+        if at + 1 == chunks.len() {
+            first = *truth.last().expect("a prefill answers one row per token");
+        }
+    }
+
+    let mut committed: Vec<u32> = prompt.clone();
+    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
+    let (mut verification_steps, mut drafted, mut accepted) = (1usize, 0usize, 0usize);
+
+    // The seed token is the first thing the model said: nothing drafted it,
+    // so nothing can reject it.
+    let mut x = first;
+    let mut stopped = stop_tokens.contains(&x);
+    if !stopped {
+        committed.push(x);
+        generated.push(x);
+    }
+    let mut base = n;
+    // How many tokens survive in the recurrent buffer, unfolded: the seed is
+    // the prefill's own fold, so the first round replays nothing.
+    let mut survivors: u32 = 0;
+
+    while !stopped && generated.len() < input.max_tokens {
+        // ── The window: the pending correct token, then the drafts.
+        let drafts = draft_from_cache(&committed, input.draft_length, input.max_ngram);
+        let mut window = Vec::with_capacity(w_max as usize);
+        window.push(x);
+        window.extend(drafts.iter().copied());
+        let w = window.len() as u32;
+
+        // ── On a hybrid model the buffer must hold the survivors and the
+        //    window; the grant is the guest's one allocation decision.
+        let need = if hybrid { buffer_pages_for(survivors, w, rs_page) } else { 0 };
+        if hybrid {
+            let have = rs[0].buffer_size();
+            if have < need {
+                rs[0]
+                    .alloc_buffer(need - have)
+                    .map_err(|why| format!("alloc {} rs buffer page(s): {why}", need - have))?;
             }
         }
-        if !rejected {
-            accepted.push(target[draft.len()]);
+
+        let truth = fire(
+            &ws,
+            &rs,
+            &pipeline,
+            &window,
+            base,
+            hybrid.then_some(survivors),
+            need,
+            page_size,
+        )
+        .await?;
+        verification_steps += 1;
+        let proposed = window.len() - 1;
+        drafted += proposed;
+
+        // ── Verify: the longest matching prefix, and nothing after it.
+        let mut m = 0usize;
+        while m < proposed && window[m + 1] == truth[m] {
+            m += 1;
+        }
+        accepted += m;
+
+        // ── The rejected tail never happened: forget it in the buffer before
+        //    the next fire, whose fold reaches exactly the accepted prefix.
+        //    Its KV cells are overwritten by the next window's rows.
+        let rejected = (proposed - m) as u32;
+        if hybrid && rejected > 0 {
+            rs[0]
+                .discard_buffered(rejected)
+                .map_err(|why| format!("discard {rejected} rejected token(s): {why}"))?;
         }
 
-        for token in accepted {
+        // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
+        //    the correction that produced it — then the new correction.
+        for &token in &window[1..=m] {
             if stop_tokens.contains(&token) {
                 stopped = true;
                 break;
@@ -285,24 +353,40 @@ async fn main(input: Input) -> Result<Output> {
                 break;
             }
         }
+        if stopped || generated.len() == input.max_tokens {
+            break;
+        }
+        let correction = truth[m];
+        if stop_tokens.contains(&correction) {
+            stopped = true;
+            break;
+        }
+        committed.push(correction);
+        generated.push(correction);
+
+        // Only the accepted run advances the length and survives in the
+        // buffer; the next fire folds it ahead of its own rows.
+        base += (m + 1) as u32;
+        survivors = (m + 1) as u32;
+        x = correction;
     }
 
-    let acceptance_rate = if total_drafted == 0 {
+    let acceptance_rate = if drafted == 0 {
         0.0
     } else {
-        total_accepted as f64 / total_drafted as f64
+        accepted as f64 / drafted as f64
     };
     Ok(Output {
         sampler: "cacheback-speculative",
         text: model::decode(&generated)?,
-        prompt_tokens: prompt_len,
+        tokens: generated.clone(),
+        prompt_tokens: prompt.len(),
         count: generated.len(),
         draft_length: input.draft_length,
         verification_steps,
         stopped,
-        drafted: total_drafted,
-        accepted: total_accepted,
+        drafted,
+        accepted,
         acceptance_rate,
-        tokens: generated,
     })
 }
