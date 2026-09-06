@@ -21,14 +21,21 @@ two with `compare.py`.
     python wan22_parity.py collect --out /tmp/wan22-parity
     python wan22_parity.py compare --out /tmp/wan22-parity
 
-    # or all four
+    # 4. the claim that the PROMPT MATTERS: the same step with the context
+    #    zeroed must answer something else (a context lane that is not in the
+    #    video lanes' fire conditions nothing, and a miniature's tolerance
+    #    will not notice)
+    python wan22_parity.py conditioning --out /tmp/wan22-parity --config ...
+
+    # or all of it
     python wan22_parity.py all --out /tmp/wan22-parity [--pertoken]
 
     # the real row: 1950 rows x 192 features and a 512x4096 context, whose
-    # case JSON is far past what argv carries, so it travels as a scratch
-    # file -- `run` notices and copies it into the config's `fs_scratch_dir`
-    python wan22_parity.py all --variant ti2v-5b --out /tmp/wan22-full \
-        --config ~/.pie/config.wan22.toml
+    # case is 15 MB as JSON numbers and 2.3 MB with `--compact` (base64 f32,
+    # and only the context rows the prompt actually filled) -- which is what
+    # argv can carry
+    python wan22_parity.py all --variant ti2v-5b --compact --out /tmp/wan22-full \
+        --config ~/.pie/config.wan22-ti2v.toml
 
 Nothing here imports torch: the reference numbers are already on disk, and
 patchify is a reshape.
@@ -52,9 +59,11 @@ in patch units.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -78,23 +87,40 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 # decade looser. The flagship's timestep is ALREADY per token (`[B, S]`,
 # TI2V's `expand_timesteps`), uniform 999 at step 0 for a pure T2V prompt --
 # `--pertoken` is the miniatures' switch and this row needs none.
+#
+# `move` is the `conditioning` claim's floor: how far dropping the prompt must
+# take the velocity. It is a ROW's number because a miniature's random 0.02
+# weights make its cross-attention nearly inert — the reference itself moves
+# only 0.0043 there, against 0.48 on the real row — so on a miniature the claim
+# separates "attended" from "not attended AT ALL" (lanes in different fires
+# answer the same bytes twice, a move of exactly zero) and nothing finer.
 ROWS = {
     "d128": dict(npz="wan22_mini.npz", stem="mini.d128", out="mini.d128.out.0",
-                 out_pertoken="mini.d128.out_pertoken.0", cos="0.9999"),
+                 out_pertoken="mini.d128.out_pertoken.0", cos="0.9999", move=0.002),
     "nano": dict(npz="wan22_mini.npz", stem="mini.nano", out="mini.nano.out.0",
-                 out_pertoken="mini.nano.out_pertoken.0", cos="0.9999"),
+                 out_pertoken="mini.nano.out_pertoken.0", cos="0.9999", move=0.002),
     "ti2v-5b": dict(npz="wan22_golden.npz", stem="dit.step0", out="dit.step0.out",
-                    out_pertoken=None, cos="0.999"),
+                    out_pertoken=None, cos="0.999", move=0.05),
 }
 
-# The most bytes `run` hands the guest as `--case_N` argv pieces before it
-# switches to a scratch file: Linux caps ONE argument at 128 KiB
-# (`MAX_ARG_STRLEN`) and the inferlet takes eight.
-ARGV_BUDGET = 8 * 128 * 1024
+# How a case reaches the guest. Linux caps ONE argument at 128 KiB
+# (`MAX_ARG_STRLEN`, not a rlimit), and the whole argv at a quarter of
+# `RLIMIT_STACK` — so `run` cuts the case into 120 KiB `--case_N` pieces and
+# raises the child's stack limit to buy the room. Past `ARGV_CEILING` even
+# that is not enough and the case must be shrunk (`--compact`), which is why
+# a real row's case states its rectangles as base64.
+PIECE = 120 * 1024
+ARGV_CEILING = 3 * 1024 * 1024
+CHILD_STACK = 256 * 1024 * 1024
 
 
 def tolerances(args) -> list[str]:
     return ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", ROWS[args.variant]["cos"]]
+
+
+def b64(a: np.ndarray) -> str:
+    """A float rectangle as the guest's `*_b64`: little-endian f32."""
+    return base64.b64encode(np.ascontiguousarray(a, dtype="<f4").tobytes()).decode()
 
 
 # ----------------------------------------------------------------------------
@@ -199,23 +225,36 @@ def cases(args) -> list[str]:
             assert ts.shape[1] == tokens.shape[1], (ts.shape, tokens.shape)
             cond_rows, timestep = lane_cut(ts[i])
         case = {
-            "latents": tokens[i].reshape(-1).astype(np.float32).tolist(),
             "rows": int(tokens.shape[1]),
             "patch_features": int(tokens.shape[2]),
             "cond_rows": cond_rows,
-            "context": ctx[i].reshape(-1).astype(np.float32).tolist(),
             "context_rows": int(ctx.shape[1]),
             "context_width": int(ctx.shape[2]),
-            "positions": pos.reshape(-1).tolist(),
             "timestep": timestep,
         }
+        rows = {"latents": tokens[i], "context": ctx[i], "positions": pos}
+        if args.zero_context:
+            # The `conditioning` claim's other half: the same step with the
+            # prompt gone. Its answer must MOVE (see `conditioning`).
+            rows["context"] = np.zeros_like(ctx[i])
+        if args.compact:
+            # Only the context rows the prompt filled travel: the reference
+            # truncates to the real length and ZERO-pads back to 512, and
+            # the pad is the guest's to write (`wan_2/forward.rs`).
+            real = int(np.flatnonzero(np.abs(ctx[i]).sum(-1) > 0).max() + 1)
+            rows["context"] = rows["context"][:real]
+            case |= {f"{name}_b64": b64(a) for name, a in rows.items()}
+        else:
+            case |= {name: a.reshape(-1).astype(np.float32).tolist()
+                     for name, a in rows.items()}
         path = os.path.join(args.out, f"case{suffix(args)}_{i}.json")
         with open(path, "w") as f:
             json.dump(case, f)
         written.append(path)
     lanes = f"cond {cond_rows} + rest" if cond_rows else "one lane"
+    biggest = max(os.path.getsize(path) for path in written)
     print(f"[case] {len(written)} batch element(s), {tokens.shape[1]} rows "
-          f"({lanes}) -> {args.out}")
+          f"({lanes}), {biggest / (1 << 20):.1f} MiB each -> {args.out}")
     return written
 
 
@@ -244,6 +283,16 @@ def wasm(inferlet: str) -> str:
     if not present:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
+
+
+def roomy_argv() -> None:
+    """The child's argv budget is a quarter of its stack limit; buy room for
+    a real row's case. Runs between fork and exec (`preexec_fn`)."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    want = CHILD_STACK if hard == resource.RLIM_INFINITY else min(CHILD_STACK, hard)
+    if soft == resource.RLIM_INFINITY or soft >= want:
+        return
+    resource.setrlimit(resource.RLIMIT_STACK, (want, hard))
 
 
 def scratch_dir(config: str | None) -> str | None:
@@ -275,22 +324,27 @@ def run(args) -> None:
             cmd += ["--config", args.config]
         cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
         text = ""
-        # A real row's case is tens of MB, far past what argv carries: hand it
-        # over as a file in the sandbox's own scratch instead.
-        by_file = args.case_file or os.path.getsize(case) > ARGV_BUDGET
-        if by_file:
+        if args.case_file:
+            # `/scratch` is a FRESH directory per process (`<fs_scratch_dir>/
+            # <process id>`), so a file put there beforehand is not the one
+            # the guest sees. Kept for a guest that writes its own.
             if scratch and os.path.abspath(scratch) != os.path.abspath(args.out):
                 os.makedirs(scratch, exist_ok=True)
                 shutil.copyfile(case, os.path.join(scratch, os.path.basename(case)))
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
-            n = 8
-            step = -(-len(text) // n)
-            for i in range(n):
-                cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
-        print(f"[run] {' '.join(cmd[:8])} ... ({len(text)} bytes of case)")
-        done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+            if len(text) > ARGV_CEILING:
+                raise SystemExit(
+                    f"{case}: {len(text)} bytes is past what argv carries; "
+                    f"write the case with `--compact`"
+                )
+            for i in range(-(-len(text) // PIECE)):
+                cmd += [f"--case_{i}", text[i * PIECE:(i + 1) * PIECE]]
+        print(f"[run] {' '.join(cmd[:8])} ... ({len(text)} bytes of case in "
+              f"{-(-len(text) // PIECE)} piece(s))")
+        done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO,
+                              preexec_fn=roomy_argv)
         with open(out[:-5] + ".stderr", "w") as f:
             f.write(done.stderr)
         if done.returncode != 0:
@@ -364,11 +418,55 @@ def compare(args) -> int:
     return subprocess.call(cmd)
 
 
+def conditioning(args) -> int:
+    """THE PROMPT MUST MATTER. Runs the same step twice — once with the
+    golden's umT5 context, once with that context zeroed — and demands the
+    velocity move by more than the gate could hide.
+
+    A cross-attention context is a lane of its own, and it conditions the
+    video rows only if the two lanes are members of ONE fire. Put them on one
+    pipeline and the scheduler seats them in different steps: the model then
+    attends its video rows alone, reads whatever the context rectangle held,
+    and answers something that a miniature's tolerance will happily pass. So
+    the harness asks the question directly: drop the prompt, and if the answer
+    does not move, the lanes were never in one attention. Lanes seated apart
+    read the same context rectangle in both runs, so the move is EXACTLY zero.
+    """
+    move = args.conditioning_move
+    if move is None:
+        move = row(args)["move"]
+    answers = {}
+    for zero in (False, True):
+        run_args = argparse.Namespace(**vars(args))
+        run_args.zero_context = zero
+        run_args.out = os.path.join(args.out, "zeroctx" if zero else "prompt")
+        cases(run_args)
+        run(run_args)
+        paths = numbered(run_args.out, "pie", suffix(args))
+        docs = [document(path) for path in paths]
+        answers[zero] = np.stack([
+            np.asarray(doc["velocity"], dtype=np.float32) for doc in docs
+        ])
+    with_prompt, without = answers[False], answers[True]
+    scale = float(np.linalg.norm(without))
+    moved = float(np.linalg.norm(with_prompt - without)) / max(scale, 1e-30)
+    verdict = "PASS" if moved > move else "FAIL"
+    print(f"[conditioning] dropping the prompt moves the velocity by {moved:.4f} "
+          f"(needs > {move}) — {verdict}")
+    if verdict == "FAIL":
+        print("[conditioning] the context lane is not in the video lanes' fire: "
+              "each lane needs its OWN pipeline (a pipeline is serial, and the "
+              "scheduler never seats two of its passes in one step).")
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
+    ap.add_argument("cmd", choices=["case", "run", "collect", "compare",
+                                    "conditioning", "all"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/wan22-parity")
     ap.add_argument("--variant", choices=sorted(ROWS), default="d128")
@@ -378,8 +476,16 @@ def main() -> int:
     ap.add_argument("--config", default=None,
                     help="the serving config; its `[model] model` must be the imported row")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
+    ap.add_argument("--compact", action="store_true",
+                    help="state the case's rectangles as base64 f32 and give the context "
+                         "only its real rows: what a real row needs to fit in argv at all")
     ap.add_argument("--case_file", action="store_true",
-                    help="force the scratch-file case (a big one takes it anyway)")
+                    help="pass the case as a `/scratch` file name instead of argv pieces")
+    ap.add_argument("--zero-context", action="store_true",
+                    help="write the case with a zeroed umT5 context (see `conditioning`)")
+    ap.add_argument("--conditioning-move", type=float, default=None,
+                    help="how far dropping the prompt must move the velocity "
+                         "(default: the row's own floor)")
     args = ap.parse_args()
 
     if args.cmd == "case":
@@ -390,12 +496,14 @@ def main() -> int:
         collect(args)
     elif args.cmd == "compare":
         return compare(args)
+    elif args.cmd == "conditioning":
+        return conditioning(args)
     else:
         cases(args)
         run(args)
         collect(args)
-        return compare(args)
-    return 0
+        gate = compare(args)
+        return conditioning(args) or gate
 
 
 if __name__ == "__main__":

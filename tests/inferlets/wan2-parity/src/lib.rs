@@ -34,28 +34,35 @@
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// The case arrives as `case` whole, as `case_file` (a name under
+/// `/scratch`), or — the usual way — cut into `case_0`, `case_1`, … argv
+/// pieces, because Linux caps ONE argument at 128 KiB. How MANY pieces is
+/// the harness's business: the real row needs a score of them, so they are
+/// read off the argument map by name rather than declared one field each.
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
     case: Option<String>,
     #[serde(default)]
     case_file: Option<String>,
-    #[serde(default)]
-    case_0: Option<String>,
-    #[serde(default)]
-    case_1: Option<String>,
-    #[serde(default)]
-    case_2: Option<String>,
-    #[serde(default)]
-    case_3: Option<String>,
-    #[serde(default)]
-    case_4: Option<String>,
-    #[serde(default)]
-    case_5: Option<String>,
-    #[serde(default)]
-    case_6: Option<String>,
-    #[serde(default)]
-    case_7: Option<String>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, inferlet::serde_json::Value>,
+}
+
+impl Input {
+    /// The `case_<n>` pieces, in `n` order, concatenated.
+    fn pieces(&self) -> String {
+        let mut found: Vec<(u64, &str)> = self
+            .rest
+            .iter()
+            .filter_map(|(name, value)| {
+                let n = name.strip_prefix("case_")?.parse::<u64>().ok()?;
+                Some((n, value.as_str()?))
+            })
+            .collect();
+        found.sort_unstable_by_key(|(n, _)| *n);
+        found.into_iter().map(|(_, text)| text).collect()
+    }
 }
 
 /// One batch element of the reference's fixed inputs, flattened
@@ -63,23 +70,102 @@ struct Input {
 /// the `[C, T, H, W]` array), the context rows, one timestep, the
 /// `(t, h, w)` patch coordinates of every row, and how many leading rows
 /// are the conditioning frame's (0 for the scalar-timestep forward).
+///
+/// Every float rectangle comes either as a JSON array — legible, and what
+/// a miniature's case uses — or, when JSON's ten bytes a number would put
+/// the case past what argv carries at all, as `*_b64`: standard base64 of
+/// the same numbers as little-endian `f32`, which is a third the size.
 #[derive(Deserialize)]
 struct Case {
     /// `[rows, patch_features]`, row-major.
+    #[serde(default)]
     latents: Vec<f32>,
+    #[serde(default)]
+    latents_b64: Option<String>,
     rows: u32,
     patch_features: u32,
     /// The first `cond_rows` rows form a second video lane at timestep 0.
     #[serde(default)]
     cond_rows: u32,
-    /// `[context_rows, context_width]`.
+    /// `[context_rows, context_width]` — but only the LEADING rows need be
+    /// given: `wan_2`'s context port takes exactly what the reference hands
+    /// the transformer, 512 rows of which the prompt fills the front and
+    /// the rest are hard zeros this guest writes (`wan_2/forward.rs`).
+    #[serde(default)]
     context: Vec<f32>,
+    #[serde(default)]
+    context_b64: Option<String>,
     context_rows: u32,
     context_width: u32,
     /// `[rows, 3]`.
+    #[serde(default)]
     positions: Vec<f32>,
+    #[serde(default)]
+    positions_b64: Option<String>,
     /// The scheduler timestep of the non-conditioning rows.
     timestep: f32,
+}
+
+/// Standard base64 (`+/`, `=` padded) into the `f32`s it spells, little
+/// endian. A case's rectangles are the only thing that travels this way.
+fn floats_of_base64(text: &str, what: &str) -> Result<Vec<f32>> {
+    let code = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let text = text.trim_end_matches('=').as_bytes();
+    let mut bytes = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for (i, &c) in text.iter().enumerate() {
+        let six = code(c).ok_or_else(|| format!("{what}: byte {i} is not base64"))?;
+        acc = (acc << 6) | six;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    if bytes.len() % 4 != 0 {
+        return Err(format!("{what}: {} bytes is not whole f32s", bytes.len()).into());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect())
+}
+
+impl Case {
+    /// The three rectangles, each in whichever form the case carried it,
+    /// with the context zero-padded to the rows the transformer attends.
+    fn rectangles(&mut self) -> Result<()> {
+        for (b64, into, what) in [
+            (&self.latents_b64, &mut self.latents, "latents"),
+            (&self.context_b64, &mut self.context, "context"),
+            (&self.positions_b64, &mut self.positions, "positions"),
+        ] {
+            if let Some(text) = b64 {
+                *into = floats_of_base64(text, what)?;
+            }
+        }
+        let want = (self.context_rows * self.context_width) as usize;
+        if self.context.len() > want {
+            return Err(format!(
+                "the case gives {} context values and states {}x{}",
+                self.context.len(),
+                self.context_rows,
+                self.context_width
+            )
+            .into());
+        }
+        self.context.resize(want, 0.0);
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -220,36 +306,26 @@ async fn step(case: &Case, ports: &Ports, reading: &str) -> Result<Vec<f32>> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
-        return Err(
-            "wan_2 is an attention-kind pass with no kv bound on its denoise reading".into(),
-        );
-    }
-    let pieces: String = [
-        &input.case_0,
-        &input.case_1,
-        &input.case_2,
-        &input.case_3,
-        &input.case_4,
-        &input.case_5,
-        &input.case_6,
-        &input.case_7,
-    ]
-    .into_iter()
-    .flatten()
-    .map(String::as_str)
-    .collect();
+    // NOT `pass_kind()`. That verb is derived from `rs_state_size() > 0`,
+    // and the flagship row carries a VAE whose causal convolutions each own
+    // a `CacheRow::State` slab, so `wan22-ti2v-5b` answers `recurrent` while
+    // the miniatures (transformer only) answer `attention` — a difference in
+    // the DECODER arms that says nothing about this pass. What a denoise
+    // step actually needs is stated on the reading, and is checked below:
+    // it binds no kv space and takes no tokens.
+    let pieces = input.pieces();
     let text = match (&input.case, &input.case_file) {
         (Some(text), _) => text.clone(),
         (None, Some(name)) => std::fs::read_to_string(format!("/scratch/{name}"))
             .map_err(|why| format!("reading /scratch/{name}: {why}"))?,
         (None, None) if !pieces.is_empty() => pieces,
         (None, None) => {
-            return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into());
+            return Err("pass `case` (json), `case_0..n` (its pieces) or `case_file`".into());
         }
     };
-    let case: Case =
+    let mut case: Case =
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
+    case.rectangles()?;
     if case.cond_rows >= case.rows {
         return Err("the conditioning rows must leave at least one row for the main lane".into());
     }
