@@ -28,15 +28,25 @@
 //!   concat) is the natural follow-up and needs no new op: it would hand
 //!   `[L, cross_dim + audio_cross_dim]` back on one `hidden` seam and the
 //!   `refine` readings would split it.
-//! * The **video and audio VAE decoders**. Two things stopped them this
-//!   pass: `vae/config.json` had not arrived in the snapshot (the audio
-//!   one had), and the video decoder's temporal upsampler drops the first
-//!   `s_t − 1` frames after its pixel shuffle as the causal anchor, which
-//!   no `Spatial` member states — `GridRule::Shuffle` has no trim, and
-//!   `Upsample { keep_first_frame }` produces the same `1 + (t−1)·s_t`
-//!   extent by REPLICATION, not by shuffling. The audio side maps cleanly
-//!   onto the voxel axis otherwise (time on the grid's `t` and causal, mel
-//!   on its `h`, `w = 1`, `[voxels, 8]` in), and is the smaller of the two.
+//! * The **video and audio VAE decoders**. Two things stopped them the
+//!   pass this text was written in, and NEITHER STOPS THEM NOW:
+//!   `vae/config.json` had not arrived in the snapshot (it has), and the
+//!   video decoder's temporal upsampler drops the first `s_t − 1` frames
+//!   after its pixel shuffle as the causal anchor, which no `Spatial`
+//!   member stated — `GridRule::Shuffle` now carries `trim_t` and
+//!   `spatial::pixel_shuffle_trimming` writes it (`Upsample
+//!   { keep_first_frame }` produces the same `1 + (t−1)·s_t` extent by
+//!   REPLICATION, not by shuffling, which is why the trim had to be its
+//!   own statement). What is left is the text itself: four up blocks of
+//!   `[2, 4, 6, 4]` resnets over channels `[1024, 512, 512, 256]`, whose
+//!   `PerChannelRMSNorm` is `elemwise::rmsnorm_no_scale(x, C, 1e-8)` on a
+//!   voxel row (a row IS a location and its width IS the channels, so the
+//!   reference's RMS across the channel dim is a row norm, not a
+//!   `Spatial::GroupNorm`) and whose channel-change shortcut is
+//!   `elemwise::layernorm_no_scale` plus its affine. The audio side maps
+//!   cleanly onto the voxel axis otherwise (time on the grid's `t` and
+//!   causal, mel on its `h`, `w = 1`, `[voxels, 8]` in), and is the
+//!   smaller of the two.
 //! * The **diffusion decoder**, the **latent upsampler**, the **duration
 //!   head** and the **48 kHz vocoder**. The vocoder is the only one blocked
 //!   by the op vocabulary rather than by time: its BigVGAN stack is DILATED
