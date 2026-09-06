@@ -133,6 +133,7 @@ impl Model {
             kind,
             width,
             streams: streams.to_vec(),
+            at: None,
         };
         let mut readings = Vec::new();
         if let (Some(index), Some(_)) = (codes.text, &self.te) {

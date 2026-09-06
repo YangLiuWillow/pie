@@ -134,6 +134,7 @@ impl Model {
             kind,
             width,
             streams: streams.to_vec(),
+            at: None,
         };
         let mut readings = Vec::new();
         if let (Some(index), Some(te)) = (codes.text, &self.te) {
@@ -229,12 +230,16 @@ impl Model {
                 has_kv: false,
                 takes_tokens: false,
                 streams: vec![Stream::Image],
-                ports: vec![port(
-                    "pixels",
-                    PortKind::Voxels,
-                    super::vae::RGB,
-                    &[Stream::Image],
-                )],
+                // Voxel index ONE: the engine seats one rectangle per
+                // `(kind, index)` for the whole plan, and `vae.decode`'s
+                // latent clip is 16 wide at index 0.
+                ports: vec![PortFact {
+                    name: "pixels",
+                    kind: PortKind::Voxels,
+                    width: super::vae::RGB,
+                    streams: vec![Stream::Image],
+                    at: Some(super::model::port::PIXEL_VOXELS),
+                }],
                 readout: ReadoutKind::Pixels,
                 readout_width: CHANNELS,
             });

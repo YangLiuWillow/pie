@@ -143,9 +143,12 @@ pub mod port {
     pub const TIMESTEP: u8 = 0;
     /// `refine`, `denoise`: the three rotary coordinates per row, `[rows, 3]`.
     pub const POSITIONS: u8 = 0;
-    /// `vae.decode`: the latent clip, `[h·w, CHANNELS]`; `vae.encode`: the
-    /// pixel clip, `[H·W, 3]`. Each reading's only voxel port.
+    /// `vae.decode`: the latent clip, `[h·w, CHANNELS]`.
     pub const VOXELS: u8 = 0;
+    /// `vae.encode`: the pixel clip, `[H·W, 3]`. A second voxel index
+    /// because the engine seats one rectangle per `(kind, index)` for the
+    /// whole plan and the two clips are different widths.
+    pub const PIXEL_VOXELS: u8 = 1;
 }
 
 /// One row's shape, the numbers that differ between the shipped transformer
