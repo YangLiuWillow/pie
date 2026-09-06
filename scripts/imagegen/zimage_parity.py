@@ -12,6 +12,9 @@ Two modes, one per row:
     --mini  (default)  the miniature `z-image-mini-bf16-kv-bf16` row against
                        `zimage_mini.npz` (one forward of the random-init
                        transformer at dim 256: `mini.in.*` -> `mini.out.0`)
+    --pad              the same row against `zimage_mini_pad.npz`: rows that
+                       NEED padding (48 -> 64 image rows, 40 -> 64 caption
+                       rows) at a pipeline-realistic `t = 0.5`
     --turbo            the flagship `z-image-turbo-bf16-kv-bf16` row against
                        `zimage_golden.npz`'s step-0 transformer call
                        (`dit.step0.in.*` -> `dit.step0.out.0`; the prompt
@@ -74,6 +77,7 @@ T_FLIP = 1000.0
 # a bf16 CUDA reference whose reductions differ from ours: looser.
 TOLERANCES = {
     "mini": ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"],
+    "mini_pad": ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"],
     "turbo": ["--tol", "1.0", "--rel-tol", "0.05", "--cos-tol", "0.999"],
 }
 
@@ -81,6 +85,10 @@ MODES = {
     # mode: (golden file, latent key, caption key, t key, out key, sku)
     "mini": ("zimage_mini.npz", "mini.in.x.0", "mini.in.cap.0", "mini.in.t",
              "mini.out.0", "z-image-mini-bf16-kv-bf16"),
+    # the same weights over rows that NEED padding (16 image pads, 24 caption
+    # pads) at a pipeline-realistic t: `zimage_golden.py --mini-pad`
+    "mini_pad": ("zimage_mini_pad.npz", "mini_pad.in.x.0", "mini_pad.in.cap.0",
+                 "mini_pad.in.t", "mini_pad.out.0", "z-image-mini-bf16-kv-bf16"),
     "turbo": ("zimage_golden.npz", "dit.step0.in.arg0.0", "dit.step0.in.arg2.0",
               "dit.step0.in.arg1", "dit.step0.out.0", "z-image-turbo-bf16-kv-bf16"),
 }
@@ -116,7 +124,9 @@ def padded(n: int) -> int:
 # ----------------------------------------------------------------------------
 
 def mode_of(args) -> str:
-    return "turbo" if args.turbo else "mini"
+    if args.turbo:
+        return "turbo"
+    return "mini_pad" if args.pad else "mini"
 
 
 def golden_of(args) -> np.lib.npyio.NpzFile:
@@ -313,6 +323,8 @@ def main() -> int:
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/zimage-parity")
     ap.add_argument("--mini", action="store_true", help="the miniature row (default)")
+    ap.add_argument("--pad", action="store_true",
+                    help="the miniature row over rows that need padding (zimage_mini_pad.npz)")
     ap.add_argument("--turbo", action="store_true", help="the Turbo row's step-0 denoise instead")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/zimage-parity"))
     ap.add_argument("--config", default=None,
