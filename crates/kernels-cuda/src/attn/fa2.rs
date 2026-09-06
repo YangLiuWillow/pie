@@ -120,6 +120,10 @@ pub enum RaggedArm {
     /// only keys past it. `MaskMode::kCustom`, so the mask is asked on every
     /// kv tile.
     ReferenceSelfOnly,
+    /// `RaggedMask::ReferenceTags`: a query tagged `t >= 0` sees only keys
+    /// tagged `t`, an untagged query every key — several reference lanes
+    /// per group, each to itself. `MaskMode::kCustom`, like the tail form.
+    ReferenceTags,
     /// `RaggedMask::RelativeBias`: every row sees every key of its group,
     /// and `bias[h][kj − qi + max_len − 1]` is added to each scaled logit
     /// through the variant's transform hook. `MaskMode::kNone`, like `Full`.
@@ -138,6 +142,7 @@ fn prefill_ragged_symbol(
     let (mask, variant, params) = match arm {
         RaggedArm::Full => ("kNone", "VariantFull", "RaggedParams"),
         RaggedArm::ReferenceSelfOnly => ("kCustom", "ReferenceSelfOnly", "RaggedRefParams"),
+        RaggedArm::ReferenceTags => ("kCustom", "ReferenceTags", "RaggedTagParams"),
         RaggedArm::RelativeBias => ("kNone", "RelativeBias", "RaggedBiasParams"),
     };
     Ok(symbol(&format!(

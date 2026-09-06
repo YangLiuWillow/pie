@@ -21,7 +21,11 @@ pub enum GridRule {
     Conv {
         k: [u32; 3],
         stride: [u32; 3],
+        /// The front pad per axis.
         pad: [u32; 3],
+        /// The back pad per axis (equal to `pad` for a symmetric
+        /// convolution); ignored on the time axis under `causal_t`.
+        pad_back: [u32; 3],
         causal_t: bool,
     },
     /// `(t·ft, h·fh, w·fw)`, or `1 + (t-1)·ft` frames under `keep_first_frame`.
@@ -43,6 +47,7 @@ struct Geom {
     a: [i32; 3],
     b: [i32; 3],
     c: [i32; 3],
+    d: [i32; 3],
     flag: i32,
     lanes: i32,
 }
@@ -69,12 +74,14 @@ pub fn derive_grid(
             k,
             stride,
             pad,
+            pad_back,
             causal_t,
         } => Geom {
             kind: 0,
             a: triple(OP, k)?,
             b: triple(OP, stride)?,
             c: triple(OP, pad)?,
+            d: triple(OP, pad_back)?,
             flag: i32::from(causal_t),
             lanes,
         },
@@ -86,6 +93,7 @@ pub fn derive_grid(
             a: triple(OP, factor)?,
             b: [0; 3],
             c: [0; 3],
+            d: [0; 3],
             flag: i32::from(keep_first_frame),
             lanes,
         },
@@ -94,6 +102,7 @@ pub fn derive_grid(
             a: triple(OP, r)?,
             b: [0; 3],
             c: [0; 3],
+            d: [0; 3],
             flag: 0,
             lanes,
         },
@@ -102,6 +111,7 @@ pub fn derive_grid(
             a: triple(OP, r)?,
             b: [0; 3],
             c: [0; 3],
+            d: [0; 3],
             flag: 0,
             lanes,
         },

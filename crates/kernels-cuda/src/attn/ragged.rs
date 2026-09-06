@@ -38,8 +38,8 @@
 
 use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::fa2_abi::{
-    PrefillRaggedBiasParams, PrefillRaggedParams, PrefillRaggedRefParams, UintFastdiv,
-    sm_scale_or_default,
+    PrefillRaggedBiasParams, PrefillRaggedParams, PrefillRaggedRefParams, PrefillRaggedTagParams,
+    UintFastdiv, sm_scale_or_default,
 };
 use crate::attn::kv;
 use crate::attn::plan::Device;
@@ -82,8 +82,18 @@ pub enum RaggedMask {
     /// key, references included. A `ref_start` at or past the group's length,
     /// or a negative one (read as zero), leaves every row seeing every key.
     /// Counted the same on both sides, it is meant for the self-attention
-    /// reading, where the query and key tables agree.
+    /// reading, where the query and key tables agree — and for at most ONE
+    /// reference lane per group; [`ReferenceTags`](RaggedMask::ReferenceTags)
+    /// is the general form.
     ReferenceSelfOnly { ref_start: Tensor },
+    /// The contract's tag form (`IMAGEGEN_CONTRACT.md` §1): `q_tags` and
+    /// `kv_tags` are `i32`, `[rows]` of the query and the key rectangle
+    /// (indexed by the same absolute packed rows the CSRs name), `-1` for a
+    /// row of a non-reference lane, else that lane's fire index. A query
+    /// tagged `t >= 0` sees only keys tagged `t`; a query tagged `-1` sees
+    /// every key of its segment, the references' included. Any number of
+    /// reference lanes per group, each attending itself alone.
+    ReferenceTags { q_tags: Tensor, kv_tags: Tensor },
     /// Every row of a group attends every key of the group, and an additive
     /// per-head bias that depends only on the signed distance `kj − qi`
     /// (both group-relative) is added to each scaled logit:
@@ -337,6 +347,30 @@ pub fn ragged(
     };
     match mask {
         RaggedMask::None => fa2::prefill_ragged(ctx, OP, point(RaggedArm::Full), &params),
+        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
+            for (what, table, rows) in [("query", q_tags, q.rows), ("key", kv_tags, k.rows)] {
+                if table.dtype != Dtype::I32 || table.rows < rows {
+                    return Err(refuse(
+                        OP,
+                        format!(
+                            "the {what} tag table is {:?} with {} entries; the mask reads one \
+                             i32 per row of the {rows}-row {what} rectangle",
+                            table.dtype, table.rows
+                        ),
+                    ));
+                }
+            }
+            fa2::prefill_ragged(
+                ctx,
+                OP,
+                point(RaggedArm::ReferenceTags),
+                &PrefillRaggedTagParams {
+                    base: params,
+                    q_tags: q_tags.ptr,
+                    kv_tags: kv_tags.ptr,
+                },
+            )
+        }
         RaggedMask::ReferenceSelfOnly { ref_start } => {
             // Read at the absolute group id, like the group tables: it must
             // reach every group the table names.

@@ -367,8 +367,7 @@ const fn flash_ratios() -> [Option<u32>; 43] {
 /// The mini `mlx-community/DeepSeek-V4-Flash-2bit-DQ` snapshot's five-layer
 /// schedule (original layers 0, 1, 2, 3, 42, renumbered), which the name
 /// bijection test holds this text against.
-const FLASH_MICRO_RATIOS: [Option<u32>; 5] =
-    [None, None, Some(4), Some(128), Some(4)];
+const FLASH_MICRO_RATIOS: [Option<u32>; 5] = [None, None, Some(4), Some(128), Some(4)];
 
 /// What the routed expert block is stored as, when one `weights` dtype
 /// cannot say it: one representation per projection plus per-layer
@@ -827,16 +826,15 @@ impl Model {
                 // half serve the previous block's — so
                 // pool_gather_paged's fanout is 2 at ratio 4 and 1 at
                 // ratio 128 (which pools its own block alone).
-                let entries = if has_indexer { 2 * kv_latent } else { kv_latent };
+                let entries = if has_indexer {
+                    2 * kv_latent
+                } else {
+                    kv_latent
+                };
                 Pool {
                     ratio,
                     entries: site.pool.clone(),
-                    compressor: Some(compressor(
-                        n("compressor"),
-                        ratio,
-                        entries,
-                        kv_latent,
-                    )),
+                    compressor: Some(compressor(n("compressor"), ratio, entries, kv_latent)),
                 }
             });
             let indexer = has_indexer.then(|| Indexer {
@@ -885,7 +883,11 @@ impl Model {
                     // A compressor layer ropes at the compress theta
                     // under the YaRN ramp; a pure window layer at the
                     // base theta with none (official `Attention.__init__`).
-                    theta: if ratio.is_some() { d.compress_theta } else { d.theta },
+                    theta: if ratio.is_some() {
+                        d.compress_theta
+                    } else {
+                        d.theta
+                    },
                     yarn: ratio.map(|_| d.yarn),
                     sm_scale: (d.head_dim as f32).sqrt().recip(),
                     q_down: Weight::sym(n("q_down"), [q_lora, hidden], weights),
@@ -1084,5 +1086,4 @@ const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 pub const DRAFT_DEPTH: u32 = 1;
 const DRAFT_EXPERTS: u32 = 256;
 
-impl Model {
- }
+impl Model {}

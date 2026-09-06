@@ -14,14 +14,15 @@
 
 namespace pie::spatial {
 
-/// `GridRule`, flattened: `kind` 0 conv (`a` k, `b` stride, `c` pad, `flag`
-/// causal_t), 1 upsample (`a` factor, `flag` keep_first_frame), 2 shuffle
-/// (`a` r), 3 unshuffle (`a` r).
+/// `GridRule`, flattened: `kind` 0 conv (`a` k, `b` stride, `c` front pad,
+/// `d` back pad, `flag` causal_t), 1 upsample (`a` factor, `flag`
+/// keep_first_frame), 2 shuffle (`a` r), 3 unshuffle (`a` r).
 struct RuleGeom {
     int kind;
     int a0, a1, a2;
     int b0, b1, b2;
     int c0, c1, c2;
+    int d0, d1, d2;
     int flag;
     int lanes;
 };
@@ -42,10 +43,10 @@ __global__ void grid_rule(const int* __restrict__ grid, int* __restrict__ out, R
         bool ok = true;
         switch (g.kind) {
             case 0: {
-                const int back_t = g.flag ? 0 : g.c0;
+                const int back_t = g.flag ? 0 : g.d0;
                 ot = conv_axis(t, g.a0, g.b0, g.c0, back_t, ok);
-                oh = conv_axis(h, g.a1, g.b1, g.c1, g.c1, ok);
-                ow = conv_axis(w, g.a2, g.b2, g.c2, g.c2, ok);
+                oh = conv_axis(h, g.a1, g.b1, g.c1, g.d1, ok);
+                ow = conv_axis(w, g.a2, g.b2, g.c2, g.d2, ok);
                 break;
             }
             case 1:

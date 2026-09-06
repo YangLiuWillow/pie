@@ -195,6 +195,46 @@ struct ReferenceSelfOnly : VariantFull {
     })
 };
 
+// `RaggedMask::ReferenceSelfOnly` in its TAG form: the block plus two i32
+// tag tables indexed by FIRE-ABSOLUTE packed row — `q_tags[row]` for the
+// query rectangle, `kv_tags[row]` for the key rectangle — each `-1` for a
+// row of a lane that is not a reference, else that lane's fire index. A
+// query with tag `t >= 0` sees only keys with tag `t` (each reference lane
+// attends itself alone, however many a group holds); a query with tag `-1`
+// sees every key of its segment, the references' included. The contract's
+// spelling (`IMAGEGEN_CONTRACT.md` §1); `ref_start` above is its one-tail
+// fast case.
+struct RaggedTagParams : RaggedParams {
+    const IdType* q_tags = nullptr;
+    const IdType* kv_tags = nullptr;
+};
+
+static_assert(sizeof(RaggedTagParams) == 328,
+              "fa2_abi::PrefillRaggedTagParams mirrors a 328-byte RaggedTagParams");
+
+/// The tag form of the reference mask. `LogitsMask` sees group-local
+/// `qo_idx`/`kv_idx`; the group's first packed rows (`q_indptr[g]`,
+/// `kv_indptr[g]`) turn them into the absolute rows the tables are indexed
+/// by. The query's tag is read per call (the mask is asked per fragment
+/// element, the row varying across them), the key's likewise.
+struct ReferenceTags : VariantFull {
+    std::uint32_t q_base = 0;
+    std::uint32_t kv_base = 0;
+
+    template <typename Params>
+    __device__ __host__ ReferenceTags(
+        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : VariantFull(params, batch_idx, smem_ptr) {
+        q_base = static_cast<std::uint32_t>(params.q_indptr[batch_idx]);
+        kv_base = static_cast<std::uint32_t>(params.kv_indptr[batch_idx]);
+    }
+
+    REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+        const IdType t = params.q_tags[q_base + qo_idx];
+        return t < 0 || params.kv_tags[kv_base + kv_idx] == t;
+    })
+};
+
 // `RaggedMask::RelativeBias`: the block plus one relative-position table.
 // `bias` is `[num_qo_heads, 2·max_len − 1]` f32, row-major, one row per
 // QUERY head (a grouped kv head's queries each read their own row). Query

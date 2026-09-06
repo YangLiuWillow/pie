@@ -1,7 +1,8 @@
 //! Qwen3.5 / Qwen3.6 vision preprocessing: resize, patchify, position taps.
 
-use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8,
-    VisionFrontEnd};
+use crate::media::{
+    Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8, VisionFrontEnd,
+};
 
 /// The `ROWS.arch` this front-end answers for.
 ///
@@ -157,7 +158,8 @@ impl QwenVisionConfig {
 
         let mut pix = vec![0.0f32; n * pd];
         let mut pos = vec![0u32; n * 2];
-        let norm = |v: u8, ch: usize| -> f32 { ((f32::from(v) / 255.0) - self.mean[ch]) / self.std[ch] };
+        let norm =
+            |v: u8, ch: usize| -> f32 { ((f32::from(v) / 255.0) - self.mean[ch]) / self.std[ch] };
 
         let mut out_idx = 0usize;
         for ih_blk in 0..bh {
@@ -209,8 +211,7 @@ impl QwenVisionConfig {
             for iw_blk in 0..bw {
                 for ih in 0..m {
                     for iw in 0..m {
-                        let (tap, weight) =
-                            interp(ih_blk * m + ih, iw_blk * m + iw, gh, gw, side);
+                        let (tap, weight) = interp(ih_blk * m + ih, iw_blk * m + iw, gh, gw, side);
                         ids.extend_from_slice(&tap);
                         weights.extend_from_slice(&weight);
                     }

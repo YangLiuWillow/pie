@@ -114,7 +114,11 @@ impl ForwardHybrid for Model {
 
                 Mixer::Gdn(g) => {
                     let conv_ch = u64::from(Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim));
-                    c.state(g.conv_state.clone(), [g.conv_kernel as u64, conv_ch], Dtype::Bf16);
+                    c.state(
+                        g.conv_state.clone(),
+                        [g.conv_kernel as u64, conv_ch],
+                        Dtype::Bf16,
+                    );
                     c.state(
                         g.delta_state.clone(),
                         [g.v_heads as u64, g.k_dim as u64, g.v_dim as u64],
@@ -201,13 +205,13 @@ impl ForwardHybrid for Model {
         // The trunk hidden states the drafter was trained against, kept in
         // tap order as the loop passes them.
         // **THE TAPS ARE FUSED WHERE THEY ARE TAKEN, NOT COLLECTED.** A residual
-    // add ALIASES its output onto the stream it folds into
-    // (`Elementwise::aliases`), so the trunk's hidden state is ONE buffer and
-    // a handle held across a later layer reads that layer's value, not the
-    // tapped one. The fusion's `[hidden, taps·hidden]` bank is its column
-    // slices summed, and a slice's matmul allocates — so taking the tap's
-    // product here is both the fusion and the snapshot, at no extra cost.
-    let mut fused: Option<Value> = None;
+        // add ALIASES its output onto the stream it folds into
+        // (`Elementwise::aliases`), so the trunk's hidden state is ONE buffer and
+        // a handle held across a later layer reads that layer's value, not the
+        // tapped one. The fusion's `[hidden, taps·hidden]` bank is its column
+        // slices summed, and a slice's matmul allocates — so taking the tap's
+        // product here is both the fusion and the snapshot, at no extra cost.
+        let mut fused: Option<Value> = None;
         let routes = inputs.adapter_routes();
         for (l, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
@@ -566,7 +570,9 @@ fn attn_mixer(
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
-        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale),
+        ops::attn::masked(
+            &mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale,
+        ),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
@@ -580,7 +586,14 @@ fn attn_mixer(
 /// schedule.
 /// `chain`: a step past the first, which reads the kv the first step wrote
 /// for this row and appends none of its own (as the qwen4 head chains).
-fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn, chain: bool) -> Value {
+fn mtp_attn(
+    x: &Value,
+    inputs: &Input<Facts>,
+    m: &Model,
+    plan: &Value,
+    a: &Attn,
+    chain: bool,
+) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);

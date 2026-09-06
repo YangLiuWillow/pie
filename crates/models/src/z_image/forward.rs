@@ -1,4 +1,4 @@
-//! Z-Image's traced arithmetic: three readings of one plan, selected per
+//! Z-Image's traced arithmetic: five readings of one plan, selected per
 //! lane by the reading bits of the fact word (design D1, D5).
 //!
 //! | reading | lanes (stream) | binds | reads back |
@@ -6,6 +6,13 @@
 //! | `text` | one, `Text` | `embed(ids)`, `attention(kv)` | `hidden` `[L, 2560]`: Qwen3 layer −2 |
 //! | `refine` | one, `Context` | `caption` `[L32, 2560]`, `pad` `[L32, 1]`, `positions` `[L32, 3]` | `hidden` `[L32, 3840]`: the refined caption |
 //! | `denoise` | `Image` + `Context`, one group | image: `latents` `[N32, 64]`, `pad` `[N32, 1]`, `positions`, `timestep`; context: `context` `[L32, 3840]`, `positions`, `timestep` | `velocity` `[N32, 64]` on the image lane |
+//! | `vae.decode` | one, `Image`, one clip `{1, h, w}` | `latent` `[h·w, 16]` on the voxel axis | `pixels` `[8h·8w, 3]` in `[-1, 1]` |
+//! | `vae.encode` | one, `Image`, one clip `{1, H, W}` | `pixels` `[H·W, 3]` on the voxel axis | `pixels` `[H/8·W/8, 16]`: the posterior mean |
+//!
+//! The two VAE readings ([`super::vae`]) exist on the flagship only (the
+//! miniature has no VAE) and run on the voxel axis: a lane submits one
+//! clip, its `Voxels` port's channel is `[h, w, C]`, and it reads its
+//! pixels back with the clip's output box.
 //!
 //! `L32`/`N32` are the caption / image row counts padded up to a multiple of
 //! [`super::model::SEQ_MULTIPLE`]. **The pad rows are the guest's to
@@ -65,11 +72,12 @@ use super::model::{CHANNELS, PATCH, SPATIAL_COMPRESSION};
 /// streams, of which this text names Text, Image and Context.
 pub const STREAM_BASE: u8 = 0;
 
-/// The two bits the reading index lives in, as a plain binary code: bit
-/// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Four codes,
-/// three readings and one reserved for the VAE.
+/// The three bits the reading index lives in, as a plain binary code: bit
+/// [`READING_LO`] is its low bit, [`READING_MID`] the middle one,
+/// [`READING_HI`] its high bit. Eight codes, five readings on the flagship.
 pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
+pub const READING_MID: u8 = 7;
+pub const READING_HI: u8 = 8;
 
 /// Which reading index means what, per row. The word packs the index the
 /// runtime stamps (`Request::reading`) and nothing else — `Classify::of` has
@@ -80,9 +88,9 @@ pub struct Readings {
     pub text: Option<u8>,
     pub refine: u8,
     pub denoise: u8,
-    /// Reserved: the VAE decode reading, once the voxel axis is read by
-    /// this text. No node is guarded on it today.
-    pub vae_decode: u8,
+    /// The VAE readings, on a row that carries the VAE.
+    pub vae_decode: Option<u8>,
+    pub vae_encode: Option<u8>,
 }
 
 impl Model {
@@ -90,19 +98,24 @@ impl Model {
     /// order (what `validate_generative` demands).
     #[must_use]
     pub fn readings(&self) -> Readings {
-        match self.te {
-            Some(_) => Readings {
-                text: Some(0),
-                refine: 1,
-                denoise: 2,
-                vae_decode: 3,
-            },
-            None => Readings {
-                text: None,
-                refine: 0,
-                denoise: 1,
-                vae_decode: 2,
-            },
+        let mut next = 0u8;
+        let mut take = |present: bool| {
+            present.then(|| {
+                next += 1;
+                next - 1
+            })
+        };
+        let text = take(self.te.is_some());
+        let refine = take(true).unwrap_or(0);
+        let denoise = take(true).unwrap_or(0);
+        let vae_decode = take(self.vae.is_some());
+        let vae_encode = take(self.vae.is_some());
+        Readings {
+            text,
+            refine,
+            denoise,
+            vae_decode,
+            vae_encode,
         }
     }
 
@@ -209,6 +222,35 @@ impl Model {
             readout: ReadoutKind::Velocity,
             readout_width: PATCH_FEATURES,
         });
+        if let (Some(decode), Some(encode), Some(_)) =
+            (codes.vae_decode, codes.vae_encode, &self.vae)
+        {
+            readings.push(ReadingFact {
+                name: "vae.decode",
+                index: decode,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Image],
+                ports: vec![port("latent", PortKind::Voxels, CHANNELS, &[Stream::Image])],
+                readout: ReadoutKind::Pixels,
+                readout_width: super::vae::RGB,
+            });
+            readings.push(ReadingFact {
+                name: "vae.encode",
+                index: encode,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Image],
+                ports: vec![port(
+                    "pixels",
+                    PortKind::Voxels,
+                    super::vae::RGB,
+                    &[Stream::Image],
+                )],
+                readout: ReadoutKind::Pixels,
+                readout_width: CHANNELS,
+            });
+        }
         Generative {
             readings,
             latent: Some(LatentSpace {
@@ -253,7 +295,7 @@ pub fn turbo_sigmas(shift: f32) -> Vec<f32> {
 /// its pass runs.
 pub struct Facts {
     pub stream: Stream,
-    /// The reading index, `0..4` (a wider index is truncated to two bits).
+    /// The reading index, `0..8` (a wider index is truncated to three bits).
     pub reading: u8,
 }
 
@@ -279,6 +321,12 @@ impl Facts {
         Predicate::fact(READING_LO)
     }
 
+    /// The middle reading bit.
+    #[must_use]
+    pub fn reading_mid() -> Predicate {
+        Predicate::fact(READING_MID)
+    }
+
     /// The high reading bit.
     #[must_use]
     pub fn reading_hi() -> Predicate {
@@ -290,12 +338,12 @@ impl Classify for Facts {
     fn of(r: &Request) -> Facts {
         Facts {
             stream: r.stream(),
-            reading: r.reading() & 3,
+            reading: r.reading() & 7,
         }
     }
 
     fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 3) << READING_LO)
+        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 7) << READING_LO)
     }
 }
 
@@ -318,12 +366,17 @@ impl ForwardHybrid for Model {
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let codes = self.readings();
-        // Four arms by reading code, each a conjunction of the two reading
-        // literals (so every arm names a `Selection` the host can pack).
+        // Eight arms by reading code, each a conjunction of the three
+        // reading literals (so every arm names a `Selection` the host can
+        // pack); a code no reading claims runs no node.
         let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
+        let (hi_mid, hi_low) = hi.split(&Facts::reading_mid());
+        let (lo_mid, lo_low) = lo.split(&Facts::reading_mid());
+        let (c7, c6) = hi_mid.split(&Facts::reading_lo());
+        let (c5, c4) = hi_low.split(&Facts::reading_lo());
+        let (c3, c2) = lo_mid.split(&Facts::reading_lo());
+        let (c1, c0) = lo_low.split(&Facts::reading_lo());
+        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
         let arm = |code: u8| &arms[usize::from(code)];
 
         if let (Some(code), Some(te)) = (codes.text, &self.te) {
@@ -331,7 +384,12 @@ impl ForwardHybrid for Model {
         }
         refine(arm(codes.refine), &self.dims, &self.dit);
         let velocity = denoise(arm(codes.denoise), &self.dims, &self.dit);
-        vae_decode(arm(codes.vae_decode));
+        if let (Some(decode), Some(encode), Some(vae)) =
+            (codes.vae_decode, codes.vae_encode, &self.vae)
+        {
+            super::vae::decode(arm(decode), vae);
+            super::vae::encode(arm(encode), vae);
+        }
         velocity
     }
 }
@@ -505,15 +563,6 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     seam::at(seam::VELOCITY, &[&velocity]);
     velocity
 }
-
-/// The `vae.decode` reading: NOT WIRED. The FLUX `AutoencoderKL` decoder is
-/// a voxel-axis text (`IMAGEGEN_CONTRACT.md` §6: `spatial::conv3d`,
-/// `group_norm`, `upsample_nearest`, the mid-block attention) that this
-/// family will state under this arm once the `vae.` tensors are declared
-/// (`import.rs` lists them). Until then a lane stamped with this code runs
-/// no node at all; the reading is reserved in [`Readings`] and absent from
-/// the facts, so a guest cannot name it.
-fn vae_decode(_arm: &Input<Facts>) {}
 
 /// The tables one attention sublayer needs: the rows' rotary coordinates,
 /// the arm's row permutation, the CSR its segments pair by, and the mask.

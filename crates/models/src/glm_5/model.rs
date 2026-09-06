@@ -304,5 +304,4 @@ impl Model {
 /// fact; changing it requires a re-trace.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-impl Model {
- }
+impl Model {}

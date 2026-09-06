@@ -207,6 +207,23 @@ const _: () = assert!(
     "PrefillRaggedRefParams: sizeof disagrees with ::pie::attn::fa2::RaggedRefParams",
 );
 
+/// `::pie::attn::fa2::RaggedTagParams`: the ragged block with the two
+/// reference tag tables (`i32`, indexed by fire-absolute packed row on the
+/// query and the key side) appended — 328 bytes, pinned beside the block's
+/// own assertion in `attn/attention.cuh`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct PrefillRaggedTagParams {
+    pub base: PrefillRaggedParams,
+    pub q_tags: DevicePtr,
+    pub kv_tags: DevicePtr,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<PrefillRaggedTagParams>() == 328,
+    "PrefillRaggedTagParams: sizeof disagrees with ::pie::attn::fa2::RaggedTagParams",
+);
+
 /// `::pie::attn::fa2::RaggedBiasParams`: the ragged block with the
 /// relative-position bias table (`f32`, `[num_qo_heads, 2·max_len − 1]`)
 /// and its `max_len` appended — 328 bytes (the `u32` pads to the block's

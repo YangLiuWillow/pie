@@ -3,8 +3,10 @@ use checkpoint::types::{DType, Encoding};
 use model_dsl::{Dtype, Weight};
 
 use super::model::Model;
+use checkpoint_dsl::{
+    Builder, Error, divided, encoding, extents, grouped, scaling, stored_encoding,
+};
 use model_dsl::Platform;
-use checkpoint_dsl::{Builder, Error, divided, encoding, extents, grouped, scaling, stored_encoding};
 
 const BANK_ROWS: u8 = 1;
 
@@ -65,7 +67,8 @@ impl Model {
 
     fn import_from(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
         // How many tensors one `read` covers depends on the weight's dtype,
@@ -140,7 +143,10 @@ impl Model {
                     // joined gate-first, same axis as `deinterleaved` above.
                     b.read_concat(
                         &mlp.gate_up_bias,
-                        [ck("mlp.experts.gate_proj.bias"), ck("mlp.experts.up_proj.bias")],
+                        [
+                            ck("mlp.experts.gate_proj.bias"),
+                            ck("mlp.experts.up_proj.bias"),
+                        ],
                     )?;
 
                     b.extend({
@@ -238,12 +244,7 @@ fn banked_split(
 
 /// The plane is on disk in the container this spelling promises, or the
 /// refusal names both.
-fn stored_as(
-    src: &ztensor::Source,
-    w: &Weight,
-    plane: &str,
-    want: DType,
-) -> Result<(), Error> {
+fn stored_as(src: &ztensor::Source, w: &Weight, plane: &str, want: DType) -> Result<(), Error> {
     let stored = stored_encoding(src, plane)?;
     if stored == Encoding::Raw(want) {
         return Ok(());
