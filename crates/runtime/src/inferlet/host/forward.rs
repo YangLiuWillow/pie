@@ -335,7 +335,7 @@ fn validate_bindings(
 }
 
 #[derive(Clone, Copy)]
-enum ChannelReadMode {
+pub(crate) enum ChannelReadMode {
     Take,
     Read,
 }
@@ -462,7 +462,7 @@ async fn materialize_channel(
 /// call, nothing else in the instance runs, and every await below is on
 /// engine-side progress (fire settlement, the reader wait slot) that never
 /// needs the store to advance.
-async fn materialize_channel_blocking(
+pub(crate) async fn materialize_channel_blocking(
     ctx: &mut ProcessCtx,
     this: Resource<Channel>,
     mode: ChannelReadMode,
