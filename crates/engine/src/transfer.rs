@@ -45,10 +45,7 @@ impl MemoryDomain {
     /// True for the domains the host may address directly.
     #[must_use]
     pub const fn host_visible(self) -> bool {
-        matches!(
-            self,
-            MemoryDomain::HostPinned | MemoryDomain::MetalShared
-        )
+        matches!(self, MemoryDomain::HostPinned | MemoryDomain::MetalShared)
     }
 }
 

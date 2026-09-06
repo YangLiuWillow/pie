@@ -80,10 +80,7 @@ mod tests {
             assert!(Runahead::of(frames).staging_depth() <= 64);
         }
         assert_eq!(Runahead::of(Runahead::MAX_FRAMES).staging_depth(), 61);
-        assert_eq!(
-            Runahead::of(u8::MAX).frames_in_flight,
-            Runahead::MAX_FRAMES
-        );
+        assert_eq!(Runahead::of(u8::MAX).frames_in_flight, Runahead::MAX_FRAMES);
         assert_eq!(Runahead::of(0).frames_in_flight, 1);
     }
 }

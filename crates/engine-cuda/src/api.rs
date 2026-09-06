@@ -18,7 +18,8 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, ReadoutSeam,
+    Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{
@@ -201,7 +202,7 @@ impl Cuda {
         self.boot.world.rank
     }
 
-        /// Rank 0's endpoint for channel `id`, for a follower to adopt.
+    /// Rank 0's endpoint for channel `id`, for a follower to adopt.
     #[must_use]
     pub fn endpoint(&self, id: ChannelId) -> Option<Arc<crate::program::Endpoint>> {
         self.channels.get(&id).cloned()
@@ -660,7 +661,10 @@ intended for diagnostics, not serving",
         // reading of the plan, so it is taken while the plan is still here.
         let patches = patch_ladder(&trace, &budgets);
         let classify = (self.classify_for)(&trace.name).ok_or_else(|| {
-            Error::Load(format!("this build ships no classifier for {:?}", trace.name))
+            Error::Load(format!(
+                "this build ships no classifier for {:?}",
+                trace.name
+            ))
         })?;
         let mut shell = Shell::load(Boot {
             classify,
@@ -1583,6 +1587,7 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
                 width,
                 values,
                 scores,
+                seam: ReadoutSeam::Logits,
             },
         });
     }
@@ -1676,7 +1681,6 @@ mod tests {
         assert_eq!(raised.max_patches, PATCH_LATTICE_FLOOR);
         assert_eq!(raised.buckets, vec![PATCH_LATTICE_FLOOR]);
     }
-
 }
 
 /// The artifact must be for this deployment, asked before a plane lands.
@@ -1753,8 +1757,8 @@ mod serving_stamp_tests {
     fn an_artifact_for_another_shell_is_refused_before_anything_is_opened() {
         let dir = tmp("cross");
         let foreign = artifact(&dir, "metal", "qwen_3");
-        let why = refuse(&foreign, "cuda", "qwen_3")
-            .expect_err("a metal artifact is not servable here");
+        let why =
+            refuse(&foreign, "cuda", "qwen_3").expect_err("a metal artifact is not servable here");
         let said = format!("{why}");
         for wanted in [
             "backend",
@@ -1772,5 +1776,4 @@ mod serving_stamp_tests {
             .expect("a cuda artifact serves on cuda");
         std::fs::remove_dir_all(&dir).ok();
     }
-
 }

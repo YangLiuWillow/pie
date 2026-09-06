@@ -98,7 +98,10 @@ pub trait Engine: Send + Sync {
     /// [`Error::Program`] for a declaration the shell can't allocate,
     /// [`Error::Unsupported`] from a shell with no guest-program plane or
     /// whose rings are its instances'.
-    fn register_channel(&mut self, registration: &ChannelRegistration) -> Result<RegisteredChannel> {
+    fn register_channel(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> Result<RegisteredChannel> {
         let _ = registration;
         Err(self.unsupported("register_channel"))
     }
@@ -146,12 +149,7 @@ pub trait Engine: Send + Sync {
     /// [`Error::Program`] for an unknown instance, an uncarried channel, or
     /// wrong cell width; [`Error::Unsupported`] from a shell with no
     /// guest-program plane.
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> Result<bool> {
+    fn publish_channel(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> Result<bool> {
         let _ = (instance, channel, cell);
         Err(self.unsupported("publish_channel"))
     }

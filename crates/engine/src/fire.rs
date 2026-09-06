@@ -235,6 +235,73 @@ pub struct Lane {
     pub channels: Vec<Ticket>,
     /// Which rows come back.
     pub readout: Readout,
+    /// The stream this lane's rows belong to (design D2: a lane is one
+    /// request's rows of ONE stream; a request with text and image rows
+    /// submits two lanes). Text by default, so every existing caller is a
+    /// text lane. Mirrors `model_ir::Stream` code for code.
+    #[serde(default)]
+    pub stream: LaneStream,
+    /// The attention group this lane joins — lanes of one request share a
+    /// group and attend each other's rows through `attention.ragged`.
+    /// `None` is a group of its own (every lane today).
+    #[serde(default)]
+    pub group: Option<u32>,
+    /// Which of the family's declared readings (arms) this lane runs
+    /// (`Request::in_reading`); 0 is the family's default arm.
+    #[serde(default)]
+    pub reading: u8,
+    /// Float input ports fed device-to-device from the lane's own channels'
+    /// COMMITTED cells at submit (design D3; the `SelfCondInput::channels`
+    /// precedent generalised). One entry per `(kind, port)` the reading
+    /// declares; a declared port with no feed is a refusal by name.
+    #[serde(default)]
+    pub ports: Vec<PortFeed>,
+}
+
+/// A lane's stream: which of the model's rectangles its rows belong to.
+/// Codes agree with `model_ir::Stream::code()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LaneStream {
+    /// Token rows (every lane today).
+    #[default]
+    Text = 0,
+    /// Image latent rows.
+    Image = 1,
+    /// Video latent rows.
+    Video = 2,
+    /// Audio latent rows.
+    Audio = 3,
+    /// Encoder-output rows (cross-attention keys/values).
+    Context = 4,
+    /// Reference-image latent rows (attend themselves only, D2).
+    Reference = 5,
+}
+
+/// Which float port a channel feeds. Mirrors the `RuntimeInput` kinds of
+/// `crates/model-ir/IMAGEGEN_CONTRACT.md` §2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PortKind {
+    /// `RuntimeInput::Latents { port, width }`: `[rows, width]` f32/bf16.
+    Latents,
+    /// `RuntimeInput::LaneVector { port, width }`: `[1, width]` f32 per lane.
+    LaneVector,
+    /// `RuntimeInput::Context { port, width }`: `[rows, width]` bf16.
+    Context,
+    /// `RuntimeInput::AxisPositions { port, axes }`: `[rows, axes]` f32.
+    AxisPositions,
+}
+
+/// One float port fed from a channel: the channel's committed cell at
+/// submit is the port's value for this lane's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PortFeed {
+    /// Which port kind.
+    pub kind: PortKind,
+    /// The family's index for a port of this kind (0 = the first/only one).
+    pub port: u8,
+    /// The engine-registered channel id (the same id space as
+    /// `SelfCondInput::channels`).
+    pub channel: u64,
 }
 
 impl Lane {
@@ -372,7 +439,8 @@ const F3_CHANNEL_TICKETS: &str =
     "Lane::channels against an engine without the pull-validate and commit-bump kernels";
 
 /// The verb spelling for the recurrent verbs an engine has no device half for.
-const RS_VERBS_WITHOUT_DEVICE_HALF: &str = "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
+const RS_VERBS_WITHOUT_DEVICE_HALF: &str =
+    "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
 const BIDIRECTIONAL_WITHOUT_ARM: &str =
     "Lane::bidirectional: this engine's attention applies its own causal bound and cannot lift it";
 
@@ -659,8 +727,7 @@ impl StepMedia {
                 self.embed_weights.len()
             )));
         }
-        if !self.token_positions.is_empty()
-            && self.token_positions.len() != 3 * lane_rows as usize
+        if !self.token_positions.is_empty() && self.token_positions.len() != 3 * lane_rows as usize
         {
             return Err(Error::Invalid(format!(
                 "lane {}'s trunk rotation stream carries {} entries for {lane_rows} \
@@ -755,7 +822,10 @@ impl Step {
                     media.lane
                 )));
             };
-            if self.media[..index].iter().any(|earlier| earlier.lane == media.lane) {
+            if self.media[..index]
+                .iter()
+                .any(|earlier| earlier.lane == media.lane)
+            {
                 return Err(Error::Invalid(format!(
                     "lane {} carries two media rows, at media row {index}; a lane's \
                      spans are one concatenation with one payload order",
@@ -853,8 +923,13 @@ pub struct LayerScores {
 pub struct LaneReadout {
     /// How many rows came back.
     pub rows: u32,
-    /// How wide each row is — the vocabulary, for logits.
+    /// How wide each row is — the vocabulary, for logits; the latent channel
+    /// width for a velocity readout; the hidden width for a hidden readout.
     pub width: u32,
+    /// Which export seam these values came off. Logits unless the plan
+    /// plants a float readout (`model_dsl::seam::{VELOCITY, HIDDEN}`).
+    #[serde(default)]
+    pub seam: ReadoutSeam,
     /// The values, row-major, `rows * width` of them.
     pub values: Vec<f32>,
     /// This lane's captured attention mass, one entry per attention layer the
@@ -862,6 +937,18 @@ pub struct LaneReadout {
     /// unless the lane set [`Lane::captures_scores`].
     #[serde(default)]
     pub scores: Vec<LayerScores>,
+}
+
+/// The export seam a readout row came off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReadoutSeam {
+    /// `seam::OUT`: logits, `[rows, vocab]`.
+    #[default]
+    Logits,
+    /// `seam::VELOCITY`: the denoiser's prediction, `[rows, C·p^k]`.
+    Velocity,
+    /// `seam::HIDDEN`: a hidden-state export, `[rows, W]`.
+    Hidden,
 }
 
 /// The receipt for one accepted fire. A synchronous shell fills
@@ -1009,13 +1096,7 @@ impl MediaEncode {
 }
 
 /// Does `indptr` partition `bytes` into `align`-aligned, ordered segments?
-fn partition(
-    indptr: &[u32],
-    name: &str,
-    bytes: usize,
-    align: usize,
-    strict: bool,
-) -> Result<()> {
+fn partition(indptr: &[u32], name: &str, bytes: usize, align: usize, strict: bool) -> Result<()> {
     if indptr.first().copied() != Some(0) {
         return Err(Error::Invalid(format!(
             "{name} starts at {:?}, not 0",

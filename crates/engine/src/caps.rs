@@ -2,8 +2,8 @@
 //! load of it can do ([`Capabilities`], what [`Loaded`](crate::load::Loaded)
 //! carries back).
 
-use serde::{Deserialize, Serialize};
 use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
+use serde::{Deserialize, Serialize};
 
 use crate::transfer::{KvHandle, MemoryDomain};
 

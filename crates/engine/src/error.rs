@@ -103,10 +103,7 @@ impl Error {
     /// failures — see the module header.
     #[must_use]
     pub const fn is_scheduling(&self) -> bool {
-        matches!(
-            self,
-            Error::Exhausted { .. } | Error::Impossible(_)
-        )
+        matches!(self, Error::Exhausted { .. } | Error::Impossible(_))
     }
 
     /// True only for [`Error::Exhausted`]: legal to resubmit unchanged once

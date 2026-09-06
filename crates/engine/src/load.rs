@@ -302,5 +302,4 @@ mod residency_tests {
             "statute, not exhaustion: freeing memory does not conjure a file"
         );
     }
-
 }
