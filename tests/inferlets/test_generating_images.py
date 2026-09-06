@@ -43,6 +43,29 @@ the run still succeeds and hands back a plausible latent for the wrong model.
 The `max_model_len` default of 4096 kills a 1024**2 job on its second fire
 ("this fire wants 8192 kv tokens in one slot").
 
+**AND SET `[runtime] submit_deadline` TO AT LEAST "1s" (WE RUN "10s"), OR THE
+CAPTION SILENTLY DOES NOT REACH THE MODEL.** A denoise frame composes an
+attention group out of two lanes -- the image lane and the context lane -- and
+a group forms only when both are members of ONE step. The scheduler holds the
+seal for a group still gathering, but the leash on that wait is
+`submit_deadline`, whose default is 50 ms. A flagship's context lane comes off
+a 4B-parameter trunk fire; when it misses the leash the frame seals with the
+image lane alone, the DiT attends its image rows with no caption, and the run
+SUCCEEDS -- handing back the textured field this docstring's other note
+describes. Measured on FLUX.2-klein-4B on 2026-09-06, one GPU, no neighbours:
+
+    submit_deadline    4-step 1024**2 runs of one prompt and seed
+    50 ms (default)    eager 1/3 correct, bodied 4/5 correct, and the wrong
+                       ones bit-identical to each other per trajectory -- it
+                       is a race, not a numerics wobble, so it reads exactly
+                       like non-determinism
+    10 s               6/6 correct, and every run bit-identical
+
+That is also why the wrong runs differ FROM EACH OTHER: how many of the four
+denoise frames lost the race varies. `graphs = "off"` does not make it go away
+(it makes it worse -- the eager text fire is slower, so it misses the leash
+more often), which is the tell that it is a scheduling race and not a body.
+
 The PNG needs an interpreter with torch + diffusers (`--python`); without
 `--model-dir` the run proves the loop and the file name and says so.
 """

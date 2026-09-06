@@ -22,6 +22,18 @@ The config must bind a generative row (`pie model list` marks one
 job is 4096 latent rows a lane and the frame carries two fires, so the 4096
 default refuses the second fire by name.
 
+It must also set **`[runtime] submit_deadline` to at least `"1s"`** (the
+harnesses run `"10s"`). A denoise frame composes an attention group out of the
+image lane and the context lane, and a group forms only when both are members
+of one step; the scheduler holds the seal for a group still gathering, but the
+leash on that wait is `submit_deadline`, whose default is 50 ms. A flagship's
+context lane comes off a 4B-parameter trunk fire, so at 50 ms it often misses
+the leash — and then the frame seals with the image lane alone, the model
+attends its image rows with NO CAPTION, and the run still succeeds. The
+picture that comes back is a plausible textured field with nothing of the
+prompt in it. Measured on FLUX.2-klein-4B: 50 ms gave 1 of 3 correct on the
+eager path and 4 of 5 bodied; `"10s"` gave 6 of 6, every run bit-identical.
+
 Two exits, and which one a model gets is its own fact.
 
 A row that declares a drivable `vae.decode` reading gets `./out/image.png`:
