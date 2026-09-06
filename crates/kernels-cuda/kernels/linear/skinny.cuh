@@ -70,6 +70,28 @@ __device__ __forceinline__ void skinny_ldmatrix_x4(unsigned (&reg)[4], const bf1
                  : "r"(addr));
 }
 
+/// An L2 policy: keep (the activation tile every block re-reads) or stream
+/// (the weight, read once).
+__device__ __forceinline__ unsigned long long skinny_policy(bool keep) {
+    unsigned long long policy;
+    if (keep) {
+        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(policy));
+    } else {
+        asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+    }
+    return policy;
+}
+
+/// One 16-byte `cp.async` under an L2 policy; grouped by the same
+/// `__pipeline_commit` / `__pipeline_wait_prior` as the intrinsic form.
+__device__ __forceinline__ void skinny_cp_async16(void* dst, const void* src, unsigned long long policy) {
+    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 :
+                 : "r"(d), "l"(src), "l"(policy)
+                 : "memory");
+}
+
 /// Round through bf16: the value the traced second pass would have read.
 __device__ __forceinline__ float skinny_round(float v) {
     return Elem<bf16>::to_f32(Elem<bf16>::from_f32(v));
@@ -151,6 +173,11 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
         }
     };
 
+    // The weight streams through L2 once; the activation tile is what
+    // every block re-reads, so it is the one to keep resident.
+    const unsigned long long stream_policy = skinny_policy(false);
+    const unsigned long long keep_policy = skinny_policy(true);
+
     // One stage: the block's weight rows and the live activation rows for
     // the k range, 16 bytes a chunk, eight adjacent threads per row so a
     // warp's fetch is four contiguous row pieces.
@@ -162,10 +189,10 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
             const int chunk = tid + i * kThreads;
             const int r = chunk / kChunksPerRow;
             const int c = (chunk % kChunksPerRow) * 8;
-            __pipeline_memcpy_async(
+            skinny_cp_async16(
                 wdst + r * kSkinnyLd + c,
                 w + static_cast<long long>(weight_row(r)) * k + k0 + c,
-                16);
+                stream_policy);
         }
 #pragma unroll
         for (int i = 0; i < kAChunks / kThreads; ++i) {
@@ -173,10 +200,10 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
             const int r = chunk / kChunksPerRow;
             const int c = (chunk % kChunksPerRow) * 8;
             if (r < m) {
-                __pipeline_memcpy_async(
+                skinny_cp_async16(
                     adst + r * kSkinnyLd + c,
                     act + static_cast<long long>(r) * k + k0 + c,
-                    16);
+                    keep_policy);
             }
         }
         __pipeline_commit();
