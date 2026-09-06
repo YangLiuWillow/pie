@@ -114,6 +114,10 @@ def drop_last(shape: Shape) -> Shape:
 class RngKind(IntEnum):
     UNIFORM = 0
     GUMBEL = 1
+    # Box-Muller's cosine branch over the two uniform lanes `2i` and `2i+1`
+    # (`eta_ir::rng::hash_normal`). The port only encodes the kind byte; the
+    # draw itself happens on the device.
+    NORMAL = 2
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +183,7 @@ class Intrinsic(IntEnum):
     LAYER = 5
     MTP_DRAFTS = 6
     ATTN_SCORE = 7
+    VELOCITY = 8
 
 
 class SinkScope(IntEnum):
@@ -233,6 +238,10 @@ class tags:  # noqa: N801
     ABS = 0x05
     SIGN = 0x06
     CAST = 0x07
+    SIN = 0x08
+    COS = 0x09
+    SQRT = 0x0A
+    RSQRT = 0x0B
     ADD = 0x10
     SUB = 0x11
     MUL = 0x12
@@ -292,6 +301,10 @@ OP_TABLE: dict[int, tuple[str, int, tuple[str, ...]]] = {
     tags.ABS: ("abs", 1, (VALUE,)),
     tags.SIGN: ("sign", 1, (VALUE,)),
     tags.CAST: ("cast", 1, (VALUE, DTYPE)),
+    tags.SIN: ("sin", 1, (VALUE,)),
+    tags.COS: ("cos", 1, (VALUE,)),
+    tags.SQRT: ("sqrt", 1, (VALUE,)),
+    tags.RSQRT: ("rsqrt", 1, (VALUE,)),
     tags.ADD: ("add", 1, (VALUE, VALUE)),
     tags.SUB: ("sub", 1, (VALUE, VALUE)),
     tags.MUL: ("mul", 1, (VALUE, VALUE)),

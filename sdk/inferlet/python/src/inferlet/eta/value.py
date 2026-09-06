@@ -67,6 +67,10 @@ __all__ = [
     "and_",
     "or_",
     "not_",
+    "sin",
+    "cos",
+    "sqrt",
+    "rsqrt",
     "select",
     "reshape",
     "broadcast",
@@ -95,6 +99,7 @@ __all__ = [
     "matmul",
     "gumbel",
     "rng",
+    "normal",
     "mask_apply",
     "causal_mask",
     "sliding_window_mask",
@@ -516,6 +521,22 @@ def log(x) -> Tensor:
     return _emit_unary(x, tags.LOG, _same)
 
 
+def sin(x) -> Tensor:
+    return _emit_unary(x, tags.SIN, _same)
+
+
+def cos(x) -> Tensor:
+    return _emit_unary(x, tags.COS, _same)
+
+
+def sqrt(x) -> Tensor:
+    return _emit_unary(x, tags.SQRT, _same)
+
+
+def rsqrt(x) -> Tensor:
+    return _emit_unary(x, tags.RSQRT, _same)
+
+
 def cast(x, to: Dtype) -> Tensor:
     """`x` converted elementwise to `to`. A cast to the dtype `x` already has
     is the identity and emits nothing."""
@@ -827,6 +848,12 @@ def gumbel(state, shape) -> Tensor:
 
 def rng(state, shape) -> Tensor:
     return _rng_noise(state, shape, RngKind.UNIFORM)
+
+
+def normal(state, shape) -> Tensor:
+    """Standard normal `N(0, 1)` noise keyed on the `[2]` u32 `[key, ctr]`
+    state, for a diffusion sampler's latent."""
+    return _rng_noise(state, shape, RngKind.NORMAL)
 
 
 def mask_apply(logits, mask) -> Tensor:

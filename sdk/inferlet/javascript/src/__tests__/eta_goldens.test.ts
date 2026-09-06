@@ -21,11 +21,13 @@ import {
   ConstData,
   Tensor,
   abs,
+  add,
   and,
   broadcast,
   cast,
   causalMask,
   constData,
+  cos,
   cummassLe,
   cumprod,
   cumsum,
@@ -50,8 +52,10 @@ import {
   matmul,
   maxElem,
   minElem,
+  mul,
   ne,
   neg,
+  normal,
   not,
   nucleusSample,
   or,
@@ -67,16 +71,19 @@ import {
   rem,
   reshape,
   rng,
+  rsqrt,
   rowMembership,
   scalarGather,
   scatterAdd,
   scatterSet,
   select,
   sign,
+  sin,
   sinkWindowMask,
   slidingWindowMask,
   softmax,
   sortDesc,
+  sqrt,
   topK,
   transpose,
 } from '../eta/value.js';
@@ -540,5 +547,79 @@ describe('beam golden', () => {
       poolIdsCh.putTensor(pids);
     });
     check('beam_step', b.build());
+  });
+});
+
+describe('sampler golden', () => {
+  // `sdk_goldens.rs::latent_step` — the image sampler's epilogue: the
+  // `velocity()` seam, an `N(0, 1)` draw, and the `sin`/`cos`/`sqrt`/`rsqrt`
+  // ops. The one golden carrying tags 0x08..0x0b, `RngKind.NORMAL` and
+  // `Intrinsic.VELOCITY`, so a port that drifts on any of them fails here.
+  it('latent_step', () => {
+    const rows = 8;
+    const channels = 16;
+    const tok = chFrom([1], dtype.i32, 'tok');
+    const indptrCh = chFrom([0, 1], dtype.u32, 'indptr');
+    const readout = chFrom(range(rows), dtype.u32, 'readout');
+    const kvLen = chFrom([rows], dtype.u32, 'kv_len');
+    const positions = chFrom(range(rows), dtype.u32, 'positions');
+    const pages = chFrom([0], dtype.u32, 'pages');
+    const pageIndptr = chFrom([0, divCeil(rows, PAGE)], dtype.u32, 'page_indptr');
+    const wSlot = chFrom(range(rows).map((q) => Math.floor(q / PAGE)), dtype.u32, 'w_slot');
+    const wOff = chFrom(range(rows).map((q) => q % PAGE), dtype.u32, 'w_off');
+    const latent = chNew([rows, channels], dtype.f32, 'latent');
+    const dsigma = chFrom([-0.25], dtype.f32, 'dsigma');
+    const rngCh = chFrom([9, 0], dtype.u32, 'rng');
+    const out = chNew([rows, channels], dtype.f32, 'latent_out');
+    const normOut = chNew([rows], dtype.f32, 'norms');
+    hostPut(latent, new Array(rows * channels).fill(0), dtype.f32);
+
+    const b = new Builder(VOCAB, PAGE);
+    bindGeometry(b, [
+      [Port.EMBED_TOKENS, tok], [Port.EMBED_INDPTR, indptrCh], [Port.KV_LEN, kvLen],
+      [Port.PAGES, pages], [Port.PAGE_INDPTR, pageIndptr], [Port.W_SLOT, wSlot],
+      [Port.W_OFF, wOff], [Port.POSITIONS, positions], [Port.READOUT, readout],
+    ]);
+    b.stage(Stage.EPILOGUE, () => {
+      positions.putTensor(positions.take());
+      wSlot.putTensor(wSlot.take());
+      wOff.putTensor(wOff.take());
+      const v = intrinsics.velocity(channels);
+      const x = latent.take();
+      const d = reshape(dsigma.read(), []);
+
+      const square = mul(v, v);
+      const energy = reduceSum(square);
+      const norm = sqrt(energy);
+      const guarded = add(energy, 1.0e-12);
+      const inverse = rsqrt(guarded);
+      const column = reshape(inverse, [rows, 1]);
+      const spread = broadcast(column, [rows, channels]);
+      const unit = mul(v, spread);
+
+      const ramp = cast(iota(channels), dtype.f32);
+      const rampRow = reshape(ramp, [1, channels]);
+      const rampPlane = broadcast(rampRow, [rows, channels]);
+      const angle = mul(rampPlane, d);
+      const sine = sin(angle);
+      const cosine = cos(angle);
+      const embedding = add(sine, cosine);
+
+      const r = rngCh.take();
+      const z = normal(r, [rows, channels]);
+      const drift = add(unit, embedding);
+      const step = mul(drift, d);
+      const jitter = mul(z, d);
+      const moved = add(x, step);
+      const stepped = add(moved, jitter);
+
+      latent.putTensor(stepped);
+      out.putTensor(stepped);
+      normOut.putTensor(norm);
+      rngCh.putTensor(add(r, iota(2)));
+    });
+    out.noteHostTake();
+    normOut.noteHostTake();
+    check('latent_step', b.build());
   });
 });

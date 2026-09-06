@@ -25,11 +25,13 @@ from inferlet.eta.value import (
     pack_elems,
     Tensor,
     abs_,
+    add,
     broadcast,
     and_,
     cast,
     causal_mask,
     const_data,
+    cos,
     cummass_le,
     cumprod,
     cumsum,
@@ -54,8 +56,10 @@ from inferlet.eta.value import (
     matmul,
     max_elem,
     min_elem,
+    mul,
     ne,
     neg,
+    normal,
     not_,
     nucleus_sample,
     or_,
@@ -70,16 +74,19 @@ from inferlet.eta.value import (
     rem,
     reshape,
     rng,
+    rsqrt,
     row_membership,
     scalar_gather,
     scatter_add,
     scatter_set,
     select,
     sign,
+    sin,
     sink_window_mask,
     sliding_window_mask,
     softmax,
     sort_desc,
+    sqrt,
     top_k,
     transpose,
 )
@@ -579,3 +586,77 @@ def test_beam_step_matches_rust():
 
     b.stage(Stage.EPILOGUE, epilogue)
     check("beam_step", b.build())
+
+
+def test_latent_step_matches_rust():
+    """`sdk_goldens.rs::latent_step` — the image sampler's epilogue: the
+    `velocity()` seam, an `N(0, 1)` draw, and the `sin`/`cos`/`sqrt`/`rsqrt`
+    ops. The one golden that carries tags 0x08..0x0b, `RngKind.NORMAL` and
+    `Intrinsic.VELOCITY`, so a port that drifts on any of them fails here."""
+    rows, channels = 8, 16
+    tok = ch_from([1], dtype.i32, "tok")
+    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
+    readout = ch_from(range(rows), dtype.u32, "readout")
+    kv_len = ch_from([rows], dtype.u32, "kv_len")
+    positions = ch_from(range(rows), dtype.u32, "positions")
+    pages = ch_from([0], dtype.u32, "pages")
+    page_indptr = ch_from([0, -(-rows // PAGE)], dtype.u32, "page_indptr")
+    w_slot = ch_from([q // PAGE for q in range(rows)], dtype.u32, "w_slot")
+    w_off = ch_from([q % PAGE for q in range(rows)], dtype.u32, "w_off")
+    latent = ch_new([rows, channels], dtype.f32, "latent")
+    dsigma = ch_from([-0.25], dtype.f32, "dsigma")
+    rng_ch = ch_from([9, 0], dtype.u32, "rng")
+    out = ch_new([rows, channels], dtype.f32, "latent_out")
+    norm_out = ch_new([rows], dtype.f32, "norms")
+    host_put(latent, [0.0] * (rows * channels), dtype.f32)
+
+    b = Builder(VOCAB, PAGE)
+    for port, c in [
+        (Port.EMBED_TOKENS, tok), (Port.EMBED_INDPTR, indptr_ch), (Port.KV_LEN, kv_len),
+        (Port.PAGES, pages), (Port.PAGE_INDPTR, page_indptr), (Port.W_SLOT, w_slot),
+        (Port.W_OFF, w_off), (Port.POSITIONS, positions), (Port.READOUT, readout),
+    ]:
+        b.bind_port(port, c)
+
+    def epilogue():
+        positions.put_tensor(positions.take())
+        w_slot.put_tensor(w_slot.take())
+        w_off.put_tensor(w_off.take())
+        v = intrinsics.velocity(channels)
+        x = latent.take()
+        d = reshape(dsigma.read(), [])
+
+        square = mul(v, v)
+        energy = reduce_sum(square)
+        norm = sqrt(energy)
+        guarded = add(energy, 1.0e-12)
+        inverse = rsqrt(guarded)
+        column = reshape(inverse, [rows, 1])
+        spread = broadcast(column, [rows, channels])
+        unit = mul(v, spread)
+
+        ramp = cast(iota(channels), dtype.f32)
+        ramp_row = reshape(ramp, [1, channels])
+        ramp_plane = broadcast(ramp_row, [rows, channels])
+        angle = mul(ramp_plane, d)
+        sine = sin(angle)
+        cosine = cos(angle)
+        embedding = add(sine, cosine)
+
+        r = rng_ch.take()
+        z = normal(r, [rows, channels])
+        drift = add(unit, embedding)
+        step = mul(drift, d)
+        jitter = mul(z, d)
+        moved = add(x, step)
+        stepped = add(moved, jitter)
+
+        latent.put_tensor(stepped)
+        out.put_tensor(stepped)
+        norm_out.put_tensor(norm)
+        rng_ch.put_tensor(add(r, iota(2)))
+
+    b.stage(Stage.EPILOGUE, epilogue)
+    out.note_host_take()
+    norm_out.note_host_take()
+    check("latent_step", b.build())

@@ -411,6 +411,88 @@ fn beam_step() -> Traced {
     b.build().unwrap()
 }
 
+/// The image sampler's epilogue in small (design D4): a `velocity()` read, a
+/// keyed `N(0, 1)` draw, one Euler step `x <- x + dsigma * v`, a sinusoidal
+/// term the IR could not spell before `sin`/`cos`, and the row norms an APG
+/// rescale wants a real `sqrt`/`rsqrt` for. Its reason for existing is the
+/// wire bytes: it is the one program here that carries tags 0x08..0x0B,
+/// `RngKind::Normal` and `IntrinsicId::Velocity`, so the Python and
+/// JavaScript ports cannot drift on any of them unnoticed.
+///
+/// Written as one binding per op, deliberately: the ports must emit the same
+/// nodes in the same order, and a nested call's argument order is one more
+/// thing three languages have to agree on.
+fn latent_step() -> Traced {
+    let rows = 8u32;
+    let channels = 16u32;
+    let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
+    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
+    let readout: &'static Channel = leak(Channel::from((0..rows).collect::<Vec<_>>()).named("readout"));
+    let kv_len: &'static Channel = leak(Channel::from([rows]).named("kv_len"));
+    let positions: &'static Channel = leak(Channel::from((0..rows).collect::<Vec<_>>()).named("positions"));
+    let pages: &'static Channel = leak(Channel::from([0u32]).named("pages"));
+    let page_indptr: &'static Channel = leak(Channel::from([0u32, rows.div_ceil(PAGE)]).named("page_indptr"));
+    let w_slot: &'static Channel = leak(Channel::from((0..rows).map(|p| p / PAGE).collect::<Vec<_>>()).named("w_slot"));
+    let w_off: &'static Channel = leak(Channel::from((0..rows).map(|p| p % PAGE).collect::<Vec<_>>()).named("w_off"));
+    let latent: &'static Channel = leak(Channel::new([rows, channels], dtype::f32).named("latent"));
+    let dsigma: &'static Channel = leak(Channel::from([-0.25f32]).named("dsigma"));
+    let rng_ch: &'static Channel = leak(Channel::from([9u32, 0]).named("rng"));
+    let out: &'static Channel = leak(Channel::new([rows, channels], dtype::f32).named("latent_out"));
+    let norm_out: &'static Channel = leak(Channel::new([rows], dtype::f32).named("norms"));
+    latent.put(vec![0.0f32; (rows * channels) as usize]);
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.bind_port(Port::EmbedTokens, tok);
+    b.bind_port(Port::EmbedIndptr, indptr_ch);
+    b.bind_port(Port::KvLen, kv_len);
+    b.bind_port(Port::Pages, pages);
+    b.bind_port(Port::PageIndptr, page_indptr);
+    b.bind_port(Port::WSlot, w_slot);
+    b.bind_port(Port::WOff, w_off);
+    b.bind_port(Port::Positions, positions);
+    b.bind_port(Port::Readout, readout);
+    b.stage(Stage::Epilogue, move || {
+        positions.put(positions.take());
+        w_slot.put(w_slot.take());
+        w_off.put(w_off.take());
+        let v = intrinsics::velocity(channels);
+        let x = latent.take();
+        let d = reshape(dsigma.read(), []);
+
+        let square = mul(&v, &v);
+        let energy = reduce_sum(&square);
+        let norm = sqrt(&energy);
+        let guarded = add(&energy, 1.0e-12f32);
+        let inverse = rsqrt(&guarded);
+        let column = reshape(&inverse, [rows, 1]);
+        let spread = broadcast(&column, [rows, channels]);
+        let unit = mul(&v, &spread);
+
+        let ramp = cast(iota(channels), dtype::f32);
+        let ramp_row = reshape(&ramp, [1, channels]);
+        let ramp_plane = broadcast(&ramp_row, [rows, channels]);
+        let angle = mul(&ramp_plane, &d);
+        let sine = sin(&angle);
+        let cosine = cos(&angle);
+        let embedding = add(&sine, &cosine);
+
+        let r = rng_ch.take();
+        let z = normal(&r, [rows, channels]);
+        let drift = add(&unit, &embedding);
+        let step = mul(&drift, &d);
+        let jitter = mul(&z, &d);
+        let moved = add(&x, &step);
+        let stepped = add(&moved, &jitter);
+
+        latent.put(&stepped);
+        out.put(&stepped);
+        norm_out.put(&norm);
+        rng_ch.put(add(&r, iota(2)));
+    });
+    out.note_host_take();
+    norm_out.note_host_take();
+    b.build().unwrap()
+}
+
 fn programs() -> Vec<(&'static str, Traced)> {
     vec![
         ("s3", s3()),
@@ -420,6 +502,7 @@ fn programs() -> Vec<(&'static str, Traced)> {
         ("sinks", sinks()),
         ("diffusion_step", diffusion_step()),
         ("beam_step", beam_step()),
+        ("latent_step", latent_step()),
     ]
 }
 
@@ -448,4 +531,20 @@ fn sdk_port_goldens_are_pinned() {
         );
     }
     assert_eq!(pinned.lines().count(), rendered.lines().count());
+}
+
+/// The new-op program is not only encodable but bindable: `velocity()` is
+/// gated and width-checked, so a golden that traced a shape no model serves
+/// would pin bytes nothing can run.
+#[test]
+fn the_latent_step_binds_against_a_denoising_model() {
+    let profile = eta_ir::registry::ModelProfile {
+        vocab: VOCAB,
+        page_size: PAGE,
+        has_velocity: true,
+        velocity_width: 16,
+        ..eta_ir::registry::ModelProfile::dummy()
+    };
+    eta_ir::validate::bind(latent_step().container().clone(), profile)
+        .expect("the latent step binds against a model that predicts a velocity");
 }
