@@ -232,6 +232,14 @@ impl<F> Refine for Input<F> {
 }
 
 impl<F> Input<F> {
+    /// The trace's recorder, for a wrapper that reads no activation and so
+    /// has no value to take it from — a table computed from weights alone
+    /// ([`ops::elemwise::relative_bucket_bias`](crate::ops::elemwise::relative_bucket_bias)).
+    #[must_use]
+    pub fn recorder(&self) -> &Recorder {
+        &self.rec
+    }
+
     /// The inputs of one class of rows each, cut by `spec` — the same
     /// algorithm and conds [`Value::split`] uses, so an `Input` arm and a
     /// `Value` arm taken with the same spec meet without complaint.

@@ -487,6 +487,39 @@ pub enum Elementwise {
         scale: f32,
         y: ValueId,
     },
+    /// The dense relative-position bias table a bidirectional encoder
+    /// layer's attention adds to its logits
+    /// ([`RaggedMask::RelativeBias`](super::attn::RaggedMask::RelativeBias)):
+    /// `y[h][d + max_len − 1] = embedding[bucket(d)][h]` for every signed
+    /// distance `d = kj − qi` in `−(max_len − 1) ..= max_len − 1`, where
+    /// `bucket` is the T5 relative-position bucket function — Hugging Face's
+    /// `_relative_position_bucket(relative_position = memory_position −
+    /// context_position, bidirectional, num_buckets, max_distance)`:
+    ///
+    /// ```text
+    /// bucket = 0
+    /// if bidirectional: num_buckets /= 2; bucket += (d > 0) · num_buckets; n = |d|
+    /// else:             n = −min(d, 0)
+    /// max_exact = num_buckets / 2
+    /// if n < max_exact: bucket + n
+    /// else: bucket + min(num_buckets − 1, max_exact +
+    ///           trunc(ln(n / max_exact) / ln(max_distance / max_exact) · (num_buckets − max_exact)))
+    /// ```
+    ///
+    /// (the logarithms' ratio in f32, as torch computes it). `embedding` is
+    /// the checkpoint's `[num_buckets, heads]` plane
+    /// (`relative_attention_bias.weight`, bf16 or f32) and `y` is
+    /// `[heads, 2·max_len − 1]` f32, a constant of the plan: computed from a
+    /// weight alone, it depends on no row of any axis. `max_len` is the
+    /// longest segment the table answers exactly.
+    RelativeBucketBias {
+        embedding: ValueId,
+        max_len: u32,
+        num_buckets: u32,
+        max_distance: f32,
+        bidirectional: bool,
+        y: ValueId,
+    },
     /// `x = x · sigmoid(x)`, in place. [`SiluScaled`](Elementwise::SiluScaled)
     /// at `s = 1`, named so a text does not spell a scale it does not have.
     Silu {
@@ -710,6 +743,7 @@ impl Operands for Elementwise {
                 sink.extend(*lane_of_row);
             }
             Self::Sinusoid { t, .. } => sink.push(*t),
+            Self::RelativeBucketBias { embedding, .. } => sink.push(*embedding),
             Self::Silu { x, .. } => sink.push(*x),
             Self::Gelu { x, .. } => sink.push(*x),
             Self::Tanh { x, .. } => sink.push(*x),
@@ -785,6 +819,7 @@ impl Operands for Elementwise {
                 sink.extend([*r_out, *normed, *out]);
             }
             Self::Sinusoid { y, .. } => sink.push(*y),
+            Self::RelativeBucketBias { y, .. } => sink.push(*y),
             Self::Silu { x_out, .. } => sink.push(*x_out),
             Self::Gelu { x_out, .. } => sink.push(*x_out),
             Self::Tanh { x_out, .. } => sink.push(*x_out),
@@ -846,6 +881,7 @@ impl Operands for Elementwise {
             // output are fresh, since an alias may name only an input.
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::Sinusoid { .. } => {}
+            Self::RelativeBucketBias { .. } => {}
             Self::Silu { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Gelu { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Tanh { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -899,6 +935,7 @@ impl Operands for Elementwise {
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::Sinusoid { .. } => "elementwise.sinusoid",
+            Self::RelativeBucketBias { .. } => "elementwise.relative_bucket_bias",
             Self::Silu { .. } => "elementwise.silu",
             Self::Gelu { .. } => "elementwise.gelu",
             Self::Tanh { .. } => "elementwise.tanh",

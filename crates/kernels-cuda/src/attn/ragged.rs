@@ -9,7 +9,8 @@
 //!
 //! **The kernel** is the vendored FlashInfer FA2 template
 //! `BatchPrefillWithRaggedKVCacheKernel` (`MaskMode::kNone`, or `kCustom`
-//! under the per-group reference mask; NHD layout, bf16 in, fp32
+//! under the per-group reference mask, or `kNone` with the additive
+//! relative-bias variant on its logits hook; NHD layout, bf16 in, fp32
 //! accumulation, online softmax, bf16 out) — the same tensor-core kernel
 //! `attention.prefill` runs, reading k/v straight out of two row-major
 //! rectangles. The paged arms take a host-built plan; this one builds its
@@ -37,7 +38,8 @@
 
 use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::fa2_abi::{
-    PrefillRaggedParams, PrefillRaggedRefParams, UintFastdiv, sm_scale_or_default,
+    PrefillRaggedBiasParams, PrefillRaggedParams, PrefillRaggedRefParams, UintFastdiv,
+    sm_scale_or_default,
 };
 use crate::attn::kv;
 use crate::attn::plan::Device;
@@ -82,6 +84,20 @@ pub enum RaggedMask {
     /// Counted the same on both sides, it is meant for the self-attention
     /// reading, where the query and key tables agree.
     ReferenceSelfOnly { ref_start: Tensor },
+    /// Every row of a group attends every key of the group, and an additive
+    /// per-head bias that depends only on the signed distance `kj − qi`
+    /// (both group-relative) is added to each scaled logit:
+    /// `s = q·k · sm_scale + table[h][clamp(kj − qi + max_len − 1, 0,
+    /// 2·max_len − 2)]`. `table` is `f32`, `[q_heads, 2·max_len − 1]`
+    /// row-major, handed whole — one row per QUERY head, so a grouped kv
+    /// head's queries each read their own row. Distances past `±(max_len −
+    /// 1)` read the table's end columns, so a table built at the longest
+    /// segment the fire may hold is exact, and one built shorter saturates
+    /// (which is the T5 bucket function's own behaviour past
+    /// `max_distance`). The umT5 relative position bias (a dense table per
+    /// layer, `elemwise::relative_bucket_bias`) and an ALiBi slope table
+    /// both fit.
+    RelativeBias { table: Tensor, max_len: u32 },
 }
 
 /// FlashInfer's own CTA tile for the query axis at this head width, for
@@ -341,6 +357,41 @@ pub fn ragged(
                 &PrefillRaggedRefParams {
                     base: params,
                     ref_start: ref_start.ptr,
+                },
+            )
+        }
+        RaggedMask::RelativeBias { table, max_len } => {
+            // The variant multiplies the raw logit by the block's `sm_scale`
+            // (already defaulted above) before the add, and scales the online
+            // softmax by `log2e` alone.
+            let span = max_len
+                .checked_mul(2)
+                .and_then(|n| n.checked_sub(1))
+                .filter(|_| max_len > 0)
+                .ok_or_else(|| {
+                    refuse(
+                        OP,
+                        format!("a relative bias over {max_len} positions has no table width"),
+                    )
+                })?;
+            if table.dtype != Dtype::F32 || table.rows < num_q_heads || table.width != span {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "the relative bias table is {} x {} {:?}; the arm reads one f32 row of \
+                         {span} (2 · {max_len} − 1) per query head, {num_q_heads} of them",
+                        table.rows, table.width, table.dtype
+                    ),
+                ));
+            }
+            fa2::prefill_ragged(
+                ctx,
+                OP,
+                point(RaggedArm::RelativeBias),
+                &PrefillRaggedBiasParams {
+                    base: params,
+                    bias: table.ptr,
+                    max_len,
                 },
             )
         }
