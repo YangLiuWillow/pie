@@ -153,15 +153,81 @@ def run_mini_pad(d: str, device="cpu", dtype=torch.float32):
     npz_keys(tap)
 
 
+def run_taps(d: str, dtype=torch.bfloat16):
+    """The Turbo transformer ALONE (bf16, CUDA) over the step-0 inputs the full
+    golden recorded, with every stage tapped — the bisect a failing
+    `zimage_parity.py --turbo` needs — twice: `taps.full.*` on the golden's own
+    1024x1024 call and `taps.crop.*` on its top-left 256x256 crop (256 image
+    rows), so a long-sequence failure reads as one.  Keys per case:
+    `in.x.0 [16,1,H,W]`, `in.cap.0 [L,2560]`, `in.t [1]`, `cap.embed [L32,3840]`,
+    `cap.refined [L32,3840]` (after the context refiner), `x.embed [N32,3840]`,
+    `x.refined [N32,3840]` (after the noise refiner), `layer{i}.out
+    [N32+L32,3840]` (after joint block i), `out.0 [16,1,H,W]`."""
+    from diffusers import ZImageTransformer2DModel
+
+    src = np.load(os.path.join(d, "zimage_golden.npz"))
+    m = ZImageTransformer2DModel.from_pretrained(REPO, subfolder="transformer", torch_dtype=dtype).to("cuda").eval()
+    tap = Tap()
+
+    def forward(case: str, x: torch.Tensor, cap: torch.Tensor, t: torch.Tensor):
+        p = f"taps.{case}."
+        tap.put(p + "in.x.0", x); tap.put(p + "in.cap.0", cap); tap.put(p + "in.t", t)
+        handles = []
+
+        def on(module, key, pick=lambda o: o):
+            def hook(_m, _i, out):
+                tap.put(p + key, pick(out)[0] if pick(out).ndim == 3 else pick(out))
+            handles.append(module.register_forward_hook(hook))
+
+        on(m.cap_embedder, "cap.embed")
+        on(m.context_refiner[-1], "cap.refined")
+        on(m.all_x_embedder["2-1"], "x.embed")
+        on(m.noise_refiner[-1], "x.refined")
+        for i, layer in enumerate(m.layers):
+            # every joint block on the crop; the full case (63 MB a tap) keeps three
+            if case != "full" or i in (0, len(m.layers) // 2, len(m.layers) - 1):
+                on(layer, f"layer{i}.out")
+        if case == "tiny":
+            # inside the first noise-refiner block: the sublayer boundaries
+            b0 = m.noise_refiner[0]
+            on(b0.attention_norm1, "b0.norm1")
+            handles.append(b0.attention.to_out[0].register_forward_pre_hook(
+                lambda _m, args: tap.put(p + "b0.attn", args[0][0])))
+            on(b0.attention, "b0.out")
+            on(b0.attention_norm2, "b0.norm2")
+            on(b0.ffn_norm1, "b0.ffn_norm1")
+            on(b0.feed_forward, "b0.ffn")
+            on(b0.ffn_norm2, "b0.ffn_norm2")
+            on(b0, "b0.res2")
+        with torch.no_grad():
+            out = m([x], t, [cap], return_dict=False)[0]
+        for h in handles:
+            h.remove()
+        tap.put_tree(p + "out", out)
+
+    x = torch.from_numpy(src["dit.step0.in.arg0.0"]).to("cuda", dtype)
+    cap = torch.from_numpy(src["dit.step0.in.arg2.0"]).to("cuda", dtype)
+    t = torch.from_numpy(src["dit.step0.in.arg1"]).to("cuda", dtype)
+    forward("full", x, cap, t)
+    forward("crop", x[:, :, :32, :32].contiguous(), cap, t)
+    # 32 image rows: small enough that a 3840-wide tap reads back through
+    # the worker link (its frame ceiling is around a megabyte)
+    forward("tiny", x[:, :, :8, :16].contiguous(), cap, t)
+    tap.save(os.path.join(d, "zimage_taps.npz"))
+    npz_keys(tap)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
     ap.add_argument("--mini-pad", action="store_true",
                     help="the padded-rows forward of the --mini weights (zimage_mini_pad.npz)")
+    ap.add_argument("--taps", action="store_true",
+                    help="the Turbo transformer's stages over the step-0 inputs (zimage_taps.npz; CUDA, ~13 GB)")
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
-    if not (a.full or a.mini or a.mini_pad):
+    if not (a.full or a.mini or a.mini_pad or a.taps):
         a.full = a.mini = a.mini_pad = True
     d = outdir(MODEL)
     torch.set_grad_enabled(False)
@@ -169,6 +235,8 @@ def main():
         print("== mini =="); run_mini(d, a.device)
     if a.mini_pad:
         print("== mini-pad =="); run_mini_pad(d, a.device)
+    if a.taps:
+        print("== taps =="); run_taps(d)
     if a.full:
         print("== full =="); run_full(d)
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED,

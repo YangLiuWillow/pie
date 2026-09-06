@@ -195,7 +195,7 @@ impl Model {
                 ),
             ],
             readout: ReadoutKind::Velocity,
-            readout_width: PATCH_FEATURES,
+            readout_width: match std::env::var("ZIMAGE_TAP").as_deref() { Ok("") | Err(_) | Ok("latents") => PATCH_FEATURES, Ok("pad_flag") => 1, Ok("pad_mod") => 2 * d.dim, Ok(_) => d.dim },
         });
         Generative {
             readings,
@@ -442,13 +442,17 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
         mask: RaggedMask::None,
     };
     let x = img.latents(port::LATENTS, PATCH_FEATURES, Dtype::Bf16);
+    let tap = std::env::var("ZIMAGE_TAP").unwrap_or_default();
+    let mut tapped: Option<Value> = None;
+    if tap == "latents" { tapped = Some(x.clone()); }
     let x = linear(&m.x_embed, &x);
-    let mut x = pad_rows(
-        &x,
-        &img.latents(port::PAD_IMAGE, 1, Dtype::Bf16),
-        &m.x_pad_mod,
-    );
-    for (_, block) in img.walk_layers(&m.noise_refiner) {
+    if tap == "x_linear" { tapped = Some(x.clone()); }
+    let flag = img.latents(port::PAD_IMAGE, 1, Dtype::Bf16);
+    if tap == "pad_flag" { tapped = Some(flag.clone()); }
+    if tap == "pad_mod" { tapped = Some(ops::linear::matmul(&flag, &m.x_pad_mod)); }
+    let mut x = pad_rows(&x, &flag, &m.x_pad_mod);
+    if tap == "x_embed" { tapped = Some(x.clone()); }
+    for (l, block) in img.walk_layers(&m.noise_refiner) {
         let mods = adaln4(
             &linear(
                 block.ada.as_ref().expect("a noise refiner is modulated"),
@@ -456,15 +460,21 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
             ),
             d.dim,
         );
-        x = run_block(&x, block, Some((&mods, &img_lanes)), d, &own);
+        if l == 0 && tap == "normed0" { tapped = Some(ops::elemwise::rmsnorm(&x, &block.attn_norm1, NORM_EPS)); }
+        if l == 0 && tap == "scaled0" {
+            let h = ops::elemwise::rmsnorm(&x, &block.attn_norm1, NORM_EPS);
+            tapped = Some(ops::elemwise::modulate(&h, &mods.scale_msa, Some(&img_lanes), ModulateForm::Scale));
+        }
+        x = if l == 0 { run_block_tapped(&x, block, Some((&mods, &img_lanes)), d, &own, &tap, &mut tapped) } else { run_block(&x, block, Some((&mods, &img_lanes)), d, &own) };
     }
 
+    if tap == "x_refined" { tapped = Some(x.clone()); }
     // ---- the caption lane: already refined, pads included ---------------
     let c = ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16);
 
     // ---- the joint trunk over `[image ‖ caption]` ------------------------
     let mut u = Value::merge(vec![x, c]);
-    for (_, block) in arm.walk_layers(&m.layers) {
+    for (l, block) in arm.walk_layers(&m.layers) {
         let mods = adaln4(
             &linear(
                 block.ada.as_ref().expect("a joint block is modulated"),
@@ -473,6 +483,7 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
             d.dim,
         );
         u = run_block(&u, block, Some((&mods, &lanes)), d, &joint);
+        if tap == format!("layer{l}") { seam::at(seam::VELOCITY, &[&u]); tapped = Some(u.clone()); }
     }
 
     // ---- the final layer, image rows only ---------------------------------
@@ -481,15 +492,18 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     let scale = linear(&m.final_ada, &ops::elemwise::silu(&temb));
     let (scale_img, _) = scale.split(&Facts::image());
     let (ui, _) = u.split(&Facts::image());
+
     let h = ops::elemwise::modulate(
         &ops::elemwise::layernorm_no_scale(&ui, FINAL_LN_EPS),
         &scale_img,
         Some(&img_lanes),
         ModulateForm::Scale,
     );
+    if tap == "final_norm" { tapped = Some(h.clone()); }
     let v = linear(&m.final_linear, &h);
     // The reference pipeline's `noise_pred = -noise_pred`.
     let velocity = ops::elemwise::mul_scalar(-1.0, &v);
+    if let Some(t) = tapped { if tap.starts_with("layer") { return ui; } seam::at(seam::VELOCITY, &[&t]); return t; }
     seam::at(seam::VELOCITY, &[&velocity]);
     velocity
 }
@@ -562,7 +576,8 @@ fn adaln4(m: &Value, dim: u32) -> Mods {
 /// with the scales and gates dropped for the unmodulated kind. Attention is
 /// `to_qkv` → per-head QK RMSNorm → three-axis interleaved rope → ragged
 /// attention over the packed segments → `to_out`; the MLP is SwiGLU.
-fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &Geom) -> Value {
+fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &Geom) -> Value { run_block_tapped(x, b, mods, d, g, "", &mut None) }
+fn run_block_tapped(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &Geom, tap: &str, sink: &mut Option<Value>) -> Value {
     let dim = d.dim;
     let hd = d.head_dim;
     let scaled = |normed: &Value, s: &Value, lanes: &Value| {
@@ -587,6 +602,9 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         )
     };
     let (q, k) = (turn(&q, &b.attn.q_norm), turn(&k, &b.attn.k_norm));
+    if tap == "b0.q" { *sink = Some(q.clone()); }
+    if tap == "b0.k" { *sink = Some(k.clone()); }
+    if tap == "b0.v" { *sink = Some(v.clone()); }
     let o = ops::attn::ragged(
         &ops::layout::pack_rows(&q, &g.perm),
         &ops::layout::pack_rows(&k, &g.perm),
@@ -598,12 +616,16 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         g.mask,
     );
     let o = ops::layout::unpack_rows(&o, &g.perm);
+    if tap == "b0.attn" { *sink = Some(o.clone()); }
     let o = ops::linear::matmul(&o, &b.attn.out);
+    if tap == "b0.out" { *sink = Some(o.clone()); }
     let o = ops::elemwise::rmsnorm(&o, &b.attn_norm2, NORM_EPS);
+    if tap == "b0.norm2" { *sink = Some(o.clone()); }
     let x = match mods {
         Some((m, lanes)) => ops::elemwise::gated_residual_add(x, &m.gate_msa, &o, Some(lanes)),
         None => ops::elemwise::residual_add(&o, x),
     };
+    if tap == "b0.res1" { *sink = Some(x.clone()); }
 
     let h = ops::elemwise::rmsnorm(&x, &b.ffn_norm1, NORM_EPS);
     let h = match mods {
@@ -614,11 +636,15 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         &ops::linear::mlp_swiglu(&ops::linear::matmul(&h, &b.mlp.gate_up), d.inter),
         &b.mlp.down,
     );
+    if tap == "b0.ffn" { *sink = Some(f.clone()); }
     let f = ops::elemwise::rmsnorm(&f, &b.ffn_norm2, NORM_EPS);
-    match mods {
+    if tap == "b0.ffn_norm2" { *sink = Some(f.clone()); }
+    let out = match mods {
         Some((m, lanes)) => ops::elemwise::gated_residual_add(&x, &m.gate_mlp, &f, Some(lanes)),
         None => ops::elemwise::residual_add(&f, &x),
-    }
+    };
+    if tap == "b0.res2" { *sink = Some(out.clone()); }
+    out
 }
 
 // `TE_HIDDEN` is the caption width the flagship's `refine` port states;
