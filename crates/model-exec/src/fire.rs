@@ -41,6 +41,7 @@ pub use compose::{
     compose_axes, rung_of, chunk_spans, pass_spans};
 pub use descriptor::{
     ABI_VERSION, CLASS_BYTES, FireDescriptor, HEADER_BYTES, LANE_BYTES, MAGIC, PATCH_LANE_BYTES,
+    VOXEL_LANE_BYTES,
 };
 pub use fallback::{Serve, answers as fallback_answers, fragmentable, max_runs};
 pub use sink::{EagerSink, EventId, Sink};
