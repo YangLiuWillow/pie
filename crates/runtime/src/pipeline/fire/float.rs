@@ -124,6 +124,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         ..crate::engine::FireRequest::default()
     };
     lane_facts.stamp(&mut req);
+    req.cohort = crate::pipeline::instance::cohort_of(ctx.resources(), lane_facts.group);
     {
         let pass = ctx.resources().get(&fwd)?;
         let program = &pass.instance.program;

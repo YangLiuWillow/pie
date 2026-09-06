@@ -239,6 +239,25 @@ impl LaneFacts {
     }
 }
 
+/// The size of attention group `group`'s cohort in this process: every
+/// `ForwardPass` in the table that names it, bound or not (a sibling still
+/// to bind will submit; the gate's leash bounds the wait for one that never
+/// does). `None` for a pass in no group. Stamped on a request at submit —
+/// not at bind, when the siblings may not have named the group yet.
+#[must_use]
+pub fn cohort_of(
+    table: &mut wasmtime::component::ResourceTable,
+    group: Option<u32>,
+) -> Option<u32> {
+    let group = group?;
+    let members = table
+        .iter_mut()
+        .filter_map(|entry| entry.downcast_ref::<ForwardPass>())
+        .filter(|pass| pass.bindings.group == Some(group))
+        .count();
+    Some(u32::try_from(members).unwrap_or(u32::MAX).max(1))
+}
+
 /// A catalog stream as the engine's lane stream (codes agree).
 #[must_use]
 pub fn lane_stream_of(stream: models::Stream) -> ::engine::fire::LaneStream {

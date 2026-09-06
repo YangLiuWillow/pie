@@ -52,6 +52,14 @@ pub struct FireRequest {
     /// [`lanes`](FireRequest::lanes) (a submission can't know which step it
     /// co-batches into); `scheduler::batch` rebases it on concatenation.
     pub media: Vec<engine::fire::StepMedia>,
+    /// **THE ATTENTION GROUP'S COHORT** (design D2): how many passes of this
+    /// request's process name the group its lanes join, this one included.
+    /// A group composes only when its passes are members of ONE step, and
+    /// the wait-all gate cannot await a pipeline it has never seen — so the
+    /// scheduler holds the seal, leashed by the submit deadline, until this
+    /// many lanes of the group have arrived for their first frame. `None`
+    /// for a pass in no group.
+    pub cohort: Option<u32>,
 }
 
 impl FireRequest {

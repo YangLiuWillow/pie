@@ -223,6 +223,21 @@ struct LaneState {
     fired_this_boundary: bool,
 }
 
+/// One attention group's first-frame gathering: which pipelines have
+/// arrived under it, out of how many its passes declared.
+#[derive(Debug)]
+struct Cohort {
+    expected: u32,
+    arrived: BTreeSet<ProcessId>,
+    since: Instant,
+}
+
+impl Cohort {
+    fn complete(&self) -> bool {
+        self.arrived.len() as u64 >= u64::from(self.expected)
+    }
+}
+
 /// The wait-all gate's verdict for one lane — [`LaneState::gate_verdict`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GateVerdict {
@@ -340,6 +355,15 @@ pub(super) struct FramePolicy {
     /// Bind controls accepted but not yet completed. Binds don't hold the
     /// seal — a live rebinder is covered by its own lane membership.
     pending_binds: BTreeMap<ProcessId, usize>,
+    /// **ATTENTION-GROUP COHORTS STILL GATHERING** (design D2), keyed by
+    /// `(owner, group)`. A group composes only when its passes are members
+    /// of one step, and the gate can await only pipelines it has seen: the
+    /// first lane of a fresh group would seal alone. So a lane's first
+    /// arrival under a group holds the seal until the cohort its request
+    /// declares has arrived, leashed by the submit deadline like any silent
+    /// member. Steady state needs none of this — every member is awaited
+    /// then — so a cohort is dropped the moment it completes.
+    cohorts: BTreeMap<(ProcessId, u32), Cohort>,
     /// Successor pool: bring-up processes whose lane hasn't fired yet.
     /// While `pending_slots > 0`, one of these is about to take a slot,
     /// opening the cohort-boundary window.
@@ -449,6 +473,7 @@ impl FramePolicy {
             last_retire_at: None,
             idle_dumped: false,
             pending_binds: BTreeMap::new(),
+            cohorts: BTreeMap::new(),
             staged: BTreeSet::new(),
             pending_slots: 0,
             joins_in_flight: BTreeSet::new(),
@@ -486,8 +511,10 @@ impl FramePolicy {
         fire_id: u64,
         tokens: usize,
         rows: usize,
+        cohort: Option<(u32, u32)>,
     ) {
         let accept_began = self.stats.is_some().then(Instant::now);
+        self.gather_cohort(stamp.lane, owner, cohort);
         self.record_arrival(
             stamp,
             owner,
@@ -522,6 +549,49 @@ impl FramePolicy {
                 rows: 0,
             },
         );
+    }
+
+    /// A lane arrived under attention group `cohort = (group, expected)`:
+    /// on its FIRST arrival it joins the group's cohort, which holds the
+    /// gate until `expected` lanes have. A lane the gate already awaits is
+    /// covered by wait-all and joins nothing.
+    fn gather_cohort(
+        &mut self,
+        lane: ProcessId,
+        owner: Option<ProcessId>,
+        cohort: Option<(u32, u32)>,
+    ) {
+        let (Some(owner), Some((group, expected))) = (owner, cohort) else {
+            return;
+        };
+        if self.lanes.contains_key(&lane) {
+            return;
+        }
+        let entry = self.cohorts.entry((owner, group)).or_insert_with(|| Cohort {
+            expected,
+            arrived: BTreeSet::new(),
+            since: Instant::now(),
+        });
+        // A later member may count more siblings than the first did (one
+        // named the group after the first submitted): the largest claim is
+        // the cohort's.
+        entry.expected = entry.expected.max(expected);
+        entry.arrived.insert(lane);
+        if entry.complete() {
+            self.cohorts.remove(&(owner, group));
+        }
+    }
+
+    /// How many attention-group cohorts are still gathering: each holds
+    /// the gate like a missing member, until it completes or has waited
+    /// the submit deadline out (a sibling that never submits is the
+    /// guest's bug, and costs it a boundary, not the fleet).
+    fn cohorts_missing(&mut self, now: Instant) -> usize {
+        let leash = self.submit_deadline;
+        self.cohorts.retain(|_, cohort| {
+            !cohort.complete() && now.saturating_duration_since(cohort.since) < leash
+        });
+        self.cohorts.len()
     }
 
     fn record_arrival(&mut self, stamp: FrameStamp, owner: Option<ProcessId>, fire: ArrivedFire) {
@@ -809,6 +879,7 @@ impl FramePolicy {
         }
         if let Some(owner) = owner {
             self.pending_binds.remove(&owner);
+        self.cohorts.retain(|(who, _), _| *who != owner);
             self.forget_staged(owner);
         }
         self.maybe_reset_episode();
@@ -830,6 +901,7 @@ impl FramePolicy {
         }
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
+        self.cohorts.retain(|(who, _), _| *who != owner);
         self.suspended.remove(&owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
@@ -864,6 +936,7 @@ impl FramePolicy {
             }
         }
         self.pending_binds.remove(&owner);
+        self.cohorts.retain(|(who, _), _| *who != owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
     }
@@ -1326,8 +1399,9 @@ ready_age_newest={}us",
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame isn't fully
-            // submitted; an idle member is waited for like any other.
-            let mut missing = 0usize;
+            // submitted; an idle member is waited for like any other — and
+            // an attention group still gathering its first frame's cohort.
+            let mut missing = self.cohorts_missing(now);
             // The submit deadline's clock is armed here per lane: it stops
             // only for debts owed to this lane, and isn't gated on
             // `executing` — a silent member must be found even while
@@ -1596,9 +1670,9 @@ mod tests {
         let (a, b) = (pid(), pid());
         // Lane a: full decode frame (4 fires). Lane b: chunk in slot 0 only.
         for slot in 0..4 {
-            policy.on_fire_enqueued(stamp(a, 0, slot, 4), Some(a), 100 + slot as u64, 1, 1);
+            policy.on_fire_enqueued(stamp(a, 0, slot, 4), Some(a), 100 + slot as u64, 1, 1, None);
         }
-        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1, None);
 
         let queued: QueuedFireIds = [100, 101, 102, 103, 200].into_iter().collect();
         let sealed = plan(&mut policy, &queued, Instant::now());
@@ -1615,6 +1689,75 @@ mod tests {
         assert_eq!(waves[3], vec![103]);
     }
 
+    /// **A GROUP'S FIRST FRAME WAITS FOR ITS COHORT** (design D2): three
+    /// passes of one process name attention group 7 and each declares a
+    /// cohort of three; the gate has never seen the other two pipelines, so
+    /// without the cohort the first would seal alone and attend alone. It
+    /// holds instead, until the third arrives — then one frame, one wave,
+    /// all three — and steady state needs no cohort at all (every member is
+    /// awaited by then).
+    #[test]
+    fn a_grouped_lanes_first_frame_waits_for_its_cohort() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(Duration::from_secs(86_400));
+        let owner = pid();
+        let (caption, context, image) = (pid(), pid(), pid());
+        let now = Instant::now();
+
+        policy.on_fire_enqueued(stamp(caption, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 3)));
+        let queued: QueuedFireIds = [1].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)),
+            "the first lane of a cohort of three must not seal alone"
+        );
+        policy.on_fire_enqueued(stamp(context, 0, 0, 1), Some(owner), 2, 16, 1, Some((7, 3)));
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert!(
+            matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)),
+            "two of three still hold"
+        );
+        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 3, 64, 1, Some((7, 3)));
+        let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
+        let mut sealed = fires(&plan(&mut policy, &queued, now));
+        sealed.sort_unstable();
+        assert_eq!(sealed, vec![1, 2, 3], "the whole cohort seals into one frame");
+        assert!(policy.cohorts.is_empty(), "a complete cohort is forgotten");
+
+        // Steady state: the three are members now, and wait-all holds for
+        // the slow one without any cohort bookkeeping.
+        policy.on_fire_enqueued(stamp(caption, 1, 0, 1), Some(owner), 4, 8, 1, Some((7, 3)));
+        policy.on_fire_enqueued(stamp(image, 1, 0, 1), Some(owner), 5, 64, 1, Some((7, 3)));
+        let queued: QueuedFireIds = [4, 5].into_iter().collect();
+        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)));
+        assert!(policy.cohorts.is_empty());
+        policy.on_fire_enqueued(stamp(context, 1, 0, 1), Some(owner), 6, 16, 1, Some((7, 3)));
+        let queued: QueuedFireIds = [4, 5, 6].into_iter().collect();
+        let mut sealed = fires(&plan(&mut policy, &queued, now));
+        sealed.sort_unstable();
+        assert_eq!(sealed, vec![4, 5, 6]);
+    }
+
+    /// The cohort's leash: a sibling that never submits is the guest's bug
+    /// and costs it a boundary, not the fleet — past the submit deadline the
+    /// gate seals with who is there.
+    #[test]
+    fn a_cohort_that_never_completes_is_released_by_the_submit_deadline() {
+        let leash = Duration::from_millis(50);
+        let mut policy = FramePolicy::new(1, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(leash);
+        let owner = pid();
+        let lone = pid();
+        let now = Instant::now();
+        policy.on_fire_enqueued(stamp(lone, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
+        let queued: QueuedFireIds = [1].into_iter().collect();
+        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)));
+        let later = now + leash + Duration::from_millis(1);
+        assert_eq!(fires(&plan(&mut policy, &queued, later)), vec![1]);
+        assert!(policy.cohorts.is_empty(), "an expired cohort is dropped");
+    }
+
     /// Wait-all regression: an incomplete lane blocks the seal (the
     /// watchdog reports, never evicts); once it completes, the epoch seals dense.
     #[test]
@@ -1625,10 +1768,10 @@ mod tests {
             .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_secs(86_400));
         let (fast, slow) = (pid(), pid());
-        policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
-        policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);
+        policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1, None);
+        policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1, None);
         // `slow` declared 2 fires but only one arrived: a missing member.
-        policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 3, 1, 1);
+        policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 3, 1, 1, None);
 
         let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
@@ -1648,7 +1791,7 @@ mod tests {
         }
 
         // The straggler completes: one dense epoch, both lanes' slot-0.
-        policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1);
+        policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1, None);
         let queued: QueuedFireIds = [1, 2, 3, 4].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("all lanes ready: the epoch must seal");
@@ -1663,8 +1806,8 @@ mod tests {
     fn sealed_frame_dispatches_whole_and_frames_overlap() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
-        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
-        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1, None);
+        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1, None);
         let queued: QueuedFireIds = [50, 51].into_iter().collect();
         let FramePlan::Dispatch(frame0) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("expected lane a's whole frame");
@@ -1673,10 +1816,10 @@ mod tests {
         // Mid-execution (worker in flight), a straggler submits its first
         // frame and lane a its next: the wait-all gate holds, so f+1 seals
         // now and dispatches whole behind the executing frame.
-        policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1);
-        policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1);
-        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1);
-        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1, None);
+        policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1, None);
+        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1, None);
+        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1, None);
         let queued: QueuedFireIds = [52, 53, 60, 61].into_iter().collect();
         let FramePlan::Dispatch(merged) =
             policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())
@@ -1699,10 +1842,10 @@ mod tests {
             let (x, y) = (pid(), pid());
             if x < y { (x, y) } else { (y, x) }
         };
-        policy.on_fire_enqueued(stamp(victim, 0, 0, 2), Some(victim), 100, 1, 1);
-        policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1);
-        policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1);
-        policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 0, 0, 2), Some(victim), 100, 1, 1, None);
+        policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1, None);
+        policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1, None);
+        policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1, None);
         let queued: QueuedFireIds = [100, 101, 102, 103].into_iter().collect();
         assert!(matches!(
             plan(&mut policy, &queued, Instant::now()),
@@ -1712,9 +1855,9 @@ mod tests {
         // The planner evicts the victim, then its slot 0 for the next frame
         // lands (already past the eviction fence); slot 1 cannot follow.
         policy.on_process_suspend(victim);
-        policy.on_fire_enqueued(stamp(victim, 1, 0, 2), Some(victim), 200, 1, 1);
-        policy.on_fire_enqueued(stamp(healthy, 1, 0, 2), Some(healthy), 300, 1, 1);
-        policy.on_fire_enqueued(stamp(healthy, 1, 1, 2), Some(healthy), 301, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 1, 0, 2), Some(victim), 200, 1, 1, None);
+        policy.on_fire_enqueued(stamp(healthy, 1, 0, 2), Some(healthy), 300, 1, 1, None);
+        policy.on_fire_enqueued(stamp(healthy, 1, 1, 2), Some(healthy), 301, 1, 1, None);
         assert!(
             !policy.lanes[&victim].awaited,
             "a suspended owner's arrival must not rejoin the wait-set"
@@ -1734,9 +1877,9 @@ mod tests {
         // Post-restore, the late slot stands alone rather than re-forming an
         // unsatisfiable 2-slot frame under a seq that already sealed.
         policy.on_process_resume(victim);
-        policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
-        policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1);
-        policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1, None);
+        policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1, None);
+        policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1, None);
         let queued: QueuedFireIds = [201, 302, 303].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("the late slot must seal");
@@ -1744,8 +1887,8 @@ mod tests {
         assert_eq!(waves[1], vec![201, 303], "the late slot keeps its wave");
 
         // Fully rejoined: the next boundary waits for the victim again.
-        policy.on_fire_enqueued(stamp(victim, 2, 0, 2), Some(victim), 400, 1, 1);
-        policy.on_fire_enqueued(stamp(victim, 2, 1, 2), Some(victim), 401, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 2, 0, 2), Some(victim), 400, 1, 1, None);
+        policy.on_fire_enqueued(stamp(victim, 2, 1, 2), Some(victim), 401, 1, 1, None);
         assert!(
             policy.lanes[&victim].awaited,
             "a resumed process rejoins on its next frame"
@@ -1758,7 +1901,7 @@ mod tests {
     fn a_lane_parked_mid_frame_seals_what_it_submitted() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1, None);
         policy.on_lane_leave(lane, Some(lane), false);
         let queued: QueuedFireIds = [10].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
@@ -1772,8 +1915,8 @@ mod tests {
     fn truncated_frame_seals_with_submitted_fires_only() {
         let mut policy = FramePolicy::new(4, 64, 4096, None);
         let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 4), Some(lane), 30, 1, 1);
-        policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 4), Some(lane), 30, 1, 1, None);
+        policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1, None);
         // Host submit failed after 2 slots.
         policy.on_frame_truncated(lane, 0, 2);
         let queued: QueuedFireIds = [30, 31].into_iter().collect();
@@ -1791,14 +1934,14 @@ mod tests {
     fn graceful_close_releases_the_wait() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
-        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1);
-        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1, None);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1, None);
         let queued: QueuedFireIds = [90, 91].into_iter().collect();
         let bootstrap = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&bootstrap).len(), 2);
 
         // b resubmits; a does not, so the gather blocks on a.
-        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1, None);
         let queued: QueuedFireIds = [92].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
@@ -1820,7 +1963,7 @@ mod tests {
         policy.on_bind_enqueued(Some(executing));
         policy.on_bind_completed(Some(executing));
         policy.on_execution_slot_consumed(executing);
-        policy.on_fire_enqueued(stamp(executing, 0, 0, 1), Some(executing), 95, 1, 1);
+        policy.on_fire_enqueued(stamp(executing, 0, 0, 1), Some(executing), 95, 1, 1, None);
         // A retirement's release is consumed by an uncontended admission
         // elsewhere, while a later process binds and stages.
         policy.on_execution_slot_released(pid());

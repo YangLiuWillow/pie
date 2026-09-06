@@ -3068,12 +3068,19 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
+                        let cohort = launch
+                            .request
+                            .lanes
+                            .first()
+                            .and_then(|lane| lane.group)
+                            .zip(launch.request.cohort);
                         frame_policy.on_fire_enqueued(
                             stamp,
                             launch.process_id,
                             launch.logical_fire_id,
                             launch.request.tokens(),
                             launch.wire_row_count(),
+                            cohort,
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -4495,6 +4502,7 @@ mod tests {
                             lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
                             media: Vec::new(),
+                            voxels: Vec::new(),
                         },
                         terminal_cells: Vec::new(),
                         instances: vec![0],
@@ -4587,6 +4595,7 @@ mod tests {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
                         media: Vec::new(),
+                        voxels: Vec::new(),
                     },
                     terminal_cells: Vec::new(),
                     instances: vec![0],

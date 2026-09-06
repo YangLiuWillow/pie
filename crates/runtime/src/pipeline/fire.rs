@@ -1430,6 +1430,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         geometry.apply_to(&mut req);
         // Reading, stream, group and port feeds ride every lane (D1/D2).
         ctx.resources().get(&fwd)?.lane.stamp(&mut req);
+        let group = ctx.resources().get(&fwd)?.lane.group;
+        req.cohort = crate::pipeline::instance::cohort_of(ctx.resources(), group);
         // Every fire through here fires a `BoundForwardPass`: the engine
         // runs its pass after the forward with this lane's logits row bound
         // as the `logits` intrinsic.
@@ -2906,6 +2908,8 @@ async fn fire_device_geometry<C: FireContext>(
     };
     rs_prepared.apply_to(&mut req);
     ctx.resources().get(&fwd)?.lane.stamp(&mut req);
+    let group = ctx.resources().get(&fwd)?.lane.group;
+    req.cohort = crate::pipeline::instance::cohort_of(ctx.resources(), group);
     // A lane of several rows reads out the rows its `readout` port names
     // (all of a verify window's, for the verifier), lane-relative; the port
     // is a seeded, never-put channel, so the host shadow knows it. One token
