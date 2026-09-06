@@ -240,6 +240,10 @@ fn unary_f(which : u32, a : u32, j : u32) -> f32 {
       if (x < 0.0) { return -1.0; }
       return 0.0;
     }
+    case 7u: { return sin(x); }
+    case 8u: { return cos(x); }
+    case 9u: { return sqrt(x); }
+    case 10u: { return 1.0 / sqrt(x); }
     default: { return x; }
   }
 }
@@ -258,6 +262,10 @@ fn unary_i(which : u32, a : u32, j : u32) -> i32 {
       return abs(v);
     }
     case 5u: { return sign(ld_i(a, j)); }
+    case 7u: { return i32(sin(ld_f(a, j))); }
+    case 8u: { return i32(cos(ld_f(a, j))); }
+    case 9u: { return i32(sqrt(ld_f(a, j))); }
+    case 10u: { return i32(1.0 / sqrt(ld_f(a, j))); }
     default: { return ld_i(a, j); }
   }
 }
@@ -270,6 +278,10 @@ fn unary_u(which : u32, a : u32, j : u32) -> u32 {
     case 2u: { return 0u - ld_u(a, j); }
     case 4u: { return ld_u(a, j); }
     case 5u: { return select(0u, 1u, ld_u(a, j) != 0u); }
+    case 7u: { return u32(sin(ld_f(a, j))); }
+    case 8u: { return u32(cos(ld_f(a, j))); }
+    case 9u: { return u32(sqrt(ld_f(a, j))); }
+    case 10u: { return u32(1.0 / sqrt(ld_f(a, j))); }
     default: { return ld_u(a, j); }
   }
 }
@@ -1047,6 +1059,16 @@ fn rng_hash_uniform(seed_eff : U64, index : u32) -> f32 {
   return 0.99999994;
 }
 
+/// `hash_normal`: Box-Muller's cosine branch over the two uniform lanes
+/// `2*index` and `2*index + 1` (`eta_ir::rng::hash_normal`).
+fn rng_hash_normal(seed_eff : U64, index : u32) -> f32 {
+  let lane = index * 2u;
+  let u0 = rng_hash_uniform(seed_eff, lane);
+  let u1 = rng_hash_uniform(seed_eff, lane + 1u);
+  let radius = sqrt(-2.0 * log(u0));
+  return radius * cos(6.2831855 * u1);
+}
+
 fn op_rng(p : u32, keyed : bool) {
   let o = p_o0(p);
   let n = d_len(o);
@@ -1060,10 +1082,11 @@ fn op_rng(p : u32, keyed : bool) {
   } else {
     seed = rng_seed_eff_stream(0u, p_imm(p));
   }
-  let gumbel = p_kind(p) == 1u;
+  let kind = p_kind(p);
   for (var i : u32 = tid; i < n; i = i + lanes) {
+    if (kind == 2u) { st_f(o, i, rng_hash_normal(seed, i)); continue; }
     let u = rng_hash_uniform(seed, i);
-    if (gumbel) { st_f(o, i, -log(-log(u))); } else { st_f(o, i, u); }
+    if (kind == 1u) { st_f(o, i, -log(-log(u))); } else { st_f(o, i, u); }
   }
 }
 
@@ -1586,6 +1609,10 @@ fn ptir_step(p : u32) {
     case 0x05u: { map_unary(p, 4u); }
     case 0x06u: { map_unary(p, 5u); }
     case 0x07u: { map_unary(p, 6u); }
+    case 0x08u: { map_unary(p, 7u); }
+    case 0x09u: { map_unary(p, 8u); }
+    case 0x0Au: { map_unary(p, 9u); }
+    case 0x0Bu: { map_unary(p, 10u); }
     // arithmetic
     case 0x10u: { bin_arith(p, 0u); }
     case 0x11u: { bin_arith(p, 1u); }

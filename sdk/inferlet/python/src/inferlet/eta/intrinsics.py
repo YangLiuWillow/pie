@@ -56,6 +56,14 @@ def hidden(width: int) -> Tensor:
     return intrinsic_val(Intrinsic.HIDDEN, shape_of([rows, max(width, 1)]), activation_type)
 
 
+def velocity(width: int) -> Tensor:
+    """The flow-matching velocity a denoise reading predicts, `[n_out, width]`
+    F32 at the epilogue. `width` is declared, as `hidden`'s is, but bind
+    checks it against the model's `velocity_width`."""
+    rows = max(current_rows(), 1)
+    return intrinsic_val(Intrinsic.VELOCITY, shape_of([rows, max(width, 1)]), activation_type)
+
+
 def query(width: int) -> Tensor:
     """This layer's projected query (attn taps), `[width]`."""
     return intrinsic_val(Intrinsic.QUERY, shape_of([max(width, 1)]), activation_type)

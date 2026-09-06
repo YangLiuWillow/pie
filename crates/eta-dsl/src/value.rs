@@ -607,6 +607,25 @@ pub fn exp(x: impl AsTensor) -> Tensor {
 pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
+/// `sin(x)` elementwise, radians; `F32` only, shape preserved.
+pub fn sin(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Sin, |t| t)
+}
+/// `cos(x)` elementwise, radians; `F32` only, shape preserved.
+pub fn cos(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Cos, |t| t)
+}
+/// `sqrt(x)` elementwise; `F32` only, shape preserved. The real op, not the
+/// `exp(0.5 * log(x))` identity `l2norm` expands to — that spelling turns
+/// `sqrt(0)` into `0 * -inf` and pays two transcendentals for it.
+pub fn sqrt(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Sqrt, |t| t)
+}
+/// `1 / sqrt(x)` elementwise; `F32` only, shape preserved — one op, since a
+/// normalization scale is what a norm is almost always wanted for.
+pub fn rsqrt(x: impl AsTensor) -> Tensor {
+    emit_unary(&x, Op::Rsqrt, |t| t)
+}
 /// `x` converted elementwise to dtype `to`, shape preserved. A cast to the
 /// dtype `x` already has is the identity and returns `x` unchanged rather
 /// than emitting an op — useful since a cast is often applied to a value
@@ -1106,6 +1125,15 @@ pub fn gumbel(state: impl AsTensor, shape: impl IntoShape) -> Tensor {
 /// `rng(state, shape)` — state-keyed uniform `[0,1)` noise, same determinism.
 pub fn rng(state: impl AsTensor, shape: impl IntoShape) -> Tensor {
     rng_noise(state, shape, RngKind::Uniform)
+}
+/// `normal(state, shape)` — standard normal `N(0, 1)` noise, keyed the same
+/// way `rng`/`gumbel` are: a pure function of the `[2]` U32 `[key, ctr]`
+/// state and the element index, so a resubmitted denoise step that advances
+/// `ctr` draws fresh noise and a replay of the same state draws the same
+/// noise. Box-Muller's cosine branch over two uniform lanes an element
+/// (`eta_ir::rng::hash_normal`).
+pub fn normal(state: impl AsTensor, shape: impl IntoShape) -> Tensor {
+    rng_noise(state, shape, RngKind::Normal)
 }
 fn rng_noise(state: impl AsTensor, shape: impl IntoShape, kind: RngKind) -> Tensor {
     let s = shape.into_shape();

@@ -85,6 +85,13 @@ declare_intrinsics! {
     /// `[num_heads, kv_len]` F32 — `OnAttn` only; model-gated. Softmax
     /// attention weights over live KV, for eviction policies.
     AttnScore = 7, ATTN_SCORE, "attn_score";
+    /// `[n_out, C]` F32 — epilogue only; model-gated. The flow-matching
+    /// velocity the denoise reading predicts for each latent row, the
+    /// quantity a diffusion sampler's Euler step integrates. Width is the
+    /// model's latent channel count, cross-checked at bind against
+    /// [`ModelProfile::velocity_width`](crate::registry::ModelProfile::velocity_width)
+    /// the way `logits` is against `vocab`.
+    Velocity = 8, VELOCITY, "velocity";
 }
 
 /// An ETA stage-body op. Docs here give meaning only; wire tags live on the
@@ -103,6 +110,18 @@ pub enum Op {
     Neg(ValueId),
     /// Element-wise `1/x`, F32 only.
     Recip(ValueId),
+    /// Element-wise sine, radians, F32 only.
+    Sin(ValueId),
+    /// Element-wise cosine, radians, F32 only.
+    Cos(ValueId),
+    /// Element-wise square root, F32 only. A first-class op rather than the
+    /// `exp(0.5·log(x))` idiom `l2norm` expands to: that identity loses
+    /// `sqrt(0) = 0` and costs two transcendentals where every backend has
+    /// one correctly-rounded instruction.
+    Sqrt(ValueId),
+    /// Element-wise reciprocal square root, F32 only — `1/sqrt(x)`, the
+    /// shape a normalization scale is actually used in.
+    Rsqrt(ValueId),
     /// Element-wise absolute value.
     Abs(ValueId),
     /// Element-wise sign as `-1` / `0` / `+1` in the input dtype.
@@ -446,6 +465,10 @@ impl Op {
             | Op::Log(..)
             | Op::Neg(..)
             | Op::Recip(..)
+            | Op::Sin(..)
+            | Op::Cos(..)
+            | Op::Sqrt(..)
+            | Op::Rsqrt(..)
             | Op::Abs(..)
             | Op::Sign(..)
             | Op::Cast { .. }
@@ -512,6 +535,10 @@ impl Op {
             | Op::Log(..)
             | Op::Neg(..)
             | Op::Recip(..)
+            | Op::Sin(..)
+            | Op::Cos(..)
+            | Op::Sqrt(..)
+            | Op::Rsqrt(..)
             | Op::Abs(..)
             | Op::Sign(..)
             | Op::Cast { .. }
@@ -612,6 +639,10 @@ declare_operands! {
         | Op::Log(a)
         | Op::Neg(a)
         | Op::Recip(a)
+        | Op::Sin(a)
+        | Op::Cos(a)
+        | Op::Sqrt(a)
+        | Op::Rsqrt(a)
         | Op::Abs(a)
         | Op::Sign(a)
         | Op::Cast { value: a, .. }
@@ -823,6 +854,10 @@ declare_ops! {
     SIGN = 0x06, "sign", Map, 1, 1, Op::Sign(0), Op::Sign(_), [Value];
     CAST = 0x07, "cast", Map, 1, 1,
         Op::Cast { value: 0, dtype: Dtype::I32 }, Op::Cast { .. }, [Value, Dtype];
+    SIN = 0x08, "sin", Map, 1, 1, Op::Sin(0), Op::Sin(_), [Value];
+    COS = 0x09, "cos", Map, 1, 1, Op::Cos(0), Op::Cos(_), [Value];
+    SQRT = 0x0A, "sqrt", Map, 1, 1, Op::Sqrt(0), Op::Sqrt(_), [Value];
+    RSQRT = 0x0B, "rsqrt", Map, 1, 1, Op::Rsqrt(0), Op::Rsqrt(_), [Value];
     ADD = 0x10, "add", Map, 2, 1, Op::Add(0, 1), Op::Add(..), [Value, Value];
     SUB = 0x11, "sub", Map, 2, 1, Op::Sub(0, 1), Op::Sub(..), [Value, Value];
     MUL = 0x12, "mul", Map, 2, 1, Op::Mul(0, 1), Op::Mul(..), [Value, Value];

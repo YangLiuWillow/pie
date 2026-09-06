@@ -17,6 +17,12 @@
 //! row sums — every construct whose row-view lowering has bitten, in one
 //! row-parallel region plus its library `top_k`. Skips (passing) when no
 //! device is present.
+//!
+//! A third program is the diffusion sampler's half: a keyed `N(0, 1)` draw
+//! and the four F32 unaries (`sin`, `cos`, `sqrt`, `rsqrt`) added for it. Its
+//! failure mode is the one the file was written for — a device arm that
+//! quietly computes a different function, which no end-to-end sampler would
+//! flag because the output is still noise of about the right shape.
 use engine::ProgramRegistration;
 use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::compile::Disk;
@@ -344,4 +350,139 @@ fn the_acceptance_rule_agrees_with_the_interpreter() {
     assert_eq!(got[4], want[4].to_le_bytes(), "the sort's permutation");
     let accepted = bools(&want[0]).iter().filter(|&&b| b).count();
     assert!(accepted > 0 && accepted < ROWS as usize, "the bound should split the rows, accepted {accepted}");
+}
+
+
+// ── The sampler's own arithmetic: a Gaussian draw and four transcendentals ──
+
+const LATENT: u32 = 0;
+const STATE: u32 = 1;
+const GAUSSIAN: u32 = 2;
+const SINE: u32 = 3;
+const COSINE: u32 = 4;
+const PYTHAGORAS: u32 = 5;
+const ROOT: u32 = 6;
+const INVERSE_ROOT: u32 = 7;
+const UNITY: u32 = 8;
+const STEPPED: u32 = 9;
+
+const WIDTH: u32 = 16;
+
+/// The shape a diffusion epilogue's noise injection has: a keyed `N(0, 1)`
+/// draw over the whole latent rectangle, the four F32 unaries the sampler's
+/// trigonometry and norms need, and one Euler-style `x + z` to prove the
+/// draw is a value and not just a channel put.
+///
+/// On the tolerance: `1e-6` relative, not exact bits. The device spells the
+/// Box-Muller transform expression for expression with
+/// `eta_ir::rng::hash_normal` and reads the same two uniform lanes, but
+/// `logf`/`cosf` on the device and `ln`/`cos` in Rust's libm are each within
+/// a few ulp of the true value and not always the same few. This is the
+/// slack `RngKind::Gumbel` has always had -- its `-logf(-logf(u))` is one
+/// call deeper into the same libraries -- and it is orders of magnitude
+/// below any scale a sampler is sensitive to. What is exact is the
+/// *integer* half: the seed, the lane pairing and the uniform draws, which
+/// is what a wrong pairing or a drifted constant would break.
+fn sampler_arithmetic() -> TraceContainer {
+    use eta_ir::types::RngKind;
+    let plane = Shape::matrix(ROWS, WIDTH);
+    let ops = vec![
+        Op::ChanRead(STATE),                                                   // 0
+        Op::RngKeyed { state: 0, shape: plane, kind: RngKind::Normal },        // 1 z
+        Op::ChanTake(LATENT),                                                  // 2 x
+        Op::Sin(2),                                                            // 3
+        Op::Cos(2),                                                            // 4
+        Op::Mul(3, 3),                                                         // 5
+        Op::Mul(4, 4),                                                         // 6
+        Op::Add(5, 6),                                                         // 7 sin^2 + cos^2
+        Op::Sqrt(2),                                                           // 8
+        Op::Rsqrt(2),                                                          // 9
+        Op::Mul(8, 9),                                                         // 10 sqrt * rsqrt
+        Op::Add(2, 1),                                                         // 11 x + z
+        Op::ChanPut { chan: GAUSSIAN, value: 1 },
+        Op::ChanPut { chan: SINE, value: 3 },
+        Op::ChanPut { chan: COSINE, value: 4 },
+        Op::ChanPut { chan: PYTHAGORAS, value: 7 },
+        Op::ChanPut { chan: ROOT, value: 8 },
+        Op::ChanPut { chan: INVERSE_ROOT, value: 9 },
+        Op::ChanPut { chan: UNITY, value: 10 },
+        Op::ChanPut { chan: STEPPED, value: 11 },
+    ];
+    TraceContainer {
+        names: Vec::new(),
+        channels: vec![
+            seeded(plane, Dtype::F32),
+            seeded(Shape::vector(2), Dtype::U32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+            reader(plane, Dtype::F32),
+        ],
+        ports: Vec::new(),
+        stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+        externs: Vec::new(),
+    }
+}
+
+/// A latent whose entries are strictly positive (so `sqrt`/`rsqrt` are
+/// defined) and span two decades (so a scale error in either shows).
+fn latent() -> Vec<f32> {
+    (0..(ROWS * WIDTH) as usize)
+        .map(|i| 0.05 + (i % 97) as f32 * 0.11)
+        .collect()
+}
+
+#[test]
+fn the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let profile = ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() };
+    let bound = bind(sampler_arithmetic(), profile).expect("the sampler epilogue binds");
+    let x = latent();
+    let (key, counter) = (0x7ce1u32, 5u32);
+    let seeds = vec![
+        (LATENT, Value::F32(x.clone())),
+        (STATE, Value::U32(vec![key, counter])),
+    ];
+    let channels = [GAUSSIAN, SINE, COSINE, PYTHAGORAS, ROOT, INVERSE_ROOT, UNITY, STEPPED];
+    let want = host_outputs(&bound, &seeds, None, &channels);
+    let got = device_outputs(&bound, &seeds, ROWS, None, &channels);
+
+    close(&wire_f32(&got[0]), &f32s(&want[0]), 1e-5, "the normal draw");
+    close(&wire_f32(&got[1]), &f32s(&want[1]), 1e-5, "sin");
+    close(&wire_f32(&got[2]), &f32s(&want[2]), 1e-5, "cos");
+    close(&wire_f32(&got[3]), &f32s(&want[3]), 1e-5, "sin^2 + cos^2");
+    close(&wire_f32(&got[4]), &f32s(&want[4]), 1e-5, "sqrt");
+    close(&wire_f32(&got[5]), &f32s(&want[5]), 1e-5, "rsqrt");
+    close(&wire_f32(&got[6]), &f32s(&want[6]), 1e-5, "sqrt * rsqrt");
+    close(&wire_f32(&got[7]), &f32s(&want[7]), 1e-5, "x + z");
+
+    // Agreeing with the interpreter is not enough on its own: both could be
+    // computing the wrong function. These pin the identities.
+    let n = (ROWS * WIDTH) as usize;
+    close(&wire_f32(&got[3]), &vec![1.0; n], 1e-5, "sin^2 + cos^2 against one");
+    close(&wire_f32(&got[6]), &vec![1.0; n], 1e-5, "sqrt * rsqrt against one");
+    let want_root: Vec<f32> = x.iter().map(|v| v.sqrt()).collect();
+    close(&wire_f32(&got[4]), &want_root, 1e-6, "sqrt against the host's");
+
+    // And the draw is the RNG contract's own numbers, not merely a normal:
+    // a device that paired the uniforms differently would still look
+    // Gaussian in aggregate.
+    let seed = eta_ir::rng::keyed_seed(key, counter);
+    let want_noise: Vec<f32> =
+        (0..n as u32).map(|i| eta_ir::rng::hash_normal(seed, i)).collect();
+    close(&wire_f32(&got[0]), &want_noise, 1e-5, "the normal draw against `rng::hash_normal`");
+
+    // The draw has to be noise, not a constant the tolerance would forgive.
+    let drawn = wire_f32(&got[0]);
+    let mean = drawn.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+    let variance =
+        drawn.iter().map(|&v| (f64::from(v) - mean).powi(2)).sum::<f64>() / n as f64;
+    assert!(variance > 0.4, "the device drew a near-constant plane (variance {variance})");
 }

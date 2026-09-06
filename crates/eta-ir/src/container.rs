@@ -720,6 +720,7 @@ fn decode_rng_kind(t: u8) -> Result<RngKind, ContainerDecodeError> {
     Ok(match t {
         0 => RngKind::Uniform,
         1 => RngKind::Gumbel,
+        2 => RngKind::Normal,
         t => {
             return Err(ContainerDecodeError::UnknownTag {
                 what: "rng kind",

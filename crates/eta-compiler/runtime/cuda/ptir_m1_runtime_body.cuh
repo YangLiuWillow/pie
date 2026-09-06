@@ -152,6 +152,20 @@ __device__ __forceinline__ void ptir_m1_execute(
     }
     return;
   }
+  if (p.tag >= 0x08 && p.tag <= 0x0B) {
+    for (m1_u32 i = 0; i < out0.len; ++i) {
+      const float value = m1_load_f(a0, m1_pick(d0.len, i), d0.dtype);
+      if (p.tag == 0x08)
+        m1_store_f(o0, i, sinf(value));
+      else if (p.tag == 0x09)
+        m1_store_f(o0, i, cosf(value));
+      else if (p.tag == 0x0A)
+        m1_store_f(o0, i, sqrtf(value));
+      else
+        m1_store_f(o0, i, 1.0f / sqrtf(value));
+    }
+    return;
+  }
   if (p.tag == 0x03 || p.tag == 0x05 || p.tag == 0x06) {
     for (m1_u32 i = 0; i < out0.len; ++i) {
       const m1_u32 source_index = m1_pick(d0.len, i);
@@ -792,6 +806,10 @@ __device__ __forceinline__ void ptir_m1_execute(
       const m1_u64 seed =
           ptir_rng_seed_eff_stream((m1_u32)p.rng_seed, p.imm);
       for (m1_u32 i = 0; i < out0.len; ++i) {
+        if (p.kind == 2) {
+          m1_store_f(o0, i, ptir_rng_hash_normal(seed, i));
+          continue;
+        }
         const float uniform = ptir_rng_hash_uniform(seed, i);
         m1_store_f(
             o0,
@@ -805,6 +823,10 @@ __device__ __forceinline__ void ptir_m1_execute(
       const m1_u64 seed =
           ptir_rng_keyed_seed((m1_u32)key, (m1_u32)counter);
       for (m1_u32 i = 0; i < out0.len; ++i) {
+        if (p.kind == 2) {
+          m1_store_f(o0, i, ptir_rng_hash_normal(seed, i));
+          continue;
+        }
         const float uniform = ptir_rng_hash_uniform(seed, i);
         m1_store_f(
             o0,

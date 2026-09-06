@@ -380,6 +380,10 @@ export const sign = (x: Operand) => emitUnary(x, tags.SIGN, same);
 export const recip = (x: Operand) => emitUnary(x, tags.RECIP, same);
 export const exp = (x: Operand) => emitUnary(x, tags.EXP, same);
 export const log = (x: Operand) => emitUnary(x, tags.LOG, same);
+export const sin = (x: Operand) => emitUnary(x, tags.SIN, same);
+export const cos = (x: Operand) => emitUnary(x, tags.COS, same);
+export const sqrt = (x: Operand) => emitUnary(x, tags.SQRT, same);
+export const rsqrt = (x: Operand) => emitUnary(x, tags.RSQRT, same);
 
 /** `x` converted elementwise to `to`; the identity cast emits nothing. */
 export function cast(x: Operand, to: Dtype): Tensor {
@@ -593,6 +597,8 @@ function rngNoise(state: Operand, shape: readonly number[], kind: RngKind): Tens
 
 export const gumbel = (state: Operand, shape: readonly number[]) => rngNoise(state, shape, RngKind.GUMBEL);
 export const rng = (state: Operand, shape: readonly number[]) => rngNoise(state, shape, RngKind.UNIFORM);
+/** Standard normal `N(0, 1)` noise keyed on the `[2]` u32 `[key, ctr]` state. */
+export const normal = (state: Operand, shape: readonly number[]) => rngNoise(state, shape, RngKind.NORMAL);
 
 export function maskApply(logits: Operand, mask: Operand): Tensor {
   const [il, tyl] = materialize(logits);

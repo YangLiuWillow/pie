@@ -42,6 +42,16 @@ export function hidden(width: number): Tensor {
   return intrinsicVal(Intrinsic.HIDDEN, shapeOf([rows, Math.max(width, 1)]), activationType);
 }
 
+/**
+ * The flow-matching velocity a denoise reading predicts, `[n_out, width]` F32
+ * at the epilogue. `width` is declared, as `hidden`'s is, but bind checks it
+ * against the model's `velocity_width`.
+ */
+export function velocity(width: number): Tensor {
+  const rows = Math.max(currentRows(), 1);
+  return intrinsicVal(Intrinsic.VELOCITY, shapeOf([rows, Math.max(width, 1)]), activationType);
+}
+
 export function query(width: number): Tensor {
   return intrinsicVal(Intrinsic.QUERY, shapeOf([Math.max(width, 1)]), activationType);
 }

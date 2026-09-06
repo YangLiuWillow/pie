@@ -342,6 +342,7 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
         IntrinsicId::Logits
         | IntrinsicId::MtpLogits
         | IntrinsicId::Hidden
+        | IntrinsicId::Velocity
         | IntrinsicId::ValueHead => &[Stage::Epilogue],
         IntrinsicId::MtpDrafts => &[Stage::Epilogue],
         // Epilogue only: the observability contract. The capture arm
@@ -362,6 +363,7 @@ pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
         IntrinsicId::MtpDrafts => profile.mtp_depth > 0,
         IntrinsicId::ValueHead => profile.has_value_head,
         IntrinsicId::AttnScore => profile.has_attn_score,
+        IntrinsicId::Velocity => profile.has_velocity,
         IntrinsicId::Logits | IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => true,
     }
 }
@@ -431,6 +433,15 @@ pub struct ModelProfile {
     /// program would validate against every backend and fail at its first
     /// fire on ones that can't enforce it.
     pub has_attn_page_mask: bool,
+    /// `[n_out, velocity_width]` F32 flow-matching velocity
+    /// ([`IntrinsicId::Velocity`]) available at the epilogue. A denoise
+    /// reading's answer, so a text model leaves it `false` and every
+    /// `velocity()` in a trace is refused at bind rather than at the fire.
+    pub has_velocity: bool,
+    /// The latent channel count one velocity row carries — the trailing
+    /// extent a `velocity()` declaration must match, as `vocab` is for
+    /// `logits`. Meaningless when `has_velocity` is false.
+    pub velocity_width: u32,
     /// The backend honours a `lora` sink (A/B/sites config, low-rank
     /// delta at declared projection sites). Same contract as
     /// `has_attn_page_mask`: naming it type-checks everywhere, honouring
@@ -470,6 +481,8 @@ impl ModelProfile {
             draft_proposals_from: 1,
             has_value_head: true,
             has_attn_score: true,
+            has_velocity: true,
+            velocity_width: 8,
             has_attn_page_mask: true,
             has_lora: true,
             kernels: Vec::new(),

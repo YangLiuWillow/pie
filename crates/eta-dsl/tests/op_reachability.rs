@@ -75,6 +75,14 @@ fn arithmetic() -> Traced {
             add(exp(&row), log(abs(&row))),
             add(neg(recip(&row)), sign(&row)),
         );
+        // the transcendental unaries a diffusion sampler needs
+        let u = add(
+            u,
+            add(
+                add(sin(&row), cos(&row)),
+                add(sqrt(abs(&row)), rsqrt(add(abs(&row), 1.0f32))),
+            ),
+        );
         // binary + rem, and a cast to reach the integer ops
         let v = div(sub(mul(&u, 2.0f32), 1.0f32), 3.0f32);
         let w = max_elem(min_elem(&v, 9.0f32), -9.0f32);
@@ -134,7 +142,8 @@ fn masking() -> Traced {
     builder.stage(Stage::Epilogue, || {
         let noise = rng(state.read(), [4, 8]);
         let jitter = gumbel(state.read(), [4, 8]);
-        let scores = add(noise, jitter);
+        let gaussian = normal(state.read(), [4, 8]);
+        let scores = add(add(noise, jitter), gaussian);
 
         let pos = positions.take();
         let causal = causal_mask(&pos, 8);

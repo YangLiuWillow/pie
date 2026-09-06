@@ -72,6 +72,24 @@ pub fn hidden(width: u32) -> Tensor {
         activation_type,
     )
 }
+/// `intrinsics::velocity(width)` — the flow-matching velocity a denoise
+/// reading predicts, `[n_out, width]` F32 at the epilogue. This is the
+/// quantity a diffusion sampler integrates: `x <- x + (sigma_next - sigma) * v`.
+///
+/// `width` is declared like [`hidden`]'s, because a guest has no host call
+/// for the latent channel count; unlike [`hidden`]'s it is *checked* — bind
+/// refuses a declaration whose width is not the model's
+/// `ModelProfile::velocity_width`, the way a `logits` declaration is checked
+/// against `vocab`. Model-gated on `has_velocity`, so a text model refuses
+/// the whole program at bind rather than at its first fire.
+pub fn velocity(width: u32) -> Tensor {
+    let rows = current_rows().max(1);
+    intrinsic_val(
+        IntrinsicId::Velocity,
+        Shape::matrix(rows, width.max(1)),
+        activation_type,
+    )
+}
 /// `intrinsics::query(width)` — this layer's projected query (attn taps),
 /// `[width]`. Declared, not derived, for the same reason as [`hidden`].
 pub fn query(width: u32) -> Tensor {

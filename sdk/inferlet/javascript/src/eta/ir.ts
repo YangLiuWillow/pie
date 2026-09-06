@@ -71,6 +71,12 @@ export function dropLast(shape: Shape): Shape {
 export enum RngKind {
   UNIFORM = 0,
   GUMBEL = 1,
+  /**
+   * Box-Muller's cosine branch over the two uniform lanes `2i` and `2i+1`
+   * (`eta_ir::rng::hash_normal`). This port only encodes the kind byte; the
+   * draw itself happens on the device.
+   */
+  NORMAL = 2,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +140,7 @@ export enum Intrinsic {
   LAYER = 5,
   MTP_DRAFTS = 6,
   ATTN_SCORE = 7,
+  VELOCITY = 8,
 }
 
 export enum SinkScope {
@@ -179,6 +186,10 @@ export const tags = {
   ABS: 0x05,
   SIGN: 0x06,
   CAST: 0x07,
+  SIN: 0x08,
+  COS: 0x09,
+  SQRT: 0x0a,
+  RSQRT: 0x0b,
   ADD: 0x10,
   SUB: 0x11,
   MUL: 0x12,
@@ -240,6 +251,10 @@ export const OP_TABLE: ReadonlyMap<number, Row> = new Map<number, Row>([
   [tags.ABS, ['abs', 1, [V]]],
   [tags.SIGN, ['sign', 1, [V]]],
   [tags.CAST, ['cast', 1, [V, Field.DTYPE]]],
+  [tags.SIN, ['sin', 1, [V]]],
+  [tags.COS, ['cos', 1, [V]]],
+  [tags.SQRT, ['sqrt', 1, [V]]],
+  [tags.RSQRT, ['rsqrt', 1, [V]]],
   [tags.ADD, ['add', 1, [V, V]]],
   [tags.SUB, ['sub', 1, [V, V]]],
   [tags.MUL, ['mul', 1, [V, V]]],

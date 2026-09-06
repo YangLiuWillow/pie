@@ -3,11 +3,42 @@
 
 use core::fmt::Write;
 
-use eta_ir::rng::RNG_FORMULA;
+use eta_ir::rng::{NORMAL_PAIR_STRIDE, NORMAL_TWO_PI, RNG_FORMULA};
 
 /// The nearest `f32` to this text is exactly `UNIFORM_MAX`, so host and
 /// device agree bit for bit.
 const UNIFORM_MAX_LITERAL: &str = "0.99999994";
+
+/// The nearest `f32` to this text is exactly [`NORMAL_TWO_PI`], for the same
+/// reason [`UNIFORM_MAX_LITERAL`] is spelled out: a shortest-round-trip
+/// print of the constant is what host and device must both parse.
+const NORMAL_TWO_PI_LITERAL: &str = "6.2831855";
+
+/// The Box-Muller projection: `sqrt(-2*ln(u0)) * cos(2*pi*u1)` over the two
+/// uniform lanes `NORMAL_PAIR_STRIDE * index` and `+ 1`, expression for
+/// expression with `eta_ir::rng::hash_normal`. `sqrt`/`log`/`cos` are the
+/// backend's spellings of the three library calls.
+fn normal_body(sqrt: &str, log: &str, cos: &str, u32_ty: &str) -> String {
+    debug_assert_eq!(
+        NORMAL_TWO_PI_LITERAL.parse::<f32>().ok(),
+        Some(NORMAL_TWO_PI)
+    );
+    let stride = NORMAL_PAIR_STRIDE;
+    let two_pi = NORMAL_TWO_PI_LITERAL;
+    let mut out = String::new();
+    let _ = writeln!(out, "  const {u32_ty} lane = index * {stride}u;");
+    let _ = writeln!(
+        out,
+        "  const float u0 = ptir_rng_hash_uniform(seed_eff, lane);"
+    );
+    let _ = writeln!(
+        out,
+        "  const float u1 = ptir_rng_hash_uniform(seed_eff, lane + 1u);"
+    );
+    let _ = writeln!(out, "  const float radius = {sqrt}(-2.0f * {log}(u0));");
+    let _ = writeln!(out, "  return radius * {cos}({two_pi}f * u1);");
+    out
+}
 
 /// The `__device__` projection, as spliced into emitted CUDA sources.
 pub fn cuda_device_functions() -> String {
@@ -54,6 +85,11 @@ pub fn cuda_device_functions() -> String {
         RNG_FORMULA.lane_index_bias,
         RNG_FORMULA.uniform_mantissa_shift,
         RNG_FORMULA.uniform_midpoint
+    );
+    let _ = writeln!(
+        out,
+        "{inline} float ptir_rng_hash_normal(\n    {u64_ty} seed_eff, {u32_ty} index) {{\n{}}}",
+        normal_body("sqrtf", "logf", "cosf", u32_ty)
     );
     out
 }
@@ -103,6 +139,11 @@ inline ulong ptir_rng_splitmix64(ulong x) {\n",
         RNG_FORMULA.lane_index_bias,
         RNG_FORMULA.uniform_mantissa_shift,
         RNG_FORMULA.uniform_midpoint
+    );
+    let _ = writeln!(
+        out,
+        "inline float ptir_rng_hash_normal(ulong seed_eff, uint index) {{\n{}}}",
+        normal_body("sqrt", "precise::log", "precise::cos", "uint")
     );
     out.push_str("#endif\n");
     out

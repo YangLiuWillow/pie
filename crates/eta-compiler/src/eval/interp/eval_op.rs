@@ -35,6 +35,10 @@ pub(crate) fn eval_op(
         Op::Exp(a) => One(map_f32(v(a), |x| x.exp())),
         Op::Log(a) => One(map_f32(v(a), |x| x.ln())),
         Op::Recip(a) => One(map_f32(v(a), |x| 1.0 / x)),
+        Op::Sin(a) => One(map_f32(v(a), f32::sin)),
+        Op::Cos(a) => One(map_f32(v(a), f32::cos)),
+        Op::Sqrt(a) => One(map_f32(v(a), f32::sqrt)),
+        Op::Rsqrt(a) => One(map_f32(v(a), |x| 1.0 / x.sqrt())),
         Op::Neg(a) => One(match v(a) {
             Value::F32(x) => Value::F32(x.iter().map(|&a| -a).collect()),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_neg()).collect()),
@@ -619,6 +623,7 @@ pub(crate) fn eval_op(
                         match kind {
                             RngKind::Uniform => u,
                             RngKind::Gumbel => -((-(u.ln())).ln()),
+                            RngKind::Normal => rng::hash_normal(seed64, j),
                         }
                     })
                     .collect(),
@@ -635,6 +640,7 @@ pub(crate) fn eval_op(
                 IntrinsicId::Logits => inputs.logits.clone(),
                 IntrinsicId::MtpLogits => inputs.mtp_logits.clone(),
                 IntrinsicId::Hidden => inputs.hidden.clone(),
+                IntrinsicId::Velocity => inputs.velocity.clone(),
                 IntrinsicId::ValueHead => inputs.value_head.clone(),
                 IntrinsicId::Query => inputs.query.get(layer as usize).cloned(),
                 IntrinsicId::Layer => Some(Value::U32(vec![layer])),
@@ -737,6 +743,7 @@ pub(super) fn rng_ambient(seed: u32, stream: u32, kind: RngKind, len: usize) -> 
             match kind {
                 RngKind::Uniform => u,
                 RngKind::Gumbel => -((-(u.ln())).ln()),
+                RngKind::Normal => rng::hash_normal(seed_eff, j),
             }
         })
         .collect()

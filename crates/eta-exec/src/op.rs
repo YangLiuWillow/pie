@@ -324,22 +324,25 @@ fn desc_by_value(row: &[f32], a: u32, b: u32) -> std::cmp::Ordering {
 }
 
 #[must_use]
-pub fn rng_lanes(seed_eff: u64, n: usize, gumbel: bool) -> Vec<f32> {
+pub fn rng_lanes(seed_eff: u64, n: usize, kind: RngKind) -> Vec<f32> {
     // **A LANE IS A PURE FUNCTION OF ITS INDEX, SO THE RANGE SPLITS.**
     //
     // `hash_uniform(seed, j)` reads no state and carries nothing between
     // lanes, so a thread filling `[a, b)` writes exactly the bytes the serial
     // loop would. Which matters: the values must agree with the device's, and
     // a Gumbel lane is two `ln` calls that no rearrangement can make cheaper
-    // without changing the token that gets sampled.
+    // without changing the token that gets sampled. A Normal lane reads two
+    // uniforms of its own (`rng::hash_normal`), still by index alone, so it
+    // splits on the same argument.
     //
     // Worth splitting only where the arithmetic dwarfs the threads: a
     // vocabulary-wide draw is ~260k lanes and milliseconds, while the small
     // draws a sampler also makes are microseconds and stay serial.
     const SPLIT_ABOVE: usize = 1 << 15;
-    let lane = |j: usize| {
-        let u = rng::hash_uniform(seed_eff, j as u32);
-        if gumbel { -(-u.ln()).ln() } else { u }
+    let lane = |j: usize| match kind {
+        RngKind::Uniform => rng::hash_uniform(seed_eff, j as u32),
+        RngKind::Gumbel => -(-rng::hash_uniform(seed_eff, j as u32).ln()).ln(),
+        RngKind::Normal => rng::hash_normal(seed_eff, j as u32),
     };
     if n <= SPLIT_ABOVE {
         return (0..n).map(lane).collect();
@@ -514,6 +517,10 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
         tags::EXP => out!(map_f32(&vals[a0], f32::exp)),
         tags::LOG => out!(map_f32(&vals[a0], f32::ln)),
         tags::RECIP => out!(map_f32(&vals[a0], |x| 1.0 / x)),
+        tags::SIN => out!(map_f32(&vals[a0], f32::sin)),
+        tags::COS => out!(map_f32(&vals[a0], f32::cos)),
+        tags::SQRT => out!(map_f32(&vals[a0], f32::sqrt)),
+        tags::RSQRT => out!(map_f32(&vals[a0], |x| 1.0 / x.sqrt())),
         tags::NEG => match &vals[a0] {
             Value::F32(v) => out!(Value::F32(v.iter().map(|&e| -e).collect())),
             Value::I32(v) => out!(Value::I32(v.iter().map(|&e| e.wrapping_neg()).collect())),
@@ -1090,11 +1097,7 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
         tags::RNG => {
             let seed_eff = rng::seed_eff_stream(0, op.imm);
             let n = shape_numel(&op.shape) as usize;
-            out!(Value::F32(rng_lanes(
-                seed_eff,
-                n,
-                op.rng_kind == RngKind::Gumbel
-            )));
+            out!(Value::F32(rng_lanes(seed_eff, n, op.rng_kind)));
         }
         tags::RNG_KEYED => {
             let st = vals[a0].lanes_i64();
@@ -1106,11 +1109,7 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
             };
             let seed64 = rng::keyed_seed(key, ctr);
             let n = shape_numel(&op.shape) as usize;
-            out!(Value::F32(rng_lanes(
-                seed64,
-                n,
-                op.rng_kind == RngKind::Gumbel
-            )));
+            out!(Value::F32(rng_lanes(seed64, n, op.rng_kind)));
         }
         tags::KERNEL_CALL => {
             if op.args.len() != 1 {
@@ -1245,6 +1244,7 @@ mod tests {
 #[cfg(test)]
 mod rng_tests {
     use super::rng_lanes;
+    use eta_ir::RngKind;
 
     /// **THE SPLIT WRITES THE BYTES THE SERIAL LOOP WOULD.**
     ///
@@ -1255,25 +1255,22 @@ mod rng_tests {
     /// does not divide.
     #[test]
     fn a_split_draw_is_the_serial_draw() {
-        let serial = |seed: u64, n: usize, gumbel: bool| -> Vec<f32> {
+        let serial = |seed: u64, n: usize, kind: RngKind| -> Vec<f32> {
             (0..n)
-                .map(|j| {
-                    let u = eta_ir::rng::hash_uniform(seed, j as u32);
-                    if gumbel { -(-u.ln()).ln() } else { u }
+                .map(|j| match kind {
+                    RngKind::Uniform => eta_ir::rng::hash_uniform(seed, j as u32),
+                    RngKind::Gumbel => -(-eta_ir::rng::hash_uniform(seed, j as u32).ln()).ln(),
+                    RngKind::Normal => eta_ir::rng::hash_normal(seed, j as u32),
                 })
                 .collect()
         };
         for &n in &[1usize, 1 << 15, (1 << 15) + 1, 100_003, 262_144] {
-            for gumbel in [false, true] {
-                let want = serial(0x9E37_79B9_7F4A_7C15, n, gumbel);
-                let got = rng_lanes(0x9E37_79B9_7F4A_7C15, n, gumbel);
+            for kind in [RngKind::Uniform, RngKind::Gumbel, RngKind::Normal] {
+                let want = serial(0x9E37_79B9_7F4A_7C15, n, kind);
+                let got = rng_lanes(0x9E37_79B9_7F4A_7C15, n, kind);
                 assert_eq!(got.len(), want.len(), "length at n={n}");
                 for (j, (g, w)) in got.iter().zip(&want).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        w.to_bits(),
-                        "lane {j} of {n} (gumbel={gumbel})"
-                    );
+                    assert_eq!(g.to_bits(), w.to_bits(), "lane {j} of {n} ({kind:?})");
                 }
             }
         }

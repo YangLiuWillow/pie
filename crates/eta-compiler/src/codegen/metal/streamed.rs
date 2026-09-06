@@ -328,13 +328,17 @@ fn direct_wide(
     let store = format!("{store_fn}({po0}, i, {v});");
     let mut compute = String::new();
     match op.tag {
-        tags::EXP | tags::LOG | tags::RECIP => {
+        tags::EXP | tags::LOG | tags::RECIP | tags::SIN | tags::COS | tags::SQRT | tags::RSQRT => {
             let d0 = d0?;
             let s0 = stride(0, &mut pre);
             let x = load(0, 0, d0, &s0);
             let expr = match op.tag {
                 tags::EXP => format!("precise::exp({x})"),
                 tags::LOG => format!("precise::log({x})"),
+                tags::SIN => format!("precise::sin({x})"),
+                tags::COS => format!("precise::cos({x})"),
+                tags::SQRT => format!("sqrt({x})"),
+                tags::RSQRT => format!("1.0f / sqrt({x})"),
                 _ => format!("1.0f / {x}"),
             };
             let _ = writeln!(compute, "{v} = {expr};");

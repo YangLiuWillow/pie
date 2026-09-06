@@ -30,14 +30,21 @@ const PINNED: &[(&str, u16, u64)] = &[
     // output element).
     // 35 -> 36: a row-parallel region's nodes are emitted in reduction-depth
     // order, so an op that waits on no reduction joins the first pass.
-    ("cuda", 36, 0x3755_0d84_bbf0_6ca7),
+    // 36 -> 37: `sin`/`cos`/`sqrt`/`rsqrt` and `RngKind::Normal` joined the
+    // op set, so the RNG preamble gained `ptir_rng_hash_normal` and both
+    // spliced runtimes (`fused_block0.cuh`, `ptir_m1_runtime_body.cuh`)
+    // gained arms -- which moves every emitted kernel's bytes, not only
+    // those of a program using them.
+    ("cuda", 37, 0x4ec5_db32_5486_dbb8),
     // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and
     // its own `ptir_m4` kernels joined the table. 49 -> 50 (merged with 45):
     // the normalization fold reaches the metal output too. 50 -> 51: a
     // gather is a direct op, a scalar runs mid-dispatch, a scatter splits.
-    ("metal", 51, 0x63b4_f718_bf13_f781),
+    // 51 -> 52: the same op-set growth as cuda 36 -> 37, reaching
+    // `ptir_m1_runtime.metal` and the generated RNG preamble.
+    ("metal", 52, 0xdb5b_4877_cc81_27a7),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

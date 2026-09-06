@@ -34,4 +34,11 @@ inline float ptir_rng_hash_uniform(ulong seed_eff, uint index) {
   return raw < 0.99999994f ? raw : 0.99999994f;
 }
 
+inline float ptir_rng_hash_normal(ulong seed_eff, uint index) {
+  const uint lane = index * 2u;
+  const float u0 = ptir_rng_hash_uniform(seed_eff, lane);
+  const float u1 = ptir_rng_hash_uniform(seed_eff, lane + 1u);
+  const float radius = sqrt(-2.0f * precise::log(u0));
+  return radius * precise::cos(6.2831855f * u1);
+}
 #endif

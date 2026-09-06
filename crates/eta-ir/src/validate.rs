@@ -749,6 +749,16 @@ fn intrinsic_type_ok(
                 && shape.dims()[0] >= 1
         }
         IntrinsicId::Hidden => dtype == Dtype::F32 && shape.rank() == 2 && shape.dims()[0] >= 1,
+        // Unlike `hidden`, whose width the profile does not carry, a
+        // velocity row's channel count is a model fact — so a declaration
+        // that disagrees is refused here rather than carried into the plan's
+        // extents.
+        IntrinsicId::Velocity => {
+            dtype == Dtype::F32
+                && shape.rank() == 2
+                && shape.dims()[0] >= 1
+                && shape.dims()[1] == profile.velocity_width
+        }
         IntrinsicId::ValueHead => dtype == Dtype::F32 && shape.rank() == 1,
         IntrinsicId::Query => dtype == Dtype::F32 && shape.rank() >= 1,
         IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),
