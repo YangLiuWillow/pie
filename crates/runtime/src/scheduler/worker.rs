@@ -3856,24 +3856,17 @@ impl BatchScheduler {
                         break;
                     }
                     FramePlan::Park => break,
-                    FramePlan::Terminate(pids) => {
-                        // Abandoned pipeline: silent past the timeout
-                        // without calling `forward.park()`. The policy
-                        // already dropped these lanes, so `continue` re-plans
-                        // a gather that no longer waits on them.
-                        for pid in pids {
-                            tracing::error!(
-                                pid = %pid,
-                                "scheduler: terminating abandoned pipeline (silent for the \
-                                 whole silence timeout without submitting and without \
-                                 calling forward.park())"
-                            );
-                            crate::inferlet::process::terminate(
-                                pid,
-                                Err("pipeline abandoned: silent past the silence timeout \
-                                     without submitting and without parking"
-                                    .to_string()),
-                            );
+                    FramePlan::Terminate(doomed) => {
+                        // A pipeline the policy will not serve any longer:
+                        // abandoned (silent past the timeout without calling
+                        // `forward.park()`), or a stated attention-group
+                        // cohort that never composed. The reason is the
+                        // guest's error verbatim — the policy holds the
+                        // facts, so it words the verdict.
+                        for (pid, doom) in doomed {
+                            let reason = doom.to_string();
+                            tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
+                            crate::inferlet::process::terminate(pid, Err(reason));
                         }
                         continue;
                     }

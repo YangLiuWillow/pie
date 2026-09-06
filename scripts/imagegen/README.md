@@ -20,6 +20,8 @@ scripts/imagegen/
   h3_parity.py        M5  drives pie's `minimax-h3-mini` row against it
   vendor/minimax_h3/      a dependency-free transcription of H3's DiT --
                           sglang's own package cannot be imported here
+  hy3_golden.py       M6  HunyuanImage 3 miniature: one prefill + one denoise step
+  hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
   golden_common.py        shared tap/hook/manifest plumbing
   compare.py              npz-vs-npz diff with tolerance gates
 ```
@@ -493,13 +495,14 @@ CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
     --out /tmp/flux2-klein-parity --config ~/.pie/config.flux2-klein.toml
 ```
 
-The config needs `[engine] max_model_len = 32768` (rows × submit depth),
-`[model] model` at the artifact, and — the one that is not obvious —
-`[runtime] submit_deadline = "10s"` with `silence_timeout = "300s"`: at the
-50 ms default the cohort gate seals the denoise group's FIRST frame with
-the image lane alone and the velocity comes back unconditioned (cos ≈ 0.535
-against the golden, cos 0.9999 against a no-text reference). `run` refuses a
-config that does not state it.
+The config needs `[engine] max_model_len = 32768` (rows × submit depth) and
+`[model] model` at the artifact. It needs nothing said about `[runtime]
+submit_deadline` any more: this parity used to demand `"10s"` because at the
+50 ms default the cohort gate sealed the denoise group's FIRST frame with
+the image lane alone and the velocity came back unconditioned (cos ≈ 0.535
+against the golden, cos 0.9999 against a no-text reference). A stated cohort
+is now fired whole or not at all — the deadline is a density knob again, and
+this harness runs at the default so that a partial group would show up here.
 
 Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
 
@@ -613,6 +616,73 @@ Measured (fp32 reference vs pie's bf16 trunk, one denoise step on one GPU):
 | `mini.out.audio` | (6, 32) | 0.00020 | 0.0025 | 0.99999699 |
 
 Gate: `--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`.
+
+---
+
+## 4b. `hy3_golden.py` / `hy3_parity.py` (M6) -> `$PIE_IMAGEGEN_GOLDEN/hy3/`
+
+HunyuanImage 3.0 is an AR-plus-diffusion hybrid: one Hunyuan-A13B MoE trunk
+denoises an image *inside* an LLM token sequence.  `--mini` random-inits a
+two-layer, eight-expert `HunyuanImage3ForCausalMM` from the HF custom code
+(`$HY3_SRC`, default the GitHub package mirror), assembles the T2I sequence by
+hand -- no tokenizer, no pipeline, no flash-attn -- and dumps one causal text
+prefill and one denoise step tapped at the three seams pie reads back.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python hy3_golden.py --mini      # seconds
+# a directory the importer can read: the weights, config.json, tokenizer.json
+pie model import $PIE_IMAGEGEN_GOLDEN/hy3/artifact \
+    --sku hunyuanimage3-mini-bf16-kv-bf16 --out .../hy3-mini.zt
+python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.toml
+```
+
+The config must be the run's OWN (its own `[server] port`), and
+`[engine] max_model_len` at least the sequence.
+
+**A whole denoise step, in three fires, each fed pie's own answer to the one
+before**: `image.in` (the conv `patch_embed` on the voxel axis), `denoise`
+(the trunk over the frozen prefix pages), `image.out` (the conv
+`final_layer`). Plus three more denoise fires that make two claims the golden
+diff cannot: `B` prefill(`<cfg>`-masked prompt) then denoise(t0) — THE PREFIX
+MATTERS; `C` denoise(t1) over A's pages and `D` denoise(t1) after a fresh
+prefill — THE PREFIX K/V IS REUSED EXACTLY.
+
+Measured 2026-09-06 (fp32 golden vs bf16 weights and bf16 activations):
+
+| tensor | shape | cos | max-abs |
+|---|---|---|---|
+| `image_in.rows` | (64, 256) | 0.999991 | 0.0012 |
+| `denoise.hidden.image` | (64, 256) | 0.999989 | 0.0016 |
+| `denoise.hidden.timestep_row` | (256,) | 0.999993 | 0.00046 |
+| `uncond.hidden.image` | (64, 256) | 0.999989 | 0.0015 |
+| `uncond.hidden.timestep_row` | (256,) | 0.999993 | 0.00047 |
+| **`image_out.velocity.rows`** | (64, 32) | **0.999997** | **0.00012** |
+| `encode.max` | (9,) | 0.999998 | 5.8e-05 |
+
+```
+[claim] PASS the prefix conditions the canvas: <cfg> moves the <timestep> row
+        rel 0.0214 (reference 0.0213, 0.1% off) and the image rows rel 0.0031
+        (reference 0.0020)
+[claim] PASS the prefix K/V is reused exactly: max-abs 0.000e+00
+```
+
+Two shell rules shape the voxel arms: the CUDA shell seats **one voxel width
+a fire**, so the timestep's sinusoid rides packed into the clip's own
+rectangle (`[h, w, 32 + 256]` going in, `[h, w, D + 256]` coming out) and the
+model text splits the columns; and a voxel-axis lane broadcast does not
+exist, which is why the sinusoid is per voxel at all.
+
+**The conditioning gate is stated against the reference, not as a constant.**
+On this two-layer random-init miniature the prompt moves the image rows by rel
+0.002 — below the bf16 parity floor — while it moves the `<timestep>` row,
+which is causal over the prefix and nothing else, by rel 0.021. A guessed
+absolute threshold would fail a correct model here and pass an unconditioned
+one on a deeper row.
+
+The one host round trip is between `denoise` and `image.out`: the trunk hands
+back `[h*w + 1, D]` token rows and the voxel arm wants `[h, w, D]` without the
+`<timestep>` row, and dropping a row is not something the guest can spell on
+the device today. A production loop would carry it in an epilogue.
 
 ---
 

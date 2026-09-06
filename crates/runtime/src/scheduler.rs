@@ -159,6 +159,13 @@ pub async fn debug_dump(engine_id: usize) -> Result<String> {
 /// wait-set, its queued frames still dispatch, and its next fire rejoins.
 /// Termination is a separate, longer verdict; see
 /// [`configured_silence_timeout`].
+///
+/// **BECAUSE IT IS A DENSITY BOUND IT MAY NEVER BE SPENT ON A STATED
+/// ATTENTION GROUP.** Dropping a member of a group from a boundary does not
+/// cost the guest latency, it changes the answer it gets: the rest of the
+/// group fires and attends without it. `scheduler::frame` therefore holds a
+/// group's lanes together on the seal side and judges a group that never
+/// assembles by the silence timeout instead.
 pub fn configured_submit_deadline() -> Duration {
     *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
 }

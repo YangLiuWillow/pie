@@ -30,6 +30,30 @@
 //! families and pins the four gaps, and the maskless-refusal gate boots
 //! gpt-oss, because the qwen it used to call maskless is not one any more.
 //!
+//! **AND THEN A FOURTH PIN FLIPPED, THE WAY THE THREE ABOVE DID — EXCEPT
+//! THIS ONE WAS THE PIN'S FAULT AND NOT THE GAP'S.** `a6c211c20` hung z-lab's
+//! DFlash block drafter off the gpt-oss 20B. A DFlash block is bidirectional
+//! over its draft rows, so its full-attention layers each state
+//! `attention.masked` — `GPTOSS_20B_DFLASH` carries `windows: &[None; 8]`, and
+//! `gptoss-20b-dflash-u4g64-mxfp4-kv-bf16` therefore bakes eight arms. The
+//! sentinel below read that as gpt-oss growing the arm, because it was matching
+//! a SKU PREFIX and calling the answer a family — which was the same thing
+//! right up until a row started reading two attention texts.
+//!
+//! The written gap is not the stale side and is not deleted here. gpt-oss folds
+//! a learned sink through the LSE and `Attention::Masked` exports no LSE, so the
+//! gpt-oss TRUNK still cannot carry the arm, and every plain `gptoss-*` row
+//! still bakes zero. What the overlay adds is a SECOND attention text, the
+//! drafter's own, which has no sinks in it — and CUDA serves it:
+//! `attention.masked` is absent from `every_catalog_sku_dispatches`' `REFUSED`
+//! (so no arm and no kernel entry refuses it), and the head's 64-wide
+//! attention is the width the gpt-oss trunk itself already fires fa2 at, well
+//! inside the stamped lattice of 64/128/256/512. So the gate narrows to the
+//! question it always meant to ask — does the FAMILY's own text bake an arm —
+//! and a row that merely borrows one from an overlaid head is named as such
+//! through `models::published::PUBLISHED`, which is where the catalog already
+//! records who wears a head.
+//!
 //! ```text
 //! cargo test -p engine-cuda --test masked_axis
 //! cargo test -p engine-cuda --features cuda --test masked_axis -- --nocapture
@@ -37,6 +61,20 @@
 
 use model_dsl::Platform;
 use model_ir::{Attention, Operation, Trace};
+
+/// Whether `sku` is a catalog row that reads an OVERLAID DRAFTER HEAD on top
+/// of its trunk — the pairing table is the catalog's own record of which rows
+/// do (`models::published`), so this asks it rather than reading a `-dflash-`
+/// out of the name.
+///
+/// A head is its own attention text: it states its own layers, its own widths
+/// and its own windows, and `dflash::Head { windows: &[None; _] }` is a block
+/// that attends bidirectionally over its draft rows. So a masked arm on such a
+/// row may belong to the head and say nothing at all about the trunk family
+/// underneath it, which is what the gap notes below are about.
+fn carries_a_head(sku: &str) -> bool {
+    models::published::PUBLISHED.iter().any(|p| p.sku == sku)
+}
 
 /// How many `attention.masked` arms a SKU's trace carries.
 fn masked_arms(trace: &Trace) -> usize {
@@ -70,6 +108,17 @@ fn masked_arms(trace: &Trace) -> usize {
 /// one of those four grows the arm, or one of the two loses it, is the day
 /// this fails and says which.
 ///
+/// **FOUR FAMILIES, NOT FOUR PREFIXES.** Each of those reasons is a statement
+/// about a family's OWN attention text, and a catalog row is no longer the same
+/// thing as one text: a row that reads an overlaid drafter head bakes that
+/// head's attention too. `gptoss-20b-dflash-u4g64-mxfp4-kv-bf16` is the row
+/// where the two came apart (`a6c211c20`) — its eight arms are the DFlash
+/// block's bidirectional layers, its trunk still bakes none — so the gap is
+/// asserted over the rows that carry the family text alone, and the rows
+/// wearing a head are recognised by [`carries_a_head`] rather than excused by
+/// name. A trunk that grew the arm would still be caught: it would show up on
+/// the plain rows, which is exactly where this looks.
+///
 /// PURE CPU, and not `#[ignore]`d for that reason: it reads the catalog's
 /// traces and loads no checkpoint and no device.
 #[test]
@@ -79,9 +128,28 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     // attention rows, and those rows carry the mask predicate qwen35 does.
     // DiffusionGemma is the gemma4 26B-A4B trunk under a second reading;
     // its attention rows carry the same mask predicate.
-    const DECLARE: [&str; 5] = ["gemma4-", "diffusiongemma-", "qwen35-", "qwen36-", "qwen38-"];
-    // And the four with a written kernel gap, which must stay maskless.
+    // HunyuanImage 3 is the image half of the same story: its denoise reading
+    // states one mask per layer — the guest's slab, a causal text prefix
+    // joined to a canvas whose rows all see each other — so the arm it takes
+    // is `attention.masked{causal: false}`, the reading the diffusion axis
+    // was built for.
+    const DECLARE: [&str; 6] = [
+        "gemma4-",
+        "diffusiongemma-",
+        "hunyuanimage3-",
+        "qwen35-",
+        "qwen36-",
+        "qwen38-",
+    ];
+    // And the four whose OWN attention text has a written reason it cannot
+    // state the arm. Their trunk rows must stay maskless; a row of theirs that
+    // wears a drafter head is reading a second text and is judged as such.
     const GAPPED: [&str; 4] = ["dsv4-", "glm5-", "gptoss-", "kimik3-"];
+    // The artifact the maskless rig below boots, named as a SKU and not as a
+    // prefix: `gptoss-` stopped being a maskless prefix at `a6c211c20`, and a
+    // rig that resolved a prefix would have picked up the drafting row and
+    // silently started testing a masked model against a maskless refusal.
+    const MASKLESS_RIG: &str = "gptoss-20b-u4g64-mxfp4-kv-bf16";
 
     let mut declaring: Vec<(String, usize)> = Vec::new();
     let mut maskless: Vec<String> = Vec::new();
@@ -96,11 +164,12 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     }
 
     assert!(
-        declaring
-            .iter()
-            .all(|(sku, _)| DECLARE.iter().any(|family| sku.starts_with(family))),
-        "a family beyond gemma and qwen declares `attention.masked`, and the \
-         device gates in this file were written against gemma: {declaring:?}"
+        declaring.iter().all(|(sku, _)| {
+            DECLARE.iter().any(|family| sku.starts_with(family)) || carries_a_head(sku)
+        }),
+        "a family beyond gemma and qwen declares `attention.masked` from its \
+         own text — not from an overlaid drafter head — and the device gates \
+         in this file were written against gemma: {declaring:?}"
     );
     assert!(
         !declaring.is_empty(),
@@ -118,19 +187,20 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
         );
     }
 
-    // And the documented gaps stay gaps. This is the half that gives the
-    // maskless-refusal gate below an artifact to stand on: it boots
-    // `gptoss-20b-*` precisely because this asserts gpt-oss bakes no arm.
+    // And the documented gaps stay gaps — in the family's own text, which is
+    // what was written down. A row wearing a drafter head is skipped here and
+    // covered by the DECLARE check above instead: its masked arms are the
+    // head's, and the head is not the family this note is about.
     for family in GAPPED {
         let grew: Vec<&(String, usize)> = declaring
             .iter()
-            .filter(|(sku, _)| sku.starts_with(family))
+            .filter(|(sku, _)| sku.starts_with(family) && !carries_a_head(sku))
             .collect();
         assert!(
             grew.is_empty(),
-            "`{family}*` grew an `attention.masked` arm, and a kernel gap was \
-             written down as the reason it could not have one — the note and \
-             the text now disagree: {grew:?}"
+            "`{family}*` grew an `attention.masked` arm in its own text, and a \
+             kernel gap was written down as the reason it could not have one — \
+             the note and the text now disagree: {grew:?}"
         );
         assert!(
             maskless.iter().any(|sku| sku.starts_with(family)),
@@ -138,6 +208,17 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
              nothing about it"
         );
     }
+
+    // The half that gives the maskless rig below an artifact to stand on. It
+    // is a SKU and not a prefix because gpt-oss no longer answers the question
+    // as a family: this row must be maskless, and it must still exist.
+    assert!(
+        maskless.iter().any(|sku| sku == MASKLESS_RIG),
+        "`{MASKLESS_RIG}` is either gone from the catalog or bakes an \
+         `attention.masked` arm, and it is the artifact the maskless rig boots \
+         to watch a maskless model refuse a mask — pick another row that is \
+         genuinely maskless and name it here: {maskless:?}"
+    );
 }
 
 // ── THE GATE: gemma, on a device, with all three classes co-firing ─────────
@@ -158,6 +239,17 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
 /// gpt-oss folds a learned sink through the LSE, which `Attention::Masked` does
 /// not export. That is a written reason rather than an accident, and the
 /// sentinel at the top of this file fails the day it stops being true.
+///
+/// **THE RIG NAMES A ROW, NOT A FAMILY, AND THAT IS THE SECOND TIME THIS HAS
+/// MOVED.** It moved off qwen once because qwen grew the arm; it did not have
+/// to move again when `a6c211c20` overlaid a DFlash head on the gpt-oss 20B,
+/// because what grew an arm was one ROW —
+/// `gptoss-20b-dflash-u4g64-mxfp4-kv-bf16`, whose eight arms are the block
+/// drafter's bidirectional layers — and not gpt-oss's own text. But a rig that
+/// resolved `gptoss-20b-*` would have found the drafting row first and quietly
+/// booted a masked model to watch it refuse a mask, so the SKU is spelled out:
+/// `MASKLESS_RIG` in the gate above, pinned there against the same catalog the
+/// rest of this file reads.
 mod maskless {
     
 
