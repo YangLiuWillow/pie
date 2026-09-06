@@ -394,7 +394,7 @@ pub fn decode(arm: &Input<Facts>, vae: &Vae) -> Value {
 pub fn encode(arm: &Input<Facts>, vae: &Vae) -> Value {
     let e = &vae.encoder;
     let mut grid = arm.grid();
-    let x = arm.voxels(port::VOXELS, RGB, Dtype::Bf16);
+    let x = arm.voxels(port::PIXEL_VOXELS, RGB, Dtype::Bf16);
     let mut h = conv(&x, &grid, &e.conv_in);
     for block in &e.down {
         for res in &block.resnets {

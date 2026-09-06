@@ -12,7 +12,9 @@
 //!     `Voxels` port and a `pixels` readout; both ports sit at the DiT's
 //!     own 128-wide `/16` grid (128 in / 3 out on decode, 3 in / 128 out
 //!     on encode); the miniature declares neither
-//! (b) the trace reads exactly those two voxel ports and plants `pixels`
+//! (b) the trace reads exactly those two voxel ports — at DIFFERENT voxel
+//!     indices, since the engine seats one rectangle per `(kind, index)`
+//!     and the two clips are 128 and 3 wide — and plants `pixels`
 //!     twice — the decoder's `[VoxelsTimes(256), 3]` plane (a 2x2 shuffle
 //!     then three nearest x2 upsamples) and the encoder's `[Voxels, 128]`
 //!     normalised mean — each beside its `[Clips, 4]` grid
@@ -100,6 +102,11 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     );
     assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
     assert_eq!(encode.port("pixels").map(|(index, _)| index), Some(0));
+    assert_eq!(
+        (decode.ports[0].at, encode.ports[0].at),
+        (None, Some(model::port::PIXEL_VOXELS)),
+        "the pixel clip is seated at its own voxel index"
+    );
     assert_eq!((decode.index, encode.index), (2, 3));
     // The latent fact stays the denoiser's: a token is 128 channels at
     // /16, and the VAE's own 32 at /8 never leave the arms.
@@ -144,11 +151,14 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         })
         .collect();
     ports.sort_unstable();
+    // Two voxel INDICES, not one: the engine seats one rectangle per
+    // `(kind, index)` for the whole plan, so the 128-wide packed latent clip
+    // and the 3-wide pixel clip cannot share index 0.
     assert_eq!(
         ports,
         vec![
-            (0, vae::RGB, "Bf16".to_string()),
-            (0, model::IN_CHANNELS, "Bf16".to_string())
+            (model::port::VOXELS, model::IN_CHANNELS, "Bf16".to_string()),
+            (model::port::PIXEL_VOXELS, vae::RGB, "Bf16".to_string())
         ]
     );
     let pixels: Vec<&Seam> = plan

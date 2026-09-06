@@ -221,6 +221,10 @@ impl Model {
                     IN_CHANNELS,
                     &[Stream::Image],
                 )],
+                // A VAE tile is a box on the voxel axis, not rows in a
+                // rotary space: it takes no positions and states no
+                // convention.
+                positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: super::vae::RGB,
             });
@@ -230,12 +234,17 @@ impl Model {
                 has_kv: false,
                 takes_tokens: false,
                 streams: vec![Stream::Image],
-                ports: vec![port(
-                    "pixels",
-                    PortKind::Voxels,
-                    super::vae::RGB,
-                    &[Stream::Image],
-                )],
+                // Voxel index ONE: the engine seats one rectangle per
+                // `(kind, index)` for the whole plan, and `vae.decode`'s
+                // packed latent clip is 128 wide at index 0.
+                ports: vec![PortFact {
+                    name: "pixels",
+                    kind: PortKind::Voxels,
+                    width: super::vae::RGB,
+                    streams: vec![Stream::Image],
+                    at: Some(port::PIXEL_VOXELS),
+                }],
+                positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: IN_CHANNELS,
             });

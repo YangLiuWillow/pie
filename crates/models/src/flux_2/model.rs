@@ -120,11 +120,13 @@ pub mod port {
     pub const GUIDANCE: u8 = 1;
     /// `denoise`: the four rotary coordinates per row, `[rows, 4]`.
     pub const POSITIONS: u8 = 0;
-    /// `vae.decode` and `vae.encode`: the clip on the voxel axis —
-    /// `[voxels, 128]` bf16 at token resolution (`/16`), BatchNorm-
-    /// normalised as the denoiser holds it, on the decode arm; `[voxels,
-    /// 3]` pixels in `[-1, 1]` on the encode arm.
+    /// `vae.decode`: the packed latent clip, `[voxels, 128]` bf16 at token
+    /// resolution (`/16`), BatchNorm-normalised as the denoiser holds it.
     pub const VOXELS: u8 = 0;
+    /// `vae.encode`: the pixel clip, `[voxels, 3]` in `[-1, 1]`. A second
+    /// voxel index because the engine seats one rectangle per `(kind,
+    /// index)` for the whole plan and the two clips are different widths.
+    pub const PIXEL_VOXELS: u8 = 1;
 }
 
 /// One row's shape: the numbers that differ between the shipped
