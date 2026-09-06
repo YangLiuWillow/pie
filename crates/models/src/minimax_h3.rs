@@ -35,12 +35,13 @@
 //!    path, where M-RoPE's three sections carry one position and the
 //!    rotary is plain neox; wiring `qwen_3`'s tower under `te.` and
 //!    splitting the text lane so its vision rows take modality 0 is next.
-//! 2. **the two autoencoders.** Declared nowhere yet: the video VAE's
-//!    ViT decoder wants `attention.ragged` over voxel-derived tokens plus
-//!    a conv/pixel-shuffle tail, its encoder wants the causal 3-D CNN
-//!    `Spatial` already has, and the audio codec wants transposed 1-D
-//!    convolutions, weight-norm reparameterisation and `Snake`/`SnakeBeta`
-//!    — none of which the `Spatial` vocabulary states.
+//! 2. **the two autoencoders.** The video VAE fits the `Spatial`
+//!    vocabulary as it stands (`forward`'s header says how) and is
+//!    blocked on the checkpoint alone: its weights sit at
+//!    `video_vae/source/model.safetensors`, a nested folder discovery
+//!    does not descend into. The audio codec is not: it wants transposed
+//!    1-D convolutions, weight-norm reparameterisation and
+//!    `Snake`/`SnakeBeta`, none of which `Spatial` states.
 //! 3. **two velocity widths.** The video head is 96 wide and the audio
 //!    head 32, and a plan carries one `velocity` export, so the audio
 //!    prediction rides the `hidden` seam ([`forward::denoise`]).

@@ -61,17 +61,32 @@
 //! [`super::model`]'s header for why that is the whole gather and why it
 //! needs no new op.
 //!
-//! # What is declared and not traced
+//! # The two autoencoders are not here
 //!
-//! The two autoencoders. The video VAE is a causal 3-D CNN encoder paired
-//! with a 36-block ViT decoder whose tokens each emit a 4×16×16 pixel
-//! block, and the audio VAE is a DAC encoder with a BigVGAN vocoder —
-//! seven `ConvTranspose1d` upsamplers, `SnakeBeta` activations and
-//! anti-aliased resampling filters. `Spatial` (`IMAGEGEN_CONTRACT.md` §6)
-//! has no transposed convolution, no weight-norm reparameterisation and
-//! no `Snake`, and the FL2VA snapshot's `video_vae/` had not landed while
-//! this text was written, so neither reading is declared here. The report
-//! records both as follow-ups with the ops each needs.
+//! Neither `vae.decode` nor `vae.encode` is declared, for two different
+//! reasons.
+//!
+//! The **video VAE** — a causal 3-D CNN encoder (f16 t4 c24) paired with a
+//! 36-block ViT decoder whose every token emits a 4×16×16 pixel block —
+//! is within the `Spatial` vocabulary as it stands: the encoder is the
+//! causal `Conv3d` + `GroupNorm` ladder `IMAGEGEN_CONTRACT.md` §6 already
+//! serves, and the decoder is `spatial::patchify` at `p = (1, 1, 1)` off
+//! the latent, `attn::ragged` over the clip's tokens under a three-axis
+//! rope (θ 100, angles pre-multiplied by 2π — `use_angle`, which is the
+//! guest's position table's business), and `spatial::unpatchify` at
+//! `p = (4, 16, 16)`. What stops it is the CHECKPOINT: the partition
+//! keeps its weights at `video_vae/source/model.safetensors`, a nested
+//! folder `checkpoint::file::diffusers::weight_files` does not descend
+//! into (design D5's subfolder recursion is unbuilt), and the file had
+//! not finished downloading while this text was written. So the reading
+//! is a follow-up with a known shape, not an open question.
+//!
+//! The **audio VAE** — a DAC encoder with a BigVGAN vocoder — is not:
+//! seven `ConvTranspose1d` upsamplers (×800 together), weight-norm
+//! reparameterisation (`g·v/‖v‖`), `Snake`/`SnakeBeta`
+//! (`x + α⁻¹·sin²(αx)`) and anti-aliased sinc up/down-sampling are four
+//! ops the `Spatial` family does not state. `Elementwise::Snake` is the
+//! small one; the transposed convolution is the real work.
 
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
