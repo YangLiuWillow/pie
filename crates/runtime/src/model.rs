@@ -833,6 +833,38 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                 ));
             }
         }
+        // A stated position convention has to line up with the port it
+        // describes, or a family-blind guest builds a grid of the wrong
+        // width and the failure surfaces as a rope mismatch deep in a
+        // fire. Refused here, in the family's own vocabulary.
+        if let Some(convention) = &reading.positions {
+            let axes = reading
+                .ports
+                .iter()
+                .find(|port| port.kind == models::PortKind::AxisPositions)
+                .map(|port| port.width);
+            let Some(axes) = axes else {
+                return Err(format!(
+                    "reading `{}` states a position convention but declares no \
+                     axis-positions port",
+                    reading.name
+                ));
+            };
+            if convention.axes.len() != axes as usize {
+                return Err(format!(
+                    "reading `{}` states {} axis roles for a {axes}-wide positions port",
+                    reading.name,
+                    convention.axes.len()
+                ));
+            }
+            if convention.text_axis >= axes {
+                return Err(format!(
+                    "reading `{}` numbers its text rows on axis {} of a {axes}-axis \
+                     positions port",
+                    reading.name, convention.text_axis
+                ));
+            }
+        }
         if !reading.takes_tokens
             && !reading.ports.iter().any(|port| {
                 matches!(
