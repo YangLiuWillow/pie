@@ -641,6 +641,7 @@ pub const ROWS: &[Row] = &[
         layers: 3,
         vocab: 0,
         arch: "minimax_h3",
+    },
     // Wan 2.2 TI2V-5B (M3). `layers` is the umT5-xxl encoder's depth the
     // `text` reading runs; `vocab` is that encoder's embedding width, which
     // the reading embeds by — no reading of this family has logits.
