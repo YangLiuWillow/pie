@@ -358,8 +358,9 @@ impl Shell {
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[u64],
     ) -> Result<u64> {
+        let stream = self.device.stream();
         self.programs
-            .bind(program_id, seeds, extents, geometry, adopted, ids)
+            .bind(program_id, seeds, extents, geometry, adopted, ids, stream)
     }
 
     /// The first of `tickets` this instance's own prediction disagrees with.
