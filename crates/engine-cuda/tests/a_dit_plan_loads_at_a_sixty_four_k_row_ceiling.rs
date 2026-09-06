@@ -19,7 +19,9 @@ mod common_dit;
 
 use std::time::Instant;
 
-use common_dit::{HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane, reference};
+use common_dit::{
+    HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane, reference,
+};
 use engine::Engine;
 use engine::fire::LaneStream;
 
@@ -60,7 +62,9 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
         text_rows,
         image_rows,
         timestep: 0.25,
-        positions: (0..text_rows + image_rows).map(|r| [r as f32, 1.0]).collect(),
+        positions: (0..text_rows + image_rows)
+            .map(|r| [r as f32, 1.0])
+            .collect(),
     };
     let want = reference(&weights, &request);
     let text = rig.lane(text_rows as u32);
@@ -70,14 +74,22 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
     rig.publish(
         text.instance,
         2,
-        &request.positions[..text_rows].iter().flatten().copied().collect::<Vec<f32>>(),
+        &request.positions[..text_rows]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<f32>>(),
     );
     rig.publish(image.instance, 0, &request.image);
     rig.publish(image.instance, 1, &[request.timestep]);
     rig.publish(
         image.instance,
         2,
-        &request.positions[text_rows..].iter().flatten().copied().collect::<Vec<f32>>(),
+        &request.positions[text_rows..]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<f32>>(),
     );
     let began = Instant::now();
     let mut ticket = rig
@@ -90,12 +102,22 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
             vec![attach(0, &text), attach(1, &image)],
         ))
         .expect("the frame fires");
-    rig.engine.settle_frame(&mut ticket).expect("the frame settles");
+    rig.engine
+        .settle_frame(&mut ticket)
+        .expect("the frame settles");
     eprintln!(
         "a {}-row fire under the 8192 rung took {:.2?} to submit and settle",
         text_rows + image_rows,
         began.elapsed()
     );
-    assert_close(&ticket.steps[0].readouts[0].values, &want.0, "text velocity");
-    assert_close(&ticket.steps[0].readouts[1].values, &want.1, "image velocity");
+    assert_close(
+        &ticket.steps[0].readouts[0].values,
+        &want.0,
+        "text velocity",
+    );
+    assert_close(
+        &ticket.steps[0].readouts[1].values,
+        &want.1,
+        "image velocity",
+    );
 }
