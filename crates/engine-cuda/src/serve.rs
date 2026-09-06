@@ -106,6 +106,8 @@ pub struct Shell {
     spaces: usize,
     /// The classes whose window runs an `attention.masked` arm.
     masked: model_ir::ClassSet,
+    /// The float ports and packing selections the plan reads (D2/D3).
+    feeds: crate::exports::Feeds,
     /// The classes whose window runs a `linear.lora_correct` arm.
     corrected: model_ir::ClassSet,
     /// The classes whose window runs a one-row-per-lane op.
@@ -556,6 +558,21 @@ struct RsFire<'a> {
     buffered: bool,
 }
 
+/// One float port's feed for one lane: which port rectangle, which row (or
+/// lane) of it, how many bytes, and where they come from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PortFeedPlan {
+    pub(crate) seat: crate::inputs::PortSeat,
+    /// The first fire row (token ports) or the fire lane (a lane vector)
+    /// the cell lands at.
+    pub(crate) first: u32,
+    pub(crate) bytes: u64,
+    /// The engine-registered channel id.
+    pub(crate) channel: u64,
+    /// The instance the channel is read through.
+    pub(crate) instance: u64,
+}
+
 /// Every host decision one step needs, made — and not one stream touched.
 pub struct Prepared<'a> {
     /// The step this was prepared from.
@@ -583,6 +600,14 @@ pub struct Prepared<'a> {
     /// rows channel, weights channel, instance)`, copied device to device
     /// over the zeros staged for them, after `stage_self_cond`.
     self_cond_feeds: Vec<(usize, usize, u64, u64, u64)>,
+    /// The D2 packing tables, one per selection the plan reads, in the
+    /// load's order; empty for a plan reading none.
+    packings: Vec<model_exec::fire::Packed>,
+    /// The D3 port feeds: one copy per (lane, port) the lane's class reads.
+    port_feeds: Vec<PortFeedPlan>,
+    /// How many lanes every `[Lanes, ·]` rectangle is carved at this fire:
+    /// the fire's own count, or the key's lane ceiling for a bodied fire.
+    lane_carve: u32,
     /// Every region's rows and lanes, bound to a device address only in `enqueue`.
     windows: Windows,
     /// One per lane, in fire (seriated) order.

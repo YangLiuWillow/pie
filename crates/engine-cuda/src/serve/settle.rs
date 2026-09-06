@@ -10,8 +10,11 @@ use super::{Enqueued, Shell};
 /// carve, spent only if somebody asks.
 #[derive(Debug, Clone)]
 pub(crate) struct Readback {
-    /// The trunk logits rectangle.
+    /// The readout rectangle: the trunk logits (bf16), or the float seam a
+    /// plan plants instead (`velocity` / `hidden`, bf16 or f32).
     pub(crate) logits: kernels_cuda::Tensor,
+    /// Which seam that rectangle is.
+    pub(crate) seam: engine::fire::ReadoutSeam,
     /// One (layer, rectangle) per exported attention column.
     pub(crate) columns: Vec<(u32, kernels_cuda::Tensor)>,
     /// Per submitted lane: its last row.
@@ -33,6 +36,8 @@ pub struct Settled {
     pub rows: Vec<u32>,
     /// Each submitted lane's captured attention mass, empty for a lane that asked for none.
     pub scores: Vec<Vec<LayerScores>>,
+    /// Which export seam [`Settled::logits`] came off.
+    pub seam: engine::fire::ReadoutSeam,
     /// Where to read them from, or `None` for the arming pass.
     pub(super) readback: Option<Readback>,
 }
@@ -111,6 +116,9 @@ impl Shell {
             logits: Vec::new(),
             rows: Vec::new(),
             scores: Vec::new(),
+            seam: readback
+                .as_ref()
+                .map_or(engine::fire::ReadoutSeam::Logits, |readback| readback.seam),
             readback,
         })
     }
@@ -141,10 +149,13 @@ impl Shell {
 
         let logits = readback.logits;
         let width = logits.width as usize;
+        // The element the rectangle is stored in: bf16 for logits, bf16 or
+        // f32 for a float seam.
+        let element = if logits.dtype == model_ir::Dtype::F32 { 4 } else { 2 };
         let lanes = readback.last_row.len();
         let mut taken = vec![Vec::new(); lanes];
         let mut counts = vec![0u32; lanes];
-        let mut raw = vec![0u8; width * 2];
+        let mut raw = vec![0u8; width * element];
         for lane in 0..lanes {
             let owned = readback.lane_rows[lane];
             if owned == 0 {
@@ -170,12 +181,21 @@ impl Shell {
             };
             let mut values = Vec::with_capacity(chosen.len() * width);
             for row in &chosen {
-                self.arena
-                    .read(logits.ptr + u64::from(*row) * width as u64 * 2, &mut raw)?;
-                values.extend(
-                    raw.chunks_exact(2)
-                        .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]]))),
-                );
+                self.arena.read(
+                    logits.ptr + u64::from(*row) * width as u64 * element as u64,
+                    &mut raw,
+                )?;
+                if element == 4 {
+                    values.extend(
+                        raw.chunks_exact(4)
+                            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]])),
+                    );
+                } else {
+                    values.extend(
+                        raw.chunks_exact(2)
+                            .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]]))),
+                    );
+                }
             }
             counts[lane] = u32::try_from(chosen.len()).unwrap_or(u32::MAX);
             taken[lane] = values;

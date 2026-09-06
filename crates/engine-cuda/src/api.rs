@@ -18,7 +18,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, ReadoutSeam,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
     Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -490,7 +490,14 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         .filter_map(|node| node.layer)
         .max()
         .map_or(0, |top| top + 1);
-    let vocab = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
+    // A plan whose readout is a float seam (a denoiser) has no vocabulary:
+    // its `logits()` is refused at bind by the zero width, and its
+    // `velocity()` is gated below.
+    let vocab = match shell.out_width() {
+        Ok(width) => u32::try_from(width).unwrap_or(u32::MAX),
+        Err(_) if shell.readout_seam().is_some() => 0,
+        Err(why) => return Err(fault(why)),
+    };
     Ok(ModelProfile {
         vocab,
         page_size: budgets.page_size,
@@ -517,11 +524,12 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // attached lane. A load with no bank refuses by name
         // (`Fault::Adapterless`).
         has_lora: true,
-        // No denoise reading on this load yet: the velocity seam is bound
-        // by the model text, so a `velocity()` in a guest trace is refused
+        // The velocity seam is the model text's: a plan that plants
+        // `seam::VELOCITY` binds the `velocity()` intrinsic at its width
+        // (design D3), and one that does not refuses a guest's `velocity()`
         // at bind rather than at its first fire.
-        has_velocity: false,
-        velocity_width: 0,
+        has_velocity: shell.velocity_width().is_some(),
+        velocity_width: shell.velocity_width().unwrap_or(0),
         kernels: Vec::new(),
     })
 }
@@ -1373,6 +1381,12 @@ impl Cuda {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
+                    // The D2/D3 facts, carried through as stated: the word
+                    // already packs the stream (the family's `Classify`),
+                    // and the shell builds the packing tables off the pair.
+                    stream: lane.stream as u8,
+                    group: lane.group,
+                    ports: &lane.ports,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
@@ -1592,7 +1606,7 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
                 width,
                 values,
                 scores,
-                seam: ReadoutSeam::Logits,
+                seam: step.settled.seam,
             },
         });
     }

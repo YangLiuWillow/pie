@@ -484,6 +484,40 @@ impl Rings {
         }
     }
 
+    /// The device address a FEED reads channel `channel`'s committed cell at
+    /// `sequence` from — where the committed bytes actually are, which is
+    /// not always [`cell_address`](Rings::cell_address): a host-ended
+    /// channel's committed cell lives in its pinned mirror (a `publish`
+    /// writes the mirror, and the wave's `pull_validate` copies it onto the
+    /// session's device cell only when a guest fires), and the mirror is
+    /// device-mapped, so a `cudaMemcpyAsync` reads it straight from the
+    /// stream. A shared ring's cell is its slab; a device-only session
+    /// channel's is its own cell. Bit-packed bool cells are refused: a float
+    /// port is never one.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for a channel this instance does not carry or a
+    /// bool one.
+    pub fn feed_address(&self, channel: usize, sequence: u64) -> Result<u64> {
+        let shape = self.shape_of(channel)?;
+        if shape.dtype == Dtype::Bool {
+            return Err(Fault::program(
+                "program::launch",
+                format!("channel {channel} is a bool ring, which no float port reads"),
+            ));
+        }
+        let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
+        if let Some(base) = self.shared_slab(channel) {
+            return Ok(base + at);
+        }
+        if let Some(endpoint) = self.endpoint(channel) {
+            let cell = (sequence % u64::from(endpoint.cap1())) * u64::from(endpoint.wire_bytes());
+            return Ok(endpoint.mirror_device() + cell);
+        }
+        self.cells[channel].at(at)
+    }
+
     /// Channel `channel`'s shared device slab, or `None` for one whose cells
     /// this session cut for itself. See
     /// [`Endpoint::device_cells`](super::Endpoint::device_cells).

@@ -136,6 +136,8 @@ struct Staged {
     patches: Option<PatchHandles>,
     mrope: Option<kernels_cuda::Tensor>,
     self_cond: Option<(kernels_cuda::Tensor, kernels_cuda::Tensor)>,
+    /// The float ports' rectangles, carved at this fire's rows / lanes.
+    ports: Vec<crate::run::PortBinding>,
     slots: SlotTable,
     caches: CacheTable,
     paging: Paging,
@@ -271,6 +273,32 @@ impl FireCtx<'_> {
             Some(staged)
         };
 
+        // The float ports (D3): each fed lane's rows of each port rectangle
+        // are copied from the channel's committed cell — the cell at the
+        // consumer head, resolved now, after the prologue, so a prologue's
+        // `take` moves the feed with it. Device to device (or off the
+        // pinned mirror, which is device-mapped), on the compute stream, in
+        // front of the launches that read the rectangle.
+        for feed in &p.port_feeds {
+            let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
+            let rectangle = self
+                .inputs
+                .port(feed.seat.kind, feed.seat.port, u32::MAX)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "the {:?} port {} rectangle, which this load carved none of",
+                        feed.seat.kind, feed.seat.port
+                    ),
+                })?;
+            let at = rectangle.ptr + u64::from(feed.first) * feed.seat.row_bytes();
+            crate::device::alloc::copy_any(
+                self.device.stream(),
+                at,
+                source,
+                usize::try_from(feed.bytes).unwrap_or(usize::MAX),
+            )?;
+        }
+
         // A bodied fire carves both columns at the key's bucket, so a replay's
         // grids never outrun the rectangle its baked pointers address.
         let carve_rows = if p.bodied {
@@ -278,6 +306,28 @@ impl FireCtx<'_> {
         } else {
             u64::from(rows)
         };
+        // Lane rectangles likewise carve at the key's lane ceiling: a
+        // lane-shaped launch grids at it and a replay never outruns it.
+        let carve_lanes = u64::from(p.lane_carve).max(u64::from(lane_count));
+        let ports: Vec<crate::run::PortBinding> = self
+            .inputs
+            .ports()
+            .into_iter()
+            .filter_map(|seat| {
+                let rows = if seat.per_lane() {
+                    carve_lanes
+                } else {
+                    carve_rows
+                };
+                self.inputs
+                    .port(seat.kind, seat.port, u32::try_from(rows).unwrap_or(u32::MAX))
+                    .map(|tensor| crate::run::PortBinding {
+                        kind: seat.kind,
+                        port: seat.port,
+                        tensor,
+                    })
+            })
+            .collect();
         let carve_patches = if p.bodied {
             u64::from(p.composition.patch_bucket()).max(u64::from(p.composition.patch_rows()))
         } else {
@@ -287,7 +337,7 @@ impl FireCtx<'_> {
             &self.compiled.arena,
             model_compiler::FireRows {
                 tokens: carve_rows,
-                lanes: u64::from(lane_count),
+                lanes: carve_lanes,
                 patches: carve_patches,
                 images: u64::from(p.composition.images()),
             },
@@ -323,6 +373,7 @@ impl FireCtx<'_> {
             patches,
             mrope,
             self_cond,
+            ports,
             slots,
             caches,
             paging,
@@ -407,6 +458,14 @@ impl FireCtx<'_> {
             mrope_positions: staged.mrope,
             self_cond_rows: staged.self_cond.map(|(rows, _)| rows),
             self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
+            group_of_lane: handles.group_of_lane,
+            packings: p
+                .packings
+                .iter()
+                .zip(&handles.packings)
+                .map(|(packed, tables)| (packed.select, *tables))
+                .collect(),
+            ports: staged.ports.clone(),
             geometry,
             schedules,
             plan_values: facts.plans.len(),
@@ -601,20 +660,30 @@ impl FireCtx<'_> {
             return Ok(None);
         }
         let slots = &staged.slots;
-        // M0: a float readout (`velocity`, `hidden`) is read back by the
-        // runtime agent's path; this shell's readback is logits only.
-        let out = self.exports.out.ok_or_else(|| Fault::Unbound {
-            what: "a plan with no `out` seam: its readout is a float seam, which this shell \
-                   does not read back yet"
+        // The readout seam: `out` (logits) when the plan has one, else the
+        // float readout it plants instead (`velocity`, then the last
+        // `hidden`) — design D3's "this kind's logits".
+        let readout = self.exports.readout().ok_or_else(|| Fault::Unbound {
+            what: "a plan with no `out` seam and no float readout, which boot should have \
+                   refused"
                 .to_string(),
         })?;
+        let out = readout.value;
         let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!(
-                "value {}, the out seam, which the carve gave no rectangle",
-                out.0
+                "value {}, the {:?} readout seam, which the carve gave no rectangle",
+                out.0, readout.seam
             ),
         })?;
-        if logits.dtype != Dtype::Bf16 {
+        if !matches!(logits.dtype, Dtype::Bf16 | Dtype::F32) {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "the {:?} readout seam landed as {:?}, which this shell cannot read back",
+                    readout.seam, logits.dtype
+                ),
+            });
+        }
+        if readout.seam == engine::fire::ReadoutSeam::Logits && logits.dtype != Dtype::Bf16 {
             return Err(Fault::Unbound {
                 what: format!(
                     "an out seam landed as {:?}, which this shell cannot read back",
@@ -622,6 +691,34 @@ impl FireCtx<'_> {
                 ),
             });
         }
+        // The float seams an epilogue may point an intrinsic at, whether or
+        // not they are the readout: the velocity plane and the last hidden
+        // plane, each as the carve placed it.
+        let float_plane = |export: Option<&crate::exports::Export>,
+                           seam: &str|
+         -> Result<Option<kernels_cuda::Tensor>> {
+            let Some(export) = export else {
+                return Ok(None);
+            };
+            let plane = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "value {}, the `{seam}` export, which the carve gave no rectangle",
+                    export.value.0
+                ),
+            })?;
+            if !matches!(plane.dtype, Dtype::Bf16 | Dtype::F32) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "a `{seam}` export landed as {:?}, which this shell cannot point an \
+                         intrinsic at",
+                        plane.dtype
+                    ),
+                });
+            }
+            Ok(Some(plane))
+        };
+        let velocity = float_plane(self.exports.velocity.as_ref(), "velocity")?;
+        let hidden = float_plane(self.exports.hidden.last(), "hidden")?;
         // Which rows of the arena's logits rectangle each submitted lane reads and owns.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
@@ -660,6 +757,13 @@ impl FireCtx<'_> {
 
         // The epilogue: intrinsics point at rows of the arena, read where they lie.
         let vocab = u32::try_from(logits.width as usize).unwrap_or(u32::MAX);
+        let storage_of = |plane: kernels_cuda::Tensor| {
+            if plane.dtype == Dtype::F32 {
+                crate::program::launch::INTRINSIC_STORAGE_F32
+            } else {
+                INTRINSIC_STORAGE_RAW_BF16
+            }
+        };
         let draft = match &self.exports.mtp {
             Some(export) => {
                 let column = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -715,7 +819,38 @@ impl FireCtx<'_> {
             let consecutive = wanted
                 .windows(2)
                 .all(|pair| pair[1] == pair[0].wrapping_add(1));
-            if consecutive {
+            // The float planes bind at the lane's whole row run: a
+            // denoiser's epilogue reads every latent row's velocity, and a
+            // hidden readout every row's state (`Readout::Rows` narrows the
+            // logits row list, never these).
+            if let Some(plane) = velocity {
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::Velocity,
+                    plane.ptr,
+                    storage_of(plane),
+                    plane.width,
+                    plane.width,
+                    first_row[lane],
+                )?;
+            }
+            if let Some(plane) = hidden {
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::Hidden,
+                    plane.ptr,
+                    storage_of(plane),
+                    plane.width,
+                    plane.width,
+                    first_row[lane],
+                )?;
+            }
+            // The logits intrinsic is the out seam's alone: a plan whose
+            // readout is a float seam binds none, and a program reading
+            // `logits()` against it is refused at its mint by name.
+            if readout.seam != engine::fire::ReadoutSeam::Logits {
+                // Nothing to bind for `logits`.
+            } else if consecutive {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::Logits,
@@ -835,6 +970,7 @@ impl FireCtx<'_> {
 
         Ok(Some(Readback {
             logits,
+            seam: readout.seam,
             columns,
             last_row,
             first_row,

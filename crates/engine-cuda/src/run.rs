@@ -302,6 +302,13 @@ pub struct FireBindings {
     /// `RuntimeInput::SelfCondWeights`: `f32`, `[token rows, taps]`, beside the rows.
     pub self_cond_weights: Option<Tensor>,
 
+    /// `GeomKind::GroupOfLane`: `i32`, `[lanes]` at the lane tables' reach. `None` for a plan that reads no packing table.
+    pub group_of_lane: Option<Tensor>,
+    /// The D2 packing tables, one per selection the plan reads: the two CSRs, the reference tails and the two row tables, handed to the arms whole (their values are fire-absolute).
+    pub packings: Vec<(model_ir::Selection, crate::inputs::PackingHandles)>,
+    /// The D3 float ports, carved at this fire's rows (or lanes): the rectangle a `RuntimeInput::{Latents, LaneVector, Context, AxisPositions}` resolves to.
+    pub ports: Vec<PortBinding>,
+
     /// Per cache space, aligned with `Trace::caches`.
     pub geometry: Vec<CacheGeometry>,
 
@@ -324,6 +331,14 @@ pub struct FireBindings {
 
     /// Whether this fire's capture phase will be captured as a CUDA graph. Builders carve graph-shaped, padded schedules under it; `PrefillPlan::graph_capturable` answers whether they managed.
     pub capture: bool,
+}
+
+/// One float port's rectangle, bound for one fire.
+#[derive(Clone, Copy, Debug)]
+pub struct PortBinding {
+    pub kind: engine::fire::PortKind,
+    pub port: u8,
+    pub tensor: Tensor,
 }
 
 /// One built plan payload. An enum over the four kinds this plane can be asked to build, not `Box<dyn Any>`: `StructKind` is closed, so a wrong kind is a named panic rather than a silent downcast failure.
@@ -951,7 +966,8 @@ impl<'c> Run<'c> {
             Dim::Tokens => row(1),
             Dim::TokensTimes(k) => row(k),
             Dim::Patches => row(1),
-            Dim::Lanes => lane(0),
+            // A lane-shaped ACTIVATION (a lane vector's chain: the timestep embedding, the adaLN modulation) is handed whole at the fire's lane carve: its launches grid over every lane the carve admits and read no seat (`Run::unseated`), so one body serves every lane count. The lane-shaped INPUTS (the group table, a lane vector port) are the same rectangle, whole.
+            Dim::Lanes => return handle,
             Dim::LanesPlus(k) => lane(k),
             Dim::Images => lane(0),
             Dim::ImagesPlus(k) => lane(k),
@@ -1018,6 +1034,73 @@ impl<'c> Run<'c> {
             }
             _ => handle,
         }
+    }
+
+    /// One selection's D2 packing tables, as this fire staged them.
+    pub(crate) fn packing(&self, at: usize, select: model_ir::Selection) -> crate::inputs::PackingHandles {
+        self.fire
+            .packings
+            .iter()
+            .find(|(have, _)| *have == select)
+            .map(|(_, tables)| *tables)
+            .unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads the packing tables of selection {select:?}, which this \
+                     fire staged none of; the load carves one per selection the plan reads"
+                )
+            })
+    }
+
+    /// The D2 reference tails (`[groups]` i32, the row of each group where its reference rows begin) of the selection a `ReferenceTag` input names — what the ragged kernel's reference mask reads.
+    pub(crate) fn reference_start_of(&self, tags: ValueId) -> Tensor {
+        let at = tags.0 as usize;
+        match &self.values[at].def {
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::ReferenceTag { select },
+                ..
+            }) => self.packing(at, *select).reference_start,
+            other => panic!(
+                "value {at} is {other:?}, and a ragged reference mask names a `ReferenceTag` \
+                 table on its query side"
+            ),
+        }
+    }
+
+    /// One float port's rectangle, carved at this fire's rows or lanes.
+    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+        self.fire
+            .ports
+            .iter()
+            .find(|bound| bound.kind == kind && bound.port == port)
+            .map(|bound| bound.tensor)
+            .unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads {kind:?} port {port}, which this load carved no \
+                     rectangle for"
+                )
+            })
+    }
+
+    /// Is `id` a lane-shaped value (`[Lanes, ·]`)? Such a value is carved at the fire's lane ceiling and resolved whole (see [`Run::cut`]).
+    pub(crate) fn lane_shaped(&self, id: ValueId) -> bool {
+        matches!(
+            &self.values[id.0 as usize].ty,
+            Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Lanes))
+        )
+    }
+
+    /// Run `launch` with the staged-geometry seat disarmed, for a launch over a LANE-shaped rectangle: the seat's words are token rows and a row origin, which a per-lane launch must not retire by or shift by. Such a launch grids at the fire's lane carve (every lane the ceiling admits, live or not), so a body replay serves any lane count without reading a seat. The seat is put back after.
+    pub(crate) fn unseated<T>(&self, launch: impl FnOnce() -> T) -> T {
+        let held = match self.ctx().stage() {
+            kernels_cuda::ArgValue::Ptr(at) => at,
+            _ => 0,
+        };
+        self.ctx().disarm_stage();
+        let out = launch();
+        if held != 0 {
+            self.ctx().arm_stage(held);
+        }
+        out
     }
 
     /// The crate's heart: one plan id in, one device handle out, routed on the id's `Def`, cut to the asking node's window ([`Run::cut`]). Cache ids and split-plane weights never resolve here — reaching that case is a dispatch-arm bug.
@@ -1138,17 +1221,36 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // M0: wired by the engine agent — the float ports (D3) and the
-            // row-packing tables (D2) are staged by the fire path once the
-            // runtime's `reading`/`input` verbs land.
-            Def::Input(
-                which @ (RuntimeInput::RowPermutation { .. }
-                | RuntimeInput::Latents { .. }
-                | RuntimeInput::LaneVector { .. }
-                | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }),
-            ) => panic!("value {at} reads {which:?}, which this shell does not stage yet"),
+            // The D2 row permutation of one selection: `[Tokens]` i32, fire-wide, staged per fire.
+            Def::Input(RuntimeInput::RowPermutation { select }) => self.packing(at, *select).permutation,
+            // The D3 float ports: rectangles the fire path filled from channel cells.
+            Def::Input(RuntimeInput::Latents { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Latents, *port)
+            }
+            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
+                self.port(at, engine::fire::PortKind::LaneVector, *port)
+            }
+            Def::Input(RuntimeInput::Context { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Context, *port)
+            }
+            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
+                self.port(at, engine::fire::PortKind::AxisPositions, *port)
+            }
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
+                // The packing kinds need no cache seat: a denoiser declares no kv space at all.
+                match kind {
+                    GeomKind::GroupOfLane => {
+                        return self.fire.group_of_lane.unwrap_or_else(|| {
+                            panic!("value {at} reads the group table, which this fire staged none of")
+                        });
+                    }
+                    GeomKind::GroupIndptr { select } => return self.packing(at, *select).group_indptr,
+                    GeomKind::LaneIndptr { select } => return self.packing(at, *select).lane_indptr,
+                    GeomKind::ReferenceTag { select } => {
+                        return self.packing(at, *select).reference_tag;
+                    }
+                    _ => {}
+                }
                 let seat = self.geometry(at, *space);
                 let bound = match kind {
                     GeomKind::Indptr => seat.indptr,
@@ -1160,11 +1262,11 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken => seat.request_of_token,
                     GeomKind::WritePage => seat.write_page,
                     GeomKind::WriteOffset => seat.write_offset,
-                    // M0: wired by the engine agent (the group tables).
+                    // Answered above, before the cache seat was asked for.
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
                     | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => None,
+                    | GeomKind::ReferenceTag { .. } => unreachable!("the D2 tables return early"),
                 };
                 bound.unwrap_or_else(|| {
                     panic!(

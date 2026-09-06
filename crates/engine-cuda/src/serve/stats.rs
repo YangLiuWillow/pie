@@ -59,6 +59,28 @@ impl Shell {
         kv::width_of(&self.trace, out)
     }
 
+    /// The width of one velocity row (`seam::VELOCITY`, design D3), or
+    /// `None` for a plan that plants none — gates `IntrinsicId::Velocity`.
+    #[must_use]
+    pub fn velocity_width(&self) -> Option<u32> {
+        let export = self.exports.velocity.as_ref()?;
+        kv::width_of(&self.trace, export.value)
+            .ok()
+            .and_then(|width| u32::try_from(width).ok())
+    }
+
+    /// Which export seam this load's readout rows come off, and the width of
+    /// one row: `out`'s vocabulary, or the float seam a plan plants instead
+    /// (`velocity`, then the last `hidden`).
+    #[must_use]
+    pub fn readout_seam(&self) -> Option<(engine::fire::ReadoutSeam, u32)> {
+        let readout = self.exports.readout()?;
+        let width = kv::width_of(&self.trace, readout.value)
+            .ok()
+            .and_then(|width| u32::try_from(width).ok())?;
+        Some((readout.seam, width))
+    }
+
     /// Does this load's model text declare a draft head — gates `IntrinsicId::MtpLogits`.
     #[must_use]
     pub fn drafts(&self) -> bool {

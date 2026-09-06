@@ -209,6 +209,34 @@ impl Session {
         Ok((address, bytes))
     }
 
+    /// Where a float-port feed reads channel `channel`'s committed cell
+    /// this fire — the cell at the consumer head, what this instance's own
+    /// `take` would read — and how many bytes that cell is. `None` when the
+    /// ring holds no committed cell. See [`Rings::feed_address`].
+    ///
+    /// # Errors
+    ///
+    /// An unknown or bool channel.
+    pub fn feed_cell(&self, channel: u32) -> Result<Option<(u64, u64)>> {
+        if self.depth(channel) == 0 {
+            return Ok(None);
+        }
+        let head = self.cursor(channel).map_or(0, |cursor| cursor.head);
+        let address = self.rings.feed_address(channel as usize, head)?;
+        let bytes = self.rings.shape_of(channel as usize)?.cell_bytes() as u64;
+        Ok(Some((address, bytes)))
+    }
+
+    /// One channel's committed-cell bytes, cursor-independent: what a feed's
+    /// cell must be, checked before any stream is touched.
+    ///
+    /// # Errors
+    ///
+    /// An unknown channel.
+    pub fn cell_bytes(&self, channel: u32) -> Result<u64> {
+        Ok(self.rings.shape_of(channel as usize)?.cell_bytes() as u64)
+    }
+
     pub fn cursor(&self, channel: u32) -> Option<Cursor> {
         let channel = channel as usize;
         let prediction = self.cursors.get(channel).copied()?;

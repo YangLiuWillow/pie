@@ -42,6 +42,9 @@ struct Synthetic {
     /// `(images, patches)` for a lane carrying an image; the payload is
     /// zero bytes, since only the geometry has to be plausible.
     media: Option<SyntheticMedia>,
+    /// The stream code of the representative request this lane's word was
+    /// classified from.
+    stream: u8,
 }
 
 /// The six vectors one synthetic image submission owns. Zeroed except
@@ -541,6 +544,7 @@ impl Shell {
                 let wants_media = media.get(at).is_some_and(|(images, _)| *images > 0);
                 let request = self.representative(class, rows, wants_media);
                 Synthetic {
+                stream: request.stream().code(),
                 word: (self.classify)(&request),
                 tokens: vec![0u32; rows as usize],
                 mask: request.has_custom_mask().then(|| {
@@ -667,6 +671,14 @@ impl Shell {
                 // it is the only one a body can be armed for.
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
+                // The stream the class's representative request carries, so
+                // the packing tables of a stream-split plan are built over
+                // the words the synthetic lands in; every synthetic lane is
+                // a group of its own, and feeds no port (the rectangles
+                // stand as the load left them: zeros, or the last fire's).
+                stream: lane.stream,
+                group: None,
+                ports: &[],
             })
             .collect();
 

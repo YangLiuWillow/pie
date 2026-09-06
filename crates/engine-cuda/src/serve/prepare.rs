@@ -14,8 +14,8 @@ use crate::store::kv::{self, Seat};
 use crate::window::Windows;
 
 use super::{
-    Enqueued, FireCost, MROPE_COORDS, Media, PATCH_ROUTE_DROP, Prepared, RsFire, Settled, Shell,
-    StepView,
+    Enqueued, FireCost, MROPE_COORDS, Media, PATCH_ROUTE_DROP, PortFeedPlan, Prepared, RsFire,
+    Settled, Shell, StepView,
 };
 
 /// `prepare`: host-only (gate, ports, compose, lane loop, geometry, windows,
@@ -353,6 +353,144 @@ impl FrameShell for Shell {
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
+
+        // 1b. The D2 packing tables: which group each fire lane joins, and
+        // per selection the plan reads, the packed order and its CSRs. Built
+        // over the composition's fire order from the `(stream, group)` the
+        // runtime stated per lane. A plan reading no table builds none.
+        let lane_facts: Vec<model_exec::fire::LaneFacts> = lanes
+            .iter()
+            .map(|seated| model_exec::fire::LaneFacts {
+                stream: seated.stream,
+                group: seated.group,
+            })
+            .collect();
+        let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let groups = model_exec::fire::group_of_lane(composition.lanes(), &lane_facts);
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
+            for &select in &self.feeds.selections {
+                let packed = model_exec::fire::pack(
+                    select,
+                    composition.lanes(),
+                    &lane_facts,
+                    &groups,
+                    composition.rows(),
+                )
+                .map_err(model_exec::Error::Fire)?;
+                // The CUDA ragged kernel's reference mask is one tail per
+                // group: a group with two reference lanes would let them see
+                // each other, which the contract forbids, so it is refused
+                // here rather than computed wrong.
+                if self.feeds.reference_masked.contains(&select)
+                    && let Some((group, count)) = packed
+                        .references
+                        .iter()
+                        .enumerate()
+                        .find(|(_, count)| **count > 1)
+                {
+                    return Err(Fault::program(
+                        "serve::packing",
+                        format!(
+                            "attention group {group} carries {count} reference lanes, and \
+                             this shell's `attention.ragged` reference mask is one tail per \
+                             group (every reference row of a group would see every other's); \
+                             submit one reference lane per group"
+                        ),
+                    ));
+                }
+                packings.push(packed);
+            }
+            (groups, packings)
+        };
+
+        // 1c. The D3 port feeds: every port a lane's class reads must be fed
+        // from one of its channels, through the instance attached to it (the
+        // `SelfCondInput::channels` precedent); the cell must be exactly the
+        // lane's rows of the port's width. Checked here, before any stream
+        // is touched; the cell's address is resolved at `enqueue`, after the
+        // prologue, so it is the cell the instance's own `take` would read.
+        let mut port_feeds: Vec<PortFeedPlan> = Vec::new();
+        for (fire_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for feed in seated.ports {
+                if !self
+                    .feeds
+                    .ports
+                    .iter()
+                    .any(|(seat, _)| seat.kind == feed.kind && seat.port == feed.port)
+                {
+                    return Err(Fault::program(
+                        "serve::ports",
+                        format!(
+                            "lane {} feeds {:?} port {} and this plan declares no such port",
+                            row.source, feed.kind, feed.port
+                        ),
+                    ));
+                }
+            }
+            for (seat, readers) in &self.feeds.ports {
+                if !readers.contains(row.class as usize) {
+                    continue;
+                }
+                let Some(feed) = seated
+                    .ports
+                    .iter()
+                    .find(|feed| feed.kind == seat.kind && feed.port == seat.port)
+                else {
+                    return Err(Fault::program(
+                        "serve::ports",
+                        format!(
+                            "lane {} runs a class that reads {:?} port {} and feeds it no \
+                             channel; a declared port is fed from a channel cell at every \
+                             submit (`Lane::ports`)",
+                            row.source, seat.kind, seat.port
+                        ),
+                    ));
+                };
+                let instance = attachments
+                    .iter()
+                    .find(|attached| attached.lane == row.source)
+                    .map(|attached| attached.instance)
+                    .ok_or_else(|| {
+                        Fault::program(
+                            "serve::ports",
+                            format!(
+                                "lane {} feeds {:?} port {} off channel {} but attaches no \
+                                 instance; a port cell is read through the instance that \
+                                 carries the channel",
+                                row.source, seat.kind, seat.port, feed.channel
+                            ),
+                        )
+                    })?;
+                let rows = if seat.per_lane() { 1 } else { row.rows };
+                let bytes = u64::from(rows) * seat.row_bytes();
+                let cell = self.programs.feed_cell_bytes(instance, feed.channel)?;
+                if cell != bytes {
+                    return Err(Fault::program(
+                        "serve::ports",
+                        format!(
+                            "lane {} feeds {:?} port {} off channel {} whose cell is {cell} \
+                             bytes, and the port wants {rows} row(s) x {} {:?} = {bytes} \
+                             bytes (the lane's rows by the port's width)",
+                            row.source, seat.kind, seat.port, feed.channel, seat.width, seat.dtype
+                        ),
+                    ));
+                }
+                port_feeds.push(PortFeedPlan {
+                    seat: *seat,
+                    first: if seat.per_lane() {
+                        fire_lane as u32
+                    } else {
+                        row.row_offset
+                    },
+                    bytes,
+                    channel: feed.channel,
+                    instance,
+                });
+            }
+        }
 
         // The composition places each lane's images independently of token
         // order: `patch_offset` is where its rows begin in the fire's patch
@@ -1132,8 +1270,10 @@ impl FrameShell for Shell {
         // Ceiling = sum of every present class's rung, each capped at the
         // load's lane ceiling, then clamped to `max_lanes`.
         let mut qo_absolute: Vec<i32> = Vec::new();
+        let mut lane_carve = composition.lane_count();
         if bodied {
             let ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes) as usize;
+            lane_carve = lane_carve.max(ceiling as u32);
             for geometry in &mut geometries {
                 geometry.pad_to(ceiling);
             }
@@ -1153,6 +1293,16 @@ impl FrameShell for Shell {
         // async H2D `enqueue` issues, so nothing may reuse them until the
         // device has passed that copy.
         let slot = self.inputs.claim()?;
+        let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
+            .iter()
+            .map(|packed| crate::inputs::PackingFire {
+                group_indptr: &packed.group_indptr,
+                lane_indptr: &packed.lane_indptr,
+                reference_start: &packed.reference_start,
+                reference_tag: &packed.reference_tag,
+                permutation: &packed.permutation,
+            })
+            .collect();
         let staged_lens = self.inputs.write_host(
             &slot,
             &crate::inputs::Fire {
@@ -1172,6 +1322,8 @@ impl FrameShell for Shell {
                 // How far this fire's own rows go before the bucket's
                 // padding starts.
                 live_rows: rows,
+                group_of_lane: &group_of_lane,
+                packings: &packing_fires,
             },
         )?;
 
@@ -1209,6 +1361,9 @@ impl FrameShell for Shell {
             self_cond_rows,
             self_cond_weights,
             self_cond_feeds,
+            packings,
+            port_feeds,
+            lane_carve,
             windows,
             seats,
             tables,

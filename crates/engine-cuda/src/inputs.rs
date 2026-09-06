@@ -113,6 +113,11 @@ pub struct Handles {
     pub mask: Option<Tensor>,
     /// Each lane's ABSOLUTE byte offset into [`mask`](Handles::mask).
     pub mask_indptr: Option<Tensor>,
+    /// `GeomKind::GroupOfLane`, `[lanes]` at the lane tables' reach. `None`
+    /// for a fire that staged none (a plan reading no packing table).
+    pub group_of_lane: Option<Tensor>,
+    /// One entry per selection the load carved, in the load's order.
+    pub packings: Vec<PackingHandles>,
 }
 
 /// Numbers per multimodal position: `(t, h, w)`. `RuntimeInput::PatchPositions` and `RuntimeInput::MropePositions` are the same triple over two rectangles.
@@ -162,6 +167,75 @@ pub struct PatchHandles {
     pub embed_weights: Option<Tensor>,
 }
 
+/// One float port the plan reads (design D3), as the load carves it: a
+/// `[max_tokens, width]` rectangle on the token axis, or `[max_lanes,
+/// width]` for a lane vector, in the element the plan's reader states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSeat {
+    pub kind: engine::fire::PortKind,
+    /// The family's index for a port of this kind.
+    pub port: u8,
+    /// Elements per row (`width`, or `axes` for the positions port).
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
+impl PortSeat {
+    /// Is this a per-lane rectangle rather than a per-row one?
+    #[must_use]
+    pub fn per_lane(&self) -> bool {
+        self.kind == engine::fire::PortKind::LaneVector
+    }
+
+    /// One row's bytes.
+    #[must_use]
+    pub fn row_bytes(&self) -> u64 {
+        u64::from(self.width) * model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+    }
+}
+
+/// Where one port's rectangle sits in the store.
+#[derive(Debug, Clone, Copy)]
+struct PortAt {
+    seat: PortSeat,
+    at: u64,
+    bytes: u64,
+}
+
+/// One selection's packing tables (design D2), host side, as one fire
+/// stages them: the two CSRs, the reference tails, and the two row tables —
+/// every one at the length `prepare` built it, padded by `write_host` to
+/// the lane ceiling / carve rows.
+#[derive(Debug, Clone, Copy)]
+pub struct PackingFire<'a> {
+    pub group_indptr: &'a [i32],
+    pub lane_indptr: &'a [i32],
+    pub reference_start: &'a [i32],
+    pub reference_tag: &'a [i32],
+    pub permutation: &'a [i32],
+}
+
+/// One selection's packing tables, on the device: `i32` columns at the
+/// addresses the load carved.
+#[derive(Debug, Clone, Copy)]
+pub struct PackingHandles {
+    pub group_indptr: Tensor,
+    pub lane_indptr: Tensor,
+    pub reference_start: Tensor,
+    pub reference_tag: Tensor,
+    pub permutation: Tensor,
+}
+
+/// Where one selection's five tables sit in the staged prefix.
+#[derive(Debug, Clone, Copy)]
+struct PackingAt {
+    group_indptr: u64,
+    lane_indptr: u64,
+    reference_start: u64,
+    reference_tag: u64,
+    permutation: u64,
+}
+
 /// One kv space's device seats.
 #[derive(Debug, Clone, Copy)]
 pub struct SpaceHandles {
@@ -195,6 +269,10 @@ pub struct Fire<'a> {
     pub mask: Option<&'a crate::mask::Staged>,
     /// How many of [`tokens`](Fire::tokens) are this fire's own — the rest is carve padding — or `0` for "all of them".
     pub live_rows: u32,
+    /// `[fire lanes]` group ids; empty for a plan that reads no packing table.
+    pub group_of_lane: &'a [i32],
+    /// One per selection the load carved, in the load's order; empty stages none.
+    pub packings: &'a [PackingFire<'a>],
 }
 
 /// Free set of a staging ring, as one word. Claim is compare-exchange on the lowest set bit; release is `fetch_or`, legal from the CUDA driver's callback thread (where a mutex or CUDA call would be a hazard).
@@ -291,6 +369,8 @@ pub struct Staged {
     space_indices: Vec<u32>,
     /// Lanes the per-space lane tables were staged at: [`lanes`](Staged::lanes) normally, or the bucket's lane ceiling for a bodied fire.
     space_lanes: u32,
+    /// Whether the group table and the packings were staged this fire.
+    packed: bool,
 }
 
 /// The resident inputs, carved once.
@@ -332,6 +412,12 @@ pub struct Inputs {
     self_cond: Option<u64>,
     self_cond_taps: u64,
     self_cond_bytes: u64,
+    /// The float ports' rectangles, below the line like the patch seat.
+    ports: Vec<PortAt>,
+    /// `GeomKind::GroupOfLane`, in the staged prefix, `[max_lanes]` i32.
+    group_of_lane: u64,
+    /// One packing per selection the plan reads, in the staged prefix.
+    packings: Vec<PackingAt>,
     spaces: Vec<SpaceAt>,
     /// Lane ceiling every per-lane table was carved at (`Budget::max_lanes`).
     max_lanes: u32,
@@ -364,6 +450,9 @@ impl Inputs {
         patch: Option<PatchSeat>,
         mrope: bool,
         self_cond_taps: u64,
+        ports: &[PortSeat],
+        selections: usize,
+        masked: bool,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -393,9 +482,13 @@ impl Inputs {
         let slot_ids = take(lanes * 4);
         // Reserved unconditionally: a conditional carve would make the store's layout depend on the plan.
         let adapter_routes = take(rows * 4);
-        // Masked axis's two vectors. `context` is what a slot can hold, so `rows * context` bounds every (query, key) cell a fire can present; `+ lanes` is one byte-alignment pad per lane.
+        // Masked axis's two vectors. `context` is what a slot can hold, so `rows * context` bounds every (query, key) cell a fire can present; `+ lanes` is one byte-alignment pad per lane. A plan with no `attention.masked` arm carves none: at 65536 rows the slab (and its nine pinned mirrors) would be gigabytes nobody reads.
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
-        let mask_bytes = (rows * context).div_ceil(8) + lanes;
+        let mask_bytes = if masked {
+            (rows * context).div_ceil(8) + lanes
+        } else {
+            0
+        };
         let mask_bits = take(mask_bytes);
         let mask_indptr = take((lanes + 1) * 4);
         let spaces: Vec<SpaceAt> = (0..spaces)
@@ -408,8 +501,31 @@ impl Inputs {
                 write_offset: take(rows * 4),
             })
             .collect();
+        // The D2 packing tables ride the staged prefix like the geometry vectors: the group table once, five tables per selection the plan reads.
+        let group_of_lane = take(lanes * 4);
+        let packings: Vec<PackingAt> = (0..selections)
+            .map(|_| PackingAt {
+                group_indptr: take((lanes + 1) * 4),
+                lane_indptr: take((lanes + 1) * 4),
+                reference_start: take(lanes * 4),
+                reference_tag: take(rows * 4),
+                permutation: take(rows * 4),
+            })
+            .collect();
         // Where the staged prefix ends: above is written by a fire and copied by `commit`; below is granted to schedule builders staging directly onto the stream. `take(0)` reads the cursor without moving it.
         let stage_bytes = take(0);
+        // The float ports (D3), below the line: device rectangles a fire fills device-to-device from channel cells, one per declared port at the row (or lane) ceiling.
+        let ports: Vec<PortAt> = ports
+            .iter()
+            .map(|seat| {
+                let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
+                PortAt {
+                    seat: *seat,
+                    at: take(bytes),
+                    bytes,
+                }
+            })
+            .collect();
         // Patch regions, below the line: device bytes, no pinned mirror. A text-only load's carve is unaffected; `PatchSeat`'s `None` costs not even an offset.
         let patch = patch.map(|seat| PatchAt {
             payload: take(seat.rows * seat.row_bytes),
@@ -502,6 +618,9 @@ impl Inputs {
             self_cond,
             self_cond_taps,
             self_cond_bytes: if self_cond.is_some() { rows * self_cond_taps * 4 } else { 0 },
+            ports,
+            group_of_lane,
+            packings,
             spaces,
             max_lanes: budget.max_lanes,
             max_rows: budget.max_tokens,
@@ -720,6 +839,51 @@ impl Inputs {
             }
         };
 
+        // The packing tables, padded to the same reaches the lane and row tables were: a group past the fire's repeats the last bound (an empty segment), a row past the fire's names no row (`-1`).
+        let packed = !fire.group_of_lane.is_empty();
+        if packed {
+            if fire.packings.len() != self.packings.len() {
+                return Err(crate::error::Fault::program(
+                    "inputs::write_host",
+                    format!(
+                        "this fire stages {} packing(s) and the load carved {}",
+                        fire.packings.len(),
+                        self.packings.len()
+                    ),
+                ));
+            }
+            let mut groups = fire.group_of_lane.to_vec();
+            groups.resize(space_lanes as usize, -1);
+            put(self.group_of_lane, bytes_of(&groups), "staged group ids")?;
+            let mut lane_table: Vec<i32> = Vec::with_capacity(space_lanes as usize + 1);
+            let mut row_table: Vec<i32> = Vec::with_capacity(rows as usize);
+            for (at, packing) in self.packings.iter().zip(fire.packings) {
+                for (offset, table, what) in [
+                    (at.group_indptr, packing.group_indptr, "staged group bounds"),
+                    (at.lane_indptr, packing.lane_indptr, "staged packed lane bounds"),
+                ] {
+                    lane_table.clear();
+                    lane_table.extend_from_slice(table);
+                    let last = table.last().copied().unwrap_or(0);
+                    lane_table.resize(space_lanes as usize + 1, last);
+                    put(offset, bytes_of(&lane_table), what)?;
+                }
+                lane_table.clear();
+                lane_table.extend_from_slice(packing.reference_start);
+                lane_table.resize(space_lanes as usize, 0);
+                put(at.reference_start, bytes_of(&lane_table), "staged reference tails")?;
+                for (offset, table, what) in [
+                    (at.reference_tag, packing.reference_tag, "staged reference tags"),
+                    (at.permutation, packing.permutation, "staged row permutation"),
+                ] {
+                    row_table.clear();
+                    row_table.extend_from_slice(table);
+                    row_table.resize(rows as usize, -1);
+                    put(offset, bytes_of(&row_table), what)?;
+                }
+            }
+        }
+
         let mut space_indices = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             put(at.indptr, bytes_of(&geometry.indptr), "staged kv indptr")?;
@@ -741,7 +905,32 @@ impl Inputs {
             mask_bytes,
             space_indices,
             space_lanes,
+            packed,
         })
+    }
+
+    /// One float port's device rectangle, `rows` tall (the caller states the
+    /// carve: the fire's rows or lanes, or a body's bucket), or `None` for a
+    /// port this load carved none of.
+    #[must_use]
+    pub fn port(&self, kind: engine::fire::PortKind, port: u8, rows: u32) -> Option<Tensor> {
+        let at = self
+            .ports
+            .iter()
+            .find(|at| at.seat.kind == kind && at.seat.port == port)?;
+        let rows = rows.min(u32::try_from(at.bytes / at.seat.row_bytes().max(1)).unwrap_or(u32::MAX));
+        Some(Tensor::new(
+            self.store.ptr() + at.at,
+            rows,
+            at.seat.width,
+            at.seat.dtype,
+        ))
+    }
+
+    /// Every port the load carved.
+    #[must_use]
+    pub fn ports(&self) -> Vec<PortSeat> {
+        self.ports.iter().map(|at| at.seat).collect()
     }
 
     /// Second row axis's H2D, inside the enqueue and outside the ring. Pageable is safe without a slot: the driver copies the source before the call returns. # Errors: [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved patch rectangle, [`Fault::Device`](crate::Fault::Device) for the copies.
@@ -925,8 +1114,10 @@ impl Inputs {
             mask_bytes,
             space_indices,
             space_lanes,
+            packed,
         } = staged;
         let (rows, lanes) = (*rows, *lanes);
+        let packed = *packed;
         // What the lane tables were written at (see `Staged::space_lanes`).
         let space_lanes = *space_lanes;
         // Offsets taken as values before the split borrow below.
@@ -938,6 +1129,8 @@ impl Inputs {
         let (at_routes, at_mask, at_mask_indptr) =
             (self.adapter_routes, self.mask_bits, self.mask_indptr);
         let places: Vec<SpaceAt> = self.spaces.clone();
+        let at_group_of_lane = self.group_of_lane;
+        let packing_places: Vec<PackingAt> = self.packings.clone();
         // Split borrow: the ring is read, the device store is written.
         let Inputs {
             store, staging, ..
@@ -970,6 +1163,24 @@ impl Inputs {
         if let Some(bytes) = mask_bytes {
             copy(at_mask, *bytes as usize)?;
             copy(at_mask_indptr, (lanes as usize + 1) * 4)?;
+        }
+        let mut packings = Vec::with_capacity(packing_places.len());
+        if packed {
+            copy(at_group_of_lane, space_lanes as usize * 4)?;
+            for at in &packing_places {
+                copy(at.group_indptr, (space_lanes as usize + 1) * 4)?;
+                copy(at.lane_indptr, (space_lanes as usize + 1) * 4)?;
+                copy(at.reference_start, space_lanes as usize * 4)?;
+                copy(at.reference_tag, rows as usize * 4)?;
+                copy(at.permutation, rows as usize * 4)?;
+                packings.push(PackingHandles {
+                    group_indptr: i32s(base + at.group_indptr, space_lanes + 1),
+                    lane_indptr: i32s(base + at.lane_indptr, space_lanes + 1),
+                    reference_start: i32s(base + at.reference_start, space_lanes),
+                    reference_tag: i32s(base + at.reference_tag, rows),
+                    permutation: i32s(base + at.permutation, rows),
+                });
+            }
         }
         let mut spaces = Vec::with_capacity(places.len());
         for (at, indices) in places.iter().zip(space_indices) {
@@ -1007,6 +1218,8 @@ impl Inputs {
             // Handed over whole: entries are bits, not fire rows, so `Run::cut` excludes it, like the page-id list.
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
+            group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
+            packings,
         })
     }
 

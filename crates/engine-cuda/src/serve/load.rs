@@ -6,8 +6,8 @@ use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
-    Exports, corrected_classes, decoding_of, landing_requests, masked_classes, media_classes,
-    regions_lane_shifting, regions_shifting,
+    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
+    media_classes, regions_lane_shifting, regions_shifting,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -64,6 +64,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if fuse_chains() {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
         boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
+        // The adaLN peepholes (design D6): a scale-free norm into its
+        // modulation, and the gated fold into both.
+        boot.trace = model_ir::fuse::modulation(boot.trace.clone());
     }
     if std::env::var_os("PIE_TRACE_CENSUS").is_some() {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
@@ -281,6 +284,8 @@ impl Shell {
                 model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
             )
         });
+        // The float ports and packing selections the plan reads (D2/D3).
+        let feeds = Feeds::of(&boot.trace, &compiled);
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,
@@ -295,6 +300,9 @@ impl Shell {
             patch_seat,
             mrope_seat,
             u64::from(self_cond_taps),
+            &feeds.seats(),
+            feeds.selections.len(),
+            !masked.is_empty(),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -352,6 +360,7 @@ impl Shell {
             facts,
             spaces,
             masked,
+            feeds,
             adapter_fact,
             corrected,
             decoding,
