@@ -305,6 +305,8 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // at bind rather than at its first fire.
         has_velocity: false,
         velocity_width: 0,
+        has_pixels: false,
+        pixels_width: 0,
         kernels: Vec::new(),
     })
 }

@@ -427,6 +427,7 @@ pub fn model_profile() -> ModelProfile {
         m.num_layers(),
         m.eta_caps(),
         crate::model::velocity_facts(m.readings()),
+        crate::model::pixels_facts(m.readings()),
     )
 }
 
@@ -438,6 +439,7 @@ fn profile_from(
     num_layers: u32,
     eta: crate::model::EtaCaps,
     (has_velocity, velocity_width): (bool, u32),
+    (has_pixels, pixels_width): (bool, u32),
 ) -> ModelProfile {
     ModelProfile {
         vocab,
@@ -456,6 +458,8 @@ fn profile_from(
         has_attn_page_mask: eta.has_attn_page_mask,
         has_velocity,
         velocity_width,
+        has_pixels,
+        pixels_width,
         // Second-party kernels the backend advertises. `envelope_dot` is
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.
