@@ -296,7 +296,15 @@ def run(args) -> None:
         deadline = time.time() + args.wait
         target = None
         while proc.poll() is None and time.time() < deadline:
-            fresh = sorted(set(os.listdir(base)) - before)
+            # A DIRECTORY, not merely the newest entry: pie makes one per
+            # process under the scratch root, and a caller whose `--out` is
+            # that same root (a gate runner's, say) puts this script's own
+            # `pie.stdout` in the running too — copying the case into a file
+            # then fails with `NotADirectoryError` and reads as pie's fault.
+            fresh = sorted(
+                name for name in set(os.listdir(base)) - before
+                if os.path.isdir(os.path.join(base, name))
+            )
             if fresh:
                 target = os.path.join(base, fresh[-1])
                 break
