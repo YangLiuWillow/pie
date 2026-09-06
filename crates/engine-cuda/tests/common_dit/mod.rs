@@ -224,7 +224,11 @@ impl Weights {
     }
 
     pub fn get(&self, name: &str) -> &[f32] {
-        &self.planes.get(name).unwrap_or_else(|| panic!("no plane {name}")).1
+        &self
+            .planes
+            .get(name)
+            .unwrap_or_else(|| panic!("no plane {name}"))
+            .1
     }
 
     /// Write the artifact the engine loads: every plane as a bf16 leaf
@@ -238,7 +242,10 @@ impl Weights {
                 (
                     name.clone(),
                     shape.clone(),
-                    values.iter().flat_map(|v| to_bf16(*v).to_le_bytes()).collect(),
+                    values
+                        .iter()
+                        .flat_map(|v| to_bf16(*v).to_le_bytes())
+                        .collect(),
                 )
             })
             .collect();
@@ -364,12 +371,7 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
     let mut o = vec![0f32; rows * hd];
     for i in 0..rows {
         let scores: Vec<f32> = (0..rows)
-            .map(|j| {
-                (0..hd)
-                    .map(|d| q[i * hd + d] * k[j * hd + d])
-                    .sum::<f32>()
-                    * SM_SCALE
-            })
+            .map(|j| (0..hd).map(|d| q[i * hd + d] * k[j * hd + d]).sum::<f32>() * SM_SCALE)
             .collect();
         let peak = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let weights: Vec<f32> = scores.iter().map(|s| (s - peak).exp()).collect();
@@ -421,7 +423,8 @@ pub fn reference(weights: &Weights, request: &HostRequest) -> (Vec<f32>, Vec<f32
     let o_img = &o[request.text_rows * hd..];
     let y_txt = matmul_bf16(o_txt, request.text_rows, hd, weights.get("txt.o"), w);
     let y_img = matmul_bf16(o_img, request.image_rows, hd, weights.get("img.o"), w);
-    let fold = |y: &[f32], x: &[f32]| -> Vec<f32> { y.iter().zip(x).map(|(a, b)| bf(a + b)).collect() };
+    let fold =
+        |y: &[f32], x: &[f32]| -> Vec<f32> { y.iter().zip(x).map(|(a, b)| bf(a + b)).collect() };
     (fold(&y_txt, &request.text), fold(&y_img, &request.image))
 }
 
@@ -500,7 +503,8 @@ impl Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
         let boot = engine_cuda::DeviceBoot::default();
-        let mut engine = engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
+        let mut engine =
+            engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
         let loaded = engine
             .load(LoadRequest {
                 trace: trace(),
@@ -551,7 +555,10 @@ impl Rig {
             launch,
             ..Default::default()
         };
-        let id = self.engine.register_program(&registration).expect("the program registers");
+        let id = self
+            .engine
+            .register_program(&registration)
+            .expect("the program registers");
         self.programs.insert(rows, id);
         id
     }

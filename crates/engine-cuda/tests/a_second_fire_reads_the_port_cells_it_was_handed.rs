@@ -48,8 +48,12 @@ fn the_second_fire_lands_the_second_cells() {
     let (text_rows, image_rows) = (2, 4);
     let first = request(&mut rng, text_rows, image_rows);
     let second = HostRequest {
-        text: (0..text_rows * WIDTH as usize).map(|_| bf(rng.unit())).collect(),
-        image: (0..image_rows * WIDTH as usize).map(|_| bf(rng.unit())).collect(),
+        text: (0..text_rows * WIDTH as usize)
+            .map(|_| bf(rng.unit()))
+            .collect(),
+        image: (0..image_rows * WIDTH as usize)
+            .map(|_| bf(rng.unit()))
+            .collect(),
         ..request(&mut rng, text_rows, image_rows)
     };
     let want_first = reference(&weights, &first);
@@ -63,12 +67,20 @@ fn the_second_fire_lands_the_second_cells() {
     rig.publish(
         text.instance,
         2,
-        &first.positions[..text_rows].iter().flatten().copied().collect::<Vec<f32>>(),
+        &first.positions[..text_rows]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<f32>>(),
     );
     rig.publish(
         image.instance,
         2,
-        &first.positions[text_rows..].iter().flatten().copied().collect::<Vec<f32>>(),
+        &first.positions[text_rows..]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<f32>>(),
     );
 
     let submission = |rig: &mut Rig, req: &HostRequest| -> Vec<Vec<f32>> {
@@ -79,8 +91,13 @@ fn the_second_fire_lands_the_second_cells() {
             lane(1, &image, LaneStream::Image, 0),
         ];
         let attachments = vec![attach(0, &text), attach(1, &image)];
-        let mut ticket = rig.engine.submit(&frame(lanes, attachments)).expect("the frame fires");
-        rig.engine.settle_frame(&mut ticket).expect("the frame settles");
+        let mut ticket = rig
+            .engine
+            .submit(&frame(lanes, attachments))
+            .expect("the frame fires");
+        rig.engine
+            .settle_frame(&mut ticket)
+            .expect("the frame settles");
         ticket.steps[0]
             .readouts
             .iter()

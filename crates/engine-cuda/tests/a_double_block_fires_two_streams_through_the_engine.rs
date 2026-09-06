@@ -52,7 +52,10 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     }
     let weights = Weights::random(&common_dit::trace(), 7);
     let mut rig = Rig::load(&weights, 64, vec![16, 32, 64]);
-    assert!(rig.profile().has_velocity, "the plan plants a velocity seam");
+    assert!(
+        rig.profile().has_velocity,
+        "the plan plants a velocity seam"
+    );
     assert_eq!(rig.profile().velocity_width, WIDTH);
 
     let mut rng = Lcg::seeded(3);
@@ -72,14 +75,22 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         rig.publish(
             text.instance,
             2,
-            &req.positions[..req.text_rows].iter().flatten().copied().collect::<Vec<f32>>(),
+            &req.positions[..req.text_rows]
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<f32>>(),
         );
         rig.publish(image.instance, 0, &req.image);
         rig.publish(image.instance, 1, &[req.timestep]);
         rig.publish(
             image.instance,
             2,
-            &req.positions[req.text_rows..].iter().flatten().copied().collect::<Vec<f32>>(),
+            &req.positions[req.text_rows..]
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<f32>>(),
         );
         let slot = (2 * at) as u32;
         // Submitted image-first for one request, text-first for the other:
@@ -98,8 +109,13 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             handles.push((text, image));
         }
     }
-    let mut ticket = rig.engine.submit(&frame(lanes, attachments)).expect("the frame fires");
-    rig.engine.settle_frame(&mut ticket).expect("the frame settles");
+    let mut ticket = rig
+        .engine
+        .submit(&frame(lanes, attachments))
+        .expect("the frame fires");
+    rig.engine
+        .settle_frame(&mut ticket)
+        .expect("the frame settles");
     let readouts = &ticket.steps[0].readouts;
     assert_eq!(readouts.len(), 4);
     for readout in readouts {
@@ -119,11 +135,27 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         values.iter().zip(latent).map(|(v, x)| v + x).collect()
     };
     let out = rig.take(r0_image.instance, 3);
-    assert_close(&out, &stepped(&want[0].1, &requests[0].image), "request 0 image epilogue");
+    assert_close(
+        &out,
+        &stepped(&want[0].1, &requests[0].image),
+        "request 0 image epilogue",
+    );
     let out = rig.take(r0_text.instance, 3);
-    assert_close(&out, &stepped(&want[0].0, &requests[0].text), "request 0 text epilogue");
+    assert_close(
+        &out,
+        &stepped(&want[0].0, &requests[0].text),
+        "request 0 text epilogue",
+    );
     let out = rig.take(r1_text.instance, 3);
-    assert_close(&out, &stepped(&want[1].0, &requests[1].text), "request 1 text epilogue");
+    assert_close(
+        &out,
+        &stepped(&want[1].0, &requests[1].text),
+        "request 1 text epilogue",
+    );
     let out = rig.take(r1_image.instance, 3);
-    assert_close(&out, &stepped(&want[1].1, &requests[1].image), "request 1 image epilogue");
+    assert_close(
+        &out,
+        &stepped(&want[1].1, &requests[1].image),
+        "request 1 image epilogue",
+    );
 }
