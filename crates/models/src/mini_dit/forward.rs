@@ -70,12 +70,18 @@ pub struct Reading {
 }
 
 /// One input port of a reading, as a guest binds it: the name it is bound by,
-/// the stream whose lane carries its rows, the `RuntimeInput` port index and
+/// which streams' lanes carry data for it, the `RuntimeInput` port index and
 /// the width the plan reads.
+///
+/// `streams` is a LIST because a port is not always one lane's. A row port
+/// belongs to the one stream whose rows it fills; a `LaneVector` is read once
+/// per lane, and every lane whose class modulates has to carry it. The
+/// context lane's timestep cell is written and never read — its class runs
+/// one projection and no modulation — so it is not listed.
 pub struct Port {
     pub name: &'static str,
     pub kind: PortKind,
-    pub stream: Stream,
+    pub streams: &'static [Stream],
     pub port: u8,
     pub width: u32,
 }
@@ -98,35 +104,35 @@ pub const READINGS: &[Reading] = &[Reading {
         Port {
             name: "latents",
             kind: PortKind::Latents,
-            stream: Stream::Image,
+            streams: &[Stream::Image],
             port: port::LATENTS,
             width: super::model::PATCH_FEATURES,
         },
         Port {
             name: "text",
             kind: PortKind::Context,
-            stream: Stream::Text,
+            streams: &[Stream::Text],
             port: port::TEXT,
             width: super::model::TEXT_WIDTH,
         },
         Port {
             name: "context",
             kind: PortKind::Context,
-            stream: Stream::Context,
+            streams: &[Stream::Context],
             port: port::CONTEXT,
             width: super::model::CONTEXT_WIDTH,
         },
         Port {
             name: "timestep",
             kind: PortKind::LaneVector,
-            stream: Stream::Image,
+            streams: &[Stream::Text, Stream::Image],
             port: port::TIMESTEP,
             width: 1,
         },
         Port {
             name: "positions",
             kind: PortKind::AxisPositions,
-            stream: Stream::Image,
+            streams: &[Stream::Text, Stream::Image],
             port: port::POSITIONS,
             width: ROPE_AXES as u32,
         },
