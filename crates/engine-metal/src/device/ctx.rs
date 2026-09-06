@@ -634,6 +634,24 @@ impl Pending {
     /// # Errors
     ///
     /// [`Fault::Device`] carrying the command buffer's own sentence.
+    /// The device's own span for this buffer, `(start, end)` in microseconds
+    /// of the GPU clock, once it has completed; zeros before that or off
+    /// Apple. What `PIE_FIRE_TRACE` prints beside the host's view.
+    #[must_use]
+    pub fn gpu_span_us(&self) -> (u64, u64) {
+        #[cfg(target_vendor = "apple")]
+        {
+            // SAFETY: documented safe to read after completion; both are plain
+            // `CFTimeInterval` getters.
+            let (start, end) = (self.buffer.GPUStartTime(), self.buffer.GPUEndTime());
+            ((start * 1e6) as u64, (end * 1e6) as u64)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            (0, 0)
+        }
+    }
+
     pub fn wait(&self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
