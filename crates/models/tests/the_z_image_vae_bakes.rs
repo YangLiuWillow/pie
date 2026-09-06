@@ -95,7 +95,12 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         ("pixels", vae::RGB, model::CHANNELS)
     );
     assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    assert_eq!(encode.port("pixels").map(|(index, _)| index), Some(0));
+    // Its STATED index, not its position: `vae.encode`'s only voxel
+    // port is read at index 1 so `vae.decode`'s 16-wide latent keeps 0.
+    assert_eq!(
+        encode.port("pixels").map(|(index, _)| index),
+        Some(model::port::PIXEL_VOXELS)
+    );
     assert_eq!(decode.index, 3);
     assert_eq!(encode.index, 4);
 

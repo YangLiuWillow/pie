@@ -7,6 +7,7 @@ pub mod gemma_4_diffusion;
 pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
+pub mod hunyuan_image_3;
 pub mod kimi_k3;
 pub mod media;
 pub mod mini_dit;
@@ -147,14 +148,11 @@ impl ReadingFact {
     /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
     #[must_use]
     pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
-        let port = self.ports.iter().find(|port| port.name == name)?;
-        let index = self
-            .ports
-            .iter()
-            .take_while(|p| p.name != name)
-            .filter(|p| p.kind == port.kind)
-            .count();
-        Some((u8::try_from(index).unwrap_or(u8::MAX), port))
+        // Through `ports_indexed`, so a port that STATES its index
+        // (`PortFact::at`) resolves to the index the trace reads it at and
+        // not to its position — the two differ exactly when two readings
+        // read one kind at different widths.
+        self.ports_indexed().find(|(_, port)| port.name == name)
     }
 
     /// Every port with its kind-relative index, in declaration order.
@@ -407,6 +405,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         glm_5::skus(),
         glm_5_next::skus(),
         gpt_oss::skus(),
+        hunyuan_image_3::skus(),
         kimi_k3::skus(),
         qwen_3::skus(),
         qwen_4::skus(),
