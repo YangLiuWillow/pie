@@ -163,9 +163,7 @@ fn dit(
     b.read_over(&m.head_proj.bias, format!("{l2}.bias"), doubled)?;
     // `time_proj`: six `dim`-row sets, `(shift, scale)` swapped in each.
     let proj = cond("time_proj");
-    let swap = |axis: u8, width: i64| {
-        move |e: Expr| slices_reordered(&e, MOD_SLICES, width, axis)
-    };
+    let swap = |axis: u8, width: i64| move |e: Expr| slices_reordered(&e, MOD_SLICES, width, axis);
     b.read_over(
         &m.time_proj.w,
         format!("{proj}.weight"),
