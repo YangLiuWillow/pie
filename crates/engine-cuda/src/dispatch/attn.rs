@@ -1131,13 +1131,54 @@ impl Run<'_> {
             Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.pool_lse_selected",
             }),
-            // M0: wired by the CUDA ragged-attention agent (the vendored
-            // FlashInfer ragged FA2 template over packed q/k/v, one CSR per
-            // side; `IMAGEGEN_CONTRACT.md` states the entry). Refused by name
-            // until then.
-            Attention::Ragged { .. } => Err(kernels_cuda::Error::Unsupported {
-                op: "attention.ragged",
-            }),
+            // The unpaged joint attention (design D2): q, k, v and o are the
+            // fire-wide PACKED rectangles (their rows are the CSRs' absolute
+            // values), the CSRs are the fire's packing tables handed whole
+            // (indexed by fire-global group, padded with empty segments), so
+            // the launch is one per node whatever the window: a split window
+            // launches on its first interval only, and the per-lane CSR of
+            // `RaggedMask::None` is the same kernel over the lane table.
+            Attention::Ragged {
+                q,
+                k,
+                v,
+                q_indptr,
+                kv_indptr,
+                head_dim,
+                kv_heads: _,
+                sm_scale,
+                mask,
+                o,
+            } => {
+                if self.run_index() > 0 {
+                    return Ok(());
+                }
+                let mask = match mask {
+                    model_ir::RaggedMask::None | model_ir::RaggedMask::GroupBlockDiagonal => {
+                        kernels_cuda::attn_ragged::RaggedMask::None
+                    }
+                    // The tag tables pack reference lanes last in their group
+                    // (`model_exec::fire::packing`), so the kernel's one tail
+                    // per group is where the query side's tags turn non-negative.
+                    model_ir::RaggedMask::ReferenceSelfOnly { q_tags, .. } => {
+                        kernels_cuda::attn_ragged::RaggedMask::ReferenceSelfOnly {
+                            ref_start: self.reference_start_of(*q_tags),
+                        }
+                    }
+                };
+                kernels_cuda::attn_ragged::ragged(
+                    self.ctx(),
+                    self.fire_wide(*q),
+                    self.fire_wide(*k),
+                    self.fire_wide(*v),
+                    self.fire_wide(*q_indptr),
+                    self.fire_wide(*kv_indptr),
+                    *head_dim,
+                    *sm_scale,
+                    mask,
+                    &mut self.fire_wide(*o),
+                )
+            }
             // DFlash2's dynamic block convolution has a Metal kernel and no
             // CUDA one yet; refused by name rather than approximated.
             Attention::BlockDynConv { .. } => Err(kernels_cuda::Error::Unsupported {
@@ -1153,7 +1194,7 @@ impl Run<'_> {
 impl Run<'_> {
     /// A weight an entry reads whole: the dense handle, or an affine bank
     /// decoded to bf16 in fire scratch (`[n, k]`, resident planes only).
-    fn dense_or_decoded(
+    pub(crate) fn dense_or_decoded(
         &self,
         op: &'static str,
         w: model_ir::ValueId,

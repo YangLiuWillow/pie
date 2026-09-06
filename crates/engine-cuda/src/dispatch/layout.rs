@@ -2,7 +2,7 @@
 
 use kernels_cuda::layout;
 use model_exec::{DispatchLayout, KernelError};
-use model_ir::{Layout, Operands};
+use model_ir::Layout;
 
 use crate::run::Run;
 
@@ -173,10 +173,27 @@ impl Run<'_> {
                 // Whole, for `scatter_live_rows`' reason one arm up.
                 &mut self.fire_wide(*y),
             ),
-            // M0: wired by the CUDA layout kernel agent (a row gather and
-            // its inverse scatter over `RuntimeInput::RowPermutation`).
-            Layout::PackRows { .. } | Layout::UnpackRows { .. } => {
-                return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+            // The packed rectangle stands at the selection's own window (the
+            // rows its lanes stand at, `model_exec::fire::packing`), so the
+            // permutation and the packed side cut like any row value while
+            // the fire-aligned side is whole: `perm`'s values are absolute.
+            Layout::PackRows { x, perm, y } => layout::pack_rows(
+                self.ctx(),
+                self.fire_wide(*x),
+                self.tensor(*perm),
+                &mut self.tensor(*y),
+            ),
+            // The launch is over the packed rows (`x`'s window); the scatter
+            // target is the whole rectangle at its base.
+            Layout::UnpackRows { x, perm, y } => {
+                let packed = self.tensor(*x);
+                let whole = self.fire_wide(*y);
+                layout::unpack_rows(
+                    self.ctx(),
+                    packed,
+                    self.tensor(*perm),
+                    &mut kernels_cuda::Tensor::new(whole.ptr, packed.rows, whole.width, whole.dtype),
+                )
             }
             Layout::TopK { .. } => {
                 return Err(kernels_cuda::Error::Backend {

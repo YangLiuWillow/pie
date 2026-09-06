@@ -2,20 +2,82 @@
 
 use kernels_cuda::{Tensor, elemwise};
 use model_exec::{DispatchElementwise, KernelError};
-use model_ir::{Elementwise, MropeForm, Operands};
+use model_ir::{Elementwise, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
 
 use crate::run::Run;
 
 impl DispatchElementwise for Run<'_> {
     fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
-        self.elementwise(op).map_err(crate::error::kernel)
+        // A launch whose answer is LANE-shaped (a lane vector's chain:
+        // the timestep embedding, its activation, its sum) grids over the
+        // fire's lane carve and reads no seat — the seat's words are token
+        // rows, which would retire and shift it wrongly.
+        let mut outputs = Vec::new();
+        op.outputs(&mut outputs);
+        let lanes = outputs.first().is_some_and(|out| self.lane_shaped(*out));
+        if lanes {
+            self.unseated(|| self.elementwise(op))
+        } else {
+            self.elementwise(op)
+        }
+        .map_err(crate::error::kernel)
+    }
+}
+
+/// The kernel's norm for a fused modulation's, when the kernel has one: the
+/// centred layer norm, or a whole-row rms norm. A grouped rms norm (`head_dim`
+/// below the row) is not one row reduction, and takes the unfused pair.
+fn fused_norm(norm: NormKind, width: u32) -> Option<elemwise::modulate::NormKind> {
+    match norm {
+        NormKind::Layernorm { eps } => Some(elemwise::modulate::NormKind::LayerNormNoAffine { eps }),
+        NormKind::Rmsnorm { head_dim, eps } if head_dim == width => {
+            Some(elemwise::modulate::NormKind::RmsNormNoScale { eps })
+        }
+        NormKind::Rmsnorm { .. } => None,
     }
 }
 
 impl Run<'_> {
+    /// The scale-free norm a fused modulation folds, launched on its own.
+    fn scale_free_norm(
+        &self,
+        norm: NormKind,
+        x: Tensor,
+        normed: &mut Tensor,
+    ) -> Result<(), kernels_cuda::Error> {
+        match norm {
+            NormKind::Layernorm { eps } => {
+                elemwise::layernorm::layernorm_no_scale(self.ctx(), x, eps, normed)
+            }
+            NormKind::Rmsnorm { head_dim, eps } => {
+                elemwise::norm::rmsnorm_no_scale(self.ctx(), x, head_dim, eps, normed)
+            }
+        }
+    }
+
+    /// `modulate`'s three forms, one entry each.
+    fn modulate(
+        &self,
+        form: ModulateForm,
+        x: Tensor,
+        m: Tensor,
+        lane_of_row: Option<Tensor>,
+        y: &mut Tensor,
+    ) -> Result<(), kernels_cuda::Error> {
+        match form {
+            ModulateForm::ScaleShift => {
+                elemwise::modulate::scale_shift(self.ctx(), x, m, lane_of_row, y)
+            }
+            ModulateForm::Scale => elemwise::modulate::scale(self.ctx(), x, m, lane_of_row, y),
+            ModulateForm::TanhGate => {
+                elemwise::modulate::tanh_gate(self.ctx(), x, m, lane_of_row, y)
+            }
+        }
+    }
+
     /// Dispatch arms, in `kernels-cuda`'s error vocabulary rather than the
     /// contract's, so each arm is a plain tail call with a plain `?`.
-    fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
+    fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
             // norm (anchor)
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
@@ -453,22 +515,202 @@ impl Run<'_> {
                 *streams,
                 &mut self.tensor(*hyper),
             ),
-            // M0: wired by the CUDA modulation / activation / rope kernel
-            // agents (`IMAGEGEN_CONTRACT.md` states each entry). Refused by
-            // name until then; no catalog row names them yet.
-            Elementwise::Modulate { .. }
-            | Elementwise::GatedResidualAdd { .. }
-            | Elementwise::NormModulate { .. }
-            | Elementwise::GatedResidualNormModulate { .. }
-            | Elementwise::Sinusoid { .. }
-            | Elementwise::Silu { .. }
-            | Elementwise::Gelu { .. }
-            | Elementwise::Tanh { .. }
-            | Elementwise::Mul { .. }
-            | Elementwise::Add { .. }
-            | Elementwise::RopeAxes { .. } => {
-                Err(kernels_cuda::Error::Unsupported { op: op.name() })
+            // The conditioning algebra (design D6). `m` and `g` are lane
+            // vectors (whole, absolute lanes through the lane map) or
+            // per-token rectangles (cut like `x`).
+            Elementwise::Modulate {
+                x,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => self.modulate(
+                *form,
+                self.tensor(*x),
+                self.tensor(*m),
+                lane_of_row.map(|lanes| self.tensor(lanes)),
+                &mut self.tensor(*y),
+            ),
+            // In place on `r`; the IR aliases `r_out` onto it.
+            Elementwise::GatedResidualAdd {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+            } => elemwise::modulate::gated_residual_add(
+                self.ctx(),
+                self.tensor(*r),
+                self.tensor(*g),
+                self.tensor(*y),
+                lane_of_row.map(|lanes| self.tensor(lanes)),
+                &mut self.tensor(*r),
+            ),
+            // The fused pair: one launch when the kernel has the norm and the
+            // form (a whole-row norm into the scale-shift), the traced pair
+            // otherwise. The normed row is written on its own only when a
+            // node other than this one reads it.
+            Elementwise::NormModulate {
+                x,
+                norm,
+                normed,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => {
+                let x_t = self.tensor(*x);
+                let lanes = lane_of_row.map(|lanes| self.tensor(lanes));
+                match (fused_norm(*norm, x_t.width), form) {
+                    (Some(kernel_norm), ModulateForm::ScaleShift) => {
+                        elemwise::modulate::norm_modulate(
+                            self.ctx(),
+                            x_t,
+                            self.tensor(*m),
+                            lanes,
+                            kernel_norm,
+                            &mut self.tensor(*y),
+                        )?;
+                        if self.read_elsewhere(*normed) {
+                            self.scale_free_norm(*norm, x_t, &mut self.tensor(*normed))?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        self.scale_free_norm(*norm, x_t, &mut self.tensor(*normed))?;
+                        self.modulate(
+                            *form,
+                            self.tensor(*normed),
+                            self.tensor(*m),
+                            lanes,
+                            &mut self.tensor(*y),
+                        )
+                    }
+                }
             }
+            Elementwise::GatedResidualNormModulate {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+                norm,
+                normed,
+                m,
+                form,
+                out,
+            } => {
+                let r_t = self.tensor(*r);
+                let lanes = lane_of_row.map(|lanes| self.tensor(lanes));
+                match (fused_norm(*norm, r_t.width), form) {
+                    (Some(kernel_norm), ModulateForm::ScaleShift) => {
+                        elemwise::modulate::gated_residual_norm_modulate(
+                            self.ctx(),
+                            r_t,
+                            self.tensor(*g),
+                            self.tensor(*y),
+                            self.tensor(*m),
+                            lanes,
+                            kernel_norm,
+                            &mut self.tensor(*r),
+                            &mut self.tensor(*out),
+                        )?;
+                        if self.read_elsewhere(*normed) {
+                            self.scale_free_norm(*norm, self.tensor(*r), &mut self.tensor(*normed))?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        elemwise::modulate::gated_residual_add(
+                            self.ctx(),
+                            r_t,
+                            self.tensor(*g),
+                            self.tensor(*y),
+                            lanes,
+                            &mut self.tensor(*r),
+                        )?;
+                        self.scale_free_norm(*norm, self.tensor(*r), &mut self.tensor(*normed))?;
+                        self.modulate(
+                            *form,
+                            self.tensor(*normed),
+                            self.tensor(*m),
+                            lanes,
+                            &mut self.tensor(*out),
+                        )
+                    }
+                }
+            }
+            Elementwise::Sinusoid {
+                t,
+                dim,
+                max_period,
+                flip_sin_cos,
+                scale,
+                y,
+            } => elemwise::sinusoid(
+                self.ctx(),
+                self.tensor(*t),
+                *dim,
+                *max_period,
+                *flip_sin_cos,
+                *scale,
+                &mut self.tensor(*y),
+            ),
+            // In place; the IR aliases `x_out` onto `x`.
+            Elementwise::Silu { x, x_out: _ } => {
+                elemwise::activation::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
+            }
+            Elementwise::Gelu { x, tanh, x_out: _ } => {
+                if !*tanh {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "elementwise.gelu",
+                        detail: "the erf gelu has no CUDA entry; the tanh approximation \
+                                 (`gelu(x, tanh = true)`) is what every DiT under study runs"
+                            .to_string(),
+                    });
+                }
+                elemwise::activation::gelu_tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
+            }
+            Elementwise::Tanh { x, x_out: _ } => {
+                elemwise::activation::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
+            }
+            Elementwise::Mul { x, y, z } => elemwise::binary::mul(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                &mut self.tensor(*z),
+            ),
+            Elementwise::Add { x, y, z } => elemwise::binary::add(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                &mut self.tensor(*z),
+            ),
+            // In place on `x`, the positions cut like it (design D7).
+            Elementwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form,
+                rotary_dim,
+                head_dim,
+                x_out: _,
+            } => elemwise::rope_axes::rope_axes(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*positions),
+                *dims,
+                *thetas,
+                match form {
+                    RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
+                    RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
+                    RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
+                },
+                *rotary_dim,
+                *head_dim,
+                &mut self.tensor(*x),
+            ),
             Elementwise::PleGate {
                 key,
                 query,

@@ -45,6 +45,24 @@ impl Run<'_> {
             // at decode sizes, far slower at prefill), the alternate decodes
             // the weight once into scratch. A STREAMED seat always takes the
             // fused arm since its planes have no fixed rectangle.
+            // A LANE chain's projection (an f32 activation: the timestep
+            // embedding into its modulation, design D6) takes the lane-axis
+            // kernel; the tensor-core arms below read bf16 activations.
+            Linear::Matmul { act, w, y } if self.tensor(*act).dtype == Dtype::F32 => {
+                let weight = self.dense_or_decoded(
+                    "linear.matmul",
+                    *w,
+                    self.tensor(*y).width,
+                    self.tensor(*act).width,
+                )?;
+                linear::lane_gemm::act_x_wt(
+                    self.ctx(),
+                    "linear.matmul",
+                    self.tensor(*act),
+                    weight,
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::Matmul { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);

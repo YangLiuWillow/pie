@@ -1081,6 +1081,22 @@ impl<'c> Run<'c> {
             })
     }
 
+    /// Which run of a split window the walk is on — `0` for the first (or only) interval. An arm whose operands are fire-global (the ragged attention over whole tables) launches once, on run zero, rather than once per interval.
+    pub(crate) fn run_index(&self) -> u32 {
+        self.place.run.get()
+    }
+
+    /// Whether any node reads `normed`: a fused modulation (which only WRITES its normed row) lands it on its own launch only when a reader wants it.
+    pub(crate) fn read_elsewhere(&self, normed: ValueId) -> bool {
+        use model_ir::Operands as _;
+        let mut inputs: Vec<ValueId> = Vec::new();
+        self.nodes.iter().any(|node| {
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            inputs.contains(&normed)
+        })
+    }
+
     /// Is `id` a lane-shaped value (`[Lanes, ·]`)? Such a value is carved at the fire's lane ceiling and resolved whole (see [`Run::cut`]).
     pub(crate) fn lane_shaped(&self, id: ValueId) -> bool {
         matches!(
