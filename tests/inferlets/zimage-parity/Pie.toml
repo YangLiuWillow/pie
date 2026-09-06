@@ -44,4 +44,5 @@ case_30 = {type = "string", optional = true, description = "Piece 30 of the case
 case_31 = {type = "string", optional = true, description = "Piece 31 of the case JSON"}
 refine_only = {type = "bool", optional = true, description = "Stop after the refine reading (the refined caption alone)"}
 prompt = {type = "string", optional = true, description = "Run the text reading on this prompt first (flagship rows); its rows replace the case's caption unless text_only"}
+ctx_tap = {type = "bool", optional = true, description = "Read the denoise readout off the context lane too (bisect)"}
 text_only = {type = "bool", optional = true, description = "With prompt: the text reading alone, no case needed"}

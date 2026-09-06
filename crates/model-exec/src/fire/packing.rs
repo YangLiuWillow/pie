@@ -238,6 +238,16 @@ pub fn pack(
     group_indptr[groups] = bound;
     debug_assert_eq!(bound, (origin + rows) as i32);
 
+    if std::env::var("PIE_PACK_TRACE").is_ok() {
+        eprintln!(
+            "[pack] mask={:#x} value={:#x} origin={origin} rows={rows} lanes={} \
+             group_of_lane={group_of_lane:?} group_indptr={group_indptr:?} \
+             lane_indptr={lane_indptr:?} fire_rows={fire_rows}",
+            select.mask,
+            select.value,
+            chosen.len(),
+        );
+    }
     Ok(Packed {
         select,
         origin,

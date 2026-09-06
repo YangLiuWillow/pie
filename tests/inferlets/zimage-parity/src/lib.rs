@@ -49,6 +49,10 @@ struct Input {
     prompt: Option<String>,
     #[serde(default)]
     text_only: bool,
+    /// Read the denoise readout off the CONTEXT lane too (a bisect: with
+    /// the family tapped on a joint-trunk value, this is its caption rows).
+    #[serde(default)]
+    ctx_tap: bool,
 }
 
 /// The reference's fixed inputs, flattened row-major and already padded.
@@ -91,6 +95,9 @@ struct Output {
     velocity: Vec<f32>,
     image_rows: u32,
     patch_features: u32,
+    /// `[caption_rows, ·]`: the same readout off the context lane, under
+    /// `ctx_tap`; empty otherwise.
+    ctx: Vec<f32>,
 }
 
 struct Reading {
@@ -166,8 +173,18 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
 }
 
 /// The `denoise` reading: the image lane and the refined-caption lane in
-/// one group, the velocity back off the image lane.
-async fn denoise(case: &Case, refined: &[f32], dim: u32, pipe: &Pipeline) -> Result<Vec<f32>> {
+/// one group, the velocity back off the image lane. The two lanes go down
+/// SEPARATE pipelines — a pipeline is serial, so two passes submitted to
+/// one seal into two fires and the group never forms (the joint trunk then
+/// attends the image rows alone).
+async fn denoise(
+    case: &Case,
+    refined: &[f32],
+    dim: u32,
+    ctx_tap: bool,
+    ctx_pipe: &Pipeline,
+    img_pipe: &Pipeline,
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let r = reading(
         model::ReadoutKind::Velocity,
         &["latents", "pad", "context", "timestep", "positions"],
@@ -202,6 +219,14 @@ async fn denoise(case: &Case, refined: &[f32], dim: u32, pipe: &Pipeline) -> Res
     context.input(p_context, &ctx)?;
     context.input(p_positions, &ctx_pos)?;
     context.input(p_timestep, &t_ctx)?;
+    let ctx_out = ctx_tap.then(|| {
+        let out = Channel::new([case.caption_rows, width], dtype::f32).named("ctx_tap");
+        let readback = out.clone();
+        context.epilogue(move || {
+            readback.put(intrinsics::velocity(width));
+        });
+        out
+    });
 
     // The image lane: the latents in, the velocity out.
     let rows = case.image_rows;
@@ -223,9 +248,14 @@ async fn denoise(case: &Case, refined: &[f32], dim: u32, pipe: &Pipeline) -> Res
         readback.put(intrinsics::velocity(width));
     });
 
-    context.submit(pipe).context("context lane")?;
-    image.submit(pipe).context("image lane")?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    context.submit(ctx_pipe).context("context lane")?;
+    image.submit(img_pipe).context("image lane")?;
+    let velocity: Vec<f32> = out.take_host().await?;
+    let ctx_rows = match ctx_out {
+        Some(out) => out.take_host::<Vec<f32>>().await?,
+        None => Vec::new(),
+    };
+    Ok((velocity, ctx_rows))
 }
 
 /// The `text` reading: the prompt through the family's template
@@ -319,6 +349,7 @@ async fn main(input: Input) -> Result<Output> {
             velocity: Vec::new(),
             image_rows: 0,
             patch_features: 0,
+            ctx: Vec::new(),
         });
     }
     let mut pieces = String::new();
@@ -380,6 +411,9 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let pipe = Pipeline::new();
+    // The denoise context lane's own pipeline: its pass and the image
+    // lane's must reach the runtime together to seal into one fire.
+    let ctx_pipe = Pipeline::new();
     // The chained check: the encoder's own rows stand in for the golden's
     // caption (the case's pads and positions must already fit them).
     let mut case = case;
@@ -406,10 +440,10 @@ async fn main(input: Input) -> Result<Output> {
         None => (Vec::new(), 0, 0),
     };
     let (refined, dim) = refine(&case, &pipe).await?;
-    let velocity = if input.refine_only {
-        Vec::new()
+    let (velocity, ctx_rows) = if input.refine_only {
+        (Vec::new(), Vec::new())
     } else {
-        denoise(&case, &refined, dim, &pipe).await?
+        denoise(&case, &refined, dim, input.ctx_tap, &ctx_pipe, &pipe).await?
     };
     // The readout's width: `patch_features` for the velocity, the tapped
     // intermediate's when the family is being bisected.
@@ -418,6 +452,7 @@ async fn main(input: Input) -> Result<Output> {
     } else {
         u32::try_from(velocity.len() / case.image_rows.max(1) as usize).unwrap_or(0)
     };
+    ctx_pipe.close();
     pipe.close();
     Ok(Output {
         text: text_rows,
@@ -429,5 +464,6 @@ async fn main(input: Input) -> Result<Output> {
         velocity,
         image_rows: case.image_rows,
         patch_features,
+        ctx: ctx_rows,
     })
 }

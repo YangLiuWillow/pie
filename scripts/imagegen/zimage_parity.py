@@ -333,6 +333,8 @@ def run(args) -> None:
             cmd += ["--prompt", prompt_of(args)]
         if args.refine_only:
             cmd += ["--refine_only", "true"]
+        if args.ctx_tap:
+            cmd += ["--ctx_tap", "true"]
     out = os.path.join(args.out, f"pie_{mode}.json")
     print(f"[run] {' '.join(c if len(c) < 80 else c[:40] + '...' for c in cmd)}")
     done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, preexec_fn=unlimited_stack)
@@ -385,6 +387,9 @@ def collect(args) -> str:
         # (a tapped family reads back an intermediate instead: rows only)
         if rows.shape[1] == c * PATCH * PATCH:
             out[keys["out"]] = unpatchify(-rows, c, f, h, w)
+    if doc.get("ctx"):
+        rows = len(doc["ctx"]) // max(int(doc["caption_rows"]), 1)
+        out["ctx.rows"] = np.asarray(doc["ctx"], np.float32).reshape(doc["caption_rows"], rows)
     npz = os.path.join(args.out, f"zimage_pie_{mode}.npz")
     np.savez(npz, **out)
     print(f"[collect] {len(out)} tensors -> {npz}")
@@ -440,6 +445,9 @@ def main() -> int:
     ap.add_argument("--case_file", action="store_true",
                     help="pass the case as a scratch file even when it fits argv")
     ap.add_argument("--refine_only", action="store_true", help="stop after the refine reading")
+    ap.add_argument("--ctx_tap", action="store_true",
+                    help="read the denoise readout off the context lane too (bisect); "
+                         "lands as `ctx.rows` in the npz")
     ap.add_argument("--keys", action="append", default=None)
     args = ap.parse_args()
 
