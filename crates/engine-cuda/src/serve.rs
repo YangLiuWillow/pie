@@ -17,6 +17,7 @@
 
 mod arming;
 mod boot;
+pub(crate) mod btrace;
 mod enqueue;
 mod lanes;
 mod load;

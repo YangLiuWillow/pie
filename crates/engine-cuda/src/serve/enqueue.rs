@@ -83,10 +83,16 @@ impl Shell {
             decoding: &self.decoding,
             seq,
         };
+        super::btrace::mark("prepare_tail");
         fire.prologue(p)?;
+        super::btrace::mark("prologue");
         let staged = fire.stage(p, slot)?;
+        super::btrace::mark("stage");
         fire.route(p, &staged)?;
+        super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
+        super::btrace::mark("readback");
+        super::btrace::flush(seq);
         Ok((p.windows.launches(), readback))
     }
 }
