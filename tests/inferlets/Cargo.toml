@@ -46,6 +46,7 @@ members = [
     "flux2-parity",
     "text-to-image",
     "zimage-parity",
+    "zimage-vae-parity",
     "wan2-parity",
     "prefill-rows",
     "context-aware-decoding",

@@ -260,6 +260,26 @@ impl Channel {
         self.decode_host::<T>(raw, "take")
     }
 
+    /// Take this channel's cell as a `frames` handle, WITHOUT the pixels
+    /// entering linear memory (design D8/D11). The VAE road: a `vae.decode`
+    /// pass's epilogue puts `intrinsics::pixels(rows, 3)` here, and this
+    /// hands the plane to the host's encoders — `[-1, 1]` f32, one row per
+    /// output voxel in `(t, h, w)` order, mapped to RGB8 with a clamp.
+    ///
+    /// Consumes the cell, exactly as [`take_host`](Self::take_host) does,
+    /// and waits on the fire that fills it the same way.
+    pub fn take_frames(
+        &self,
+        width: u32,
+        height: u32,
+        count: u32,
+        fps: f32,
+    ) -> Result<crate::pie::inferlet::frames::Frames, String> {
+        self.dsl().note_host_take();
+        crate::pie::inferlet::frames::Frames::from_channel(&self.wit(), width, height, count, fps)
+            .map_err(|why| format!("{}: {why}", self.host_label("take-frames")))
+    }
+
     /// Peek a cell on the host (leaves it full). Same as
     /// [`take_host`](Self::take_host) otherwise.
     pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {
