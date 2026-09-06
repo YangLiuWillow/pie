@@ -18,12 +18,10 @@ pub fn all_reduce(buf: &Value) -> Value {
 /// Concatenates each rank's `width`-shard into the full tensor:
 /// `[rows, width]` on every rank becomes `[rows, width * world]`.
 ///
-/// **ONE ROW ONLY.** The entry behind this is `ncclAllGather`, which joins
-/// whole buffers rank-major, and that is the same layout as a width concat
-/// only when `rows == 1`. A wider value is refused at the fire
-/// (`kernels_cuda::collective::all_gather`) rather than silently transposed.
-/// Gathering wider wants a permute after the collective, which nothing builds
-/// yet — see that entry before reaching for this on a batched fire.
+/// The collective underneath (`ncclAllGather`) joins whole buffers rank-major,
+/// which is this layout only at one row; above one row the CUDA entry gathers
+/// into scratch and permutes, so the declared shape holds either way. Other
+/// backends serve the same declaration and were not audited for it.
 pub fn all_gather(x: &Value, world: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(x.rows(), x.width() * u64::from(world), x.dtype()));

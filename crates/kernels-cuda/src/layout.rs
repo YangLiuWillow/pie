@@ -6,7 +6,8 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
+    symbol,
 };
 use crate::tensor::Tensor;
 
@@ -79,6 +80,121 @@ pub fn embed(
             // Staged-geometry seat: live-rows word when a body replay armed
             // one, ABSENT otherwise.
             ctx.stage(),
+        ],
+    )
+}
+
+/// [`embed`] over a VOCAB-BANDED table: `y[r] = table[ids[r] - offset]` where
+/// the id falls in this rank's band, zeros where it does not.
+///
+/// **THE CALLER MUST `collective::all_reduce` THE RESULT.** Each rank lands
+/// only its band, so the sum across ranks is the whole embedded row, and the
+/// zeros are what make that sum exact rather than an average.
+///
+/// The band is read off the COMMUNICATOR, not the trace: traces are SPMD and
+/// carry no rank, while the loader has already landed rows
+/// `[rank * table.rows, (rank + 1) * table.rows)`. So the rank the collectives
+/// agree on is the rank the gather bands by, and the two cannot drift.
+///
+/// # Errors
+///
+/// [`Error::Refused`] on a context with no communicator (a single rank has
+/// nothing to band), a dtype outside the lattice, or a refused launch.
+pub fn embed_vocab_shard(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.embed_vocab_shard";
+    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    debug_assert_eq!(ids.rows, y.rows, "the ids handed over are the rows landed");
+    let comm = ctx.comm(OP)?;
+    let local = nonzero(OP, "this rank's band of the embedding table", table.rows)?;
+    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
+    let rows = nonzero(OP, "rows", y.rows)?;
+
+    #[cfg(feature = "cuda")]
+    {
+        let rank = {
+            use cudarc::nccl::sys as nccl;
+            let mut rank: i32 = 0;
+            // SAFETY: `comm` is the live communicator this context fires its
+            // collectives on; the out-parameter is a stack i32.
+            let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
+            crate::collective::answered(OP, "ncclCommUserRank", code)?;
+            u32::try_from(rank).unwrap_or(0)
+        };
+        ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
+                .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
+            &[
+                ids.arg(),
+                table.arg(),
+                y.arg(),
+                hidden.arg(),
+                stated(OP, local)?.arg(),
+                stated(OP, rank.saturating_mul(local))?.arg(),
+                // The staged-geometry seat, as `embed` passes it.
+                ctx.stage(),
+            ],
+        )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (comm, local, hidden, rows, ids, table, y);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// The permute a width-concatenating gather needs: `src` holds
+/// `[world][rows][shard]` — each rank's whole rectangle, one after the other,
+/// which is what `ncclAllGather` lands — and `y` takes `[rows, world * shard]`,
+/// each rank's columns joined into every row, which is what the IR declares.
+///
+/// Only `collective::all_gather` calls this, and only above one row: at one
+/// row the two layouts are already the same buffer.
+///
+/// # Errors
+///
+/// [`Error::Refused`] for a `y` that is not `world` shards wide, or a launch
+/// the runtime refused.
+pub(crate) fn gather_width_concat(
+    ctx: &Ctx,
+    src: u64,
+    y: &mut Tensor,
+    shard_width: u32,
+    world: u32,
+) -> Result<(), Error> {
+    const OP: &str = "layout.gather_width_concat";
+    dtype_dispatch!(OP, y.dtype, { Bf16 => () });
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let shard = nonzero(OP, "the shard width", shard_width)?;
+    let world = nonzero(OP, "the rank count", world)?;
+    if shard.checked_mul(world) != Some(y.width) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {}-wide destination is not {world} shards of {shard}",
+                y.width
+            ),
+        ));
+    }
+    let total = u64::from(rows) * u64::from(y.width);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
+        .map_err(|_| refuse(OP, format!("{total} lanes do not fit a 32-bit grid")))?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::gather_width_concat<::pie::bf16>")
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(src),
+            y.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, shard)?.arg(),
+            stated(OP, world)?.arg(),
         ],
     )
 }

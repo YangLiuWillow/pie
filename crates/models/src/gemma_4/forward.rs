@@ -229,7 +229,13 @@ impl ForwardHybrid for Model {
         let towered = m.tower.as_ref().map(|t| tower(&inputs, t));
 
         let ids = inputs.tokens();
-        let mut y = ops::layout::embed(&ids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
+        let embedded = ops::layout::embed(&ids, &m.embed, m.vocab);
+        let embedded = if embed_banded(m) {
+            ops::collective::all_reduce(&embedded)
+        } else {
+            embedded
+        };
+        let mut y = embedded * (m.hidden as f32).sqrt();
 
         // Embed merge runs only over media-window rows; other rows keep the
         // token embedding already written.
@@ -573,6 +579,11 @@ impl ForwardHybrid for Model {
             _ => (x, None),
         };
         let logits = ops::linear::lm_head(&x, &m.embed);
+        let logits = if embed_banded(m) {
+            ops::collective::all_gather(&logits, m.tp)
+        } else {
+            logits
+        };
         let logits = if let Some(cap) = m.softcap {
             ops::attn::logit_softcap(&logits, cap)
         } else {
@@ -608,7 +619,13 @@ impl ForwardHybrid for Model {
             // `[a|b]·[We|Wh]^T = a·We^T + b·Wh^T`: two matmuls and an add
             // since this IR has no concat op. No pre-fusion norms (EAGLE's
             // design). Embedding scale matches the trunk's own.
-            let e = ops::layout::embed(&chosen, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
+            let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
+            let e = if embed_banded(m) {
+                ops::collective::all_reduce(&e)
+            } else {
+                e
+            };
+            let e = e * (m.hidden as f32).sqrt();
             let mut dy = ops::elemwise::residual_add(
                 &ops::linear::matmul(&e, &a.fc_embed),
                 &ops::linear::matmul(&dx, &a.fc_hidden),
@@ -644,6 +661,11 @@ impl ForwardHybrid for Model {
                 &ops::elemwise::rmsnorm(&dy, &m.final_norm, m.final_norm_eps),
                 &m.embed,
             );
+            let draft = if embed_banded(m) {
+                ops::collective::all_gather(&draft, m.tp)
+            } else {
+                draft
+            };
             let draft = match m.softcap {
                 Some(cap) => ops::attn::logit_softcap(&draft, cap),
                 None => draft,
@@ -687,7 +709,13 @@ impl ForwardHybrid for Model {
             let mut hidden = dx;
             let mut chain: Vec<Value> = Vec::with_capacity(a.depth as usize);
             for step in 0..a.depth {
-                let e = ops::layout::embed(&token, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
+                let e = ops::layout::embed(&token, &m.embed, m.vocab);
+                let e = if embed_banded(m) {
+                    ops::collective::all_reduce(&e)
+                } else {
+                    e
+                };
+                let e = e * (m.hidden as f32).sqrt();
                 let mut y = ops::elemwise::residual_add(
                     &ops::linear::matmul(&e, &a.pre_embed),
                     &ops::linear::matmul(&hidden, &a.pre_hidden),
@@ -752,6 +780,17 @@ impl ForwardHybrid for Model {
 
 /// The aux head's attention: this family's own global site, over the head's
 /// own kv row, on one prefill schedule.
+/// Whether the tied table is vocab-BANDED across ranks: its declared rows are
+/// this rank's share, not the whole vocabulary (see `Model`'s `embed`).
+///
+/// Every read of `m.embed` owes a collective when this holds. A gather owes an
+/// `all_reduce` — the ids outside this rank's band landed zeros, and the sum
+/// is the whole row. The tied head owes an `all_gather` — it produced this
+/// rank's columns of the logits, and the plan wants all of them.
+fn embed_banded(m: &Model) -> bool {
+    m.embed.dim(0) < u64::from(m.vocab)
+}
+
 fn draft_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Draft) -> Value {
     let at = &a.attn;
     let d = m.global.head_dim;

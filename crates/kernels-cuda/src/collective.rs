@@ -48,31 +48,19 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
     }
 }
 
-/// Concatenates each rank's `x` into `y` on every rank, RANK-MAJOR: rank `k`
-/// lands whole at `k * x.elements()`.
+/// Concatenates each rank's `x` into `y` on every rank along the WIDTH:
+/// `[rows, width]` on each rank becomes `[rows, width * world]`, which is the
+/// shape `model_dsl`'s `collective::all_gather` declares.
 ///
-/// **THAT IS NOT THE WIDTH CONCAT THE IR DECLARES.** `model_dsl`'s
-/// `collective::all_gather` shapes `y` as `[rows, width * world]` — each
-/// rank's columns joined into every row — and the two layouts coincide only
-/// at ONE ROW. At more rows this would land rank 0's whole rectangle, then
-/// rank 1's, and the plan would read it as columns: a silent transpose. So a
-/// wider fire is refused here rather than served wrong.
+/// **NCCL DOES NOT LAND THAT LAYOUT ON ITS OWN.** `ncclAllGather` concatenates
+/// whole buffers rank-major — rank `k`'s entire rectangle at `k * elements` —
+/// and that is the same bytes as a width concat only at ONE ROW. Above one row
+/// this gathers rank-major into scratch and permutes
+/// (`layout::gather_width_concat`); at one row it writes `y` directly. Reading
+/// the rank-major bytes as columns is the silent transpose this avoids.
 pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_gather";
     let comm = ctx.comm(OP)?;
-    if x.rows > 1 {
-        return Err(refuse(
-            OP,
-            format!(
-                "this gather joins each rank's shard along the WIDTH (the IR shapes it \
-                 `[rows, width * world]`) and ncclAllGather joins whole buffers rank-major; \
-                 the two are the same layout only at one row, and this fire brought {}. \
-                 Gathering wider wants a permute after the collective — `[world, rows, \
-                 width]` to `[rows, world * width]` — which is not built.",
-                x.rows,
-            ),
-        ));
-    }
     debug_assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
     debug_assert!(
         x.elements() > 0 && y.elements() % x.elements() == 0,
@@ -87,17 +75,37 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let Some((send, count)) = message(x) else {
             return Ok(());
         };
+
+        // At ONE ROW the rank-major concat NCCL lands and the width concat the
+        // IR declares are the same bytes, so the collective writes `y` itself.
+        if x.rows <= 1 {
+            let code = unsafe {
+                nccl::ncclAllGather(
+                    send,
+                    y.ptr as usize as *mut core::ffi::c_void,
+                    count,
+                    dtype,
+                    comm.cast(),
+                    ctx.stream().cast(),
+                )
+            };
+            return answered(OP, "ncclAllGather", code);
+        }
+
+        // Wider, they are not: NCCL would land rank k's whole rectangle at
+        // `k * rows * width` and the plan would read those bytes as columns.
+        // So gather rank-major into scratch and permute it into the declared
+        // `[rows, world * width]` (`layout::gather_width_concat`).
+        let world = u32::try_from(y.elements() / x.elements())
+            .map_err(|_| refuse(OP, "the gathered rectangle is more shards than a u32 counts"))?;
+        let bytes = usize::try_from(y.elements().saturating_mul(y.dtype.bytes_ceil()))
+            .map_err(|_| refuse(OP, "the gathered rectangle does not fit this address space"))?;
+        let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;
         let code = unsafe {
-            nccl::ncclAllGather(
-                send,
-                y.ptr as usize as *mut core::ffi::c_void,
-                count,
-                dtype,
-                comm.cast(),
-                ctx.stream().cast(),
-            )
+            nccl::ncclAllGather(send, stage, count, dtype, comm.cast(), ctx.stream().cast())
         };
-        answered(OP, "ncclAllGather", code)
+        answered(OP, "ncclAllGather", code)?;
+        crate::layout::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -190,7 +198,7 @@ fn message(t: Tensor) -> Option<(*const core::ffi::c_void, usize)> {
 }
 
 #[cfg(feature = "cuda")]
-fn answered(
+pub(crate) fn answered(
     op: &'static str,
     call: &'static str,
     code: cudarc::nccl::sys::ncclResult_t,

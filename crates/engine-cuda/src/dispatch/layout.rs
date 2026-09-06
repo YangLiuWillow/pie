@@ -37,6 +37,17 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )
                 }
+                // A table the loader banded holds fewer rows than the
+                // vocabulary the op names: this rank owns a slice, so the
+                // gather bands and the model's `all_reduce` sums the ranks
+                // back into a whole row. Nothing here needs the rank — the
+                // banded entry reads it off the communicator.
+                None if self.tensor(*table).rows < *vocab => layout::embed_vocab_shard(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    &mut self.tensor(*y),
+                ),
                 None => layout::embed(
                     self.ctx(),
                     self.tensor(*ids),

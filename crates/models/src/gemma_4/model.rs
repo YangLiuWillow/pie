@@ -1090,6 +1090,29 @@ impl Model {
             }
         });
 
+        // The tied table is banded on the VOCAB axis rather than replicated.
+        // It is the single biggest read a decode step makes — gemma's
+        // vocabulary is 262144, so a replicated tied head streams 1.3 GB per
+        // step PER RANK. Banded, each rank holds `vocab / tp` rows: the gather
+        // zeroes the ids outside its band (the forward all-reduces them back
+        // into one row) and the tied head lands a logits shard (the forward
+        // all-gathers it). Both are BITWISE identical to the replicated form —
+        // partitioning a GEMM's output changes no reduction, and the gather's
+        // zeros sum exactly.
+        //
+        // A self-conditioning SKU keeps the whole table: its soft-embedding
+        // gather is `layout.embed_weighted`, which has no banded form.
+        // `PIE_NO_VOCAB_SHARD` keeps the whole table on every rank, for
+        // bisecting a suspected banding fault against the replicated form.
+        let banded = tp > 1
+            && !d.self_cond
+            && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+        let vocab_rows = if banded {
+            (d.vocab / tp) as u64
+        } else {
+            d.vocab as u64
+        };
+
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
@@ -1105,11 +1128,16 @@ impl Model {
             // gather (`layout.embed_weighted`) reads bf16/f16 tables only,
             // and the tied head pays the wider read. Revisit when the gather
             // learns a quantized table.
-            embed: Weight::sym(
-                "embed",
-                [d.vocab as u64, hidden],
-                if d.self_cond { dense } else { w },
-            ),
+            embed: {
+                let table = Weight::sym(
+                    "embed",
+                    [vocab_rows, hidden],
+                    if d.self_cond { dense } else { w },
+                );
+                // The cut axis is the vocabulary's; `forward` reads the band
+                // back off `dim(0) < vocab` rather than a second flag.
+                if banded { table.packed([vocab_rows]) } else { table }
+            },
             ple: d.ple_dim.map(|dim| {
                 let ple = dim as u64;
                 Ple {
