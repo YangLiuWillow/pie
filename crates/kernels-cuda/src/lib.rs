@@ -56,6 +56,7 @@ pub mod jit;
 pub mod layout;
 pub mod linear;
 pub mod seat;
+pub mod spatial;
 pub mod source;
 pub mod tensor;
 
