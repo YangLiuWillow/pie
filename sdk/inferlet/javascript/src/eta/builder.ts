@@ -221,7 +221,10 @@ export class Builder {
       const hasHostPut = st.hostPuts > 0;
       const hostConsumes = st.hostTakes > 0 || st.hostReads > 0;
       const isTerminalOutput = hasProgPut && !hasProgConsume && !hasDescUse && !hasHostPut && !st.seeded && !st.hasSeed;
-      const seededDescriptorWriter = st.seeded && hasDescUse && !hasProgPut;
+      // A seeded channel the pass only reads (a descriptor, or a program
+      // `read` such as a control word) is a latest-value cell the host
+      // replaces through `set`, so it needs a Writer endpoint too.
+      const seededDescriptorWriter = st.seeded && (hasDescUse || st.progReads.length > 0) && !hasProgPut;
       let hostRole: HostRole;
       if ((hasHostPut || seededDescriptorWriter) && !hasProgPut) hostRole = HostRole.WRITER;
       else if (hostConsumes && (st.progTakes.length > 0 || hasProgPut)) hostRole = HostRole.READER;

@@ -933,7 +933,12 @@ def gumbel_max(logits, state) -> Tensor:
 def entropy(probabilities) -> Tensor:
     pid, pty = _materialize(_to_arg(probabilities))
     result_type = ValueType(drop_last(pty.shape), Dtype.F32)
-    lp = emit(Op.unary(tags.LOG, pid), (pty,))
+    # The log is taken over the probabilities floored at the smallest
+    # positive f32, so a zero probability contributes 0 * log(min) = 0
+    # rather than 0 * -inf = NaN (the Rust DSL's rule).
+    floored = max_elem(Tensor.node(pid, pty), 1.1754944e-38)
+    fid, _ = _materialize(_to_arg(floored))
+    lp = emit(Op.unary(tags.LOG, fid), (pty,))
     terms = emit(Op.binary(tags.MUL, pid, lp), (pty,))
     s = emit(Op.unary(tags.REDUCE_SUM, terms), (result_type,))
     result = emit(Op.unary(tags.NEG, s), (result_type,))
