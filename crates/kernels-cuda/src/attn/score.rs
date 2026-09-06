@@ -23,8 +23,9 @@ const BLOCK: u32 = WARPS * 32;
 
 /// The dot-product stamps, tightest first. A stamp is the unrolled per-lane
 /// length (`stamp / 32` elements), so head widths at or below it share it
-/// unpadded.
-const STAMPS: [u32; 3] = [64, 128, 256];
+/// unpadded. 512 is gemma-4's head (16 values a lane; the q row and the
+/// fold words still fit the shared plane).
+const STAMPS: [u32; 4] = [64, 128, 256, 512];
 
 /// The head count a row's width spells at a stated head width.
 fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
