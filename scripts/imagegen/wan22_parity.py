@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-wan22_parity.py -- drive pie's `wan22-mini-*` rows against the M3 miniature golden.
+wan22_parity.py -- drive pie's `wan22-*` rows against the M3 golden.
 
-The reference and its dump come from `wan22_golden.py --mini` (see README).
-This script is the other half: it turns the golden's *inputs* into the case
-JSON the `wan2-parity` inferlet takes, runs it, turns its JSON answer back
-into an `.npz` under the golden's own key names, and diffs the two with
-`compare.py`.
+The reference and its dump come from `wan22_golden.py` (see README): the two
+miniatures under `--mini`, the real `Wan2.2-TI2V-5B` step-0 forward under
+`--full`. This script is the other half: it turns the golden's *inputs* into
+the case JSON the `wan2-parity` inferlet takes, runs it, turns its JSON
+answer back into an `.npz` under the golden's own key names, and diffs the
+two with `compare.py`.
 
     # 1. the case the inferlet reads (scalar timestep, or TI2V's per-token one)
     python wan22_parity.py case  --out /tmp/wan22-parity
@@ -22,6 +23,12 @@ into an `.npz` under the golden's own key names, and diffs the two with
 
     # or all four
     python wan22_parity.py all --out /tmp/wan22-parity [--pertoken]
+
+    # the real row: 1950 rows x 192 features and a 512x4096 context, whose
+    # case JSON is far past what argv carries, so it travels as a scratch
+    # file -- `run` notices and copies it into the config's `fs_scratch_dir`
+    python wan22_parity.py all --variant ti2v-5b --out /tmp/wan22-full \
+        --config ~/.pie/config.wan22.toml
 
 Nothing here imports torch: the reference numbers are already on disk, and
 patchify is a reshape.
@@ -60,10 +67,34 @@ DEFAULT_GOLDEN = os.path.join(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# The golden is fp32 (`wan22_golden.py --mini` runs on CPU in float32); pie
-# runs the same weights cast to bf16 with bf16 activations: the bf16 drift of
-# a two-block trunk, the same order as mini-dit's gate (README §3).
-TOLERANCES = ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"]
+# What a row's golden holds, and how close pie must come to it.
+#
+# `stem` names the dump's keys (`<stem>.in.<name>` in, `out` / `out_pertoken`
+# back); `cos` is the gate. The miniature golden is fp32 (`wan22_golden.py
+# --mini` runs on CPU in float32) and pie runs the same weights cast to bf16
+# with bf16 activations: the bf16 drift of a two-block trunk, the same order
+# as mini-dit's gate (README §3). The flagship's golden is itself a bf16
+# diffusers forward, but thirty blocks deep over 1950 rows, so it gates one
+# decade looser. The flagship's timestep is ALREADY per token (`[B, S]`,
+# TI2V's `expand_timesteps`), uniform 999 at step 0 for a pure T2V prompt --
+# `--pertoken` is the miniatures' switch and this row needs none.
+ROWS = {
+    "d128": dict(npz="wan22_mini.npz", stem="mini.d128", out="mini.d128.out.0",
+                 out_pertoken="mini.d128.out_pertoken.0", cos="0.9999"),
+    "nano": dict(npz="wan22_mini.npz", stem="mini.nano", out="mini.nano.out.0",
+                 out_pertoken="mini.nano.out_pertoken.0", cos="0.9999"),
+    "ti2v-5b": dict(npz="wan22_golden.npz", stem="dit.step0", out="dit.step0.out",
+                    out_pertoken=None, cos="0.999"),
+}
+
+# The most bytes `run` hands the guest as `--case_N` argv pieces before it
+# switches to a scratch file: Linux caps ONE argument at 128 KiB
+# (`MAX_ARG_STRLEN`) and the inferlet takes eight.
+ARGV_BUDGET = 8 * 128 * 1024
+
+
+def tolerances(args) -> list[str]:
+    return ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", ROWS[args.variant]["cos"]]
 
 
 # ----------------------------------------------------------------------------
@@ -109,21 +140,50 @@ def numbered(out: str, stem: str, tail: str) -> list[str]:
     return [path for _, path in sorted(found)]
 
 
-def config(golden: str) -> dict:
-    with open(os.path.join(golden, "wan22_mini_config.json")) as f:
-        return json.load(f)
+def row(args) -> dict:
+    return ROWS[args.variant]
+
+
+def dump_of(args) -> np.lib.npyio.NpzFile:
+    return np.load(os.path.join(args.golden, row(args)["npz"]))
+
+
+def out_key(args) -> str:
+    """The golden key this run's answer stands against."""
+    r = row(args)
+    if not args.pertoken:
+        return r["out"]
+    if r["out_pertoken"] is None:
+        raise SystemExit(f"`{args.variant}` has no per-token forward in its golden")
+    return r["out_pertoken"]
+
+
+def timesteps(args, dump) -> np.ndarray:
+    """The golden's timestep for this run, `[B]` or `[B, S]` per token."""
+    r = row(args)
+    if args.pertoken:
+        return dump[f"{r['stem']}.in.timestep_pertoken"]
+    return dump[f"{r['stem']}.in.timestep"]
+
+
+def lane_cut(pt: np.ndarray) -> tuple[int, float]:
+    """A per-token timestep as the two lanes `wan_2` takes: how many leading
+    rows are the conditioning frame's (timestep 0), and the rest's timestep."""
+    zeros = np.flatnonzero(pt == 0.0)
+    cond_rows = int(zeros.size)
+    assert np.array_equal(zeros, np.arange(cond_rows)), "the zeros are a prefix"
+    rest = pt[cond_rows:]
+    assert rest.size and np.all(rest == rest[0]), "one timestep past the prefix"
+    return cond_rows, float(rest[0])
 
 
 def cases(args) -> list[str]:
     """Write one `case[_pertoken]_{b}.json` per batch element; answer their paths."""
-    cfg = config(args.golden)
-    dump = np.load(os.path.join(args.golden, "wan22_mini.npz"))
-    v = args.variant
-    p = cfg["variants"][v]["config"]["patch_size"]
-    assert p == [1, 2, 2], p
-    hs = dump[f"mini.{v}.in.hidden_states"]           # [B, C, T, H, W]
-    ctx = dump[f"mini.{v}.in.encoder_hidden_states"]  # [B, L, text_dim]
-    ts = dump[f"mini.{v}.in.timestep"]                # [B]
+    r = row(args)
+    dump = dump_of(args)
+    hs = dump[f"{r['stem']}.in.hidden_states"]           # [B, C, T, H, W]
+    ctx = dump[f"{r['stem']}.in.encoder_hidden_states"]  # [B, L, text_dim]
+    ts = timesteps(args, dump)                           # [B] or [B, S]
     b, c, t, h, w = hs.shape
     tokens = patchify(hs, 2)
     pos = positions(t, h // 2, w // 2)
@@ -133,15 +193,11 @@ def cases(args) -> list[str]:
     written = []
     for i in range(b):
         cond_rows = 0
-        timestep = float(ts[i])
-        if args.pertoken:
-            pt = dump[f"mini.{v}.in.timestep_pertoken"][i]   # [S]
-            zeros = np.flatnonzero(pt == 0.0)
-            cond_rows = int(zeros.size)
-            assert np.array_equal(zeros, np.arange(cond_rows)), "the zeros are a prefix"
-            rest = pt[cond_rows:]
-            assert rest.size and np.all(rest == rest[0]), "one timestep past the prefix"
-            timestep = float(rest[0])
+        if ts.ndim == 1:
+            timestep = float(ts[i])
+        else:
+            assert ts.shape[1] == tokens.shape[1], (ts.shape, tokens.shape)
+            cond_rows, timestep = lane_cut(ts[i])
         case = {
             "latents": tokens[i].reshape(-1).astype(np.float32).tolist(),
             "rows": int(tokens.shape[1]),
@@ -157,8 +213,9 @@ def cases(args) -> list[str]:
         with open(path, "w") as f:
             json.dump(case, f)
         written.append(path)
+    lanes = f"cond {cond_rows} + rest" if cond_rows else "one lane"
     print(f"[case] {len(written)} batch element(s), {tokens.shape[1]} rows "
-          f"({'cond ' + str(cond_rows) + ' + rest' if args.pertoken else 'one lane'}) -> {args.out}")
+          f"({lanes}) -> {args.out}")
     return written
 
 
@@ -189,6 +246,15 @@ def wasm(inferlet: str) -> str:
     return max(present, key=os.path.getmtime)
 
 
+def scratch_dir(config: str | None) -> str | None:
+    """The sandbox scratch a `--case_file` name resolves under, off the config."""
+    if not config:
+        return None
+    with open(os.path.expanduser(config)) as f:
+        found = re.search(r'^\s*fs_scratch_dir\s*=\s*"([^"]*)"', f.read(), re.M)
+    return found.group(1) if found else None
+
+
 def run(args) -> None:
     paths = numbered(args.out, "case", suffix(args))
     if not paths:
@@ -201,6 +267,7 @@ def run(args) -> None:
         )
     binary = wasm(args.inferlet)
     manifest = os.path.join(args.inferlet, "Pie.toml")
+    scratch = scratch_dir(args.config)
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie{suffix(args)}_{b}.json")
         cmd = [pie]
@@ -208,7 +275,13 @@ def run(args) -> None:
             cmd += ["--config", args.config]
         cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
         text = ""
-        if args.case_file:
+        # A real row's case is tens of MB, far past what argv carries: hand it
+        # over as a file in the sandbox's own scratch instead.
+        by_file = args.case_file or os.path.getsize(case) > ARGV_BUDGET
+        if by_file:
+            if scratch and os.path.abspath(scratch) != os.path.abspath(args.out):
+                os.makedirs(scratch, exist_ok=True)
+                shutil.copyfile(case, os.path.join(scratch, os.path.basename(case)))
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
@@ -246,10 +319,15 @@ def document(path: str) -> dict:
     return doc
 
 
+def answers(args) -> tuple[str, str]:
+    """Where this run's answer and the golden it stands against are written."""
+    stem = os.path.join(args.out, f"wan22_{args.variant}")
+    return f"{stem}_pie{suffix(args)}.npz", f"{stem}_target{suffix(args)}.npz"
+
+
 def collect(args) -> str:
-    v = args.variant
-    dump = np.load(os.path.join(args.golden, "wan22_mini.npz"))
-    hs = dump[f"mini.{v}.in.hidden_states"]
+    dump = dump_of(args)
+    hs = dump[f"{row(args)['stem']}.in.hidden_states"]
     _, c, t, h, w = hs.shape
     paths = numbered(args.out, "pie", suffix(args))
     if not paths:
@@ -259,12 +337,11 @@ def collect(args) -> str:
     tokens = np.stack(
         [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
     )
-    key = f"mini.{v}.{'out_pertoken' if args.pertoken else 'out'}.0"
+    key = out_key(args)
     mine = unpatchify(tokens, c, t, h, w, 2)
-    path = os.path.join(args.out, f"wan22_mini_pie{suffix(args)}.npz")
+    path, target = answers(args)
     np.savez(path, **{key: mine})
     theirs = dump[key][: len(docs)]
-    target = os.path.join(args.out, f"wan22_mini_target{suffix(args)}.npz")
     np.savez(target, **{key: theirs.astype(np.float32)})
     print(f"[collect] {mine.shape} from {len(docs)} batch element(s) -> {path}; golden -> {target}")
     return path
@@ -275,14 +352,13 @@ def collect(args) -> str:
 # ----------------------------------------------------------------------------
 
 def compare(args) -> int:
-    mine = os.path.join(args.out, f"wan22_mini_pie{suffix(args)}.npz")
-    theirs = os.path.join(args.out, f"wan22_mini_target{suffix(args)}.npz")
+    mine, theirs = answers(args)
     for path in (mine, theirs):
         if not os.path.exists(path):
             raise SystemExit(f"{path}: missing; run `collect` first")
     cmd = [
         sys.executable, os.path.join(HERE, "compare.py"), mine, theirs,
-        "--sort-by", "rel", *TOLERANCES,
+        "--sort-by", "rel", *tolerances(args),
     ]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
@@ -295,15 +371,15 @@ def main() -> int:
     ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/wan22-parity")
-    ap.add_argument("--variant", choices=["d128", "nano"], default="d128")
+    ap.add_argument("--variant", choices=sorted(ROWS), default="d128")
     ap.add_argument("--pertoken", action="store_true",
-                    help="the TI2V per-token-timestep forward: two video lanes")
+                    help="the miniatures' TI2V per-token-timestep forward: two video lanes")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/wan2-parity"))
     ap.add_argument("--config", default=None,
-                    help="the serving config; its `[model] model` must be the imported miniature")
+                    help="the serving config; its `[model] model` must be the imported row")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true",
-                    help="pass the case as a scratch file instead of argv pieces")
+                    help="force the scratch-file case (a big one takes it anyway)")
     args = ap.parse_args()
 
     if args.cmd == "case":
