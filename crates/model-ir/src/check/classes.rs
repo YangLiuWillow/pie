@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, CustomCuda, Spatial};
+use crate::ops::{Attention, CustomCuda, Layout, Spatial};
 use crate::{Guard, Def, Operands, Operation, Trace, ValueId};
 
 /// One deduplicated behavior: the fact words that run the same nodes and
@@ -545,7 +545,23 @@ fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
 
 /// Does this op read operands from MORE THAN ONE CLASS — the ragged
 /// attention (D2), whose queries come off one stream's arm and whose keys
-/// come off another's, under the `Or` of the two guards?
+/// come off another's, under the `Or` of the two guards; and the two row
+/// permutations, whose index space is the SELECTION's packed rectangle and
+/// not any one class's rows?
+///
+/// **WHY THE PERMUTATIONS ARE ROOTED.** `layout.pack_rows` and
+/// `layout.unpack_rows` are launched over the window of the classes the
+/// node is demanded in, and their permutation is fire-absolute over the
+/// whole selection (`model_exec::fire::packing`). Narrow that window to one
+/// class and the launch still walks packed rows `[start, start + rows)` —
+/// packed rows, not that class's rows — so it writes some other class's
+/// rows and leaves its own tail unwritten. A DiT's last joint block is
+/// exactly this shape: its output is read on the image class alone (the
+/// head drops the text rows), so per-class demand would run the unpack over
+/// the image window and leave the last `text_rows` image rows carrying the
+/// block's input. Rooting both ops in every class their guard admits keeps
+/// the window the selection's, which is what the contract states
+/// (`IMAGEGEN_CONTRACT.md` §7, the pack_rows window rule).
 ///
 /// **WHY IT IS ROOTED.** The demand walk is per class: a class runs the
 /// nodes its own outputs need. A cross-attention's output is consumed on
@@ -557,7 +573,11 @@ fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
 /// attention, whose launch spans the two windows. A class with no query
 /// rows launches it as a no-op, which the kernel contract states.
 fn spans_classes(op: &Operation) -> bool {
-    matches!(op, Operation::Attention(Attention::Ragged { .. }))
+    matches!(
+        op,
+        Operation::Attention(Attention::Ragged { .. })
+            | Operation::Layout(Layout::PackRows { .. } | Layout::UnpackRows { .. })
+    )
 }
 
 /// Does this op write a cache — is it demanded for its effect, whatever a

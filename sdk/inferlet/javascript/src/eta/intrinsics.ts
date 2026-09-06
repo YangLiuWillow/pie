@@ -47,6 +47,16 @@ export function hidden(width: number): Tensor {
  * at the epilogue. `width` is declared, as `hidden`'s is, but bind checks it
  * against the model's `velocity_width`.
  */
+/**
+ * The pixels a VAE reading lands (design D8), `[rows, width]` F32 at the
+ * epilogue: one row per OUTPUT voxel of the lane's clip. `rows` is declared
+ * (a VAE lane has no token rows to derive it from); `width` is checked at
+ * bind against the model's `pixels_width` when it states one.
+ */
+export function pixels(rows: number, width: number): Tensor {
+  return intrinsicVal(Intrinsic.PIXELS, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType);
+}
+
 export function velocity(width: number): Tensor {
   const rows = Math.max(currentRows(), 1);
   return intrinsicVal(Intrinsic.VELOCITY, shapeOf([rows, Math.max(width, 1)]), activationType);

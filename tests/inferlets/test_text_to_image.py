@@ -218,9 +218,22 @@ def a_prompt_becomes_a_latent_a_vae_can_decode(args) -> None:
     # exploded one is the loop having gone wrong in a way the shape hides.
     assert 0.05 < report["std"] < 20.0, f"the final latent's scale is {report['std']}"
 
-    # The latent goes out through `session.send-file-as`, so it arrives NAMED
-    # and `pie run -o` writes it under that name -- no `file-0000.bin` to
-    # rename, and no need to read the report to find out which file is which.
+    # THE DECODED EXIT (design D8/D11). A model that declares a `vae.decode`
+    # reading fires it in-guest and sends a PNG the runtime encoded: there is
+    # no latent blob, no sidecar and nothing for `decode_latent.py` to do,
+    # because the picture is already a picture.
+    if report.get("decoded"):
+        png = out_dir / report["file"]
+        assert png.exists(), f"the report says it sent {report['file']} and {out_dir} has it not"
+        how = check_png(png, args.size, args.size)
+        print(f"[OK] {png}  {png.stat().st_size:,} bytes  (checked by {how}) "
+              f"-- decoded in-guest by reading `{report['decode_reading']}`")
+        return
+
+    # The other exit goes out through `session.send-file-as`, so the latent
+    # arrives NAMED too and `pie run -o` writes it under that name -- no
+    # `file-0000.bin` to rename, and no need to read the report to find out
+    # which file is which.
     latent = out_dir / report["file"]
     assert latent.exists(), (
         f"the report names {report['file']}, which is not in {out_dir}: "

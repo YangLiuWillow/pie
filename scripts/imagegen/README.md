@@ -13,8 +13,13 @@ scripts/imagegen/
   mini_dit_ref.py     M0  synthetic mini-DiT reference (no real model, no download)
   mini_dit_parity.py  M0  drives pie's `mini-dit` row against that reference
   zimage_golden.py    M1  Z-Image-Turbo golden + miniature forward
+  zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
+  h3_golden.py        M5  MiniMax H3 miniature forward (vendored reference)
+  h3_parity.py        M5  drives pie's `minimax-h3-mini` row against it
+  vendor/minimax_h3/      a dependency-free transcription of H3's DiT --
+                          sglang's own package cannot be imported here
   golden_common.py        shared tap/hook/manifest plumbing
   compare.py              npz-vs-npz diff with tolerance gates
 ```
@@ -355,6 +360,35 @@ n_heads=4, axes_dims=[16,24,24], axes_lens=[256,64,64], cap_feat_dim=64)` —
 | `zimage_mini.safetensors` | 25,677,496 | `fd71e61a6955381aff902cf10612c850` |
 | `zimage_mini_config.json` | 7,278 | `3afce5520a90b635c009a890b866b64b` |
 
+#### The pie side, from a guest — `zimage_vae_parity.py`
+
+`zimage_golden.py --vae` dumps a 64x64x16 centre crop of `latent.final` beside
+the pixels the reference VAE decodes it to
+(`golden/z-image/zimage_vae/{latent,pixels,mean}.f32` + `shapes.json`).  The
+engine gate `engine-cuda/tests/the_z_image_vae_answers_the_reference` feeds
+that latent from the HOST; this script feeds it the way a guest can, through
+`tests/inferlets/zimage-vae-parity`: the latent bound as the reading's
+`Voxels` port CHANNEL (whose declared shape is the clip's box), the answer
+read off `intrinsics::pixels()`, and the picture out through
+`frames.from-channel` + `session.send-frames`.
+
+```bash
+cp ~/.pie/config.minidit.toml ~/.pie/config.zimage-vae.toml
+# then edit: [model] model = the imported z-image-turbo artifact,
+#            [engine] graphs = "on", max_model_len = 32768,
+#            [server] port = something nothing else is using
+python zimage_vae_parity.py all --out /tmp/zimage-vae \
+    --config ~/.pie/config.zimage-vae.toml
+```
+
+Measured: **cos 0.999981, mean |err| 0.00225, max |err| 0.1526** against
+`pixels.f32` — the same distance the host-fed gate reports (0.99998 / 0.0023),
+so the guest road costs nothing.  `/tmp/zimage-vae/zimage-vae.png` is the
+picture: the golden's red bicycle against its blue wall, 512x512.
+
+`--no-pixels` takes the zero-copy road only (the PNG, no rows lifted); the two
+roads produce a byte-identical PNG.
+
 ### `flux2_golden.py` → `/root/.cache/pie-imagegen/golden/flux2/`
 
 `Flux2KleinPipeline` (klein-4B is `_class_name: Flux2KleinPipeline`, **not**
@@ -442,6 +476,49 @@ python flux2_parity.py all --out /tmp/flux2-parity --config ~/.pie/config.flux2-
 Measured (bf16 pie vs the fp32 golden): max-abs 0.0059, rel 0.0044, cos
 0.99999 — under the mini-dit gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`).
 
+#### The REAL row — `flux2_klein_parity.py`
+
+`tests/inferlets/flux2-klein-parity` is the `flux2-klein-4b` row against the
+same dump: the `text` reading over the family's chat template (the ids are
+checked against `text.input_ids` exactly), one `denoise` step over the
+golden's own step-0 inputs, one independent step per sigma from the
+reference's own latent, and the four-step Euler trajectory, then both final
+latents through the diffusers VAE.
+
+```bash
+# ~3 min to import, ~2 min to run
+pie model import ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/ \
+    --sku flux2-klein-4b-bf16-kv-bf16 --out ~/.cache/pie-imagegen/flux2-klein-4b.zt
+CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
+    --out /tmp/flux2-klein-parity --config ~/.pie/config.flux2-klein.toml
+```
+
+The config needs `[engine] max_model_len = 32768` (rows × submit depth),
+`[model] model` at the artifact, and — the one that is not obvious —
+`[runtime] submit_deadline = "10s"` with `silence_timeout = "300s"`: at the
+50 ms default the cohort gate seals the denoise group's FIRST frame with
+the image lane alone and the velocity comes back unconditioned (cos ≈ 0.535
+against the golden, cos 0.9999 against a no-text reference). `run` refuses a
+config that does not state it.
+
+Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
+
+| reading | cos | gate |
+|---|---|---|
+| `text.hidden` (20 rows × 3072) | 0.999993 | ≥ 0.999 ✓ |
+| `dit.step0.out` | 0.999552 | ≥ 0.999 ✓ |
+| `probe.step{0,1,2,3}.out` | 0.999552 / 0.999125 / 0.999615 / 0.999767 | ≥ 0.999 ✓ |
+| `latent.final` (four Euler steps) | 0.997903 | reported |
+| PSNR(`pie.png`, `golden.png`) | 34.87 dB | reported |
+
+The trajectory is REPORTED, not gated: klein is distilled to four steps
+whose last takes σ 0.767 → 0, which amplifies a velocity difference about
+sixfold, and bf16 alone moves the step-0 velocity by 4e-4 in cosine. The
+SAME diffusers transformer in fp32 reads cos 0.999618 on the velocity and
+**0.997510** on `latent.final` against this bf16 dump — i.e. an exact fp32
+computation is FARTHER from the golden than pie is. The per-step velocities
+are what the model is gated on.
+
 ### `wan22_golden.py` → `/root/.cache/pie-imagegen/golden/wan22/`
 
 `WanPipeline` on TI2V-5B, 480x832, **17 frames**, **8 steps**, seed 0, bf16 DiT with
@@ -480,6 +557,62 @@ Both on latent `[1,16,5,16,16]` → S = 320 tokens, context `[1,32,64]`.
 | `wan22_mini_nano.safetensors` | 380,704 | `743e316070fbbf918e556b9e43d92b97` |
 | `wan22_mini_d128.safetensors` | 8,914,648 | `5707cde610525dbcec5ca1c95f21ec16` |
 | `wan22_mini_config.json` | 11,474 | `aab5a938c58f7864cbe2a03fe69bf47d` |
+
+### `h3_golden.py` → `/root/.cache/pie-imagegen/golden/minimax_h3/`
+
+**Miniature only, and the reference is VENDORED.** `sglang.multimodal_gen`
+cannot be imported in this checkout (its `__init__` pulls in starlette and the
+rest of the serving stack), so `vendor/minimax_h3/modeling.py` transcribes the
+eager arithmetic of `runtime/models/dits/minimax_h3.py` from sglang commit
+`6cee9285a3dd43e1f0270818aef7bf01a0568863`, class by class, with the upstream
+line numbers in its header. Only eager branches are kept: no TP, no
+quantization, no fused kernels, no adaLN cache, no sparse attention.
+
+`--mini` builds the study's §D.3 configuration (2 blocks, 1 refiner, dim 128,
+2 heads x 64, ffn 256, text_dim 64, 8 rope frequencies → 48 of 64 rotated;
+863,048 params) over a 21-row packed sequence: 3 text rows, 8 video rows
+(a 2 x 4 x 4 latent under the (1,2,2) patch), 6 audio rows (3 ticks, stereo,
+channel-major) and 4 keyframe rows. The four unique timesteps are
+`[0.35, 0.999, 0.62, 1.0]` — video, the pinned visual condition, audio, and the
+ref2va audio-reference slot nothing in FL2VA claims.
+
+It also **checks** the claim `crates/models/src/minimax_h3/forward.rs` makes
+about the packed row order: pie's `[text | video | audio | reference]` (lanes by
+stream code) and the reference's `[text | refs | audio | video]` answer at
+cos 1.0, because the joint attention is unmasked and every row's rotary
+coordinates travel with it.
+
+The checkpoint it writes uses the OFFICIAL tensor spellings — `qkv_proj`
+re-interleaved per head — so pie's import runs the same de-interleave the 66 GB
+flagship needs.
+
+Keys: `mini.in.{text_hidden,refined_text,video_rows,audio_rows,reference_rows,
+positions,token_tags,inverse_indices,unique_timesteps}`,
+`mini.out.{video,audio}`.
+
+### The pie side — `h3_parity.py`
+
+```bash
+python h3_golden.py --mini
+pie model import <dir with h3_mini.safetensors> --sku minimax-h3-mini-bf16-kv-bf16
+python h3_parity.py all --out /tmp/h3-parity --config ~/.pie/config.h3-mini.toml
+```
+
+The guest (`tests/inferlets/h3-parity`) runs the `refine` pass (the text lane
+alone) and then one `denoise` step of FOUR lanes in one attention group — text,
+video, audio, reference — one pipeline each, one timestep cell per pass. Use a
+PRIVATE config with its own `[server] port` and an `[engine] max_model_len` at
+least the packed row count times the submit depth.
+
+Measured (fp32 reference vs pie's bf16 trunk, one denoise step on one GPU):
+
+| tensor | shape | max-abs | rel | cos |
+|---|---|---:|---:|---:|
+| `mini.out.refined_text` | (3, 128) | 0.00025 | 0.0039 | 0.99999254 |
+| `mini.out.video` | (8, 96) | 0.00025 | 0.0027 | 0.99999653 |
+| `mini.out.audio` | (6, 32) | 0.00020 | 0.0025 | 0.99999699 |
+
+Gate: `--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`.
 
 ---
 

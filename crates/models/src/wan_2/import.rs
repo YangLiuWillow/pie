@@ -197,13 +197,20 @@ fn dit(
     // shift]`, and `proj_out` with its rows brought to `(c, ph, pw)`.
     table(b, src, &m.head_table, &at("scale_shift_table"), HEAD_SLICES)?;
     let rows = head_rows(d.out_channels);
-    b.read_expr(
-        &m.proj_out.w,
-        Expr::src(at("proj_out.weight")).gather(0, rows.clone()),
-    )?;
-    b.read_expr(
-        &m.proj_out.bias,
-        Expr::src(at("proj_out.bias")).gather(0, rows),
+    b.read_expr(&m.proj_out.w, rows_reordered(&at("proj_out.weight"), &rows))?;
+    b.read_expr(&m.proj_out.bias, rows_reordered(&at("proj_out.bias"), &rows))
+}
+
+/// Rows of axis 0 in the stated order, as a concatenation of one-row
+/// slices — the one row permutation the load ladder lowers under a cast
+/// (`Expr::gather` lands its plane sized in the source's bytes, which a
+/// following cast refuses).
+fn rows_reordered(from: &str, rows: &[i64]) -> Expr {
+    Expr::concat(
+        0,
+        rows.iter()
+            .map(|&r| Expr::src(from.to_string()).slice(0, r, 1))
+            .collect(),
     )
 }
 
@@ -418,19 +425,17 @@ fn conv(
 ) -> Result<(), Error> {
     let name = format!("{stem}.weight");
     let stored = stored_encoding(src, &name)?;
-    let kernel = Expr::src(name);
-    let kernel = match &rows {
-        Some(rows) => kernel.gather(0, rows.clone()),
-        None => kernel,
-    };
-    b.read_expr(
-        &c.w,
-        kernel.transmute(TensorType::new(extents(&c.w), stored)),
-    )?;
-    let bias = Expr::src(format!("{stem}.bias"));
+    let shape = TensorType::new(extents(&c.w), stored);
+    let bias = format!("{stem}.bias");
     match rows {
-        Some(rows) => b.read_expr(&c.bias, bias.gather(0, rows)),
-        None => b.read_expr(&c.bias, bias),
+        Some(rows) => {
+            b.read_expr(&c.w, rows_reordered(&name, &rows).transmute(shape))?;
+            b.read_expr(&c.bias, rows_reordered(&bias, &rows))
+        }
+        None => {
+            b.read_expr(&c.w, Expr::src(name).transmute(shape))?;
+            b.read(&c.bias, bias)
+        }
     }
 }
 

@@ -15,7 +15,7 @@ use crate::window::Windows;
 
 use super::{
     Enqueued, FireCost, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, PortFeedPlan, Prepared,
-    RsFire, Settled, Shell, StepView,
+    RsFire, Settled, Shell, StepView, VoxelFeedPlan,
 };
 
 /// `prepare`: host-only (gate, ports, compose, lane loop, geometry, windows,
@@ -266,9 +266,13 @@ impl FrameShell for Shell {
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes);
         // Position-gather width, from the load, not the submission.
         let embed_taps = self.patch_seat.map_or(0, |seat| seat.embed_taps);
-        let embed_weight_taps = self
-            .patch_seat
-            .map_or(0, |seat| if seat.embed_weights { seat.embed_taps } else { 0 });
+        let embed_weight_taps = self.patch_seat.map_or(0, |seat| {
+            if seat.embed_weights {
+                seat.embed_taps
+            } else {
+                0
+            }
+        });
         let mut media_of: Vec<Option<&Media<'_>>> = vec![None; lanes.len()];
         for shot in media {
             let at = shot.lane as usize;
@@ -453,6 +457,7 @@ impl FrameShell for Shell {
         // is touched; the cell's address is resolved at `enqueue`, after the
         // prologue, so it is the cell the instance's own `take` would read.
         let mut port_feeds: Vec<PortFeedPlan> = Vec::new();
+        let mut voxel_feeds: Vec<VoxelFeedPlan> = Vec::new();
         for (fire_lane, row) in composition.lanes().iter().enumerate() {
             let seated = &lanes[row.source as usize];
             for feed in seated.ports {
@@ -486,6 +491,19 @@ impl FrameShell for Shell {
                     if arming {
                         continue;
                     }
+                    // A voxel port has TWO feeds (design D8), and a lane
+                    // takes one of them: a channel (this loop) or the
+                    // payload it submitted beside its clips
+                    // (`StepVoxels::payload`, the shell's own door). A lane
+                    // that handed over bytes has fed the port already.
+                    if seat.kind == engine::fire::PortKind::Voxels
+                        && clips_of
+                            .get(row.source as usize)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|shot| !shot.payload.is_empty())
+                    {
+                        continue;
+                    }
                     return Err(Fault::program(
                         "serve::ports",
                         format!(
@@ -511,14 +529,26 @@ impl FrameShell for Shell {
                             ),
                         )
                     })?;
-                let rows = if seat.per_lane() { 1 } else { row.rows };
+                // A voxel port's cell is the LANE'S CLIP, not its token rows
+                // (design D8): its rectangle lives in the voxel store, at the
+                // lane's `voxel_offset`, and what the cell owes is one row per
+                // voxel of the clips the lane submitted.
+                let voxel = seat.kind == engine::fire::PortKind::Voxels;
+                let rows = if voxel {
+                    row.voxels
+                } else if seat.per_lane() {
+                    1
+                } else {
+                    row.rows
+                };
                 let bytes = u64::from(rows) * seat.row_bytes();
                 // A cell in the port's own element copies; an f32 cell into
                 // a bf16 port (design D3: latents stay f32 masters on the
                 // ring, a text may read them in bf16) is cast on the way.
                 let f32_bytes = u64::from(rows) * u64::from(seat.width) * 4;
                 let cell = self.programs.feed_cell_bytes(instance, feed.channel)?;
-                let cast = cell != bytes && seat.dtype == model_ir::Dtype::Bf16 && cell == f32_bytes;
+                let cast =
+                    cell != bytes && seat.dtype == model_ir::Dtype::Bf16 && cell == f32_bytes;
                 if cell != bytes && !cast {
                     return Err(Fault::program(
                         "serve::ports",
@@ -530,6 +560,19 @@ impl FrameShell for Shell {
                             row.source, seat.kind, seat.port, feed.channel, seat.width, seat.dtype
                         ),
                     ));
+                }
+                if voxel {
+                    voxel_feeds.push(VoxelFeedPlan {
+                        lane: row.source,
+                        first: row.voxel_offset,
+                        rows,
+                        width: seat.width,
+                        cast,
+                        bytes,
+                        channel: feed.channel,
+                        instance,
+                    });
+                    continue;
                 }
                 port_feeds.push(PortFeedPlan {
                     seat: *seat,
@@ -545,6 +588,16 @@ impl FrameShell for Shell {
                     instance,
                 });
             }
+        }
+        // A fire whose voxel port is channel-fed stages no payload: the
+        // width the tables state is the seat the feed named.
+        let fed_width = voxel_feeds.first().map_or(0, |feed| feed.width);
+        if voxel_feeds.iter().any(|feed| feed.width != fed_width) {
+            return Err(Fault::VoxelPayload {
+                lane: voxel_feeds[0].lane,
+                what: "two lanes feed voxel ports of two widths in one fire (M0: one voxel \
+                       class per fire)",
+            });
         }
         // The voxel tables, in fire order. M0: every spatial launch runs over
         // the whole voxel rectangle (`crate::voxels`), so the clips of one
@@ -566,7 +619,13 @@ impl FrameShell for Shell {
                 });
             }
             let slot_of: Vec<u32> = lanes.iter().map(|seated| seated.lane.slot).collect();
-            crate::voxels::Tables::of(&store.seat(), composition.lanes(), &clips_of, &slot_of)?
+            crate::voxels::Tables::of(
+                &store.seat(),
+                composition.lanes(),
+                &clips_of,
+                &slot_of,
+                fed_width,
+            )?
         };
 
         // The composition places each lane's images independently of token
@@ -594,11 +653,14 @@ impl FrameShell for Shell {
             let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
             // Default route is the drop sentinel, not zero: every entry no
             // lane writes has no destination, and zero is a legal token row.
-            let mut routes =
-                vec![
-                    if self.drops_patch_rows { PATCH_ROUTE_DROP } else { 0 };
-                    composition.patch_rows() as usize
-                ];
+            let mut routes = vec![
+                if self.drops_patch_rows {
+                    PATCH_ROUTE_DROP
+                } else {
+                    0
+                };
+                composition.patch_rows() as usize
+            ];
             // Rotation stream `(t, h, w)` is each patch's own grid
             // coordinate, copied verbatim (unlike routes, which are rebased).
             let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
@@ -619,12 +681,7 @@ impl FrameShell for Shell {
                 // space), not at `patch_offset` (patch-row space). A
                 // negative (sentinel) route is left untouched.
                 let landed = (row.patch_offset as usize) / fold;
-                let live = shot
-                    .rows
-                    .iter()
-                    .map(|rows| *rows as usize)
-                    .sum::<usize>()
-                    / fold;
+                let live = shot.rows.iter().map(|rows| *rows as usize).sum::<usize>() / fold;
                 for (j, &route) in shot.routes.iter().take(live).enumerate() {
                     routes[landed + j] = if route < 0 {
                         route
@@ -633,11 +690,9 @@ impl FrameShell for Shell {
                     };
                 }
                 let triples = row.patch_offset as usize * MROPE_COORDS;
-                positions[triples..triples + shot.positions.len()]
-                    .copy_from_slice(shot.positions);
+                positions[triples..triples + shot.positions.len()].copy_from_slice(shot.positions);
                 let at_ids = row.patch_offset as usize * taps;
-                embed_rows[at_ids..at_ids + shot.embed_rows.len()]
-                    .copy_from_slice(shot.embed_rows);
+                embed_rows[at_ids..at_ids + shot.embed_rows.len()].copy_from_slice(shot.embed_rows);
                 let at_w = row.patch_offset as usize * weight_taps;
                 embed_weights[at_w..at_w + shot.embed_weights.len()]
                     .copy_from_slice(shot.embed_weights);
@@ -669,6 +724,7 @@ impl FrameShell for Shell {
         // order.
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         // One mask entry per lane, seriated with the rest.
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -706,6 +762,9 @@ impl FrameShell for Shell {
             // device-geometry lane states its post-append extent on
             // `kv_len`, and `have` is derived as `extent - rows`.
             let have = match ports.as_ref().filter(|ports| ports.owns_pages()) {
+                // A lane whose reading binds no kv space holds nothing,
+                // whatever the shell counted for its slot.
+                _ if seated.kv_less => 0,
                 Some(ports) => {
                     let after = ports.extent().ok_or_else(|| {
                         Fault::program(
@@ -768,6 +827,7 @@ impl FrameShell for Shell {
                 have,
                 rows: row.rows,
             });
+            kv_less_seats.push(seated.kv_less);
             // Page table from whichever author has one: a device-geometry
             // lane's resolved cell, else the submission's own.
             tables.push(match &device_pages[source] {
@@ -800,8 +860,7 @@ impl FrameShell for Shell {
             // the verb's bound.
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
-            let port = envelope_of[source]
-                .and_then(|(held, _)| resolved[held].fold_len.as_deref());
+            let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold_len.as_deref());
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 // `fold == 0` is a pure scatter (boundary = row count,
@@ -902,7 +961,10 @@ impl FrameShell for Shell {
             // owed and nothing is refused (`ClassTable::correction_reaches`).
             let unreachable = seated.adapter.is_some()
                 && !runs_correction
-                && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);
+                && !self
+                    .compiled
+                    .classes
+                    .correction_reaches(&self.corrected, lane.word);
             if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
@@ -940,7 +1002,9 @@ impl FrameShell for Shell {
             }
             if any_adapter {
                 // `-1` = base model.
-                let id = seated.adapter.map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
+                let id = seated
+                    .adapter
+                    .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
 
@@ -963,14 +1027,11 @@ impl FrameShell for Shell {
                     // (step 0c); `None` means the seat's own `have + row`
                     // arithmetic stands for that row.
                     match &device_writes[source] {
-                        Some((slots, offsets)) => writes.extend(
-                            slots
-                                .iter()
-                                .zip(offsets)
-                                .map(|(&page, &off)| {
-                                    Some((narrow(u64::from(page)), narrow(u64::from(off))))
-                                }),
-                        ),
+                        Some((slots, offsets)) => {
+                            writes.extend(slots.iter().zip(offsets).map(|(&page, &off)| {
+                                Some((narrow(u64::from(page)), narrow(u64::from(off))))
+                            }))
+                        }
                         None => writes.extend(std::iter::repeat_n(None, rows_here)),
                     }
                 }
@@ -1003,8 +1064,7 @@ impl FrameShell for Shell {
                     continue;
                 }
                 let at = row.row_offset as usize * MROPE_COORDS;
-                triples[at..at + shot.token_positions.len()]
-                    .copy_from_slice(shot.token_positions);
+                triples[at..at + shot.token_positions.len()].copy_from_slice(shot.token_positions);
             }
             triples
         };
@@ -1041,10 +1101,19 @@ impl FrameShell for Shell {
                         if sc.taps as usize != taps {
                             return Err(Fault::program(
                                 "serve::prepare",
-                                format!("lane {} states {} taps and this plan reads {taps}", row.source, sc.taps),
+                                format!(
+                                    "lane {} states {} taps and this plan reads {taps}",
+                                    row.source, sc.taps
+                                ),
                             ));
                         }
-                        self_cond_feeds.push((ids.len(), cells, rows_channel, weights_channel, instance));
+                        self_cond_feeds.push((
+                            ids.len(),
+                            cells,
+                            rows_channel,
+                            weights_channel,
+                            instance,
+                        ));
                         ids.extend(std::iter::repeat_n(0, cells));
                         ws.extend(std::iter::repeat_n(0.0, cells));
                     }
@@ -1087,27 +1156,31 @@ impl FrameShell for Shell {
         // its demand on the pools is nothing.
         let kv_less = self.spaces == 0;
         let demand = Demand {
-            kv_pages: if kv_less { 0 } else { seats
-                .iter()
-                .zip(&tables)
-                .map(|(seat, table)| {
-                    let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
-                    let pages = after.div_ceil(page_size).max(1);
-                    if table.is_empty() {
-                        // Shell-owned block: one past this lane's last page id.
-                        self.pools.paging().base(seat.slot).saturating_add(pages)
-                    } else {
-                        // Runtime-tabled ids: one past the highest addressed.
-                        table
-                            .iter()
-                            .take(pages as usize)
-                            .copied()
-                            .max()
-                            .map_or(0, |page| u64::from(page).saturating_add(1))
-                    }
-                })
-                .max()
-                .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)) },
+            kv_pages: if kv_less {
+                0
+            } else {
+                seats
+                    .iter()
+                    .zip(&tables)
+                    .map(|(seat, table)| {
+                        let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
+                        let pages = after.div_ceil(page_size).max(1);
+                        if table.is_empty() {
+                            // Shell-owned block: one past this lane's last page id.
+                            self.pools.paging().base(seat.slot).saturating_add(pages)
+                        } else {
+                            // Runtime-tabled ids: one past the highest addressed.
+                            table
+                                .iter()
+                                .take(pages as usize)
+                                .copied()
+                                .max()
+                                .map_or(0, |page| u64::from(page).saturating_add(1))
+                        }
+                    })
+                    .max()
+                    .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX))
+            },
             state_slots: seats
                 .iter()
                 .map(|seat| seat.slot.saturating_add(1))
@@ -1461,11 +1534,13 @@ impl FrameShell for Shell {
             self_cond_feeds,
             packings,
             port_feeds,
+            voxel_feeds,
             merge_lands,
             lane_carve,
             windows,
             seats,
             tables,
+            kv_less_seats,
             geometries,
             pages,
             fresh,
@@ -1482,9 +1557,9 @@ impl FrameShell for Shell {
                         .iter()
                         .filter(|verb| matches!(verb, RsMove::Scatter { fold: 0, .. }))
                         .count();
-                    let prologue = attachments.iter().any(|attached| {
-                        attached.at == Boundary::Prologue
-                    });
+                    let prologue = attachments
+                        .iter()
+                        .any(|attached| attached.at == Boundary::Prologue);
                     (scatters != 0 && scatters != rs_moves.len()) || prologue
                 },
                 // Bound only where it can truncate something — tidiness, not
@@ -1556,12 +1631,7 @@ impl FrameShell for Shell {
 /// Resolves one lane's fold length: a host-stated length is itself; a
 /// device-stated one reads the descriptor port's cell for this lane. Both
 /// are clamped to `bound` and refuse zero.
-fn resolve_fold_len(
-    len: FoldLen,
-    bound: u32,
-    lane: usize,
-    port: Option<&[u32]>,
-) -> Result<u32> {
+fn resolve_fold_len(len: FoldLen, bound: u32, lane: usize, port: Option<&[u32]>) -> Result<u32> {
     let stated = match len {
         FoldLen::Host(n) => n,
         FoldLen::Device(which) => {
@@ -1612,8 +1682,7 @@ mod tests {
 
     /// Port a device-resident fold length is read from; any consuming
     /// geometry port works, since the resolver only uses the cell.
-    const PORT: eta_ir::registry::Port =
-        eta_ir::registry::Port::RsFoldLen;
+    const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
 
     /// A device-resolved count is bounded by what the host knows the buffer
     /// holds; a host-stated count is clamped by the same line.
@@ -1621,8 +1690,14 @@ mod tests {
     fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
         let cells = [3u32, 9, 5];
         let port = Some(&cells[..]);
-        assert_eq!(resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(), 3);
-        assert_eq!(resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(), 8);
+        assert_eq!(
+            resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(),
+            3
+        );
+        assert_eq!(
+            resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(),
+            8
+        );
         assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
         assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
     }
@@ -1641,5 +1716,4 @@ mod tests {
         let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
         assert!(error.to_string().contains("bonus token"), "{error}");
     }
-
 }

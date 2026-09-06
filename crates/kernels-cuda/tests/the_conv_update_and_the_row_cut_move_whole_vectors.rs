@@ -70,7 +70,10 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
             }
             let silu = acc / (1.0 + (-acc).exp());
             let got = from_bf16(got_y[r * channels + c]);
-            assert!(close(got, silu), "row {r} channel {c}: {got} against {silu}");
+            assert!(
+                close(got, silu),
+                "row {r} channel {c}: {got} against {silu}"
+            );
             for t in 0..k as usize - 1 {
                 state[t * channels + c] = state[(t + 1) * channels + c];
             }
@@ -110,7 +113,59 @@ fn the_row_cut_lands_both_halves() {
     let got_l: Vec<u16> = gpu.down(l_at, rows as usize * left_w);
     let got_r: Vec<u16> = gpu.down(r_at, rows as usize * right_w);
     for r in 0..rows as usize {
-        assert_eq!(&got_l[r * left_w..(r + 1) * left_w], &x_raw[r * total..r * total + left_w]);
-        assert_eq!(&got_r[r * right_w..(r + 1) * right_w], &x_raw[r * total + left_w..(r + 1) * total]);
+        assert_eq!(
+            &got_l[r * left_w..(r + 1) * left_w],
+            &x_raw[r * total..r * total + left_w]
+        );
+        assert_eq!(
+            &got_r[r * right_w..(r + 1) * right_w],
+            &x_raw[r * total + left_w..(r + 1) * total]
+        );
+    }
+}
+
+/// **THE CUT SERVES PAST 65 535 ROWS.** The eight-wide form used to launch
+/// its rows on `grid.y`, which every compute capability caps at 65 535, so a
+/// fire at a 65 536-token ceiling — or a VAE's voxel rectangle, which is
+/// wider still — was refused by the driver rather than served. Rows now ride
+/// `grid.x` and the column tiles `grid.y`; this is the claim, at a row count
+/// the old geometry could not launch. Only the first and last few rows are
+/// compared: the point is that the launch happened at all and that the row
+/// indexing did not transpose.
+#[test]
+fn the_row_cut_lands_both_halves_past_the_grid_y_ceiling() {
+    let (rows, left_w, right_w) = (65_600u32, 48usize, 80usize);
+    let total = left_w + right_w;
+    let mut lcg = Lcg::seeded(0x71);
+    let (x_raw, _) = lcg.row(rows as usize * total);
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x_raw);
+    let l_at = gpu.zeros(rows as usize * left_w * 2);
+    let r_at = gpu.zeros(rows as usize * right_w * 2);
+    let mut left = Tensor::new(l_at, rows, left_w as u32, Dtype::Bf16);
+    let mut right = Tensor::new(r_at, rows, right_w as u32, Dtype::Bf16);
+    layout::split_rows(
+        &gpu.ctx(),
+        Tensor::new(x_at, rows, total as u32, Dtype::Bf16),
+        left_w as u32,
+        &mut left,
+        &mut right,
+    )
+    .expect("the cut fires at 65_600 rows");
+    gpu.sync();
+    let got_l: Vec<u16> = gpu.down(l_at, rows as usize * left_w);
+    let got_r: Vec<u16> = gpu.down(r_at, rows as usize * right_w);
+    let probes = [0usize, 1, 65_534, 65_535, 65_536, rows as usize - 1];
+    for r in probes {
+        assert_eq!(
+            &got_l[r * left_w..(r + 1) * left_w],
+            &x_raw[r * total..r * total + left_w],
+            "row {r}'s left half"
+        );
+        assert_eq!(
+            &got_r[r * right_w..(r + 1) * right_w],
+            &x_raw[r * total + left_w..(r + 1) * total],
+            "row {r}'s right half"
+        );
     }
 }

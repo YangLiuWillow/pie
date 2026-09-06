@@ -13,9 +13,13 @@ use eta_dsl::{Channel, Traced};
 const VOCAB: u32 = 151_936;
 const PAGE: u32 = 32;
 
-fn leak<T>(v: T) -> &'static T { Box::leak(Box::new(v)) }
+fn leak<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
 
-fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
 
 /// lowering.rs `build_s3` verbatim (golden hash 4213522552817221928 with VOCAB 32000, PAGE 16).
 fn s3() -> Traced {
@@ -54,7 +58,8 @@ fn text_completion_decode() -> Traced {
     let embed_indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("embed_indptr"));
     let positions: &'static Channel = leak(Channel::from([n]).named("positions"));
     let pages: &'static Channel = leak(Channel::from((0..3u32).collect::<Vec<_>>()).named("pages"));
-    let page_indptr: &'static Channel = leak(Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr"));
+    let page_indptr: &'static Channel =
+        leak(Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr"));
     let w_slot: &'static Channel = leak(Channel::from([n / page_size]).named("w_slot"));
     let w_off: &'static Channel = leak(Channel::from([n % page_size]).named("w_off"));
     let kv_len: &'static Channel = leak(Channel::from([n + 1]).named("kv_len"));
@@ -91,13 +96,17 @@ fn naive_decode() -> Traced {
     let cap = 8u32;
     let tok_in: &'static Channel = leak(Channel::from([3i32]).named("tok_in"));
     let rng: &'static Channel = leak(Channel::from([0x7ce1u32 ^ 0x5bd1, 0]).named("rng"));
-    let tok_out: &'static Channel = leak(Channel::new([1], dtype::i32).capacity(cap).named("tok_out"));
-    let s1_out: &'static Channel = leak(Channel::new([1], dtype::f32).capacity(cap).named("s1_out"));
-    let s2_out: &'static Channel = leak(Channel::new([1], dtype::f32).capacity(cap).named("s2_out"));
+    let tok_out: &'static Channel =
+        leak(Channel::new([1], dtype::i32).capacity(cap).named("tok_out"));
+    let s1_out: &'static Channel =
+        leak(Channel::new([1], dtype::f32).capacity(cap).named("s1_out"));
+    let s2_out: &'static Channel =
+        leak(Channel::new([1], dtype::f32).capacity(cap).named("s2_out"));
     let lane1: &'static Channel = leak(Channel::from([0u32, 1u32]).named("embed_indptr"));
     let positions: &'static Channel = leak(Channel::from([n]).named("positions"));
     let pages: &'static Channel = leak(Channel::from((0..4u32).collect::<Vec<_>>()).named("pages"));
-    let page_indptr: &'static Channel = leak(Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr"));
+    let page_indptr: &'static Channel =
+        leak(Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr"));
     let w_slot: &'static Channel = leak(Channel::from([n / page_size]).named("w_slot"));
     let w_off: &'static Channel = leak(Channel::from([n % page_size]).named("w_off"));
     let kv_len: &'static Channel = leak(Channel::from([n + 1]).named("kv_len"));
@@ -185,9 +194,27 @@ fn coverage() -> Traced {
         let mem = row_membership(reshape(iota(8), [2, 4]), iota(3));
         let u = rng(&r, [4]);
         let bb = bias.read() + u;
-        let extra = abs(recip(sign(neg(&bb)))) + log(exp(&bb)) + max_elem(&bb, 1.0f32) - min_elem(&bb, 2.0f32) + rem(&bb, 3.0f32);
-        let flag_v = reduce_sum(cast(cm, dtype::u32)) + reduce_sum(cast(sw, dtype::u32)) + reduce_sum(cast(sk, dtype::u32)) + reduce_sum(cast(mem, dtype::u32)) + reduce_sum(cast(ge_, dtype::u32));
-        let total = h + h2 + ssum + reduce_sum(cs) + reduce_sum(l2) + reduce_sum(reshape(m, [1])) + reduce_sum(g) + g2 + reduce_sum(&extra) + cast(flag_v, dtype::f32) + cast(eq(&t1, &t2), dtype::f32) + cast(ne(&t1, &t3), dtype::f32) + cast(le(&t2, &t3), dtype::f32);
+        let extra = abs(recip(sign(neg(&bb)))) + log(exp(&bb)) + max_elem(&bb, 1.0f32)
+            - min_elem(&bb, 2.0f32)
+            + rem(&bb, 3.0f32);
+        let flag_v = reduce_sum(cast(cm, dtype::u32))
+            + reduce_sum(cast(sw, dtype::u32))
+            + reduce_sum(cast(sk, dtype::u32))
+            + reduce_sum(cast(mem, dtype::u32))
+            + reduce_sum(cast(ge_, dtype::u32));
+        let total = h
+            + h2
+            + ssum
+            + reduce_sum(cs)
+            + reduce_sum(l2)
+            + reduce_sum(reshape(m, [1]))
+            + reduce_sum(g)
+            + g2
+            + reduce_sum(&extra)
+            + cast(flag_v, dtype::f32)
+            + cast(eq(&t1, &t2), dtype::f32)
+            + cast(ne(&t1, &t3), dtype::f32)
+            + cast(le(&t2, &t3), dtype::f32);
         stat.put(reshape(&total, [1]));
         stat2.put(extra);
         flag.put(reshape(gt(&total, 0.0f32), [1]));
@@ -221,7 +248,9 @@ fn sinks() -> Traced {
         let q = intrinsics::query(16);
         let s = intrinsics::kernel::envelope_dot(4);
         let _ = (q, s);
-        intrinsics::kernel::attn_page_mask(cast(gt(intrinsics::kernel::envelope_dot(4), 0.0f32), dtype::u32) + intrinsics::layer());
+        intrinsics::kernel::attn_page_mask(
+            cast(gt(intrinsics::kernel::envelope_dot(4), 0.0f32), dtype::u32) + intrinsics::layer(),
+        );
     });
     b.stage(Stage::Epilogue, move || {
         out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
@@ -229,7 +258,6 @@ fn sinks() -> Traced {
     out.note_host_take();
     b.build().unwrap()
 }
-
 
 /// diffusion-baseline's denoise pass (`tests/inferlets/diffusion-baseline`),
 /// with `inferlet::eta::diffusion::{entropy_bound_accept, stable_and_confident}`
@@ -244,24 +272,40 @@ fn diffusion_step() -> Traced {
     let max_pages = 2u32;
     let bound = 0.5f32;
     let confidence = 0.1f32;
-    let toks: &'static Channel = leak(Channel::from((0..length).map(|i| (i * 7919 % 1000) as i32).collect::<Vec<_>>()).named("canvas"));
+    let toks: &'static Channel = leak(
+        Channel::from(
+            (0..length)
+                .map(|i| (i * 7919 % 1000) as i32)
+                .collect::<Vec<_>>(),
+        )
+        .named("canvas"),
+    );
     let embed_indptr: &'static Channel = leak(Channel::from([0u32, length]).named("embed_indptr"));
-    let positions: &'static Channel = leak(Channel::from((base..end).collect::<Vec<_>>()).named("positions"));
-    let pages: &'static Channel = leak(Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages"));
-    let page_indptr: &'static Channel = leak(Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr"));
-    let w_slot: &'static Channel = leak(Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot"));
-    let w_off: &'static Channel = leak(Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off"));
+    let positions: &'static Channel =
+        leak(Channel::from((base..end).collect::<Vec<_>>()).named("positions"));
+    let pages: &'static Channel =
+        leak(Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages"));
+    let page_indptr: &'static Channel =
+        leak(Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr"));
+    let w_slot: &'static Channel =
+        leak(Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot"));
+    let w_off: &'static Channel =
+        leak(Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off"));
     let kv_len: &'static Channel = leak(Channel::from([end]).named("kv_len"));
-    let readout: &'static Channel = leak(Channel::from((0..length).collect::<Vec<_>>()).named("readout"));
+    let readout: &'static Channel =
+        leak(Channel::from((0..length).collect::<Vec<_>>()).named("readout"));
     let temp: &'static Channel = leak(Channel::from([1.0f32]).named("temperature"));
     let rng_state: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
-    let history: &'static Channel = leak(Channel::from(vec![-1i32; length as usize]).named("argmax_history"));
+    let history: &'static Channel =
+        leak(Channel::from(vec![-1i32; length as usize]).named("argmax_history"));
     let canvas_out: &'static Channel = leak(Channel::new([length], dtype::i32).named("canvas_out"));
     let argmax_out: &'static Channel = leak(Channel::new([length], dtype::i32).named("argmax_out"));
     let stop: &'static Channel = leak(Channel::new([1], dtype::bool).named("stop"));
     let mean_out: &'static Channel = leak(Channel::new([1], dtype::f32).named("mean_entropy"));
-    let tap_ids_out: &'static Channel = leak(Channel::new([length, taps], dtype::u32).named("tap_ids"));
-    let tap_weights_out: &'static Channel = leak(Channel::new([length, taps], dtype::f32).named("tap_weights"));
+    let tap_ids_out: &'static Channel =
+        leak(Channel::new([length, taps], dtype::u32).named("tap_ids"));
+    let tap_weights_out: &'static Channel =
+        leak(Channel::new([length, taps], dtype::f32).named("tap_weights"));
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, embed_indptr);
@@ -320,7 +364,14 @@ fn diffusion_step() -> Traced {
         mean_out.put(reshape(div(reduce_sum(&h), length as f32), [1]));
         rng_state.put(add(&r_noise, iota(2)));
     });
-    for ch in [canvas_out, argmax_out, stop, mean_out, tap_ids_out, tap_weights_out] {
+    for ch in [
+        canvas_out,
+        argmax_out,
+        stop,
+        mean_out,
+        tap_ids_out,
+        tap_weights_out,
+    ] {
         ch.note_host_take();
     }
     b.build().unwrap()
@@ -339,21 +390,31 @@ fn beam_step() -> Traced {
     let tiled: Vec<u32> = (0..B * pool_pages).map(|_| pool_ids[0]).collect();
     let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
     let mask: &'static Channel = leak(Channel::from_shaped([B, pool_len], init_mask).named("mask"));
-    let scores: &'static Channel = leak(Channel::from(vec![0.0f32, f32::NEG_INFINITY]).named("scores"));
+    let scores: &'static Channel =
+        leak(Channel::from(vec![0.0f32, f32::NEG_INFINITY]).named("scores"));
     let toks: &'static Channel = leak(Channel::from(vec![1i32; B as usize]).named("toks"));
     let pos: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("pos"));
     let fill: &'static Channel = leak(Channel::from([1u32]).named("fill"));
     let klen: &'static Channel = leak(Channel::from(vec![1u32; B as usize]).named("klen"));
-    let w_slot: &'static Channel = leak(Channel::from(vec![pool_ids[0]; B as usize]).named("w_slot"));
+    let w_slot: &'static Channel =
+        leak(Channel::from(vec![pool_ids[0]; B as usize]).named("w_slot"));
     let w_off: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("w_off"));
     let pages: &'static Channel = leak(Channel::from(tiled).named("pages"));
-    let page_indptr: &'static Channel = leak(Channel::from_shaped([B + 1], (0..=B).collect::<Vec<_>>()).named("page_indptr"));
-    let lanes_b: &'static Channel = leak(Channel::from((0..=B).collect::<Vec<_>>()).named("embed_indptr"));
+    let page_indptr: &'static Channel =
+        leak(Channel::from_shaped([B + 1], (0..=B).collect::<Vec<_>>()).named("page_indptr"));
+    let lanes_b: &'static Channel =
+        leak(Channel::from((0..=B).collect::<Vec<_>>()).named("embed_indptr"));
     let pool_ids_ch: &'static Channel = leak(Channel::from(pool_ids).named("pool_ids"));
     let out: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8).named("out"));
-    let out_par: &'static Channel = leak(Channel::new([B], dtype::u32).capacity(8).named("out_par"));
-    let out_scr: &'static Channel = leak(Channel::new([B], dtype::f32).capacity(8).named("out_scr"));
-    let out_greedy: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8).named("out_greedy"));
+    let out_par: &'static Channel =
+        leak(Channel::new([B], dtype::u32).capacity(8).named("out_par"));
+    let out_scr: &'static Channel =
+        leak(Channel::new([B], dtype::f32).capacity(8).named("out_scr"));
+    let out_greedy: &'static Channel = leak(
+        Channel::new([B], dtype::i32)
+            .capacity(8)
+            .named("out_greedy"),
+    );
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::KvLen, klen);
     b.bind_port(Port::Pages, pages);
@@ -366,7 +427,10 @@ fn beam_step() -> Traced {
     b.bind_port(Port::EmbedIndptr, lanes_b);
     b.stage(Stage::Epilogue, move || {
         let logits = reshape(intrinsics::logits(), [B, v]);
-        let cand = add(broadcast(reshape(scores.take(), [B, 1]), [B, v]), log_softmax(&logits));
+        let cand = add(
+            broadcast(reshape(scores.take(), [B, 1]), [B, v]),
+            log_softmax(&logits),
+        );
         let (s, i) = top_k(reshape(cand, [B * v]), B);
         let parent = div(&i, v);
         let tok_i = cast(rem(&i, v), dtype::i32);
@@ -398,7 +462,13 @@ fn beam_step() -> Traced {
         scores.put(&s);
         toks.put(&tok_i);
         let page_count = filled.div_ceil(page_t);
-        let pages_ig = gather(&pids, rem(iota(B * pool_pages), broadcast(&page_count, [B * pool_pages])));
+        let pages_ig = gather(
+            &pids,
+            rem(
+                iota(B * pool_pages),
+                broadcast(&page_count, [B * pool_pages]),
+            ),
+        );
         pages.put(&pages_ig);
         page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
 
@@ -427,17 +497,23 @@ fn latent_step() -> Traced {
     let channels = 16u32;
     let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
     let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let readout: &'static Channel = leak(Channel::from((0..rows).collect::<Vec<_>>()).named("readout"));
+    let readout: &'static Channel =
+        leak(Channel::from((0..rows).collect::<Vec<_>>()).named("readout"));
     let kv_len: &'static Channel = leak(Channel::from([rows]).named("kv_len"));
-    let positions: &'static Channel = leak(Channel::from((0..rows).collect::<Vec<_>>()).named("positions"));
+    let positions: &'static Channel =
+        leak(Channel::from((0..rows).collect::<Vec<_>>()).named("positions"));
     let pages: &'static Channel = leak(Channel::from([0u32]).named("pages"));
-    let page_indptr: &'static Channel = leak(Channel::from([0u32, rows.div_ceil(PAGE)]).named("page_indptr"));
-    let w_slot: &'static Channel = leak(Channel::from((0..rows).map(|p| p / PAGE).collect::<Vec<_>>()).named("w_slot"));
-    let w_off: &'static Channel = leak(Channel::from((0..rows).map(|p| p % PAGE).collect::<Vec<_>>()).named("w_off"));
+    let page_indptr: &'static Channel =
+        leak(Channel::from([0u32, rows.div_ceil(PAGE)]).named("page_indptr"));
+    let w_slot: &'static Channel =
+        leak(Channel::from((0..rows).map(|p| p / PAGE).collect::<Vec<_>>()).named("w_slot"));
+    let w_off: &'static Channel =
+        leak(Channel::from((0..rows).map(|p| p % PAGE).collect::<Vec<_>>()).named("w_off"));
     let latent: &'static Channel = leak(Channel::new([rows, channels], dtype::f32).named("latent"));
     let dsigma: &'static Channel = leak(Channel::from([-0.25f32]).named("dsigma"));
     let rng_ch: &'static Channel = leak(Channel::from([9u32, 0]).named("rng"));
-    let out: &'static Channel = leak(Channel::new([rows, channels], dtype::f32).named("latent_out"));
+    let out: &'static Channel =
+        leak(Channel::new([rows, channels], dtype::f32).named("latent_out"));
     let norm_out: &'static Channel = leak(Channel::new([rows], dtype::f32).named("norms"));
     latent.put(vec![0.0f32; (rows * channels) as usize]);
     let mut b = Builder::new(VOCAB, PAGE);
@@ -493,6 +569,29 @@ fn latent_step() -> Traced {
     b.build().unwrap()
 }
 
+/// A VAE reading's epilogue in small (design D8): the one golden that
+/// carries `IntrinsicId::Pixels`, so the Python and JavaScript ports cannot
+/// drift on the new intrinsic's wire id unnoticed. A `vae.decode` pass binds
+/// no descriptor port and embeds no token; its answer is the pixels plane,
+/// which the guest remaps from the model's `[-1, 1]` to the `[0, 1]` a
+/// frames encoder wants and hands back on one channel.
+///
+/// The rows are DECLARED, not hinted: a VAE lane's token rows are not its
+/// clip's voxels, so `pixels(rows, width)` takes both.
+fn vae_readback() -> Traced {
+    let (rows, rgb) = (16u32, 3u32);
+    let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32).named("pixels_out"));
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.stage(Stage::Epilogue, move || {
+        let px = intrinsics::pixels(rows, rgb);
+        let shifted = add(&px, 1.0f32);
+        let unit = mul(&shifted, 0.5f32);
+        out.put(&unit);
+    });
+    out.note_host_take();
+    b.build().unwrap()
+}
+
 fn programs() -> Vec<(&'static str, Traced)> {
     vec![
         ("s3", s3()),
@@ -503,6 +602,7 @@ fn programs() -> Vec<(&'static str, Traced)> {
         ("diffusion_step", diffusion_step()),
         ("beam_step", beam_step()),
         ("latent_step", latent_step()),
+        ("vae_readback", vae_readback()),
     ]
 }
 
@@ -547,4 +647,28 @@ fn the_latent_step_binds_against_a_denoising_model() {
     };
     eta_ir::validate::bind(latent_step().container().clone(), profile)
         .expect("the latent step binds against a model that predicts a velocity");
+}
+
+/// The pixels golden is bindable too, and only against a model that lands
+/// them: a golden pinning bytes no model can run would pin a shape the
+/// engine never binds. `pixels_width` is `0` here on purpose — a VAE plants
+/// two widths (a decode's RGB beside an encode's 16-channel mean), which is
+/// what a real family's profile states.
+#[test]
+fn the_vae_readback_binds_against_a_model_that_lands_pixels() {
+    let profile = eta_ir::registry::ModelProfile {
+        vocab: VOCAB,
+        page_size: PAGE,
+        has_pixels: true,
+        pixels_width: 0,
+        ..eta_ir::registry::ModelProfile::dummy()
+    };
+    eta_ir::validate::bind(vae_readback().container().clone(), profile.clone())
+        .expect("the readback binds against a model whose VAE lands pixels");
+    let vaeless = eta_ir::registry::ModelProfile {
+        has_pixels: false,
+        ..profile
+    };
+    eta_ir::validate::bind(vae_readback().container().clone(), vaeless)
+        .expect_err("a model with no VAE refuses the readback at bind");
 }

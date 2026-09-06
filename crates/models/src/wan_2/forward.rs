@@ -201,6 +201,8 @@ impl Model {
                 // `use_dynamic_shifting: false`: the guest builds
                 // `linspace` through the static shift; nothing is pinned.
                 pinned_sigmas: vec![],
+                // One backbone, one schedule: every lane takes `shift`.
+                stream_shifts: vec![],
             }),
             // 1280×704 at 121 frames is 31 × 22 × 40 = 27 280 tokens plus
             // the 512-row context; the miniatures' reference grid is

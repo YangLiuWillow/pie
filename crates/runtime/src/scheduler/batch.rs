@@ -17,6 +17,8 @@ pub(crate) struct StepBuild {
     /// Media rows, rebased onto the step's lane numbering (each member's
     /// own lane index is offset by its base lane in the step).
     pub(crate) media: Vec<engine::fire::StepMedia>,
+    /// Voxel clips (design D8), rebased the same way.
+    pub(crate) voxels: Vec<engine::fire::StepVoxels>,
     /// Which bound instance each member belongs to.
     pub(crate) instance_ids: Vec<u64>,
     /// Whether each member's instance runs a pass at the fire's boundary —
@@ -163,6 +165,7 @@ pub(crate) fn build_batch_request(
         let mut member_lane_indptr = Vec::with_capacity(requests.len() + 1);
         member_lane_indptr.push(0);
         let mut media: Vec<engine::fire::StepMedia> = Vec::new();
+        let mut voxels: Vec<engine::fire::StepVoxels> = Vec::new();
         for req in requests {
             boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
@@ -177,10 +180,16 @@ pub(crate) fn build_batch_request(
                 row.lane = row.lane.saturating_add(base);
                 row
             }));
+            // A member with no VAE tile contributes no clip row.
+            voxels.extend(req.request.voxels.iter().cloned().map(|mut row| {
+                row.lane = row.lane.saturating_add(base);
+                row
+            }));
         }
         StepBuild {
             lanes,
             media,
+            voxels,
             instance_ids,
             boundary_programs,
             member_lane_indptr,
@@ -309,7 +318,7 @@ pub(crate) fn build_frame_submission(
                 lanes,
                 attachments,
                 media: build.media,
-                voxels: Vec::new(),
+                voxels: build.voxels,
             },
             terminal_cells: build.terminal_cells,
             instances,
@@ -345,7 +354,8 @@ mod tests {
 
     /// One decode lane: one token, one page, last-row readout.
     fn decode(token: u32, page: u32) -> FireRequest {
-        let mut request = FireRequest::one(crate::engine::fire::lane_of(0, vec![token], 0, vec![page]));
+        let mut request =
+            FireRequest::one(crate::engine::fire::lane_of(0, vec![token], 0, vec![page]));
         request.single_token_mode = true;
         request
     }
@@ -424,9 +434,10 @@ mod tests {
         let mut masked = decode(11, 3);
         masked.has_user_mask = true;
         masked.single_token_mode = false;
-        masked.lanes[0].mask = Some(::engine::Masking::Extent(
-            ::engine::Mask::new(vec![0, 1], 1),
-        ));
+        masked.lanes[0].mask = Some(::engine::Masking::Extent(::engine::Mask::new(
+            vec![0, 1],
+            1,
+        )));
 
         let requests = [pending(masked, 20), pending(decode(22, 4), 21)];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());

@@ -31,6 +31,9 @@
 //! | `text_encoder` | `te.` | the conditioning encoder |
 //! | `text_encoder_2` | `te2.` | a second encoder |
 //! | `vae` | `vae.` | the latent autoencoder |
+//! | `video_vae` | `vae.` | the same role under a pipeline that also
+//!   ships a second, non-latent codec (MiniMax H3 pairs a `video_vae/`
+//!   with an `audio_vae/`; the video one IS its latent autoencoder) |
 //! | `image_encoder` | `ie.` | a reference-image encoder |
 //! | `audio_vae` | `avae.` | an audio autoencoder |
 //! | `vocoder` | `voc.` | an audio decoder |
@@ -106,7 +109,7 @@ pub fn prefix_of(folder: &str) -> String {
         "transformer_2" => "dit2",
         "text_encoder" => "te",
         "text_encoder_2" => "te2",
-        "vae" => "vae",
+        "vae" | "video_vae" => "vae",
         "image_encoder" => "ie",
         "audio_vae" => "avae",
         "vocoder" => "voc",

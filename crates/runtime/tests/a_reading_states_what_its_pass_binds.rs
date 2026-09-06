@@ -2,7 +2,8 @@
 //! and `input` resolve against, so the runtime refuses at registration any
 //! statement it could not resolve by name: readings must sit at their own
 //! index, names and port names must be unique, a token-less reading must
-//! carry a latents port (its lane's row count), positions carry at most
+//! carry a ROW-SHAPED port (latents, context or voxels: its lane's row
+//! count), positions carry at most
 //! four axes, and one velocity width serves the whole eta profile — which
 //! `velocity_facts` reads off the first velocity reading.
 //!
@@ -40,28 +41,28 @@ fn denoise() -> ReadingFact {
                 kind: PortKind::Latents,
                 width: 64,
                 streams: Vec::new(),
-            at: None,
+                at: None,
             },
             PortFact {
                 name: "timestep",
                 kind: PortKind::LaneVector,
                 width: 1,
                 streams: Vec::new(),
-            at: None,
+                at: None,
             },
             PortFact {
                 name: "positions",
                 kind: PortKind::AxisPositions,
                 width: 3,
                 streams: Vec::new(),
-            at: None,
+                at: None,
             },
             PortFact {
                 name: "context",
                 kind: PortKind::Context,
                 width: 512,
                 streams: Vec::new(),
-            at: None,
+                at: None,
             },
         ],
         positions: Some(convention()),
@@ -113,7 +114,7 @@ fn a_reading_resolves_its_ports_by_name_to_kind_relative_indices() {
         kind: PortKind::LaneVector,
         width: 1,
         streams: Vec::new(),
-            at: None,
+        at: None,
     });
     let (index, _) = two.port("guidance").expect("declared");
     assert_eq!(index, 1, "the second lane vector is lane-vector port 1");
@@ -155,18 +156,37 @@ fn duplicate_names_are_refused() {
         kind: PortKind::Latents,
         width: 64,
         streams: Vec::new(),
-            at: None,
+        at: None,
     });
     let why = validate_generative(&family(vec![text(), twice])).unwrap_err();
     assert!(why.contains("`latents`") && why.contains("twice"), "{why}");
 }
 
 #[test]
-fn a_token_less_reading_must_carry_a_latents_port() {
+fn a_token_less_reading_must_carry_a_row_shaped_port() {
     let mut rowless = denoise();
-    rowless.ports.retain(|port| port.kind != PortKind::Latents);
+    rowless.ports.retain(|port| {
+        !matches!(
+            port.kind,
+            PortKind::Latents | PortKind::Context | PortKind::Voxels
+        )
+    });
     let why = validate_generative(&family(vec![text(), rowless])).unwrap_err();
-    assert!(why.contains("no latents or voxels port"), "{why}");
+    assert!(why.contains("no latents, context or voxels port"), "{why}");
+
+    // A CONTEXT port is row-shaped and states the lane's rows on its own
+    // (`host::forward::port_rows` takes it when it is the lane's only row
+    // port): MiniMax H3's `refine` reading binds the encoder's rows and
+    // nothing else, and that is a whole statement.
+    let mut context_only = denoise();
+    context_only
+        .ports
+        .retain(|port| port.kind == PortKind::Context);
+    // Its rope table went with the other ports, and so does its
+    // convention.
+    context_only.positions = None;
+    validate_generative(&family(vec![text(), context_only]))
+        .expect("a context port states its lane's rows");
 }
 
 #[test]

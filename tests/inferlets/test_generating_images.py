@@ -15,9 +15,10 @@ Three claims, in the order the guide teaches them:
   * `pie run text-to-image -o DIR -- --prompt "..."` runs the guest BY NAME.
     No `--path`, no `--manifest`: the name resolves against the
     `tests/inferlets` of the checkout the command runs in;
-  * the file that arrives is NAMED (`image.latent.f32`, not `file-0000.bin`),
-    and `scripts/imagegen/decode_latent.py` turns it into a PNG that is the
-    right size and is a picture rather than a flat field.
+  * the file that arrives is NAMED -- `image.png` where the row drives its own
+    `vae.decode` reading, `image.latent.f32` where it does not, never
+    `file-0000.bin` -- and it is a PNG of the size that was asked for, either
+    straight out of the run or through `scripts/imagegen/decode_latent.py`.
 
 **WHAT THE PICTURE CHECK DOES NOT PROVE.** It proves the file decodes, that it
 is the size that was asked for, and that the decode was not a flat field. It
@@ -341,6 +342,16 @@ def main() -> int:
         build_guest()
         print("🔄 a_bare_name_draws_a_named_file")
         report = a_bare_name_draws_a_named_file(args, out_dir)
+        if report.get("decoded"):
+            # The row drove its own `vae.decode` reading, so what arrived IS
+            # the picture (design D8/D11) and there is nothing left to decode.
+            png = out_dir / report["file"]
+            how = check_png(png, args.size, args.size)
+            print(f"✅ {png}  {png.stat().st_size:,} bytes  ({args.size}x{args.size}, "
+                  f"checked by {how}) -- decoded in-guest by reading "
+                  f"`{report['decode_reading']}`")
+            print("\n✅ every claim holds")
+            return 0
         if not args.model_dir:
             print("⚠️  no --model-dir: the latent is not decoded, so this run proved "
                   "the commands and not the picture")

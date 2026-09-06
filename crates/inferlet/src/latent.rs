@@ -82,6 +82,38 @@ impl FlowMatchEuler {
     /// The schedule `fact` describes, at `steps` steps. `rows` enables the
     /// dynamic shift (see [`dynamic_shift`]) for a flow model whose stated
     /// shift is its base `mu`; `None` uses the stated shift as-is.
+    /// The schedule ONE stream's lanes advance on, for a family that runs
+    /// several inside one evaluation (`schedule-fact.stream-shifts`:
+    /// MiniMax H3's video grid is built at shift 12 and its audio grid at
+    /// 3, and one step advances both). A stream the fact does not name
+    /// takes the family-wide `shift`, so this is
+    /// [`from_schedule`](FlowMatchEuler::from_schedule) for every other
+    /// family.
+    ///
+    /// # Errors
+    ///
+    /// The model's schedule is not a flow schedule.
+    pub fn for_stream(
+        fact: &ScheduleFact,
+        lane: crate::model::LaneStream,
+        steps: u32,
+        rows: Option<u32>,
+    ) -> Result<FlowMatchEuler, String> {
+        let mut fact = fact.clone();
+        if let Some(found) = fact
+            .stream_shifts
+            .iter()
+            .find(|shift| shift.lane == lane)
+            .map(|shift| shift.shift)
+        {
+            fact.shift = found;
+            // A pinned list is the family's own grid at the family-wide
+            // shift; a per-stream shift replaces the grid, not scales it.
+            fact.pinned_sigmas.clear();
+        }
+        FlowMatchEuler::from_schedule(&fact, steps, rows)
+    }
+
     pub fn from_schedule(
         fact: &ScheduleFact,
         steps: u32,
@@ -654,6 +686,7 @@ mod tests {
             train_steps: 1000,
             boundary: None,
             pinned_sigmas: Vec::new(),
+            stream_shifts: Vec::new(),
         };
         let sched = FlowMatchEuler::from_schedule(&fact, 4, None).unwrap();
         assert_eq!(sched.sigmas, vec![1.0, 0.75, 0.5, 0.25, 0.0]);
@@ -671,6 +704,7 @@ mod tests {
             train_steps: 1000,
             boundary: Some(0.875),
             pinned_sigmas: Vec::new(),
+            stream_shifts: Vec::new(),
         };
         let sched = FlowMatchEuler::from_schedule(&fact, 4, None).unwrap();
         assert!(sched.sigmas[1] > 0.75, "{:?}", sched.sigmas);
@@ -687,6 +721,7 @@ mod tests {
             train_steps: 1000,
             boundary: None,
             pinned_sigmas: vec![1.0, 0.5],
+            stream_shifts: Vec::new(),
         };
         let sched = FlowMatchEuler::from_schedule(&fact, 2, None).unwrap();
         assert_eq!(sched.sigmas, vec![1.0, 0.5, 0.0]);

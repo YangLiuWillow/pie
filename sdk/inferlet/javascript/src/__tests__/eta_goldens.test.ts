@@ -622,4 +622,23 @@ describe('sampler golden', () => {
     normOut.noteHostTake();
     check('latent_step', b.build());
   });
+
+  // `sdk_goldens.rs::vae_readback` - a VAE reading's epilogue (design D8):
+  // the one golden that carries `Intrinsic.PIXELS`, so a port that drifts on
+  // the new intrinsic's wire id fails here. The rows are declared, not
+  // hinted: a VAE lane's token rows are not its clip's voxels.
+  it('vae_readback matches the Rust golden', () => {
+    const rows = 16;
+    const rgb = 3;
+    const out = chNew([rows, rgb], dtype.f32, 'pixels_out');
+    const b = new Builder(VOCAB, PAGE);
+    b.stage(Stage.EPILOGUE, () => {
+      const px = intrinsics.pixels(rows, rgb);
+      const shifted = add(px, 1.0);
+      const unit = mul(shifted, 0.5);
+      out.putTensor(unit);
+    });
+    out.noteHostTake();
+    check('vae_readback', b.build());
+  });
 });

@@ -112,6 +112,8 @@ pub fn generative(tap: Option<&str>) -> Generative {
             // `mini_dit_ref.py`'s `euler_sigmas`, without its trailing zero
             // (the schedule appends that itself).
             pinned_sigmas: vec![1.0, 0.75, 0.5, 0.25],
+            // One backbone, one schedule: every lane takes `shift`.
+            stream_shifts: vec![],
         }),
         // A synthetic row: the reference's grid is 8 x 8 patch rows, and a
         // pass big enough for a 128 x 128 latent at patch 2 covers anything

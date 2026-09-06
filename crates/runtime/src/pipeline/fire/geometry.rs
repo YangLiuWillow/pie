@@ -607,6 +607,7 @@ impl ReqGeometry {
                     group: None,
                     reading: 0,
                     ports: Vec::new(),
+                    kv_less: false,
                 }
             })
             .collect()

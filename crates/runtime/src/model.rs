@@ -582,6 +582,36 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "flux_2",
     },
+    // MiniMax H3 (M5), the `FL2VA/` partition. `layers` is the encoder's
+    // depth the plan runs (its `hidden` tap is addressed by layer, at 49);
+    // `vocab` is Qwen3-VL-32B's embedding width, which the `text` reading
+    // embeds by — no reading of this family has logits.
+    Row {
+        id: "minimax-h3-fl2va-bf16-kv-bf16",
+        layers: 50,
+        vocab: 151_936,
+        arch: "minimax_h3",
+    },
+    Row {
+        id: "minimax-h3-fl2va-bf16-kv-bf16-tp2",
+        layers: 50,
+        vocab: 151_936,
+        arch: "minimax_h3",
+    },
+    Row {
+        id: "minimax-h3-fl2va-bf16-kv-bf16-tp4",
+        layers: 50,
+        vocab: 151_936,
+        arch: "minimax_h3",
+    },
+    // The miniature: no encoder, so no vocabulary; two DiT blocks and one
+    // token-refiner block.
+    Row {
+        id: "minimax-h3-mini-bf16-kv-bf16",
+        layers: 3,
+        vocab: 0,
+        arch: "minimax_h3",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
@@ -856,17 +886,25 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                 ));
             }
         }
+        // A `[rows, ·]` port states the lane's rows, and a CONTEXT port is
+        // one: `inferlet::host::forward::port_rows` takes a context lane's
+        // cell as its row count when it is the only row port the lane binds
+        // (MiniMax H3's `refine` reading binds the encoder's rows and
+        // nothing else). A lane vector or a positions table is not: the
+        // first is one row per lane, the second is sized BY the rows.
         if !reading.takes_tokens
             && !reading.ports.iter().any(|port| {
                 matches!(
                     port.kind,
-                    models::PortKind::Latents | models::PortKind::Voxels
+                    models::PortKind::Latents
+                        | models::PortKind::Voxels
+                        | models::PortKind::Context
                 )
             })
         {
             return Err(format!(
-                "reading `{}` embeds no tokens and declares no latents or voxels port; nothing \
-                 states its lane's row count",
+                "reading `{}` embeds no tokens and declares no latents, context or voxels port; \
+                 nothing states its lane's row count",
                 reading.name
             ));
         }
@@ -886,6 +924,23 @@ pub fn velocity_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
         .iter()
         .find(|reading| reading.readout == models::ReadoutKind::Velocity)
         .map_or((false, 0), |reading| (true, reading.readout_width))
+}
+
+/// The `pixels()` intrinsic's gate and width, read off the family's
+/// readings (design D8): available iff some reading reads back pixels, and
+/// as wide as that readout row when every such reading agrees — `0` when
+/// they do not (a VAE's decode lands RGB and its encode a 16-channel mean),
+/// which tells bind to check rank and rows alone. The engine fills its
+/// side of the same profile from the plan's `seam::PIXELS` plantings.
+pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
+    let mut widths = readings
+        .iter()
+        .filter(|reading| reading.readout == models::ReadoutKind::Pixels)
+        .map(|reading| reading.readout_width);
+    let Some(first) = widths.next() else {
+        return (false, 0);
+    };
+    (true, if widths.all(|width| width == first) { first } else { 0 })
 }
 
 /// Returns the single registered model. Panics if called before bootstrap

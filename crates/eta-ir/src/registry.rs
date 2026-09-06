@@ -343,6 +343,7 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
         | IntrinsicId::MtpLogits
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
+        | IntrinsicId::Pixels
         | IntrinsicId::ValueHead => &[Stage::Epilogue],
         IntrinsicId::MtpDrafts => &[Stage::Epilogue],
         // Epilogue only: the observability contract. The capture arm
@@ -364,6 +365,7 @@ pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
         IntrinsicId::ValueHead => profile.has_value_head,
         IntrinsicId::AttnScore => profile.has_attn_score,
         IntrinsicId::Velocity => profile.has_velocity,
+        IntrinsicId::Pixels => profile.has_pixels,
         IntrinsicId::Logits | IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => true,
     }
 }
@@ -442,6 +444,18 @@ pub struct ModelProfile {
     /// extent a `velocity()` declaration must match, as `vocab` is for
     /// `logits`. Meaningless when `has_velocity` is false.
     pub velocity_width: u32,
+    /// `[n_out, pixels_width]` F32 pixels ([`IntrinsicId::Pixels`], design
+    /// D8) available at the epilogue: a VAE reading's answer on the voxel
+    /// axis, one row per output voxel. A model with no VAE leaves it
+    /// `false` and every `pixels()` in a trace is refused at bind.
+    pub has_pixels: bool,
+    /// The channel count one pixels row carries when every pixels planting
+    /// of the model agrees on one (3 for an RGB decoder); `0` when the
+    /// model plants pixel seams of several widths (a VAE whose decode lands
+    /// RGB and whose encode lands a 16-channel mean), and the declaration
+    /// is then checked for rank and rows alone, as `hidden`'s is.
+    /// Meaningless when `has_pixels` is false.
+    pub pixels_width: u32,
     /// The backend honours a `lora` sink (A/B/sites config, low-rank
     /// delta at declared projection sites). Same contract as
     /// `has_attn_page_mask`: naming it type-checks everywhere, honouring
@@ -483,6 +497,8 @@ impl ModelProfile {
             has_attn_score: true,
             has_velocity: true,
             velocity_width: 8,
+            has_pixels: true,
+            pixels_width: 3,
             has_attn_page_mask: true,
             has_lora: true,
             kernels: Vec::new(),

@@ -154,9 +154,26 @@ pub(crate) fn validate_port_channel(
     }
 }
 
+/// The clip box a `Voxels` port's channel states (design D8): its shape IS
+/// the box, `[h, w, C]` for a still and `[t, h, w, C]` for a clip, so the
+/// geometry a channel cell cannot carry travels beside the feed as
+/// `StepVoxels::clips`. `None` for any other port kind, and for a shape
+/// `validate_port_channel` would have refused.
+pub(crate) fn port_clip(port: &models::PortFact, shape: &[u32]) -> Option<[u32; 3]> {
+    if port.kind != models::PortKind::Voxels {
+        return None;
+    }
+    match *shape {
+        [h, w, width] if width == port.width && h > 0 && w > 0 => Some([1, h, w]),
+        [t, h, w, width] if width == port.width && t > 0 && h > 0 && w > 0 => Some([t, h, w]),
+        _ => None,
+    }
+}
+
 /// The rows a pass's `[rows, ·]` ports agree on, or the first pair that
 /// disagree. Context ports are a context lane's own rows and need not
-/// match the latents'.
+/// match the latents'. A voxel port states none: its channel's rows are its
+/// clip's VOXELS, which are not the lane's token rows (design D8).
 pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
     let mut rows: Option<(u32, &str)> = None;
     // Latents and positions state the lane's rows; a context port does too
@@ -165,6 +182,9 @@ pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
     let mut context_rows: Option<u32> = None;
     for port in ports {
         let Some(these) = port.rows else { continue };
+        if port.kind == ::engine::fire::PortKind::Voxels {
+            continue;
+        }
         if port.kind == ::engine::fire::PortKind::Context {
             context_rows = context_rows.or(Some(these));
             continue;
@@ -315,7 +335,7 @@ fn validate_bindings(
 }
 
 #[derive(Clone, Copy)]
-enum ChannelReadMode {
+pub(crate) enum ChannelReadMode {
     Take,
     Read,
 }
@@ -442,7 +462,7 @@ async fn materialize_channel(
 /// call, nothing else in the instance runs, and every await below is on
 /// engine-side progress (fire settlement, the reader wait slot) that never
 /// needs the store to advance.
-async fn materialize_channel_blocking(
+pub(crate) async fn materialize_channel_blocking(
     ctx: &mut ProcessCtx,
     this: Resource<Channel>,
     mode: ChannelReadMode,
@@ -918,6 +938,7 @@ impl ProcessCtx {
             channel_rep: channel.rep(),
             channel_id: global_id,
             rows,
+            clip: port_clip(fact, &shape),
         };
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.bindings.ports.iter().any(|bound| bound.name == port) {
@@ -1396,6 +1417,7 @@ impl ProcessCtx {
                             return Ok(Err(format!("reading `{}`: {error}", reading.name)));
                         }
                     }
+                    binding.clip = port_clip(fact, shape);
                     if fact.kind == models::PortKind::Latents
                         && let Some(rows) = binding.rows
                         && let Some(generative) = crate::model::model().generative()
@@ -1414,12 +1436,24 @@ impl ProcessCtx {
                     return Ok(Err(error));
                 }
             }
-            // A float lane's rows are its latents port's.
+            // The clips a VAE reading's `Voxels` ports state (design D8), in
+            // binding order: a channel cell carries no grid, so the box its
+            // shape declares travels beside the feed.
+            let clips: Vec<[u32; 3]> = port_bindings
+                .iter()
+                .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
+                .filter_map(|binding| binding.clip)
+                .collect();
+            // A float lane's rows are its latents port's. A VAE reading binds
+            // no `[rows, ·]` port at all — its rows are its clips' voxels, on
+            // the third axis — and takes ONE dummy token row so that its lane
+            // exists in the fire's composition.
             let float_rows = if wants_tokens {
                 None
             } else {
                 match port_rows(&port_bindings) {
                     Ok(Some(rows)) => Some(rows),
+                    Ok(None) if !clips.is_empty() => Some(1),
                     Ok(None) => {
                         return Ok(Err(format!(
                             "reading `{}` embeds no tokens and this pass bound no `[rows, ·]` \
@@ -1986,7 +2020,17 @@ impl ProcessCtx {
                 decode_envelope,
                 host_shadow,
                 lane: lane_facts,
-                float: float_rows.map(|rows| FloatLane { rows }),
+                float: float_rows.map(|rows| FloatLane {
+                    rows,
+                    // The boxes this lane's `Voxels` ports declared (D8), in
+                    // binding order — a channel cell carries no grid, so the
+                    // geometry travels beside the feed.
+                    clips: port_bindings
+                        .iter()
+                        .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
+                        .filter_map(|binding| binding.clip)
+                        .collect(),
+                }),
                 closed: false,
             };
             if let Err(error) = self.ctx().table.get_mut(&this)?.attach_bound(bound) {
@@ -2596,6 +2640,7 @@ mod tests {
             channel_rep: 1,
             channel_id: 1,
             rows,
+            clip: None,
         }
     }
 

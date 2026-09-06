@@ -249,8 +249,14 @@ pub fn split_rows(
     let (entrypoint, launch) = if vectors {
         (
             "::pie::layout::split_rows_vec8<::pie::bf16>".to_string(),
+            // Rows on `grid.x`, column tiles on `grid.y`. `gridDim.y` is
+            // capped at 65535 on every compute capability; rows are not
+            // bounded by anything but the fire (a 65536-token ceiling, a
+            // VAE's voxel rectangle), so they take the wide axis. The seat
+            // semantics are unchanged: the kernel still retires a replay's
+            // padded rows off `win[0]` and shifts by `win[1]`.
             Launch::grid(
-                [(x.width / VEC_WIDTH).div_ceil(BLOCK), left.rows, 1],
+                [left.rows, (x.width / VEC_WIDTH).div_ceil(BLOCK), 1],
                 [BLOCK, 1, 1],
             ),
         )

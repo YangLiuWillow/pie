@@ -133,14 +133,21 @@ def md5(path: str) -> str:
 
 
 def manifest(d: str, extra: dict | None = None) -> str:
-    import diffusers, transformers
+    # A golden built from a VENDORED reference (scripts/imagegen/vendor/)
+    # needs neither library; record what is installed, not what is missing.
+    def version(name: str) -> str | None:
+        try:
+            return __import__(name).__version__
+        except Exception:
+            return None
+
     rows = []
     for name in sorted(os.listdir(d)):
         p = os.path.join(d, name)
         if os.path.isfile(p) and name != "MANIFEST.json":
             rows.append({"file": name, "bytes": os.path.getsize(p), "md5": md5(p)})
-    m = {"dir": d, "torch": torch.__version__, "diffusers": diffusers.__version__,
-         "transformers": transformers.__version__, "files": rows}
+    m = {"dir": d, "torch": torch.__version__, "diffusers": version("diffusers"),
+         "transformers": version("transformers"), "files": rows}
     if extra:
         m.update(extra)
     path = os.path.join(d, "MANIFEST.json")
