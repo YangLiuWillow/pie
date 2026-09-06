@@ -4720,22 +4720,37 @@ impl Shell {
         let taps = self.self_cond_taps as usize;
         let mut self_cond_rows = vec![0i32; rows as usize * taps];
         let mut self_cond_weights = vec![0f32; rows as usize * taps];
+        let mut self_cond_feeds: Vec<(u64, u64, u64, u64)> = Vec::new();
         if taps > 0 {
             for row in composition.lanes() {
                 let Some(sc) = lanes[row.source as usize].self_cond else {
                     continue;
                 };
-                if sc.channels.is_some() {
-                    return Err(Fault::Program {
-                        at: "serve::prepare",
-                        why: format!(
-                            "lane {} reads its self-conditioning taps off channels, which this \
-                             shell cannot advance on the device",
-                            row.source
-                        ),
-                    });
-                }
                 let cells = row.rows as usize * taps;
+                if let Some((rows_channel, weights_channel)) = sc.channels {
+                    // Fed off the lane's own channels: zeros are staged here
+                    // and the committed cells are blitted over them once the
+                    // command buffer opens, ordered behind the fire that
+                    // wrote them. The rings advance on the host on this
+                    // plane, so the cell read is the one the last take
+                    // committed — the step the guest waited for.
+                    if sc.taps as usize != taps {
+                        return Err(Fault::Program {
+                            at: "serve::prepare",
+                            why: format!(
+                                "lane {} states {} taps and this plan reads {taps}",
+                                row.source, sc.taps
+                            ),
+                        });
+                    }
+                    self_cond_feeds.push((
+                        u64::from(row.row_offset) * taps as u64 * 4,
+                        cells as u64 * 4,
+                        rows_channel,
+                        weights_channel,
+                    ));
+                    continue;
+                }
                 if sc.taps as usize != taps || sc.rows.len() != cells || sc.weight_bits.len() != cells {
                     return Err(Fault::Program {
                         at: "serve::prepare",
@@ -4943,6 +4958,7 @@ impl Shell {
 
         Ok(Prepared {
             lanes,
+            self_cond_feeds,
             attachments,
             done,
             arm,
@@ -4974,6 +4990,45 @@ impl Shell {
     ///
     /// [`Fault::Fire`] for a dispatch this plane refuses, [`Fault::Device`]
     /// for a pass the command buffer would not open.
+    /// **THE CHANNEL-FED TAPS, INTO THE SEAT**: one blit per lane and plane
+    /// from the ring's committed cell into this fire's arm, at the head of
+    /// the command buffer so the forward reads them. Refused when a channel
+    /// is not a ring this plane registered or its cell is narrower than the
+    /// lane's rows.
+    fn feed_self_cond(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.self_cond_feeds.is_empty() {
+            return Ok(());
+        }
+        let (store, at_ids, at_ws) = self.inputs[p.arm].self_cond_seat().ok_or_else(|| Fault::Program {
+            at: "serve::feed_self_cond",
+            why: "a lane feeds self-conditioning taps and this plan reserved no seat".to_string(),
+        })?;
+        for &(first, bytes, rows_channel, weights_channel) in &p.self_cond_feeds {
+            for (channel, at) in [(rows_channel, at_ids), (weights_channel, at_ws)] {
+                let ring = self.programs.channel(channel).ok_or_else(|| Fault::Program {
+                    at: "serve::feed_self_cond",
+                    why: format!("channel {channel} is not a ring this plane registered"),
+                })?;
+                if (ring.cell_bytes() as u64) < bytes {
+                    return Err(Fault::Program {
+                        at: "serve::feed_self_cond",
+                        why: format!(
+                            "channel {channel} holds {} bytes a cell and the lane's taps take {bytes}",
+                            ring.cell_bytes()
+                        ),
+                    });
+                }
+                let slab = ring.slab();
+                let committed = ring.cell_offset(ring.cursor().head);
+                frame.copy(slab.slab(), committed, store.slab(), at + first, bytes)?;
+            }
+        }
+        // The copies ran in a blit pass; the forward wants its compute pass
+        // back open, ordered behind them.
+        frame.next_pass()?;
+        Ok(())
+    }
+
     fn walk_once(&self, p: &Prepared<'_>, mode: Mode) -> Result<Walked> {
         // The one piece of state between the two halves of the walk: the
         // sink writes which region is running and which run of its window,
@@ -4985,10 +5040,13 @@ impl Shell {
         // touch no compute pass, and a frame opened and dropped without a
         // commit is an encoder Metal expects to be ended — so the modes differ
         // here, in the one place they can, and nowhere above it.
-        let frame = match mode {
+        let mut frame = match mode {
             Mode::Encode => Some(self.device.frame()?),
             Mode::Record | Mode::Build { .. } | Mode::Replay => None,
         };
+        if let Some(frame) = frame.as_mut() {
+            self.feed_self_cond(frame, p)?;
+        }
         let sink = match mode {
             Mode::Encode => Encoded::Live(Sink::new(
                 &self.device,
@@ -5136,9 +5194,11 @@ impl Shell {
         }
 
         let place = At::new();
+        let mut frame = self.device.frame()?;
+        self.feed_self_cond(&mut frame, p)?;
         let sink = Encoded::Live(Sink::streaming(
             &self.device,
-            self.device.frame()?,
+            frame,
             &self.pipelines,
             &self.handles,
             crate::encode::Cuts::new(
@@ -5458,6 +5518,11 @@ pub struct StepView<'a> {
 /// structural possibility rather than a discipline somebody maintains.
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
+    /// Lanes whose self-conditioning taps live on two of their channels:
+    /// `(first byte of the lane's rows in the seat, bytes, ids channel,
+    /// weights channel)`. Blitted from each ring's committed cell into the
+    /// seat at the head of the fire's command buffer (`feed_self_cond`).
+    self_cond_feeds: Vec<(u64, u64, u64, u64)>,
     /// The attachments this step's gate admitted, epilogues and all. Held
     /// rather than re-derived because `enqueue` binds each one's intrinsic at
     /// a rectangle only the composition knows, and the gate that checked them

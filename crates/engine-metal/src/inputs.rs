@@ -374,6 +374,15 @@ impl Inputs {
         })
     }
 
+    /// The self-conditioning seat: the store and the byte offsets of its
+    /// `[rows, taps]` ids and weights regions, or `None` for a plan that
+    /// reads none. A fire blits channel-fed taps into it device-side.
+    #[must_use]
+    pub fn self_cond_seat(&self) -> Option<(&Buffer, u64, u64)> {
+        self.self_cond
+            .map(|(at_ids, at_ws, _)| (&self.store, at_ids, at_ws))
+    }
+
     /// The patch element this load computes in, or `None` for a plan that
     /// states no patch row.
     #[must_use]
