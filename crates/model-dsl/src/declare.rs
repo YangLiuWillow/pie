@@ -1,7 +1,10 @@
 //! Weight declarations without generics: `Dtype` is a plain field, so there
 //! is one `Weight` struct and no monomorphized model trees.
 
-use model_ir::{BIASES, Dtype, Param, ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP};
+use model_ir::{
+    BIASES, Dtype, Param, ParamLayout, ParamSource, Platform, SCALES, Shard, TILED_BAND,
+    TILED_STEP,
+};
 
 /// One logical weight: name, logical shape, on-device representation, how it
 /// is laid out across ranks, and where its bytes come from. The recorder
@@ -16,6 +19,9 @@ pub struct Weight {
     /// The checkpoint's, unless [`registered`](Weight::registered) says
     /// otherwise.
     pub source: ParamSource,
+    /// The on-device element order; [`ParamLayout::Natural`] unless
+    /// [`conv_taps_major`](Weight::conv_taps_major) says otherwise.
+    pub layout: ParamLayout,
 }
 
 impl Weight {
@@ -31,7 +37,27 @@ impl Weight {
             dtype,
             shard: Shard::Replicated,
             source: ParamSource::Checkpoint,
+            layout: ParamLayout::Natural,
         }
+    }
+
+    /// A convolution weight, declared as the checkpoint stores it —
+    /// `[C_out, C_in·kt·kh·kw]` (`weight.reshape(C_out, -1)`) — and served
+    /// in the tap-major channel-fastest order `spatial.conv3d` reads. The
+    /// shell relabels the landed rectangle once at load
+    /// (`ParamLayout::ConvTapsMajor`); the shape does not change.
+    /// `ops::spatial::conv3d` requires it and refuses a natural weight.
+    #[must_use]
+    pub fn conv_taps_major(mut self, c_in: u32, taps: u32) -> Weight {
+        assert!(
+            self.shape.len() == 2 && self.shape[1] == u64::from(c_in) * u64::from(taps),
+            "`{}` is {:?}; a conv weight is `[C_out, C_in*taps]` = [.., {}]",
+            self.name,
+            self.shape,
+            u64::from(c_in) * u64::from(taps)
+        );
+        self.layout = ParamLayout::ConvTapsMajor { c_in, taps };
+        self
     }
 
     /// An adapter bank: the checkpoint does not publish this plane. It is
@@ -373,6 +399,7 @@ impl Weight {
             dtype: p.dtype,
             shard,
             source: p.source,
+            layout: p.layout,
         }
     }
 }

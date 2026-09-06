@@ -20,7 +20,8 @@ pub use dtype::Dtype;
 pub use dtype::{BIASES, SCALES, TILED_BAND, TILED_STEP};
 
 /// The shape algebra's symbolic dims, sized by runtime budgets (`Tokens` →
-/// max_tokens, `Lanes` → max_lanes, `Patches` → max_patches) when the arena
+/// max_tokens, `Lanes` → max_lanes, `Patches` → max_patches, `Voxels` →
+/// max_voxels) when the arena
 /// is cut. Which axis a value lives on is read off its type
 /// ([`Dim::axis`]) rather than declared beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -46,6 +47,23 @@ pub enum Dim {
     Images,
     /// Indptr-shaped on the patch axis: `images + 1`.
     ImagesPlus(u32),
+    /// This fire's voxel count at the voxel port — the rows of the third
+    /// row axis, one row per voxel `(t, h, w)` of every clip every lane
+    /// submitted, `w` fastest, clips contiguous in fire order. A VAE's
+    /// activations live here (`[Voxels, channels]`); the per-clip box is
+    /// the `[Clips, 4]` grid table ([`RuntimeInput::Grid`]).
+    Voxels,
+    /// `voxels * k`: a rectangle an upsample, a pixel shuffle or an
+    /// unpatchify grew by a fixed factor from the port's count. An op that
+    /// shrinks rows (a strided conv, an unshuffle) keeps its input's dim and
+    /// over-allocates; the grid table says which rows are live.
+    VoxelsTimes(u32),
+    /// The voxel axis's own lane space: how many clips (images or videos)
+    /// this fire carries. `Clips` is to [`Voxels`](Dim::Voxels) what
+    /// `Images` is to `Patches`.
+    Clips,
+    /// Indptr-shaped on the voxel axis: `clips + k`.
+    ClipsPlus(u32),
 }
 
 /// Which row space a symbolic dim sizes — the discriminator every per-axis
@@ -57,6 +75,9 @@ pub enum RowAxis {
     Tokens,
     /// The patch rectangle: `Patches`, `Images`, `ImagesPlus(k)`.
     Patches,
+    /// The voxel rectangle: `Voxels`, `VoxelsTimes(k)`, `Clips`,
+    /// `ClipsPlus(k)` — the VAE's row space (design D8).
+    Voxels,
 }
 
 impl RowAxis {
@@ -68,7 +89,7 @@ impl RowAxis {
     /// per row space iterates, and what [`PerAxis`] is laid out along.
     /// `ALL[axis as usize] == axis`, so a `PerAxis` entry is reachable by
     /// the same integer the variant is.
-    pub const ALL: [RowAxis; 2] = [RowAxis::Tokens, RowAxis::Patches];
+    pub const ALL: [RowAxis; 3] = [RowAxis::Tokens, RowAxis::Patches, RowAxis::Voxels];
 
     /// How many row spaces there are — [`ALL`](RowAxis::ALL)'s length, and
     /// the width of every [`PerAxis`].
@@ -80,6 +101,7 @@ impl RowAxis {
         match self {
             RowAxis::Tokens => "tokens",
             RowAxis::Patches => "patches",
+            RowAxis::Voxels => "voxels",
         }
     }
 }
@@ -165,6 +187,9 @@ impl Dim {
                 Some(RowAxis::Tokens)
             }
             Dim::Patches | Dim::Images | Dim::ImagesPlus(_) => Some(RowAxis::Patches),
+            Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_) => {
+                Some(RowAxis::Voxels)
+            }
         }
     }
 }
@@ -386,6 +411,29 @@ pub enum RuntimeInput {
     /// position stream beside `Positions` (`[Tokens]` i32) and
     /// `MropePositions` (`[Tokens, 3]` i32), which keep their names.
     AxisPositions { port: u8, axes: u8 },
+    /// The voxel axis's lane table: `[Dim::Clips, 4]` `i32`, one row per
+    /// clip in fire order, `{t, h, w, row_offset}` — the clip's box at the
+    /// voxel PORT's resolution and the first row of its voxels in the
+    /// `[Dim::Voxels, ·]` rectangle (clips contiguous, offsets a prefix sum
+    /// of `t·h·w`). What every `spatial.*` kernel reads to find a row's
+    /// lane and `(t, h, w)`; derived grids of later resolutions are
+    /// computed on the device by `spatial.grid`. The host builds it from
+    /// the clips each lane submitted.
+    Grid,
+    /// A float port on the voxel axis: `[Dim::Voxels, channels]`, `f32` or
+    /// `bf16` as the reader states — a VAE's input tile (latents to decode,
+    /// pixels to encode), one row per voxel of [`Grid`](RuntimeInput::Grid).
+    /// `port` as for [`Latents`](RuntimeInput::Latents).
+    Voxels { port: u8, channels: u32 },
+    /// The clip table at TOKEN resolution: `[Dim::Clips, 4]` `i32`, one
+    /// row per clip in fire order, `{t/pt, h/ph, w/pw, token_row_offset}`
+    /// for the patch `p` the reader states — the token side of
+    /// `spatial.patchify` / `spatial.unpatchify`. A clip's tokens are its
+    /// lane's token rows, clips of one lane consecutive in clip order, so
+    /// the offset is the lane's first token row plus the earlier clips'
+    /// token counts; the host checks that a lane's token count is the sum
+    /// of its clips' and refuses a clip whose box does not divide by `p`.
+    TokenGrid { p: [u32; 3] },
 }
 
 /// Raggedness is not a `Ty` — a leading symbolic `Dim` means the value is
@@ -452,7 +500,7 @@ mod tests {
     /// on the entry its row space owns.
     #[test]
     fn a_per_axis_reads_back_what_each_axis_was_filled_with() {
-        let mut table = PerAxis::new(["tokens", "patches"]);
+        let mut table = PerAxis::new(["tokens", "patches", "voxels"]);
         assert_eq!(table[RowAxis::Tokens], "tokens");
         assert_eq!(table[RowAxis::Patches], "patches");
         assert_eq!(table.as_slice().len(), RowAxis::COUNT);
@@ -471,9 +519,10 @@ mod tests {
         let named = PerAxis::from_fn(RowAxis::name);
         assert_eq!(named[RowAxis::Tokens], "tokens");
         assert_eq!(named[RowAxis::Patches], "patches");
+        assert_eq!(named[RowAxis::Voxels], "voxels");
 
         // What a cut indexes with: every symbolic dim's own axis.
-        let cut = PerAxis::new([10u32, 20]);
+        let cut = PerAxis::new([10u32, 20, 30]);
         for (dim, want) in [
             (Dim::Tokens, 10),
             (Dim::TokensTimes(2), 10),
@@ -482,6 +531,10 @@ mod tests {
             (Dim::Patches, 20),
             (Dim::Images, 20),
             (Dim::ImagesPlus(1), 20),
+            (Dim::Voxels, 30),
+            (Dim::VoxelsTimes(8), 30),
+            (Dim::Clips, 30),
+            (Dim::ClipsPlus(1), 30),
         ] {
             assert_eq!(cut[dim.axis().expect("a symbolic dim names a row space")], want);
         }

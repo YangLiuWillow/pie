@@ -41,6 +41,7 @@ pub use compose::{
     compose_axes, rung_of, chunk_spans, pass_spans};
 pub use descriptor::{
     ABI_VERSION, CLASS_BYTES, FireDescriptor, HEADER_BYTES, LANE_BYTES, MAGIC, PATCH_LANE_BYTES,
+    VOXEL_LANE_BYTES,
 };
 pub use fallback::{Serve, answers as fallback_answers, fragmentable, max_runs};
 pub use sink::{EagerSink, EventId, Sink};
@@ -204,6 +205,55 @@ pub enum Fault {
         /// The lane's index in the submitted slice.
         lane: u32,
     },
+    /// The same, on the voxel axis.
+    DescriptorVoxelRows {
+        /// What the voxel windows add up to.
+        counted: u64,
+        /// What the header claims.
+        header: u32,
+    },
+    /// More port voxels than the artifact was baked for — the voxel axis's
+    /// [`TooManyRows`](Fault::TooManyRows), on `VoxelLadder::max_voxels`.
+    TooManyVoxels {
+        /// The voxel rows the submitted clips add up to.
+        voxels: u64,
+        /// `VoxelLadder::max_voxels`.
+        max: u32,
+    },
+    /// More clips than the artifact was baked for.
+    TooManyClips {
+        /// How many clips were submitted, over every lane.
+        clips: u64,
+        /// `VoxelLadder::max_clips`.
+        max: u32,
+    },
+    /// The fire's voxel rows are above every rung of the voxel lattice.
+    NoVoxelBucket {
+        /// The voxel rows this fire carries.
+        voxels: u32,
+        /// The largest rung the voxel ladder lists.
+        top: u32,
+    },
+    /// A lane submitted clips to an artifact that declares no voxel axis.
+    Vaeless {
+        /// The lane's index in the submitted slice.
+        lane: u32,
+    },
+    /// A lane with clips against a deployment that stated no voxel ladder.
+    NoVoxelLadder {
+        /// The lane's index in the submitted slice.
+        lane: u32,
+    },
+    /// A lane whose clip count and voxel payload disagree: a clip is at
+    /// least one voxel, so neither count can be zero while the other is not.
+    ClipGeometry {
+        /// The lane's index in the submitted slice.
+        lane: u32,
+        /// The clips it declared.
+        clips: u32,
+        /// The voxel rows it declared.
+        voxels: u32,
+    },
     /// A windowed region fragmented past what the bake promised or bounded.
     Fragmented {
         /// The region, as the template numbers it.
@@ -340,6 +390,42 @@ impl fmt::Display for Fault {
             Self::NoPatchLadder { lane } => write!(
                 f,
                 "lane {lane} submitted images and this deployment stated no patch ladder"
+            ),
+            Self::DescriptorVoxelRows { counted, header } => write!(
+                f,
+                "this fire descriptor's voxel windows add up to {counted} voxel rows \
+                 and its header claims {header}"
+            ),
+            Self::TooManyVoxels { voxels, max } => write!(
+                f,
+                "this fire carries {voxels} voxel rows and every VAE column was cut at {max}"
+            ),
+            Self::TooManyClips { clips, max } => write!(
+                f,
+                "this fire assembles {clips} clips and the artifact was baked for {max}"
+            ),
+            Self::NoVoxelBucket { voxels, top } => write!(
+                f,
+                "this fire carries {voxels} voxel rows and the largest voxel rung is \
+                 {top} — there is no VAE exec to launch it in"
+            ),
+            Self::Vaeless { lane } => write!(
+                f,
+                "lane {lane} submitted clips and this artifact declares no voxel axis — \
+                 there is no VAE in it for them to go through"
+            ),
+            Self::NoVoxelLadder { lane } => write!(
+                f,
+                "lane {lane} submitted clips and this deployment stated no voxel ladder"
+            ),
+            Self::ClipGeometry {
+                lane,
+                clips,
+                voxels,
+            } => write!(
+                f,
+                "lane {lane} declares {clips} clips and {voxels} voxel rows, and a clip \
+                 is at least one voxel — its geometry and its payload disagree"
             ),
             Self::Fragmented {
                 region,

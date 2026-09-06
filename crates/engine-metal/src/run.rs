@@ -487,6 +487,10 @@ impl<'c> Run<'c> {
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
+            // M0: the voxel axis (D8) is CUDA-only; this shell seats no voxel rectangle.
+            Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
+                panic!("value {} lives on the voxel axis, which this shell does not seat", id.0)
+            }
         };
         self.slice(handle, skip, keep)
     }
@@ -651,7 +655,10 @@ impl<'c> Run<'c> {
                 | RuntimeInput::Latents { .. }
                 | RuntimeInput::LaneVector { .. }
                 | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }),
+                | RuntimeInput::AxisPositions { .. }
+                | RuntimeInput::Grid
+                | RuntimeInput::Voxels { .. }
+                | RuntimeInput::TokenGrid { .. }),
             ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;

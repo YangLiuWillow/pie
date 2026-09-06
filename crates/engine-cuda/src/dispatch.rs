@@ -8,3 +8,4 @@ mod custom;
 mod elemwise;
 mod layout;
 mod linear;
+mod spatial;

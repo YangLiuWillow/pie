@@ -21,6 +21,7 @@ pub mod custom;
 pub mod elemwise;
 pub mod layout;
 pub mod linear;
+pub mod spatial;
 
 /// A two-axis tensor type: the whole surviving shape algebra is `[rows, width]`.
 fn tensor(rows: Dim, width: impl Into<u64>, dtype: Dtype) -> Ty {

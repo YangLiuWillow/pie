@@ -4,7 +4,7 @@
 //! range. Runs on the host in front of every launch, so it must stay
 //! allocation-light.
 
-use model_compiler::{Budget, Budgets, ClassOrder, CompiledModel, PatchLadder};
+use model_compiler::{Budget, Budgets, ClassOrder, CompiledModel, Ladder};
 use model_ir::{ClassSet, PerAxis, RowAxis};
 
 use crate::fire::Fault;
@@ -23,6 +23,11 @@ pub struct Lane {
     pub images: u32,
     /// How many patch rows those images total, concatenated.
     pub patches: u32,
+    /// How many clips this lane submitted on the voxel axis. Zero for
+    /// every lane with no VAE tile.
+    pub clips: u32,
+    /// How many port voxel rows those clips total (`Σ t·h·w`).
+    pub voxels: u32,
 }
 
 impl Lane {
@@ -34,6 +39,22 @@ impl Lane {
             rows,
             images: 0,
             patches: 0,
+            clips: 0,
+            voxels: 0,
+        }
+    }
+
+    /// The same lane, carrying `clips` clips of `voxels` port voxel rows
+    /// total on the third axis.
+    #[must_use]
+    pub fn with_clips(word: u64, rows: u32, clips: u32, voxels: u32) -> Lane {
+        Lane {
+            word,
+            rows,
+            images: 0,
+            patches: 0,
+            clips,
+            voxels,
         }
     }
 
@@ -45,6 +66,8 @@ impl Lane {
             rows,
             images,
             patches,
+            clips: 0,
+            voxels: 0,
         }
     }
 
@@ -55,6 +78,7 @@ impl Lane {
         match axis {
             RowAxis::Tokens => (self.rows, 1),
             RowAxis::Patches => (self.patches, self.images),
+            RowAxis::Voxels => (self.voxels, self.clips),
         }
     }
 }
@@ -288,6 +312,14 @@ pub struct LaneRow {
     pub image_offset: u32,
     /// How many images it contributes.
     pub images: u32,
+    /// Its first voxel row in the third seriation.
+    pub voxel_offset: u32,
+    /// How many port voxel rows it contributes.
+    pub voxels: u32,
+    /// Its first clip in the voxel seriation.
+    pub clip_offset: u32,
+    /// How many clips it contributes.
+    pub clips: u32,
 }
 
 /// One fire's composition: which windows have rows, where, and in what
@@ -391,6 +423,30 @@ impl Composition {
         self.axes[RowAxis::Patches].bucket
     }
 
+    /// How many port voxel rows this fire carries. Zero for a fire with no clip.
+    #[must_use]
+    pub fn voxel_rows(&self) -> u32 {
+        self.axes[RowAxis::Voxels].rows
+    }
+
+    /// How many clips this fire carries — the voxel axis's lane count.
+    #[must_use]
+    pub fn clips(&self) -> u32 {
+        self.axes[RowAxis::Voxels].lanes
+    }
+
+    /// The voxel window table, indexed by class.
+    #[must_use]
+    pub fn voxel_classes(&self) -> &WindowTable {
+        self.table(RowAxis::Voxels)
+    }
+
+    /// The voxel rung these voxel rows round up to.
+    #[must_use]
+    pub fn voxel_bucket(&self) -> u32 {
+        self.axes[RowAxis::Voxels].bucket
+    }
+
 }
 
 /// Compose one fire on the token axis — the door every text-only deployment
@@ -402,7 +458,7 @@ impl Composition {
 /// [`Fault::TooManyRows`] past the arena's ceilings, [`Fault::NoBucket`]
 /// above the bucket lattice, or [`Fault::Towerless`] for images (this door admits none).
 pub fn compose(compiled: &CompiledModel, budget: &Budget, lanes: &[Lane]) -> Result<Composition> {
-    seriate(compiled, budget, None, lanes)
+    seriate(compiled, budget, None, None, lanes)
 }
 
 /// Compose one fire over every row axis the deployment admits. Two
@@ -422,7 +478,8 @@ pub fn compose_axes(
     seriate(
         compiled,
         &budgets.tokens,
-        budgets.patches.as_ref(),
+        budgets.ladder(RowAxis::Patches),
+        budgets.ladder(RowAxis::Voxels),
         lanes,
     )
 }
@@ -430,7 +487,8 @@ pub fn compose_axes(
 fn seriate(
     compiled: &CompiledModel,
     budget: &Budget,
-    ladder: Option<&PatchLadder>,
+    ladder: Option<Ladder<'_>>,
+    voxel_ladder: Option<Ladder<'_>>,
     lanes: &[Lane],
 ) -> Result<Composition> {
     if lanes.len() > budget.max_lanes as usize {
@@ -454,6 +512,7 @@ fn seriate(
     // Whether this artifact has anywhere for a patch row to go — read off
     // the bake, not the budget.
     let towered = compiled.order_for(RowAxis::Patches).is_some();
+    let voxeled = compiled.order_for(RowAxis::Voxels).is_some();
 
     for (i, lane) in lanes.iter().enumerate() {
         let i = i as u32;
@@ -476,6 +535,21 @@ fn seriate(
         }
         if lane.images > 0 && ladder.is_none() {
             return Err(Fault::NoPatchLadder { lane: i }.into());
+        }
+        // The same three refusals on the voxel axis.
+        if (lane.clips == 0) != (lane.voxels == 0) {
+            return Err(Fault::ClipGeometry {
+                lane: i,
+                clips: lane.clips,
+                voxels: lane.voxels,
+            }
+            .into());
+        }
+        if lane.clips > 0 && !voxeled {
+            return Err(Fault::Vaeless { lane: i }.into());
+        }
+        if lane.clips > 0 && voxel_ladder.is_none() {
+            return Err(Fault::NoVoxelLadder { lane: i }.into());
         }
         // Masked to the bits the sweep ran over, since a model may state a
         // fact it does not split on.
@@ -515,7 +589,7 @@ fn seriate(
 
     // The patch ceilings, checked even with no ladder (`patches` is then zero).
     let (patches, images) = totals[RowAxis::Patches];
-    let (max_patches, max_images) = ladder.map_or((0, 0), |l| (l.max_patches, l.max_images));
+    let (max_patches, max_images) = ladder.map_or((0, 0), |l| (l.max_rows, l.max_lanes));
     if patches > u64::from(max_patches) {
         return Err(Fault::TooManyPatches {
             patches,
@@ -532,8 +606,31 @@ fn seriate(
     }
     let patches = patches as u32;
 
+    // And the voxel ceilings, the same way.
+    let (voxels, clips) = totals[RowAxis::Voxels];
+    let (max_voxels, max_clips) = voxel_ladder.map_or((0, 0), |l| (l.max_rows, l.max_lanes));
+    if voxels > u64::from(max_voxels) {
+        return Err(Fault::TooManyVoxels {
+            voxels,
+            max: max_voxels,
+        }
+        .into());
+    }
+    if clips > u64::from(max_clips) {
+        return Err(Fault::TooManyClips {
+            clips,
+            max: max_clips,
+        }
+        .into());
+    }
+    let voxels = voxels as u32;
+
     // Taken before the seriations: the token refusal is owed before the patch one.
-    let buckets = PerAxis::new([bucket_of(budget, rows)?, patch_bucket_of(ladder, patches)?]);
+    let buckets = PerAxis::new([
+        bucket_of(budget, rows)?,
+        patch_bucket_of(ladder, patches)?,
+        voxel_bucket_of(voxel_ladder, voxels)?,
+    ]);
 
     // Where each submitted lane's rows land on each axis, one side table
     // (not two lists) to avoid reading a `source` against the wrong record.
@@ -570,6 +667,7 @@ fn seriate(
             }
             let token = placed[i][RowAxis::Tokens];
             let patch = placed[i][RowAxis::Patches];
+            let voxel = placed[i][RowAxis::Voxels];
             seriated.push(LaneRow {
                 source: i as u32,
                 word: lane.word,
@@ -580,6 +678,10 @@ fn seriate(
                 patches: lane.patches,
                 image_offset: patch.1,
                 images: lane.images,
+                voxel_offset: voxel.0,
+                voxels: lane.voxels,
+                clip_offset: voxel.1,
+                clips: lane.clips,
             });
         }
     }
@@ -667,7 +769,7 @@ fn seriate_axis(
 /// The smallest patch rung that holds these patch rows — [`bucket_of`]'s
 /// question on the second row axis. `0` for no ladder or no patch rows;
 /// past the top rung is [`Fault::NoPatchBucket`]; otherwise [`rung_of`].
-fn patch_bucket_of(ladder: Option<&PatchLadder>, patches: u32) -> Result<u32> {
+fn patch_bucket_of(ladder: Option<Ladder<'_>>, patches: u32) -> Result<u32> {
     let Some(ladder) = ladder else {
         return Ok(0);
     };
@@ -676,7 +778,21 @@ fn patch_bucket_of(ladder: Option<&PatchLadder>, patches: u32) -> Result<u32> {
     }
     match ladder.buckets.last().copied() {
         Some(top) if patches > top => Err(Error::Fire(Fault::NoPatchBucket { patches, top })),
-        _ => Ok(rung_of(&ladder.buckets, patches)),
+        _ => Ok(rung_of(ladder.buckets, patches)),
+    }
+}
+
+/// [`patch_bucket_of`]'s question on the third row axis.
+fn voxel_bucket_of(ladder: Option<Ladder<'_>>, voxels: u32) -> Result<u32> {
+    let Some(ladder) = ladder else {
+        return Ok(0);
+    };
+    if voxels == 0 {
+        return Ok(0);
+    }
+    match ladder.buckets.last().copied() {
+        Some(top) if voxels > top => Err(Error::Fire(Fault::NoVoxelBucket { voxels, top })),
+        _ => Ok(rung_of(ladder.buckets, voxels)),
     }
 }
 

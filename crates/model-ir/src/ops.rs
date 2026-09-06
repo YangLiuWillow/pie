@@ -30,6 +30,7 @@ pub mod custom_cuda;
 pub mod elemwise;
 pub mod layout;
 pub mod linear;
+pub mod spatial;
 
 pub use attn::{Attention, RaggedMask};
 pub use collective::Collective;
@@ -37,6 +38,7 @@ pub use custom_cuda::CustomCuda;
 pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, NormKind, RopeForm};
 pub use layout::Layout;
 pub use linear::Linear;
+pub use spatial::{GridRule, Spatial, TimePad};
 
 /// One variant per family, so "does this backend cover this op" is a missing
 /// match arm in its `Dispatch` impl, caught at compile time. Written out by
@@ -50,6 +52,7 @@ pub enum Operation {
     Layout(Layout),
     Collective(Collective),
     CustomCuda(CustomCuda),
+    Spatial(Spatial),
 }
 
 impl Operation {
@@ -64,6 +67,7 @@ impl Operation {
             Self::Layout(op) => op,
             Self::Collective(op) => op,
             Self::CustomCuda(op) => op,
+            Self::Spatial(op) => op,
         }
     }
 }
@@ -111,5 +115,10 @@ impl From<Collective> for Operation {
 impl From<CustomCuda> for Operation {
     fn from(op: CustomCuda) -> Self {
         Self::CustomCuda(op)
+    }
+}
+impl From<Spatial> for Operation {
+    fn from(op: Spatial) -> Self {
+        Self::Spatial(op)
     }
 }

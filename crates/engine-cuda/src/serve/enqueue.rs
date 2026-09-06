@@ -70,6 +70,7 @@ impl Shell {
             cache: &mut self.cache,
             programs: &mut self.programs,
             exports: &self.exports,
+            voxels: self.voxels.as_mut(),
             held: &mut self.held,
             buffers: self.buffers.as_ref(),
             predicate: &mut self.predicate,
@@ -114,6 +115,7 @@ struct FireCtx<'a> {
     cache: &'a mut GraphCache,
     programs: &'a mut ProgramPlane,
     exports: &'a Exports,
+    voxels: Option<&'a mut crate::voxels::Store>,
     held: &'a mut [u32],
     buffers: Option<&'a Buffers>,
     predicate: &'a mut Predicate,
@@ -134,6 +136,7 @@ struct Staged {
     lane_count: u32,
     handles: Handles,
     patches: Option<PatchHandles>,
+    voxels: Option<crate::voxels::Handles>,
     mrope: Option<kernels_cuda::Tensor>,
     self_cond: Option<(kernels_cuda::Tensor, kernels_cuda::Tensor)>,
     slots: SlotTable,
@@ -249,6 +252,17 @@ impl FireCtx<'_> {
                     .stage_mrope_positions(self.device.stream(), &p.mrope_positions)?,
             )
         };
+        // The voxel tables (D8), the same way: pageable copies on the stream.
+        let voxels = if p.voxel_tables.grid.is_empty() {
+            None
+        } else {
+            let store = self.voxels.as_deref_mut().ok_or(Fault::Ceiling {
+                what: "the voxel tables, which this load reserved none of",
+                need: 1,
+                have: 0,
+            })?;
+            Some(store.stage(self.device.stream(), &p.voxel_tables)?)
+        };
         let self_cond = if p.self_cond_rows.is_empty() {
             None
         } else {
@@ -290,6 +304,8 @@ impl FireCtx<'_> {
                 lanes: u64::from(lane_count),
                 patches: carve_patches,
                 images: u64::from(p.composition.images()),
+                voxels: u64::from(p.composition.voxel_rows()),
+                clips: u64::from(p.composition.clips()),
             },
         );
         // The three RS seats: a plain fire binds `Tensor::ABSENT` for all of them.
@@ -321,6 +337,7 @@ impl FireCtx<'_> {
             lane_count,
             handles,
             patches,
+            voxels,
             mrope,
             self_cond,
             slots,
@@ -405,6 +422,10 @@ impl FireCtx<'_> {
                 .as_ref()
                 .and_then(|seats| seats.embed_weights),
             mrope_positions: staged.mrope,
+            grid: staged.voxels.as_ref().map(|seats| seats.grid),
+            token_grid: staged.voxels.as_ref().and_then(|seats| seats.token_grid),
+            voxels: staged.voxels.as_ref().and_then(|seats| seats.voxels),
+            clip_slots: staged.voxels.as_ref().map(|seats| seats.slots),
             self_cond_rows: staged.self_cond.map(|(rows, _)| rows),
             self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
             geometry,
@@ -462,8 +483,13 @@ impl FireCtx<'_> {
             },
         };
         // The ceilings are armed in one piece: pad pair, admission and ladder together.
+        // The voxel axis is served eagerly this phase: its pad is the live count.
+        let armed_voxels = kernels_cuda::Pad {
+            rows: p.composition.voxel_rows(),
+            bucket: p.composition.voxel_rows(),
+        };
         let ceilings = Ceilings {
-            pads: model_ir::PerAxis::new([armed, armed_patches]),
+            pads: model_ir::PerAxis::new([armed, armed_patches, armed_voxels]),
             bodied: p.bodied,
             shifted: self.shifted,
             admits: p.admits.as_ref(),
@@ -479,6 +505,8 @@ impl FireCtx<'_> {
                         ladder,
                         lane_ceiling: None,
                     }),
+                    // No body carves the voxel axis (M0: eager).
+                    None,
                 ]),
             }),
         };
@@ -601,27 +629,59 @@ impl FireCtx<'_> {
             return Ok(None);
         }
         let slots = &staged.slots;
+        // The pixels seam (D8): the plane and its output grid, resolved here
+        // whenever the fire carried clips.
+        let pixels = match self.exports.pixels {
+            Some((plane, grid)) if p.composition.voxel_rows() > 0 => {
+                let rect = |id: model_ir::ValueId, what: &str| {
+                    slots.0[id.0 as usize].ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "value {}, the pixels seam's {what}, which the carve gave no rectangle",
+                            id.0
+                        ),
+                    })
+                };
+                let mut lane_clips = vec![(0u32, 0u32); p.lanes.len()];
+                for row in p.composition.lanes() {
+                    lane_clips[row.source as usize] = (row.clip_offset, row.clips);
+                }
+                Some(super::settle::PixelsReadback {
+                    plane: rect(plane, "plane")?,
+                    grid: rect(grid, "grid")?,
+                    lane_clips,
+                })
+            }
+            _ => None,
+        };
         // M0: a float readout (`velocity`, `hidden`) is read back by the
-        // runtime agent's path; this shell's readback is logits only.
-        let out = self.exports.out.ok_or_else(|| Fault::Unbound {
-            what: "a plan with no `out` seam: its readout is a float seam, which this shell \
-                   does not read back yet"
-                .to_string(),
-        })?;
-        let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
-            what: format!(
-                "value {}, the out seam, which the carve gave no rectangle",
-                out.0
-            ),
-        })?;
-        if logits.dtype != Dtype::Bf16 {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "an out seam landed as {:?}, which this shell cannot read back",
-                    logits.dtype
-                ),
-            });
-        }
+        // runtime agent's path; this shell's readback is logits, and pixels.
+        let logits = match self.exports.out {
+            Some(out) => {
+                let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, the out seam, which the carve gave no rectangle",
+                        out.0
+                    ),
+                })?;
+                if logits.dtype != Dtype::Bf16 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "an out seam landed as {:?}, which this shell cannot read back",
+                            logits.dtype
+                        ),
+                    });
+                }
+                logits
+            }
+            None if pixels.is_some() => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
+            None => {
+                return Err(Fault::Unbound {
+                    what: "a plan with no `out` seam: its readout is a float seam, which this \
+                           shell does not read back yet"
+                        .to_string(),
+                });
+            }
+        };
         // Which rows of the arena's logits rectangle each submitted lane reads and owns.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
@@ -840,6 +900,7 @@ impl FireCtx<'_> {
             first_row,
             lane_rows,
             captures: p.lanes.iter().map(|s| s.captures_scores).collect(),
+            pixels,
         }))
     }
 }

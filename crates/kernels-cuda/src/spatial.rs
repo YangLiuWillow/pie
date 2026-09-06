@@ -2,19 +2,25 @@
 //! channels]` with a row per voxel in `(t, h, w)` order (`w` fastest), one
 //! lane (an image or a clip) per contiguous row range, and the per-lane box
 //! in an `i32` table `grid: [lanes, 4] = {t, h, w, row_offset}`. Convolution
-//! (implicit GEMM, causal time with a frame cache), group norm, and the
+//! (implicit GEMM, causal time with a frame cache), group norm, the
 //! index-arithmetic reshapes (nearest upsample, pixel (un)shuffle,
-//! patchify). No cuDNN, no cuBLAS: every kernel is carried `.cuh` text.
+//! patchify), the device-side grid rule that derives one table from
+//! another, and the frame cache's slot gather/store. No cuDNN, no cuBLAS:
+//! every kernel is carried `.cuh` text.
 //!
 //! One submodule per member; the entries inside keep one entry per op.
 
+pub mod cache;
 pub mod conv;
 pub mod norm;
 pub mod resample;
+pub mod rule;
 
+pub use cache::{cache_gather, cache_rows, cache_store};
 pub use conv::{Conv3d, ConvPath, TimePad, conv_weight_taps_major, conv3d, conv3d_on};
 pub use norm::group_norm;
 pub use resample::{patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest};
+pub use rule::{GridRule, derive_grid};
 
 use crate::error::Error;
 use crate::jit::{count, refuse};

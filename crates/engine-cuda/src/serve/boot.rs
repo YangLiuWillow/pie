@@ -210,6 +210,8 @@ pub struct Boot<'a> {
     pub budget: Budget,
     /// The patch axis's ceilings, or `None` for a deployment that admits no image.
     pub patches: Option<model_compiler::PatchLadder>,
+    /// The voxel axis's ceilings (D8), or `None` for a deployment that admits no clip.
+    pub voxels: Option<model_compiler::VoxelLadder>,
     /// What the device charges; `None` takes the defaults at this device's SM count.
     pub profile: Option<DeviceProfile>,
     /// Tokens per kv page.

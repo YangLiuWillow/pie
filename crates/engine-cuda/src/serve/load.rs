@@ -54,6 +54,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let budgets = Budgets {
         tokens: boot.budget.clone(),
         patches: boot.patches.clone(),
+        voxels: boot.voxels.clone(),
     };
     // The peepholes (`model_ir::fuse`) run on the trace this load keeps, so
     // the compile and every node index taken off `boot.trace` below share
@@ -209,6 +210,9 @@ impl Shell {
             ),
             decode_dense,
         )?;
+        // The convolution weights (D8) relabelled once into the tap-major
+        // order the spatial kernels read, before anything reads them.
+        crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
         let pools = Pools::reserve(
@@ -275,6 +279,13 @@ impl Shell {
             )
         });
         let patch_fold = patch_fold(&boot.trace);
+        // The voxel seat (D8): the deployment's ceilings, the plan's own port.
+        let voxels = match boot.voxels.as_ref() {
+            Some(ladder) if compiled.order_for(model_ir::RowAxis::Voxels).is_some() => Some(
+                crate::voxels::Store::reserve(crate::voxels::Seat::of(&boot.trace, ladder))?,
+            ),
+            _ => None,
+        };
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
@@ -330,6 +341,7 @@ impl Shell {
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(model_ir::RowAxis::Patches).is_some();
+        let voxel_plan = voxels.is_some();
         let mut shell = Shell {
             device,
             accounting,
@@ -343,6 +355,7 @@ impl Shell {
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,
+            voxels,
             weights,
             arena,
             pools,
@@ -372,7 +385,10 @@ impl Shell {
             pad: boot.knobs.pad(),
             golden: boot.knobs.golden(),
             golden_arm: Golden::Off,
-            bodies: boot.knobs.bodies(),
+            // M0 (D8): a plan on the voxel axis is served eagerly — the
+            // arming pass fires synthetic lanes that carry no clip, and the
+            // spatial kernels read no seat, so no body could replay one.
+            bodies: boot.knobs.bodies() && !voxel_plan,
             // Megabytes to bytes, once, at the seam the boot document crosses.
             bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
             arming: false,

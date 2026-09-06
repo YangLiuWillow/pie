@@ -123,10 +123,19 @@ pub mod seam {
     /// [`VELOCITY`], it may stand in for [`OUT`] on the returned value.
     pub const HIDDEN: Def = Def { name: "hidden" };
 
+    /// The pixel readout of a VAE decode reading (D8): a `[Voxels·k, C]`
+    /// float plane on the voxel axis — `C = 3` for an image decoder — read
+    /// back per clip. Planted on TWO values: the plane first, its
+    /// `[Clips, 4]` grid second, so the reader knows which rows are which
+    /// clip's voxels at the output resolution (`seam::at(PIXELS, &[&y,
+    /// &y_grid])`). Like [`VELOCITY`], it stands in for [`OUT`] on the
+    /// returned value.
+    pub const PIXELS: Def = Def { name: "pixels" };
+
     /// The seams a forward may return its value under instead of [`OUT`]:
     /// the float readouts. What [`trace_hybrid`] checks before planting
     /// `out` on a returned value.
-    pub const FLOAT_READOUTS: [&str; 2] = [VELOCITY.name, HIDDEN.name];
+    pub const FLOAT_READOUTS: [&str; 3] = [VELOCITY.name, HIDDEN.name, PIXELS.name];
 
     /// Plant a seam on the values it names. The first one carries the recorder
     /// — every value of one trace carries the same one — so the slice must not

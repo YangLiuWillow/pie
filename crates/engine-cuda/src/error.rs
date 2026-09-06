@@ -67,6 +67,14 @@ pub enum Fault {
         /// What its payload carries.
         have: u64,
     },
+    /// A voxel submission (D8) whose clips, payload or token rows disagree
+    /// with each other or with the plan.
+    VoxelPayload {
+        /// Which lane of the submission.
+        lane: u32,
+        /// Which of the three agreements failed.
+        what: &'static str,
+    },
 
     Ceiling {
         /// What overflowed.
@@ -313,6 +321,9 @@ impl fmt::Display for Fault {
                 "lane {lane} describes {need} bytes of patch rows and submitted {have} — \
                  its geometry and its payload disagree"
             ),
+            Self::VoxelPayload { lane, what } => {
+                write!(f, "lane {lane} submitted clips this fire cannot seat: {what}")
+            }
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire wants {need} {what} and the shell reserved {have}"

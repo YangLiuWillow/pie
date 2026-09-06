@@ -139,6 +139,7 @@ impl Run<'_> {
                 Operation::Layout(op) => collect!(op),
                 Operation::Collective(op) => collect!(op),
                 Operation::CustomCuda(op) => collect!(op),
+                Operation::Spatial(op) => collect!(op),
             }
             for &id in &ins {
                 note(&mut plan, id, false);
