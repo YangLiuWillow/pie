@@ -93,6 +93,10 @@ pub enum Fault {
     AliasInUnknown { node: usize, op: &'static str, input: ValueId },
     /// An in-place overwrite between two differently-typed values.
     AliasTyMismatch { node: usize, op: &'static str, out: ValueId, input: ValueId, out_ty: Ty, in_ty: Ty },
+    /// A value overwritten in place is read again after the overwrite. The
+    /// arena folds an alias onto its operand's rectangle unconditionally, so
+    /// the later reader gets the result, not the value it named.
+    FoldThenRead { fold: usize, fold_op: &'static str, input: ValueId, node: usize, op: &'static str, arm: Option<ValueId> },
     /// A struct value defined by anything but an op.
     StructDef { id: ValueId, kind: StructKind, def: DefKind },
     /// A struct value used as a merge arm.
@@ -124,6 +128,10 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     // phantom `Def::Op` from a mere disagreement.
     let mut owner: Vec<Option<usize>> = vec![None; len];
     let mut matched = vec![false; len];
+    // The node that overwrites each value in place, for the read-after-fold
+    // sweep below. First writer wins: a second fold over the same operand is
+    // itself a read of the first one's result and faults as one.
+    let mut folded: Vec<Option<(usize, &'static str)>> = vec![None; len];
     let (mut ins, mut outs, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut seen = HashSet::new();
 
@@ -183,6 +191,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                         node: j, op, out, input, out_ty: out_ty.clone(), in_ty: in_ty.clone(),
                     });
                 }
+                folded[input.0 as usize].get_or_insert((j, op));
             }
         }
 
@@ -220,6 +229,37 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                     node: j, op, port, id, want,
                     ty: decl.ty.clone(), def: DefKind::of(&decl.def),
                 });
+            }
+        }
+    }
+
+    // An in-place fold is the LAST read of what it folds over. The arena
+    // gives an alias its operand's rectangle unconditionally (`fold_in_place`
+    // — no copy is minted for a still-live operand), so a node reading that
+    // operand later sees the fold's result under the old name. That is how a
+    // per-block table added onto one stack-wide adaLN vector silently
+    // accumulates every table before it.
+    //
+    // A guarded fold clobbers only the lanes it is admitted on, so the rule
+    // asks whether every lane the READER serves lies inside them: two arms of
+    // one split fold one rectangle on disjoint rows, and are no fault.
+    //
+    // NODE READERS ONLY. A seam runs at plan end and so reads through every
+    // fold after it — but an observation seam is deliberately planted on a
+    // value the next op folds (`attn.out` names the merge that
+    // `gate_sigmoid_mul` then gates), and that is an exactness question about
+    // what a probe hands out, not a wrong answer in the plan. Faulting it here
+    // would refuse half the text catalog for a debug knob.
+    if folded.iter().any(Option::is_some) {
+        for (k, node) in trace.nodes.iter().enumerate() {
+            ins.clear();
+            node.op.inputs(&mut ins);
+            for &id in &ins {
+                if !in_range(id) {
+                    continue; // already an OutOfRange fault above
+                }
+                seen.clear();
+                intact(trace, &folded, id, id, k, &mut seen, &mut faults);
             }
         }
     }
@@ -332,6 +372,33 @@ fn available(
             }
         }
         _ => {} // Input / Weight / Cache: always bound before the first node.
+    }
+}
+
+/// Is what `id` names still what it named when it was defined, by the time
+/// node `at` reads it? Merges are chased arm by arm, like [`available`]: an
+/// arm the merge may select is a rectangle the reader may be handed.
+fn intact(
+    trace: &Trace, folded: &[Option<(usize, &'static str)>], root: ValueId, id: ValueId,
+    at: usize, seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
+) {
+    let by = &trace.nodes[at];
+    if let Some((fold, fold_op)) = folded[id.0 as usize]
+        && fold < at
+        && by.guard.implies(&trace.nodes[fold].guard)
+    {
+        faults.push(Fault::FoldThenRead {
+            fold, fold_op, input: id,
+            node: at, op: by.op.name(),
+            arm: (id != root).then_some(root),
+        });
+    }
+    if let Def::Merge(arms) = &trace.values[id.0 as usize].def {
+        for &(arm, _) in arms {
+            if (arm.0 as usize) < trace.values.len() && seen.insert(arm.0) {
+                intact(trace, folded, root, arm, at, seen, faults);
+            }
+        }
     }
 }
 
@@ -782,6 +849,13 @@ impl Display for Fault {
             }
             Fault::AliasTyMismatch { node, op, out, input, out_ty, in_ty } => {
                 write!(f, "node {node} ({op}): {} overwrites {} in place, but {} is not {}", V(*out), V(*input), T(out_ty), T(in_ty))
+            }
+            Fault::FoldThenRead { fold, fold_op, input, node, op, arm } => {
+                write!(f, "node {fold} ({fold_op}) overwrites {} in place, and node {node} ({op}) reads it afterwards", V(*input))?;
+                if let Some(a) = arm {
+                    write!(f, " through merge {}", V(*a))?;
+                }
+                f.write_str(" — an in-place fold is the last read of its operand; fold onto a copy")
             }
             Fault::StructDef { id, kind, def } => {
                 write!(f, "{} is a struct ({kind:?}) defined as {def} — struct values come only from plan-building ops", V(*id))

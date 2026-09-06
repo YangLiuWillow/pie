@@ -6,6 +6,8 @@ use checkpoint::contract::ModelContract;
 use model_compiler::{Budget, DeviceProfile};
 use model_ir::Trace;
 
+use super::diag::Diagnostics;
+
 /// The capture mode: `Off` walks eagerly, `Shaped` walks with graph-shaped
 /// schedules, `On` records bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,7 +128,12 @@ impl std::str::FromStr for Recording {
 }
 
 /// The shell's own words, typed — the `[engine]` table of the boot document.
-#[derive(Debug, Clone, Copy, PartialEq)]
+//
+// NOT `Copy`, since [`Diagnostics`] carries the trace filters a person types
+// (`ptr-trace=<key substring>`, `graph-dot=<dir>`). One `.clone()` at the one
+// seam that copied it is the whole cost, and it buys a knob that can be a
+// string.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Knobs {
     /// The pad and the bodies path, as one word (`[engine] recording`).
     pub recording: Recording,
@@ -138,6 +145,16 @@ pub struct Knobs {
     pub side_streams: Option<u32>,
     /// What fraction of the card this deployment lets pie hold, weights included.
     pub gpu_mem_utilization: f64,
+    /// What a person debugging turned on (`[engine] diagnostics`, or `--diag`
+    /// on `pie serve` / `pie run`). Everything off by default; the shell
+    /// publishes it at load and reads it back through
+    /// [`diag::on`](super::diag::on).
+    pub diagnostics: Diagnostics,
+    /// What a tensor-parallel group's ranks talk over (`[engine]
+    /// nccl_transport`). Shared memory by default; read once, by
+    /// [`open_group`](crate::open_group), and written into NCCL's environment
+    /// there because NCCL has no other door.
+    pub nccl_transport: crate::comm::Transport,
 }
 
 impl Knobs {
@@ -174,6 +191,8 @@ impl Default for Knobs {
             grouped: true,
             side_streams: None,
             gpu_mem_utilization: DEFAULT_GPU_MEM_UTILIZATION,
+            diagnostics: Diagnostics::default(),
+            nccl_transport: crate::comm::Transport::default(),
         }
     }
 }
@@ -234,6 +253,10 @@ pub struct Boot<'a> {
     pub runahead: engine::runahead::Runahead,
     /// How much of the weight table this load may hold on the device.
     pub residency: crate::experts::Plan,
+    /// May a warm boot defer the pinned tier (`engine::Residency::deferred_tier`,
+    /// `[model] deferred_tier`)? On, where the device reports
+    /// `pageableMemoryAccess`; off builds the page-locked image up front.
+    pub deferred_tier: bool,
     /// Which rank of how wide a group this shell is (rank 0 of 1 alone).
     pub world: crate::api::World,
     /// The rank's `ncclComm_t`, or null on a single device.

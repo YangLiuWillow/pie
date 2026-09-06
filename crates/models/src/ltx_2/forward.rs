@@ -628,18 +628,13 @@ struct BlockMods {
     prompt_ss: Value,
 }
 
-/// A fresh copy of a lane vector. `elementwise.add_bias` folds its bias IN
-/// PLACE (the IR aliases `out_out` onto `out`), and every table below is
-/// added to a vector the WHOLE STACK shares — one adaLN head serves all 48
-/// blocks — so each block must add its table to a copy or the second block
-/// reads the first block's table as well as its own.
-fn copy_of(v: &Value) -> Value {
-    ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(v, v))
-}
-
-/// `table + vector`, on a copy of the vector.
+/// `table + vector`, on a COPY of the vector. `elementwise.add_bias` folds
+/// its bias in place (the IR aliases `out_out` onto `out`), and every table
+/// below is added to a vector the WHOLE STACK shares — one adaLN head serves
+/// all 48 blocks — so each block must add its table to a copy or the second
+/// block reads the first block's table as well as its own.
 fn table_add(table: &Weight, v: &Value) -> Value {
-    ops::elemwise::add_bias(table, &copy_of(v))
+    ops::elemwise::add_bias(table, &ops::elemwise::copy(v))
 }
 
 fn block_mods(side: &Side, s: &StreamMods, prompt: &Value, dim: u32) -> BlockMods {

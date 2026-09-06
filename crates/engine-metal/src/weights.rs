@@ -539,7 +539,7 @@ impl Weights {
             )));
             self.decoded.push(buffer);
         }
-        if decoded_bytes > 0 && std::env::var_os("PIE_TIER_TRACE").is_some() {
+        if decoded_bytes > 0 && crate::diag::on().tier_trace {
             eprintln!(
                 "load: decoded {:.2} GiB of absorbed banks to bf16 in {:.2} s",
                 decoded_bytes as f64 / (1u64 << 30) as f64,

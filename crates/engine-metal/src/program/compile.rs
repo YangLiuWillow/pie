@@ -88,12 +88,12 @@ fn region_widest(plan: &LaunchStagePlan, region_index: u32) -> u32 {
         })
 }
 
-/// `PIE_REGION_TRACE=1`: one line per compiled region naming the form it
-/// took, and why the grouped one was declined when it was. The decline reason
-/// otherwise reaches nobody: the shell falls back to the single-lane kernel
-/// and nothing says so.
+/// `region-trace`: one line per compiled region naming the form it took, and
+/// why the grouped one was declined when it was. The decline reason otherwise
+/// reaches nobody: the shell falls back to the single-lane kernel and nothing
+/// says so.
 fn region_trace() -> bool {
-    std::env::var_os("PIE_REGION_TRACE").is_some_and(|v| v != "0")
+    crate::diag::on().region_trace
 }
 
 /// Which emitted form a compiled region is; fixed at compile time, since the
@@ -225,11 +225,11 @@ impl Module {
         let options = MTLCompileOptions::new();
         // Metal defaults fast math on; turn it off for determinism.
         set_safe_math(&options);
-        // `PIE_KERNEL_DUMP=<dir>`: every generated source, as `<entry>.metal`,
-        // for a standalone harness to time or inspect. A failed write is not
-        // a compile failure.
-        if let Some(dir) = std::env::var_os("PIE_KERNEL_DUMP") {
-            let path = std::path::Path::new(&dir).join(format!("{entry}.metal"));
+        // `kernel-dump=<dir>`: every generated source, as `<entry>.metal`, for
+        // a standalone harness to time or inspect. A failed write is not a
+        // compile failure.
+        if let Some(dir) = crate::diag::on().kernel_dump.as_deref() {
+            let path = dir.join(format!("{entry}.metal"));
             let _ = std::fs::write(path, source);
         }
         let text = crate::device::ctx::nsstring(source);

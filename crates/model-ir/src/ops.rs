@@ -38,7 +38,7 @@ pub use custom_cuda::CustomCuda;
 pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, NormKind, RopeForm};
 pub use layout::Layout;
 pub use linear::Linear;
-pub use spatial::{GridRule, Spatial, TimePad};
+pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};
 
 /// One variant per family, so "does this backend cover this op" is a missing
 /// match arm in its `Dispatch` impl, caught at compile time. Written out by

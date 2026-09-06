@@ -10,7 +10,7 @@
 //! `c_in = c * r1*r2*r3 + (i1 * r2 + i2) * r3 + i3`.
 
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::spatial::{flat_elements, lane_pair};
 use crate::tensor::Tensor;
 
@@ -90,13 +90,21 @@ fn block_of(op: &'static str, r: [u32; 3]) -> Result<([i32; 3], u32), Error> {
 }
 
 /// Depth to space: `[rows, C*r1*r2*r3]` over `(t, h, w)` into
-/// `[rows*r1*r2*r3, C]` over `(t*r1, h*r2, w*r3)`; `o_grid` states the
-/// output boxes.
+/// `[rows*r1*r2*r3, C]` over `(t*r1 - trim_t, h*r2, w*r3)`; `o_grid` states
+/// the output boxes.
+///
+/// `trim_t` is a causal temporal upsampler's ANCHOR DROP: the leading
+/// `trim_t` frames of the shuffled result are not emitted, so output frame
+/// `i` reads shuffled frame `i + trim_t` (LTX-2.5's `LTXVideoUpsampler3d`
+/// drops `r1 - 1`). `0` is the plain shuffle. `o` may over-allocate: only
+/// the rows `o_grid` claims are written, the rest land zeros.
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx,
     x: Tensor,
     grid: Tensor,
     r: [u32; 3],
+    trim_t: u32,
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
@@ -115,6 +123,7 @@ pub fn pixel_shuffle(
         ));
     }
     let c = count(OP, "the output channel count", o.width)?;
+    let trim = stated(OP, trim_t)?;
     let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
     ctx.fire(
         OP,
@@ -133,6 +142,7 @@ pub fn pixel_shuffle(
             r[0].arg(),
             r[1].arg(),
             r[2].arg(),
+            trim.arg(),
             total.arg(),
         ],
     )
@@ -211,5 +221,6 @@ pub fn unpatchify(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
-    pixel_shuffle(ctx, x, grid, p, o, o_grid)
+    // A patch grid never drops a frame: the DiT boundary is a reshape.
+    pixel_shuffle(ctx, x, grid, p, 0, o, o_grid)
 }

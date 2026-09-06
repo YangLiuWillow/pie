@@ -18,10 +18,10 @@
 mod arming;
 mod boot;
 pub(crate) mod btrace;
+pub mod diag;
 mod enqueue;
 mod lanes;
 mod load;
-pub(crate) use load::fuse_chains;
 mod prepare;
 mod segments;
 mod settle;
@@ -31,6 +31,7 @@ pub use arming::{Armed, Kind, Seal};
 pub use boot::{
     Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, Golden, Graphs, Knobs, Recording,
 };
+pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
 pub(crate) use settle::Readback;
@@ -382,7 +383,7 @@ impl Shell {
         self.reap_guests_at("shell.reap_guests")
     }
 
-    /// [`Shell::reap_guests`], naming the door for `PIE_REAP_TRACE`.
+    /// [`Shell::reap_guests`], naming the door for `reap-trace`.
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
         reap_guest_fires(
             &mut self.programs,

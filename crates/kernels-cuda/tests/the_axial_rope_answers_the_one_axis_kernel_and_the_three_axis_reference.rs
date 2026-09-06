@@ -54,6 +54,20 @@ fn reference(
                         RopeForm::Split => {
                             (first_channel + within, first_channel + block / 2 + within)
                         }
+                        // `SplitLadder` is a different shape of statement, not
+                        // a fourth pairing: its ladder runs across the WHOLE
+                        // row with the axes round-robin rather than down a
+                        // head, its frequencies climb a positive
+                        // endpoint-inclusive `linspace(0, 1, F_a)` instead of
+                        // the negative `-2i/dims[a]` this loop walks, and it
+                        // pads. The reference above cannot express it, so the
+                        // enumeration below never hands it over; LTX-2.5's
+                        // rows-bake and its parity gate (video and audio
+                        // velocity 0.99998) are where that form is checked.
+                        RopeForm::SplitLadder => unreachable!(
+                            "this reference walks per-head axis blocks at \
+                             negative exponents; SplitLadder is neither"
+                        ),
                     };
                     let (a, b) = (x[base + lo], x[base + hi]);
                     o[base + lo] = a.mul_add(cos, -(b * sin));

@@ -143,8 +143,14 @@ pub struct Cuda {
 
 impl Cuda {
     /// An engine bound to nothing yet.
+    ///
+    /// The boot's diagnostics record is published here, before any load: the
+    /// traces read it through [`crate::serve::diag::on`] from places no boot
+    /// reaches, and an engine that is opened and never loaded still answers
+    /// for what it was asked to trace.
     #[must_use]
     pub fn new(boot: DeviceBoot, contract_for: ContractFor, classify_for: ClassifyFor) -> Cuda {
+        crate::serve::diag::publish(&boot.knobs.diagnostics);
         Cuda {
             boot,
             contract_for,
@@ -669,7 +675,7 @@ impl Engine for Cuda {
             frames_in_flight,
         } = request;
         let trace = model_ir::fuse::residual_norm(trace);
-        let trace = if crate::serve::fuse_chains() {
+        let trace = if self.boot.knobs.diagnostics.fuse_chains {
             model_ir::fuse::residual_chains(trace)
         } else {
             trace
@@ -740,13 +746,14 @@ intended for diagnostics, not serving",
                 self.boot.ordinal
             },
             graphs: self.boot.graphs,
-            knobs: self.boot.knobs,
+            knobs: self.boot.knobs.clone(),
             cache_dir: self.boot.cache_dir.as_deref(),
             // Clamps what the free-slot word cannot carry.
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             // Carried whole rather than re-derived, so it cannot disagree
             // with the numbers `admit` was asked about.
             residency: plan,
+            deferred_tier: residency.deferred_tier,
             world: self.boot.world,
             comm: self
                 .boot

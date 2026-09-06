@@ -33,8 +33,10 @@ pub enum GridRule {
         factor: [u32; 3],
         keep_first_frame: bool,
     },
-    /// `(t·r1, h·r2, w·r3)`.
-    Shuffle { r: [u32; 3] },
+    /// `(t·r1 - trim_t, h·r2, w·r3)`; `trim_t` is a causal temporal
+    /// upsampler's anchor drop, the leading frames of the shuffled result
+    /// that are not emitted, and a box it empties lands no rows.
+    Shuffle { r: [u32; 3], trim_t: u32 },
     /// `(t/r1, h/r2, w/r3)`; a box that does not divide lands no rows.
     Unshuffle { r: [u32; 3] },
 }
@@ -97,13 +99,13 @@ pub fn derive_grid(
             flag: i32::from(keep_first_frame),
             lanes,
         },
-        GridRule::Shuffle { r } => Geom {
+        GridRule::Shuffle { r, trim_t } => Geom {
             kind: 2,
             a: triple(OP, r)?,
             b: [0; 3],
             c: [0; 3],
             d: [0; 3],
-            flag: 0,
+            flag: stated(OP, trim_t)?,
             lanes,
         },
         GridRule::Unshuffle { r } => Geom {

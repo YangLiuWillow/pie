@@ -117,6 +117,16 @@ both. `lane_of_row` is `request_of_token()` (`[Tokens] i32`) for a `[Lanes, ·]`
 - `Elementwise::Silu { x }`, `Gelu { x, tanh: bool }`, `Tanh { x }`: in place (`x_out`
   aliases `x`). `Mul { x, y } -> z`, `Add { x, y } -> z`: fresh, same type on all three.
   DSL: `elemwise::{modulate, gated_residual_add, sinusoid, silu, gelu, tanh, mul, add}`.
+- **AN IN-PLACE FOLD IS THE LAST READ OF ITS OPERAND.** Every `aliases()` pair `(out, in)`
+  is folded onto `in`'s rectangle unconditionally (`model_compiler::arena::fold_in_place`) —
+  no copy is minted for an operand something else still reads. So a value read twice may be
+  folded over at most once, and the second reader gets a copy: `elemwise::copy(v)` (`2v·½`,
+  exact, one fresh rectangle). This is the shape adaLN keeps walking into — one timestep
+  projection a fire, a `scale_shift_table` per block, `add_bias` folding the projection
+  itself so block `n+1` reads the sum of every table before it (exact at one block, drifting
+  with depth, invisible to a two-block miniature). `check` refuses it as `FoldThenRead`,
+  guard-aware: only a reader whose lanes all lie inside the fold's is a fault, so two arms of
+  one split folding one rectangle on disjoint rows still pass.
 
 ## 4. RoPE over guest positions (D7)
 
@@ -166,8 +176,16 @@ clip table below carries the offsets.
   chosen over a prepare-phase host node because a device rule is capturable
   and stateless, while a host derivation would need a per-fire host copy of
   every intermediate grid. `GridRule::{Conv{k,stride,pad,causal_t},
-  Upsample{factor,keep_first_frame}, Shuffle{r}, Unshuffle{r}}`;
-  `GridRule::out_extent`/`apply`/`growth` are the host twins.
+  Upsample{factor,keep_first_frame}, Shuffle{r,trim_t}, Unshuffle{r}}`;
+  `GridRule::out_extent`/`apply`/`growth` are the host twins. `trim_t` is a
+  causal temporal upsampler's ANCHOR DROP: a shuffle lands `t·r1 - trim_t`
+  frames, LTX-2.5's `LTXVideoUpsampler3d` dropping `r1 - 1` after it expands
+  one latent frame into `r1` sample frames (study §I.9). It is the same
+  flavour of statement as `Upsample::keep_first_frame` — a time rule the box
+  carries and the rows follow — and `growth()` is unchanged by it, so the
+  output dim keeps the untrimmed `VoxelsTimes(r1·r2·r3)` and over-allocates
+  the way every shrinking rule on this axis does. A box the trim empties
+  maps to no rows.
 - **Ports and readouts.** `RuntimeInput::Voxels { port, channels }`
   `[Voxels, channels]` f32/bf16 (DSL `Input::voxels(port, channels, dtype)`);
   a plan may read voxel ports of SEVERAL widths on several arms (Z-Image's
@@ -200,25 +218,42 @@ clip table below carries the offsets.
   `Conv::conv2d([3, 3], [2, 2], [0, 0]).pad_back([0, 1, 1])` is diffusers'
   `Downsample2D`, `F.pad(x, (0, 1, 0, 1))` then a stride-2 3×3);
   `GroupNorm { x, grid, groups, weight, bias, eps, silu, y }` (fp32 Welford
-  per clip per group); `Attention { q, k, v, grid, sm_scale, y }` — the conv
-  VAE's mid-block attention, ONE head as wide as the row, per clip over every
-  voxel of the clip, `q`/`k`/`v`/`y` all `[rows, C]` bf16 at one type (not
-  `attention.ragged`: that kernel is stamped at head widths 64/128/256 over
-  token-axis CSRs, and a VAE's head is its whole channel row); fp32 scores,
-  online softmax and accumulation, one rounding at the store; kernel
-  `spatial::attention(ctx, q, k, v, grid, sm_scale, &mut y)`
-  (`kernels/spatial/attn.cuh`, `C ∈ {256, 512, 1024}`, a warp-per-four-
-  queries online-softmax walk over the clip's keys, no flash tiling — a VAE
-  attends at its lowest resolution); DSL `spatial::attention(q, k, v, grid,
-  sm_scale)`;
+  per clip per group); `Attention { q, k, v, grid, segment, sm_scale, y }` —
+  the conv VAE's mid-block attention, ONE head as wide as the row, over the
+  block `segment` names, `q`/`k`/`v`/`y` all `[rows, C]` bf16 at one type
+  (not `attention.ragged`: that kernel is stamped at head widths 64/128/256
+  over token-axis CSRs, and a VAE's head is its whole channel row); fp32
+  scores, online softmax and accumulation, one rounding at the store; kernel
+  `spatial::attention(ctx, q, k, v, grid, segment, sm_scale, &mut y)`
+  (`kernels/spatial/attn.cuh`, `C ∈ {256, 512, 1024}` with the queries per
+  warp stamped against it — 4 / 2 / 1, holding `QPW·C/32` fp32 of query and
+  of accumulator at 32 registers each, which is what keeps the 1024-wide head
+  off the local-memory spill path — an online-softmax walk over the block's
+  keys, no flash tiling: a VAE attends at its lowest resolution); DSL
+  `spatial::attention(q, k, v, grid, sm_scale)` and
+  `spatial::attention_over(q, k, v, grid, segment, sm_scale)`.
+  **THE VOXEL AXIS'S SEGMENT TABLE** is `VoxelSegment::{Clip, Frames(n)}`,
+  what `GroupIndptr`/`LaneIndptr` (§1) are to the token axis: `Clip` is one
+  block per clip (FLUX's, Z-Image's and FLUX.2's mid blocks), `Frames(n)` one
+  block per run of `n` consecutive frames, short at the end when `t` does not
+  divide — `Frames(1)` is Wan 2.2's mid block, which attends each frame on
+  its own at `C = 1024`. It is an enum and not a CSR because the segment
+  count on this axis is `Σ t` over the clips, which no budget states and no
+  dim spells, while the blocks a VAE attends over are REGULAR and so are
+  already described by the `[Clips, 4]` grid every voxel rectangle travels
+  with; the enum says how to read that table. `VoxelSegment::bounds(box,
+  row)` is the host twin, `spatial/grid.cuh::segment_of` the device one, and
+  `Frames(0)` is refused by name at the DSL and at the kernel;
   `UpsampleNearest { x, grid, factor, keep_first_frame, y_grid, y }`;
-  `PixelShuffle`/`PixelUnshuffle { x, grid, r, y_grid, y }` (einops
+  `PixelShuffle { x, grid, r, trim_t, y_grid, y }` /
+  `PixelUnshuffle { x, grid, r, y_grid, y }` (einops
   `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'`); `Patchify { x, grid, p,
   tgrid, y }` → `[Tokens, C·p³]`; `Unpatchify { x, tgrid, p, grid, y }` →
   `[Voxels, C]`. Every member lands a fresh rectangle (a conv reads its
   neighbours). DSL: `spatial::conv3d(x, grid, w, bias, Conv, cache) -> (y,
   y_grid)`, `group_norm(..) -> y`, `upsample_nearest(..) -> (y, y_grid)`,
-  `pixel_shuffle/pixel_unshuffle(..) -> (y, y_grid)`, `patchify(x, grid, p,
+  `pixel_shuffle/pixel_shuffle_trimming/pixel_unshuffle(..) -> (y, y_grid)`,
+  `patchify(x, grid, p,
   tgrid) -> y`, `unpatchify(x, tgrid, p, grid) -> y`, `Conv::{conv2d, conv3d,
   same3, causal(TimePad)}`. Shape rules: conv/norm keep rows; upsample and
   shuffle grow `Voxels → VoxelsTimes(vol)`; unshuffle divides a carried
@@ -292,7 +327,10 @@ clip table below carries the offsets.
   `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU),
   `engine-cuda/tests/a_channel_fed_voxel_port_lands_the_committed_cell` (GPU),
   `engine-cuda/tests/a_two_axis_plan_arms_its_token_bodies` (GPU),
-  `kernels-cuda/tests/the_spatial_attention_answers_the_cpu_reference` (GPU).
+  `kernels-cuda/tests/the_spatial_attention_answers_the_cpu_reference` (GPU,
+  256/512/1024 channels),
+  `kernels-cuda/tests/the_spatial_attention_segments_by_frame` (GPU),
+  `kernels-cuda/tests/a_trimmed_pixel_shuffle_drops_its_anchor_frames` (GPU).
 - **The first real VAE (M1).** `models::z_image::vae` states the FLUX
   16-channel `AutoencoderKL` as the flagship's `vae.decode` (latent `[h·w, 16]`
   → pixels `[8h·8w, 3]` in `[-1, 1]`, the `z/scaling + shift` denormalise

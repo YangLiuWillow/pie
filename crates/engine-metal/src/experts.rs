@@ -64,7 +64,8 @@ pub struct BandPlan {
 /// half can be filled for the next pass while this one runs on the device.
 #[must_use]
 pub fn pass_group(slots: u32) -> u32 {
-    if std::env::var_os("PIE_PASS_HALF").is_some_and(|v| v == "0") {
+    // `diagnostics = "pass-half=off"`: the whole slab in one pass.
+    if !crate::diag::on().pass_half {
         return slots.max(1);
     }
     (slots / 2).max(1)
@@ -745,7 +746,7 @@ pub struct Tier {
     swaps: u64,
     /// How many segment cuts this load has taken.
     segments: u64,
-    /// Threads a segment's seat copies spread over (`PIE_SEAT_THREADS`).
+    /// Threads a segment's seat copies spread over (`seat-threads=<n>`).
     threads: usize,
     /// Seats decided but not yet filled — `(slab, seat, expert)` — between a
     /// segment's rewrite pass and its [`Tier::flush`].
@@ -778,7 +779,7 @@ pub struct Tier {
     prefetch: bool,
     /// How many predicted experts per row the prefetch reads ([`PREFETCH_K`]).
     prefetch_k: usize,
-    /// `PIE_ROUTE_DUMP=path`: every cut's true routes appended as one line
+    /// `route-dump=<path>`: every cut's true routes appended as one line
     /// `slab<TAB>id id …` per token row.
     dump: Option<std::io::BufWriter<std::fs::File>>,
     /// The prediction's score, over every cut that had one to check.
@@ -801,7 +802,7 @@ pub struct Prediction {
 }
 
 /// How many predicted experts per token row the prefetch reads ahead by
-/// default (`PIE_PREFETCH_K` overrides) — fewer than the router's fan-out,
+/// default (`prefetch-k=<n>` overrides) — fewer than the router's fan-out,
 /// since a wrong pick is a whole expert read for nothing.
 const PREFETCH_K: usize = 4;
 
@@ -846,19 +847,14 @@ impl Tier {
             prediction: Prediction::default(),
             inflight: None,
             file: None,
-            prefetch: std::env::var_os("PIE_ROUTE_PREFETCH").is_none_or(|v| v != "0"),
-            dump: std::env::var_os("PIE_ROUTE_DUMP")
+            prefetch: crate::diag::on().route_prefetch,
+            dump: crate::diag::on()
+                .route_dump
+                .as_ref()
                 .and_then(|path| std::fs::File::create(path).ok())
                 .map(std::io::BufWriter::new),
-            prefetch_k: std::env::var("PIE_PREFETCH_K")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(PREFETCH_K),
-            threads: std::env::var("PIE_SEAT_THREADS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(SEAT_THREADS),
+            prefetch_k: crate::diag::on().prefetch_k.unwrap_or(PREFETCH_K),
+            threads: crate::diag::on().seat_threads.unwrap_or(SEAT_THREADS),
             pending: Vec::new(),
         };
         for (at, group) in plan.groups.iter().enumerate() {
@@ -1259,7 +1255,7 @@ impl Tier {
             }
             raw.extend_from_slice(&entry.to_le_bytes());
         }
-        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+        if crate::diag::on().cut_trace {
             let seats: Vec<i32> = seat_of.values().copied().collect();
             eprintln!(
                 "pass {pass} of {passes} on slab {at}: group of {} experts (seats {:?}), {assigned} of {count} entries assigned, groups {}",

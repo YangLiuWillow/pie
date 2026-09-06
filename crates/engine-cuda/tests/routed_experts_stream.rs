@@ -148,6 +148,7 @@ fn a_host_budget_under_the_pinned_tier_is_refused_by_name() {
     let residency = engine::load::Residency {
         device_weight_budget: Some(full * 3 / 4),
         host_weight_budget: Some(plan.host_demand() - 1),
+        ..engine::load::Residency::uncapped()
     };
     let why = residency
         .admit(plan.device_demand(), plan.host_demand())

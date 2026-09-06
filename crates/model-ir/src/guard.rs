@@ -96,6 +96,23 @@ impl Guard {
     /// every fact either of them names, not an algebraic argument.
     #[must_use]
     pub fn equivalent(&self, other: &Guard) -> bool {
+        self.agree(other, |mine, theirs| mine == theirs)
+    }
+
+    /// Whether every lane this guard admits `outer` admits too — the same
+    /// truth table as [`equivalent`](Guard::equivalent), read one way round.
+    ///
+    /// Streams are one-hot bits with no stated exclusion, so `image` does NOT
+    /// imply `!text`: a caller asking "was this lane certainly touched" gets
+    /// `false` for two arms of one split, which is the safe answer.
+    #[must_use]
+    pub fn implies(&self, outer: &Guard) -> bool {
+        self.agree(outer, |mine, theirs| !mine || theirs)
+    }
+
+    /// Truth table over every fact either guard names, `all`-folded through
+    /// `agree`.
+    fn agree(&self, other: &Guard, agree: impl Fn(bool, bool) -> bool) -> bool {
         let mut bits = self.referenced_bits();
         for bit in other.referenced_bits() {
             if !bits.contains(&bit) {
@@ -103,7 +120,7 @@ impl Guard {
             }
         }
         if bits.is_empty() {
-            return self.holds(0) == other.holds(0);
+            return agree(self.holds(0), other.holds(0));
         }
         assert!(bits.len() <= 20, "a condition over {} facts", bits.len());
         (0..1u64 << bits.len()).all(|assignment| {
@@ -113,7 +130,7 @@ impl Guard {
                     word |= 1 << bit;
                 }
             }
-            self.holds(word) == other.holds(word)
+            agree(self.holds(word), other.holds(word))
         })
     }
 

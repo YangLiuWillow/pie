@@ -13,6 +13,8 @@ pub mod arena;
 pub mod blob;
 pub mod boot;
 pub mod device;
+/// What a person debugging turned on, typed and stated by the boot document.
+pub mod diag;
 mod dispatch;
 pub mod encode;
 pub mod weight_store;
@@ -52,6 +54,7 @@ pub use api::{ContractFor, DeviceBoot, Metal};
 pub use boot::open;
 pub use arena::Arena;
 pub use device::{Buffer, Context, Handles, Pipelines};
+pub use diag::Diagnostics;
 pub use encode::{Sink, kernel_profile, reset_kernel_profile};
 pub use error::{Fault, Result};
 pub use experts::{GroupResidency, PREDICTION_PREFIXES, Plan as ResidencyPlan, Prediction};

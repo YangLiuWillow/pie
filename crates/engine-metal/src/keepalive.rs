@@ -1,4 +1,4 @@
-//! **THE KEEP-ALIVE QUEUE** (on by default; `PIE_METAL_KEEPALIVE=0` turns it
+//! **THE KEEP-ALIVE QUEUE** (on by default; `keepalive=off` turns it
 //! off): a streamed decode
 //! fire cuts its command buffer after every router and waits while the host
 //! copies expert seats — forty-odd idle gaps of a few milliseconds per token,
@@ -26,13 +26,19 @@ pub struct KeepAlive {
 /// one token's fire and the next is host turnaround (well under this).
 const LINGER_MS: u64 = 250;
 
+/// The spinner's inner loop count, tuned so one dispatch is a few hundred
+/// microseconds — short enough that the real fire's next command buffer is
+/// never far behind it. `diagnostics = "keepalive-iters=<n>"` moves it.
+const DEFAULT_ITERS: u32 = 20_000;
+
 impl KeepAlive {
-    /// On unless the environment turns it off. Measured per token on the
-    /// same prompt: dsv4 237 → 163 ms, qwen38 75 → 57 ms, GLM 320 → 337 ms
-    /// (its host copies dominate and the spinner competes for bandwidth).
+    /// On unless the boot document turns it off (`diagnostics =
+    /// "keepalive=off"`). Measured per token on the same prompt: dsv4
+    /// 237 → 163 ms, qwen38 75 → 57 ms, GLM 320 → 337 ms (its host copies
+    /// dominate and the spinner competes for bandwidth).
     #[must_use]
     pub fn wanted() -> bool {
-        std::env::var_os("PIE_METAL_KEEPALIVE").is_none_or(|v| v != "0")
+        crate::diag::on().keepalive
     }
 
     /// Note that a fire is being enqueued now.
@@ -57,9 +63,7 @@ impl KeepAlive {
         let fire = Fire::at("layout/keepalive.metal", "keepalive_spin").apply(Grid::of([32, 1, 1], [32, 1, 1]));
         let pipeline = pipelines.at(device.device(), fire)?;
         let sink = crate::device::Buffer::zeroed(device, 256)?;
-        // Tuned so one dispatch is a few hundred microseconds: short enough
-        // that the real fire's next command buffer is never far behind it.
-        let iters: u32 = std::env::var("PIE_METAL_KEEPALIVE_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        let iters: u32 = crate::diag::on().keepalive_iters.unwrap_or(DEFAULT_ITERS);
         let (last_t, stop_t) = (Arc::clone(&last), Arc::clone(&stop));
         let carry = Carry { queue, pipeline, sink };
         let thread = std::thread::Builder::new()

@@ -15,13 +15,21 @@
 use kernels_cuda::spatial;
 use kernels_cuda::tensor::Tensor;
 use model_exec::{DispatchSpatial, KernelError};
-use model_ir::{GridRule, Spatial, TimePad};
+use model_ir::{GridRule, Spatial, TimePad, VoxelSegment};
 
 use crate::run::Run;
 
 impl DispatchSpatial for Run<'_> {
     fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
         self.spatial(op).map_err(crate::error::kernel)
+    }
+}
+
+/// The block a spatial attention segments by, in the kernel's spelling.
+fn segment(segment: VoxelSegment) -> spatial::Segment {
+    match segment {
+        VoxelSegment::Clip => spatial::Segment::Lane,
+        VoxelSegment::Frames(n) => spatial::Segment::Frames(n),
     }
 }
 
@@ -47,7 +55,7 @@ fn rule(rule: GridRule) -> spatial::GridRule {
             factor,
             keep_first_frame,
         },
-        GridRule::Shuffle { r } => spatial::GridRule::Shuffle { r },
+        GridRule::Shuffle { r, trim_t } => spatial::GridRule::Shuffle { r, trim_t },
         GridRule::Unshuffle { r } => spatial::GridRule::Unshuffle { r },
     }
 }
@@ -182,6 +190,7 @@ impl Run<'_> {
                 k,
                 v,
                 grid,
+                segment: how,
                 sm_scale,
                 y,
             } => spatial::attention(
@@ -190,6 +199,7 @@ impl Run<'_> {
                 self.tensor(*k),
                 self.tensor(*v),
                 self.tensor(*grid),
+                segment(*how),
                 *sm_scale,
                 &mut self.tensor(*y),
             ),
@@ -213,6 +223,7 @@ impl Run<'_> {
                 x,
                 grid,
                 r,
+                trim_t,
                 y_grid,
                 y,
             } => spatial::pixel_shuffle(
@@ -220,6 +231,7 @@ impl Run<'_> {
                 self.tensor(*x),
                 self.tensor(*grid),
                 *r,
+                *trim_t,
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),

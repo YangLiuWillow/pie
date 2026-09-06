@@ -88,7 +88,7 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, Recording, Seal, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, FireCost, Golden, Graphs, Knobs,
+    Armed, Boot, Diagnostics, Recording, Seal, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, FireCost, Golden, Graphs, Knobs,
     Lane, Media, Seated, Shell,
 };
 

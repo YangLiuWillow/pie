@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 
 #[cfg(feature = "cuda")]
-use runtime::engine::backend::{DeviceBoot, Graphs, Knobs, Recording, World, ordinal_of};
+use runtime::engine::backend::{
+    DeviceBoot, Diagnostics, Graphs, Knobs, Recording, Transport, World, ordinal_of,
+};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
@@ -202,6 +204,19 @@ fn device_boot(
     }
     if let Some(streams) = opts.side_streams {
         knobs.side_streams = Some(streams);
+    }
+    // The one word list a person debugging types, parsed into the shell's own
+    // record here so a misspelling is a refusal that names the vocabulary
+    // rather than a trace that never prints.
+    if let Some(words) = opts.diagnostics.as_deref() {
+        knobs.diagnostics = words
+            .parse::<Diagnostics>()
+            .map_err(|error| anyhow!("[engine] diagnostics: {error}"))?;
+    }
+    if let Some(word) = opts.nccl_transport.as_deref() {
+        knobs.nccl_transport = word
+            .parse::<Transport>()
+            .map_err(|error| anyhow!("[engine] nccl_transport: {error}"))?;
     }
     Ok(DeviceBoot {
         ordinal: ordinal_of(&opts.device),
@@ -493,6 +508,16 @@ pub(crate) fn create_engine_backend(
                 "[metal]\ngpu_mem_utilization = {:?}\n",
                 opts.gpu_mem_utilization
             );
+            // The one word list a person debugging types, quoted through
+            // `toml::Value` so a filter or a path cannot break the document.
+            // It goes before the `[metal.tuning]` table below, since a bare
+            // key after a table header would land inside it.
+            if let Some(words) = opts.diagnostics.as_deref() {
+                boot_doc.push_str(&format!(
+                    "diagnostics = {}\n",
+                    toml::Value::String(words.to_string())
+                ));
+            }
             if !opts.tuning.is_empty() {
                 boot_doc.push_str("\n[metal.tuning]\n");
                 boot_doc.push_str(&opts.tuning.to_string());

@@ -51,8 +51,10 @@ impl Run<'_> {
     }
 }
 
-/// `PIE_CUDA_NAN_CHECK=1`: after every node, sample each tensor output and
-/// report the first non-finite value seen — the op, its layer, the value id.
+/// `[engine] diagnostics = "nan-check"`: after every node, sample each tensor
+/// output and report the first non-finite value seen — the op, its layer, the
+/// value id. Under `ptr-trace` (`crate::record::PTR_TAG`) it also prints every
+/// node's operands and the device pointers behind them.
 impl model_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &model_ir::Node) {
         use model_ir::Operands;
@@ -112,8 +114,7 @@ impl model_exec::DispatchProbe for Run<'_> {
                 show(self, &outs)
             );
         }
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("PIE_CUDA_NAN_CHECK").is_some_and(|v| v == "1")) {
+        if !crate::serve::diag::on().nan_check {
             return;
         }
         let mut outs = Vec::new();

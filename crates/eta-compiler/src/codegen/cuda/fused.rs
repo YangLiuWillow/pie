@@ -184,8 +184,9 @@ pub(crate) struct GumbelChain {
 }
 
 /// Whether a Gumbel-max head folds into the one-scan form. On unless an
-/// engine clears it (the CUDA shell does under `PTIR_GUMBEL_DIRECT=0`, the
-/// A/B arm that keeps the four launches the head was traced as). A static
+/// engine clears it (the CUDA shell does under `[engine] diagnostics =
+/// "gumbel-direct=off"`, the A/B arm that keeps the four launches the head
+/// was traced as). A static
 /// rather than an argument because the emitter is reached through the
 /// compile plane's cache key, which does not carry a per-boot flag.
 pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);

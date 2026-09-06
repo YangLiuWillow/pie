@@ -781,11 +781,17 @@ fn draft_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Dra
 /// Bounds are weights, not plan constants: trace building has no checkpoint
 /// present yet. The `None` arm emits no clamp at all (not a ±∞ one), since
 /// an unclipped tower has no clip planes to read.
+///
+/// The INPUT clamp runs on a copy. One normed rectangle feeds three banks
+/// (q, k, v; gate and up), each with its own learned bounds, and
+/// `clamp_learned` folds in place — clamping `x` itself would hand the next
+/// bank `clamp(clamp(x, mine), theirs)`. The OUTPUT clamp needs no copy: the
+/// bank's product is this call's own and nobody else's.
 fn clipped(x: &Value, c: &Clippable) -> Value {
     let Some(k) = &c.clip else {
         return ops::linear::matmul(x, &c.bank);
     };
-    let held = ops::elemwise::clamp_learned(x, &k.in_lo, &k.in_hi);
+    let held = ops::elemwise::clamp_learned(&ops::elemwise::copy(x), &k.in_lo, &k.in_hi);
     ops::elemwise::clamp_learned(&ops::linear::matmul(&held, &c.bank), &k.out_lo, &k.out_hi)
 }
 

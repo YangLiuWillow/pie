@@ -29,7 +29,7 @@ pub use model_ir::{
     Attention, BlockDrafter, CacheRow, Def, Dim, Dtype, Elementwise, GateActivation, GeomKind,
     Guard, Layout, Linear, ModulateForm, MropeForm, Operands, Operation, Param, ParamSource,
     Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard, Stream, Trace, Ty, ValueId,
-    resolve_classes,
+    VoxelSegment, resolve_classes,
 };
 pub use record::{Recorder, Refine, SplitSpec, Value};
 
