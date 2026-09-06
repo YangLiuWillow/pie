@@ -63,12 +63,19 @@ pub const FUSED_GEOMETRY_MISMATCH: u32 = 0xA0;
 /// module docs.
 pub const M3_THREADS_EXCEEDED: u32 = 0xB3;
 
+/// A streamed region's fused reduction final was handed a row wider than
+/// its threadgroup memory can fold (more than 32,768 level-0 chunks: a row
+/// past 1,048,576 elements). The emitter fuses by shape class, not size,
+/// so the kernel refuses at run time rather than folding a truncated tree.
+pub const M4_REDUCE_TOO_WIDE: u32 = 0xB4;
+
 /// Every aliasing class and the op whose tag it collides with (`None` = tag
 /// unassigned). Kept by hand; checked against the op table by
 /// [`the_tag_aliases_are_still_what_they_say`](self).
 pub const TAG_ALIASES: &[(u32, Option<&str>)] = &[
     (FUSED_GEOMETRY_MISMATCH, Some("intrinsic_val")),
     (M3_THREADS_EXCEEDED, None),
+    (M4_REDUCE_TOO_WIDE, None),
 ];
 
 /// The class table as declared: base, name, per-channel. A tuple table
@@ -76,6 +83,7 @@ pub const TAG_ALIASES: &[(u32, Option<&str>)] = &[
 const TABLE: &[(u32, &str, bool)] = &[
     (FUSED_GEOMETRY_MISMATCH, "FUSED_GEOMETRY_MISMATCH", false),
     (M3_THREADS_EXCEEDED, "M3_THREADS_EXCEEDED", false),
+    (M4_REDUCE_TOO_WIDE, "M4_REDUCE_TOO_WIDE", false),
     (LANE_HEADER_MISMATCH, "LANE_HEADER_MISMATCH", false),
     (M1_RING_CORRUPT, "M1_RING_CORRUPT", true),
     (M1_HEAD_STALE, "M1_HEAD_STALE", true),

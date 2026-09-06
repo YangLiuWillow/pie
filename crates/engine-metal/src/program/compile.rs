@@ -118,7 +118,8 @@ pub enum Form {
 /// descriptors size its grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedStep {
-    /// The op this step runs (`M4Step::index`).
+    /// The value the emitter sized this step by; `M4Step::index` is the
+    /// step's position in the table.
     pub node: u32,
     pub kind: eta_compiler::codegen::metal::StepKind,
     /// The value whose length sizes a `Wide` grid: the op's result, or its
@@ -204,6 +205,12 @@ impl Module {
         self.pipeline.maxTotalThreadsPerThreadgroup()
     }
 
+    /// The SIMD width this pipeline executes at.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn execution_width(&self) -> usize {
+        self.pipeline.threadExecutionWidth()
+    }
+
     /// Compile one owned MSL source and build the pipeline for `entry`. A
     /// rejected source is remembered in the negative tier; any other failure
     /// is not.
@@ -218,6 +225,13 @@ impl Module {
         let options = MTLCompileOptions::new();
         // Metal defaults fast math on; turn it off for determinism.
         set_safe_math(&options);
+        // `PIE_KERNEL_DUMP=<dir>`: every generated source, as `<entry>.metal`,
+        // for a standalone harness to time or inspect. A failed write is not
+        // a compile failure.
+        if let Some(dir) = std::env::var_os("PIE_KERNEL_DUMP") {
+            let path = std::path::Path::new(&dir).join(format!("{entry}.metal"));
+            let _ = std::fs::write(path, source);
+        }
         let text = crate::device::ctx::nsstring(source);
         let library = device
             .newLibraryWithSource_options_error(&text, Some(&options))
@@ -790,23 +804,33 @@ impl Cache {
             };
         let mut steps = Vec::with_capacity(table.len());
         for &word in table {
-            let node = eta_compiler::codegen::metal::step_node(word);
+            // The emitter names the value that sizes each dispatch outright:
+            // a wide pass's result, a reduction's input.
+            let value = eta_compiler::codegen::metal::step_value(word);
             let Some(kind) = eta_compiler::codegen::metal::step_kind(word) else {
                 return Ok(None);
             };
-            let Some(op) = plan.ops.get(node as usize) else {
-                return Ok(None);
-            };
-            let input = op.args.first().copied().unwrap_or(op.result_id);
-            let result = if op.result_count == 0 { input } else { op.result_id };
             steps.push(StreamedStep {
-                node,
+                node: value,
                 kind,
-                result,
-                input,
+                result: value,
+                input: value,
             });
         }
         let module = self.region_module(context, entry, source)?;
+        #[cfg(target_vendor = "apple")]
+        if module.execution_width() != 32 {
+            // The streamed reductions fold a chunk across a SIMD group of
+            // exactly 32 lanes; the grouped forms make no such assumption.
+            if region_trace() {
+                eprintln!(
+                    "region: stage {stage_index} region {region_index} declines the Streamed \
+                     form: the pipeline's execution width is {}, not 32",
+                    module.execution_width()
+                );
+            }
+            return Ok(None);
+        }
         Ok(Some(Region {
             region_index,
             steps: Arc::new(steps),

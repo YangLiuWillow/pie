@@ -21,7 +21,7 @@ const PINNED: &[(&str, u16, u64)] = &[
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and
     // its own `ptir_m4` kernels joined the table.
-    ("metal", 47, 0x74bc_eef5_8e19_8649),
+    ("metal", 48, 0x00dc_9848_6781_b52f),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

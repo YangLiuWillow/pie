@@ -18,7 +18,7 @@ use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region, StreamedStep};
-use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels, reduce_levels};
+use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 use super::shared::SharedRing;
 
 /// The buffer index the first channel's committed cell binds at, below
@@ -704,6 +704,7 @@ fn streamed_knobs() -> StreamedKnobs {
             .max(1),
         repeat_kind: match std::env::var("PIE_STREAMED_REPEAT_KIND").ok().as_deref() {
             Some("wide") => Some(StepKind::Wide),
+            Some("partial") => Some(StepKind::Partial),
             Some("single") => Some(StepKind::Single),
             Some("reduce") => Some(StepKind::Reduce),
             Some("argmax") => Some(StepKind::Argmax),
@@ -716,9 +717,30 @@ fn streamed_knobs() -> StreamedKnobs {
     })
 }
 
-/// Most element blocks one streamed dispatch spreads over: enough to fill
-/// the device, few enough that a partial table stays small.
-const STREAMED_MAX_GROUPS: u32 = 1024;
+/// Most element blocks one streamed dispatch spreads over. Every thread of
+/// every block walks the kernel's preamble — a chain of dependent loads from
+/// the lane table — before it touches an element, so a wide grid pays that
+/// chain once per wave of resident threads: measured on the emitted kernel,
+/// a 248k-element pass cost 55 µs at 1024 blocks and 22 µs at 64, with the
+/// loop itself a third of the latter. Sixty-four blocks of a few hundred
+/// threads fill the device once; each thread then strides a handful of
+/// elements.
+const STREAMED_MAX_GROUPS: u32 = 64;
+
+/// Level-`l + 1` chunks one threadgroup of a reduce dispatch folds; the
+/// runtime's `M4_REDUCE_CHUNKS_PER_GROUP`. A dispatch at level `l` covers
+/// `32 × this` level-`l` chunks per group.
+const REDUCE_CHUNKS_PER_GROUP: u32 = 4;
+
+/// The threadgroup a streamed region is dispatched with: the pipeline's
+/// widest, capped at the region ceiling, rounded down to a power of two of
+/// at least 32 — the reductions fold across SIMD groups and divide the
+/// group into rounds, so its width must divide evenly.
+pub(super) fn streamed_threads(max_total: usize) -> usize {
+    let capped = max_total.clamp(1, REGION_THREADS as usize);
+    let pow2 = 1usize << (usize::BITS - 1 - capped.leading_zeros());
+    pow2.max(32)
+}
 
 /// The dispatches a streamed region's step table unfolds into for these
 /// descriptors: `(word, groups along x)`. A `Wide` step is one dispatch over
@@ -743,15 +765,21 @@ fn streamed_dispatches(
             None => 1,
         }
     };
-    for step in steps.iter().take(knobs.limit) {
+    for (position, step) in steps.iter().enumerate().take(knobs.limit) {
+        // The kernel's `case` is the step's position in the table.
         let word = StepWord {
-            index: step.node,
+            index: u32::try_from(position).unwrap_or(u32::MAX),
             ..StepWord::default()
         };
         match step.kind {
-            StepKind::Wide => {
+            StepKind::Wide | StepKind::Partial => {
+                let sized_by = if step.kind == StepKind::Partial {
+                    step.input
+                } else {
+                    step.result
+                };
                 let len = descriptors
-                    .get(step.result as usize)
+                    .get(sized_by as usize)
                     .map_or(1, |desc| desc.len);
                 for _ in 0..repeats(StepKind::Wide) {
                     out.push((word, groups_for(len)));
@@ -769,28 +797,23 @@ fn streamed_dispatches(
                 // per thread, per row.
                 let mut count = desc.last;
                 let mut at = 0u32;
-                // The runtime folds a second level in the threadgroup only when
-                // the width is a multiple of 32; otherwise every level is its
-                // own dispatch.
-                let levels: Vec<u32> = if threads % 32 == 0 {
-                    reduce_dispatch_levels(desc.last)
-                } else {
-                    (0..reduce_levels(desc.last)).collect()
-                };
-                for level in levels {
+                // The runtime folds two levels per dispatch, a group owning
+                // `REDUCE_CHUNKS_PER_GROUP` chunks of the upper one; rows are
+                // walked inside the group.
+                for level in reduce_dispatch_levels(desc.last) {
                     while at < level {
                         count = count.div_ceil(32);
                         at += 1;
                     }
                     let chunks = count.div_ceil(32).max(1);
-                    let work = desc.rows.max(1).saturating_mul(chunks);
+                    let groups = chunks.div_ceil(32 * REDUCE_CHUNKS_PER_GROUP).max(1);
                     for _ in 0..repeats(StepKind::Reduce) {
                         out.push((
                             StepWord {
                                 level,
                                 ..word
                             },
-                            groups_for(work),
+                            groups,
                         ));
                     }
                 }
@@ -822,6 +845,47 @@ fn streamed_dispatches(
                 }
             }
         }
+    }
+    // `PIE_STREAMED_NOP=n`: n dispatches of one group that hit the kernel's
+    // `default: return` — the production floor of a dispatch of this kernel
+    // with these bindings, with no op behind it.
+    let nops = std::env::var("PIE_STREAMED_NOP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    for _ in 0..nops {
+        out.push((
+            StepWord {
+                index: u32::MAX,
+                ..StepWord::default()
+            },
+            1,
+        ));
+    }
+    if std::env::var_os("PIE_STREAMED_TRACE").is_some_and(|v| v != "0") {
+        let grid: Vec<String> = out
+            .iter()
+            .map(|(word, groups)| format!("{}:{}x{groups}", word.index, word.level))
+            .collect();
+        let sizes: Vec<String> = steps
+            .iter()
+            .map(|step| {
+                format!(
+                    "{:?}[r{}={} i{}={}]",
+                    step.kind,
+                    step.result,
+                    descriptors.get(step.result as usize).map_or(0, |d| d.len),
+                    step.input,
+                    descriptors.get(step.input as usize).map_or(0, |d| d.len)
+                )
+            })
+            .collect();
+        eprintln!(
+            "streamed: {} step(s) -> {} dispatch(es), {threads} threads, repeat {} of {:?}; grid {}; sizes {}",
+            steps.len(),
+            out.len(),
+            knobs.repeat,
+            knobs.repeat_kind,
+            grid.join(" "),
+            sizes.join(" ")
+        );
     }
     out
 }
@@ -1399,10 +1463,7 @@ impl Prepared {
             for held in self.intrinsics.iter().flatten() {
                 resident(&held.base, MTLResourceUsage::Read);
             }
-            let threads = region
-                .pipeline()
-                .maxTotalThreadsPerThreadgroup()
-                .clamp(1, REGION_THREADS as usize);
+            let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
             let temporary_bytes = u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
             dispatch_streamed(
                 encoder,
@@ -1996,12 +2057,10 @@ impl Batch {
             let template = members
                 .first()
                 .ok_or_else(|| Fault::program("program::launch", "a batch with no members"))?;
-            let threads = region
-                .pipeline()
-                .maxTotalThreadsPerThreadgroup()
-                .clamp(1, REGION_THREADS as usize);
+            let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
             let temporary_bytes =
                 u64::from(self.key.scratch_stride.saturating_sub(self.key.temporary_offset));
+            self.dump_streamed_tables(region, template)?;
             dispatch_streamed(
                 encoder,
                 &streamed_dispatches(
@@ -2019,6 +2078,49 @@ impl Batch {
         {
             Err(Fault::Deviceless)
         }
+    }
+
+    /// `PIE_KERNEL_DUMP=<dir>`: beside a streamed region's source, its lane-0
+    /// tables as `<entry>.tables` — `[value_count, params_per_lane,
+    /// scratch_stride, temporary_offset]` as `u32`s, the 32-byte layout
+    /// word, then the descriptors, the op params and the offsets — so a
+    /// standalone harness can replay one lane of this dispatch table against
+    /// the very shapes the program ran with. Written once per entry.
+    #[cfg(target_vendor = "apple")]
+    fn dump_streamed_tables(&self, region: &Region, template: &Prepared) -> Result<()> {
+        let Some(dir) = std::env::var_os("PIE_KERNEL_DUMP") else {
+            return Ok(());
+        };
+        let path = std::path::Path::new(&dir).join(format!("{}.tables", region.module.entry()));
+        if path.exists() {
+            return Ok(());
+        }
+        let Some(words) = self.layout_words.get(region.region_index as usize) else {
+            return Ok(());
+        };
+        let value_count = template.descriptor_table.len();
+        let params_per_lane = words.reserved2 as usize;
+        let mut descriptors = vec![0u8; value_count * size_of::<ValueDesc>()];
+        self.descriptors.read(0, &mut descriptors)?;
+        let mut params = vec![0u8; params_per_lane * size_of::<OpParams>()];
+        self.params.read(0, &mut params)?;
+        let mut offsets = vec![0u8; value_count * 4];
+        self.offsets.read(0, &mut offsets)?;
+        let mut bytes = Vec::new();
+        for word in [
+            value_count as u32,
+            params_per_lane as u32,
+            self.key.scratch_stride,
+            self.key.temporary_offset,
+        ] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&record_bytes(words));
+        bytes.extend_from_slice(&descriptors);
+        bytes.extend_from_slice(&params);
+        bytes.extend_from_slice(&offsets);
+        let _ = std::fs::write(path, bytes);
+        Ok(())
     }
 
     /// One grouped region for every member: the batch's eleven bindings, a
