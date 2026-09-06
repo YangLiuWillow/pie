@@ -121,6 +121,10 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elementwise.mul_scalar", Reads::Rows),
     entry("elementwise.norm_modulate", Reads::Rows),
     entry("elementwise.ple_gate", Reads::Rows),
+    // A constant of the plan: `[heads, 2·max_len − 1]` from one weight, no
+    // row of any axis read or written, so it is baked at its recorded
+    // extent like the planners.
+    entry("elementwise.relative_bucket_bias", Reads::Nothing),
     entry("elementwise.residual_add", Reads::Rows),
     entry("elementwise.residual_add_rmsnorm", Reads::Rows),
     entry("elementwise.rmsnorm", Reads::Rows),

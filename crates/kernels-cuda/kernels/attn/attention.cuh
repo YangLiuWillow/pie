@@ -195,6 +195,62 @@ struct ReferenceSelfOnly : VariantFull {
     })
 };
 
+// `RaggedMask::RelativeBias`: the block plus one relative-position table.
+// `bias` is `[num_qo_heads, 2·max_len − 1]` f32, row-major, one row per
+// QUERY head (a grouped kv head's queries each read their own row). Query
+// row `qi` and key row `kj` of a group — both group-relative — read
+// `bias[h][clamp(kj − qi + max_len − 1, 0, 2·max_len − 2)]`, added to the
+// SCALED logit. The umT5 / T5 relative position bias (whose bucket
+// function is precomputed into this dense table per layer by
+// `elementwise.relative_bucket_bias`) and an ALiBi slope table both fit.
+struct RaggedBiasParams : RaggedParams {
+    const float* bias = nullptr;
+    std::uint32_t max_len = 0;
+};
+
+static_assert(sizeof(RaggedBiasParams) == 328,
+              "fa2_abi::PrefillRaggedBiasParams mirrors a 328-byte RaggedBiasParams");
+
+/// The full-attention variant with an additive relative-position bias on
+/// its logits. Instantiated under `MaskMode::kNone` like the plain arm —
+/// nothing is masked beyond the segment, only the transform hook is used.
+/// The hook applies `sm_scale` itself (the bias is in logit units, not
+/// `q·k` units), so the online softmax scales by `log2e` alone — exactly
+/// FlashInfer's own ALiBi arm (`DefaultAttention<.., use_alibi = true>`).
+struct RelativeBias : VariantFull {
+    const float* bias = nullptr;
+    /// `2·max_len − 1`, the table's row width.
+    std::uint32_t span = 1;
+    /// `max_len − 1`, the column a zero distance reads.
+    std::uint32_t centre = 0;
+
+    template <typename Params>
+    __device__ __host__ RelativeBias(
+        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : VariantFull(params, batch_idx, smem_ptr) {
+        bias = params.bias;
+        centre = params.max_len - 1;
+        span = 2 * params.max_len - 1;
+        sm_scale_log2 = ::flashinfer::math::log2e;
+    }
+
+    REGISTER_LOGITS_TRANSFORM(
+        params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+            // The hook is asked for every (row, key) pair of a tile,
+            // including rows past the segment's end and keys the tail mask
+            // retires after it, so the column is clamped rather than trusted.
+            const long long d = static_cast<long long>(kv_idx) -
+                                static_cast<long long>(qo_idx) +
+                                static_cast<long long>(centre);
+            const std::uint32_t at =
+                d < 0 ? 0u
+                      : (d >= static_cast<long long>(span) ? span - 1
+                                                           : static_cast<std::uint32_t>(d));
+            const float b = bias[static_cast<std::size_t>(qo_head_idx) * span + at];
+            return static_cast<T>(static_cast<float>(logits) * params.sm_scale + b);
+        })
+};
+
 }
 
 namespace merge_lse {
