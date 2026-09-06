@@ -377,10 +377,14 @@ fn expected_dit_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
                 6
             } else if name.starts_with("condition_embedder.time_embedder.linear_2.") {
                 3
-            } else if name.starts_with("proj_out.") {
-                // One slice per row: the `(ph, pw, c)` → `(c, ph, pw)` permutation.
-                d.patch_out() as usize
             } else {
+                // `proj_out` is read ONCE, permutation and all: its
+                // `(ph, pw, c)` → `(c, ph, pw)` row gather rides inside a
+                // `read_over`, where the ladder lowers it under the cast
+                // rather than around it. (It was one slice per row while the
+                // permutation was spelled as a concatenation of one-row
+                // slices — the shape `read_expr` forced, and the reason the
+                // fp32 → bf16 cast refused the plane it landed.)
                 1
             };
             (format!("{prefix}{name}"), count)
@@ -530,21 +534,15 @@ fn the_flagship_reads_the_real_snapshot() {
         .collect();
     assert_eq!(vae_read, vae_want, "the VAE planes read are the decoder's");
 
-    // Every other tensor exactly once, but the two row-permuted VAE convs:
-    // a `time_conv` `(r1, c)` → `(c, r1)` is one slice per output row,
-    // `conv_out`'s `(c, pw, ph)` → `(c, ph, pw)` twelve.
-    let sliced = |n: &str| -> Option<usize> {
-        if n.contains(".upsampler.time_conv.") {
-            Some(2 * model::VAE_DECODER_DIMS[1] as usize)
-        } else if n.starts_with("vae.decoder.conv_out.") {
-            Some(model::VAE_PIX_CHANNELS as usize)
-        } else {
-            None
-        }
-    };
+    // Every other tensor exactly once — the row-permuted VAE convs
+    // included. A `time_conv` `(r1, c)` → `(c, r1)` and `conv_out`'s
+    // `(c, pw, ph)` → `(c, ph, pw)` are gathers inside a `read_over`, which
+    // the ladder lowers UNDER the fp32 → bf16 cast; spelled as a
+    // concatenation of one-row slices they were one read per row, and the
+    // cast then refused the plane they landed.
     let odd: BTreeSet<&String> = counts
         .iter()
-        .filter(|(n, c)| !n.starts_with("dit.") && **c != sliced(n).unwrap_or(1))
+        .filter(|(n, c)| !n.starts_with("dit.") && **c != 1)
         .map(|(n, _)| n)
         .collect();
     assert!(odd.is_empty(), "read at an unexpected count: {odd:?}");
