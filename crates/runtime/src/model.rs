@@ -896,7 +896,9 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
             && !reading.ports.iter().any(|port| {
                 matches!(
                     port.kind,
-                    models::PortKind::Latents | models::PortKind::Voxels | models::PortKind::Context
+                    models::PortKind::Latents
+                        | models::PortKind::Voxels
+                        | models::PortKind::Context
                 )
             })
         {
