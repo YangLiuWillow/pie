@@ -85,11 +85,15 @@ MINI = dict(
     patch_embed_hidden_dim=64,
     image_base_size=256,
 )
-# 256 x 256 pixels at stride 16 and patch 1.
-TOKEN_H, TOKEN_W = 16, 16
+# 128 x 128 pixels at stride 16 and patch 1 — small enough that the
+# whole case fits argv (the sandbox's `/scratch` is per-process, so a
+# harness cannot place a file in it).
+TOKEN_H, TOKEN_W = 8, 8
 # `<bos>` + five text ids + `<boi> <img_size> <img_ratio>` then `<timestep>`.
-TEXT_IDS = [127958, 100, 200, 300, 400, 500, 128000, 128100, 128200]
-TIMESTEP_ID = 128010
+# `<|startoftext|>` + five ordinary pieces + `<boi> <img_size_1024> <img_ratio_0>`.
+TEXT_IDS = [127958, 100, 200, 300, 400, 500, 128000, 128037, 128044]
+# `<timestep>` in the base repo's tokenizer (128 010 is `<cfg>`).
+TIMESTEP_ID = 128017
 IMG_ID = 128006
 EOI_ID = 128001
 # `sigma' * 1000` at the first of eight shifted steps (shift 3).

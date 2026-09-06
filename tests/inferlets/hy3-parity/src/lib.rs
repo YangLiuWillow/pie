@@ -212,6 +212,7 @@ async fn main(input: Input) -> Result<Output> {
     let e_slot = Channel::from_iter((0..prefix_len).map(|p| p / page_size)).named("prefix_w_slot");
     let e_off = Channel::from_iter((0..prefix_len).map(|p| p % page_size)).named("prefix_w_off");
     let e_len = Channel::from([prefix_len]).named("prefix_kv_len");
+    let e_readout = Channel::from_iter(0..prefix_len).named("prefix_readout");
     let e_argmax = Channel::new([prefix_len], dtype::i32).named("encode_argmax");
     let e_max = Channel::new([prefix_len], dtype::f32).named("encode_max");
 
@@ -234,6 +235,9 @@ async fn main(input: Input) -> Result<Output> {
             mask: None,
         },
     )?;
+    // Every row reads out: the default is the lane's LAST row, and the
+    // golden's logits are the whole causal pass.
+    prefill.readout(&e_readout)?;
     let (argmax_out, max_out) = (e_argmax.clone(), e_max.clone());
     prefill.epilogue(move || {
         let logits = intrinsics::logits();
@@ -245,40 +249,51 @@ async fn main(input: Input) -> Result<Output> {
     let encode_max = e_max.take_host::<Vec<f32>>().await?;
 
     // ---- the canvas: one `denoise` fire over the frozen prefix -----------
-    let mut ids: Vec<i32> = vec![case.img_id; case.image_rows as usize];
-    ids.push(case.timestep_id);
-    let special: Vec<f32> = (0..canvas_len)
-        .map(|row| f32::from(row == case.image_rows))
-        .collect();
-    // `[canvas_len, hidden]`: the image head's rows, then one row the plan
-    // overwrites (its bytes are never read).
-    let mut rows = case.rows.clone();
-    rows.resize((canvas_len * case.hidden) as usize, 0.0);
+    // **THE SPECIAL ROW COMES FIRST, AND THE LANE IS ITS SEQUENCE.** The
+    // CUDA fire path derives a lane's KV positions as `held .. held +
+    // rows` and refuses an explicit list by name (`api.rs`: "explicit lane
+    // positions"), so the canvas lane's rows must BE the run
+    // `[<timestep>, image rows…]` the sequence spells. Design D10's
+    // "writable canvas slots" — a lane whose rows land at slots the guest
+    // names — is the engine gap this works around.
+    let mut ids: Vec<i32> = vec![case.timestep_id];
+    ids.extend(std::iter::repeat_n(case.img_id, case.image_rows as usize));
+    let special: Vec<f32> = (0..canvas_len).map(|row| f32::from(row == 0)).collect();
+    // `[canvas_len, hidden]`: one row the plan overwrites (its bytes are
+    // never read), then the image head's rows.
+    let mut rows = vec![0.0f32; case.hidden as usize];
+    rows.extend_from_slice(&case.rows);
     // The generalized causal mask, dense `[rows, keys]` row-major: an image
     // row sees every key, the `<timestep>` row sees itself and the prefix.
-    let t_at = case.canvas_sequence[case.image_rows as usize];
+    let t_at = case.canvas_sequence[0];
     let mask: Vec<bool> = (0..canvas_len)
         .flat_map(|row| {
-            let bound = if row == case.image_rows { t_at } else { kv_len - 1 };
+            let bound = if row == 0 { t_at } else { kv_len - 1 };
             (0..kv_len).map(move |key| key <= bound)
         })
         .collect();
 
     let d_toks = Channel::from(ids).named("canvas_ids");
     let d_indptr = Channel::from([0u32, canvas_len]).named("canvas_indptr");
-    let d_rows = Channel::from_shaped([canvas_len, case.hidden], rows.as_slice()).named("canvas_rows");
-    let d_special = Channel::from_shaped([canvas_len, 1], special.as_slice()).named("canvas_special");
+    let d_rows =
+        Channel::from_shaped([canvas_len, case.hidden], rows.as_slice()).named("canvas_rows");
+    let d_special =
+        Channel::from_shaped([canvas_len, 1], special.as_slice()).named("canvas_special");
     let d_t = Channel::from([case.timestep]).named("canvas_timestep");
     let d_rope = Channel::from_shaped([canvas_len, axes], case.canvas_positions.as_slice())
         .named("canvas_positions");
     let d_pos = Channel::from(case.canvas_sequence.clone()).named("canvas_kv_positions");
-    let d_indptr_pages = Channel::from([0u32, kv_len.div_ceil(page_size)]).named("canvas_page_indptr");
+    // Its OWN page list: a seeded channel attaches to one pass only.
+    let d_pages = Channel::from_iter(0..max_pages).named("canvas_pages");
+    let d_indptr_pages =
+        Channel::from([0u32, kv_len.div_ceil(page_size)]).named("canvas_page_indptr");
     let d_slot = Channel::from_iter(case.canvas_sequence.iter().map(|p| p / page_size))
         .named("canvas_w_slot");
     let d_off = Channel::from_iter(case.canvas_sequence.iter().map(|p| p % page_size))
         .named("canvas_w_off");
     let d_len = Channel::from([kv_len]).named("canvas_kv_len");
     let d_mask = Channel::from_shaped([canvas_len, kv_len], mask.as_slice()).named("canvas_mask");
+    let d_readout = Channel::from_iter(0..canvas_len).named("canvas_readout");
     let out = Channel::new([canvas_len, case.hidden], dtype::f32).named("canvas_hidden");
 
     let step = ForwardPass::new();
@@ -296,7 +311,7 @@ async fn main(input: Input) -> Result<Output> {
             readable_pages: ..,
             writable_pages: ..,
             kv_len: &d_len,
-            pages: &pages,
+            pages: &d_pages,
             page_indptr: &d_indptr_pages,
             w_slot: &d_slot,
             w_off: &d_off,
@@ -304,6 +319,7 @@ async fn main(input: Input) -> Result<Output> {
             mask: Some(&d_mask),
         },
     )?;
+    step.readout(&d_readout)?;
     let hidden = case.hidden;
     let readback = out.clone();
     step.epilogue(move || {

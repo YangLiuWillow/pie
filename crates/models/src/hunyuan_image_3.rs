@@ -113,8 +113,8 @@ pub fn skus() -> Vec<crate::Sku> {
 
 /// The image rows one denoising loop refines — `model.canvas()`'s answer.
 /// 1024² at stride 16 and patch 1 is 64 × 64; the miniature's reference
-/// image is 256² = 16 × 16.
+/// image is 128² = 8 × 8 (`hy3_golden.py --mini`).
 fn canvas_rows(model: &Model) -> u32 {
-    let side = if model.dims.layers > 4 { 64 } else { 16 };
+    let side = if model.dims.layers > 4 { 64 } else { 8 };
     side * side
 }

@@ -32,9 +32,18 @@ WHAT IS COMPARED
 `denoise.hidden`   the trunk's rows for the canvas — the `h*w` image rows in
                    raster order and then the `<timestep>` row — with `ln_f`
                    NOT applied, which is what `final_layer` consumes.
-`encode.argmax`    the causal text pass's per-row argmax and winning logit.
-                   (The full `[L, 133120]` logit plane is 5 MB of JSON; the
-                   argmax is the part a stage-transition processor reads.)
+`encode.max`       the causal text pass's winning logit per row, and the
+                   argmax as an agreement COUNT beside it. (The full
+                   `[L, 133120]` plane is 5 MB of JSON, and two token ids do
+                   not subtract.)
+
+MEASURED (2026-09-06, `hunyuanimage3-mini-bf16-kv-bf16` on one Blackwell,
+fp32 golden vs bf16 weights and bf16 activations):
+
+    denoise.hidden.image        (64, 256)   cos 0.999996   max-abs 0.0013
+    denoise.hidden.timestep_row (256,)      cos 0.999993   max-abs 0.00046
+    encode.max                  (9,)        cos 0.999998   max-abs 5.8e-05
+    prefill argmax                          8 / 9 rows agree
 
 WHAT IS NOT
 -----------
@@ -120,9 +129,11 @@ def cases(args) -> list[str]:
         out[:, 1] *= scale
         return out.reshape(-1).astype(np.float32).tolist()
 
-    # The canvas lane's row order: the image rows in raster order, then the
-    # `<timestep>` row.
-    canvas_seq = list(range(img_at, img_at + n)) + [t_at]
+    # The canvas lane's row order: the `<timestep>` row, then the image rows
+    # in raster order — which is the SEQUENCE's own run, because the CUDA
+    # fire path derives a lane's KV positions as `held .. held + rows` and
+    # refuses an explicit list.
+    canvas_seq = [t_at] + list(range(img_at, img_at + n))
     canvas_pos = pos[canvas_seq]
 
     case = {
@@ -174,6 +185,26 @@ def wasm(inferlet: str) -> str:
     return max(present, key=os.path.getmtime)
 
 
+def split(text: str, n: int) -> list[str]:
+    """`n` pieces, none of which starts with `-`.
+
+    The CLI reads a parameter as `--case_i <value>` and a value that begins
+    with `-` is read as the next FLAG, which leaves `case_i` a bare boolean
+    and the document unparseable. Nudging each boundary forward past a
+    minus sign costs nothing and cannot fail: a JSON number is never all
+    minus signs.
+    """
+    step = -(-len(text) // n)
+    cuts = [0]
+    for i in range(1, n):
+        at = min(i * step, len(text))
+        while at < len(text) and text[at] == "-":
+            at += 1
+        cuts.append(at)
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
+
+
 def run(args) -> None:
     paths = numbered(args.out, "case")
     if not paths:
@@ -197,10 +228,9 @@ def run(args) -> None:
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
-            n = 8
-            step = -(-len(text) // n)
-            for i in range(n):
-                cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
+            pieces = split(text, 8)
+            for i in range(len(pieces)):
+                cmd += [f"--case_{i}", pieces[i]]
         print(f"[run] {' '.join(cmd[:8])} ... ({len(text)} bytes of case)")
         done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
         with open(out[:-5] + ".stderr", "w") as f:
@@ -241,27 +271,30 @@ def collect(args) -> str:
     n, hidden = int(doc["image_rows"]), int(doc["hidden"])
     rows = np.asarray(doc["canvas_hidden"], dtype=np.float32).reshape(n + 1, hidden)
 
+    logits = dump["encode.logits"]
+    # The argmax is NOT compared as a tensor: it is a token id, and the
+    # distance between two ids says nothing (a flipped near-tie is a whole
+    # vocabulary apart and a rounding error in the logits). It is reported
+    # as an agreement COUNT beside the winning logit, which is comparable.
     mine = {
-        "denoise.hidden.image": rows[:n],
-        "denoise.hidden.timestep_row": rows[n],
-        "encode.argmax": np.asarray(doc["encode_argmax"], dtype=np.float32),
+        "denoise.hidden.image": rows[1:],
+        "denoise.hidden.timestep_row": rows[0],
         "encode.max": np.asarray(doc["encode_max"], dtype=np.float32),
     }
-    logits = dump["encode.logits"]
     theirs = {
         "denoise.hidden.image": dump["denoise.hidden.image"],
         "denoise.hidden.timestep_row": dump["denoise.hidden.timestep_row"],
-        "encode.argmax": logits.argmax(axis=-1).astype(np.float32),
         "encode.max": logits.max(axis=-1).astype(np.float32),
     }
     a = os.path.join(args.out, "hy3_mini_pie.npz")
     b = os.path.join(args.out, "hy3_mini_target.npz")
     np.savez(a, **mine)
     np.savez(b, **theirs)
-    agree = int((mine["encode.argmax"] == theirs["encode.argmax"]).sum())
+    theirs_argmax = logits.argmax(axis=-1)
+    agree = int((np.asarray(doc["encode_argmax"]) == theirs_argmax).sum())
     print(
         f"[collect] canvas {rows.shape} (image rows {n}, one <timestep> row), "
-        f"argmax {agree}/{len(theirs['encode.argmax'])} agree "
+        f"prefill argmax {agree}/{len(theirs_argmax)} agree "
         f"({layout['token_h']}x{layout['token_w']} grid) -> {a}; golden -> {b}"
     )
     return a

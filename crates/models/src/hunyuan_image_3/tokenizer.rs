@@ -12,11 +12,15 @@
 //!
 //! plus `<cfg>` (the unconditional branch replaces every prompt token with
 //! it, so both CFG branches have identical length, identical masks and
-//! identical rotary positions), and `<guidance>` / `<timestep_r>` on the
-//! Instruct-Distil SKU. The stage markers `<think>`/`<recaption>`/
-//! `<answer>` are read by the AR phases' forced-transition logits
-//! processor, which is a guest epilogue mask over `logits()` (design D10)
-//! and needs each of them to be one id.
+//! identical rotary positions), and `<guidance>` on the CFG-distilled SKU.
+//! **`<timestep_r>` is NOT demanded**: MeanFlow's second timestep token is
+//! spelled only by the Instruct-Distil tokenizer, and the base repo's
+//! vocabulary (verified: 127 957 BPE pieces plus 2 126 added tokens) does
+//! not carry it. A row that reads it would refuse every base checkpoint.
+//!
+//! The stage markers `<think>` / `<recaption>` / `<answer>` are read by the
+//! AR phases' forced-transition logits processor, which is a guest epilogue
+//! mask over `logits()` (design D10) and needs each of them to be one id.
 //!
 //! **Three ids are pinned** because the row's identity hangs on them: they
 //! are `config.json`'s own `im_start_id` / `im_end_id` / `image_token_id`,
@@ -48,7 +52,6 @@ pub const IMAGE_TOKENS: &[&str] = &[
     "<cfg>",
     "<timestep>",
     "<guidance>",
-    "<timestep_r>",
     "<joint_img_sep>",
     "<img_size_1024>",
     "<img_ratio_0>",

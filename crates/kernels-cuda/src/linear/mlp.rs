@@ -170,7 +170,13 @@ pub fn swiglu_clamp_split(
     ))
 }
 
-pub fn geglu_tanh(ctx: &Ctx, gate: Tensor, up: Tensor, fan: u32, y: &mut Tensor) -> Result<(), Error> {
+pub fn geglu_tanh(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    fan: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
     const OP: &str = "linear.mlp_geglu_tanh";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let n = y.elements();
@@ -203,11 +209,19 @@ pub fn geglu_tanh(ctx: &Ctx, gate: Tensor, up: Tensor, fan: u32, y: &mut Tensor)
 ///
 /// # Errors
 ///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for an
-/// empty rectangle or an extent past a 32-bit launch.
+/// [`Error::DtypeUnsupported`] for anything but bf16, f16 and f32 -- the last
+/// for a LANE VECTOR's chain, which stays f32 end to end (`elemwise::silu`
+/// already serves it there, and a timestep embedder whose activation is GELU
+/// rather than SiLU reaches this entry through
+/// `elemwise::activation::gelu_tanh`); a refusal for an empty rectangle or an
+/// extent past a 32-bit launch.
 pub fn gelu_tanh(ctx: &Ctx, x: Tensor, fan: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_gelu_tanh";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(
+        OP,
+        x.dtype,
+        { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" }
+    );
     let n = y.elements();
     let lanes = u32::try_from(n).map_err(|_| {
         refuse(

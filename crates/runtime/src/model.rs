@@ -582,6 +582,36 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "flux_2",
     },
+    // HunyuanImage 3 (M6). Its trunk IS its text model, so `vocab` is the
+    // real logits width the AR phases sample from and `layers` the trunk's
+    // depth. The `-tp4` rows serve the same plan across four ranks; the
+    // one-rank row is what `pie model import` converts through.
+    Row {
+        id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16",
+        layers: 32,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
+    Row {
+        id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
+        layers: 32,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
+    Row {
+        id: "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
+        layers: 32,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
+    // The miniature: two layers, the real vocabulary (the checkpoint's
+    // special ids live above 128 000, so `nn.Embedding` cannot shrink it).
+    Row {
+        id: "hunyuanimage3-mini-bf16-kv-bf16",
+        layers: 2,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes

@@ -511,7 +511,9 @@ impl Model {
                 norm_out: GroupNorm::at("final_layer.norm_out", hw),
                 conv_out: Conv::at("final_layer.conv", LATENT_CHANNELS, hw, CONV3, banks),
             },
-            ones: Weight::sym("special.ones", [2 * hidden, 1], banks).packed([hidden, hidden]),
+            // REPLICATED: the flag it spreads modulates a full-width
+            // port rectangle, so every rank wants the whole column.
+            ones: Weight::sym("special.ones", [2 * hidden, 1], banks),
         }
     }
 
