@@ -1012,7 +1012,14 @@ pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
     let Some(first) = widths.next() else {
         return (false, 0);
     };
-    (true, if widths.all(|width| width == first) { first } else { 0 })
+    (
+        true,
+        if widths.all(|width| width == first) {
+            first
+        } else {
+            0
+        },
+    )
 }
 
 /// Returns the single registered model. Panics if called before bootstrap

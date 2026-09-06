@@ -627,6 +627,12 @@ Measured (bf16 pie vs the fp32 golden), under the mini-dit gate
 | `refine.video` | 0.0204 | 0.0043 | 0.99999 |
 | `refine.audio` | 0.0345 | 0.0047 | 0.99999 |
 
+The FLAGSHIP row's import is checked against the real 201 GB snapshot:
+`pie model import <snapshot> --sku ltx25-bf16-kv-bf16 --dry-run` lands every
+plane the flagship declares (13.0 GiB decoded — the reordered tables and the
+doubled head projection — and 28.3 GiB copied through). Nothing runs it yet:
+the arm has no `text` reading and no VAE.
+
 `matters` is the claim a parity gate cannot make on its own: **every
 conditioning stream moves the answer.** It perturbs each in turn and demands
 the velocity move by more than ten times the gate's own slack — the video by
