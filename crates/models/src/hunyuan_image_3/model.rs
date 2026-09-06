@@ -185,7 +185,11 @@ impl Dims {
             q_heads: 4,
             kv_heads: 2,
             head_dim: 64,
-            vocab: 4096,
+            // The REAL vocabulary even at hidden 256: the checkpoint's
+            // `pad_token_id` is 128 009 and `nn.Embedding` refuses a padding
+            // index outside its table, so `hy3_golden.py --mini` cannot
+            // shrink it.
+            vocab: 133_120,
             experts: 8,
             top_k: 2,
             moe_inter: 256,
