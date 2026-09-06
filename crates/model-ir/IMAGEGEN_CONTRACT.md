@@ -130,3 +130,69 @@ both. `lane_of_row` is `request_of_token()` (`[Tokens] i32`) for a `[Lanes, ·]`
 `a_forward_may_return_its_velocity_instead_of_logits`, `a_row_permutation_keeps_the_row_space`,
 `the_axis_rope_states_its_axes_once`; `model-compiler/tests/a_ragged_attention_over_two_arms_bakes_into_one_region`;
 `model-ir` unit tests in `fuse.rs`, `value.rs`, `request.rs`.
+
+## 6. How the CUDA engine serves §1–§2 (M0 round 2)
+
+What `engine-cuda` (with `model-exec`) does with the tables and ports above — the refinements
+a runtime or another shell must agree with. Tests: `engine-cuda/tests/a_double_block_fires_two_streams_through_the_engine`,
+`a_second_fire_reads_the_port_cells_it_was_handed`, `a_missing_or_misshapen_port_feed_is_refused_by_name`,
+`a_dit_plan_loads_at_a_sixty_four_k_row_ceiling`; `model-exec/src/fire/packing.rs` unit tests.
+
+- **Lanes.** `Lane.stream` / `Lane.group` / `Lane.ports` reach the shell as stated
+  (`serve::Seated { stream, group, ports }`); the word is the runtime's (`Model::word(.., stream,
+  reading)`), never re-derived. `Lane.group == None` is a group of its own. A token-less lane
+  (`tokens = vec![0; rows]`, `kv: KvDelta::default()`) is accepted: a plan with no kv space seats
+  no page, makes no pool demand, and its lanes' rows are bounded by `Budget::max_tokens` alone.
+- **Groups are fire-global** (`model_exec::fire::packing`). `GroupOfLane` numbers groups densely
+  from 0 in order of first appearance in fire-lane order. Every `GroupIndptr { select }` is indexed
+  by that id: a group none of the selection's lanes belong to is an EMPTY segment (the bound
+  repeats), so the two sides of a cross-attention pair segment `g` with segment `g` even when one
+  side has no lane in some group. Tables are staged `[lane ceiling + 1]` (padding repeats the last
+  bound) and handed to `attention.ragged` whole; the kernel reads no seat word.
+- **The packed rectangle stands at the selection's window.** Packed row `j` of selection `S` is
+  fire row `origin_S + j`, `origin_S` = the first fire row of `S`'s lanes (0 for `Selection::ALL`,
+  the joint attention). `RowPermutation`/`ReferenceTag` are fire-wide `[Tokens]` tables, `-1`
+  outside `[origin_S, origin_S + rows_S)`; CSR bounds are absolute rows of that rectangle. A
+  selection whose lanes' rows are not one contiguous run of the fire (classes seriated apart) is
+  refused (`model_exec::fire::Fault::ScatteredSelection`) rather than packed over another class's
+  rows.
+- **`ReferenceSelfOnly`** is served with the kernel's one-tail-per-group mask (reference lanes pack
+  last in their group; `packing::Packed::reference_start`). A group with two reference lanes is
+  refused by name at submit.
+- **Ports.** Every `(kind, port)` a lane's CLASS reads must be fed (`Lane::ports`) from a channel the
+  instance ATTACHED to that lane carries (the `SelfCondInput::channels` precedent): the feed reads
+  the channel's committed cell at the consumer head — what the instance's own `take` would read
+  this fire — resolved at enqueue after the prologue. A missing feed, a feed for an undeclared
+  port, or a lane with no attachment is refused by name at submit; a synthetic (arming) fire feeds
+  nothing. Cell shape: `Latents`/`Context` `rows × width` in the port's dtype, `AxisPositions`
+  `rows × axes` f32, `LaneVector` `1 × width` f32 (one cell per lane). An f32 cell into a bf16
+  port is cast on the way (`linear.quant_cast_fp32_to`); any other mismatch is refused naming the
+  port, the lane, the cell bytes and the wanted bytes. The rectangles live in the inputs store at
+  `[max_tokens, width]` (`[max_lanes, width]` for lane vectors); rows a lane does not feed keep
+  the last fire's bytes.
+- **Readback.** The readout seam is `out` (logits, bf16) when the plan has one, else `velocity`,
+  else the last `hidden` — `LaneReadout { seam, width, values }` through `settle_frame`, bf16 or
+  f32 planes widened to f32, rows per `Readout::Rows`. `ModelProfile { has_velocity, velocity_width }`
+  is read off the `velocity` seam's width; `vocab` is 0 for a plan with no `out`. An epilogue
+  attachment gets `IntrinsicId::Velocity` (the velocity plane) and `IntrinsicId::Hidden` (the last
+  hidden plane) bound at the lane's first row, `width = plane.width`, storage raw-bf16 or f32 as
+  the arena holds it; `Logits` is bound only when the readout seam is logits.
+- **Lane-shaped values** (`[Lanes, ·]`: a lane vector's chain) are carved and computed at the
+  fire's lane carve (the key's lane ceiling for a body) and launched without the staged seat
+  (`Run::unseated`); an f32 lane activation's `linear.matmul` takes `linear::lane_gemm`.
+  `GeomKind::RequestOfToken` is staged by every fire (`[carve rows]`, lane 0 past the live rows).
+- **Fusion.** `fuse::modulation` runs in the CUDA load chain; the fused arm launches the fused
+  kernel only for `ScaleShift` over a whole-row norm (`Layernorm`, or `Rmsnorm` with `head_dim ==
+  width`) and lands the traced pair otherwise; `normed` is written on its own only when some node
+  reads it.
+- **Bodies.** A new arming kind, `joint`, arms every present set a multi-class region spans (the
+  MM-DiT fire: text and image classes together), one body per stated bucket, golden-checked
+  against its eager walk like the rest. State `buckets` for a large ceiling: the default lattice
+  is every power of two up to `max_tokens`, and each rung fires synthetics of that many rows at
+  load. Measured on the miniature: `max_tokens = 65536, buckets = [8192, 32768]` loads in 1.2 s
+  (arena 56 MiB, inputs 10 MiB — no mask slab is carved for a plan with no `attention.masked`
+  arm; at a real context that slab and its nine pinned mirrors would be gigabytes).
+- **Known limits.** Split-form and erf-gelu: `gelu(tanh = false)` is refused by name. A lane-shaped
+  launch in a captured region whose window does not begin at fire row 0 is not exercised. The
+  `layout.pack_rows` window must equal the selection's rows (a text reads `row_permutation()` on
+  the arm it packs, or on the root for a merge).
