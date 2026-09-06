@@ -188,7 +188,18 @@ fn roles() -> Result<Roles> {
         )
         .into());
     }
-    let decode = readings.iter().find(|r| r.name == "vae.decode").cloned();
+    // The decoder, by role: a `Pixels` readout is what says "this arm ends
+    // in pixels", and the one other reading that carries it is the ENCODER,
+    // whose pixels are its input and whose readout is latent rows. The name
+    // separates them, and it is the design's own vocabulary (D1's reading
+    // list), not a family's.
+    let decode = readings
+        .iter()
+        .find(|r| {
+            r.name == "vae.decode"
+                || (r.readout == model::ReadoutKind::Pixels && r.name != "vae.encode")
+        })
+        .cloned();
     Ok(Roles {
         text,
         denoise,
