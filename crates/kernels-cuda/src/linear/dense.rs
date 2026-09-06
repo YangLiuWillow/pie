@@ -502,7 +502,14 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
             Arc::new(Mutex::new(Device {
                 lt: LtCtx {
                     handle: std::ptr::null_mut(),
-                    workspace_bytes: 64 * 1024 * 1024,
+                    // Eight MiB, not sixty-four: the slab is cut once per
+                    // recorded region (`jit::device` keys scratch by region
+                    // so a captured graph's address stays put), and a
+                    // deployment arms a hundred-odd bodies — at 64 MiB that
+                    // was 7.5 GB of workspace on a 46 GB card, the memory
+                    // that refused an eighth diffusion canvas. Ada's Lt
+                    // heuristics want a few MiB for these shapes.
+                    workspace_bytes: 8 * 1024 * 1024,
                 },
                 plans: HashMap::new(),
                 chosen: HashMap::new(),

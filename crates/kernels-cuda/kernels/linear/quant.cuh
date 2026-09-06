@@ -829,6 +829,9 @@ __global__ void moe_route_order(
     const i32* __restrict__ routes,
     i32* __restrict__ order,
     i32* __restrict__ offsets,
+    i32* __restrict__ work,
+    int work_cap,
+    int group_routes,
     int top_k,
     int route_count,
     int num_experts,
@@ -869,6 +872,21 @@ __global__ void moe_route_order(
         if (e < 0 || e >= num_experts) e = num_experts;
         const int pos = counts[e] + atomicAdd(fill + e, 1);
         order[pos] = base + r;
+    }
+    // The work list the tensor-core select launches over: one item per
+    // (expert, `group_routes`-wide slice of its run), `expert * 65536 +
+    // slice`, so a popular expert's routes spread over as many blocks as
+    // an unpopular one's few — the grid is level whatever the routing.
+    // `work_cap` bounds the list (`route_count / group_routes +
+    // num_experts` covers every routing); the count lands past the last
+    // offset, at `offsets[num_experts + 1]`.
+    if (threadIdx.x == 0) {
+        int w = 0;
+        for (int e = 0; e < num_experts && w < work_cap; ++e) {
+            const int c = counts[e + 1] - counts[e];
+            for (int g = 0; g * group_routes < c && w < work_cap; ++g) work[w++] = e * 65536 + g;
+        }
+        offsets[num_experts + 1] = w;
     }
 }
 
@@ -1032,11 +1050,43 @@ __global__ void moe_matmul_select_mlxu4_grouped(
 // more than the decode they saved — 1.9 ms a call against 1.4.) Routes
 // past the group and rows past N see zeros and are not written. Only for
 // a bf16 activation; f16 takes the fp32 kernel.
+// `ldmatrix` and `mma.sync` spelled directly: the wmma API's fragment loads
+// compiled to a run of scalar shared loads per fragment, and the select's
+// mma phase was paying ~190 cycles an mma for them.
+__device__ __forceinline__ void pie_ldmatrix_x4(unsigned (&r)[4], const void* row) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(row));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
+}
+// Global loads that ask the L2 to fill the whole 128-byte line. The select
+// reads 64-byte pieces of 128 rows a chunk (the row stride is the codes
+// row), and the next chunk wants the other half of every line: without
+// the hint the L2 fetched two sectors a line and the DRAM saw 64-byte
+// pieces scattered over as many pages, ~490 GB/s on an L40S in a pure-read
+// mock of the pattern; with it ~670.
+__device__ __forceinline__ uint4 pie_ld_line(const uint4* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L2::128B.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ unsigned short pie_ld_line_u16(const unsigned short* p) {
+    unsigned short v;
+    asm volatile("ld.global.nc.L2::128B.u16 %0, [%1];\n" : "=h"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ void pie_mma_bf16_16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 template <int kBits, int kGroup>
 __global__ void moe_matmul_select_mlxu4_wmma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
     const u8* __restrict__ codes,
     const u8* __restrict__ scales,
     const u8* __restrict__ biases,
@@ -1060,12 +1110,16 @@ __global__ void moe_matmul_select_mlxu4_wmma(
     constexpr int kPerWord = 32 / kBits;
     constexpr unsigned kMask = (1u << kBits) - 1u;
     static_assert(kRoutes * kLd * 2 >= kWarps * 16 * 16 * 4, "the C tiles fit where the activations were");
-    const int expert = blockIdx.x;
-    if (expert >= num_experts) return;
+    // One work item per block: an expert and a `kRoutes`-wide slice of
+    // its run (`moe_route_order`'s list; the count sits past the offsets).
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item / 65536;
+    const int slice = item % 65536;
     const int row0 = blockIdx.y * kTileN;
     if (row0 >= n) return;
-    const int begin = offsets[expert];
-    const int end = offsets[expert + 1];
+    const int begin = offsets[expert] + slice * kRoutes;
+    const int end = min(offsets[expert + 1], begin + kRoutes);
     if (begin >= end) return;
     if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
         atomicAdd(group_hits, static_cast<unsigned>(end - begin));
@@ -1110,20 +1164,48 @@ __global__ void moe_matmul_select_mlxu4_wmma(
     constexpr int kVecsPerThread = kRoutes * kVecsPerTileK / 256;
     static_assert(kGroup % kQuadCodes == 0, "a quad lies within one group");
     static_assert(kTileN * kQuadsPerTileK % 256 == 0 && kRoutes * kVecsPerTileK % 256 == 0, "even split");
+    // The scale and zero point ride as their raw bf16 bits: converting them
+    // at fetch time made the thread wait out the load's latency right
+    // there, once per chunk, in series — the fetch was 40–57 % of a block's
+    // cycles and the kernel sat at half the card's bandwidth.
     struct Staged {
         uint4 quad[kQuadsPerThread];
-        float scale[kQuadsPerThread];
-        float zero[kQuadsPerThread];
+        unsigned short scale_bits[kQuadsPerThread];
+        unsigned short zero_bits[kQuadsPerThread];
         bool quad_live[kQuadsPerThread];
         uint4 vec[kVecsPerThread];
     };
+    const unsigned short* s_bits = reinterpret_cast<const unsigned short*>(s16);
+    const unsigned short* b_bits = reinterpret_cast<const unsigned short*>(b16);
 
-    for (int g0 = begin; g0 < end; g0 += kRoutes) {
-        const int group = min(kRoutes, end - g0);
+    {
+        const int g0 = begin;
+        const int group = end - g0;
         const int batches = (group + kBatch - 1) / kBatch;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kBatches];
+        // Accumulators: per route batch, two n8 tiles of m16n8 C fragments.
+        float acc[kBatches][2][4];
 #pragma unroll
-        for (int b = 0; b < kBatches; ++b) wmma::fill_fragment(acc[b], 0.0f);
+        for (int b = 0; b < kBatches; ++b)
+#pragma unroll
+            for (int t = 0; t < 2; ++t)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[b][t][e] = 0.f;
+
+        // Each activation vector this thread fetches comes from one route's
+        // row for the whole group: resolve the route once here, not once a
+        // chunk — reading `order[]` inside the fetch put a dependent load
+        // ahead of every activation load, a full latency serialised into
+        // each of the twenty-two chunks.
+        const bf16* vec_src[kVecsPerThread];
+#pragma unroll
+        for (int i = 0; i < kVecsPerThread; ++i) {
+            const int t = (tid + i * 256) / kVecsPerTileK;
+            vec_src[i] = nullptr;
+            if (t < group) {
+                const int plane_route = order[g0 + t];
+                vec_src[i] = act + static_cast<long long>(plane_route / act_div) * k;
+            }
+        }
 
         // Fetch chunk `k0`'s share of this thread into `st`. Only whole
         // quads and vectors inside K and N are fetched; the rest is zeroed
@@ -1140,23 +1222,19 @@ __global__ void moe_matmul_select_mlxu4_wmma(
                 st.quad_live[i] = kk + kQuadCodes <= k && rr < n;
                 if (st.quad_live[i]) {
                     const long long fx = static_cast<long long>(rr) * groups_per_row + kk / kGroup;
-                    st.scale[i] = Elem<bf16>::to_f32(s16[fx]);
-                    st.zero[i] = Elem<bf16>::to_f32(b16[fx]);
-                    st.quad[i] = *reinterpret_cast<const uint4*>(
-                        w32 + static_cast<long long>(rr) * words_per_row + kk / kPerWord);
+                    st.scale_bits[i] = pie_ld_line_u16(s_bits + fx);
+                    st.zero_bits[i] = pie_ld_line_u16(b_bits + fx);
+                    st.quad[i] = pie_ld_line(reinterpret_cast<const uint4*>(
+                        w32 + static_cast<long long>(rr) * words_per_row + kk / kPerWord));
                 }
             }
 #pragma unroll
             for (int i = 0; i < kVecsPerThread; ++i) {
-                const int idx = tid + i * 256;
-                const int t = idx / kVecsPerTileK;
-                const int v = idx % kVecsPerTileK;
+                const int v = (tid + i * 256) % kVecsPerTileK;
                 const int kk = k0 + v * kVec;
                 st.vec[i] = make_uint4(0u, 0u, 0u, 0u);
-                if (t < group && kk + kVec <= k) {
-                    const int plane_route = order[g0 + t];
-                    st.vec[i] = *reinterpret_cast<const uint4*>(
-                        act + static_cast<long long>(plane_route / act_div) * k + kk);
+                if (vec_src[i] != nullptr && kk + kVec <= k) {
+                    st.vec[i] = *reinterpret_cast<const uint4*>(vec_src[i] + kk);
                 }
             }
         };
@@ -1169,6 +1247,8 @@ __global__ void moe_matmul_select_mlxu4_wmma(
                 const int q = idx % kQuadsPerTileK;
                 unsigned* dst = reinterpret_cast<unsigned*>(&w_tile[r][q * kQuadCodes]);
                 if (st.quad_live[i]) {
+                    const float sv = __uint_as_float(static_cast<unsigned>(st.scale_bits[i]) << 16);
+                    const float zv = __uint_as_float(static_cast<unsigned>(st.zero_bits[i]) << 16);
                     const unsigned words[kQuadWords] = {st.quad[i].x, st.quad[i].y, st.quad[i].z, st.quad[i].w};
 #pragma unroll
                     for (int w = 0; w < kQuadWords; ++w) {
@@ -1176,8 +1256,7 @@ __global__ void moe_matmul_select_mlxu4_wmma(
                         for (int j = 0; j < kPerWord; j += 2) {
                             const float c0 = static_cast<float>((words[w] >> (kBits * j)) & kMask);
                             const float c1 = static_cast<float>((words[w] >> (kBits * (j + 1))) & kMask);
-                            dst[(w * kPerWord + j) / 2] = pack_bf16x2(
-                                fmaf(c0, st.scale[i], st.zero[i]), fmaf(c1, st.scale[i], st.zero[i]));
+                            dst[(w * kPerWord + j) / 2] = pack_bf16x2(fmaf(c0, sv, zv), fmaf(c1, sv, zv));
                         }
                     }
                 } else {
@@ -1238,24 +1317,45 @@ __global__ void moe_matmul_select_mlxu4_wmma(
             if (k0 + kTileK < k) fetch(k0 + kTileK, staged);
 #pragma unroll
             for (int kk = 0; kk < kTileK; kk += 16) {
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-                wmma::load_matrix_sync(
-                    b, reinterpret_cast<const __nv_bfloat16*>(&w_tile[warp * 16][kk]), kLd);
+                // B: this warp's sixteen rows (n) by sixteen k, as two n8
+                // tiles — matrices (n0-7,k0-7) (n0-7,k8-15) (n8-15,k0-7)
+                // (n8-15,k8-15), one ldmatrix.
+                unsigned bfrag[4];
+                pie_ldmatrix_x4(bfrag, &w_tile[warp * 16 + (lane & 7) + ((lane >> 4) << 3)][kk + (((lane >> 3) & 1) << 3)]);
+                // Both batches, always: the rows past `group` are zero in
+                // `x_tile`, so an absent batch costs its mma and nothing
+                // else — and a branch here on the runtime `batches` kept
+                // the compiler from hoisting the next step's fragment loads
+                // over this step's mma, which doubled the kernel (1.47 ms
+                // → 0.75 ms on the up leg at 2048 routes).
 #pragma unroll
                 for (int bt = 0; bt < kBatches; ++bt) {
-                    if (bt < batches) {
-                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-                        wmma::load_matrix_sync(
-                            a, reinterpret_cast<const __nv_bfloat16*>(&x_tile[bt * kBatch][kk]), kLd);
-                        wmma::mma_sync(acc[bt], a, b, acc[bt]);
-                    }
+                    // A: sixteen routes by sixteen k — matrices (m0-7,k0-7)
+                    // (m8-15,k0-7) (m0-7,k8-15) (m8-15,k8-15).
+                    unsigned afrag[4];
+                    pie_ldmatrix_x4(afrag, &x_tile[bt * kBatch + (lane & 15)][kk + ((lane >> 4) << 3)]);
+                    pie_mma_bf16_16816(acc[bt][0], afrag, bfrag[0], bfrag[1]);
+                    pie_mma_bf16_16816(acc[bt][1], afrag, bfrag[2], bfrag[3]);
                 }
             }
             __syncthreads();
         }
         // The activations are spent; their tile holds the C tiles now.
         for (int bt = 0; bt < batches; ++bt) {
-            wmma::store_matrix_sync(c_tile + warp * 16 * 16, acc[bt], 16, wmma::mem_row_major);
+            // The m16n8 C fragment: lane holds rows lane/4 and lane/4 + 8,
+            // columns (lane % 4) * 2 and + 1, of each n8 tile.
+            {
+                float* mine = c_tile + warp * 16 * 16;
+                const int m = lane >> 2;
+                const int col = (lane & 3) << 1;
+#pragma unroll
+                for (int t = 0; t < 2; ++t) {
+                    mine[m * 16 + t * 8 + col] = acc[bt][t][0];
+                    mine[m * 16 + t * 8 + col + 1] = acc[bt][t][1];
+                    mine[(m + 8) * 16 + t * 8 + col] = acc[bt][t][2];
+                    mine[(m + 8) * 16 + t * 8 + col + 1] = acc[bt][t][3];
+                }
+            }
             __syncthreads();
             for (int idx = lane; idx < 16 * 16; idx += 32) {
                 const int m = idx / 16;

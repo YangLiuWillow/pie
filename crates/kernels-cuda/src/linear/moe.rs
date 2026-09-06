@@ -677,19 +677,33 @@ fn matmul_select_mlxu4(
     /// From this many routes on, the grouped kernel (one block per expert
     /// × 128 rows, the bank decoded once per expert) beats the per-route
     /// GEMV; below it a decode step's handful of routes is the GEMV's.
-    const GROUPED_FROM: u32 = 256;
+    /// Priced on an L40S at gemma-4-26B-A4B's shapes
+    /// (`the_expert_select_is_priced_by_its_bytes`, u4 up leg): 16 routes
+    /// 0.058 vs 0.063 ms, 32 routes 0.096 vs 0.115, 64 routes 0.134 vs
+    /// 0.220, 160 routes 0.299 vs 0.533 — the GEMV re-reads an expert per
+    /// route, the grouped kernel once per expert. One token's eight routes
+    /// stay the GEMV's.
+    const GROUPED_FROM: u32 = 16;
     const GROUPED_TILE_N: u32 = 128;
     const GROUPED_BLOCK: u32 = 256;
+    /// Routes a tensor-core block takes at once (the kernel's `kRoutes`);
+    /// the work list slices every expert's run this wide.
+    const WMMA_ROUTES: u32 = 32;
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    // The order slab: `route_count` route ids, then `experts + 2` offsets.
+    // The order slab: `route_count` route ids, `experts + 2` offsets (the
+    // last one the work count), then the work list — at most one slice
+    // per `WMMA_ROUTES` routes plus one per expert, whatever the routing.
     let order_words = fan.route_count as usize;
     let offsets_at = order_words.next_multiple_of(64);
+    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
+    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
     let order = ctx.scratch(
         op,
         ROUTE_ORDER,
-        (offsets_at + experts as usize + 2) * core::mem::size_of::<i32>(),
+        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
     )? as usize as u64;
     let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
     ctx.fire(
         op,
         Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
@@ -698,6 +712,9 @@ fn matmul_select_mlxu4(
             routes.arg(),
             ArgValue::Ptr(order),
             ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            stated(op, work_cap)?.arg(),
+            WMMA_ROUTES.arg(),
             fan.top_k.arg(),
             stated(op, fan.route_count)?.arg(),
             stated(op, experts)?.arg(),
@@ -716,28 +733,32 @@ fn matmul_select_mlxu4(
                  ::pie::i32({group})>"
             )
         };
+        // The tensor-core form launches over the work list (a level grid);
+        // the fp32 form still walks an expert per block.
+        let wmma = x.dtype == Dtype::Bf16;
+        let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
+        if wmma {
+            args.push(ArgValue::Ptr(work));
+        }
+        args.extend([
+            codes.arg(),
+            scales.arg(),
+            biases.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
+        ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.cuh", symbol(&entry))
-            .apply(Launch::grid(
-                [experts, y.width.div_ceil(GROUPED_TILE_N), 1],
+            Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
+                [if wmma { work_cap } else { experts }, y.width.div_ceil(GROUPED_TILE_N), 1],
                 [GROUPED_BLOCK, 1, 1],
             )),
-            &[
-                x.arg(),
-                ArgValue::Ptr(order),
-                ArgValue::Ptr(offsets),
-                codes.arg(),
-                scales.arg(),
-                biases.arg(),
-                y.arg(),
-                act_div.arg(),
-                n.arg(),
-                k.arg(),
-                stated(op, experts)?.arg(),
-                ArgValue::Ptr(seat.cell),
-                ArgValue::Ptr(seat.hits),
-            ],
+            &args,
         );
     }
     ctx.fire(

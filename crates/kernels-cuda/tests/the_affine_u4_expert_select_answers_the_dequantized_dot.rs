@@ -73,8 +73,12 @@ fn bank(lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> Bank {
 /// TO BF16 — what the tensor-core kernel (and transformers, whose
 /// dequantized bank is a bf16 tensor) multiply; the per-route GEMV keeps
 /// the weight in f32.
+/// The reference rounds as the kernel the route count selects does: from
+/// sixteen routes on the grouped tensor-core kernel (`moe.rs`,
+/// `GROUPED_FROM`) multiplies bf16 weights; under it the per-route GEMV
+/// keeps f32.
 fn check(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, by_token: bool, seed: u64) {
-    check_with(experts, n, k, tokens, top_k, by_token, seed, false);
+    check_with(experts, n, k, tokens, top_k, by_token, seed, tokens * top_k >= 16);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -153,7 +157,13 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
 fn the_up_leg_read_by_token() {
     // 128 x [1408, 2816] would take a while on the host reference; the
     // layout and the kernel's group walk are the same at 16 experts.
+    // Three tokens' 24 routes: the grouped kernel.
     check(16, 1408, 2816, 3, 8, true, 0x51);
+}
+
+#[test]
+fn the_up_leg_read_by_token_at_one_token_takes_the_gemv() {
+    check(16, 1408, 2816, 1, 8, true, 0x54);
 }
 
 #[test]
@@ -162,15 +172,21 @@ fn the_down_leg_read_by_route_over_eleven_groups() {
 }
 
 #[test]
+fn the_down_leg_read_by_route_at_one_token_takes_the_gemv() {
+    check(16, 2816, 704, 1, 8, false, 0x55);
+}
+
+#[test]
 fn every_expert_of_the_full_bank_is_addressed() {
     check(128, 64, 704, 16, 8, true, 0x53);
 }
 
-// From 256 routes on the select takes the GROUPED kernel (one block per
+// From sixteen routes on the select takes the GROUPED kernel (one block per
 // expert × 128 rows, the bank decoded once per expert to bf16 and the dot
-// on tensor cores — `moe.rs`, `GROUPED_FROM`); the three above stay on the
-// per-route GEMV. Same answer on both legs to bf16-weight arithmetic, with
-// rows past a 128-tile and a K that is not a whole number of 128-chunks.
+// on tensor cores — `moe.rs`, `GROUPED_FROM`); one token's eight routes
+// stay on the per-route GEMV. Same answer on both legs to bf16-weight
+// arithmetic, with rows past a 128-tile and a K that is not a whole number
+// of 128-chunks.
 
 #[test]
 fn a_wide_fire_takes_the_grouped_kernel_on_the_up_leg() {
