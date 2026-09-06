@@ -422,6 +422,68 @@ fn q_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node> {
     })
 }
 
+/// A `select` and the [`Elementwise::EmbedScaleAdd`] that folds the copied
+/// slice, adjacent under one guard with nothing else reading the copy,
+/// become [`Elementwise::EmbedScaleAddSelect`]: the residual is read off
+/// the stacked table in place. Run after [`residual_chains`], which emits
+/// the select ahead of the fused fold.
+#[must_use]
+pub fn embed_select(trace: Trace) -> Trace {
+    fold_pairs(trace, embed_select_pair)
+}
+
+/// Nodes `i` and `i + 1` as one select-folded embed node, if they are the pair.
+fn embed_select_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node> {
+    let (first, second) = (&nodes[i], &nodes[i + 1]);
+    if first.guard != second.guard {
+        return None;
+    }
+    let (
+        Operation::Layout(Layout::Select {
+            table: stacked,
+            layer,
+            width,
+            y: copied,
+        }),
+        Operation::Elementwise(Elementwise::EmbedScaleAdd {
+            ids,
+            table,
+            vocab,
+            e,
+            embed_scale,
+            e_scaled,
+            y,
+            y_out,
+            out_scale,
+            y_scaled,
+        }),
+    ) = (&first.op, &second.op)
+    else {
+        return None;
+    };
+    if y != copied || read_elsewhere(nodes, values, *copied, i) {
+        return None;
+    }
+    Some(Node {
+        op: Operation::Elementwise(Elementwise::EmbedScaleAddSelect {
+            ids: *ids,
+            table: *table,
+            vocab: *vocab,
+            e: *e,
+            embed_scale: *embed_scale,
+            e_scaled: *e_scaled,
+            stacked: *stacked,
+            layer: *layer,
+            width: *width,
+            y_out: *y_out,
+            out_scale: *out_scale,
+            y_scaled: *y_scaled,
+        }),
+        guard: first.guard.clone(),
+        layer: second.layer.or(first.layer),
+    })
+}
+
 /// Every adjacent pair `pair` folds, folded, with the same landing
 /// bookkeeping as [`residual_chains`].
 fn fold_pairs(mut trace: Trace, pair: fn(&[Node], usize, &[ValueDecl]) -> Option<Node>) -> Trace {
@@ -944,6 +1006,73 @@ mod tests {
         assert_eq!(
             q_norm_rope(trace_of(vec![norm(2), rope(128)])).nodes.len(),
             2
+        );
+    }
+
+    /// A select and the embed fold over its copy become one node reading
+    /// the stacked table in place; a second reader of the copy keeps them.
+    #[test]
+    fn a_select_and_the_embed_fold_over_its_copy_fold_unless_the_copy_is_read_again() {
+        let select = Node {
+            op: Operation::Layout(Layout::Select {
+                table: ValueId(10),
+                layer: 3,
+                width: 256,
+                y: ValueId(11),
+            }),
+            guard: Guard::Always,
+            layer: None,
+        };
+        let fold = |y: u32| Node {
+            op: Operation::Elementwise(Elementwise::EmbedScaleAdd {
+                ids: ValueId(0),
+                table: ValueId(1),
+                vocab: 64,
+                e: ValueId(2),
+                embed_scale: 2.0,
+                e_scaled: ValueId(3),
+                y: ValueId(y),
+                y_out: ValueId(12),
+                out_scale: 0.5,
+                y_scaled: ValueId(13),
+            }),
+            guard: Guard::Always,
+            layer: Some(3),
+        };
+        let fused = embed_select(trace_of(vec![select.clone(), fold(11)]));
+        assert_eq!(fused.nodes.len(), 1);
+        let Operation::Elementwise(Elementwise::EmbedScaleAddSelect {
+            stacked,
+            layer,
+            width,
+            y_out,
+            ..
+        }) = &fused.nodes[0].op
+        else {
+            panic!("the pair fused into {:?}", fused.nodes[0].op);
+        };
+        assert_eq!(
+            (*stacked, *layer, *width, *y_out),
+            (ValueId(10), 3, 256, ValueId(12))
+        );
+        let mut aliases = Vec::new();
+        fused.nodes[0].op.aliases(&mut aliases);
+        assert!(aliases.is_empty(), "the folded row is a fresh output");
+
+        let reader = Node {
+            op: Operation::Elementwise(Elementwise::MulScalar {
+                s: 1.0,
+                x: ValueId(11),
+                x_out: ValueId(14),
+            }),
+            guard: Guard::Always,
+            layer: None,
+        };
+        assert_eq!(
+            embed_select(trace_of(vec![select, fold(11), reader]))
+                .nodes
+                .len(),
+            3
         );
     }
 

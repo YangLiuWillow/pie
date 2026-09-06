@@ -107,6 +107,7 @@ impl Run<'_> {
             // this engine never runs that pass, so it never sees these.
             | Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::EmbedScaleAdd { .. }
+            | Elementwise::EmbedScaleAddSelect { .. }
             | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }

@@ -65,6 +65,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
         boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
         boot.trace = model_ir::fuse::q_norm_rope(boot.trace.clone());
+        boot.trace = model_ir::fuse::embed_select(boot.trace.clone());
     }
     if std::env::var_os("PIE_TRACE_CENSUS").is_some() {
         let mut census: std::collections::BTreeMap<&'static str, usize> =

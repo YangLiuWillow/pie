@@ -180,6 +180,24 @@ pub enum Elementwise {
         out_scale: f32,
         y_scaled: ValueId,
     },
+    /// [`Elementwise::EmbedScaleAdd`] whose residual row is layer `layer`'s
+    /// `width`-wide slice of the stacked table `stacked`, read in place —
+    /// the `select` that copied it out folded away (`fuse::embed_select`).
+    /// `y_out` is a fresh row, not an alias.
+    EmbedScaleAddSelect {
+        ids: ValueId,
+        table: ValueId,
+        vocab: u32,
+        e: ValueId,
+        embed_scale: f32,
+        e_scaled: ValueId,
+        stacked: ValueId,
+        layer: u32,
+        width: u32,
+        y_out: ValueId,
+        out_scale: f32,
+        y_scaled: ValueId,
+    },
     AddBias {
         bias: ValueId,
         out: ValueId,
@@ -485,6 +503,12 @@ impl Operands for Elementwise {
                 }
             }
             Self::EmbedScaleAdd { ids, table, y, .. } => sink.extend([*ids, *table, *y]),
+            Self::EmbedScaleAddSelect {
+                ids,
+                table,
+                stacked,
+                ..
+            } => sink.extend([*ids, *table, *stacked]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
             Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
             Self::MulScalar { x, .. } => sink.push(*x),
@@ -564,6 +588,13 @@ impl Operands for Elementwise {
                 y_scaled,
                 ..
             } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
+            Self::EmbedScaleAddSelect {
+                e,
+                e_scaled,
+                y_out,
+                y_scaled,
+                ..
+            } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
             Self::Standardize { x_out, .. } => sink.push(*x_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
@@ -609,6 +640,7 @@ impl Operands for Elementwise {
             // are fresh outputs, since an alias may name only an input.
             Self::RmsnormResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
+            Self::EmbedScaleAddSelect { .. } => {}
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
             Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -656,6 +688,7 @@ impl Operands for Elementwise {
             Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
             Self::RmsnormResidualAdd { .. } => "elementwise.rmsnorm_residual_add",
             Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
+            Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",
             Self::AddBias { .. } => "elementwise.add_bias",
             Self::Standardize { .. } => "elementwise.standardize",
             Self::MulScalar { .. } => "elementwise.mul_scalar",

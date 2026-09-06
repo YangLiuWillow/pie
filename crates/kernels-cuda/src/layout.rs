@@ -135,6 +135,87 @@ pub fn embed_scale_add(
     )
 }
 
+/// [`embed_scale_add`] whose residual is layer `layer`'s `width`-wide slice
+/// of the stacked table `stacked` (the `select` folded away), landing the
+/// folded row in `y_out`.
+///
+/// # Errors
+///
+/// [`Error::Refused`] for a slice past the stacked table or a width other
+/// than the embedded row's, or a launch the runtime refused.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_scale_add_select(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    e: &mut Tensor,
+    embed_scale: f32,
+    e_scaled: &mut Tensor,
+    stacked: Tensor,
+    layer: u32,
+    width: u32,
+    y_out: &mut Tensor,
+    out_scale: f32,
+    y_scaled: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.embed_scale_add_select";
+    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    debug_assert!(
+        ids.rows == y_out.rows && e.rows == y_out.rows && e.width == y_out.width,
+        "the token ids and every row plane share the fire's rows"
+    );
+    let col = layer.checked_mul(width).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("layer {layer}'s slice starts beyond any column: {layer} x {width}"),
+        )
+    })?;
+    if width != y_out.width || col.checked_add(width).is_none_or(|end| end > stacked.width) {
+        return Err(refuse(
+            OP,
+            format!(
+                "layer {layer}'s {width}-wide slice does not sit in a {}-wide stacked row landing a \
+                 {}-wide row",
+                stacked.width, y_out.width
+            ),
+        ));
+    }
+    let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
+    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y_out.width)?)?;
+    let rows = stated(OP, nonzero(OP, "rows", y_out.rows)?)?;
+    let stacked_width = stated(OP, stacked.width)?;
+    let col = stated(OP, col)?;
+    let total = u64::from(y_out.rows) * u64::from(y_out.width);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
+        .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::embed_scale_add_select")
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ids.arg(),
+            table.arg(),
+            e.arg(),
+            embed_scale.arg(),
+            e_scaled.arg(),
+            stacked.arg(),
+            stacked_width.arg(),
+            col.arg(),
+            y_out.arg(),
+            out_scale.arg(),
+            y_scaled.arg(),
+            hidden.arg(),
+            vocab.arg(),
+            rows.arg(),
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn split_qkv(
     ctx: &Ctx,
     packed: Tensor,
