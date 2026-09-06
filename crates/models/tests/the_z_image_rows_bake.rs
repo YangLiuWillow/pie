@@ -218,7 +218,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(
             at(denoise, "context"),
-            (model::port::CONTEXT, PortKind::Context, d.dim)
+            (model::port::CONTEXT_REFINED, PortKind::Latents, d.dim)
         );
         assert_eq!(
             at(denoise, "timestep"),
@@ -235,8 +235,24 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(
             at(refine, "caption"),
-            (model::port::CONTEXT, PortKind::Context, d.cap_width)
+            (model::port::CAPTION, PortKind::Context, d.cap_width)
         );
+
+        // A `(kind, index)` pair is seated once per PLAN, at one width
+        // (`IMAGEGEN_CONTRACT.md` §2): two readings sharing a pair must
+        // agree on its width, or the second reader lands in the first's
+        // rectangle.
+        let mut widths: std::collections::BTreeMap<(String, u8), u32> =
+            std::collections::BTreeMap::new();
+        for (kind, index, width) in &traced {
+            if let Some(have) = widths.insert((kind.clone(), *index), *width) {
+                assert_eq!(
+                    have, *width,
+                    "{sku}: {kind} port {index} is read at two widths ({have} and {width}); \
+                     the engine seats one rectangle per (kind, index)"
+                );
+            }
+        }
         assert_eq!(
             at(refine, "positions"),
             (model::port::POSITIONS, PortKind::AxisPositions, axes)
