@@ -64,6 +64,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if fuse_chains() {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
     }
+    // `PTIR_GUMBEL_DIRECT=0`: keep a program's Gumbel-max head as the
+    // launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
+    if std::env::var("PTIR_GUMBEL_DIRECT").is_ok_and(|value| value == "0") {
+        eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     Ok(Baked {
         device,

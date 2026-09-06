@@ -16,7 +16,10 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// fingerprint change that doesn't move the version fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 28, 0x7c99_21ae_b678_f7ec),
+    // 28 -> 29: `fused_block0.cuh` (spliced into every emitted kernel) grew
+    // `ptir_fast_gumbel_argmax_intrinsic`, and a Gumbel-max head emits a call
+    // to it instead of its four launches.
+    ("cuda", 29, 0x4874_daa4_f583_d367),
     // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and
