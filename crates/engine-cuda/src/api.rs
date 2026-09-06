@@ -532,6 +532,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         Err(_) if shell.readout_seam().is_some() => 0,
         Err(why) => return Err(fault(why)),
     };
+    let (has_pixels, pixels_width) = shell.pixels_facts();
     Ok(ModelProfile {
         vocab,
         page_size: budgets.page_size,
@@ -564,6 +565,12 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // at bind rather than at its first fire.
         has_velocity: shell.velocity_width().is_some(),
         velocity_width: shell.velocity_width().unwrap_or(0),
+        // The pixels seam is the model text's too (design D8): a plan that
+        // plants `seam::PIXELS` binds the `pixels()` intrinsic, at the one
+        // width every planting agrees on or at none when a VAE's decode
+        // lands RGB beside its encode's 16-channel mean.
+        has_pixels,
+        pixels_width,
         kernels: Vec::new(),
     })
 }

@@ -69,6 +69,22 @@ impl Shell {
             .and_then(|width| u32::try_from(width).ok())
     }
 
+    /// The `pixels()` intrinsic's gate and width (`seam::PIXELS`, design
+    /// D8), read off the plan's plantings: available iff the plan plants
+    /// one at all, and as wide as a pixels row when every planting agrees —
+    /// `0` when they do not (a VAE's decode lands RGB and its encode a
+    /// 16-channel mean), which tells bind to check rank and rows alone.
+    /// The runtime's `model::pixels_facts` derives the same pair off the
+    /// family's readings.
+    #[must_use]
+    pub fn pixels_facts(&self) -> (bool, u32) {
+        let mut widths = self.exports.pixels_widths(&self.trace);
+        let Some(first) = widths.next() else {
+            return (false, 0);
+        };
+        (true, if widths.all(|width| width == first) { first } else { 0 })
+    }
+
     /// Which export seam this load's readout rows come off, and the width of
     /// one row: `out`'s vocabulary, or the float seam a plan plants instead
     /// (`velocity`, then the last `hidden`).

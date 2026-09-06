@@ -384,6 +384,58 @@ impl Store {
     }
 }
 
+/// The host twin of a later resolution's grid (D8): the `[Clips, 4]` table
+/// value `grid` would hold, computed from the fire's PORT grid rather than
+/// read back off the device.
+///
+/// Every grid past the port's is a VALUE — `Spatial::Grid { grid, rule, y }`,
+/// one single-block launch per resolution — so nothing on the host knows
+/// where a lane's pixels begin until that launch has run. An epilogue's
+/// `pixels()` binding has to know BEFORE the walk (the intrinsic's base is a
+/// device address the guest program reads), so the chain is replayed here
+/// through `GridRule::apply`, the rule's own host twin. `None` for a `grid`
+/// that is not reachable from the port grid by `Spatial::Grid` alone, or
+/// whose rules do not map a box the fire submitted.
+#[must_use]
+pub(crate) fn host_grid(
+    trace: &model_ir::Trace,
+    port_grid: &[i32],
+    grid: model_ir::ValueId,
+) -> Option<Vec<i32>> {
+    use model_ir::{Def, Operation, RuntimeInput, Spatial};
+
+    // Which `Spatial::Grid` writes each value, walked backwards from `grid`
+    // to the port input. The chain is short (one rule per resolution) and a
+    // trace states each grid once, so a linear scan per link is cheap.
+    let mut rules = Vec::new();
+    let mut at = grid;
+    loop {
+        if matches!(
+            trace.values[at.0 as usize].def,
+            Def::Input(RuntimeInput::Grid)
+        ) {
+            break;
+        }
+        let step = trace.nodes.iter().find_map(|node| match &node.op {
+            Operation::Spatial(Spatial::Grid { grid, rule, y }) if *y == at => Some((*grid, *rule)),
+            _ => None,
+        })?;
+        rules.push(step.1);
+        at = step.0;
+        // A cycle would be a malformed trace; the bound is the trace's own
+        // value count, which every chain is shorter than.
+        if rules.len() > trace.values.len() {
+            return None;
+        }
+    }
+    rules.reverse();
+    let mut table = port_grid.to_vec();
+    for rule in rules {
+        table = rule.apply(&table)?;
+    }
+    Some(table)
+}
+
 fn i32_bytes(values: &[i32]) -> &[u8] {
     // SAFETY: `i32` has no padding and any bit pattern is a valid byte.
     unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }

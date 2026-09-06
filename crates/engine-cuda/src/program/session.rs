@@ -508,6 +508,24 @@ impl Session {
             ));
         }
 
+        // The pixels plane (D8) needs the same guard, read off the program's
+        // own values rather than a plan flag: a lane whose arm plants no
+        // `seam::PIXELS` — a text pass, a denoise pass, any load with no VAE
+        // reading — binds none, and the emitted kernel would dereference the
+        // side table's zero.
+        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::Pixels as u32)) == 0
+            && plan
+                .package
+                .values
+                .iter()
+                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::Pixels))
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `pixels` intrinsic and no buffer has been                  bound to it; a lane whose reading plants no `pixels` seam — or a                  fire that submitted no clip — has no pixel plane for it to point at",
+            ));
+        }
+
         // First failing channel wins, matching `eta_exec::step`'s ordering.
         if let Some(blocked) = self.blocked_channel(plan) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));

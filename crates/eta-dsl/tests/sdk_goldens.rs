@@ -493,6 +493,29 @@ fn latent_step() -> Traced {
     b.build().unwrap()
 }
 
+/// A VAE reading's epilogue in small (design D8): the one golden that
+/// carries `IntrinsicId::Pixels`, so the Python and JavaScript ports cannot
+/// drift on the new intrinsic's wire id unnoticed. A `vae.decode` pass binds
+/// no descriptor port and embeds no token; its answer is the pixels plane,
+/// which the guest remaps from the model's `[-1, 1]` to the `[0, 1]` a
+/// frames encoder wants and hands back on one channel.
+///
+/// The rows are DECLARED, not hinted: a VAE lane's token rows are not its
+/// clip's voxels, so `pixels(rows, width)` takes both.
+fn vae_readback() -> Traced {
+    let (rows, rgb) = (16u32, 3u32);
+    let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32).named("pixels_out"));
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.stage(Stage::Epilogue, move || {
+        let px = intrinsics::pixels(rows, rgb);
+        let shifted = add(&px, 1.0f32);
+        let unit = mul(&shifted, 0.5f32);
+        out.put(&unit);
+    });
+    out.note_host_take();
+    b.build().unwrap()
+}
+
 fn programs() -> Vec<(&'static str, Traced)> {
     vec![
         ("s3", s3()),
@@ -503,6 +526,7 @@ fn programs() -> Vec<(&'static str, Traced)> {
         ("diffusion_step", diffusion_step()),
         ("beam_step", beam_step()),
         ("latent_step", latent_step()),
+        ("vae_readback", vae_readback()),
     ]
 }
 
@@ -547,4 +571,28 @@ fn the_latent_step_binds_against_a_denoising_model() {
     };
     eta_ir::validate::bind(latent_step().container().clone(), profile)
         .expect("the latent step binds against a model that predicts a velocity");
+}
+
+/// The pixels golden is bindable too, and only against a model that lands
+/// them: a golden pinning bytes no model can run would pin a shape the
+/// engine never binds. `pixels_width` is `0` here on purpose — a VAE plants
+/// two widths (a decode's RGB beside an encode's 16-channel mean), which is
+/// what a real family's profile states.
+#[test]
+fn the_vae_readback_binds_against_a_model_that_lands_pixels() {
+    let profile = eta_ir::registry::ModelProfile {
+        vocab: VOCAB,
+        page_size: PAGE,
+        has_pixels: true,
+        pixels_width: 0,
+        ..eta_ir::registry::ModelProfile::dummy()
+    };
+    eta_ir::validate::bind(vae_readback().container().clone(), profile.clone())
+        .expect("the readback binds against a model whose VAE lands pixels");
+    let vaeless = eta_ir::registry::ModelProfile {
+        has_pixels: false,
+        ..profile
+    };
+    eta_ir::validate::bind(vae_readback().container().clone(), vaeless)
+        .expect_err("a model with no VAE refuses the readback at bind");
 }

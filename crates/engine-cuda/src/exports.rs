@@ -129,6 +129,21 @@ impl Exports {
             .map(|(export, grid)| (export.value, *grid))
     }
 
+    /// Every pixels planting's row width, in plan order — one per
+    /// `seam::PIXELS` the text plants. A planting whose width is symbolic
+    /// is skipped rather than guessed, so a plan of only symbolic pixel
+    /// widths reads as planting none.
+    pub(crate) fn pixels_widths<'a>(
+        &'a self,
+        trace: &'a Trace,
+    ) -> impl Iterator<Item = u32> + 'a {
+        self.pixels.iter().filter_map(move |(export, _)| {
+            crate::store::kv::width_of(trace, export.value)
+                .ok()
+                .and_then(|width| u32::try_from(width).ok())
+        })
+    }
+
     /// The seam a lane of `class` reads back from — the export its OWN arm
     /// writes (a multi-reading plan plants `hidden` on its encoder arm and
     /// `velocity` on its denoise arm, design D1/D5): `out` when the class

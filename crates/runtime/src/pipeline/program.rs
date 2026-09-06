@@ -300,8 +300,9 @@ fn price(c: &TraceContainer) -> Pricing {
     };
     // A float lane's program (design D1) binds neither port: its read-out
     // rows are the leading extent of the `velocity()` / `hidden()` /
-    // `logits()` value it materializes, sized by the SDK from the latents
-    // port's rows.
+    // `pixels()` / `logits()` value it materializes, sized by the SDK from
+    // the latents port's rows — or, for a VAE reading (D8), from the clip
+    // the guest states, which is what a pixels epilogue reads back.
     let intrinsic_rows = || {
         c.stages
             .iter()
@@ -311,6 +312,7 @@ fn price(c: &TraceContainer) -> Pricing {
                     intr:
                         eta_ir::op::IntrinsicId::Velocity
                         | eta_ir::op::IntrinsicId::Hidden
+                        | eta_ir::op::IntrinsicId::Pixels
                         | eta_ir::op::IntrinsicId::Logits,
                     shape,
                     ..

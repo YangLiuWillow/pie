@@ -788,6 +788,37 @@ impl FireCtx<'_> {
             }
             _ => None,
         };
+        // Where each lane's pixels BEGIN in that plane, on the host, before
+        // the walk that computes the device grid: the epilogue's `pixels()`
+        // intrinsic is a base address, so it cannot wait for the launch.
+        // `voxels::host_grid` replays the plan's `Spatial::Grid` chain with
+        // the rules' own host twins over this fire's port grid. A chain the
+        // twins cannot follow binds nothing rather than binding a wrong row.
+        let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> = vec![None; p.lanes.len()];
+        if let (Some(seat), Some((_, grid))) =
+            (pixels.as_ref(), self.exports.pixels_for(voxel_class))
+            && let Some(table) =
+                crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
+        {
+            for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let at = first as usize * 4;
+                let Some(&offset) = table.get(at + 3) else {
+                    continue;
+                };
+                let rows: i64 = (first..first + count)
+                    .filter_map(|clip| table.get(clip as usize * 4..clip as usize * 4 + 3))
+                    .map(|b| i64::from(b[0]) * i64::from(b[1]) * i64::from(b[2]))
+                    .sum();
+                pixels_at[lane] = Some((
+                    seat.plane,
+                    u32::try_from(offset).unwrap_or(0),
+                    u32::try_from(rows).unwrap_or(u32::MAX),
+                ));
+            }
+        }
         // Which rows of the arena's readout rectangles each submitted lane
         // reads and owns, and the class its word landed in.
         let lane_count = p.lanes.len();
@@ -986,6 +1017,20 @@ impl FireCtx<'_> {
                     plane.width,
                     plane.width,
                     first_row[lane],
+                )?;
+            }
+            // The pixels plane (D8), at the lane's OWN first output voxel —
+            // not `first_row`, which is its TOKEN row: a VAE lane's rows are
+            // its clips' voxels, and the plane is the whole fire's.
+            if let Some((plane, first, _)) = pixels_at[lane] {
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::Pixels,
+                    plane.ptr,
+                    storage_of(plane),
+                    plane.width,
+                    plane.width,
+                    first,
                 )?;
             }
             // The logits intrinsic is the out seam's alone: a plan whose
