@@ -12,7 +12,7 @@
 
 use crate::error::Error;
 
-use crate::jit::Ctx;
+use crate::jit::{Ctx, refuse};
 use crate::tensor::Tensor;
 
 /// `buf = Σ_ranks buf`, in place (the IR aliases `buf_out` onto `buf`).
@@ -48,10 +48,31 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
     }
 }
 
-/// Concatenates each rank's `x` into `y` on every rank, rank-major.
+/// Concatenates each rank's `x` into `y` on every rank, RANK-MAJOR: rank `k`
+/// lands whole at `k * x.elements()`.
+///
+/// **THAT IS NOT THE WIDTH CONCAT THE IR DECLARES.** `model_dsl`'s
+/// `collective::all_gather` shapes `y` as `[rows, width * world]` — each
+/// rank's columns joined into every row — and the two layouts coincide only
+/// at ONE ROW. At more rows this would land rank 0's whole rectangle, then
+/// rank 1's, and the plan would read it as columns: a silent transpose. So a
+/// wider fire is refused here rather than served wrong.
 pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_gather";
     let comm = ctx.comm(OP)?;
+    if x.rows > 1 {
+        return Err(refuse(
+            OP,
+            format!(
+                "this gather joins each rank's shard along the WIDTH (the IR shapes it \
+                 `[rows, width * world]`) and ncclAllGather joins whole buffers rank-major; \
+                 the two are the same layout only at one row, and this fire brought {}. \
+                 Gathering wider wants a permute after the collective — `[world, rows, \
+                 width]` to `[rows, world * width]` — which is not built.",
+                x.rows,
+            ),
+        ));
+    }
     debug_assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
     debug_assert!(
         x.elements() > 0 && y.elements() % x.elements() == 0,
@@ -85,10 +106,31 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     }
 }
 
-/// Sums `x` across ranks, leaving each rank its own shard in `y`.
+/// Sums `x` across ranks, leaving each rank its own shard in `y` — the shard
+/// being a CONTIGUOUS BLOCK of the flat buffer, rank `k` taking
+/// `[k * y.elements(), (k + 1) * y.elements())`.
+///
+/// **THAT IS NOT THE WIDTH SHARD THE IR DECLARES**, for
+/// [`all_gather`]'s reason mirrored: `model_dsl`'s
+/// `collective::reduce_scatter` shapes `y` as `[rows, width / world]` — each
+/// rank keeping its columns of EVERY row — while NCCL hands it a block of
+/// whole rows. The two coincide only at one row, so a wider fire is refused.
 pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.reduce_scatter";
     let comm = ctx.comm(OP)?;
+    if x.rows > 1 {
+        return Err(refuse(
+            OP,
+            format!(
+                "this scatter keeps each rank its columns of every row (the IR shapes it \
+                 `[rows, width / world]`) and ncclReduceScatter hands each rank a \
+                 contiguous block of the flat buffer; the two are the same layout only at \
+                 one row, and this fire brought {}. Scattering wider wants a permute before \
+                 the collective, which is not built.",
+                x.rows,
+            ),
+        ));
+    }
     debug_assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
     debug_assert!(
         y.elements() > 0 && x.elements() % y.elements() == 0,
