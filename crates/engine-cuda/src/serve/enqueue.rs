@@ -1094,6 +1094,7 @@ impl FireCtx<'_> {
             self.guest_landed,
             "enqueue.epilogue",
         )?;
+        super::btrace::mark("epi_reap");
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             // The guest's own rows, by index within the lane.
@@ -1345,6 +1346,7 @@ impl FireCtx<'_> {
             }
         }
 
+        super::btrace::mark("epi_bind");
         // The epilogue boundary does not wait: its fires are parked and reaped
         // next frame; a mid-batch flush's verdicts are final now and read here.
         let mut settled: Vec<(usize, Fired)> = Vec::new();
@@ -1355,6 +1357,7 @@ impl FireCtx<'_> {
             self.seq,
             &mut settled,
         )?;
+        super::btrace::mark("epi_fly");
         for (lane, fired) in settled {
             let attached = p
                 .attachments

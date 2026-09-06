@@ -1250,6 +1250,19 @@ impl Prepared {
         if lanes <= self.lanes {
             return Ok(());
         }
+        // **GROWTH IS GEOMETRIC, BECAUSE EVERY STEP REALLOCATES THE SCRATCH.**
+        // The buffers below are `cudaMalloc` + `cudaMemset`, both synchronous
+        // and both proportional to the lane count; sizing them to exactly the
+        // lanes this boundary carries meant a boundary sequence of 4, 7, 9,
+        // 15, 19, 31, 44, 64 lanes paid that eight times over, 30-80 ms a
+        // step on a program whose scratch stride is wide. Rounding to the
+        // next power of two makes it a handful of steps whatever order the
+        // lane counts arrive in, and the ceiling is still the scratch cap's.
+        let lanes = lanes
+            .checked_next_power_of_two()
+            .unwrap_or(lanes)
+            .min(self.lane_ceiling())
+            .max(lanes);
         // The scratch ceiling is a wave's, not a lane's; a named refusal the
         // caller can retry with a smaller batch.
         let total = u64::from(self.scratch_stride) * u64::from(lanes);
