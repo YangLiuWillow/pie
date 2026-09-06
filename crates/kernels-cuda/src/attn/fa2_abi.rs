@@ -192,6 +192,21 @@ const _: () = assert!(
     "PrefillRaggedParams: alignof disagrees with ::flashinfer::BatchPrefillRaggedParams",
 );
 
+/// `::pie::attn::fa2::RaggedRefParams`: the ragged block with the
+/// per-group `ref_start` table (`i32`, `[groups]`) appended — 320 bytes,
+/// pinned beside the block's own assertion in `attn/attention.cuh`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct PrefillRaggedRefParams {
+    pub base: PrefillRaggedParams,
+    pub ref_start: DevicePtr,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<PrefillRaggedRefParams>() == 320,
+    "PrefillRaggedRefParams: sizeof disagrees with ::pie::attn::fa2::RaggedRefParams",
+);
+
 /// Every device address a decode or prefill fire touches, gathered by the
 /// entry from `q`/`o`/the pool row/the plan's workspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

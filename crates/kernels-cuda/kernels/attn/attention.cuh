@@ -161,6 +161,40 @@ static_assert(sizeof(RaggedParams) == 312,
 static_assert(alignof(RaggedParams) == 8,
               "fa2_abi::PrefillRaggedParams mirrors an 8-byte-aligned BatchPrefillRaggedParams");
 
+// `RaggedMask::ReferenceSelfOnly`: the block plus one per-group table.
+// `ref_start[g]` is the row of group `g` (local to the group, the same
+// number on the query and the key side) where its reference rows begin: a
+// query row at or past it sees only keys at or past it; every other row
+// sees every key. Group-relative on both sides, so the mask is for the
+// self-attention reading, where q and kv tables agree.
+struct RaggedRefParams : RaggedParams {
+    const IdType* ref_start = nullptr;
+};
+
+static_assert(sizeof(RaggedRefParams) == 320,
+              "fa2_abi::PrefillRaggedRefParams mirrors a 320-byte RaggedRefParams");
+
+/// The full-attention variant with the reference mask on top. Instantiated
+/// under `MaskMode::kCustom`, which is what makes the kernel ask
+/// `LogitsMask` on every kv tile rather than only the causal frontier; the
+/// custom-mask bit plane itself is never read (this variant overrides the
+/// mask outright).
+struct ReferenceSelfOnly : VariantFull {
+    std::uint32_t ref_start = 0;
+
+    template <typename Params>
+    __device__ __host__ ReferenceSelfOnly(
+        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : VariantFull(params, batch_idx, smem_ptr) {
+        const IdType at = params.ref_start[batch_idx];
+        ref_start = at < 0 ? 0u : static_cast<std::uint32_t>(at);
+    }
+
+    REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+        return qo_idx < ref_start || kv_idx >= ref_start;
+    })
+};
+
 }
 
 namespace merge_lse {

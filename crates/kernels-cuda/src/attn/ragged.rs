@@ -33,13 +33,16 @@
 //! handed over whole, values inside them plane-absolute, live groups from
 //! `win[2..4]` when armed.
 
-use crate::attn::fa2::{self, PrefillArm, PrefillPoint};
-use crate::attn::fa2_abi::{PrefillRaggedParams, UintFastdiv, sm_scale_or_default};
+use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
+use crate::attn::fa2_abi::{
+    PrefillRaggedParams, PrefillRaggedRefParams, UintFastdiv, sm_scale_or_default,
+};
 use crate::attn::kv;
 use crate::attn::plan::Device;
 use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
+use dtype::Dtype;
 
 const OP: &str = "attention.ragged";
 
@@ -67,6 +70,16 @@ const KV_CHUNK_SENTINEL: i32 = i32::MAX;
 pub enum RaggedMask {
     /// Every query row of a group attends every key row of the group.
     None,
+    /// A group's tail is reference rows that see only each other. `ref_start`
+    /// is `i32`, `[groups]` (indexed like the group tables — handed whole):
+    /// the row of group `g`, counted from the group's own first row on both
+    /// the query and the key side, where its reference rows begin. Rows at or
+    /// past it attend only keys at or past it; rows before it attend every
+    /// key, references included. A `ref_start` at or past the group's length,
+    /// or a negative one (read as zero), leaves every row seeing every key.
+    /// Counted the same on both sides, it is meant for the self-attention
+    /// reading, where the query and key tables agree.
+    ReferenceSelfOnly { ref_start: Tensor },
 }
 
 /// FlashInfer's own CTA tile for the query axis at this head width, for
@@ -169,7 +182,6 @@ pub fn ragged(
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` reads q, k and v in one element");
     debug_assert_eq!(v.dtype, q.dtype, "`{OP}` reads q, k and v in one element");
-    let RaggedMask::None = mask;
     if !HEAD_DIMS.contains(&head_dim) {
         return Err(refuse(
             OP,
@@ -291,18 +303,38 @@ pub fn ragged(
         partition_kv: false,
         ..PrefillRaggedParams::default()
     };
-    let device = Device::probe(ctx).unwrap_or(Device::L40S);
-    fa2::prefill_ragged(
-        ctx,
-        OP,
-        PrefillPoint {
-            head_dim,
-            cta_tile_q: cta_tile_q(head_dim),
-            arm: PrefillArm::NoneFull,
-            padded_batch_size: padded_u32,
-            num_kv_heads,
-            device,
-        },
-        &params,
-    )
+    let point = |arm: RaggedArm| RaggedPoint {
+        head_dim,
+        cta_tile_q: cta_tile_q(head_dim),
+        arm,
+        padded_batch_size: padded_u32,
+        num_kv_heads,
+        device: Device::probe(ctx).unwrap_or(Device::L40S),
+    };
+    match mask {
+        RaggedMask::None => fa2::prefill_ragged(ctx, OP, point(RaggedArm::Full), &params),
+        RaggedMask::ReferenceSelfOnly { ref_start } => {
+            // Read at the absolute group id, like the group tables: it must
+            // reach every group the table names.
+            if ref_start.dtype != Dtype::I32 || ref_start.rows < groups.unsigned_abs() {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "the reference table is {:?} with {} entries; the mask reads one i32 \
+                         per group of the {groups} the tables name",
+                        ref_start.dtype, ref_start.rows
+                    ),
+                ));
+            }
+            fa2::prefill_ragged(
+                ctx,
+                OP,
+                point(RaggedArm::ReferenceSelfOnly),
+                &PrefillRaggedRefParams {
+                    base: params,
+                    ref_start: ref_start.ptr,
+                },
+            )
+        }
+    }
 }
