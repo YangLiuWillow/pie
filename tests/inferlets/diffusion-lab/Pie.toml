@@ -11,7 +11,7 @@ core = "^0.2.0"
 prompt = {type = "string", optional = true, description = "User turn to answer"}
 max_tokens = {type = "int", optional = true, description = "Generation budget in tokens, rounded up to whole canvases (default: one canvas)"}
 max_steps = {type = "int", optional = true, description = "Denoising steps per canvas at most (default: 48)"}
-variant = {type = "string", optional = true, description = "Acceptance rule: reference | remask | margin | sticky (default: reference)"}
+variant = {type = "string", optional = true, description = "Acceptance rule: reference | remask | margin | llada | threshold | remdm | klass (default: reference)"}
 schedule = {type = "string", optional = true, description = "Temperature schedule: linear | cosine (default: linear)"}
 t_max = {type = "float", optional = true, description = "Temperature at the first step (default: 0.8)"}
 t_min = {type = "float", optional = true, description = "Temperature at the last step (default: 0.4)"}

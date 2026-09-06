@@ -5,10 +5,28 @@
 //! rule, and what gets committed. Nothing here needed a host change.
 //!
 //! Knobs (all inputs; see `Pie.toml`):
-//! - `variant`: the acceptance rule — `reference` (entropy-bound budget),
-//!   `remask` (the `k_t` lowest-entropy rows, `k_t` on a linear count
-//!   schedule — LLaDA's low-confidence remasking), `margin` (top-1 minus
-//!   top-2 probability over a threshold).
+//! - `variant`: the acceptance rule —
+//!   `reference`: the entropy-bound budget (EB-sampler, Ben-Hamu et al.
+//!   2505.24857) — DiffusionGemma's own;
+//!   `remask`: the `k_t` lowest-entropy rows, `k_t` on a linear count
+//!   schedule;
+//!   `llada`: the `k_t` highest-confidence rows (top-1 probability), the
+//!   rest re-noised, accepted rows kept — LLaDA's low-confidence remasking
+//!   (Nie et al. 2502.09992); sticky by construction;
+//!   `threshold`: every row whose top-1 probability clears `threshold`,
+//!   at least the most confident one — Fast-dLLM's confidence-aware
+//!   parallel decoding (Wu et al. 2505.22618); sticky;
+//!   `remdm`: `llada` plus remasking — a kept row whose current top-1
+//!   probability is under `remask_conf` is re-noised with probability
+//!   `remask_rate` until the last fifth of the schedule (ReMDM's
+//!   confidence-allocated, capped, switched-off remasking, Wang et al.
+//!   2503.00307);
+//!   `klass`: a row is accepted when its distribution held still for two
+//!   steps (per-row KL between consecutive steps under `kl_eps`) and its
+//!   top-1 probability clears `klass_conf`, else the single most confident
+//!   row — KLASS (Kim et al. 2511.05664); sticky, and it carries the
+//!   previous step's log-probabilities on the device ([canvas, vocab]);
+//!   `margin`: top-1 minus top-2 probability over a threshold.
 //! - `sticky`: an accepted row keeps its token from then on (masked-diffusion
 //!   decoding), device-carried as a frozen mask + ids; the reference
 //!   re-decides every row every step (full renoise).
@@ -50,12 +68,31 @@ struct Input {
     margin: f32,
     #[serde(default = "default_confidence")]
     confidence: f32,
+    /// `threshold`: the top-1 probability a row must clear.
+    #[serde(default = "default_threshold")]
+    threshold: f32,
+    /// `klass`: the KL bound a row's distribution must stay under for two
+    /// steps, and the top-1 probability it must clear.
+    #[serde(default = "default_kl_eps")]
+    kl_eps: f32,
+    #[serde(default = "default_klass_conf")]
+    klass_conf: f32,
+    /// `remdm`: a kept row under this top-1 probability is a remask
+    /// candidate, re-noised with this probability a step.
+    #[serde(default = "default_remask_conf")]
+    remask_conf: f32,
+    #[serde(default = "default_remask_rate")]
+    remask_rate: f32,
     #[serde(default = "default_stability")]
     stability: u32,
     #[serde(default)]
     taps: Option<u32>,
     #[serde(default)]
     elide_commit: bool,
+    /// Take the argmax instead of a Gumbel-max sample (a diagnostic: what
+    /// the per-element noise costs the epilogue).
+    #[serde(default)]
+    greedy: bool,
     #[serde(default)]
     quality: bool,
     #[serde(default = "default_best_of")]
@@ -96,6 +133,21 @@ fn default_confidence() -> f32 {
 fn default_stability() -> u32 {
     1
 }
+fn default_threshold() -> f32 {
+    0.9
+}
+fn default_kl_eps() -> f32 {
+    0.01
+}
+fn default_klass_conf() -> f32 {
+    0.6
+}
+fn default_remask_conf() -> f32 {
+    0.5
+}
+fn default_remask_rate() -> f32 {
+    0.1
+}
 fn default_best_of() -> u32 {
     1
 }
@@ -126,6 +178,21 @@ enum Rule {
     Reference,
     Remask,
     Margin,
+    Llada,
+    Threshold,
+    Remdm,
+    Klass,
+}
+
+impl Rule {
+    /// Rules that decode a row once and keep it (masked-diffusion decoding).
+    fn sticky(self) -> bool {
+        matches!(self, Rule::Llada | Rule::Threshold | Rule::Remdm | Rule::Klass)
+    }
+    /// Rules whose count of rows to accept the host schedules (`count`).
+    fn counted(self) -> bool {
+        matches!(self, Rule::Remask | Rule::Llada | Rule::Remdm)
+    }
 }
 
 /// Host-side uniform ids for a fresh canvas: xorshift32, seeded per block.
@@ -191,11 +258,18 @@ impl Block<'_> {
         } = *self;
         let end = base + length;
         let n = length as usize;
-        let sticky = input.sticky;
+        let sticky = input.sticky || rule.sticky();
         let bound = input.entropy_bound;
         let margin = input.margin;
         let confidence = input.confidence;
         let stability = input.stability as i32;
+        let threshold = input.threshold;
+        let kl_eps = input.kl_eps;
+        let klass_conf = input.klass_conf;
+        let remask_conf = input.remask_conf;
+        let remask_rate = input.remask_rate;
+        let max_steps = input.max_steps;
+        let greedy = input.greedy;
 
         let mut canvas = noise_canvas(seed, length, vocab);
         for &(p, t) in clamps {
@@ -219,6 +293,22 @@ impl Block<'_> {
         let stable_run = Channel::from([0i32]).named("stable_run");
         let frozen = Channel::from(vec![false; n]).named("frozen");
         let frozen_ids = Channel::from(vec![-1i32; n]).named("frozen_ids");
+        // `klass`: the previous step's log-probabilities, a whole
+        // [canvas, vocab] plane carried on the device, seeded uniform; and
+        // the previous step's per-row KL, seeded past any bound.
+        // `klass`: the previous step's argmax and its probability per row,
+        // and the previous step's KL. The KL is taken on the previous
+        // step's top-1 support — `p_{t-1}(a) · (log p_{t-1}(a) − log p_t(a))`
+        // for `a` the previous argmax — the one term of the full KL a
+        // per-row gather can reach; the whole [canvas, vocab] plane of the
+        // previous step (268 MB) is more than a guest can seed.
+        let prev_id = (rule == Rule::Klass).then(|| Channel::from(vec![0u32; n]).named("prev_argmax"));
+        let prev_p = (rule == Rule::Klass).then(|| Channel::from(vec![0f32; n]).named("prev_top1"));
+        let prev_kl = (rule == Rule::Klass)
+            .then(|| Channel::from(vec![1e30f32; n]).named("prev_kl"));
+        // `remdm`: the step index, device-carried, switches remasking off
+        // for the schedule's last fifth.
+        let step_index = Channel::from([0u32]).named("step_index");
         // Outputs the host drains each step.
         let canvas_out = Channel::new([length], dtype::i32).named("canvas_out");
         let commit_out = Channel::new([length], dtype::i32).named("commit_out");
@@ -260,10 +350,28 @@ impl Block<'_> {
                 let scaled = &logits / &t;
                 let probs = softmax(&scaled);
                 let h = entropy(&probs); // [length]
-                let sampled = gumbel_max(&scaled, &r);
                 let argmax = reduce_argmax(&scaled);
+                let sampled = if greedy { argmax.clone() } else { gumbel_max(&scaled, &r) };
+                // Top-1 probability per row: what LLaDA, Fast-dLLM and
+                // KLASS call confidence.
+                let conf = reduce_max(&probs); // [length]
+                let step = step_index.take();
+                step_index.put(&(&step + 1u32));
+
+                // `count` highest-confidence rows (LLaDA's rule: the rest
+                // re-noised), as a [length] bool.
+                let top_by_conf = || {
+                    let (_, order) = sort_desc(&conf);
+                    let zeros = cast(lt(iota(length), 0u32), dtype::i32);
+                    let rank = scatter_set(&zeros, &order, &cast(iota(length), dtype::i32));
+                    lt(&rank, &reshape(count.read(), []))
+                };
+                // The single most confident row, so a threshold rule always
+                // decodes something.
+                let most_confident = || eq(&conf, &reshape(reduce_max(&conf), []));
 
                 // ── the acceptance rule ──
+                let mut release = lt(iota(length), 0u32); // rows to re-noise (remdm)
                 let accept = match rule {
                     Rule::Reference => entropy_bound_accept(&h, bound),
                     Rule::Remask => {
@@ -281,6 +389,38 @@ impl Block<'_> {
                         let gap = &gather_row(&top2, &col0) - &gather_row(&top2, &col1);
                         gt(&gap, margin)
                     }
+                    Rule::Llada => top_by_conf(),
+                    Rule::Threshold => or(&gt(&conf, threshold), &most_confident()),
+                    Rule::Remdm => {
+                        // Remask: a kept row now read under `remask_conf`,
+                        // with probability `remask_rate`, while the
+                        // schedule is in its first four fifths.
+                        let u = rng(&(&r + iota(2)), [length]);
+                        let on = lt(&(&step * 5u32), max_steps * 4);
+                        let doubt = and(&lt(&conf, remask_conf), &lt(&u, remask_rate));
+                        release = and(&doubt, &reshape(on, []));
+                        top_by_conf()
+                    }
+                    Rule::Klass => {
+                        let (prev_id, prev_p, prev_kl) =
+                            (prev_id.as_ref().unwrap(), prev_p.as_ref().unwrap(), prev_kl.as_ref().unwrap());
+                        // log p_t at the previous argmax, off the scaled row's max and partition sum.
+                        let m = reduce_max(&scaled);
+                        let lz = log(&reduce_sum(&exp(&scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab]))));
+                        let id_before = prev_id.take();
+                        let lp_at = &(&gather_row(&scaled, &id_before) - &m) - &lz; // [length]
+                        let p_before = max_elem(&prev_p.take(), 1e-30f32);
+                        let kl = &p_before * &(&log(&p_before) - &lp_at);
+                        prev_id.put(&cast(&argmax, dtype::u32));
+                        prev_p.put(&conf);
+                        let kl_before = prev_kl.take();
+                        prev_kl.put(&kl);
+                        let warm = reshape(ge(&step, 2u32), []);
+                        let still = and(&and(&lt(&kl, kl_eps), &lt(&kl_before, kl_eps)), &warm);
+                        let stable = and(&still, &gt(&conf, klass_conf));
+                        let any = gt(&reduce_sum(cast(&stable, dtype::i32)), 0i32);
+                        or(&stable, &and(&most_confident(), &not(&reshape(any, []))))
+                    }
                 };
 
                 let r_noise = &r + iota(2);
@@ -288,7 +428,7 @@ impl Block<'_> {
 
                 // ── sticky: an accepted row keeps its token from then on ──
                 let (next, commit, all_frozen) = if sticky {
-                    let was = frozen.take();
+                    let was = and(&frozen.take(), &not(&release));
                     let ids = frozen_ids.take();
                     let newly = and(&accept, &not(&was));
                     let now = or(&was, &newly);
@@ -349,7 +489,7 @@ impl Block<'_> {
                 temp.set([t]).context("set temperature")?;
                 // Only the remask rule reads `count`; a channel the program
                 // never reads has no host role, so `set` would be refused.
-                if rule == Rule::Remask {
+                if rule.counted() {
                     count.set([k_t]).context("set count")?;
                 }
             }
@@ -423,7 +563,15 @@ async fn main(input: Input) -> Result<Output> {
         "reference" => Rule::Reference,
         "remask" => Rule::Remask,
         "margin" => Rule::Margin,
-        other => return Err(format!("unknown variant {other:?}: reference | remask | margin")),
+        "llada" => Rule::Llada,
+        "threshold" => Rule::Threshold,
+        "remdm" => Rule::Remdm,
+        "klass" => Rule::Klass,
+        other => {
+            return Err(format!(
+                "unknown variant {other:?}: reference | remask | margin | llada | threshold | remdm | klass"
+            ));
+        }
     };
     let clamps: Vec<(u32, i32)> = match &input.clamp {
         Some(text) => {
