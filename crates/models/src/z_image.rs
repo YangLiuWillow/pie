@@ -4,8 +4,9 @@
 //! A single-stream DiT (`[image ‖ caption]`, image first) behind a Qwen3-4B
 //! encoder, under one plan of three readings — `text`, `refine`, `denoise`
 //! — selected per lane by the fact word ([`forward`] states the table a
-//! guest programs against). The FLUX VAE is not read yet ([`forward`]'s
-//! `vae_decode` stub; `import.rs` lists its tensors).
+//! guest programs against) — plus, on the flagship, the FLUX 16-channel
+//! VAE's two readings on the voxel axis, `vae.decode` and `vae.encode`
+//! ([`vae`]).
 //!
 //! Two rows: the flagship `Tongyi-MAI/Z-Image-Turbo` (fp32 transformer cast
 //! to bf16, bf16 encoder, static shift 3.0, eight distilled steps, no CFG)
@@ -26,6 +27,7 @@ pub mod import;
 pub mod model;
 pub mod template;
 pub mod tokenizer;
+pub mod vae;
 
 use model::Model;
 use model_dsl::Dtype;

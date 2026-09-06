@@ -2,7 +2,6 @@
 
 use model_dsl::{Dtype, Weight};
 
-
 pub use crate::qwen_3::model::{Attn, Gdn, Merger, Mlp, Tower, TowerBlock};
 
 pub struct Model {
@@ -628,7 +627,13 @@ impl Model {
                  answer is a token row, and a mismatch would scatter a rectangle \
                  of the wrong width into the embedding"
             );
-            assert_eq!(t.hidden % t.heads, 0, "a {}-wide tower does not divide into {} heads", t.hidden, t.heads);
+            assert_eq!(
+                t.hidden % t.heads,
+                0,
+                "a {}-wide tower does not divide into {} heads",
+                t.hidden,
+                t.heads
+            );
             let th = u64::from(t.hidden);
             let ti = u64::from(t.inter);
             let merged = u64::from(t.merge) * u64::from(t.merge) * th;
@@ -697,7 +702,7 @@ impl Model {
             ),
             mixer: residual("mtp.mixer", false),
             eps: d.norm_eps,
-                depth: DRAFT_DEPTH,
+            depth: DRAFT_DEPTH,
         });
 
         let ple = d.ple.as_ref().map(|p| {
@@ -751,7 +756,6 @@ impl Model {
             tower,
         }
     }
-
 }
 
 /// Fixed by the checkpoint's own arithmetic, not chosen here.
@@ -817,13 +821,16 @@ mod tests {
     fn the_hash_constants_are_the_checkpoints_own() {
         let m = Model::flash(Dtype::Bf16, Dtype::Bf16, 1);
         let p = m.ple.expect("flash carries the PLE");
-        assert_eq!(p.mults, [23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]);
+        assert_eq!(
+            p.mults,
+            [23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]
+        );
         assert_eq!(
             p.primes,
             [
-                20_000_003, 20_000_023, 20_000_033, 20_000_047, 20_000_059, 20_000_063,
-                20_000_069, 20_000_077, 20_000_081, 20_000_093, 20_000_107, 20_000_147,
-                20_000_153, 20_000_159, 20_000_161, 20_000_171,
+                20_000_003, 20_000_023, 20_000_033, 20_000_047, 20_000_059, 20_000_063, 20_000_069,
+                20_000_077, 20_000_081, 20_000_093, 20_000_107, 20_000_147, 20_000_153, 20_000_159,
+                20_000_161, 20_000_171,
             ]
         );
         assert_eq!(p.offsets[0], 0);

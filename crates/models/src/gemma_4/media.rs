@@ -1,8 +1,9 @@
 //! Gemma-4 vision preprocessing: resize to a whole `k x k` block grid,
 //! patchify in pool-block-major order, and emit one soft token per block.
 
-use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8,
-    VisionFrontEnd};
+use crate::media::{
+    Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8, VisionFrontEnd,
+};
 
 /// The `ROWS.arch` this front-end answers for.
 pub const ARCH: &str = "gemma4";
@@ -82,7 +83,8 @@ impl GemmaVisionConfig {
         let factor = (target_px / total_px).sqrt();
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let down = |ideal: f64| -> u32 { (ideal / f64::from(side_mult)).floor() as u32 * side_mult };
+        let down =
+            |ideal: f64| -> u32 { (ideal / f64::from(side_mult)).floor() as u32 * side_mult };
 
         let mut target_h = down(factor * f64::from(h));
         let mut target_w = down(factor * f64::from(w));

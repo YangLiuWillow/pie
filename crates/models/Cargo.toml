@@ -31,5 +31,7 @@ ztensor = { workspace = true }
 # Dev-only: compiles a model's plan to check it still compiles and its fire
 # behavior is unchanged. Dev edge, so it does not cycle with this crate.
 model-compiler = { path = "../model-compiler" }
+# Dev-only: the VAE bake test reads the spatial ops back by their IR names.
+model-ir = { path = "../model-ir" }
 # Opens real shipped safetensors headers for the qwen4 4-bit import test.
 ztensor-compat = { workspace = true }

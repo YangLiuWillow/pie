@@ -183,7 +183,10 @@ impl DFlash {
                 ),
                 proj: Weight::sym(
                     format!("{prefix}.layers.{l}.{which}.kernel_projection"),
-                    [2 * u64::from(c.taps) * (hidden / u64::from(c.group)), hidden],
+                    [
+                        2 * u64::from(c.taps) * (hidden / u64::from(c.group)),
+                        hidden,
+                    ],
                     w,
                 )
                 .columns(),
@@ -194,7 +197,8 @@ impl DFlash {
         let (dq, dkv, dhd) = (head.q_heads / tp, head.kv_heads / tp, head.head_dim);
         let hd = u64::from(dhd);
         let inter = head.inter / tp;
-        let codebook = |s: &str, rank: u32| Weight::sym(n(s), [trunk.vocab, u64::from(rank)], dense);
+        let codebook =
+            |s: &str, rank: u32| Weight::sym(n(s), [trunk.vocab, u64::from(rank)], dense);
         DFlash {
             taps: head.taps.to_vec(),
             fc: (0..head.taps.len())
@@ -218,18 +222,30 @@ impl DFlash {
                             rotary_dim: dhd,
                             theta: head.theta,
                             sm_scale: (dhd as f32).sqrt().recip(),
-                            q_proj: Weight::sym(b("q_proj"), [u64::from(dq) * hd, hidden], w).columns(),
-                            k_proj: Weight::sym(b("k_proj"), [u64::from(dkv) * hd, hidden], w).columns(),
-                            v_proj: Weight::sym(b("v_proj"), [u64::from(dkv) * hd, hidden], w).columns(),
-                            o_proj: Weight::sym(b("o_proj"), [hidden, u64::from(dq) * hd], w).rows(),
+                            q_proj: Weight::sym(b("q_proj"), [u64::from(dq) * hd, hidden], w)
+                                .columns(),
+                            k_proj: Weight::sym(b("k_proj"), [u64::from(dkv) * hd, hidden], w)
+                                .columns(),
+                            v_proj: Weight::sym(b("v_proj"), [u64::from(dkv) * hd, hidden], w)
+                                .columns(),
+                            o_proj: Weight::sym(b("o_proj"), [hidden, u64::from(dq) * hd], w)
+                                .rows(),
                             q_norm: Weight::sym(b("q_norm"), [hd], dense),
                             q_norm_eps: trunk.norm_eps,
                             k_norm: Weight::sym(b("k_norm"), [hd], dense),
                             k_norm_eps: trunk.norm_eps,
-                            q_bias: head.attn_bias.then(|| Weight::sym(b("q_bias"), [u64::from(dq) * hd], dense)),
-                            k_bias: head.attn_bias.then(|| Weight::sym(b("k_bias"), [u64::from(dkv) * hd], dense)),
-                            v_bias: head.attn_bias.then(|| Weight::sym(b("v_bias"), [u64::from(dkv) * hd], dense)),
-                            o_bias: head.attn_bias.then(|| Weight::sym(b("o_bias"), [hidden], dense)),
+                            q_bias: head
+                                .attn_bias
+                                .then(|| Weight::sym(b("q_bias"), [u64::from(dq) * hd], dense)),
+                            k_bias: head
+                                .attn_bias
+                                .then(|| Weight::sym(b("k_bias"), [u64::from(dkv) * hd], dense)),
+                            v_bias: head
+                                .attn_bias
+                                .then(|| Weight::sym(b("v_bias"), [u64::from(dkv) * hd], dense)),
+                            o_bias: head
+                                .attn_bias
+                                .then(|| Weight::sym(b("o_bias"), [hidden], dense)),
                             kv: format!("kv.dflash.{l}"),
                         },
                         mlp_norm: Weight::sym(b("mlp_norm"), [hidden], dense),
@@ -446,12 +462,18 @@ impl DFlash {
         src: &ztensor::Source,
         norm: &dyn Fn(String) -> Expr,
     ) -> Result<(), Error> {
-        b.read_expr(&self.hidden_norm, norm("aux.hidden_norm.weight".to_string()))?;
+        b.read_expr(
+            &self.hidden_norm,
+            norm("aux.hidden_norm.weight".to_string()),
+        )?;
         // `fc.weight` is one `[hidden, taps·hidden]` bank; tap `i` is columns `i·hidden .. (i+1)·hidden`.
         let span = extents(&self.fc[0])[1];
         for (i, bank) in self.fc.iter().enumerate() {
             let at = span * i as i64;
-            b.read_expr(bank, Expr::src("aux.fc.weight".to_string()).slice(1, at, span))?;
+            b.read_expr(
+                bank,
+                Expr::src("aux.fc.weight".to_string()).slice(1, at, span),
+            )?;
         }
         for (l, block) in self.blocks.iter().enumerate() {
             let n = |s: &str| format!("aux.layers.{l}.{s}");
@@ -474,10 +496,16 @@ impl DFlash {
             b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
             b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
             b.read_expr(&block.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
-            for (conv, which) in [(&block.attn_conv, "attention_conv"), (&block.mlp_conv, "mlp_conv")] {
+            for (conv, which) in [
+                (&block.attn_conv, "attention_conv"),
+                (&block.mlp_conv, "mlp_conv"),
+            ] {
                 if let Some(c) = conv {
                     let want: Vec<i64> = extents(&c.base);
-                    b.read_expr(&c.base, flat(src, n(&format!("{which}.base_kernel")), want)?)?;
+                    b.read_expr(
+                        &c.base,
+                        flat(src, n(&format!("{which}.base_kernel")), want)?,
+                    )?;
                     b.read(&c.proj, n(&format!("{which}.kernel_projection.weight")))?;
                 }
             }
@@ -491,10 +519,19 @@ impl DFlash {
         match (&self.selector, self.head.readout) {
             (Some(sel), Readout::Selector { .. }) => {
                 if let Some(proj) = &sel.hidden_projection {
-                    b.read(proj, "aux.candidate_selector.hidden_projection.weight".to_string())?;
+                    b.read(
+                        proj,
+                        "aux.candidate_selector.hidden_projection.weight".to_string(),
+                    )?;
                 }
-                b.read(&sel.pred, "aux.candidate_selector.predecessor_codebook".to_string())?;
-                b.read(&sel.succ, "aux.candidate_selector.successor_codebook".to_string())?;
+                b.read(
+                    &sel.pred,
+                    "aux.candidate_selector.predecessor_codebook".to_string(),
+                )?;
+                b.read(
+                    &sel.succ,
+                    "aux.candidate_selector.successor_codebook".to_string(),
+                )?;
             }
             (Some(sel), Readout::Markov { .. }) => {
                 b.read(&sel.pred, "aux.markov_head.markov_w1.weight".to_string())?;
