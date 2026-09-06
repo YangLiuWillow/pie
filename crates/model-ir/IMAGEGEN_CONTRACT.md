@@ -55,6 +55,20 @@ CUDA agents replace the CUDA arms, the other shells stay refused this phase.
   kv_heads, sm_scale, mask, tags: Option<(Tensor, Tensor)>, &mut o)`, bf16 in/out, head_dim
   64/128/256 (the vendored FlashInfer ragged FA2 template); `seat::ENTRIES` `RowsAndLanes`
   and a rebind law like `attention.prefill`.
+- `RaggedMask::RelativeBias { table, max_len }` (M3): the segment pairing plus an additive
+  per-head bias on every logit, `s = q·k · sm_scale + table[h][clamp(kj − qi + max_len − 1)]`,
+  `table` a `[heads, 2·max_len − 1]` f32 value (`Dim::Const` rows — a plan constant, handed
+  whole; one row per QUERY head). The umT5 / T5 relative position bias and an ALiBi slope
+  table both fit. The table is `Elementwise::RelativeBucketBias { embedding: [num_buckets,
+  heads] weight (bf16/f32), max_len, num_buckets, max_distance, bidirectional } -> y`, HF's
+  `_relative_position_bucket` transcribed in torch's f32 steps (statement on the op). DSL:
+  `elemwise::relative_bucket_bias(inputs.recorder(), &weight, max_len, num_buckets,
+  max_distance, bidirectional)`, `attn::relative_bias(&table, max_len) -> RaggedMask`.
+  Kernels: `attn_ragged::RaggedMask::RelativeBias { table: Tensor, max_len }` (the FA2
+  `RelativeBias` variant, `MaskMode::kNone`, bias added on the logits hook, `sm_scale_log2 =
+  log2e`; a zero table is the plain arm bit for bit at a power-of-two `sm_scale`) and
+  `elemwise::relative_bucket_bias(ctx, embedding, max_len, num_buckets, max_distance,
+  bidirectional, &mut y)`, `seat::ENTRIES` `Reads::Nothing` (a constant launch).
 - `Guard::narrow(outer, inner)`: a value read under a narrower guard that implies its
   producer's is spelled as `inner` (so a joint attention's answer splits back onto its arms).
 

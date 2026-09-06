@@ -102,6 +102,7 @@ impl Run<'_> {
             | Elementwise::NormModulate { .. }
             | Elementwise::GatedResidualNormModulate { .. }
             | Elementwise::Sinusoid { .. }
+            | Elementwise::RelativeBucketBias { .. }
             | Elementwise::Silu { .. }
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }

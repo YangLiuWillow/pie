@@ -39,12 +39,17 @@ pub mod rope_axes;
 /// under its own statute, not because the rotation differs.
 pub mod rope_mrope;
 
+/// The dense relative-position bias table a bidirectional encoder's
+/// attention adds to its logits, from the layer's bucket embedding.
+pub mod relative_bucket_bias;
+
 /// The sinusoidal timestep embedding, the one denoise input that is
 /// arithmetic rather than an activation.
 pub mod sinusoid;
 
-// The two entries a caller spells as the family's own verb
-// (`elemwise::rope_axes(..)`, `elemwise::sinusoid(..)`), since each file
-// carries exactly one.
+// The entries a caller spells as the family's own verb
+// (`elemwise::rope_axes(..)`, `elemwise::sinusoid(..)`,
+// `elemwise::relative_bucket_bias(..)`), since each file carries exactly one.
+pub use relative_bucket_bias::relative_bucket_bias;
 pub use rope_axes::{RopeForm, rope_axes};
 pub use sinusoid::sinusoid;

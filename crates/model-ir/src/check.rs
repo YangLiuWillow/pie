@@ -371,6 +371,11 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Ragged { mask: RaggedMask::ReferenceSelfOnly { .. }, .. } => {
                 &[(In(3), I32), (In(4), I32), (In(5), I32), (In(6), I32)]
             }
+            // Under the relative bias the table behind the CSRs is the f32
+            // `[heads, 2·max_len − 1]` plane the kernel adds from.
+            Attention::Ragged { mask: RaggedMask::RelativeBias { .. }, .. } => {
+                &[(In(3), I32), (In(4), I32), (In(5), F32)]
+            }
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
@@ -513,6 +518,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The timestep embedding is fp32 end to end: the scalar in and
             // the sinusoid row out.
             Elementwise::Sinusoid { .. } => &[(In(0), F32), (Out(0), F32)],
+            // The bucket embedding rides the checkpoint's dtype; the table
+            // it lands is f32, what the ragged arm's bias reads.
+            Elementwise::RelativeBucketBias { .. } => &[(Out(0), F32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
             // The mix projection is f32 end to end — the operand the norm
             // widened, the dynamic plane, and the row the sinkhorn splits.

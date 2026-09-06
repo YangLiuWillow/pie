@@ -618,6 +618,18 @@ pub enum RaggedMask {
     /// `t >= 0` sees only keys with tag `t`; a query with tag `-1` sees
     /// every key of its segment.
     ReferenceSelfOnly { q_tags: ValueId, kv_tags: ValueId },
+    /// The segment pairing, with an additive per-head bias on every logit
+    /// that depends only on the signed distance `kj − qi` inside the
+    /// segment: `s = q·k · sm_scale + table[h][kj − qi + max_len − 1]`,
+    /// the column clamped to the table. `table` is a `[heads, 2·max_len −
+    /// 1]` f32 value — one row per QUERY head — computed once per layer
+    /// from the checkpoint by [`Elementwise::RelativeBucketBias`] (a
+    /// bidirectional encoder's T5-style relative position bias) or any
+    /// other constant the text writes (an ALiBi slope table). `max_len` is
+    /// the longest segment the table answers exactly; a longer distance
+    /// reads the end column. The indptrs are whichever CSR the text passes,
+    /// as under [`None`](RaggedMask::None).
+    RelativeBias { table: ValueId, max_len: u32 },
 }
 
 impl Operands for Attention {
@@ -635,8 +647,12 @@ impl Operands for Attention {
             Self::Dense { q, k, v, segments, .. } => sink.extend([*q, *k, *v, *segments]),
             Self::Ragged { q, k, v, q_indptr, kv_indptr, mask, .. } => {
                 sink.extend([*q, *k, *v, *q_indptr, *kv_indptr]);
-                if let RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } = mask {
-                    sink.extend([*q_tags, *kv_tags]);
+                match mask {
+                    RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
+                        sink.extend([*q_tags, *kv_tags]);
+                    }
+                    RaggedMask::RelativeBias { table, .. } => sink.push(*table),
+                    RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
                 }
             }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),

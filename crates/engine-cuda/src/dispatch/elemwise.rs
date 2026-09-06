@@ -656,6 +656,25 @@ impl Run<'_> {
                 *scale,
                 &mut self.tensor(*y),
             ),
+            // A constant of the plan: the bucket embedding is a weight and
+            // the table is `[Const, Const]`, both handed whole, so the
+            // launch reads no seat and no window.
+            Elementwise::RelativeBucketBias {
+                embedding,
+                max_len,
+                num_buckets,
+                max_distance,
+                bidirectional,
+                y,
+            } => elemwise::relative_bucket_bias(
+                self.ctx(),
+                self.tensor(*embedding),
+                *max_len,
+                *num_buckets,
+                *max_distance,
+                *bidirectional,
+                &mut self.tensor(*y),
+            ),
             // In place; the IR aliases `x_out` onto `x`.
             Elementwise::Silu { x, x_out: _ } => {
                 elemwise::activation::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
