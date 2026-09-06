@@ -1336,7 +1336,7 @@ impl Shell {
                     floor = acct.floor,
                 )));
             }
-            if std::env::var_os("PIE_TIER_TRACE").is_some_and(|v| v != "0") {
+            if crate::diag::on().tier_trace {
                 eprintln!(
                     "residency: wired {wired} (weights {} scratch {} kv {} floor {}), streamed \
                      source {source}, working set {}, ram {ram}",
@@ -5095,7 +5095,10 @@ impl Shell {
             }
         }
         // The copies ran in a blit pass; the forward wants its compute pass
-        // back open, ordered behind them.
+        // back open, ordered behind them. `Ctx::next_pass` hands back an
+        // encoder, so it exists only on Apple; off it the copies above have
+        // already refused and there is no pass to reopen.
+        #[cfg(target_vendor = "apple")]
         frame.next_pass()?;
         Ok(())
     }

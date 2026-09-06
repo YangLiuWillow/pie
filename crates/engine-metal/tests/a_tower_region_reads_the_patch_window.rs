@@ -169,7 +169,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
         &indptr(&[5, 3, 4]),
         Copies::off(),
         &[],
-    &[],
+        &[],
     )
     .expect("every region seats a window");
 
@@ -215,6 +215,10 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                 merge_saw_the_tower |=
                     window.patch.rows == fire.patch_rows() && window.span.rows == fire.rows();
             }
+            // The third row axis, which a VAE's conv decoder runs on. This
+            // trace is a vision tower over a text trunk and seats no voxel
+            // port, so a region on that axis would be a compile bug here.
+            RowAxis::Voxels => unreachable!("this trace declares no voxel port"),
         }
     }
     assert!(towers > 0 && trunks > 0, "{towers} tower, {trunks} trunk");
@@ -264,7 +268,7 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             &boundaries,
             Copies::off(),
             &[],
-        &[],
+            &[],
         )
         .expect("every region seats a window")
     };
@@ -319,6 +323,10 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
             lanes: u64::from(fire.lane_count()),
             patches: u64::from(fire.patch_rows()),
             images: u64::from(fire.images()),
+            // The voxel axis and its clips are a VAE's; this hand-built
+            // tower is token rows and patch rows, and states neither.
+            voxels: 0,
+            clips: 0,
         },
     )
     .expect("the patch input is carved");

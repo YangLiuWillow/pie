@@ -180,21 +180,44 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
     // Tensor parallelism: rank-crossing reductions, and this backend drives
     // one device. `worker::serve` refuses `tensor_parallel_size > 1` for every
     // flavor but CUDA, so these rows are unreachable from the CLI as well.
+    // A row whose lm_head is sharded on the vocab axis gathers the shards
+    // back, so `collective.all_gather` stops it as well. `dsv4-base` ties
+    // its head and states no gather.
     ("dsv4-base-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("gemma4-e4b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("gemma4-31b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("glm5-a12b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
+    (
+        "gemma4-e4b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "gemma4-31b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "glm5-a12b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
     (
         "gptoss-120b-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_reduce"],
+        &["collective.all_gather", "collective.all_reduce"],
     ),
-    ("qwen35-a3b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
+    (
+        "qwen35-a3b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "muse-glimmer-30b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
     // kimi-k3 folds its residual through `res_blend`, which only the CUDA
     // plane claims; the tp2 row wants the collective as well.
     ("kimik3-bf16-mxfp4-kv-bf16", &["elementwise.res_blend"]),
     (
         "kimik3-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_reduce", "elementwise.res_blend"],
+        &[
+            "collective.all_gather",
+            "collective.all_reduce",
+            "elementwise.res_blend",
+        ],
     ),
     // gemma-4's vision tower clamps a learned per-channel bound.
     (
@@ -208,6 +231,262 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "mini-dit-bf16-kv-bf16",
         &[
             "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    // z-image and flux.2: the M0 image families, whose conditioning ops are
+    // CUDA-first this phase.
+    (
+        "z-image-mini-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "z-image-turbo-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "flux2-mini-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "flux2-klein-4b-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    // wan 2.2 and ltx-2.5: the video families. `wan22-ti2v-5b` clamps its VAE's
+    // latents on top of the M0 set.
+    (
+        "wan22-mini-nano-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "wan22-mini-d128-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "wan22-ti2v-5b-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.clamp",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "ltx25-mini-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "ltx25-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    // minimax h3: one stream over video and audio. It norms with a scale, so it
+    // does not name the centred LayerNorm the others do.
+    (
+        "minimax-h3-mini-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "minimax-h3-fl2va-bf16-kv-bf16",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "minimax-h3-fl2va-bf16-kv-bf16-tp2",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "minimax-h3-fl2va-bf16-kv-bf16-tp4",
+        &[
+            "attention.ragged",
+            "elementwise.gated_residual_add",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    // hunyuanimage 3: an AR/diffusion hybrid on a text trunk, so it names the
+    // modulation ops without the ragged attention or the row packing.
+    (
+        "hunyuanimage3-mini-bf16-kv-bf16",
+        &[
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+        ],
+    ),
+    (
+        "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16",
+        &[
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+        ],
+    ),
+    (
+        "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
+        &[
+            "collective.all_reduce",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+        ],
+    ),
+    (
+        "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
+        &[
+            "collective.all_reduce",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+        ],
+    ),
+    // the synthetic generative row's sharded twins: the M0 set plus the collective.
+    (
+        "mini-dit-bf16-kv-bf16-tp2",
+        &[
+            "attention.ragged",
+            "collective.all_reduce",
+            "elementwise.gated_residual_add",
+            "elementwise.layernorm_no_scale",
+            "elementwise.modulate",
+            "elementwise.rope_axes",
+            "elementwise.silu",
+            "elementwise.sinusoid",
+            "layout.pack_rows",
+            "layout.unpack_rows",
+        ],
+    ),
+    (
+        "mini-dit-bf16-kv-bf16-tp4",
+        &[
+            "attention.ragged",
+            "collective.all_reduce",
             "elementwise.gated_residual_add",
             "elementwise.layernorm_no_scale",
             "elementwise.modulate",

@@ -1570,102 +1570,109 @@ impl Prepared {
 
     /// Encode one grouped region: eleven fixed bindings, a residency
     /// declaration per reservation an address reaches, and a threadgroup per lane.
-    #[cfg(target_vendor = "apple")]
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn encode_grouped(&self, frame: &Frame, region: &Region) -> Result<()> {
-        use objc2::runtime::ProtocolObject;
-        use objc2_metal::{
-            MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-            MTLSize,
-        };
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2::runtime::ProtocolObject;
+            use objc2_metal::{
+                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
+                MTLSize,
+            };
 
-        let grouped = self.grouped.as_ref().ok_or_else(|| {
-            Fault::program(
-                "program::launch",
-                "a region was compiled for the grouped form and this stage carries no \
-                 lane table; the plan said the grouped path could not cover it",
-            )
-        })?;
-        let layout = grouped
-            .layouts
-            .get(region.region_index as usize)
-            .ok_or_else(|| {
+            let grouped = self.grouped.as_ref().ok_or_else(|| {
                 Fault::program(
                     "program::launch",
-                    format!(
-                        "region {} has no group layout, so its library sampler would \
-                         decompose its grid by a row count nobody stated",
-                        region.region_index
-                    ),
+                    "a region was compiled for the grouped form and this stage carries no \
+                     lane table; the plan said the grouped path could not cover it",
                 )
             })?;
+            let layout = grouped
+                .layouts
+                .get(region.region_index as usize)
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::launch",
+                        format!(
+                            "region {} has no group layout, so its library sampler would \
+                             decompose its grid by a row count nobody stated",
+                            region.region_index
+                        ),
+                    )
+                })?;
 
-        let encoder = frame.encoder();
-        encoder.setComputePipelineState(region.pipeline());
-        // SAFETY: every reservation is retained by `self`; every offset is zero (the kernel strides off `layout`).
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-            encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
-            encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-            encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-            encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-            encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
-        }
+            let encoder = frame.encoder();
+            encoder.setComputePipelineState(region.pipeline());
+            // SAFETY: every reservation is retained by `self`; every offset is zero (the kernel strides off `layout`).
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
+                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
+                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
+                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
+                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+            }
 
-        let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-            let resource: &ProtocolObject<dyn MTLResource> =
-                ProtocolObject::from_ref(&**buffer.slab());
-            encoder.useResource_usage(resource, usage);
-        };
-        resident(
-            &self.status,
-            MTLResourceUsage::Read | MTLResourceUsage::Write,
-        );
-        for cell in &self.bound {
+            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
+                let resource: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(&**buffer.slab());
+                encoder.useResource_usage(resource, usage);
+            };
             resident(
-                &cell.slab,
+                &self.status,
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
-        }
-        for held in self.intrinsics.iter().flatten() {
-            resident(&held.base, MTLResourceUsage::Read);
-        }
-
-        // A library sampler declines any width but 256; fused takes the narrower of its buffer width and the pipeline's.
-        let rows = grouped
-            .layout_words
-            .get(region.region_index as usize)
-            .map_or(1, |words| words.reserved1 as usize);
-        let (groups, threads) = match region.form {
-            Form::Fused | Form::Streamed => {
-                unreachable!("`encode_into` routes the single-lane and streamed forms")
+            for cell in &self.bound {
+                resident(
+                    &cell.slab,
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
             }
-            Form::GroupedLibrary => ((GROUPED_LANES as usize) * rows, LIBRARY_SAMPLER_THREADS),
-            Form::Grouped => (
-                GROUPED_LANES as usize,
-                region
-                    .pipeline()
-                    .maxTotalThreadsPerThreadgroup()
-                    .clamp(1, REGION_THREADS as usize),
-            ),
-        };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: groups.max(1),
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: threads,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
+            for held in self.intrinsics.iter().flatten() {
+                resident(&held.base, MTLResourceUsage::Read);
+            }
+
+            // A library sampler declines any width but 256; fused takes the narrower of its buffer width and the pipeline's.
+            let rows = grouped
+                .layout_words
+                .get(region.region_index as usize)
+                .map_or(1, |words| words.reserved1 as usize);
+            let (groups, threads) = match region.form {
+                Form::Fused | Form::Streamed => {
+                    unreachable!("`encode_into` routes the single-lane and streamed forms")
+                }
+                Form::GroupedLibrary => ((GROUPED_LANES as usize) * rows, LIBRARY_SAMPLER_THREADS),
+                Form::Grouped => (
+                    GROUPED_LANES as usize,
+                    region
+                        .pipeline()
+                        .maxTotalThreadsPerThreadgroup()
+                        .clamp(1, REGION_THREADS as usize),
+                ),
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: groups.max(1),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(Fault::Deviceless)
+        }
     }
 
     /// Encode and run one generated region, and wait for it — the host
