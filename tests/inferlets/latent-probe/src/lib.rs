@@ -164,6 +164,10 @@ async fn main(input: Input) -> Result<Output> {
     let t = Channel::from([ts[0]]).named("timestep");
     let step = Channel::from([0u32]).named("step");
     let rng = Channel::from(rng_state(input.seed)).named("rng");
+    // The schedule's vectors are channels, read by step index: the op set
+    // carries constants as scalars only.
+    let dts_ch = Channel::from(dts).named("dts");
+    let ts_ch = Channel::from(ts).named("ts");
     let out = Channel::new([rows, width], dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -219,7 +223,7 @@ async fn main(input: Input) -> Result<Output> {
         let k = step.take();
         let x_cur = x.take();
         let v = intrinsics::velocity(velocity_width);
-        let dt = gather(Tensor::constant(dts.clone()), &k);
+        let dt = gather(dts_ch.read(), &k);
         let next = euler_step(&x_cur, &v, &dt);
         let r = rng.take();
         let fresh = noise([rows, width], &r);
@@ -229,7 +233,7 @@ async fn main(input: Input) -> Result<Output> {
         out.put(&x_next);
         let k_next = &k + 1u32;
         t.take();
-        t.put(gather(Tensor::constant(ts.clone()), &k_next));
+        t.put(gather(ts_ch.read(), &k_next));
         step.put(&k_next);
         rng.put(&r + &Tensor::constant([0u32, 1u32]));
     });
