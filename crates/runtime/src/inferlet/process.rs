@@ -831,6 +831,15 @@ impl Process {
         if let Err(ref err) = result {
             tracing::info!("Process {process_id} failed: {err}");
         }
+        if crate::planner::trace_enabled() {
+            println!(
+                "[process t_us={} pid={}] guest finished ok={} restart_requested={}",
+                crate::scheduler::fire_timing_now_us(),
+                process_id,
+                result.is_ok(),
+                restart_requested(process_id)
+            );
+        }
 
         // A process the planner asked to restart leaves the channel in
         // place; `terminate` hands it to the re-run instead.
@@ -900,6 +909,14 @@ impl Process {
                 let _ = tx.send(result.clone());
             }
 
+            if crate::planner::trace_enabled() {
+                println!(
+                    "[process t_us={} pid={}] delivering {}",
+                    crate::scheduler::fire_timing_now_us(),
+                    self.process_id,
+                    if result.is_ok() { "return" } else { "error" }
+                );
+            }
             match result {
                 Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
                 Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
