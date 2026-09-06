@@ -376,7 +376,8 @@ fn lane(
             // for it and says so rather than feeding it zeros.
             model::PortKind::Voxels => {
                 return Err(format!(
-                    "reading `{}` declares a voxel port `{}`; this sampler drives latent rows,                      not a VAE tile",
+                    "reading `{}` declares a voxel port `{}`; this sampler drives latent rows, \
+                     not a VAE tile",
                     reading.name, port.name
                 )
                 .into());
