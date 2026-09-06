@@ -920,8 +920,27 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
         }
         result_base += u32::from(op.result_count);
         let predicate = (op.tag == tags::PIVOT_THRESHOLD).then_some(op.pred_payload);
+        // A generated region is one kernel, and its streams may read a value
+        // in a later pass than the op graph's last reader of it (a pass
+        // recomputes a value from its operands rather than loading a stored
+        // copy), so a value the region both defines and reads lives until the
+        // region ends: the row max must not give its slot to the row sum
+        // while the last pass still normalises by both.
+        let region = region_of[node];
+        let generated = plan
+            .fused
+            .get(region as usize)
+            .is_some_and(|fused| fused.kind == RegionKind::Generated);
         for value in op.args.iter().copied().chain(predicate) {
             bump(&mut lifetimes, &alias_of, value, step);
+            if generated
+                && lifetimes
+                    .get(value as usize)
+                    .is_some_and(|life| life.launch_def == region && life.last >= life.def)
+                && let Some(&last) = region_last.get(region as usize)
+            {
+                bump(&mut lifetimes, &alias_of, value, last);
+            }
         }
     }
     for (region, fused) in plan.fused.iter().enumerate() {
@@ -1053,6 +1072,13 @@ fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> 
 pub fn scratch_bytes(plan: &LaunchStagePlan, extents: Extents) -> Result<u64> {
     let descriptors = describe_values(plan, extents)?;
     lay_out(plan, &descriptors).map(|layout| layout.total)
+}
+
+/// Where each value of `plan` lands in one lane's scratch, by value id — the
+/// layout `scratch_bytes` totals. A value the layout gives no slot reads 0.
+pub fn scratch_offsets(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<u64>> {
+    let descriptors = describe_values(plan, extents)?;
+    lay_out(plan, &descriptors).map(|layout| layout.values)
 }
 
 impl Prepared {
@@ -1519,9 +1545,6 @@ impl Prepared {
         )
     }
 
-    /// How many lanes this stage can carry in one launch, so a caller can
-    /// split a group into launches that fit. At least one: a lane that alone
-    /// doesn't fit is refused at bind by [`eta_exec::layout`].
     #[must_use]
     pub fn lane_ceiling(&self) -> u32 {
         if self.scratch_stride == 0 {

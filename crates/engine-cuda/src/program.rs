@@ -23,7 +23,7 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
-pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes};
+pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets};
 pub use ports::Envelope;
 pub use session::{Fired, Launched, Session, seeds_of};
 pub use wave::Wave;
