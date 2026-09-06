@@ -121,6 +121,7 @@ impl Run<'_> {
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
+            | Elementwise::GateSigmoidMulHeads { .. }
             => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
 
             Elementwise::RmsnormGroupedPlusOne {

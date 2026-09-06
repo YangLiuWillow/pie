@@ -311,6 +311,20 @@ pub enum Elementwise {
         gate: ValueId,
         x_out: ValueId,
     },
+    /// `x[:, h·head_dim + j] *= scale · sigmoid(gate[:, h])`, in place on
+    /// `x` — a per-HEAD gate, one logit per head per row, broadcast across
+    /// the head's channels. `x` is `[rows, heads·head_dim]`, `gate` is
+    /// `[rows, heads]` at `x`'s dtype. The `scale` is the constant in front
+    /// of the sigmoid (LTX-2's gated attention is `out · 2σ(W·x)`; a plain
+    /// gate states `1.0`). fp32 sigmoid and product, one rounding at the
+    /// store.
+    GateSigmoidMulHeads {
+        x: ValueId,
+        gate: ValueId,
+        head_dim: u32,
+        scale: f32,
+        x_out: ValueId,
+    },
     // Hyper-connections: residual streams expanded, mixed by learned gates, and
     // folded back layer by layer.
     /// Tiles `x` across `streams` residual streams.
@@ -623,9 +637,28 @@ pub enum RopeForm {
     /// MiniMax's layout (96 of 128 channels rotated).
     Neox,
     /// `rotate_half` WITHIN each block: pair `i` of axis `a` is `(b + i,
-    /// b + dims[a]/2 + i)` — Wan's and LTX's layout, and
-    /// [`MropeForm::Split`]'s pairing.
+    /// b + dims[a]/2 + i)` — Wan's layout, and [`MropeForm::Split`]'s
+    /// pairing.
     Split,
+    /// ONE frequency ladder across the whole `[rows, heads·rotary_dim]`
+    /// rectangle, the axes handed out round-robin along it — LTX-2's
+    /// layout, which no per-head rule states.
+    ///
+    /// The row's angle slots are numbered `g = head · rotary_dim/2 + i`
+    /// across every head. The first `pad` slots turn by nothing
+    /// (`cos = 1`, `sin = 0`); slot `g >= pad` belongs to axis
+    /// `a = (g − pad) mod axes` at ladder index `f = (g − pad) div axes`
+    /// and turns by `positions[a] · thetas[a]^(f / (F_a − 1))` — a
+    /// POSITIVE, endpoint-inclusive exponent (`torch.linspace(0, 1, F_a)`),
+    /// where `F_a = dims[a]/2` is how many frequencies axis `a` owns over
+    /// the WHOLE row. So `dims[a]` here counts the ROW's channels, not a
+    /// head's, and `pad = (heads · rotary_dim − Σ dims) / 2`; every live
+    /// axis owns the same count, and `rotary_dim == head_dim` because the
+    /// pairing is `rotate_half` within each head (`(i, i + rotary_dim/2)`).
+    /// The positions are the reference's already-normalised coordinates
+    /// (`(2·coord/max − 1) · π/2`), which is why they are fractional and
+    /// signed.
+    SplitLadder,
 }
 
 /// Which activation gates a [`RmsnormGated`](Elementwise::RmsnormGated) —
@@ -711,6 +744,7 @@ impl Operands for Elementwise {
             Self::RopePartialLast { q, positions, .. } => sink.extend([*q, *positions]),
             Self::RopeYarn { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::GateSigmoidMul { x, gate, .. } => sink.extend([*x, *gate]),
+            Self::GateSigmoidMulHeads { x, gate, .. } => sink.extend([*x, *gate]),
             Self::HcExpand { x, .. } => sink.push(*x),
             Self::HcRmsnormF32 { streams, .. } => sink.push(*streams),
             Self::HcProject { normed, weight, .. } => sink.extend([*normed, *weight]),
@@ -803,6 +837,7 @@ impl Operands for Elementwise {
             Self::RopePartialLast { q_out, .. } => sink.push(*q_out),
             Self::RopeYarn { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::GateSigmoidMul { x_out, .. } => sink.push(*x_out),
+            Self::GateSigmoidMulHeads { x_out, .. } => sink.push(*x_out),
             Self::HcExpand { y, .. } => sink.push(*y),
             Self::HcRmsnormF32 { y, .. } => sink.push(*y),
             Self::HcProject { mixes, .. } => sink.push(*mixes),
@@ -865,6 +900,7 @@ impl Operands for Elementwise {
             Self::RopePartialLast { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::RopeYarn { q_out, q, k_out, k, .. } => sink.extend([(*q_out, *q), (*k_out, *k)]),
             Self::GateSigmoidMul { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::GateSigmoidMulHeads { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::HcExpand { .. } => {}
             Self::HcRmsnormF32 { .. } => {}
             Self::HcProject { .. } => {}
@@ -921,6 +957,7 @@ impl Operands for Elementwise {
             Self::RopePartialLast { .. } => "elementwise.rope_partial_last",
             Self::RopeYarn { .. } => "elementwise.rope_yarn",
             Self::GateSigmoidMul { .. } => "elementwise.gate_sigmoid_mul",
+            Self::GateSigmoidMulHeads { .. } => "elementwise.gate_sigmoid_mul_heads",
             Self::HcExpand { .. } => "elementwise.hc_expand",
             Self::HcRmsnormF32 { .. } => "elementwise.hc_rmsnorm_f32",
             Self::HcProject { .. } => "elementwise.hc_project",

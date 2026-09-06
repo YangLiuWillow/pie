@@ -111,6 +111,38 @@ __global__ void gate_sigmoid_mul(
     x[at] = Elem<T>::from_f32(xv * s);
 }
 
+/// **THE PER-HEAD GATE**: one logit per head per row, broadcast across the
+/// head's channels, with a constant in front of the sigmoid
+/// (`x[h·head_dim + j] *= scale · σ(gate[h])`). LTX-2's gated attention is
+/// this at `scale = 2`; the flat `gate_sigmoid_mul` above wants a gate plane
+/// as wide as the rectangle, which a `[rows, heads]` logit is not.
+///
+/// One block per ROW (`rope_axes`'s seat, not the flat one): the gate plane
+/// is `heads` wide and the gated plane `heads·head_dim`, so an element index
+/// answers neither. fp32 sigmoid and product, one rounding at the store.
+template <class T>
+__global__ void gate_sigmoid_mul_heads(
+    T* __restrict__ x,
+    const T* __restrict__ gate,
+    i32 heads,
+    i32 head_dim,
+    float scale,
+    const u32* __restrict__ win)
+{
+    const i32 n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    const i32 row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
+
+    const i32 width = heads * head_dim;
+    T* xr = x + static_cast<long long>(row) * width;
+    const T* gr = gate + static_cast<long long>(row) * heads;
+    for (i32 idx = threadIdx.x; idx < width; idx += blockDim.x) {
+        const float g = Elem<T>::to_f32(gr[idx / head_dim]);
+        const float s = scale / (1.f + __expf(-g));
+        xr[idx] = Elem<T>::from_f32(Elem<T>::to_f32(xr[idx]) * s);
+    }
+}
+
 template <bool GateSecond>
 __device__ __forceinline__ i32 gate_offset(i32 i, i32 I) {
     return GateSecond ? I + i : i;

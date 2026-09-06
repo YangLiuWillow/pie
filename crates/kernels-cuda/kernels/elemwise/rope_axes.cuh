@@ -27,6 +27,7 @@ namespace pie::elemwise {
 constexpr int kRopeInterleaved = 0;  ///< GPT-J: `(x[2i], x[2i+1])`.
 constexpr int kRopeNeox = 1;         ///< rotate-half: `(x[p], x[p + rotary_dim/2])`.
 constexpr int kRopeSplit = 2;        ///< within the axis block: `(x[b+i], x[b+s+i])`.
+constexpr int kRopeSplitLadder = 3;  ///< one ladder across the row, axes round-robin.
 
 /// **`kRopeInterleaved` IS NOT `MropeForm::Interleaved`.** That name, one
 /// file over, describes how SECTIONS are handed out (pairs alternating
@@ -44,8 +45,25 @@ constexpr int kRopeSplit = 2;        ///< within the axis block: `(x[b+i], x[b+s
 /// `rotary_dim == head_dim` it is `rope_full`'s non-interleaved arm, angle for
 /// angle.
 ///
+/// `kRopeSplitLadder` is the odd one out and the reason the form is not just
+/// a pairing: LTX-2 builds ONE frequency ladder over the whole
+/// `[rows, heads·head_dim]` row and hands the axes out round-robin ALONG it,
+/// so head `h`'s angles are neither one axis's nor one band of the ladder.
+/// Slot `g = head·angles + i` (`angles = rotary_dim/2`) is identity while
+/// `g < pad`, and otherwise belongs to axis `(g − pad) mod axes` at ladder
+/// index `f = (g − pad) / axes`, turning by `positions[a] ·
+/// thetas[a]^(f/(F_a − 1))` — a POSITIVE, endpoint-inclusive exponent
+/// (`torch.linspace(0, 1, F_a)`), `F_a = dims[a]/2` the ROW's frequency
+/// count for that axis and `pad = (heads·rotary_dim − Σ dims)/2`. Its
+/// pairing is rotate-half within the head, which is `kRopeNeox`'s at
+/// `rotary_dim == head_dim`.
+///
 /// `__sincosf` and `powf` are `rope.cuh`'s, transcribed, so a one-axis call
-/// answers what the scalar kernel answers to the bit.
+/// answers what the scalar kernel answers to the bit. THE LADDER FORM USES
+/// `sincosf` INSTEAD: its positions are pre-scaled by `π/2` and its top
+/// frequency is `theta` itself, so an angle reaches ~1.6e4 radians, past
+/// where the SFU's reduction holds; the reference reduces in fp32 with a
+/// full-precision π, and so does this.
 template <class T, int FORM>
 __global__ void rope_axes(
     const T* __restrict__ x,
@@ -76,6 +94,38 @@ __global__ void rope_axes(
     const float* pos = positions + static_cast<long long>(row) * axes;
     const T* xr = x + static_cast<long long>(row) * width;
     T* orow = o + static_cast<long long>(row) * width;
+
+    if constexpr (FORM == kRopeSplitLadder) {
+        // One ladder over the whole row. `pad` identity slots in front, then
+        // axis-major round robin; the pairing is rotate-half within a head.
+        int span = 0;
+        for (int a = 0; a < axes; ++a) span += dims[a];
+        const int pad = (heads * rotary_dim - span) / 2;
+        for (int idx = threadIdx.x; idx < heads * angles; idx += blockDim.x) {
+            const int head = idx / angles;
+            const int angle = idx % angles;
+            float cos_v = 1.f;
+            float sin_v = 0.f;
+            if (idx >= pad) {
+                const int slot = idx - pad;
+                const int axis = slot % axes;
+                const int f = slot / axes;
+                const int ladder = dims[axis] / 2;
+                const float exponent =
+                    ladder > 1 ? static_cast<float>(f) / static_cast<float>(ladder - 1) : 0.f;
+                sincosf(pos[axis] * powf(thetas[axis], exponent), &sin_v, &cos_v);
+            }
+            const int lo = angle;
+            const int hi = angle + angles;
+            const T* xh = xr + static_cast<long long>(head) * head_dim;
+            T* oh = orow + static_cast<long long>(head) * head_dim;
+            const float a = Elem<T>::to_f32(xh[lo]);
+            const float b = Elem<T>::to_f32(xh[hi]);
+            oh[lo] = Elem<T>::from_f32(a * cos_v - b * sin_v);
+            oh[hi] = Elem<T>::from_f32(b * cos_v + a * sin_v);
+        }
+        return;
+    }
 
     for (int idx = threadIdx.x; idx < heads * angles; idx += blockDim.x) {
         const int head = idx / angles;
