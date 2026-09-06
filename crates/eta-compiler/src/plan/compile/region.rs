@@ -14,7 +14,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use eta_ir::op::{Family, Op};
+use eta_ir::op::{Family, IntrinsicId, Op};
 use eta_ir::types::ValueId;
 
 use super::normalize::{ChannelSlot, NodeIndex, NormalizedStage, result_layout};
@@ -392,17 +392,39 @@ pub(crate) fn build_region(
     kind: RegionKind,
 ) -> Region {
     let node_set: BTreeSet<NodeIndex> = nodes.iter().copied().collect();
+    let produced_here = |value: ValueId| {
+        index
+            .producer(value)
+            .is_some_and(|producer| node_set.contains(&producer))
+    };
 
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
     let mut sinks = Vec::new();
+    // A direct `top_k` reads its divisor itself (see [`direct_topk`]): the
+    // region names it an input, and the region producing it an output, so
+    // the value is materialised and stays alive until the kernel runs —
+    // the op graph alone says the divide's own region was its last reader.
+    for (other, _) in stage.ops.iter().enumerate() {
+        let other = NodeIndex(other as u32);
+        let Some(DirectTopK { divisor: Some(divisor), .. }) = direct_topk(stage, index, other)
+        else {
+            continue;
+        };
+        match (node_set.contains(&other), produced_here(divisor)) {
+            (true, false) => {
+                inputs.insert(divisor);
+            }
+            (false, true) => {
+                outputs.insert(divisor);
+            }
+            _ => {}
+        }
+    }
     for &node in &nodes {
         let op = &stage.ops[node.index()];
         for operand in op.operands() {
-            if !index
-                .producer(operand)
-                .is_some_and(|producer| node_set.contains(&producer))
-            {
+            if !produced_here(operand) {
                 inputs.insert(operand);
             }
         }
@@ -485,6 +507,64 @@ pub(crate) enum Geometry {
     Single,
     Rows { fixed: u64, extent: u32 },
     Mixed,
+}
+
+/// A `top_k` whose operand is the logits plane itself (through reshapes),
+/// optionally divided by one element: the backend may rank the plane
+/// directly, applying the divide as it reads, and store no copy of the
+/// scaled value. `intrinsic` is the plane's node; `divisor` the one element,
+/// as the divide names it (the planner keeps that value alive, see
+/// [`build_region`]).
+pub(crate) struct DirectTopK {
+    pub(crate) intrinsic: NodeIndex,
+    pub(crate) divisor: Option<ValueId>,
+}
+
+pub(crate) fn direct_topk(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+    node: NodeIndex,
+) -> Option<DirectTopK> {
+    let Op::TopK { input, .. } = stage.ops.get(node.index())? else {
+        return None;
+    };
+    let input = *input;
+    let through_reshapes = |mut value: ValueId| -> ValueId {
+        while let Some(producer) = index.producer(value) {
+            match stage.ops[producer.index()] {
+                Op::Reshape { value: inner, .. } => value = inner,
+                _ => break,
+            }
+        }
+        value
+    };
+    let one_element = |value: ValueId| -> bool {
+        stage
+            .value_types
+            .get(value as usize)
+            .is_some_and(|ty| ty.dims.iter().all(|dim| matches!(dim, Dimension::Static(1))))
+    };
+    let mut value = through_reshapes(input);
+    let mut divisor = None;
+    if let Some(producer) = index.producer(value) {
+        if let Op::Div(numerator, element) = stage.ops[producer.index()] {
+            if one_element(element) {
+                divisor = Some(element);
+                value = through_reshapes(numerator);
+            }
+        }
+    }
+    let intrinsic = index.producer(value)?;
+    let Op::IntrinsicVal { intr, .. } = stage.ops[intrinsic.index()] else {
+        return None;
+    };
+    if !matches!(intr, IntrinsicId::Logits | IntrinsicId::MtpLogits) {
+        return None;
+    }
+    let plane = &stage.value_types.get(index.base(intrinsic)? as usize)?.dims;
+    let ranked = &stage.value_types.get(input as usize)?.dims;
+    let same_rows = value_rows(plane).is_some() && value_rows(plane) == value_rows(ranked);
+    (same_rows && plane.last() == ranked.last()).then_some(DirectTopK { intrinsic, divisor })
 }
 
 /// The rows of a value: the product of its leading dims, one of which may

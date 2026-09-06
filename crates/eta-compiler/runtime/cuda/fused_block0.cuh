@@ -425,8 +425,11 @@ __device__ __forceinline__ void ptir_parallel_gather(
     const M1ValueDesc index_desc,
     const M1ValueDesc output_desc) {
   if (tag == 0x61u) {
-    const m1_u32 rows = input_desc.dims[0];
-    const m1_u32 columns = input_desc.dims[1];
+    // A row block sees the row view (rank 1): one row of `len` columns and
+    // one output element. Reading `dims[0]`/`dims[1]` of that view made
+    // every index invalid and zero-filled `len` elements past the output.
+    const m1_u32 rows = input_desc.rank <= 1u ? 1u : input_desc.dims[0];
+    const m1_u32 columns = input_desc.rank <= 1u ? input_desc.len : input_desc.dims[1];
     for (m1_u32 row = threadIdx.x; row < rows; row += blockDim.x) {
       const long long column =
           m1_load_index(indices, row, index_desc.dtype);

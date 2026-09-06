@@ -185,8 +185,10 @@ fn the_row_parallel_epilogue_fuses_into_streams() {
         "the logits value (2) never touches scratch"
     );
     // `centred` (6), `log p` (11) and `p log p` (12) are read only inside
-    // their streams: no store lands them.
-    for spent in [6u32, 11, 12] {
+    // their streams: no store lands them. `scaled` (3) is read by three
+    // passes, each of which recomputes `logits / t` from the intrinsic
+    // rather than loading a stored plane.
+    for spent in [3u32, 6, 11, 12] {
         assert!(
             !source.contains(&format!("offsets[{spent}]")),
             "value {spent} is spent inside its stream and must not touch scratch"
@@ -255,5 +257,118 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
     assert!(
         !source.contains("ptir_parallel_broadcast("),
         "the row max's broadcast still materialises the row"
+    );
+}
+
+/// A `top_k` of the scaled logits (a sampler's taps) is a library region
+/// reading the streams' `scaled`; it ranks the intrinsic plane straight, so
+/// `scaled` still lands nowhere.
+#[test]
+fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
+    let ops = vec![
+        Op::ChanRead(0),
+        Op::Reshape {
+            value: 0,
+            shape: Shape::new(&[]).unwrap(),
+        },
+        Op::IntrinsicVal {
+            intr: IntrinsicId::Logits,
+            shape: Shape::matrix(ROWS, VOCAB),
+            dtype: Dtype::F32,
+        },
+        // 3: scaled
+        Op::Div(2, 1),
+        Op::ReduceMax(3),
+        Op::Reshape {
+            value: 4,
+            shape: Shape::matrix(ROWS, 1),
+        },
+        Op::Broadcast {
+            value: 5,
+            shape: Shape::matrix(ROWS, VOCAB),
+        },
+        Op::Sub(3, 6),
+        Op::Exp(7),
+        Op::ReduceSum(8),
+        // 10, 11: the taps
+        Op::TopK { input: 3, k: 8 },
+        Op::ChanPut { chan: 1, value: 9 },
+        Op::ChanPut { chan: 2, value: 11 },
+    ];
+    let taps_out = ChannelDecl {
+        shape: Shape::matrix(ROWS, 8),
+        dtype: ChanDType::Concrete(Dtype::U32),
+        capacity: 2,
+        host_role: HostRole::Reader,
+        seeded: false,
+    };
+    let container = TraceContainer {
+        names: Vec::new(),
+        channels: vec![scalar_writer(), rows_out(Dtype::F32), taps_out],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+    };
+    let bound = bind(container, profile()).expect("binds");
+    let stages = compile_bound(&bound);
+    let stage = stages.first().expect("one stage");
+    let mut generated = String::new();
+    let mut order = String::new();
+    for (index, region) in stage.fused.regions.iter().enumerate() {
+        let name = format!("k{index}");
+        if eta_compiler::codegen::cuda::order::is_order_region(stage, region) {
+            order.push_str(&eta_compiler::codegen::cuda::order::emit_order_region(&name, stage, region).expect("order emits"));
+        } else if region.row_value.is_some() {
+            let emitted = emit_fused_region(&name, stage, region).expect("cuda emits");
+            generated.push_str(emitted.split("descriptors = ptir_rowdesc;").nth(1).unwrap_or(""));
+        }
+    }
+    assert!(
+        !generated.contains("offsets[3]"),
+        "`scaled` is stored although its only readers recompute it or rank the plane"
+    );
+    assert!(
+        order.contains("kDirectIntrinsic = 0u") || order.contains("kDirectIntrinsic = 1u"),
+        "the top_k does not rank the intrinsic plane directly:\n{}",
+        order.lines().filter(|l| l.contains("kDirect")).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        order.contains("kDirectDivisor = 1u"),
+        "the divisor is not the value the divide names (the reshaped temperature, 1)"
+    );
+    // The divide's own region was the divisor's last reader as far as the op
+    // graph knows; the plan names it across to the top_k so it stays alive.
+    let one_element = |value: &u32| {
+        stage.normalized.value_types[*value as usize]
+            .dims
+            .iter()
+            .all(|dim| matches!(dim, eta_compiler::plan::Dimension::Static(1)))
+    };
+    let ranks = stage
+        .fused
+        .regions
+        .iter()
+        .find(|region| {
+            matches!(
+                region.kind,
+                eta_compiler::plan::RegionKind::Library(eta_compiler::plan::LibraryOp::TopK)
+            )
+        })
+        .expect("the top_k has a region");
+    let divisor = ranks
+        .inputs
+        .iter()
+        .find(|value| one_element(value))
+        .unwrap_or_else(|| panic!("the top_k region names no one-element input: {:?}", ranks.inputs));
+    assert!(
+        stage
+            .fused
+            .regions
+            .iter()
+            .any(|region| !core::ptr::eq(region, ranks) && region.outputs.contains(divisor)),
+        "no region names the divisor {divisor} an output"
     );
 }

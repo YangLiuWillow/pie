@@ -327,6 +327,152 @@ __device__ __forceinline__ float m1_intrinsic_row_load(
   return __uint_as_float((m1_u32)value << 16);
 }
 
+// ── four elements at once ─────────────────────────────────────────────
+// The stream emitter's vector path: a thread takes four consecutive
+// elements a step, read and written as one 16-byte access when the row's
+// pointers are 16-byte aligned and its width is a multiple of four (the
+// emitter checks both per block and falls back to the scalar loop). The
+// arithmetic per element is the scalar helpers', component by component.
+__device__ __forceinline__ bool m1_aligned16(const void* p) {
+  return (reinterpret_cast<m1_u64>(p) & 15u) == 0u;
+}
+
+__device__ __forceinline__ float4 m1_load4_f(
+    const m1_u8* data, m1_u32 index4, m1_u32 dtype) {
+  if (dtype == 0) return reinterpret_cast<const float4*>(data)[index4];
+  if (dtype == 1) {
+    const int4 r = reinterpret_cast<const int4*>(data)[index4];
+    return make_float4(float(r.x), float(r.y), float(r.z), float(r.w));
+  }
+  if (dtype == 2) {
+    const uint4 r = reinterpret_cast<const uint4*>(data)[index4];
+    return make_float4(float(r.x), float(r.y), float(r.z), float(r.w));
+  }
+  const uchar4 r = reinterpret_cast<const uchar4*>(data)[index4];
+  return make_float4(r.x != 0 ? 1.0f : 0.0f, r.y != 0 ? 1.0f : 0.0f,
+                     r.z != 0 ? 1.0f : 0.0f, r.w != 0 ? 1.0f : 0.0f);
+}
+
+__device__ __forceinline__ int4 m1_load4_i(
+    const m1_u8* data, m1_u32 index4, m1_u32 dtype) {
+  if (dtype == 0) {
+    const float4 r = reinterpret_cast<const float4*>(data)[index4];
+    return make_int4(m1_float_to_i32(r.x), m1_float_to_i32(r.y),
+                     m1_float_to_i32(r.z), m1_float_to_i32(r.w));
+  }
+  if (dtype == 1) return reinterpret_cast<const int4*>(data)[index4];
+  if (dtype == 2) {
+    const uint4 r = reinterpret_cast<const uint4*>(data)[index4];
+    return make_int4(m1_bits_i32(r.x), m1_bits_i32(r.y), m1_bits_i32(r.z), m1_bits_i32(r.w));
+  }
+  const uchar4 r = reinterpret_cast<const uchar4*>(data)[index4];
+  return make_int4(r.x != 0 ? 1 : 0, r.y != 0 ? 1 : 0, r.z != 0 ? 1 : 0, r.w != 0 ? 1 : 0);
+}
+
+__device__ __forceinline__ uint4 m1_load4_u(
+    const m1_u8* data, m1_u32 index4, m1_u32 dtype) {
+  if (dtype == 0) {
+    const float4 r = reinterpret_cast<const float4*>(data)[index4];
+    return make_uint4(m1_float_to_u32(r.x), m1_float_to_u32(r.y),
+                      m1_float_to_u32(r.z), m1_float_to_u32(r.w));
+  }
+  if (dtype == 1) {
+    const int4 r = reinterpret_cast<const int4*>(data)[index4];
+    return make_uint4((m1_u32)r.x, (m1_u32)r.y, (m1_u32)r.z, (m1_u32)r.w);
+  }
+  if (dtype == 2) return reinterpret_cast<const uint4*>(data)[index4];
+  const uchar4 r = reinterpret_cast<const uchar4*>(data)[index4];
+  return make_uint4(r.x != 0 ? 1u : 0u, r.y != 0 ? 1u : 0u, r.z != 0 ? 1u : 0u, r.w != 0 ? 1u : 0u);
+}
+
+__device__ __forceinline__ uchar4 m1_load4_b(
+    const m1_u8* data, m1_u32 index4, m1_u32 dtype) {
+  if (dtype == 0) {
+    const float4 r = reinterpret_cast<const float4*>(data)[index4];
+    return make_uchar4(r.x != 0.0f, r.y != 0.0f, r.z != 0.0f, r.w != 0.0f);
+  }
+  if (dtype == 1) {
+    const int4 r = reinterpret_cast<const int4*>(data)[index4];
+    return make_uchar4(r.x != 0, r.y != 0, r.z != 0, r.w != 0);
+  }
+  if (dtype == 2) {
+    const uint4 r = reinterpret_cast<const uint4*>(data)[index4];
+    return make_uchar4(r.x != 0u, r.y != 0u, r.z != 0u, r.w != 0u);
+  }
+  return reinterpret_cast<const uchar4*>(data)[index4];
+}
+
+__device__ __forceinline__ float m1_pick4_f(float4 v, m1_u32 j) {
+  return j == 0u ? v.x : j == 1u ? v.y : j == 2u ? v.z : v.w;
+}
+__device__ __forceinline__ int m1_pick4_i(int4 v, m1_u32 j) {
+  return j == 0u ? v.x : j == 1u ? v.y : j == 2u ? v.z : v.w;
+}
+__device__ __forceinline__ m1_u32 m1_pick4_u(uint4 v, m1_u32 j) {
+  return j == 0u ? v.x : j == 1u ? v.y : j == 2u ? v.z : v.w;
+}
+__device__ __forceinline__ bool m1_pick4_b(uchar4 v, m1_u32 j) {
+  return (j == 0u ? v.x : j == 1u ? v.y : j == 2u ? v.z : v.w) != 0;
+}
+__device__ __forceinline__ void m1_set4_f(float4& v, m1_u32 j, float x) {
+  if (j == 0u) v.x = x; else if (j == 1u) v.y = x; else if (j == 2u) v.z = x; else v.w = x;
+}
+__device__ __forceinline__ void m1_set4_i(int4& v, m1_u32 j, int x) {
+  if (j == 0u) v.x = x; else if (j == 1u) v.y = x; else if (j == 2u) v.z = x; else v.w = x;
+}
+__device__ __forceinline__ void m1_set4_u(uint4& v, m1_u32 j, m1_u32 x) {
+  if (j == 0u) v.x = x; else if (j == 1u) v.y = x; else if (j == 2u) v.z = x; else v.w = x;
+}
+__device__ __forceinline__ void m1_set4_b(uchar4& v, m1_u32 j, bool x) {
+  const unsigned char b = x ? 1 : 0;
+  if (j == 0u) v.x = b; else if (j == 1u) v.y = b; else if (j == 2u) v.z = b; else v.w = b;
+}
+__device__ __forceinline__ void m1_store4_f(m1_u8* data, m1_u32 index4, float4 v) {
+  reinterpret_cast<float4*>(data)[index4] = v;
+}
+__device__ __forceinline__ void m1_store4_i(m1_u8* data, m1_u32 index4, int4 v) {
+  reinterpret_cast<int4*>(data)[index4] = v;
+}
+__device__ __forceinline__ void m1_store4_u(m1_u8* data, m1_u32 index4, uint4 v) {
+  reinterpret_cast<uint4*>(data)[index4] = v;
+}
+__device__ __forceinline__ void m1_store4_b(m1_u8* data, m1_u32 index4, uchar4 v) {
+  reinterpret_cast<uchar4*>(data)[index4] = v;
+}
+
+// Four consecutive columns of an intrinsic row, `column` a multiple of four.
+__device__ __forceinline__ float4 m1_intrinsic_row_load4(
+    const m1_u8* input, m1_u64 row, m1_u32 column, m1_u32 stride, m1_u32 mode) {
+  if (mode == 0u) {
+    const m1_u64 index = row * (m1_u64)stride + column;
+    return reinterpret_cast<const float4*>(input + index * 4u)[0];
+  }
+  const m1_u8* base = input;
+  m1_u64 index = row * (m1_u64)stride + column;
+  if (mode == 2u) {
+    base = reinterpret_cast<const m1_u8*>(reinterpret_cast<const m1_u64*>(input)[row]);
+    index = column;
+  }
+  const uint2 raw = reinterpret_cast<const uint2*>(base + index * 2u)[0];
+  return make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
+                     __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u));
+}
+
+// Whether `row` of an intrinsic can be read four at a time: its first
+// element 16-byte aligned (f32) or 8-byte aligned (bf16) and the stride a
+// multiple of four.
+__device__ __forceinline__ bool m1_intrinsic_row_vectorable(
+    const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
+  if ((stride & 3u) != 0u) return false;
+  if (mode == 2u) {
+    const m1_u64 address = reinterpret_cast<const m1_u64*>(input)[row];
+    return (address & 7u) == 0u;
+  }
+  const m1_u64 element = mode == 0u ? 4u : 2u;
+  const m1_u64 address = reinterpret_cast<m1_u64>(input) + row * (m1_u64)stride * element;
+  return (address & (mode == 0u ? 15u : 7u)) == 0u;
+}
+
 // Resolve a row once, then read columns off it.
 //
 // `mode == 2` keeps a table of row pointers, so calling `m1_intrinsic_row_load`

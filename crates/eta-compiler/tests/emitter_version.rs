@@ -20,8 +20,17 @@ const PINNED: &[(&str, u16, u64)] = &[
     // `ptir_fast_gumbel_argmax_intrinsic`, and a Gumbel-max head emits a call
     // to it instead of its four launches. 29 -> 32 (merged with 30/31):
     // row-parallel streams through registers, the reshaped-row-vector
-    // broadcast fold and the pooled `top_k` select.
-    ("cuda", 32, 0x27d8_d2fd_45f0_9ca1),
+    // broadcast fold and the pooled `top_k` select. 32 -> 33: a stream's
+    // vector loop (16-byte loads and stores, four elements a thread) beside
+    // the scalar one, chosen per block by alignment. 33 -> 34: a later pass
+    // recomputes an intrinsic-derived value instead of loading it, and a
+    // `top_k` of the (scaled) logits ranks the intrinsic plane straight.
+    // 34 -> 35: `fused_block0.cuh`'s `gather_row` reads a row block's
+    // rank-1 view as one row (it zero-filled a row's width past its one
+    // output element).
+    // 35 -> 36: a row-parallel region's nodes are emitted in reduction-depth
+    // order, so an op that waits on no reduction joins the first pass.
+    ("cuda", 36, 0x3755_0d84_bbf0_6ca7),
     // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and

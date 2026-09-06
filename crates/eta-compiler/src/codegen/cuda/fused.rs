@@ -357,6 +357,38 @@ pub(crate) fn analyze_direct_argmax(
     analysis
 }
 
+/// A `top_k` whose operand is the logits, scaled by one element or not,
+/// reached through reshapes: the select kernel reads the intrinsic plane
+/// straight (`order.rs`), so the scaled plane it would have ranked need
+/// never land in scratch — the streams that read it recompute it
+/// (`stream.rs`). Stage-wide, per node: a stream in one region asks about a
+/// `top_k` in another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TopKDirect {
+    /// The intrinsic slot (`OpView::intr`).
+    pub(crate) intrinsic: u16,
+    /// The intrinsic op's node, for its `imm2` row offset.
+    pub(crate) node: u32,
+    /// The one-element value the logits are divided by, if they are.
+    pub(crate) divisor: Option<u32>,
+}
+
+pub(crate) fn analyze_direct_topk(stage: &CompiledStage) -> Vec<Option<TopKDirect>> {
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let index = crate::plan::StageIndex::of(&stage.normalized);
+    (0..ops.len())
+        .map(|node| {
+            let direct = crate::plan::direct_topk(&stage.normalized, &index, crate::plan::NodeIndex(node as u32))?;
+            let producer = direct.intrinsic.index();
+            Some(TopKDirect {
+                intrinsic: ops[producer].intr,
+                node: producer as u32,
+                divisor: direct.divisor,
+            })
+        })
+        .collect()
+}
+
 /// The row geometry a region is launched over, when it is row-parallel.
 pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u64, u32)> {
     region
@@ -479,13 +511,20 @@ pub fn emit_fused_region(
 
     // The barrier-and-status block every op (and every stream) ends with.
     const TAIL: &str = "    __syncthreads();\n    if (status.state != 1u) {\n      if (threadIdx.x == 0u) *commit = 0u;\n      return;\n    }\n";
+    let direct_topk = analyze_direct_topk(stage);
     let streams = row_parallel.then(|| {
-        super::stream::Streams::new(stage, region, &ops, &bases, &row_kinds, &direct.intrinsic, &skipped)
+        super::stream::Streams::new(stage, region, &ops, &bases, &row_kinds, &direct.intrinsic, &skipped, &direct_topk)
     });
 
+    // A row-parallel region's nodes are emitted in the streams' order
+    // (`stream::emission_order`); any other region in the plan's.
+    let order: Vec<usize> = match &streams {
+        Some(streams) => streams.order.clone(),
+        None => region.nodes.iter().map(|n| n.index()).collect(),
+    };
     let mut at = 0usize;
-    while at < region.nodes.len() {
-        let node = region.nodes[at].index();
+    while at < order.len() {
+        let node = order[at];
         at += 1;
         let op = &ops[node];
         let base = bases[node];

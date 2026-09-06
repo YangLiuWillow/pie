@@ -32,7 +32,7 @@ pub use symbolic::*;
 /// everything a device already built.
 pub const COMPILER_VERSION: u16 = 3;
 /// Bumped when region partitioning changes shape. See [`COMPILER_VERSION`].
-pub const REGION_PLAN_VERSION: u16 = 7;
+pub const REGION_PLAN_VERSION: u16 = 8;
 
 /// The complete plan for one stage, handed to `eta-compiler` as a value.
 ///

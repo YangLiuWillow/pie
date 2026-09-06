@@ -254,6 +254,25 @@ const BODY_SELECT: &str = r#"
   const m1_u32 order_rows = order_input_desc.rows;
   const m1_u32 order_width = kWidth;
   const m1_u32 order_count = order_width < order_len ? order_width : order_len;
+  // The direct form: the ranked value is the intrinsic (divided by one
+  // element or not), read off its plane row by row.
+  const bool direct = kDirectIntrinsic != 0xFFFFFFFFu;
+  const m1_u32 direct_index = dispatch_lane * kIntrinsicSlots + (direct ? kDirectIntrinsic : 0u);
+  const m1_u8* direct_base =
+      direct ? reinterpret_cast<const m1_u8*>(intrinsic_bases[direct_index]) : nullptr;
+  const m1_u32 direct_mode = direct ? intrinsic_modes[direct_index] : 0u;
+  const m1_u32 direct_stride_raw = direct ? intrinsic_strides[direct_index] : 0u;
+  const m1_u32 direct_stride = direct_stride_raw == 0u ? order_len : direct_stride_raw;
+  const m1_u64 direct_row0 =
+      direct ? (m1_u64)intrinsic_offsets[direct_index] + (m1_u64)params[kDirectNode].imm2 : 0u;
+  const float direct_divisor = (direct && kDirectDivisor != 0xFFFFFFFFu)
+      ? m1_load_f(scratch + offsets[kDirectDivisor], 0u, descriptors[kDirectDivisor].dtype)
+      : 1.0f;
+  auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
+    if (direct)
+      return m1_intrinsic_row_load(direct_base, direct_row0 + order_row, column, direct_stride, direct_mode) / direct_divisor;
+    return m1_load_f(order_input, order_row * order_len + column, order_input_desc.dtype);
+  };
   __shared__ m1_u32 sel_hist[256];
   __shared__ m1_u32 sel_warp[32];
   __shared__ m1_u64 sel_cand[kSelectCap];
@@ -269,7 +288,6 @@ const BODY_SELECT: &str = r#"
   const m1_u32 sel_warps = (blockDim.x + 31u) >> 5u;
   if (order_count != 0u) {
     for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
-      const m1_u32 order_base = order_row * order_len;
       // 1. The `order_count`-th smallest key by radix select, one 8-bit
       // digit a pass. The first two passes read the row; the keys still
       // under the 16-bit prefix are then few (a row of logits shares its
@@ -293,8 +311,7 @@ const BODY_SELECT: &str = r#"
         __syncthreads();
         if (pooled == 0xFFFFFFFFu) {
           for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
-            const m1_u32 key = m1_desc_key(m1_load_f(
-                order_input, order_base + i, order_input_desc.dtype));
+            const m1_u32 key = m1_desc_key(order_value(order_row, i));
             if ((key & fixed) == prefix) atomicAdd(&sel_hist[(key >> shift) & 255u], 1u);
           }
         } else {
@@ -326,8 +343,7 @@ const BODY_SELECT: &str = r#"
           // low bits (the sort below orders them); a key at the prefix
           // joins the pool the remaining digits are decided in.
           for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
-            const m1_u32 key = m1_desc_key(m1_load_f(
-                order_input, order_base + i, order_input_desc.dtype));
+            const m1_u32 key = m1_desc_key(order_value(order_row, i));
             const m1_u32 high = key & 0xFFFF0000u;
             if (high < prefix) {
               const m1_u32 at = atomicAdd(&sel_fill, 1u);
@@ -362,7 +378,7 @@ const BODY_SELECT: &str = r#"
           const m1_u32 i = window + threadIdx.x;
           const bool valid = i < order_len;
           const m1_u32 key = valid
-              ? m1_desc_key(m1_load_f(order_input, order_base + i, order_input_desc.dtype))
+              ? m1_desc_key(order_value(order_row, i))
               : 0xFFFFFFFFu;
           if (valid && key < threshold) {
             const m1_u32 at = atomicAdd(&sel_fill, 1u);
@@ -434,7 +450,7 @@ const BODY_SELECT: &str = r#"
         m1_store_f(
             order_values,
             order_row * order_width + at,
-            m1_load_f(order_input, order_base + index, order_input_desc.dtype));
+            order_value(order_row, index));
         m1_store_u(order_indices, order_row * order_width + at, index);
       }
       __syncthreads();
@@ -525,6 +541,22 @@ pub fn emit_order_region(
         let cap = width.next_power_of_two().max(2);
         let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
         let _ = writeln!(source, "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;");
+        // A `top_k` of the (scaled) logits ranks the intrinsic plane
+        // straight, the divide applied as each element is read; its operand
+        // plane never lands in scratch (`fused::analyze_direct_topk`).
+        let direct = super::fused::analyze_direct_topk(stage)[node];
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kDirectIntrinsic = {}u;",
+            direct.map_or(u32::MAX, |d| u32::from(d.intrinsic))
+        );
+        let _ = writeln!(source, "  constexpr m1_u32 kDirectNode = {}u;", direct.map_or(0, |d| d.node));
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kDirectDivisor = {}u;",
+            direct.and_then(|d| d.divisor).unwrap_or(u32::MAX)
+        );
+        let _ = writeln!(source, "  constexpr m1_u32 kIntrinsicSlots = {}u;", super::fused::PTIR_INTRINSIC_SLOTS);
         source.push_str(BODY_SELECT);
     } else {
         source.push_str(BODY);
