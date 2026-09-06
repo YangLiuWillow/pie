@@ -1496,11 +1496,8 @@ pub(super) fn reap_guest_fires(
     // reaped with no CUDA call at all, which is the steady state whenever the
     // host is not running ahead of the device.
     if !airborne.settled_past(batch.seq) {
-        // `PIE_REAP_TRACE=1`: which door waited, and how long, per reap.
-        let traced = {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var_os("PIE_REAP_TRACE").is_some())
-        };
+        // `reap-trace`: which door waited, and how long, per reap.
+        let traced = super::diag::on().reap_trace;
         let started = traced.then(std::time::Instant::now);
         landed.settle()?;
         super::btrace::mark("landed");

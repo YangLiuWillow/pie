@@ -5,7 +5,7 @@ hooked snapkv, masked dense, lora (span-grouped correction),
 layer-truncated draft — plus a plain anchor. Sequential on the
 harness client (the concurrent-census instrument with fire-trace
 verdicts lives in .wiki/tart/ac5_census.py; per-lane connections and
-PIE_FIRE_TRACE need a hand-driven boot). What THIS catches: any
+the `fire-trace` diagnostic need a hand-driven boot). What THIS catches: any
 seriation/relax/gate regression that breaks an axis's fire shape
 outright — the failure mode every AC increment hit first.
 

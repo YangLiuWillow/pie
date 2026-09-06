@@ -108,7 +108,7 @@ impl Run<'_> {
                         seat.workspace,
                     )?
                 };
-                if std::env::var_os("PIE_PLAN_TRACE").is_some() {
+                if crate::serve::diag::on().plan_trace.is_some() {
                     let seat = self.planning(*kv_indptr, *plan);
                     eprintln!(
                         "[plan-trace] decode capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
@@ -161,13 +161,12 @@ impl Run<'_> {
                                 &fire.device,
                                 seat.workspace,
                             )?;
-                            // `PIE_PLAN_TRACE=<rows>`: the plan this fire
-                            // built, for a fire of exactly that many rows —
-                            // both arms of a golden print theirs, which is
-                            // how a body's schedule is read beside its walk's.
-                            if let Some(wanted) = std::env::var_os("PIE_PLAN_TRACE")
-                                && (wanted == "all"
-                                    || wanted.to_string_lossy() == seat.rows.to_string())
+                            // `plan-trace=<rows>`: the plan this fire built,
+                            // for a fire of exactly that many rows — both
+                            // arms of a golden print theirs, which is how a
+                            // body's schedule is read beside its walk's.
+                            if let Some(wanted) = crate::serve::diag::on().plan_trace.as_deref()
+                                && (wanted == "all" || wanted == seat.rows.to_string())
                             {
                                 let ints: Vec<i32> = built
                                     .int_upload
@@ -207,7 +206,7 @@ impl Run<'_> {
                                 &fire.device,
                                 seat.workspace,
                             )?;
-                            if std::env::var_os("PIE_PLAN_TRACE").is_some() {
+                            if crate::serve::diag::on().plan_trace.is_some() {
                                 eprintln!(
                                     "[plan-trace] sm90 capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
                                     fire.capture,

@@ -722,23 +722,22 @@ impl AxisCarve<'_> {
 }
 
 /// How many leading execs of a body a replay launches; the rest walk. The
-/// golden probe's bisection knob (`Shell::golden` under `PIE_GOLDEN_PROBE`);
+/// golden probe's bisection knob (`Shell::golden` under `golden-probe`);
 /// `usize::MAX` — every fire outside that probe — launches them all.
 pub static REPLAY_UPTO: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 /// The first exec a replay launches (the ones before it walk); with
 /// [`REPLAY_UPTO`] this isolates one exec. `0` outside the probe.
 pub static REPLAY_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// `PIE_PTR_TRACE=<substring of a key>`: which walk the per-node pointer
+/// `ptr-trace=<substring of a key>`: which walk the per-node pointer
 /// trace ([`crate::dispatch::custom`]'s probe) is inside — `1` the capture
 /// of a matching body, `2` its golden's eager arm, `0` neither.
 pub static PTR_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Whether `PIE_PTR_TRACE` names this key.
+/// Whether `[engine] diagnostics`'s `ptr-trace` names this key.
 pub fn ptr_traced(key: &BodyKey) -> bool {
-    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    match WANT.get_or_init(|| std::env::var("PIE_PTR_TRACE").ok()) {
-        Some(want) => key.to_string().contains(want.as_str()),
+    match crate::serve::diag::on().ptr_trace.as_deref() {
+        Some(want) => key.to_string().contains(want),
         None => false,
     }
 }
@@ -1089,11 +1088,7 @@ impl Bodies {
             self.recorder.bstats.sealed_short += 1;
         }
         let replays = !short && !moved && !empty;
-        let probing = {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var_os("PIE_GOLDEN_PROBE").is_some())
-        };
-        if probing {
+        if crate::serve::diag::on().golden_probe {
             let held = self.map.bodies.get(&key).map(|body| body.shape);
             eprintln!(
                 "[body-probe] {key} eager_twin={} replays={replays} short={short} moved={moved} empty={empty} shape={shape:#x} held={held:x?}",
@@ -1235,15 +1230,15 @@ impl Bodies {
                 PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
                 captured?
             };
-            // `PIE_GRAPH_DOT=<dir>`: every exec of the `PIE_PTR_TRACE` key as DOT.
-            if let Some(dir) = std::env::var_os("PIE_GRAPH_DOT")
+            // `graph-dot=<dir>`: every exec of the `ptr-trace` key as DOT.
+            if let Some(dir) = crate::serve::diag::on().graph_dot.as_deref()
                 && ptr_traced(&key)
             {
                 let nth = steps
                     .iter()
                     .filter(|step| matches!(step, Step::Exec { .. }))
                     .count();
-                let path = format!("{}/exec{nth}.dot", dir.to_string_lossy());
+                let path = format!("{}/exec{nth}.dot", dir.display());
                 let wrote = graph.debug_dot(&path);
                 eprintln!(
                     "[graph-dot] {key} exec {nth} regions {}..{} -> {path} ({})",
@@ -1294,11 +1289,11 @@ impl Bodies {
             return Ok(());
         }
         let grids = launch_grids(at, run);
-        // `PIE_GRID_TRACE=<substring of a key>`: per launch of a matching
+        // `grid-trace=<substring of a key>`: per launch of a matching
         // body, the live span beside the ceiling grid it was captured at —
         // the two numbers a replay disagreeing with its walk is read by.
-        if let Some(wanted) = std::env::var_os("PIE_GRID_TRACE")
-            && key.to_string().contains(wanted.to_string_lossy().as_ref())
+        if let Some(wanted) = crate::serve::diag::on().grid_trace.as_deref()
+            && key.to_string().contains(wanted)
         {
             let windows = run.windows();
             let mut seen = 0usize;
@@ -1604,15 +1599,11 @@ fn walk_capture_units(
     units: Units,
     regions: Regions,
 ) -> Result<()> {
-    // `PIE_CAPTURE_SERIAL=1`: a diagnostic arm that captures on ONE stream
-    // — the fork/join event points the stream pass baked are not walked —
-    // while still writing the capture down. A body that agrees with its
-    // walk only under this flag names the stream plan as what it disagrees
-    // over.
-    let serial_capture = {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("PIE_CAPTURE_SERIAL").is_some())
-    };
+    // `capture-serial`: a diagnostic arm that captures on ONE stream — the
+    // fork/join event points the stream pass baked are not walked — while
+    // still writing the capture down. A body that agrees with its walk only
+    // under this arm names the stream plan as what it disagrees over.
+    let serial_capture = crate::serve::diag::on().capture_serial;
     let mut cursor = match (streams, at.lanes) {
         (Streams::Forked, Some(lanes)) if !serial_capture => Cursor::across(place, lanes),
         _ => at.serial(place),

@@ -85,7 +85,7 @@ pub enum Checkpoint {
 /// A budget can only be met by holding less of what the plane can shrink
 /// (e.g. streaming routed expert banks); anything else refuses with
 /// [`Error::Impossible`](crate::Error::Impossible), naming both numbers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Residency {
     /// Most weight bytes this load may hold on the device (tier T0). `None`
     /// is uncapped; met by holding fewer routed experts.
@@ -94,6 +94,31 @@ pub struct Residency {
     /// T1) — read over UVA on a device miss instead of stalling on the
     /// checkpoint. `None` is uncapped.
     pub host_weight_budget: Option<u64>,
+    /// May a warm boot DEFER the pinned tier: verify T1's planes where they
+    /// lie in the artifact and serve them from there while a background
+    /// thread builds the page-locked copy, instead of paying that copy up
+    /// front? **On**, where the device reports `pageableMemoryAccess`
+    /// (CUDA 12.2+ HMM) — which is the mechanism, and which the shell asks
+    /// the device about rather than being told.
+    ///
+    /// Off is the eager arm: the image is page-locked before the load
+    /// answers, so the first fires take no page faults and the boot is
+    /// slower by the copy. It is a load-shape knob and not a diagnostic —
+    /// a deployment that measures its first-token latency may want it —
+    /// which is why it is stated here and not in `[engine] diagnostics`.
+    #[serde(default = "deferred_by_default")]
+    pub deferred_tier: bool,
+}
+
+/// What `deferred_tier` means when a document does not state it.
+fn deferred_by_default() -> bool {
+    true
+}
+
+impl Default for Residency {
+    fn default() -> Residency {
+        Residency::uncapped()
+    }
 }
 
 /// What a planned load will hold, tier by tier: T0 device, T1 pinned host,
@@ -122,6 +147,7 @@ impl Residency {
         Residency {
             device_weight_budget: None,
             host_weight_budget: None,
+            deferred_tier: true,
         }
     }
 
@@ -271,6 +297,7 @@ mod residency_tests {
         Residency {
             device_weight_budget: Some(device),
             host_weight_budget: Some(host),
+            ..Residency::uncapped()
         }
     }
 

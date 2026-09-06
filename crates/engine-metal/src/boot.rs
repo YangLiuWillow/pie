@@ -15,6 +15,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .parse()
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
     tuning(&doc);
+    crate::diag::publish(&diagnostics(&doc)?);
     Ok(Metal::new(
         DeviceBoot {
             gpu_mem_utilization: gpu_mem_utilization(&doc),
@@ -34,6 +35,30 @@ fn adapter_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
         .map(str::trim)
         .filter(|dir| !dir.is_empty())
         .map(std::path::PathBuf::from)
+}
+
+/// `[metal] diagnostics`: the one word list a person debugging types
+/// (`"tier-trace,kernel-profile=2"`), written here by `pie serve`/`pie run`'s
+/// `--diag` or by `[engine] diagnostics` in the operator's own file.
+///
+/// **A word this shell does not speak refuses the open**, unlike the advisory
+/// keys around it: an ignored `gpu_mem_utilization = "most"` leaves a good
+/// default standing, but an ignored `teir-trace` leaves a person staring at a
+/// silent log wondering what else is broken.
+fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
+    let Some(words) = doc
+        .get("metal")
+        .and_then(toml::Value::as_table)
+        .and_then(|metal| metal.get("diagnostics"))
+    else {
+        return Ok(crate::diag::Diagnostics::default());
+    };
+    let words = words.as_str().ok_or_else(|| {
+        format!("[metal] diagnostics is a comma-separated word list, not {words}")
+    })?;
+    words
+        .parse::<crate::diag::Diagnostics>()
+        .map_err(|error| format!("[metal] diagnostics: {error}"))
 }
 
 /// `[metal] gpu_mem_utilization`: the fraction of `recommendedMaxWorkingSetSize`
@@ -120,6 +145,28 @@ mod tests {
     #[test]
     fn a_boot_document_that_is_not_toml_is_refused_at_the_door() {
         assert!(open(b"this is not = = toml", nothing).is_err());
+    }
+
+    /// The word list is read where the shell reads everything else it is
+    /// told, and — unlike the advisory keys beside it — a word this shell
+    /// does not speak refuses the open rather than tracing nothing.
+    #[test]
+    fn the_diagnostics_word_list_is_read_or_refused_by_name() {
+        let of = |src: &str| super::diagnostics(&src.parse::<toml::Table>().unwrap());
+        assert_eq!(
+            of("").expect("silence is no diagnostics"),
+            crate::diag::Diagnostics::default()
+        );
+        let stated = of("[metal]\ndiagnostics = \"tier-trace,kernel-profile=2\"\n")
+            .expect("two words this shell speaks");
+        assert!(stated.tier_trace);
+        assert_eq!(stated.kernel_profile, crate::diag::Profile::Shaped);
+
+        let why = of("[metal]\ndiagnostics = \"teir-trace\"\n").expect_err("a misspelling");
+        assert!(why.contains("teir-trace"), "the refusal names it: {why}");
+        let why = of("[metal]\ndiagnostics = 3\n").expect_err("a number is not a word list");
+        assert!(why.contains("word list"), "{why}");
+        assert!(open(b"[metal]\ndiagnostics = \"teir-trace\"\n", nothing).is_err());
     }
 
     #[test]

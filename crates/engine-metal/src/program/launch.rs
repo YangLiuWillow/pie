@@ -668,19 +668,18 @@ struct StepWord {
     reserved: u32,
 }
 
-/// `PIE_SCRATCH_NO_ZERO=1`: skip the host memset of a fire's scratch, to
-/// measure what the host's touch of those pages costs the device.
+/// `scratch-no-zero`: skip the host memset of a fire's scratch, to measure
+/// what the host's touch of those pages costs the device.
 fn scratch_zeroing_skipped() -> bool {
-    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SKIP.get_or_init(|| std::env::var_os("PIE_SCRATCH_NO_ZERO").is_some_and(|v| v != "0"))
+    crate::diag::on().scratch_no_zero
 }
 
-/// The streamed form's measurement knobs, read once. `PIE_STREAMED_GROUPS=n`
-/// caps the blocks a wide dispatch spreads over; `PIE_STREAMED_REPEAT=n`
-/// issues each wide dispatch n times (or each dispatch of the kind
-/// `PIE_STREAMED_REPEAT_KIND=wide|single|reduce|argmax`) — all are
-/// idempotent, so this prices a dispatch; `PIE_STREAMED_LIMIT=k` runs only
-/// the first k steps, which breaks the program and times what ran.
+/// The streamed form's measurement knobs, as this module reads them.
+/// `streamed-groups=n` caps the blocks a wide dispatch spreads over;
+/// `streamed-repeat=n` issues each wide dispatch n times (or each dispatch of
+/// the kind `streamed-repeat-kind=wide|partial|single|reduce|argmax`) — all
+/// are idempotent, so this prices a dispatch; `streamed-limit=k` runs only the
+/// first k steps, which breaks the program and times what ran.
 #[derive(Clone, Copy, Debug)]
 struct StreamedKnobs {
     max_groups: u32,
@@ -689,32 +688,22 @@ struct StreamedKnobs {
     limit: usize,
 }
 
+/// The boot's word list, in this module's own vocabulary. `StepKind` is
+/// private here, so the mapping from the typed word lives here too.
 fn streamed_knobs() -> StreamedKnobs {
-    static KNOBS: std::sync::OnceLock<StreamedKnobs> = std::sync::OnceLock::new();
-    *KNOBS.get_or_init(|| StreamedKnobs {
-        max_groups: std::env::var("PIE_STREAMED_GROUPS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(STREAMED_MAX_GROUPS),
-        repeat: std::env::var("PIE_STREAMED_REPEAT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1),
-        repeat_kind: match std::env::var("PIE_STREAMED_REPEAT_KIND").ok().as_deref() {
-            Some("wide") => Some(StepKind::Wide),
-            Some("partial") => Some(StepKind::Partial),
-            Some("single") => Some(StepKind::Single),
-            Some("reduce") => Some(StepKind::Reduce),
-            Some("argmax") => Some(StepKind::Argmax),
-            _ => None,
-        },
-        limit: std::env::var("PIE_STREAMED_LIMIT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(usize::MAX),
-    })
+    let diag = crate::diag::on();
+    StreamedKnobs {
+        max_groups: diag.streamed_groups.unwrap_or(STREAMED_MAX_GROUPS),
+        repeat: diag.streamed_repeat.max(1),
+        repeat_kind: diag.streamed_repeat_kind.map(|kind| match kind {
+            crate::diag::StreamedKind::Wide => StepKind::Wide,
+            crate::diag::StreamedKind::Partial => StepKind::Partial,
+            crate::diag::StreamedKind::Single => StepKind::Single,
+            crate::diag::StreamedKind::Reduce => StepKind::Reduce,
+            crate::diag::StreamedKind::Argmax => StepKind::Argmax,
+        }),
+        limit: diag.streamed_limit.unwrap_or(usize::MAX),
+    }
 }
 
 /// Most element blocks one streamed dispatch spreads over. Every thread of
@@ -846,10 +835,10 @@ fn streamed_dispatches(
             }
         }
     }
-    // `PIE_STREAMED_NOP=n`: n dispatches of one group that hit the kernel's
+    // `streamed-nop=n`: n dispatches of one group that hit the kernel's
     // `default: return` — the production floor of a dispatch of this kernel
     // with these bindings, with no op behind it.
-    let nops = std::env::var("PIE_STREAMED_NOP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let nops = crate::diag::on().streamed_nop;
     for _ in 0..nops {
         out.push((
             StepWord {
@@ -859,7 +848,7 @@ fn streamed_dispatches(
             1,
         ));
     }
-    if std::env::var_os("PIE_STREAMED_TRACE").is_some_and(|v| v != "0") {
+    if crate::diag::on().streamed_trace {
         let grid: Vec<String> = out
             .iter()
             .map(|(word, groups)| format!("{}:{}x{groups}", word.index, word.level))
@@ -2106,7 +2095,7 @@ impl Batch {
         }
     }
 
-    /// `PIE_KERNEL_DUMP=<dir>`: beside a streamed region's source, its lane-0
+    /// `kernel-dump=<dir>`: beside a streamed region's source, its lane-0
     /// tables as `<entry>.tables` — `[value_count, params_per_lane,
     /// scratch_stride, temporary_offset]` as `u32`s, the 32-byte layout
     /// word, then the descriptors, the op params and the offsets — so a
@@ -2114,10 +2103,10 @@ impl Batch {
     /// the very shapes the program ran with. Written once per entry.
     #[cfg(target_vendor = "apple")]
     fn dump_streamed_tables(&self, region: &Region, template: &Prepared) -> Result<()> {
-        let Some(dir) = std::env::var_os("PIE_KERNEL_DUMP") else {
+        let Some(dir) = crate::diag::on().kernel_dump.as_deref() else {
             return Ok(());
         };
-        let path = std::path::Path::new(&dir).join(format!("{}.tables", region.module.entry()));
+        let path = dir.join(format!("{}.tables", region.module.entry()));
         if path.exists() {
             return Ok(());
         }

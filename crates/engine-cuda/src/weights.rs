@@ -423,13 +423,15 @@ fn restore_from_checkpoint(
 /// The artifact to serve T1 from during a warm boot, or `None` to page-lock
 /// the image up front. Deferring verifies T1 planes where they lie instead of
 /// copying them, at the cost of page faults until the background fill lands.
-/// Requires a warm artifact, `host_image() > 0`, and `pageable_access`.
+/// Requires the deployment's word (`[model] deferred_tier`, `deferred` here),
+/// a warm artifact, `host_image() > 0`, and `pageable_access`.
 fn defer_tiers(
     serving: Option<&crate::checkpoint_serving::Serving>,
     plan: &crate::experts::Plan,
+    deferred: bool,
 ) -> Option<crate::checkpoint_serving::Serving> {
     let serving = serving?;
-    if plan.host_image() == 0 || !crate::experts::pageable_access() {
+    if !deferred || plan.host_image() == 0 || !crate::experts::pageable_access() {
         return None;
     }
     // A spill and a deferred seat ask the artifact for different sets; the
@@ -788,6 +790,9 @@ impl Weights {
         stream: *mut core::ffi::c_void,
         target: StorageTarget,
         decode_dense: bool,
+        // `Residency::deferred_tier`: whether a warm boot may serve T1 out of
+        // the artifact while the page-locked image is built behind it.
+        deferred_tier: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -813,7 +818,7 @@ impl Weights {
         // A streamed bank's plane lands whole in the pinned tier, not the store.
         let serving = crate::checkpoint_serving::Serving::open(path, trace);
         // T2 source: this deployment's own artifact, else a resident load's.
-        let deferred = defer_tiers(serving.as_ref(), &plan);
+        let deferred = defer_tiers(serving.as_ref(), &plan, deferred_tier);
         // Whether the checkpoint could fill the image, asked before it exists.
         // The artifact's images are whole tensors landed for one rank; a
         // rank of a wider group wants its band of each, which only the

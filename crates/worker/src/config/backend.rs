@@ -161,6 +161,29 @@ pub struct CudaNativeEngineOptions {
     /// none of them, which is the off arm of a Grouped-versus-Split
     /// measurement — the same row order, a different answer on it.
     pub grouped: Option<bool>,
+    /// **WHAT A PERSON DEBUGGING TURNED ON**, as one comma-separated word
+    /// list: `"golden-probe,arm-trace"`, `"ptr-trace=decode,graph-dot=/tmp/d"`.
+    /// **Omit for none of it**, which is what a deployment states.
+    ///
+    /// These were fourteen `PIE_*` environment variables read straight out of
+    /// the shell (article 9: "shells read no environment"). They are one typed
+    /// record now — `engine_cuda::Diagnostics`, parsed at boot construction, a
+    /// word it does not speak refused there by name — reachable without a
+    /// rebuild from here or from `--diag` on `pie serve` / `pie run`, which
+    /// fills this key. The vocabulary lives on the record; `--diag nonsense`
+    /// prints it.
+    pub diagnostics: Option<String>,
+    /// **WHAT A TENSOR-PARALLEL GROUP'S RANKS TALK OVER**: `"shm"` (P2P off —
+    /// the default, because NCCL's P2P transport has been observed to wedge
+    /// before it falls back on PCIe boxes), `"peer"` (P2P on), or `"nccl"`
+    /// (pie writes nothing and NCCL reads its own environment). **Omit for
+    /// `"shm"`.** Ignored by a single-device deployment, which opens no
+    /// communicator.
+    ///
+    /// Crosses as `Knobs::nccl_transport`. pie WRITES `NCCL_P2P_DISABLE` from
+    /// it, because NCCL has no other door; what it no longer does is read that
+    /// variable to decide its own default.
+    pub nccl_transport: Option<String>,
     /// **HOW MANY SIDE STREAMS THE COMPILER MAY HAND OUT.** `0` bakes an
     /// artifact with no fork group, no event point and stream 0 on every
     /// region — the artifact this compiler produced before concurrency
@@ -197,6 +220,8 @@ impl Default for CudaNativeEngineOptions {
             bodies_mem: None,
             fallback_copy: None,
             grouped: None,
+            diagnostics: None,
+            nccl_transport: None,
             side_streams: None,
         }
     }
@@ -264,6 +289,18 @@ pub struct MetalEngineOptions {
     /// in-memory boot document — the one key of the old bootstrap file the
     /// shell ever read.
     pub gpu_mem_utilization: f64,
+    /// **WHAT A PERSON DEBUGGING TURNED ON**, as one comma-separated word
+    /// list: `"tier-trace,kernel-profile=2"`, `"pass-half=off"`. **Omit for
+    /// none of it.**
+    ///
+    /// These were twenty-six `PIE_*` environment variables read straight out
+    /// of the shell (article 9). They are one typed record now —
+    /// `engine_metal::Diagnostics`, parsed where the shell reads its boot
+    /// document, a word it does not speak refusing the open by name —
+    /// reachable from here or from `--diag` on `pie serve` / `pie run`, which
+    /// fills this key. It rides the options block as `[metal] diagnostics`,
+    /// the same way `tuning` rides it as `[metal.tuning]`.
+    pub diagnostics: Option<String>,
     /// Kernel-selection overrides for the Metal shell, `[engine.tuning]`,
     /// handed through verbatim as the boot document's `[metal.tuning]`
     /// (`kernels_metal::tuning::Overrides` names the keys: `qmv_rows_packs`,
@@ -290,6 +327,7 @@ impl Default for MetalEngineOptions {
             max_model_len: None,
             max_state_slots: None,
             gpu_mem_utilization: 0.90,
+            diagnostics: None,
             tuning: toml::Table::new(),
             device: "metal:0".to_string(),
             verbose: false,

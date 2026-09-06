@@ -22,6 +22,11 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// The cold prefix both doors run: bind the device, settle the compiler's
 /// inputs, bake the artifact. `boot` is widened in place (its lattice).
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
+    // Before anything reads one: the diagnostics this boot states become the
+    // process's, so the trace filters deep in `record`/`dispatch` have a
+    // record to read (`serve::diag`). A `Boot` handed straight to
+    // `Shell::load` — every GPU test in this crate — arrives here too.
+    super::diag::publish(&boot.knobs.diagnostics);
     let device = Context::bind(boot.ordinal, boot.comm)?;
 
     // One-shot: whichever load arrives first states the kernel cache root.
@@ -60,16 +65,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // the compile and every node index taken off `boot.trace` below share
     // one numbering; see the Metal shell's `load` for the argument.
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
-    // The chain fusions behind it; `PIE_FUSE_CHAINS=0` is the A/B arm that
-    // lands the traced launches instead.
-    if fuse_chains() {
+    // The chain fusions behind it; `diagnostics = "fuse-chains=off"` is the
+    // A/B arm that lands the traced launches instead.
+    if boot.knobs.diagnostics.fuse_chains {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
         boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
         // The adaLN peepholes (design D6): a scale-free norm into its
         // modulation, and the gated fold into both.
         boot.trace = model_ir::fuse::modulation(boot.trace.clone());
     }
-    if std::env::var_os("PIE_TRACE_CENSUS").is_some() {
+    if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
         for node in &boot.trace.nodes {
@@ -82,9 +87,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             boot.trace.nodes.len()
         );
     }
-    // `PTIR_GUMBEL_DIRECT=0`: keep a program's Gumbel-max head as the
-    // launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
-    if std::env::var("PTIR_GUMBEL_DIRECT").is_ok_and(|value| value == "0") {
+    // `diagnostics = "gumbel-direct=off"`: keep a program's Gumbel-max head as
+    // the launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
+    if !boot.knobs.diagnostics.gumbel_direct {
         eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -218,6 +223,7 @@ impl Shell {
                 boot.world.size,
             ),
             decode_dense,
+            boot.deferred_tier,
         )?;
         // The convolution weights (D8) relabelled once into the tap-major
         // order the spatial kernels read, before anything reads them.
@@ -546,9 +552,8 @@ pub(super) struct Baked {
     pub(super) budgets: Budgets,
 }
 
-/// Whether the load folds the norm-add-scale-norm and per-layer-input chains
-/// (`model_ir::fuse::residual_chains`). On unless `PIE_FUSE_CHAINS=0`.
-pub(crate) fn fuse_chains() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("PIE_FUSE_CHAINS").is_ok_and(|value| value == "0"))
-}
+// `fuse_chains()` STOOD HERE, reading `PIE_FUSE_CHAINS` through a `OnceLock`.
+// The arm is `Knobs::diagnostics`'s `fuse_chains` now (`diagnostics =
+// "fuse-chains=off"`), read off the boot both callers already hold — `bake`
+// from its own `Boot`, `Cuda::load` from the `DeviceBoot` it was opened with.
+// A knob a caller can state needs no accessor to memoise it.

@@ -139,10 +139,10 @@ impl Buffer {
             // bytes, matching what `newBufferWithBytesNoCopy` requires; the
             // window checked above lies inside it.
             let at = unsafe { map.base().add(cut.base()) };
-            // `PIE_METAL_COPY_RESIDENT=1`: an experiment — copy the window
-            // into a buffer Metal allocated rather than binding the mapping,
-            // to price the no-copy binding's first-use wiring.
-            if std::env::var_os("PIE_METAL_COPY_RESIDENT").is_some_and(|v| v != "0") {
+            // `copy-resident`: an experiment — copy the window into a buffer
+            // Metal allocated rather than binding the mapping, to price the
+            // no-copy binding's first-use wiring.
+            if crate::diag::on().copy_resident {
                 let started = std::time::Instant::now();
                 let mut owned = Buffer::zeroed(device, cut.span() as u64)?;
                 let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
@@ -169,7 +169,7 @@ impl Buffer {
                         });
                     }
                 });
-                if std::env::var_os("PIE_TIER_TRACE").is_some() {
+                if crate::diag::on().tier_trace {
                     eprintln!(
                         "load: copied a {:.2} GiB resident window in {:.2} s",
                         cut.span() as f64 / (1u64 << 30) as f64,

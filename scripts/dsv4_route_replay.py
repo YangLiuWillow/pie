@@ -1,4 +1,4 @@
-"""Replay a `PIE_ROUTE_DUMP` route trace per slab under LRU, clock, LFU and Belady at several seat counts: `python3 scripts/dsv4_route_replay.py routes.tsv`."""
+"""Replay a `diagnostics = "route-dump=<path>"` route trace per slab under LRU, clock, LFU and Belady at several seat counts: `python3 scripts/dsv4_route_replay.py routes.tsv`."""
 import sys, collections
 lines=[l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
 # The dump holds two loads back to back (run-1, run-2); the slab index restarts at 0 each fire.

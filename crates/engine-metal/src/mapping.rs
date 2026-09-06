@@ -236,15 +236,13 @@ impl Cut {
 /// writer's own padding (`pie model import` aligns at 2 MiB), never a band.
 const SLACK: u64 = 8 << 20;
 
-/// The device's `maxBufferLength`, clamped down by `PIE_METAL_WINDOW_CEILING`
-/// if that env var is a valid, positive, smaller byte count.
+/// The device's `maxBufferLength`, clamped down by `diagnostics =
+/// "window-ceiling=<bytes>"` when that states a smaller one.
 #[must_use]
 pub fn ceiling(device: u64) -> u64 {
-    std::env::var("PIE_METAL_WINDOW_CEILING")
-        .ok()
-        .and_then(|it| it.parse::<u64>().ok())
-        .filter(|it| *it > 0)
-        .map_or(device, |it| it.min(device))
+    crate::diag::on()
+        .window_ceiling
+        .map_or(device, |stated| stated.min(device))
 }
 
 /// Cut a mapping into windows, none larger than `ceiling`, that cover the
@@ -287,7 +285,7 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
 
     let mut sorted: Vec<(&str, u64, u64)> = bound.to_vec();
     sorted.sort_by_key(|(_, offset, length)| (*offset, *length));
-    if std::env::var_os("PIE_METAL_PREFAULT").is_some_and(|v| v != "0") {
+    if crate::diag::on().prefault {
         prefault(map, &sorted);
     }
 
@@ -485,7 +483,7 @@ mod tests {
 
 }
 
-/// **PREFAULT THE RESIDENT PLANES** (`PIE_METAL_PREFAULT=1`): the artifact is
+/// **PREFAULT THE RESIDENT PLANES** (`prefault`): the artifact is
 /// mapped and bound without a copy, so the device's first touch of a plane
 /// page-faults it in — a random walk over the whole resident tier that the
 /// first fire after boot waits on. Asking the kernel for the pages up front,
@@ -536,7 +534,7 @@ fn prefault(map: &Mapping, planes: &[(&str, u64, u64)]) {
             });
         }
     });
-    if std::env::var_os("PIE_TIER_TRACE").is_some() {
+    if crate::diag::on().tier_trace {
         eprintln!(
             "load: prefaulted {:.2} GiB of resident planes in {:.2} s",
             total as f64 / (1u64 << 30) as f64,

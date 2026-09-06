@@ -674,7 +674,7 @@ impl Pending {
     /// [`Fault::Device`] carrying the command buffer's own sentence.
     /// The device's own span for this buffer, `(start, end)` in microseconds
     /// of the GPU clock, once it has completed; zeros before that or off
-    /// Apple. What `PIE_FIRE_TRACE` prints beside the host's view.
+    /// Apple. What `fire-trace` prints beside the host's view.
     #[must_use]
     pub fn gpu_span_us(&self) -> (u64, u64) {
         #[cfg(target_vendor = "apple")]
