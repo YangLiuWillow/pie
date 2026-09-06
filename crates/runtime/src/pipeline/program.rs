@@ -430,6 +430,9 @@ fn profile_from(
         has_value_head: eta.has_value_head,
         has_attn_score: eta.has_attn_score,
         has_attn_page_mask: eta.has_attn_page_mask,
+        // Filled by the imagegen runtime work: a family planting `seam::VELOCITY`.
+        has_velocity: false,
+        velocity_width: 0,
         // Second-party kernels the backend advertises. `envelope_dot` is
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.

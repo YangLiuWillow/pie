@@ -603,6 +603,10 @@ impl ReqGeometry {
                         [only] if *only + 1 == rows => ::engine::Readout::Last,
                         rows => ::engine::Readout::Rows(rows.to_vec()),
                     },
+                    stream: engine::fire::LaneStream::Text,
+                    group: None,
+                    reading: 0,
+                    ports: Vec::new(),
                 }
             })
             .collect()
