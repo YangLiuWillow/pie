@@ -1019,8 +1019,12 @@ impl FrameShell for Shell {
         // before any of it runs. A demand is a watermark (highest addressed
         // page/slot + 1), not a count, since the arenas grow at the tail.
         let page_size = u64::from(self.pools.paging().page_size).max(1);
+        // A plan with no kv space (a denoiser, a VAE) seats no page: its
+        // lanes' rows are latents, bounded by the token ceiling alone, and
+        // its demand on the pools is nothing.
+        let kv_less = self.spaces == 0;
         let demand = Demand {
-            kv_pages: seats
+            kv_pages: if kv_less { 0 } else { seats
                 .iter()
                 .zip(&tables)
                 .map(|(seat, table)| {
@@ -1040,7 +1044,7 @@ impl FrameShell for Shell {
                     }
                 })
                 .max()
-                .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
+                .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)) },
             state_slots: seats
                 .iter()
                 .map(|seat| seat.slot.saturating_add(1))
@@ -1052,7 +1056,7 @@ impl FrameShell for Shell {
         // a slot's run for a shell-owned block, each tabled id for a
         // runtime-tabled one — not under every page below the watermark.
         let mut kv_ranges: Vec<(u64, u64)> = Vec::new();
-        for (seat, table) in seats.iter().zip(&tables) {
+        for (seat, table) in seats.iter().zip(&tables).filter(|_| !kv_less) {
             let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
             let pages = after.div_ceil(page_size).max(1);
             if table.is_empty() {

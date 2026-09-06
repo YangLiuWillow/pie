@@ -1113,7 +1113,14 @@ impl Shell {
         // Budget is device memory (`[engine] bodies_mem`, with
         // `record::MAX_BODIES` a count belt), asked per key.
         let seats = self.held.len() as u32;
-        let context = self.pools.paging().context();
+        // The rows one lane may carry: a slot's context for a plan with kv
+        // spaces, the token ceiling for one without (a denoiser's lane is
+        // its latents, and no page bounds it).
+        let context = if self.spaces == 0 {
+            self.budget.max_tokens
+        } else {
+            self.pools.paging().context()
+        };
         let max_lanes = self.budget.max_lanes;
         let classes = self.compiled.classes.classes.len();
         // A text synthetic may not land in a media class: a media-fact
