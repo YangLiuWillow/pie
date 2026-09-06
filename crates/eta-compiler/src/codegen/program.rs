@@ -269,11 +269,21 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     // at region 0 (the per-program single-lane forms are region 1).
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let entry = format!("ptir_m4_{signature}_r{region_index}");
-        let (emitted, steps) =
-            match crate::codegen::metal::emit_streamed_region(&entry, stage, region) {
-                Ok((source, steps)) => (Ok(source), steps),
-                Err(error) => (Err(error), Vec::new()),
-            };
+        // A `top_k` library region has a streamed form of its own; the other
+        // library samplers keep their grouped kernels.
+        let answer = match grouped_library(stage, region) {
+            Some(LibraryOp::TopK) => {
+                crate::codegen::metal::emit_streamed_topk(&entry, stage, region)
+            }
+            Some(_) => Err(crate::codegen::error::EmitError::LibraryRegionAbiInvalid(
+                crate::codegen::error::RegionForm::GroupedFused,
+            )),
+            None => crate::codegen::metal::emit_streamed_region(&entry, stage, region),
+        };
+        let (emitted, steps) = match answer {
+            Ok((source, steps)) => (Ok(source), steps),
+            Err(error) => (Err(error), Vec::new()),
+        };
         let mut kernel = EmittedKernel::new(
             KernelKind::Streamed,
             stage_index,

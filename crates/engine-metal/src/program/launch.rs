@@ -2152,6 +2152,9 @@ impl Batch {
                 })?;
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
+            if let Some(template) = members.first() {
+                self.dump_streamed_tables(region, template)?;
+            }
             // SAFETY: every buffer is retained by `self`; every offset is zero (the kernel strides off `layout`).
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);

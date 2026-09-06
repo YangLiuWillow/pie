@@ -763,11 +763,13 @@ impl Cache {
     }
 
     /// The streamed kernel for one fused region, when it applies: the region
-    /// holds a value of at least [`WIDE_REGION_ELEMENTS`], is not a library
-    /// sampler (those keep their hand-written kernels), the plan's grouped
-    /// path covers the stage (the streamed form shares its tables), and the
-    /// emitter answered a kernel with a step table. Otherwise `None`, and the
-    /// caller tries the grouped and single-lane forms as before.
+    /// is not a library sampler (those keep their hand-written kernels), the
+    /// plan's grouped path covers the stage (the streamed form shares its
+    /// tables), and the emitter answered a kernel with a step table.
+    /// Otherwise `None`, and the caller tries the grouped and single-lane
+    /// forms as before. Width is no longer a condition: a 64-element region
+    /// of eighteen ops was a millisecond on the single-lane form's one
+    /// thread and is a few dispatches of a few microseconds here.
     fn streamed_region(
         &mut self,
         context: &Context,
@@ -779,20 +781,10 @@ impl Cache {
         if !plan.needs.grouped_valid {
             return Ok(None);
         }
-        let Some(region) = plan.fused.get(region_index as usize) else {
-            return Ok(None);
-        };
-        if matches!(region.kind, RegionKind::Library(_)) {
+        if plan.fused.get(region_index as usize).is_none() {
             return Ok(None);
         }
-        let wide = region.nodes.iter().any(|&node| {
-            plan.ops
-                .get(node as usize)
-                .is_some_and(|op| op_width(op) >= WIDE_REGION_ELEMENTS)
-        });
-        if !wide {
-            return Ok(None);
-        }
+
         let (source, entry, table) =
             match index.get(KernelKind::Streamed, stage_index, region_index) {
                 Slot::Kernel {

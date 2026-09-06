@@ -822,27 +822,10 @@ impl Scheduler<'_> {
     }
 }
 
-/// One fused region as a streamed kernel, and its dispatch table.
-///
-/// # Errors
-///
-/// The grouped form's refusals: an intrinsic the lane record cannot bind, a
-/// library region whose ABI does not hold, a node outside the stage.
-#[allow(clippy::too_many_lines)]
-pub fn emit_streamed_region(
-    function_name: &str,
-    stage: &CompiledStage,
-    region: &Region,
-) -> Result<(String, Vec<u32>), EmitError> {
-    if !library_region_valid(stage, region) {
-        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
-    }
-    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
-    grouped_intrinsics_bindable(&ops, region)?;
-    let bases = result_bases(&ops);
-    let channel_count = used_channel_slots(&ops);
-    let value_types = &stage.normalized.value_types;
-
+/// The streamed kernel's opening: runtime, preamble, signature and the
+/// per-dispatch derivations every case relies on — lane, status, tables,
+/// channels, `m4_gtid` / `m4_gthreads`. Shared with the streamed top-k.
+pub(super) fn kernel_head(function_name: &str, channel_count: usize) -> String {
     let mut source = String::new();
     source.push_str(RUNTIME_TEMPLATE);
     source.push('\n');
@@ -955,6 +938,32 @@ pub fn emit_streamed_region(
     }
     source.push_str("  const uint m4_gtid = m4_group.x * m3_threads + m3_tid;\n");
     source.push_str("  const uint m4_gthreads = m4_groups.x * m3_threads;\n");
+
+    source
+}
+
+/// One fused region as a streamed kernel, and its dispatch table.
+///
+/// # Errors
+///
+/// The grouped form's refusals: an intrinsic the lane record cannot bind, a
+/// library region whose ABI does not hold, a node outside the stage.
+#[allow(clippy::too_many_lines)]
+pub fn emit_streamed_region(
+    function_name: &str,
+    stage: &CompiledStage,
+    region: &Region,
+) -> Result<(String, Vec<u32>), EmitError> {
+    if !library_region_valid(stage, region) {
+        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
+    }
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    grouped_intrinsics_bindable(&ops, region)?;
+    let bases = result_bases(&ops);
+    let channel_count = used_channel_slots(&ops);
+    let value_types = &stage.normalized.value_types;
+
+    let mut source = kernel_head(function_name, channel_count);
 
     // The same view/alias decisions as the grouped emitter, so the two forms
     // read the same values at the same offsets.

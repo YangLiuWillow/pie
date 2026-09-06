@@ -13,6 +13,7 @@ pub mod nucleus;
 pub mod preamble;
 pub mod singleton;
 pub mod streamed;
+pub mod streamed_topk;
 pub mod topk;
 pub mod validate;
 
@@ -28,6 +29,7 @@ pub use intrinsics::{
 pub use nucleus::emit_grouped_nucleus;
 pub use preamble::RUNTIME_TEMPLATE;
 pub use singleton::emit_singleton_region;
+pub use streamed_topk::emit_streamed_topk;
 pub use streamed::{
     StepKind, emit_streamed_region, reduce_dispatch_levels, reduce_levels, step_kind, step_value,
     streamed_step,
@@ -36,7 +38,7 @@ pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
 /// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the engine's pipeline cache keys on it.
-pub const METAL_M1_EMITTER_VERSION: u16 = 48;
+pub const METAL_M1_EMITTER_VERSION: u16 = 49;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
 /// `words_N` buffer per channel starting at buffer 2, and Metal's highest
