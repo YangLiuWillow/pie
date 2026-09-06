@@ -3,7 +3,8 @@
 //! `3x3x3` causal with a two-frame cache and a bias, two lanes whose row
 //! ranges straddle the 128-row tiles, and a channel count off the 128-wide
 //! column tile. The two kernels sum K in different orders, so the claim is
-//! "within one bf16 ulp plus fp32 noise", not "bit-equal".
+//! "within one bf16 ulp plus fp32 noise", not "bit-equal". And `conv3d`
+//! itself, asked without a path, takes the tensor cores on such a shape.
 //!
 //! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_tensor_core_conv_lands_what_the_direct_kernel_lands`
 
@@ -14,7 +15,7 @@ mod common;
 use common::spatial::{Box3, near, out_boxes, table};
 use common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
-use kernels_cuda::spatial::{Conv3d, ConvPath, TimePad, conv3d_on};
+use kernels_cuda::spatial::{Conv3d, ConvPath, TimePad, conv3d, conv3d_on};
 use kernels_cuda::tensor::Tensor;
 
 fn run(c_in: usize, c_out: usize, boxes: &[Box3], conv: Conv3d) {
@@ -112,4 +113,50 @@ fn the_two_kernels_agree_off_the_tile_boundaries() {
             time_pad: TimePad::Zero,
         },
     );
+}
+
+#[test]
+fn the_unnamed_entry_takes_the_tensor_cores_on_a_vectorisable_shape() {
+    let (c_in, c_out) = (32usize, 40usize);
+    let boxes = [Box3::new(2, 5, 9)];
+    let conv = Conv3d::conv2d([3, 3], [1, 1], [1, 1]);
+    let taps = conv.taps() as usize;
+    let (grid, rows) = table(&boxes);
+    let outs = out_boxes(&conv, &boxes);
+    let (o_grid, rows_out) = table(&outs);
+    let mut lcg = Lcg::seeded(0xa07);
+    let (x_raw, _) = lcg.row(rows * c_in);
+    let (w_raw, _) = lcg.row(c_out * c_in * taps);
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x_raw);
+    let w_at = gpu.up(&w_raw);
+    let grid_at = gpu.up(&grid);
+    let o_grid_at = gpu.up(&o_grid);
+    let auto_at = gpu.zeros(rows_out * c_out * 2);
+    let mma_at = gpu.zeros(rows_out * c_out * 2);
+    let ctx = gpu.ctx();
+    let x = Tensor::new(x_at, rows as u32, c_in as u32, Dtype::Bf16);
+    let w = Tensor::new(w_at, c_out as u32, (c_in * taps) as u32, Dtype::Bf16);
+    let g = Tensor::new(grid_at, 1, 4, Dtype::I32);
+    let og = Tensor::new(o_grid_at, 1, 4, Dtype::I32);
+    let mut auto = Tensor::new(auto_at, rows_out as u32, c_out as u32, Dtype::Bf16);
+    conv3d(&ctx, x, g, w, None, conv, None, &mut auto, og).expect("the entry fires");
+    let mut mma = Tensor::new(mma_at, rows_out as u32, c_out as u32, Dtype::Bf16);
+    conv3d_on(
+        &ctx,
+        ConvPath::TensorCore,
+        x,
+        g,
+        w,
+        None,
+        conv,
+        None,
+        &mut mma,
+        og,
+    )
+    .expect("the tensor-core kernel fires");
+    gpu.sync();
+    let a: Vec<u16> = gpu.down(auto_at, rows_out * c_out);
+    let b: Vec<u16> = gpu.down(mma_at, rows_out * c_out);
+    assert_eq!(a, b, "the same kernel, bit for bit");
 }
