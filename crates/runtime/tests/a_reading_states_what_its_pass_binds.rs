@@ -36,21 +36,25 @@ fn denoise() -> ReadingFact {
                 name: "latents",
                 kind: PortKind::Latents,
                 width: 64,
+                streams: Vec::new(),
             },
             PortFact {
                 name: "timestep",
                 kind: PortKind::LaneVector,
                 width: 1,
+                streams: Vec::new(),
             },
             PortFact {
                 name: "positions",
                 kind: PortKind::AxisPositions,
                 width: 3,
+                streams: Vec::new(),
             },
             PortFact {
                 name: "context",
                 kind: PortKind::Context,
                 width: 512,
+                streams: Vec::new(),
             },
         ],
         readout: ReadoutKind::Velocity,
@@ -90,6 +94,7 @@ fn a_reading_resolves_its_ports_by_name_to_kind_relative_indices() {
         name: "guidance",
         kind: PortKind::LaneVector,
         width: 1,
+        streams: Vec::new(),
     });
     let (index, _) = two.port("guidance").expect("declared");
     assert_eq!(index, 1, "the second lane vector is lane-vector port 1");
@@ -130,6 +135,7 @@ fn duplicate_names_are_refused() {
         name: "latents",
         kind: PortKind::Latents,
         width: 64,
+        streams: Vec::new(),
     });
     let why = validate_generative(&family(vec![text(), twice])).unwrap_err();
     assert!(why.contains("`latents`") && why.contains("twice"), "{why}");
@@ -140,7 +146,7 @@ fn a_token_less_reading_must_carry_a_latents_port() {
     let mut rowless = denoise();
     rowless.ports.retain(|port| port.kind != PortKind::Latents);
     let why = validate_generative(&family(vec![text(), rowless])).unwrap_err();
-    assert!(why.contains("no latents port"), "{why}");
+    assert!(why.contains("no latents or voxels port"), "{why}");
 }
 
 #[test]
