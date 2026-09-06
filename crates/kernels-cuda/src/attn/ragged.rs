@@ -31,8 +31,9 @@
 //! the attention launch is `[padded, 1, kv_heads]` with
 //! `padded = ceil((rows·group + groups·(tile − 1)) / tile)`, a tiling law in
 //! rows at a fixed group ceiling. The seat is `Reads::RowsAndLanes`: tables
-//! handed over whole, values inside them plane-absolute, live groups from
-//! `win[2..4]` when armed.
+//! handed over whole (indexed by fire-global group, padded to the lane
+//! ceiling with empty segments), values inside them plane-absolute, and no
+//! seat word read at all — so a body of it replays at any row or lane offset.
 
 use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::fa2_abi::{
@@ -265,8 +266,14 @@ pub fn ragged(
             ArgValue::Ptr(slab + tables.kv_tile_indices),
             ArgValue::Ptr(slab + tables.block_valid_mask),
             ArgValue::Ptr(slab + tables.kv_chunk_size),
-            // Live-groups words when a body replay armed one, else ABSENT.
-            ctx.stage(),
+            // No seat: the engine hands the group tables over WHOLE, indexed
+            // by fire-global group and padded to the lane ceiling with empty
+            // segments, so every entry the table names is a live-or-empty
+            // group and a body replay above lane zero reads the same table
+            // the eager walk does. The window's lane words (`win[2..4]`)
+            // count the window's LANES, which a joint attention's groups are
+            // not, so they are not read.
+            ArgValue::ABSENT,
         ],
     )?;
 

@@ -155,6 +155,15 @@ struct Elem<f16> {
     static __device__ __forceinline__ f16 from_f32(float v) { return f32_to_f16(v); }
 };
 
+/// The identity element: a plane kept in f32 (a lane vector's chain — the
+/// timestep embedding and the adaLN modulation it feeds, design D6) reads
+/// and writes through the same `Elem` idiom the half planes do.
+template <>
+struct Elem<float> {
+    static __device__ __forceinline__ float to_f32(float v) { return v; }
+    static __device__ __forceinline__ float from_f32(float v) { return v; }
+};
+
 __device__ __forceinline__ float block_sum(float local, float* smem) {
     const unsigned int active = 0xffffffffu;
     for (int off = 16; off > 0; off >>= 1) {

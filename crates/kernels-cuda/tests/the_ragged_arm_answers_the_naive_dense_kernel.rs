@@ -2,8 +2,10 @@
 //! `attention.dense` (the naive one-block-per-row kernel) lands over the same
 //! block-diagonal groups, for three groups of unequal size at head widths
 //! 64, 128 and 256 with grouped heads — and what an f32 host reference
-//! computes for a small case, within bf16's own rounding. A staged seat
-//! window names a subset of the groups and touches nothing outside it.
+//! computes for a small case, within bf16's own rounding. An armed staged
+//! seat changes nothing: the arm reads every group its table names (the
+//! engine hands the tables over whole, padded with empty segments) and
+//! touches no row past them.
 //!
 //! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_answers_the_naive_dense_kernel`
 
@@ -232,11 +234,11 @@ fn the_ragged_arm_answers_an_f32_host_reference() {
     }
 }
 
-/// The seat: a plane taller than its live rows, a group table longer than
-/// its live groups, the live groups named off `win[2..4]`. Rows of groups
-/// outside the window, and rows past every group, keep their bytes.
+/// The seat: a plane taller than its groups cover and a staged seat armed
+/// with lane words that name a subset. The arm reads no seat — every group
+/// of the table is served — and rows past every group keep their bytes.
 #[test]
-fn the_ragged_arm_serves_the_groups_the_staged_seat_names() {
+fn the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat() {
     let hd = 64u32;
     let (q_heads, kv_heads) = (2u32, 2u32);
     let sizes = [40u32, 100, 300, 64];
@@ -250,14 +252,14 @@ fn the_ragged_arm_serves_the_groups_the_staged_seat_names() {
     let (v_raw, v_f) = lcg.row(plane_rows * kw);
     let (fill_raw, _) = lcg.row(plane_rows * qw);
     let sm_scale = 1.0 / (hd as f32).sqrt();
-    // Groups 1 and 2 are the window.
+    // The seat names groups 1 and 2; the arm ignores it and serves all four.
     let (first, live) = (1usize, 2usize);
     let want = reference(
         &q_f,
         &k_f,
         &v_f,
-        &table[first..=first + live],
-        &table[first..=first + live],
+        &table,
+        &table,
         q_heads as usize,
         kv_heads as usize,
         hd as usize,
@@ -293,7 +295,7 @@ fn the_ragged_arm_serves_the_groups_the_staged_seat_names() {
     .expect("the ragged arm fires under a staged seat");
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, plane_rows * qw);
-    let (r0, r1) = (table[first] as usize, table[first + live] as usize);
+    let (r0, r1) = (table[0] as usize, *table.last().unwrap() as usize);
     for r in 0..plane_rows {
         let span = r * qw..(r + 1) * qw;
         if r >= r0 && r < r1 {
@@ -301,14 +303,14 @@ fn the_ragged_arm_serves_the_groups_the_staged_seat_names() {
                 let (g, w) = (from_bf16(got[r * qw + c]), want[r * qw + c]);
                 assert!(
                     (g - w).abs() <= TOLERANCE * w.abs().max(1.0),
-                    "row {r} column {c}: a windowed row landed {g} against {w}"
+                    "row {r} column {c}: a grouped row landed {g} against {w}"
                 );
             }
         } else {
             assert_eq!(
                 got[span.clone()],
                 fill_raw[span],
-                "row {r}: a row outside the seat's groups moved"
+                "row {r}: a row past every group moved"
             );
         }
     }

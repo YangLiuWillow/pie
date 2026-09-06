@@ -20,9 +20,10 @@ const BLOCK: u32 = 256;
 ///
 /// # Errors
 ///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for
-/// operands that do not share one shape, an empty rectangle, or an extent
-/// past a 32-bit launch.
+/// [`Error::DtypeUnsupported`] for anything but bf16, f16 and f32 (the last
+/// for a lane vector's chain, which stays f32); a refusal for operands that
+/// do not share one shape, an empty rectangle, or an extent past a 32-bit
+/// launch.
 pub fn silu(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
     fire(ctx, "elementwise.silu", "0", x, o)
 }
@@ -51,7 +52,7 @@ pub fn gelu_tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
 }
 
 fn fire(ctx: &Ctx, op: &'static str, stamp: &str, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
-    let t = dtype_dispatch!(op, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(op, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     if x.dtype != o.dtype || x.rows < o.rows || x.width != o.width {
         return Err(refuse(
             op,

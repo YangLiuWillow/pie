@@ -38,10 +38,14 @@ __device__ __forceinline__ int modulation_row(
 /// reference is `mul_add` and the two agree to the bit. Everything else is
 /// f32 in, f32 out, one rounding at the store. `o` may alias `x`: every
 /// thread reads its own columns before it writes them.
-template <class T, int FORM>
+/// `TM` is the modulation plane's element: `T` itself, or `float` when the
+/// vector arrives from a lane chain kept in f32 (the timestep embedding's
+/// linear lands f32). The arithmetic is f32 either way; only the read
+/// changes, so `m` in f32 is exact and `m` in `T` rounds once at its store.
+template <class T, class TM, int FORM>
 __global__ void modulate(
     const T* __restrict__ x,
-    const T* __restrict__ m,
+    const TM* __restrict__ m,
     const i32* __restrict__ lane_of_row,
     T* __restrict__ o,
     int width,
@@ -60,17 +64,17 @@ __global__ void modulate(
 
     const T* xr = x + static_cast<long long>(row) * width;
     T* orow = o + static_cast<long long>(row) * width;
-    const T* mr = m + static_cast<long long>(modulation_row(lane_of_row, row)) * m_width;
+    const TM* mr = m + static_cast<long long>(modulation_row(lane_of_row, row)) * m_width;
 
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
         const float xv = Elem<T>::to_f32(xr[i]);
         float v;
         if constexpr (FORM == kModScaleShift) {
-            v = fmaf(xv, 1.f + Elem<T>::to_f32(mr[i]), Elem<T>::to_f32(mr[i + width]));
+            v = fmaf(xv, 1.f + Elem<TM>::to_f32(mr[i]), Elem<TM>::to_f32(mr[i + width]));
         } else if constexpr (FORM == kModScale) {
-            v = xv * (1.f + Elem<T>::to_f32(mr[i]));
+            v = xv * (1.f + Elem<TM>::to_f32(mr[i]));
         } else {
-            v = tanhf(Elem<T>::to_f32(mr[i])) * xv;
+            v = tanhf(Elem<TM>::to_f32(mr[i])) * xv;
         }
         orow[i] = Elem<T>::from_f32(v);
     }
@@ -83,10 +87,10 @@ __global__ void modulate(
 /// `g` reads its row the way `modulate`'s `m` does — per lane through
 /// `lane_of_row`, or per token without it. `r_out` may alias `r`; that is the
 /// in-place form the IR spells by aliasing the output onto the input.
-template <class T>
+template <class T, class TM>
 __global__ void gated_residual_add(
     const T* __restrict__ r,
-    const T* __restrict__ g,
+    const TM* __restrict__ g,
     const T* __restrict__ y,
     const i32* __restrict__ lane_of_row,
     T* __restrict__ r_out,
@@ -100,10 +104,10 @@ __global__ void gated_residual_add(
     const T* rr = r + static_cast<long long>(row) * width;
     const T* yr = y + static_cast<long long>(row) * width;
     T* orow = r_out + static_cast<long long>(row) * width;
-    const T* gr = g + static_cast<long long>(modulation_row(lane_of_row, row)) * width;
+    const TM* gr = g + static_cast<long long>(modulation_row(lane_of_row, row)) * width;
 
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
-        orow[i] = Elem<T>::from_f32(fmaf(Elem<T>::to_f32(gr[i]),
+        orow[i] = Elem<T>::from_f32(fmaf(Elem<TM>::to_f32(gr[i]),
                                          Elem<T>::to_f32(yr[i]),
                                          Elem<T>::to_f32(rr[i])));
     }
@@ -136,14 +140,14 @@ constexpr int kNormRmsWeight = 2;
 /// LayerNorm reduces TWICE (mean, then centred squares) and not once through
 /// `E[x²]-E[x]²`, for `layernorm_row`'s reason: a row whose mean is large
 /// against its spread cancels catastrophically in f32.
-template <class T, int BLOCK, int NORM, bool GATED>
+template <class T, class TM, int BLOCK, int NORM, bool GATED>
 __device__ __forceinline__ void norm_modulate_row(
     const T* __restrict__ src,
-    const T* __restrict__ g,
+    const TM* __restrict__ g,
     const T* __restrict__ y,
     T* __restrict__ residual,
     const T* __restrict__ weight,
-    const T* __restrict__ m,
+    const TM* __restrict__ m,
     const i32* __restrict__ lane_of_row,
     T* __restrict__ o,
     int width,
@@ -157,7 +161,7 @@ __device__ __forceinline__ void norm_modulate_row(
 
     const int tid = threadIdx.x;
     const int mrow = modulation_row(lane_of_row, row);
-    const T* mr = m + static_cast<long long>(mrow) * m_width;
+    const TM* mr = m + static_cast<long long>(mrow) * m_width;
     T* orow = o + static_cast<long long>(row) * width;
 
     // The normed row's storage: the residual plane when this pass folds one
@@ -171,10 +175,10 @@ __device__ __forceinline__ void norm_modulate_row(
     if constexpr (GATED) {
         const T* rr = src + static_cast<long long>(row) * width;
         const T* yr = y + static_cast<long long>(row) * width;
-        const T* gr = g + static_cast<long long>(mrow) * width;
+        const TM* gr = g + static_cast<long long>(mrow) * width;
         T* rout = residual + static_cast<long long>(row) * width;
         for (int i = tid; i < width; i += BLOCK) {
-            const T summed = Elem<T>::from_f32(fmaf(Elem<T>::to_f32(gr[i]),
+            const T summed = Elem<T>::from_f32(fmaf(Elem<TM>::to_f32(gr[i]),
                                                     Elem<T>::to_f32(yr[i]),
                                                     Elem<T>::to_f32(rr[i])));
             rout[i] = summed;
@@ -211,15 +215,15 @@ __device__ __forceinline__ void norm_modulate_row(
         float c = (Elem<T>::to_f32(normed[i]) - mean) * inv;
         if constexpr (NORM == kNormRmsWeight) c *= Elem<T>::to_f32(weight[i]);
         orow[i] = Elem<T>::from_f32(
-            fmaf(c, 1.f + Elem<T>::to_f32(mr[i]), Elem<T>::to_f32(mr[i + width])));
+            fmaf(c, 1.f + Elem<TM>::to_f32(mr[i]), Elem<TM>::to_f32(mr[i + width])));
     }
 }
 
-template <class T, int BLOCK, int NORM>
+template <class T, class TM, int BLOCK, int NORM>
 __global__ void norm_modulate(
     const T* __restrict__ x,
     const T* __restrict__ weight,
-    const T* __restrict__ m,
+    const TM* __restrict__ m,
     const i32* __restrict__ lane_of_row,
     T* __restrict__ o,
     int width,
@@ -227,19 +231,19 @@ __global__ void norm_modulate(
     float norm_eps,
     const u32* __restrict__ win)
 {
-    norm_modulate_row<T, BLOCK, NORM, false>(
+    norm_modulate_row<T, TM, BLOCK, NORM, false>(
         x, nullptr, nullptr, nullptr, weight, m, lane_of_row, o, width, m_width,
         norm_eps, win);
 }
 
-template <class T, int BLOCK, int NORM>
+template <class T, class TM, int BLOCK, int NORM>
 __global__ void gated_residual_norm_modulate(
     const T* __restrict__ r,
-    const T* __restrict__ g,
+    const TM* __restrict__ g,
     const T* __restrict__ y,
     T* __restrict__ r_out,
     const T* __restrict__ weight,
-    const T* __restrict__ m,
+    const TM* __restrict__ m,
     const i32* __restrict__ lane_of_row,
     T* __restrict__ o,
     int width,
@@ -247,7 +251,7 @@ __global__ void gated_residual_norm_modulate(
     float norm_eps,
     const u32* __restrict__ win)
 {
-    norm_modulate_row<T, BLOCK, NORM, true>(
+    norm_modulate_row<T, TM, BLOCK, NORM, true>(
         r, g, y, r_out, weight, m, lane_of_row, o, width, m_width, norm_eps, win);
 }
 

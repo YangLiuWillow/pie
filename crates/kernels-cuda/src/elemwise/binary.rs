@@ -19,9 +19,10 @@ const BLOCK: u32 = 256;
 ///
 /// # Errors
 ///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for
-/// operands that do not share one shape, an empty rectangle, or an extent
-/// past a 32-bit launch.
+/// [`Error::DtypeUnsupported`] for anything but bf16, f16 and f32 (the last
+/// for a lane vector's chain, which stays f32); a refusal for operands that
+/// do not share one shape, an empty rectangle, or an extent past a 32-bit
+/// launch.
 pub fn add(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
     fire(ctx, "elementwise.add", "0", x, y, o)
 }
@@ -43,7 +44,7 @@ fn fire(
     y: Tensor,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    let t = dtype_dispatch!(op, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(op, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     for (what, plane) in [("left", x), ("right", y)] {
         if plane.dtype != o.dtype || plane.rows < o.rows || plane.width != o.width {
             return Err(refuse(

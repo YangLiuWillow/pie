@@ -126,26 +126,34 @@ fn lane_map(op: &'static str, lane_of_row: Option<Tensor>, rows: u32) -> Result<
     Ok(map.arg())
 }
 
-/// The `m` rectangle's element and width check, shared by every arm. Its ROW
-/// count is checked by the caller instead: with a lane map bound the rows are
-/// lanes and only the map's values name them, so nothing here can count them.
+/// The `m` rectangle's element and width check, shared by every arm,
+/// answering the element the kernel is stamped with for it: the rows'
+/// own, or `float` for a vector that arrives from a lane chain kept in f32
+/// (`IMAGEGEN_CONTRACT.md` §3: `m`/`g` are f32 or `x`'s dtype). Its ROW
+/// count is checked by the caller instead: with a lane map bound the rows
+/// are lanes and only the map's values name them, so nothing here can count
+/// them.
 fn modulation(
     op: &'static str,
     m: Tensor,
     width: u32,
     vectors: u32,
     dtype: Dtype,
-) -> Result<(), Error> {
-    if m.dtype != dtype {
+) -> Result<&'static str, Error> {
+    let tm = if m.dtype == dtype {
+        dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" })
+    } else if m.dtype == Dtype::F32 {
+        "float"
+    } else {
         return Err(refuse(
             op,
             format!(
                 "the modulation plane is {:?} and the rows it modulates are {dtype:?}; \
-                 both ride the activation's element",
+                 a vector rides the activation's element or stays f32",
                 m.dtype
             ),
         ));
-    }
+    };
     if m.width != vectors * width {
         return Err(refuse(
             op,
@@ -155,7 +163,7 @@ fn modulation(
             ),
         ));
     }
-    Ok(())
+    Ok(tm)
 }
 
 /// The three unfused arms' one body.
@@ -175,7 +183,7 @@ fn fire(
     );
     let width = nonzero(op, "the modulated width", o.width)?;
     let rows = nonzero(op, "rows", o.rows)?;
-    modulation(op, m, width, form.vectors(), x.dtype)?;
+    let tm = modulation(op, m, width, form.vectors(), x.dtype)?;
     if lane_of_row.is_none() && m.rows < rows {
         return Err(refuse(
             op,
@@ -186,7 +194,10 @@ fn fire(
         op,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::modulate<{t}, {}>", form.stamp())),
+            symbol(&format!(
+                "::pie::elemwise::modulate<{t}, {tm}, {}>",
+                form.stamp()
+            )),
         )
         .apply(Launch::per_row(rows, BLOCK)),
         &[
@@ -301,7 +312,7 @@ pub fn gated_residual_add(
     );
     let width = nonzero(OP, "the folded width", r_out.width)?;
     let rows = nonzero(OP, "rows", r_out.rows)?;
-    modulation(OP, g, width, 1, r.dtype)?;
+    let tm = modulation(OP, g, width, 1, r.dtype)?;
     if lane_of_row.is_none() && g.rows < rows {
         return Err(refuse(
             OP,
@@ -312,7 +323,7 @@ pub fn gated_residual_add(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::gated_residual_add<{t}>")),
+            symbol(&format!("::pie::elemwise::gated_residual_add<{t}, {tm}>")),
         )
         .apply(Launch::per_row(rows, BLOCK)),
         &[
@@ -350,13 +361,13 @@ pub fn norm_modulate(
     o: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.norm_modulate";
-    let (t, width, rows) = fused_shapes(OP, x, m, lane_of_row, norm, o)?;
+    let (t, tm, width, rows) = fused_shapes(OP, x, m, lane_of_row, norm, o)?;
     ctx.fire(
         OP,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::norm_modulate<{t}, {BLOCK}, {}>",
+                "::pie::elemwise::norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
             )),
         )
@@ -398,12 +409,22 @@ pub fn gated_residual_norm_modulate(
     o: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.gated_residual_norm_modulate";
-    let (t, width, rows) = fused_shapes(OP, r, m, lane_of_row, norm, o)?;
+    let (t, tm, width, rows) = fused_shapes(OP, r, m, lane_of_row, norm, o)?;
     debug_assert!(
         r.rows == y.rows && r.width == y.width && r.rows == r_out.rows && r.width == r_out.width,
         "`{OP}` folds three rectangles of one shape"
     );
-    modulation(OP, g, width, 1, r.dtype)?;
+    let tg = modulation(OP, g, width, 1, r.dtype)?;
+    if tg != tm {
+        return Err(refuse(
+            OP,
+            format!(
+                "the gate plane is {:?} and the modulation plane {:?}; one fused pass reads \
+                 both in one element",
+                g.dtype, m.dtype
+            ),
+        ));
+    }
     if lane_of_row.is_none() && g.rows < rows {
         return Err(refuse(
             OP,
@@ -415,7 +436,7 @@ pub fn gated_residual_norm_modulate(
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::gated_residual_norm_modulate<{t}, {BLOCK}, {}>",
+                "::pie::elemwise::gated_residual_norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
             )),
         )
@@ -448,7 +469,7 @@ fn fused_shapes(
     lane_of_row: Option<Tensor>,
     norm: NormKind,
     o: &mut Tensor,
-) -> Result<(&'static str, u32, u32), Error> {
+) -> Result<(&'static str, &'static str, u32, u32), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(
         x.rows == o.rows && x.width == o.width,
@@ -456,7 +477,7 @@ fn fused_shapes(
     );
     let width = nonzero(op, "the normed width", o.width)?;
     let rows = nonzero(op, "rows", o.rows)?;
-    modulation(op, m, width, 2, x.dtype)?;
+    let tm = modulation(op, m, width, 2, x.dtype)?;
     if lane_of_row.is_none() && m.rows < rows {
         return Err(refuse(
             op,
@@ -475,5 +496,5 @@ fn fused_shapes(
             ),
         ));
     }
-    Ok((t, width, rows))
+    Ok((t, tm, width, rows))
 }
