@@ -23,6 +23,55 @@ class Event(Enum):
     Error = "error"
 
 
+class ReceivedFile(bytes):
+    """One complete file an inferlet sent, with the name it suggested.
+
+    A `bytes` SUBCLASS, deliberately. The file event has always carried the
+    payload and nothing else, so every program written against this client
+    does `event, data = await proc.recv()` and then writes `data`. Returning a
+    tuple or a dataclass here would break all of them to add one field.
+    Subclassing means the payload is still the payload -- `len(data)`,
+    `data[:8]`, `f.write(data)` all unchanged -- and `data.name` is the new
+    fact beside it.
+
+    `name` is `None` for `session.send-file`, which carries no name, and a
+    string for `session.send-file-as`, `send-frames` and `send-pcm`, which do.
+    It is a SUGGESTION off the wire: sanitise it before joining it to a
+    directory (`file_name()` does).
+    """
+
+    name: str | None
+
+    def __new__(cls, data: bytes, name: str | None = None):
+        self = super().__new__(cls, data)
+        self.name = name
+        return self
+
+    def file_name(self, fallback: str = "file.bin") -> str:
+        """A name safe to join onto a directory.
+
+        The directory part, `..` and NUL are stripped and `fallback` stands in
+        when nothing usable is left. The server sanitises on the way out too;
+        this is the check that counts, because a client does not get to assume
+        the server it is talking to is the one that wrote that code.
+        """
+        raw = self.name or ""
+        tail = raw.replace("\\", "/").rsplit("/", 1)[-1]
+        base = tail.replace("\0", "").strip()
+        if base in ("", ".", ".."):
+            return fallback
+        return base
+
+    def save(self, directory, fallback: str = "file.bin") -> Path:
+        """Write this file into `directory` under its own name, and return the
+        path. Creates the directory if it is not there."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / self.file_name(fallback)
+        path.write_bytes(self)
+        return path
+
+
 class Process:
     """Represents a running process on the server."""
 
@@ -43,10 +92,12 @@ class Process:
         """Transfer a file to the process (fire-and-forget, chunked)."""
         await self.client._transfer_file(self.process_id, file_bytes)
 
-    async def recv(self) -> tuple[Event, str | bytes]:
+    async def recv(self) -> tuple[Event, "str | ReceivedFile"]:
         """
         Receive an event from the process. Blocks until an event is available.
-        Returns a tuple of (Event, value), where value can be a string or bytes.
+        Returns a tuple of (Event, value): a string for the text events, and a
+        `ReceivedFile` -- bytes carrying the name the inferlet suggested --
+        for `Event.File`.
         """
         if self.event_queue is None:
             raise Exception("Event queue is not available for this process.")
@@ -177,13 +228,19 @@ class PieClient:
                 "buffer": bytearray(),
                 "total_chunks": total_chunks,
                 "process_id": process_id,
+                # The name rides on every chunk; the first one is the one
+                # that is guaranteed to have been seen, so it is the one
+                # remembered. `None` when the inferlet named nothing.
+                "name": message.get("name"),
             }
 
         download = self.pending_downloads[file_hash]
         download["buffer"].extend(message.get("chunk_data"))
 
         if chunk_index == total_chunks - 1:
-            completed_file = bytes(download["buffer"])
+            completed_file = ReceivedFile(
+                bytes(download["buffer"]), download.get("name")
+            )
             computed_hash = blake3.blake3(completed_file).hexdigest()
             if computed_hash == file_hash:
                 if process_id in self.process_event_queues:
