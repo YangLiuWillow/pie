@@ -3735,6 +3735,13 @@ impl BatchScheduler {
             // it, a resize's pipe drain); a settling standalone copy holds
             // nothing, so frames keep posting while it settles.
             if in_flight_control.holds_launches() {
+                if wave_trace() {
+                    wave_trace_emit(format!(
+                        "[wave-trace] t={}us hold control in_flight={}",
+                        wave_trace_us(),
+                        in_flight_launches.len()
+                    ));
+                }
                 // Counted only when the device is idle: the frame policy
                 // isn't even consulted here. See `probe::QuorumProbes`.
                 if in_flight_launches.is_empty() {
@@ -3757,6 +3764,14 @@ impl BatchScheduler {
             // frees a slot; posting never waits on completion beyond this
             // backpressure.
             if in_flight_launches.len() >= frame::configured_dispatch_depth() {
+                if wave_trace() {
+                    wave_trace_emit(format!(
+                        "[wave-trace] t={}us hold depth in_flight={} depth={}",
+                        wave_trace_us(),
+                        in_flight_launches.len(),
+                        frame::configured_dispatch_depth()
+                    ));
+                }
                 if in_flight_launches.is_empty() {
                     stats
                         .fire
@@ -3768,6 +3783,13 @@ impl BatchScheduler {
             }
             let now = Instant::now();
             let scan = Self::scan_queue(scan_cache, pending, stopping);
+            if wave_trace() {
+                wave_trace_emit(format!(
+                    "[wave-trace] t={}us plan in_flight={}",
+                    wave_trace_us(),
+                    in_flight_launches.len()
+                ));
+            }
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
                 // Shutdown drain: the boundary gate waits for arrivals that
