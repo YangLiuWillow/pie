@@ -871,6 +871,13 @@ pub struct Shell {
     /// Rows harvested and not yet taken, by step sequence. Bounded — see
     /// [`Shell::harvest_one`].
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
+    /// Whether a step's last-row logits are copied to the host at harvest.
+    /// Nothing in the runtime reads them any more — guests read logits on
+    /// the device through the `out` seam — and the copy was 16 blits, a
+    /// 7.9 MB read and a 4M-element bf16→f32 conversion per fire: 3–7 ms
+    /// of host time between one fire's device-done and the next's commit,
+    /// most of the idle in a 16-lane decode. `PIE_HOST_ROWS=1` turns it on.
+    host_rows: bool,
     /// What the plan restates about its own caches: per cache ROW (the bytes
     /// one page holds) and per PLAN VALUE (the reading one schedule carves).
     ///
@@ -1600,6 +1607,7 @@ impl Shell {
             inflight: VecDeque::new(),
             grafted: None,
             landed: BTreeMap::new(),
+            host_rows: std::env::var_os("PIE_HOST_ROWS").is_some_and(|v| v != "0"),
             patch_seat,
             patch_fold,
             drops_patch_rows,
@@ -2818,18 +2826,23 @@ impl Shell {
             }
         }
 
-        let width = self.out_width as usize;
-        let mut raw = vec![0u8; flight.lanes * width * 2];
-        self.readout[flight.arm].read(0, &mut raw)?;
-        let rows: Vec<Vec<f32>> = raw
-            .chunks_exact(width.max(1) * 2)
-            .take(flight.lanes)
-            .map(|row| {
-                row.chunks_exact(2)
-                    .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
-                    .collect()
-            })
-            .collect();
+        let rows: Vec<Vec<f32>> = if self.host_rows {
+            let width = self.out_width as usize;
+            let mut raw = vec![0u8; flight.lanes * width * 2];
+            self.readout[flight.arm].read(0, &mut raw)?;
+            raw.chunks_exact(width.max(1) * 2)
+                .take(flight.lanes)
+                .map(|row| {
+                    row.chunks_exact(2)
+                        .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
+                        .collect()
+                })
+                .collect()
+        } else {
+            // Filed empty, so `rows_of` answers the step and the readout ABI
+            // keeps its shape; the seat was never written.
+            vec![Vec::new(); flight.lanes]
+        };
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
         self.landed.insert(flight.seq, rows);
@@ -5789,16 +5802,18 @@ impl engine::frame::Shell for Shell {
             })?;
             (row.slab().clone(), row.offset())
         };
-        let seat = self.readout[prepared.arm].slab().clone();
-        for row in prepared.composition.lanes() {
-            let last = row.row_offset + row.rows - 1;
-            frame.copy(
-                &source,
-                base + u64::from(last) * width * 2,
-                &seat,
-                u64::from(row.source) * width * 2,
-                width * 2,
-            )?;
+        if self.host_rows {
+            let seat = self.readout[prepared.arm].slab().clone();
+            for row in prepared.composition.lanes() {
+                let last = row.row_offset + row.rows - 1;
+                frame.copy(
+                    &source,
+                    base + u64::from(last) * width * 2,
+                    &seat,
+                    u64::from(row.source) * width * 2,
+                    width * 2,
+                )?;
+            }
         }
 
         // ── **THE ATTACHED EPILOGUES, ENCODED INTO THIS SAME COMMAND

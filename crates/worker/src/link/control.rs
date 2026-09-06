@@ -199,6 +199,14 @@ pub fn spawn_control_tasks<C: ControlLink>(
                     .len()
                     .min(u32::MAX as usize) as u32,
             };
+            if runtime::planner::trace_enabled() {
+                println!(
+                    "[report] kv_bucket={} inflight={} queue=[{}]",
+                    status.kv_pressure_bucket,
+                    status.inflight,
+                    runtime::planner::planner().map(|p| p.debug_queue()).unwrap_or_default()
+                );
+            }
             if let Err(e) = report_ctrl.report_worker(worker_id, status).await {
                 tracing::warn!(
                     worker = %worker_id,
