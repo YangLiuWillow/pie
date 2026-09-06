@@ -319,6 +319,9 @@ impl ForwardHybrid for Model {
             _ => (x, None),
         };
 
+        // The head runs over the rows a reader takes, not every row the
+        // fire carries (`Dim::Readouts`; the same gather gemma_4 does).
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, head);
         let logits = if head_banded(m, head) {
             ops::collective::all_gather(&logits, m.tp)

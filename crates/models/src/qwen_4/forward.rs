@@ -175,6 +175,9 @@ impl ForwardHybrid for Model {
         }
 
         let (x, _) = mix_in(&y, &m.mixer, m);
+        // The head runs over the rows a reader takes, not every row the
+        // fire carries (`Dim::Readouts`; the same gather gemma_4 does).
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
 
         // **THE DRAFT HEAD**, over the drafting lanes' rows, off the WIDE
