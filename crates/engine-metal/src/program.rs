@@ -552,6 +552,9 @@ impl Plane {
                         // No grouped seat, or a shared ring: this stage runs on
                         // the instance's own tables, one at a time, as it always did.
                         for prepared in group {
+                            #[cfg(target_vendor = "apple")]
+                            prepared.zero_scratch_on(frame)?;
+                            #[cfg(not(target_vendor = "apple"))]
                             prepared.zero_scratch()?;
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;

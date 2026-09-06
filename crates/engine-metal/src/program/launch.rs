@@ -1152,6 +1152,20 @@ impl Prepared {
         self.scratch.zero_span(0, bytes)
     }
 
+    /// [`Prepared::zero_scratch`] on the device: a blit in `frame`'s order,
+    /// then a fresh compute pass. What a batch does for its pool
+    /// (`Batch::encode`), for the instance that launches alone.
+    #[cfg(target_vendor = "apple")]
+    pub fn zero_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
+        if scratch_zeroing_skipped() {
+            return Ok(());
+        }
+        let bytes = self.scratch.bytes();
+        frame.fill(self.scratch.slab(), 0, bytes)?;
+        frame.next_pass()?;
+        Ok(())
+    }
+
     /// [`Prepared::refresh`] without the scratch: what a [`Batch`] member
     /// needs, since its values live in the batch's pool and not here.
     pub fn refresh_cells(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
