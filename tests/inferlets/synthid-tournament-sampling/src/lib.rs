@@ -198,12 +198,6 @@ fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
     h
 }
 
-/// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
-fn rng_state(key: u32, counter: &Tensor) -> Tensor {
-    let is_counter = eq(iota(2), broadcast(1u32, [2]));
-    select(&is_counter, broadcast(counter, [2]), broadcast(key, [2]))
-}
-
 /// The host mirror of `context_counter`, used to find which steps saw a context
 /// the detector has already scored.
 ///
@@ -220,6 +214,20 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
     h
 }
 
+/// Four `[1]` f32 values as one `[4]` cell.
+fn pack4(a: &Tensor, b: &Tensor, c: &Tensor, d: &Tensor) -> Tensor {
+    let lane = iota(4);
+    let cd = select(&eq(&lane, broadcast(2u32, [4])), broadcast(c, [4]), broadcast(d, [4]));
+    let bcd = select(&eq(&lane, broadcast(1u32, [4])), broadcast(b, [4]), &cd);
+    select(&eq(&lane, broadcast(0u32, [4])), broadcast(a, [4]), &bcd)
+}
+
+/// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
+fn rng_state(key: u32, counter: &Tensor) -> Tensor {
+    let is_counter = eq(iota(2), broadcast(1u32, [2]));
+    select(&is_counter, broadcast(counter, [2]), broadcast(key, [2]))
+}
+
 /// The mean-score detector statistic: the emitted token's g-value averaged over
 /// the `depth` layers. Exactly `0.5` in expectation under H0.
 fn mean_g(gs: &[Tensor], token: &Tensor) -> Tensor {
@@ -232,7 +240,9 @@ fn mean_g(gs: &[Tensor], token: &Tensor) -> Tensor {
 
 /// One sampling step.
 ///
-/// Returns `(token, hist_next, chist_next, score, null_score)`.
+/// Returns `(token, hist_next, chist_next, score, null_score, repeated)`;
+/// `repeated` is the `[1]` flag for a context the ring had already seen,
+/// which the detector masks out exactly as the generator did.
 fn step(
     logits: Tensor,
     vocab: u32,
@@ -241,7 +251,7 @@ fn step(
     hlen: &Tensor,
     chist: &Tensor,
     free_state: &Tensor,
-) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
@@ -295,7 +305,7 @@ fn step(
 
     let hist_next = scatter_set(hist, hlen, &token);
     let chist_next = scatter_set(chist, hlen % cfg.history_size, &counter);
-    (token, hist_next, chist_next, score, null_score)
+    (token, hist_next, chist_next, score, null_score, reshape(repeated, [1]))
 }
 
 #[inferlet::main]
@@ -380,8 +390,6 @@ async fn main(input: Input) -> Result<Output> {
     history.resize(cfg.capacity as usize, -1);
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut scores: Vec<f32> = Vec::with_capacity(max_tokens);
-    let mut nulls: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
@@ -430,7 +438,7 @@ async fn main(input: Input) -> Result<Output> {
         let hlen = hlen_p.take();
         let chist = chist_p.take();
         let logits = intrinsics::logits();
-        let (token, hist_next, chist_next, score, null) =
+        let (token, hist_next, chist_next, score, null, _repeated) =
             step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -449,8 +457,15 @@ async fn main(input: Input) -> Result<Output> {
     let s0 = score_out_p.take_host::<f32>().await?;
     let n0 = null_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
-    scores.push(s0);
-    nulls.push(n0);
+    // The detector's sums accumulate on the device, masked by the same
+    // `repeated` flag the generator used (the reference masks a step whose
+    // context n-gram sat in the ring buffer), and ride out beside the token
+    // in one `[4]` cell: a token costs one host round trip, not three. The
+    // prefill's step is never a repeat: the ring was empty.
+    let kept_score = Channel::from([s0]).named("kept_score");
+    let kept_null = Channel::from([n0]).named("kept_null");
+    let kept_count = Channel::from([1.0f32]).named("kept_count");
+    let mut totals = [s0, n0, 1.0f32];
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
@@ -467,15 +482,9 @@ async fn main(input: Input) -> Result<Output> {
         ring_seed[(n % cfg.history_size) as usize] =
             host_counter(&history, n as usize, cfg.context_width);
         let chist_c = Channel::from(ring_seed).named("context_history");
-        let tok_out = Channel::new([1], dtype::i32)
+        let out = Channel::new([4], dtype::f32)
             .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let score_out = Channel::new([1], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("score_out");
-        let null_out = Channel::new([1], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("null_out");
+            .named("out");
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from([n]).named("positions");
         let pages = Channel::from_iter(0..max_pages).named("pages");
@@ -514,9 +523,14 @@ async fn main(input: Input) -> Result<Output> {
             let hist = hist_c.take();
             let hlen = hlen_c.take();
             let chist = chist_c.take();
+            let score_so_far = kept_score.take();
+            let null_so_far = kept_null.take();
+            let count_so_far = kept_count.take();
             let logits = intrinsics::logits();
-            let (token, hist_next, chist_next, score, null) =
+            let (token, hist_next, chist_next, score, null, repeated) =
                 step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
+            let zero = broadcast(0.0f32, [1]);
+            let kept_now = select(&repeated, &zero, broadcast(1.0f32, [1]));
 
             let r_next = &r + iota(2);
             let next_length = &length + 1u32;
@@ -528,9 +542,18 @@ async fn main(input: Input) -> Result<Output> {
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
             page_indptr.put(indptr(1, &page_count));
-            tok_out.put(&token);
-            score_out.put(&score);
-            null_out.put(&null);
+            let score_next = &score_so_far + select(&repeated, &zero, &score);
+            let null_next = &null_so_far + select(&repeated, &zero, &null);
+            let count_next = &count_so_far + &kept_now;
+            out.put(pack4(
+                &cast(reshape(&token, [1]), dtype::f32),
+                &score_next,
+                &null_next,
+                &count_next,
+            ));
+            kept_score.put(&score_next);
+            kept_null.put(&null_next);
+            kept_count.put(&count_next);
             chist_c.put(&chist_next);
             hist_c.put(&hist_next);
             hlen_c.put(&hlen + 1u32);
@@ -539,50 +562,19 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
-            let t = tok_out
-                .take_host::<i32>()
+            let v = out
+                .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let s = score_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let z = null_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            generated.push(t as u32);
-            scores.push(s);
-            nulls.push(z);
+            generated.push(v[0] as u32);
+            totals = [v[1], v[2], v[3]];
             Ok(ControlFlow::Continue(()))
         })
         .await?;
     }
     pipe.close();
-
-    // Both sides of the reference implementation mask a step whose context
-    // n-gram appeared inside the ring buffer: the generator skipped
-    // watermarking there, so scoring it would only add noise. The ring is
-    // replayed here exactly as the device maintained it.
-    let mut full = prompt.clone();
-    full.extend_from_slice(&generated);
-    let mut history_view: Vec<i32> = full.iter().map(|&t| t as i32).collect();
-    history_view.resize(cfg.capacity.max(full.len() as u32) as usize, -1);
-
-    let mut ring = vec![u32::MAX; cfg.history_size as usize];
-    let mut kept_score = 0.0f32;
-    let mut kept_null = 0.0f32;
-    let mut kept = 0usize;
-    for (t, (&s, &z)) in scores.iter().zip(nulls.iter()).enumerate() {
-        let position = n as usize + t;
-        let counter = host_counter(&history_view, position, cfg.context_width);
-        if !ring.contains(&counter) {
-            kept_score += s;
-            kept_null += z;
-            kept += 1;
-        }
-        ring[position % cfg.history_size as usize] = counter;
-    }
+    let [kept_score, kept_null, kept_n] = totals;
+    let kept = kept_n as usize;
 
     let denom = kept.max(1) as f32;
     let mean_score = kept_score / denom;

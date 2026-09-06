@@ -318,7 +318,7 @@ pub fn emit_streamed_topk(
         return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedTopK));
     }
     let input = topk.args[0];
-    let mut source = kernel_head(function_name, used_channel_slots(&ops));
+    let mut source = kernel_head(function_name, used_channel_slots(&ops), "");
     // The helpers follow the head's runtime text; they only need the
     // kernel's own scope, so they sit inside it as constexprs and code.
     let _ = writeln!(source, "  constexpr uint kInput = {input}u;");
