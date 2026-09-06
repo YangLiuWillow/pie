@@ -1138,6 +1138,16 @@ impl<'c> Run<'c> {
                     )
                 })
             }
+            // M0: wired by the engine agent — the float ports (D3) and the
+            // row-packing tables (D2) are staged by the fire path once the
+            // runtime's `reading`/`input` verbs land.
+            Def::Input(
+                which @ (RuntimeInput::RowPermutation { .. }
+                | RuntimeInput::Latents { .. }
+                | RuntimeInput::LaneVector { .. }
+                | RuntimeInput::Context { .. }
+                | RuntimeInput::AxisPositions { .. }),
+            ) => panic!("value {at} reads {which:?}, which this shell does not stage yet"),
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let seat = self.geometry(at, *space);
                 let bound = match kind {
@@ -1150,6 +1160,11 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken => seat.request_of_token,
                     GeomKind::WritePage => seat.write_page,
                     GeomKind::WriteOffset => seat.write_offset,
+                    // M0: wired by the engine agent (the group tables).
+                    GeomKind::GroupOfLane
+                    | GeomKind::GroupIndptr { .. }
+                    | GeomKind::LaneIndptr { .. }
+                    | GeomKind::ReferenceTag { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(

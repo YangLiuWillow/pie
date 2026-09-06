@@ -50,9 +50,13 @@ impl Shell {
         self.device.device().num_sm
     }
 
-    /// The `out` seam's row width — the vocabulary; errors on a symbolic width.
+    /// The `out` seam's row width — the vocabulary; errors on a symbolic
+    /// width, or on a plan whose readout is a float seam and has no `out`.
     pub fn out_width(&self) -> Result<u64> {
-        kv::width_of(&self.trace, self.exports.out)
+        let out = self.exports.out.ok_or_else(|| crate::error::Fault::Unbound {
+            what: "a plan with no `out` seam has no vocabulary width".to_string(),
+        })?;
+        kv::width_of(&self.trace, out)
     }
 
     /// Does this load's model text declare a draft head — gates `IntrinsicId::MtpLogits`.

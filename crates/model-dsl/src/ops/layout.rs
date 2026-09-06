@@ -251,3 +251,40 @@ pub fn scatter_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     );
     y_out
 }
+
+/// The gather that packs rows by attention group: `y[i] = x[perm[i]]`,
+/// `perm` being the arm's `Input::row_permutation`. `y` keeps `x`'s type —
+/// same row space, same width, same dtype; only the order changes, so a
+/// group's lanes land contiguous for [`super::attn::ragged`].
+pub fn pack_rows(x: &Value, perm: &Value) -> Value {
+    let r = x.rec();
+    assert_eq!(x.rows(), perm.rows(), "a permutation is over the rows it packs");
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Layout::PackRows {
+            x: x.id(),
+            perm: perm.id(),
+            y: y.id(),
+        },
+        &[x, perm],
+    );
+    y
+}
+
+/// [`pack_rows`] undone: the scatter `y[perm[i]] = x[i]` over the same
+/// permutation, landing packed rows back on their fire rows. `y` keeps
+/// `x`'s type.
+pub fn unpack_rows(x: &Value, perm: &Value) -> Value {
+    let r = x.rec();
+    assert_eq!(x.rows(), perm.rows(), "a permutation is over the rows it unpacks");
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Layout::UnpackRows {
+            x: x.id(),
+            perm: perm.id(),
+            y: y.id(),
+        },
+        &[x, perm],
+    );
+    y
+}

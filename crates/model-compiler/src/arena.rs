@@ -35,7 +35,7 @@ struct Export {
 
 /// The export set: names `model_dsl::seam` states for values materializing
 /// outside the graph. Republished as [`crate::EXPORT_SEAMS`].
-const EXPORTS: [Export; 4] = [
+const EXPORTS: [Export; 6] = [
     // Trunk logits, into the runtime's sampler.
     Export {
         seam: "out",
@@ -56,11 +56,35 @@ const EXPORTS: [Export; 4] = [
         seam: "mtp.drafts",
         read_by: Readers::ItsOwnClasses,
     },
+    // A denoise arm's velocity, `[rows, C·p^k]` float, into the epilogue's
+    // `velocity()`. Written by the arm that denoises, read for its lanes.
+    Export {
+        seam: "velocity",
+        read_by: Readers::ItsOwnClasses,
+    },
+    // An encoder arm's hidden states at the declared layer(s), `[rows, W]`,
+    // into the epilogue's `hidden()`.
+    Export {
+        seam: "hidden",
+        read_by: Readers::ItsOwnClasses,
+    },
 ];
 
-/// The export seam names, in the order [`EXPORTS`] states them.
-pub const EXPORT_SEAMS: [&str; 4] =
-    [EXPORTS[0].seam, EXPORTS[1].seam, EXPORTS[2].seam, EXPORTS[3].seam];
+/// The export seam names, in the order [`EXPORTS`] states them: `out`,
+/// `mtp`, `attn.scores`, `mtp.drafts`, `velocity`, `hidden`.
+pub const EXPORT_SEAMS: [&str; 6] = [
+    EXPORTS[0].seam,
+    EXPORTS[1].seam,
+    EXPORTS[2].seam,
+    EXPORTS[3].seam,
+    EXPORTS[4].seam,
+    EXPORTS[5].seam,
+];
+
+/// The float readouts among [`EXPORT_SEAMS`]: the seams a forward may
+/// return its value under INSTEAD of `out`, so a plan carrying one of them
+/// and no `out` still has something a reader takes.
+pub const FLOAT_READOUT_SEAMS: [&str; 2] = [EXPORTS[4].seam, EXPORTS[5].seam];
 
 /// How many rows a value has, in the terms the carve evaluates rather than
 /// `model_ir::Dim`'s serializable form.

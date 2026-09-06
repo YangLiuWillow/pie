@@ -94,9 +94,21 @@ impl Run<'_> {
             // CUDA's load-time chain fusions (`model_ir::fuse::residual_chains`);
             // this engine never runs that pass, so it never sees these.
             | Elementwise::RmsnormResidualAdd { .. }
-            | Elementwise::EmbedScaleAdd { .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
+            | Elementwise::EmbedScaleAdd { .. }
+            // M0: the generative families' conditioning ops (D6/D7) are
+            // CUDA-first; refused by name here in this phase.
+            | Elementwise::Modulate { .. }
+            | Elementwise::GatedResidualAdd { .. }
+            | Elementwise::NormModulate { .. }
+            | Elementwise::GatedResidualNormModulate { .. }
+            | Elementwise::Sinusoid { .. }
+            | Elementwise::Silu { .. }
+            | Elementwise::Gelu { .. }
+            | Elementwise::Tanh { .. }
+            | Elementwise::Mul { .. }
+            | Elementwise::Add { .. }
+            | Elementwise::RopeAxes { .. }
+            => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             // qwen4's gated-residual family.
             Elementwise::RmsnormGroupedPlusOne {
                 x,

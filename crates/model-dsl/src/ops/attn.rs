@@ -1227,6 +1227,68 @@ pub fn pool_lse_selected(
     (o, lse)
 }
 
+/// Non-causal attention over packed token rows, segment `i` of `q` against
+/// segment `i` of `k`/`v`, no cache, no plan, no window (D2). `q_indptr` and
+/// `kv_indptr` are the two sides' CSRs — `Input::group_indptr` for a joint
+/// attention over a request's lanes, `Input::lane_indptr` for a
+/// lane-block-diagonal one — each over its own arm's packed rows
+/// (`layout::pack_rows`); `mask` is what applies on top. `head_dim` reads
+/// `q`'s head count off its width and `kv_heads` off `k`'s.
+///
+/// **`q` and `(k, v)` may come from different arms**: the one op the
+/// recorder lets span classes, so cross-attention reads queries off one
+/// stream and keys off another; the node runs over both windows, under the
+/// `Or` of the two guards. The answer is handed back under `q`'s own guard
+/// — it is defined on the query rows and nowhere else — so the text reads
+/// it on the arm the queries came from with no split.
+pub fn ragged(
+    q: &Value,
+    k: &Value,
+    v: &Value,
+    q_indptr: &Value,
+    kv_indptr: &Value,
+    head_dim: u32,
+    sm_scale: f32,
+    mask: RaggedMask,
+) -> Value {
+    let r = q.rec();
+    assert!(
+        head_dim > 0 && q.width().is_multiple_of(u64::from(head_dim)),
+        "q is {} wide, not a whole number of {head_dim}-wide heads",
+        q.width()
+    );
+    assert!(
+        k.width().is_multiple_of(u64::from(head_dim)) && k.width() == v.width(),
+        "k ({}) and v ({}) are one shape of {head_dim}-wide heads",
+        k.width(),
+        v.width()
+    );
+    let heads = q.width() / u64::from(head_dim);
+    let kv_heads = k.width() / u64::from(head_dim);
+    assert!(
+        heads.is_multiple_of(kv_heads),
+        "{heads} query heads do not group over {kv_heads} kv heads"
+    );
+    assert_eq!(k.rows(), v.rows(), "k and v share a row space");
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::Ragged {
+            q: q.id(),
+            k: k.id(),
+            v: v.id(),
+            q_indptr: q_indptr.id(),
+            kv_indptr: kv_indptr.id(),
+            head_dim,
+            kv_heads: kv_heads as u32,
+            sm_scale,
+            mask,
+            o: o.id(),
+        },
+        &[q, k, v, q_indptr, kv_indptr],
+    );
+    o.under(q.cond())
+}
+
 /// Bidirectional attention over the patch window, block-diagonal per image.
 /// `segments` is the patch axis's indptr: patch row `n` attends over the rows
 /// of the image whose span contains it, both ways, and nothing else.

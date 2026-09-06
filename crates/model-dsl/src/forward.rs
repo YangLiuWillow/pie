@@ -4,7 +4,9 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-use model_ir::{CacheRow, Guard, Dim, Dtype, GeomKind, Trace, Platform, RuntimeInput, Ty, ValueId};
+use model_ir::{
+    CacheRow, Dim, Dtype, GeomKind, Guard, Platform, RuntimeInput, Selection, Trace, Ty, ValueId,
+};
 
 use crate::record::{Recorder, Refine, SplitSpec, Value};
 use crate::seam;
@@ -115,6 +117,12 @@ pub fn platform() -> Platform {
 /// Trace one plan for one platform: seam the boundary, run the model's
 /// forward, and `finish` through the validator. A nested trace on one
 /// thread is refused (it would have two answers to [`platform`]).
+///
+/// The returned value is planted as [`seam::OUT`] — the logits — unless the
+/// forward already planted it under a float readout ([`seam::VELOCITY`],
+/// [`seam::HIDDEN`]): a denoiser returns its velocity and has no logits to
+/// speak of, and a plan with no `out` seam is a plan whose readout is the
+/// float one (`seam::FLOAT_READOUTS`).
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
     let caches = m.caches();
     let rec = Recorder::new(name, platform, caches.rows.clone());
@@ -126,17 +134,38 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> 
         );
         tracing.set(Some(platform));
     });
+    // Cleared on the way out whether the forward returns or panics, so a
+    // refused trace caught by a test leaves the thread free for the next.
+    struct Tracing;
+    impl Drop for Tracing {
+        fn drop(&mut self) {
+            TRACING.with(|tracing| tracing.set(None));
+        }
+    }
+    let tracing = Tracing;
     let logits = m.forward(Input {
         rec: rec.clone(),
         caches,
         over: Guard::Always,
         _facts: PhantomData,
     });
-    TRACING.with(|tracing| tracing.set(None));
-    rec.seam(seam::OUT.name, &[&logits]);
+    drop(tracing);
+    let float_readout = seam::FLOAT_READOUTS
+        .iter()
+        .any(|name| rec.seamed(name, &logits));
+    if !float_readout {
+        rec.seam(seam::OUT.name, &[&logits]);
+    }
     drop(logits);
     rec.finish()
 }
+
+/// The geometry space of the token axis itself: the first kv space when a
+/// plan declares one, and still space 0 when it declares none. The
+/// per-token and per-lane tables that describe the fire rather than a
+/// cache (`RequestOfToken`, the group tables) live here, so a denoiser
+/// with no kv reads them without a cache to name.
+const TOKEN_SPACE: u32 = 0;
 
 /// Walks a model's per-layer weights, keeping the recorder's layer mark in
 /// step so every node knows which layer said it.
@@ -196,7 +225,7 @@ impl<F> Refine for Input<F> {
         Input {
             rec: self.rec.clone(),
             caches: self.caches.clone(),
-            over: Guard::and(self.over.clone(), cond),
+            over: Guard::narrow(self.over.clone(), cond),
             _facts: PhantomData,
         }
     }
@@ -439,10 +468,163 @@ impl<F> Input<F> {
         self.geometry(self.kv_space(), GeomKind::RowValid)
     }
 
-    /// The token→lane map: which request each token row belongs to.
+    /// The token→lane map: which request each token row belongs to. The
+    /// token axis's own table — read in space 0 whether or not a cache
+    /// joined it, so a cacheless denoiser can broadcast a per-lane vector
+    /// over its rows (`ops::elemwise::modulate`).
     #[must_use]
     pub fn request_of_token(&self) -> Value {
-        self.geometry(self.kv_space(), GeomKind::RequestOfToken)
+        self.geometry(TOKEN_SPACE, GeomKind::RequestOfToken)
+    }
+
+    /// Which attention group each lane belongs to: `[Dim::Lanes]` `i32`,
+    /// dense from 0 — the lanes one request submitted share a group.
+    #[must_use]
+    pub fn group_of_lane(&self) -> Value {
+        self.geometry(TOKEN_SPACE, GeomKind::GroupOfLane)
+    }
+
+    /// Per-group bounds over THIS ARM's rows once packed by group:
+    /// `[Dim::LanesPlus(1)]` `i32`, the CSR `attention.ragged` pairs
+    /// segments by. The selection is the arm's own guard — call it on the
+    /// `Input` arm whose class the queries (or the keys) come from.
+    #[must_use]
+    pub fn group_indptr(&self) -> Value {
+        self.geometry(
+            TOKEN_SPACE,
+            GeomKind::GroupIndptr {
+                select: self.selection(),
+            },
+        )
+    }
+
+    /// Per-lane bounds over this arm's packed rows: `[Dim::LanesPlus(1)]`
+    /// `i32`, the finer CSR a lane-block-diagonal ragged attention passes.
+    #[must_use]
+    pub fn lane_indptr(&self) -> Value {
+        self.geometry(
+            TOKEN_SPACE,
+            GeomKind::LaneIndptr {
+                select: self.selection(),
+            },
+        )
+    }
+
+    /// Per packed row of this arm, its lane index when the lane is on
+    /// [`Stream::Reference`](model_ir::Stream::Reference), else `-1`:
+    /// `[Dim::Tokens]` `i32`, what `RaggedMask::ReferenceSelfOnly` reads.
+    #[must_use]
+    pub fn reference_tags(&self) -> Value {
+        self.geometry(
+            TOKEN_SPACE,
+            GeomKind::ReferenceTag {
+                select: self.selection(),
+            },
+        )
+    }
+
+    /// The row order that packs this arm's rows by group: `[Dim::Tokens]`
+    /// `i32`, `perm[i]` the fire row of packed row `i` and `-1` past the
+    /// arm's row count. What `ops::layout::pack_rows` gathers by and
+    /// `unpack_rows` scatters by.
+    #[must_use]
+    pub fn row_permutation(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::RowPermutation {
+                    select: self.selection(),
+                },
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// A latent float port: `[Dim::Tokens, width]` of `dtype` (`F32` or
+    /// `Bf16`, as the family states — the reference schedulers keep fp32
+    /// masters), fed from a guest channel at every submit. `port` is the
+    /// family's index for it, `0` for the only one.
+    #[must_use]
+    pub fn latents(&self, port: u8, width: u32, dtype: Dtype) -> Value {
+        assert!(
+            matches!(dtype, Dtype::F32 | Dtype::Bf16),
+            "a latent port is f32 or bf16, not {dtype:?}"
+        );
+        self.rec
+            .input(
+                RuntimeInput::Latents { port, width },
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(u64::from(width))],
+                    dtype,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// A per-lane float port: `[Dim::Lanes, width]` `f32` — a timestep, a
+    /// guidance scale, a sigma per modality. `port` as for
+    /// [`latents`](Input::latents).
+    #[must_use]
+    pub fn lane_vector(&self, port: u8, width: u32) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::LaneVector { port, width },
+                Ty::Tensor {
+                    shape: vec![Dim::Lanes, Dim::Const(u64::from(width))],
+                    dtype: Dtype::F32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// A context lane's rows: `[Dim::Tokens, width]` `bf16`, an encoder's
+    /// output constant across steps; only rows of lanes on
+    /// [`Stream::Context`](model_ir::Stream::Context) carry data. `port` as
+    /// for [`latents`](Input::latents).
+    #[must_use]
+    pub fn context(&self, port: u8, width: u32) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::Context { port, width },
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(u64::from(width))],
+                    dtype: Dtype::Bf16,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// The guest's per-axis rotary positions: `[Dim::Tokens, axes]` `f32`,
+    /// `1 <= axes <= 4`, read by `ops::elemwise::rope_axes`. `port` as for
+    /// [`latents`](Input::latents) — LTX rotates queries and keys by two
+    /// different position streams.
+    #[must_use]
+    pub fn axis_positions(&self, port: u8, axes: u8) -> Value {
+        assert!((1..=4).contains(&axes), "a rope has one to four axes, not {axes}");
+        self.rec
+            .input(
+                RuntimeInput::AxisPositions { port, axes },
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(u64::from(axes))],
+                    dtype: Dtype::F32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// This arm's lanes as the host sees them: its guard as a mask/value
+    /// pair over the fact word. An `Input` arm always has one — split arms
+    /// are conjunctions of fact literals — so the `expect` never fires.
+    fn selection(&self) -> Selection {
+        Selection::of(&self.over).unwrap_or_else(|| {
+            panic!(
+                "an input arm guarded by {:?} is not a conjunction of facts and names no \
+                 row selection",
+                self.over
+            )
+        })
     }
 
     /// The page each token row appends to, in the space the kv row `row`
@@ -497,14 +679,19 @@ impl<F> Input<F> {
     /// `i32` except `RowValid` (`u8`).
     fn geometry(&self, space: u32, kind: GeomKind) -> Value {
         let (rows, dtype) = match kind {
-            GeomKind::Indptr => (Dim::LanesPlus(1), Dtype::I32),
-            GeomKind::Indices | GeomKind::SeqLens | GeomKind::LastPageLen | GeomKind::KvLen => {
-                (Dim::Lanes, Dtype::I32)
+            GeomKind::Indptr | GeomKind::GroupIndptr { .. } | GeomKind::LaneIndptr { .. } => {
+                (Dim::LanesPlus(1), Dtype::I32)
             }
+            GeomKind::Indices
+            | GeomKind::SeqLens
+            | GeomKind::LastPageLen
+            | GeomKind::KvLen
+            | GeomKind::GroupOfLane => (Dim::Lanes, Dtype::I32),
             GeomKind::RowValid => (Dim::Tokens, Dtype::U8),
-            GeomKind::RequestOfToken | GeomKind::WritePage | GeomKind::WriteOffset => {
-                (Dim::Tokens, Dtype::I32)
-            }
+            GeomKind::RequestOfToken
+            | GeomKind::WritePage
+            | GeomKind::WriteOffset
+            | GeomKind::ReferenceTag { .. } => (Dim::Tokens, Dtype::I32),
         };
         self.rec
             .input(
@@ -518,7 +705,9 @@ impl<F> Input<F> {
     }
 
     /// The model's paged-kv geometry space: the first space `caches()`
-    /// declared.
+    /// declared. Its per-token tables are also the token axis's own
+    /// ([`TOKEN_SPACE`]), which is why a cacheless plan still reads
+    /// [`request_of_token`](Input::request_of_token).
     fn kv_space(&self) -> u32 {
         assert!(
             !self.caches.dtypes.is_empty(),

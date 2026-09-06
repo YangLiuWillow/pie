@@ -201,6 +201,98 @@ pub enum GeomKind {
     WritePage,
     /// Per-token in-page offset of a kv write; read by the `kv_append` ops.
     WriteOffset,
+    /// Which ATTENTION GROUP each lane belongs to: `[Dim::Lanes]` `i32`, one
+    /// group id per lane in fire order, ascending and dense from 0. A lane is
+    /// `(request, stream)`; the lanes one request submitted share its group
+    /// and attend together through `attention.ragged`. Space 0 only — the
+    /// token axis's own table, whether or not a cache joined it.
+    GroupOfLane,
+    /// Per-GROUP bounds over the PACKED rows of one row selection:
+    /// `[Dim::LanesPlus(1)]` `i32` (a fire has at most as many groups as
+    /// lanes), where group `g`'s packed rows are `[indptr[g], indptr[g+1])`.
+    /// Packed order is what [`RuntimeInput::RowPermutation`] of the same
+    /// selection states: selected lanes sorted by `(group, stream, lane)`,
+    /// each lane's rows contiguous. Groups no selected lane belongs to are
+    /// skipped, so the CSR is over the groups present, ascending. Read by
+    /// `attention.ragged`.
+    GroupIndptr { select: Selection },
+    /// Per-LANE bounds over the packed rows of one row selection:
+    /// `[Dim::LanesPlus(1)]` `i32`, the finer CSR beneath
+    /// [`GroupIndptr`](GeomKind::GroupIndptr) — selected lane `j` (in
+    /// packed order) owns packed rows `[indptr[j], indptr[j+1])`. What a
+    /// lane-block-diagonal ragged attention passes as its indptr.
+    LaneIndptr { select: Selection },
+    /// Per packed row of one selection, the fire lane index of the row when
+    /// its lane's stream is [`Reference`](crate::request::Stream::Reference)
+    /// and `-1` otherwise: `[Dim::Tokens]` `i32`. Read by `attention.ragged`
+    /// under [`RaggedMask::ReferenceSelfOnly`](crate::ops::attn::RaggedMask).
+    ReferenceTag { select: Selection },
+}
+
+/// A set of lanes named by their fact words: the lanes whose word satisfies
+/// `word & mask == value`. What a row-packing input is keyed by, and the
+/// spelling every guard a split arm carries has (a conjunction of fact
+/// literals) — [`Selection::of`] reads one off such a guard. `mask == 0` is
+/// every lane.
+///
+/// A pair of words rather than a `Guard` so the input stays `Copy`, `Hash`
+/// and self-describing to the host: a fire evaluates it per lane with one
+/// `and` and one compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Selection {
+    /// The fact bits the selection reads.
+    pub mask: u32,
+    /// What those bits must be.
+    pub value: u32,
+}
+
+impl Selection {
+    /// Every lane of the fire.
+    pub const ALL: Selection = Selection { mask: 0, value: 0 };
+
+    /// The selection a guard states, when the guard is a conjunction of
+    /// fact literals (`Always`, `Fact`, `Not(Fact)`, `And` of those) — the
+    /// shape every split arm's guard has. `None` for a guard with an `Or`
+    /// or a negated conjunction, which no single mask/value pair spells.
+    #[must_use]
+    pub fn of(guard: &Guard) -> Option<Selection> {
+        let mut select = Selection::ALL;
+        select.gather(guard).then_some(select)
+    }
+
+    fn gather(&mut self, guard: &Guard) -> bool {
+        match guard {
+            Guard::Always => true,
+            Guard::Fact(bit) => self.literal(*bit, true),
+            Guard::Not(inner) => match inner.as_ref() {
+                Guard::Fact(bit) => self.literal(*bit, false),
+                _ => false,
+            },
+            Guard::And(a, b) => self.gather(a) && self.gather(b),
+            Guard::Or(..) => false,
+        }
+    }
+
+    fn literal(&mut self, bit: u8, set: bool) -> bool {
+        if bit >= 32 {
+            return false;
+        }
+        let one = 1u32 << bit;
+        let want = if set { one } else { 0 };
+        // The same bit stated twice must agree, else the guard is empty.
+        if self.mask & one != 0 && self.value & one != want {
+            return false;
+        }
+        self.mask |= one;
+        self.value |= want;
+        true
+    }
+
+    /// Whether a lane with fact word `word` is in the selection.
+    #[must_use]
+    pub fn holds(self, word: u64) -> bool {
+        (word as u32) & self.mask == self.value
+    }
 }
 
 /// What the engine binds each fire. Geometry is a declared input, not implicit
@@ -261,6 +353,39 @@ pub enum RuntimeInput {
     /// step's probabilities of those ids. `f32` because it is a weight, not
     /// the activation element.
     SelfCondWeights,
+    /// The row order that packs one selection's rows by attention group:
+    /// `[Dim::Tokens]` `i32`, where packed row `i` (for `i` below the
+    /// selection's row count) is fire row `perm[i]`, and every later entry
+    /// is `-1`. Selected lanes are ordered `(group, stream, lane)` with each
+    /// lane's rows contiguous, so a group's rows are one contiguous run —
+    /// what the ragged attention kernel's CSR wants. Read by
+    /// `layout.pack_rows` (gather) and `layout.unpack_rows` (its inverse
+    /// scatter). The host builds it from the lanes' words
+    /// ([`Selection::holds`]) and [`GeomKind::GroupOfLane`].
+    RowPermutation { select: Selection },
+    /// A float port on the token axis: `[Dim::Tokens, width]`, `f32` or
+    /// `bf16` as the model text states at the reader. The latent rows of a
+    /// denoise reading, fed device-to-device from a guest channel cell at
+    /// every submit. `port` is the family's index for the port (its first
+    /// or only latent port is 0), so a text with two latent streams of one
+    /// width (video and audio) declares two.
+    Latents { port: u8, width: u32 },
+    /// A float port on the lane axis: `[Dim::Lanes, width]` `f32`, one row
+    /// per lane — a timestep, a guidance scale, a per-modality sigma. `port`
+    /// as for [`Latents`](RuntimeInput::Latents).
+    LaneVector { port: u8, width: u32 },
+    /// A context lane's rows: `[Dim::Tokens, width]` `bf16` — an encoder's
+    /// output or reference tokens, channel-fed and constant across steps.
+    /// Only the rows of lanes whose stream is `Context` carry data; the
+    /// rest of the rectangle is unwritten. `port` as for
+    /// [`Latents`](RuntimeInput::Latents).
+    Context { port: u8, width: u32 },
+    /// Per-axis rotary positions as the guest states them: `[Dim::Tokens,
+    /// axes]` `f32`, `axes <= 4` — `(t, h, w[, l])` per token row, fractional
+    /// where a text wants it. Read by `elementwise.rope_axes`. A third
+    /// position stream beside `Positions` (`[Tokens]` i32) and
+    /// `MropePositions` (`[Tokens, 3]` i32), which keep their names.
+    AxisPositions { port: u8, axes: u8 },
 }
 
 /// Raggedness is not a `Ty` — a leading symbolic `Dim` means the value is
@@ -299,7 +424,28 @@ pub struct ValueDecl {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dim, PerAxis, RowAxis};
+    use super::{Dim, Guard, PerAxis, RowAxis, Selection};
+
+    /// A split arm's guard — a conjunction of fact literals — reads as one
+    /// mask/value pair that admits exactly the lanes the guard admits; an
+    /// `Or` has no such pair and says so.
+    #[test]
+    fn a_selection_is_a_split_arms_guard_as_two_words() {
+        let arm = Guard::and(Guard::Fact(3), Guard::not(Guard::Fact(5)));
+        let select = Selection::of(&arm).expect("a conjunction of literals");
+        assert_eq!(select, Selection { mask: 0b101000, value: 0b001000 });
+        for word in 0..64u64 {
+            assert_eq!(select.holds(word), arm.holds(word), "word {word:#b}");
+        }
+        assert_eq!(Selection::of(&Guard::Always), Some(Selection::ALL));
+        assert!(Selection::ALL.holds(u64::MAX));
+        assert_eq!(Selection::of(&Guard::or(Guard::Fact(0), Guard::Fact(1))), None);
+        assert_eq!(
+            Selection::of(&Guard::and(Guard::Fact(0), Guard::not(Guard::Fact(0)))),
+            None,
+            "a contradiction admits no lane and is not a selection"
+        );
+    }
 
     /// The index is the variant's own integer, both ways: every axis reads
     /// back what was filled at it, and `Dim::axis` lands each symbolic dim

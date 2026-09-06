@@ -71,16 +71,21 @@ impl Recorder {
     /// derive wires the recorder rather than the wrapper doing it by hand.
     pub fn push(&self, op: impl Into<Operation>, ins: &[&Value]) {
         let op = op.into();
-        let mut cond = Guard::Always;
-        for v in ins {
-            let c = v.cond();
-            assert!(
-                compatible(&cond, &c),
-                "`{}` mixes values from different split arms",
-                op.name(),
-            );
-            cond = meet(cond, c);
-        }
+        let cond = if joins_arms(&op) {
+            join(ins)
+        } else {
+            let mut cond = Guard::Always;
+            for v in ins {
+                let c = v.cond();
+                assert!(
+                    compatible(&cond, &c),
+                    "`{}` mixes values from different split arms",
+                    op.name(),
+                );
+                cond = meet(cond, c);
+            }
+            cond
+        };
         let mut outs = Vec::new();
         op.outputs(&mut outs);
         let mut p = self.inner.borrow_mut();
@@ -203,6 +208,16 @@ impl Recorder {
             values: ids,
             layer: self.at.get(),
         });
+    }
+
+    /// Whether `value` is already planted under a seam named `name`.
+    #[must_use]
+    pub fn seamed(&self, name: &str, value: &Value) -> bool {
+        self.inner
+            .borrow()
+            .seams
+            .iter()
+            .any(|seam| seam.seam == name && seam.values.contains(&value.id))
     }
 
     pub fn enter(&self, layer: u32) {
@@ -409,6 +424,19 @@ impl Value {
         }
     }
 
+    /// The same value, read under exactly `cond` — a wrapper's tool for an
+    /// output that is defined on fewer rows than the node that writes it
+    /// runs over (a ragged attention's answer belongs to its queries' arm,
+    /// while the node spans the keys' arm too).
+    pub(crate) fn under(&self, cond: Guard) -> Value {
+        Value {
+            rec: self.rec.clone(),
+            id: self.id,
+            over: Some(cond),
+            ty: self.ty.clone(),
+        }
+    }
+
     /// The same value, read without its producer's guard. For an in-place
     /// output under a guard (e.g. `linear.lora_correct`'s `y_out`, which
     /// aliases the `y` it adds to): the value is defined everywhere, only
@@ -431,7 +459,7 @@ impl Refine for Value {
         Value {
             rec: self.rec.clone(),
             id: self.id,
-            over: Some(Guard::and(self.cond(), cond)),
+            over: Some(Guard::narrow(self.cond(), cond)),
             ty: self.ty.clone(),
         }
     }
@@ -546,6 +574,50 @@ fn cond_of(p: &Predicate) -> Guard {
 
 fn compatible(a: &Guard, b: &Guard) -> bool {
     matches!(a, Guard::Always) || matches!(b, Guard::Always) || a == b
+}
+
+/// **THE ONE OP WHOSE OPERANDS MAY COME FROM DIFFERENT ARMS.** Every other
+/// node runs over one class's window, and [`Recorder::push`] refuses two
+/// arms at the line that mixed them — the rule that keeps a class's rows
+/// the only rows its nodes touch. A ragged attention is the deliberate
+/// exception (D2): cross-attention reads its queries off one stream's
+/// rectangle and its keys off another's, and the node must run over BOTH
+/// windows, so its guard is the `Or` of its operands' guards rather than
+/// their meet. Nothing else spans classes; a second exception would be a
+/// second op that reads across a window, and would have to say so here.
+fn joins_arms(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Attention(model_ir::Attention::Ragged { .. })
+    )
+}
+
+/// The `Or` of the operands' guards, spelled the way [`Value::merge`]
+/// spells a join: a tautology collapses to `Always`, and arms of one outer
+/// split come back as that split's guard so the node reads as a sibling of
+/// the values around it.
+fn join(ins: &[&Value]) -> Guard {
+    // An `Always` operand (a runtime input, a weight) guards nothing and
+    // widens nothing: only the arm-carrying operands vote.
+    let mut distinct: Vec<Guard> = Vec::new();
+    for c in ins.iter().map(|v| v.cond()) {
+        if !matches!(c, Guard::Always) && !distinct.contains(&c) {
+            distinct.push(c);
+        }
+    }
+    let Some((first, rest)) = distinct.split_first() else {
+        return Guard::Always;
+    };
+    let joined = rest
+        .iter()
+        .fold(first.clone(), |a, b| Guard::or(a, b.clone()))
+        .simplified();
+    let shared = Guard::common(&distinct);
+    if matches!(shared, Guard::Always) || !shared.equivalent(&joined) {
+        joined
+    } else {
+        shared
+    }
 }
 
 fn meet(a: Guard, b: Guard) -> Guard {

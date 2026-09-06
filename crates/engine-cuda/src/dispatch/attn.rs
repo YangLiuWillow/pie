@@ -1131,6 +1131,13 @@ impl Run<'_> {
             Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.pool_lse_selected",
             }),
+            // M0: wired by the CUDA ragged-attention agent (the vendored
+            // FlashInfer ragged FA2 template over packed q/k/v, one CSR per
+            // side; `IMAGEGEN_CONTRACT.md` states the entry). Refused by name
+            // until then.
+            Attention::Ragged { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "attention.ragged",
+            }),
             // DFlash2's dynamic block convolution has a Metal kernel and no
             // CUDA one yet; refused by name rather than approximated.
             Attention::BlockDynConv { .. } => Err(kernels_cuda::Error::Unsupported {

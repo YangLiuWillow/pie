@@ -2,7 +2,7 @@
 //! launch that lands both. Every value and every reader survives, so a
 //! fused trace checks and compiles as the traced one did.
 
-use crate::ops::elemwise::PostNorm;
+use crate::ops::elemwise::{NormKind, PostNorm};
 use crate::operands::Operands;
 use crate::ops::{Attention, Elementwise, Layout, Linear, Operation};
 use crate::trace::{Node, Trace};
@@ -389,6 +389,170 @@ pub fn gemm_epilogues(mut trace: Trace) -> Trace {
     }
     trace.nodes = nodes;
     trace
+}
+
+/// The adaLN chains of a generative block (D6), each folded into one node:
+///
+/// - `gated_residual_add` → a scale-free norm of the folded row →
+///   `modulate` of the normed row, all under one guard and one `lane_of_row`,
+///   becomes [`Elementwise::GatedResidualNormModulate`] (three nodes, one
+///   launch, the deferred-residual form the FLUX.2 / LTX references run);
+/// - `layernorm_no_scale` / `rmsnorm_no_scale` → `modulate` of the normed
+///   row becomes [`Elementwise::NormModulate`].
+///
+/// The longer chain is tried first at every node, so a triple never lands
+/// as a fold and a pair. Every value of the traced nodes is still produced
+/// by the fused node (the normed row is written as its own launch would
+/// write it), so readers elsewhere in the trace are untouched; only the fold
+/// keeps its alias. The fused node keeps the LAST node's layer.
+#[must_use]
+pub fn modulation(mut trace: Trace) -> Trace {
+    let mut nodes = Vec::with_capacity(trace.nodes.len());
+    let mut landed = Vec::with_capacity(trace.nodes.len());
+    let old = trace.nodes;
+    let mut i = 0usize;
+    while i < old.len() {
+        if let Some((fused, took)) = gated_chain(&old[i..]).or_else(|| norm_modulate(&old[i..])) {
+            let at = nodes.len() as u32;
+            landed.extend(std::iter::repeat_n(at, took));
+            nodes.push(fused);
+            i += took;
+            continue;
+        }
+        landed.push(nodes.len() as u32);
+        nodes.push(old[i].clone());
+        i += 1;
+    }
+    for value in &mut trace.values {
+        if let Def::Op(node) = &mut value.def {
+            *node = landed[*node as usize];
+        }
+    }
+    trace.nodes = nodes;
+    trace
+}
+
+/// A scale-free norm node as `(x, kind, normed)`, or `None` for anything else.
+fn scale_free_norm(node: &Node) -> Option<(ValueId, NormKind, ValueId)> {
+    match &node.op {
+        Operation::Elementwise(Elementwise::LayernormNoScale { x, eps, y }) => {
+            Some((*x, NormKind::Layernorm { eps: *eps }, *y))
+        }
+        Operation::Elementwise(Elementwise::RmsnormNoScale {
+            x,
+            head_dim,
+            eps,
+            y,
+        }) => Some((
+            *x,
+            NormKind::Rmsnorm {
+                head_dim: *head_dim,
+                eps: *eps,
+            },
+            *y,
+        )),
+        _ => None,
+    }
+}
+
+/// `norm(x) -> normed`, then `modulate(normed, m)`: two nodes, one launch.
+fn norm_modulate(rest: &[Node]) -> Option<(Node, usize)> {
+    let [first, second, ..] = rest else {
+        return None;
+    };
+    if first.guard != second.guard {
+        return None;
+    }
+    let (x, norm, normed) = scale_free_norm(first)?;
+    let Operation::Elementwise(Elementwise::Modulate {
+        x: modulated,
+        m,
+        lane_of_row,
+        form,
+        y,
+    }) = &second.op
+    else {
+        return None;
+    };
+    if *modulated != normed {
+        return None;
+    }
+    Some((
+        Node {
+            op: Operation::Elementwise(Elementwise::NormModulate {
+                x,
+                norm,
+                normed,
+                m: *m,
+                lane_of_row: *lane_of_row,
+                form: *form,
+                y: *y,
+            }),
+            guard: second.guard.clone(),
+            layer: second.layer.or(first.layer),
+        },
+        2,
+    ))
+}
+
+/// `r += g·y -> r_out`, `norm(r_out) -> normed`, `modulate(normed, m)`:
+/// three nodes, one launch, two outputs a reader wants.
+fn gated_chain(rest: &[Node]) -> Option<(Node, usize)> {
+    let [fold, norm_node, modulate, ..] = rest else {
+        return None;
+    };
+    if fold.guard != norm_node.guard || fold.guard != modulate.guard {
+        return None;
+    }
+    let Operation::Elementwise(Elementwise::GatedResidualAdd {
+        r,
+        g,
+        y,
+        lane_of_row,
+        r_out,
+    }) = &fold.op
+    else {
+        return None;
+    };
+    let (normed_x, norm, normed) = scale_free_norm(norm_node)?;
+    if normed_x != *r_out {
+        return None;
+    }
+    let Operation::Elementwise(Elementwise::Modulate {
+        x: modulated,
+        m,
+        lane_of_row: modulate_lanes,
+        form,
+        y: out,
+    }) = &modulate.op
+    else {
+        return None;
+    };
+    // One lane map serves the gate and the modulation, or neither has one:
+    // a per-lane gate under a per-token modulation is two broadcasts, and
+    // the fused launch reads one.
+    if *modulated != normed || modulate_lanes != lane_of_row {
+        return None;
+    }
+    Some((
+        Node {
+            op: Operation::Elementwise(Elementwise::GatedResidualNormModulate {
+                r: *r,
+                g: *g,
+                y: *y,
+                lane_of_row: *lane_of_row,
+                r_out: *r_out,
+                norm,
+                normed,
+                m: *m,
+                form: *form,
+                out: *out,
+            }),
+            guard: modulate.guard.clone(),
+            layer: modulate.layer.or(norm_node.layer).or(fold.layer),
+        },
+        3,
+    ))
 }
 
 /// Nodes `i` and `i + 1` as one epilogue-fused node, if they are a pair.
@@ -869,6 +1033,143 @@ mod tests {
         assert!(matches!(
             fused.nodes[0].op,
             Operation::Linear(Linear::LmHeadSoftcap { cap, .. }) if (cap - 30.0).abs() < f32::EPSILON
+        ));
+    }
+
+    use crate::ops::elemwise::ModulateForm;
+
+    fn gated_add(r: u32, g: u32, y: u32, lanes: Option<u32>, r_out: u32) -> Elementwise {
+        Elementwise::GatedResidualAdd {
+            r: ValueId(r),
+            g: ValueId(g),
+            y: ValueId(y),
+            lane_of_row: lanes.map(ValueId),
+            r_out: ValueId(r_out),
+        }
+    }
+
+    fn ln(x: u32, y: u32) -> Elementwise {
+        Elementwise::LayernormNoScale {
+            x: ValueId(x),
+            eps: 1e-6,
+            y: ValueId(y),
+        }
+    }
+
+    fn modulate(x: u32, m: u32, lanes: Option<u32>, y: u32) -> Elementwise {
+        Elementwise::Modulate {
+            x: ValueId(x),
+            m: ValueId(m),
+            lane_of_row: lanes.map(ValueId),
+            form: ModulateForm::ScaleShift,
+            y: ValueId(y),
+        }
+    }
+
+    #[test]
+    fn a_scale_free_norm_and_the_modulate_over_it_become_one_node() {
+        let fused = modulation(trace_of(vec![
+            node(ln(1, 2), Some(0)),
+            node(modulate(2, 3, Some(4), 5), Some(0)),
+        ]));
+        assert_eq!(fused.nodes.len(), 1);
+        assert!(matches!(
+            fused.nodes[0].op,
+            Operation::Elementwise(Elementwise::NormModulate {
+                x: ValueId(1),
+                normed: ValueId(2),
+                m: ValueId(3),
+                lane_of_row: Some(ValueId(4)),
+                y: ValueId(5),
+                norm: NormKind::Layernorm { .. },
+                ..
+            })
+        ));
+        // The same pair over an rmsnorm, and a modulate of something else
+        // stays apart.
+        let rms = Elementwise::RmsnormNoScale {
+            x: ValueId(1),
+            head_dim: 8,
+            eps: 1e-6,
+            y: ValueId(2),
+        };
+        let fused = modulation(trace_of(vec![
+            node(rms.clone(), Some(0)),
+            node(modulate(2, 3, None, 5), Some(0)),
+        ]));
+        assert!(matches!(
+            fused.nodes[0].op,
+            Operation::Elementwise(Elementwise::NormModulate {
+                norm: NormKind::Rmsnorm { head_dim: 8, .. },
+                lane_of_row: None,
+                ..
+            })
+        ));
+        let apart = modulation(trace_of(vec![
+            node(rms, Some(0)),
+            node(modulate(9, 3, None, 5), Some(0)),
+        ]));
+        assert_eq!(apart.nodes.len(), 2);
+    }
+
+    #[test]
+    fn the_gated_fold_its_norm_and_the_modulate_become_one_two_output_node() {
+        let mut trace = trace_of(vec![
+            node(gated_add(1, 2, 3, Some(4), 5), Some(0)),
+            node(ln(5, 6), Some(0)),
+            node(modulate(6, 7, Some(4), 8), Some(0)),
+            node(add(9), Some(1)),
+        ]);
+        trace.values = rows(12, 64);
+        for (value, at) in [(5u32, 0u32), (6, 1), (8, 2), (9, 3)] {
+            trace.values[value as usize].def = Def::Op(at);
+        }
+        let fused = modulation(trace);
+        assert_eq!(fused.nodes.len(), 2, "three nodes became one, the fourth stood");
+        assert!(matches!(
+            fused.nodes[0].op,
+            Operation::Elementwise(Elementwise::GatedResidualNormModulate {
+                r: ValueId(1),
+                g: ValueId(2),
+                y: ValueId(3),
+                lane_of_row: Some(ValueId(4)),
+                r_out: ValueId(5),
+                normed: ValueId(6),
+                m: ValueId(7),
+                out: ValueId(8),
+                ..
+            })
+        ));
+        let mut outs = Vec::new();
+        fused.nodes[0].op.outputs(&mut outs);
+        assert_eq!(outs, vec![ValueId(5), ValueId(6), ValueId(8)]);
+        let mut pairs = Vec::new();
+        fused.nodes[0].op.aliases(&mut pairs);
+        assert_eq!(pairs, vec![(ValueId(5), ValueId(1))], "only the fold is in place");
+        // Every value the chain defined now names the fused node; the one
+        // past it moved up.
+        for value in [5usize, 6, 8] {
+            assert!(matches!(fused.values[value].def, Def::Op(0)));
+        }
+        assert!(matches!(fused.values[9].def, Def::Op(1)));
+    }
+
+    #[test]
+    fn a_gate_per_lane_under_a_modulate_per_token_stays_apart() {
+        let fused = modulation(trace_of(vec![
+            node(gated_add(1, 2, 3, Some(4), 5), Some(0)),
+            node(ln(5, 6), Some(0)),
+            node(modulate(6, 7, None, 8), Some(0)),
+        ]));
+        // The triple refuses, and the pair behind it still folds.
+        assert_eq!(fused.nodes.len(), 2);
+        assert!(matches!(
+            fused.nodes[0].op,
+            Operation::Elementwise(Elementwise::GatedResidualAdd { .. })
+        ));
+        assert!(matches!(
+            fused.nodes[1].op,
+            Operation::Elementwise(Elementwise::NormModulate { .. })
         ));
     }
 }

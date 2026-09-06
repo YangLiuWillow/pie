@@ -852,6 +852,11 @@ impl Run<'_> {
                 *group,
                 self.tensor(*y),
             ),
+            // M0: the ragged attention (D2) is CUDA-first; refused by name
+            // here in this phase.
+            Attention::Ragged { .. } => {
+                return Err(kernels_metal::Error::Unsupported { op: op.name() });
+            }
             Attention::SelectorWalk {
                 cand,
                 unary,

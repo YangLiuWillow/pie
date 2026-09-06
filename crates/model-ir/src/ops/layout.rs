@@ -137,6 +137,27 @@ pub enum Layout {
         values: ValueId,
         indices: ValueId,
     },
+    /// The gather that packs rows by attention group: `y[i] = x[perm[i]]`
+    /// for every `i` with `perm[i] >= 0`, and rows past the selection's
+    /// count (where `perm[i] < 0`) are left unwritten. `perm` is a
+    /// `RuntimeInput::RowPermutation` (`[Dim::Tokens]` i32); `x` and `y`
+    /// are token rectangles of one type — the row space is kept, only the
+    /// order changes. What lands a group's lanes (text and image, in two
+    /// class windows) contiguous for `attention.ragged`.
+    PackRows {
+        x: ValueId,
+        perm: ValueId,
+        y: ValueId,
+    },
+    /// [`PackRows`](Layout::PackRows) undone: the scatter `y[perm[i]] =
+    /// x[i]` for every `i` with `perm[i] >= 0`. Rows of `y` no packed row
+    /// names are unwritten — the same fresh-rectangle rule as the gather,
+    /// since a selection writes only its own rows.
+    UnpackRows {
+        x: ValueId,
+        perm: ValueId,
+        y: ValueId,
+    },
 }
 
 impl Operands for Layout {
@@ -157,6 +178,8 @@ impl Operands for Layout {
             Self::EmbedConcat { ids, table, .. } => sink.extend([*ids, *table]),
             Self::Argmax { xs, .. } => sink.extend(xs.iter().copied()),
             Self::TopK { x, .. } => sink.push(*x),
+            Self::PackRows { x, perm, .. } => sink.extend([*x, *perm]),
+            Self::UnpackRows { x, perm, .. } => sink.extend([*x, *perm]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -174,6 +197,8 @@ impl Operands for Layout {
             Self::EmbedConcat { y, .. } => sink.push(*y),
             Self::Argmax { y, .. } => sink.push(*y),
             Self::TopK { values, indices, .. } => sink.extend([*values, *indices]),
+            Self::PackRows { y, .. } => sink.push(*y),
+            Self::UnpackRows { y, .. } => sink.push(*y),
         }
     }
     /// The one aliasing row this family has, and it is the scatter's: every
@@ -193,7 +218,11 @@ impl Operands for Layout {
             | Self::MergeRows { .. }
             | Self::EmbedConcat { .. }
             | Self::Argmax { .. }
-            | Self::TopK { .. } => {}
+            | Self::TopK { .. }
+            // The two permutations write fresh rectangles: a gather cannot
+            // run in place, and its inverse writes only the rows it names.
+            | Self::PackRows { .. }
+            | Self::UnpackRows { .. } => {}
             Self::ScatterRows { y_out, y, .. }
             | Self::ScatterLiveRows { y_out, y, .. } => sink.push((*y_out, *y)),
         }
@@ -213,6 +242,8 @@ impl Operands for Layout {
             Self::EmbedConcat { .. } => "layout.embed_concat",
             Self::Argmax { .. } => "layout.argmax",
             Self::TopK { .. } => "layout.topk",
+            Self::PackRows { .. } => "layout.pack_rows",
+            Self::UnpackRows { .. } => "layout.unpack_rows",
         }
     }
 }

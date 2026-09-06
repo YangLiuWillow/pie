@@ -96,6 +96,40 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
+    /// Non-causal attention over segments of PACKED token rows, no cache,
+    /// no plan, no window: query segment `i` attends key/value segment `i`,
+    /// both ways, and nothing else. What every generative family's joint,
+    /// cross- and self-attention is (D2): the segments are groups
+    /// (`GeomKind::GroupIndptr`, the lanes one request submitted, packed
+    /// contiguous by `layout.pack_rows`) or lanes (`GeomKind::LaneIndptr`).
+    ///
+    /// **`q` AND `(k, v)` MAY COME FROM DIFFERENT ARMS.** Cross-attention
+    /// reads its queries off one class's rectangle (the audio lanes) and its
+    /// keys off another's (the video or context lanes); the recorder joins
+    /// the operand guards with `Or` for this op alone and the node runs over
+    /// both classes' windows. `q_indptr` and `kv_indptr` are each a CSR over
+    /// their own selection's packed rows and must have the same segment
+    /// count, segment `i` of one pairing with segment `i` of the other — the
+    /// host orders both by group, so the same request lands at the same
+    /// index on both sides.
+    ///
+    /// `q` is `[rows, heads·head_dim]`, `k`/`v` are `[rows, kv_heads·head_dim]`
+    /// (GQA when `kv_heads` divides `heads`), `o` is `q`'s shape. Widths of
+    /// the two rectangles are unrelated (LTX: 4096-wide video keys under
+    /// 2048-wide audio queries, projected to one `kv_heads·head_dim`).
+    /// `sm_scale` is a trace constant. fp32 accumulation, softmax in fp32.
+    Ragged {
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        q_indptr: ValueId,
+        kv_indptr: ValueId,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        mask: RaggedMask,
+        o: ValueId,
+    },
     DecodeLse {
         q: ValueId,
         plan: ValueId,
@@ -557,6 +591,35 @@ pub enum Attention {
     },
 }
 
+/// What a [`Ragged`](Attention::Ragged) attention masks beyond its
+/// segments. The segment pairing is always in force; the mask names what a
+/// kernel must read on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RaggedMask {
+    /// Nothing beyond the segments: every query of segment `i` sees every
+    /// key of segment `i`. The indptrs are per-LANE CSRs
+    /// (`GeomKind::LaneIndptr`): a single-stream self-attention, or a
+    /// cross-attention pairing lane `i` of one stream with lane `i` of
+    /// another (Wan's text cross-attention, LTX's a2v/v2a).
+    None,
+    /// The segments are attention GROUPS (`GeomKind::GroupIndptr`): every
+    /// lane a request submitted, packed contiguous, attends every other lane
+    /// of the same request — MM-DiT joint attention over `[txt ‖ img]`. The
+    /// same kernel as [`None`](RaggedMask::None); the variant records which
+    /// CSR the text passed.
+    GroupBlockDiagonal,
+    /// [`GroupBlockDiagonal`](RaggedMask::GroupBlockDiagonal), except that a
+    /// row whose lane is on [`Stream::Reference`](crate::Stream::Reference)
+    /// attends only the rows of its own lane, while every other row of the
+    /// group still sees the reference rows (FLUX.2's `[txt ‖ target ‖
+    /// ref_1..n]` with refs self-attending). Which rows those are is read
+    /// per packed row from the two `GeomKind::ReferenceTag` tables — the
+    /// query side's and the key side's — carried here: a query with tag
+    /// `t >= 0` sees only keys with tag `t`; a query with tag `-1` sees
+    /// every key of its segment.
+    ReferenceSelfOnly { q_tags: ValueId, kv_tags: ValueId },
+}
+
 impl Operands for Attention {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
@@ -570,6 +633,12 @@ impl Operands for Attention {
             Self::Prefill { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::Masked { q, plan, mask, cache, .. } => sink.extend([*q, *plan, *mask, *cache]),
             Self::Dense { q, k, v, segments, .. } => sink.extend([*q, *k, *v, *segments]),
+            Self::Ragged { q, k, v, q_indptr, kv_indptr, mask, .. } => {
+                sink.extend([*q, *k, *v, *q_indptr, *kv_indptr]);
+                if let RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } = mask {
+                    sink.extend([*q_tags, *kv_tags]);
+                }
+            }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             // Bound as `sink_id`: the field name collides with the `sink` param.
@@ -693,6 +762,7 @@ impl Operands for Attention {
             Self::Prefill { o, .. } => sink.push(*o),
             Self::Masked { o, .. } => sink.push(*o),
             Self::Dense { o, .. } => sink.push(*o),
+            Self::Ragged { o, .. } => sink.push(*o),
             Self::DecodeLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PrefillLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::Sink { o_out, .. } => sink.push(*o_out),
@@ -757,6 +827,7 @@ impl Operands for Attention {
             Self::Prefill { .. } => {}
             Self::Masked { .. } => {}
             Self::Dense { .. } => {}
+            Self::Ragged { .. } => {}
             Self::DecodeLse { .. } => {}
             Self::PrefillLse { .. } => {}
             Self::Sink { o_out, o, .. } => sink.push((*o_out, *o)),
@@ -807,6 +878,7 @@ impl Operands for Attention {
             Self::Prefill { .. } => "attention.prefill",
             Self::Masked { .. } => "attention.masked",
             Self::Dense { .. } => "attention.dense",
+            Self::Ragged { .. } => "attention.ragged",
             Self::DecodeLse { .. } => "attention.decode_lse",
             Self::PrefillLse { .. } => "attention.prefill_lse",
             Self::Sink { .. } => "attention.sink",

@@ -21,13 +21,13 @@ pub use check::classes::{
 pub use check::{Fault, check, checked};
 pub use guard::Guard;
 pub use operands::Operands;
-pub use request::{ClassifyFn, Request};
+pub use request::{ClassifyFn, Request, Stream};
 pub use ops::{
-    Attention, Collective, CustomCuda, Elementwise, GateActivation, Layout, Linear, MropeForm,
-    Operation,
+    Attention, Collective, CustomCuda, Elementwise, GateActivation, Layout, Linear, ModulateForm,
+    MropeForm, NormKind, Operation, RaggedMask, RopeForm,
 };
 pub use trace::{BlockDrafter, CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
 pub use value::{
-    BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, StructKind,
-    TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
+    BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, Selection,
+    StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
 };

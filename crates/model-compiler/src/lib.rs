@@ -18,7 +18,10 @@ mod fixture;
 
 use model_ir::{ClassTable, Def, Operands, Operation, Trace, Ty, resolve_classes};
 
-pub use arena::{ArenaMap, Concurrency, EXPORT_SEAMS, FireRows, RowExpr, Placement, Span, Extent};
+pub use arena::{
+    ArenaMap, Concurrency, EXPORT_SEAMS, Extent, FLOAT_READOUT_SEAMS, FireRows, Placement,
+    RowExpr, Span,
+};
 pub use compiled::{
     AxisPlan, CompiledModel, EventId, Fallback, FallbackRow, FallbackTable, ClassOrder, Lowering,
     Phase, Region,

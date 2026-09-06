@@ -20,7 +20,7 @@ pub use classes::{fact_width, resolve_classes};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
-use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear};
+use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear, RaggedMask};
 use crate::{Def, Dim, Dtype, Operands, Operation, Trace, StructKind, Ty, ValueId};
 
 /// Where an out-of-range `ValueId` was found.
@@ -365,6 +365,13 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // and o ride the activation dtype, and `segments` is the patch
             // axis's own bounds vector, i32 like every other indptr here.
             Attention::Dense { .. } => &[(In(3), I32)],
+            // The ragged attention pins its two CSRs, and — under the
+            // reference mask — the two per-row tag tables behind them; q, k,
+            // v and o ride the activation dtype.
+            Attention::Ragged { mask: RaggedMask::ReferenceSelfOnly { .. }, .. } => {
+                &[(In(3), I32), (In(4), I32), (In(5), I32), (In(6), I32)]
+            }
+            Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
@@ -492,6 +499,20 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Elementwise::RopePartialQ { .. } | Elementwise::RopePartialLast { .. } => {
                 &[(In(1), I32)]
             }
+            // The axis rope reads the guest's f32 positions, fractional
+            // where a text wants them.
+            Elementwise::RopeAxes { .. } => &[(In(1), F32)],
+            // The modulation ops read their lane map, when they have one, as
+            // the i32 token→lane table it is; it sits behind the activations.
+            Elementwise::Modulate { lane_of_row: Some(_), .. }
+            | Elementwise::NormModulate { lane_of_row: Some(_), .. } => &[(In(2), I32)],
+            Elementwise::GatedResidualAdd { lane_of_row: Some(_), .. } => &[(In(3), I32)],
+            Elementwise::GatedResidualNormModulate { lane_of_row: Some(_), .. } => {
+                &[(In(4), I32)]
+            }
+            // The timestep embedding is fp32 end to end: the scalar in and
+            // the sinusoid row out.
+            Elementwise::Sinusoid { .. } => &[(In(0), F32), (Out(0), F32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
             // The mix projection is f32 end to end — the operand the norm
             // widened, the dynamic plane, and the row the sinkhorn splits.
@@ -530,7 +551,16 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::SiluScaled { .. }
             | Elementwise::HcMix { .. }
             | Elementwise::HcInject { .. }
-            | Elementwise::PleGate { .. } => &[],
+            | Elementwise::PleGate { .. }
+            | Elementwise::Modulate { lane_of_row: None, .. }
+            | Elementwise::NormModulate { lane_of_row: None, .. }
+            | Elementwise::GatedResidualAdd { lane_of_row: None, .. }
+            | Elementwise::GatedResidualNormModulate { lane_of_row: None, .. }
+            | Elementwise::Silu { .. }
+            | Elementwise::Gelu { .. }
+            | Elementwise::Tanh { .. }
+            | Elementwise::Mul { .. }
+            | Elementwise::Add { .. } => &[],
         },
         Operation::Layout(op) => match op {
             Layout::Embed { .. } | Layout::EmbedConcat { .. } => &[(In(0), I32)],
@@ -559,6 +589,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // dtype and its i32 answer is stated by the value it writes.
             | Layout::Argmax { .. } => &[],
             Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
+            // The two permutations pin their row order: one i32 fire row per
+            // packed row, `-1` past the selection.
+            Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
         },
         Operation::CustomCuda(op) => match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => {

@@ -31,6 +31,27 @@ impl Guard {
         Guard::Or(Box::new(a), Box::new(b))
     }
 
+    /// A value guarded by `outer`, read under `inner`: `and(outer, inner)`
+    /// — spelled as `inner` alone when `inner` already implies `outer`.
+    ///
+    /// **WHY THE SPELLING MATTERS.** The recorder compares guards by
+    /// equality to tell one split's arms apart, so a value read under a
+    /// narrower guard than its producer's must come back spelled the way
+    /// its siblings are. A joint attention runs under `Or(text, image)`
+    /// and its output is then read on the text arm: `And(Or(text, image),
+    /// text)` admits exactly the lanes `text` does, and `text` is how every
+    /// other value on that arm is spelled. Checked by truth table, like
+    /// [`equivalent`](Guard::equivalent); an `inner` that narrows `outer`
+    /// keeps the conjunction, as every split arm always has.
+    #[must_use]
+    pub fn narrow(outer: Guard, inner: Guard) -> Guard {
+        if matches!(outer, Guard::Always) {
+            return inner;
+        }
+        let joined = Guard::and(outer, inner.clone());
+        if joined.equivalent(&inner) { inner } else { joined }
+    }
+
     #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn not(a: Guard) -> Guard {

@@ -752,3 +752,234 @@ pub fn rope_mrope(
     );
     (q_out, k_out)
 }
+
+/// Adaptive modulation (D6): `y = form(x, m)`. `m` is either `[Lanes,
+/// k·width]` with `lane_of_row` the fire's `Input::request_of_token` (one
+/// vector per lane, broadcast over its rows), or `[Tokens, k·width]` with
+/// `lane_of_row: None` (a vector per row — Wan TI2V's per-token timestep).
+/// `k` is the form's: `[s | b]` for [`ModulateForm::ScaleShift`], one slice
+/// for the others. Fresh output of `x`'s type.
+pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: ModulateForm) -> Value {
+    let r = x.rec();
+    assert_eq!(
+        m.width(),
+        form.slices() * x.width(),
+        "a {form:?} modulation of a {}-wide row wants a {}-wide vector, not {}",
+        x.width(),
+        form.slices() * x.width(),
+        m.width()
+    );
+    match lane_of_row {
+        Some(lanes) => {
+            assert_eq!(m.rows(), Dim::Lanes, "a lane-broadcast vector is per lane");
+            assert_eq!(lanes.rows(), x.rows(), "the lane map is over the rows it maps");
+        }
+        None => assert_eq!(m.rows(), x.rows(), "a per-row vector shares the rows it modulates"),
+    }
+    let y = r.fresh(x.ty().clone());
+    let mut ins = vec![x, m];
+    ins.extend(lane_of_row);
+    r.push(
+        Elementwise::Modulate {
+            x: x.id(),
+            m: m.id(),
+            lane_of_row: lane_of_row.map(Value::id),
+            form,
+            y: y.id(),
+        },
+        &ins,
+    );
+    y
+}
+
+/// The gated residual fold: `r += g · y`, in place on `r`. `g` is `[Lanes,
+/// width]` broadcast through `lane_of_row` (`Input::request_of_token`), or
+/// `[Tokens, width]` per row with `lane_of_row: None`. Returns the fresh
+/// value aliased onto `r`'s slot.
+pub fn gated_residual_add(r_in: &Value, g: &Value, y: &Value, lane_of_row: Option<&Value>) -> Value {
+    let r = r_in.rec();
+    assert_eq!(r_in.ty(), y.ty(), "the stream and what joins it share a type");
+    assert_eq!(g.width(), r_in.width(), "one gate per column");
+    match lane_of_row {
+        Some(lanes) => {
+            assert_eq!(g.rows(), Dim::Lanes, "a lane-broadcast gate is per lane");
+            assert_eq!(lanes.rows(), r_in.rows(), "the lane map is over the rows it maps");
+        }
+        None => assert_eq!(g.rows(), r_in.rows(), "a per-row gate shares the rows it gates"),
+    }
+    let r_out = r.fresh(r_in.ty().clone());
+    let mut ins = vec![r_in, g, y];
+    ins.extend(lane_of_row);
+    r.push(
+        Elementwise::GatedResidualAdd {
+            r: r_in.id(),
+            g: g.id(),
+            y: y.id(),
+            lane_of_row: lane_of_row.map(Value::id),
+            r_out: r_out.id(),
+        },
+        &ins,
+    );
+    r_out
+}
+
+/// The sinusoidal timestep embedding: `t` is `[rows, 1]` f32 (per lane or
+/// per token), the answer `[rows, dim]` f32 — `[sin | cos]` of `scale · t ·
+/// exp(-ln(max_period) · i / (dim/2))`, or `[cos | sin]` under
+/// `flip_sin_cos`. `dim` is even.
+pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale: f32) -> Value {
+    let r = t.rec();
+    assert_eq!(t.width(), 1, "a timestep is one scalar per row");
+    assert_eq!(t.dtype(), Dtype::F32, "timesteps are fp32");
+    assert!(dim > 0 && dim.is_multiple_of(2), "a sinusoid of {dim} has no equal halves");
+    let y = r.fresh(tensor(t.rows(), dim, Dtype::F32));
+    r.push(
+        Elementwise::Sinusoid {
+            t: t.id(),
+            dim,
+            max_period,
+            flip_sin_cos,
+            scale,
+            y: y.id(),
+        },
+        &[t],
+    );
+    y
+}
+
+/// `x · sigmoid(x)`, in place.
+pub fn silu(x: &Value) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Silu {
+            x: x.id(),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
+/// `gelu(x)`, in place: erf, or the tanh approximation when `tanh` is set.
+pub fn gelu(x: &Value, tanh: bool) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Gelu {
+            x: x.id(),
+            tanh,
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
+/// `tanh(x)`, in place.
+pub fn tanh(x: &Value) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Tanh {
+            x: x.id(),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
+/// `x · y`, two activations of one type, fresh output.
+pub fn mul(x: &Value, y: &Value) -> Value {
+    let r = x.rec();
+    assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
+    let z = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Mul {
+            x: x.id(),
+            y: y.id(),
+            z: z.id(),
+        },
+        &[x, y],
+    );
+    z
+}
+
+/// `x + y`, two activations of one type, fresh output — [`residual_add`]
+/// when the sum may land in place on `y`.
+pub fn add(x: &Value, y: &Value) -> Value {
+    let r = x.rec();
+    assert_eq!(x.ty(), y.ty(), "a sum's operands share a type");
+    let z = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Add {
+            x: x.id(),
+            y: y.id(),
+            z: z.id(),
+        },
+        &[x, y],
+    );
+    z
+}
+
+/// Rotary embedding over up to four position axes with a theta per axis
+/// (D7), in place on `x` (`[rows, heads·head_dim]`), over the guest's
+/// `Input::axis_positions` (`[rows, axes]` f32). `dims[a]` is axis `a`'s
+/// channel count, zero past the last axis; their sum is `rotary_dim`, at
+/// most `head_dim`, the rest of each head passing through. `form` says
+/// which channels pair. Called once each for `q` and `k`.
+pub fn rope_axes(
+    x: &Value,
+    positions: &Value,
+    dims: [u32; 4],
+    thetas: [f32; 4],
+    form: RopeForm,
+    rotary_dim: u32,
+    head_dim: u32,
+) -> Value {
+    let r = x.rec();
+    let axes = dims.iter().take_while(|d| **d > 0).count();
+    assert!(axes > 0, "a rope turns at least one axis");
+    assert!(
+        dims[axes..].iter().all(|d| *d == 0),
+        "the axes of {dims:?} are stated first, the zeros last"
+    );
+    assert_eq!(
+        positions.width(),
+        axes as u64,
+        "{axes} axes of dims want {axes} position columns, not {}",
+        positions.width()
+    );
+    assert_eq!(positions.rows(), x.rows(), "positions are over the rows they turn");
+    assert_eq!(positions.dtype(), Dtype::F32, "axis positions are fp32");
+    assert_eq!(
+        dims.iter().sum::<u32>(),
+        rotary_dim,
+        "the axes of {dims:?} do not sum to rotary_dim {rotary_dim}"
+    );
+    assert!(
+        rotary_dim <= head_dim && rotary_dim.is_multiple_of(2) && dims.iter().all(|d| d.is_multiple_of(2)),
+        "rotary_dim {rotary_dim} within head_dim {head_dim}, every axis an even count"
+    );
+    assert!(
+        x.width().is_multiple_of(u64::from(head_dim)),
+        "x is {} wide, not a whole number of {head_dim}-wide heads",
+        x.width()
+    );
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::RopeAxes {
+            x: x.id(),
+            positions: positions.id(),
+            dims,
+            thetas,
+            form,
+            rotary_dim,
+            head_dim,
+            x_out: x_out.id(),
+        },
+        &[x, positions],
+    );
+    x_out
+}

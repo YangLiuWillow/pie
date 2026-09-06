@@ -500,6 +500,15 @@ impl<'c> Run<'c> {
                     )
                 })
             }
+            // M0: the float ports (D3) and the row-packing table (D2) are
+            // CUDA-first; this shell stages none of them in this phase.
+            Def::Input(
+                which @ (RuntimeInput::RowPermutation { .. }
+                | RuntimeInput::Latents { .. }
+                | RuntimeInput::LaneVector { .. }
+                | RuntimeInput::Context { .. }
+                | RuntimeInput::AxisPositions { .. }),
+            ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -519,6 +528,12 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken => seat.request_of_token,
                     GeomKind::WritePage => seat.write_page,
                     GeomKind::WriteOffset => seat.write_offset,
+                    // M0: the group tables (D2) are CUDA-first; this shell
+                    // stages none of them in this phase.
+                    GeomKind::GroupOfLane
+                    | GeomKind::GroupIndptr { .. }
+                    | GeomKind::LaneIndptr { .. }
+                    | GeomKind::ReferenceTag { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
