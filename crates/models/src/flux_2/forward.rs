@@ -230,6 +230,8 @@ impl Model {
                 // klein is distilled to four steps; these are its sigmas at
                 // 1024² (the golden's `sigmas[:-1]`).
                 pinned_sigmas: sigmas(4096, 4),
+                // One backbone, one schedule: every lane takes `shift`.
+                stream_shifts: vec![],
             }),
             // 1024² target + four 1024² references (the API's klein cap) +
             // the 512-token prompt; the miniature's job is 64 + 128 + 32.
