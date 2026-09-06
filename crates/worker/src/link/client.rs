@@ -41,6 +41,7 @@ pub async fn spawn(listen: &str) -> Result<ClientServerHandle> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream).await {
                             tracing::warn!(?peer, error = %e, "client connection ended");

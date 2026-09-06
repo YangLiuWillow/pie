@@ -66,6 +66,10 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         let transport = conn
             .await
             .with_context(|| format!("dialing gateway at {addr}"))?;
+        // A dispatch is a header write and a body write; with Nagle on, the
+        // second waits for the peer's delayed ACK — 40 ms on Linux, on
+        // every launch, measured. Small RPCs want the wire, not batching.
+        let _ = transport.get_ref().set_nodelay(true);
         connect_gateway_link(transport)
     };
 

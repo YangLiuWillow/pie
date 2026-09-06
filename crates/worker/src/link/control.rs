@@ -144,6 +144,7 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
         let conn = tcp::connect(tcp_addr, Bincode::default)
             .await
             .with_context(|| format!("dialing controller at {addr}"))?;
+        let _ = conn.get_ref().set_nodelay(true);
         Ok(ControlClient::new(cfg, conn).spawn())
     }
 }

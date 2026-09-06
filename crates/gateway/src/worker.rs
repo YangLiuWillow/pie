@@ -234,6 +234,9 @@ pub async fn serve(
                     continue;
                 }
             };
+            // See the worker's dial side: Nagle + delayed ACK put 40 ms on
+            // every dispatch of this link.
+            let _ = transport.get_ref().set_nodelay(true);
             // Split the one connection: serve GatewayInbound here, hold the
             // reverse WorkerControl client for the registry.
             let (server_half, wc_client) = accept_gateway_link(transport);
