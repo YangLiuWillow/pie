@@ -722,7 +722,13 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     // The reference runs BOTH heads over EVERY row and selects afterwards
     // (`minimax_h3.py:2545-2596`); this text runs each head on the rows
     // that keep its answer, which is the same numbers over fewer rows.
-    let (h_video, rest) = h.split(&Facts::video());
+    // Cut the SAME nested tree the lanes were cut with, so each head's
+    // guard is exactly its arm's: a head split straight off the reading
+    // (`h.split(video)`) would make `text ∧ video` — a word no request can
+    // carry, since a stream fact is one-hot — a class of its own, which
+    // the arming pass then cannot find a representative for.
+    let (_, rest) = h.split(&Facts::text());
+    let (h_video, rest) = rest.split(&Facts::video());
     let (h_audio, _) = rest.split(&Facts::audio());
     let velocity = linear(&m.video_out, &h_video);
     seam::at(seam::VELOCITY, &[&velocity]);

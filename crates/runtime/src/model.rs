@@ -886,17 +886,23 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                 ));
             }
         }
+        // A `[rows, ·]` port states the lane's rows, and a CONTEXT port is
+        // one: `inferlet::host::forward::port_rows` takes a context lane's
+        // cell as its row count when it is the only row port the lane binds
+        // (MiniMax H3's `refine` reading binds the encoder's rows and
+        // nothing else). A lane vector or a positions table is not: the
+        // first is one row per lane, the second is sized BY the rows.
         if !reading.takes_tokens
             && !reading.ports.iter().any(|port| {
                 matches!(
                     port.kind,
-                    models::PortKind::Latents | models::PortKind::Voxels
+                    models::PortKind::Latents | models::PortKind::Voxels | models::PortKind::Context
                 )
             })
         {
             return Err(format!(
-                "reading `{}` embeds no tokens and declares no latents or voxels port; nothing \
-                 states its lane's row count",
+                "reading `{}` embeds no tokens and declares no latents, context or voxels port; \
+                 nothing states its lane's row count",
                 reading.name
             ));
         }

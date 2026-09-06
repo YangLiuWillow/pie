@@ -47,6 +47,7 @@ members = [
     "text-to-image",
     "zimage-parity",
     "wan2-parity",
+    "h3-parity",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",
