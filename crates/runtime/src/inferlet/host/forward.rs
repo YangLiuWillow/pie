@@ -1100,7 +1100,8 @@ impl ProcessCtx {
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.bindings.canvas != Some(CanvasMode::Denoise) {
             return Ok(Err(
-                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first".to_string(),
+                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first"
+                    .to_string(),
             ));
         }
         if pass.bindings.self_cond.is_some() {
@@ -1271,7 +1272,11 @@ impl ProcessCtx {
             // Every port the reading declares is bound, and nothing else is.
             if let Some(reading) = reading {
                 if let Some((_, port)) = reading.ports_indexed().find(|(_, port)| {
-                    !pass.bindings.ports.iter().any(|bound| bound.name == port.name)
+                    !pass
+                        .bindings
+                        .ports
+                        .iter()
+                        .any(|bound| bound.name == port.name)
                 }) {
                     return Ok(Err(format!(
                         "reading `{}` declares port `{}` and this pass bound no channel to it; \
@@ -1417,11 +1422,20 @@ impl ProcessCtx {
                 (Port::EmbedIndptr, embed.map(|embed| embed.indptr)),
                 (Port::KvLen, attention.map(|attention| attention.kv_len)),
                 (Port::Pages, attention.map(|attention| attention.pages)),
-                (Port::PageIndptr, attention.map(|attention| attention.page_indptr)),
+                (
+                    Port::PageIndptr,
+                    attention.map(|attention| attention.page_indptr),
+                ),
                 (Port::WSlot, attention.map(|attention| attention.w_slot)),
                 (Port::WOff, attention.map(|attention| attention.w_off)),
-                (Port::Positions, attention.map(|attention| attention.positions)),
-                (Port::AttnMask, attention.and_then(|attention| attention.mask)),
+                (
+                    Port::Positions,
+                    attention.map(|attention| attention.positions),
+                ),
+                (
+                    Port::AttnMask,
+                    attention.and_then(|attention| attention.mask),
+                ),
                 (Port::Readout, readout),
             ];
             if let Err(error) =
@@ -1500,111 +1514,113 @@ impl ProcessCtx {
                 cells.push(cell);
             }
 
-            let (ws_rep, readable, writable, devgeo, decode_envelope, geometry_class) = if let Some(
-                attention,
-            ) = attention
-            {
-            let readable = attention.readable;
-            let writable = attention.writable;
-            let ws_rep = attention.kv_ws;
-            let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-            let bound_ws = self.ctx().table.get(&ws_res)?.clone();
-            let stores = crate::store::registry::get(bound_ws.model, bound_ws.engine);
-            let page_len =
-                match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                    kv.page_len(bound_ws.id)
-                }) {
-                    Ok(page_len) => page_len,
-                    Err(error) => {
-                        return Ok(Err(format!("pipeline: KV page extent: {error}")));
+            let (ws_rep, readable, writable, devgeo, decode_envelope, geometry_class) =
+                if let Some(attention) = attention {
+                    let readable = attention.readable;
+                    let writable = attention.writable;
+                    let ws_rep = attention.kv_ws;
+                    let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
+                    let bound_ws = self.ctx().table.get(&ws_res)?.clone();
+                    let stores = crate::store::registry::get(bound_ws.model, bound_ws.engine);
+                    let page_len =
+                        match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                            kv.page_len(bound_ws.id)
+                        }) {
+                            Ok(page_len) => page_len,
+                            Err(error) => {
+                                return Ok(Err(format!("pipeline: KV page extent: {error}")));
+                            }
+                        };
+                    if let Err(error) = readable.resolve(page_len) {
+                        return Ok(Err(error));
                     }
-                };
-            if let Err(error) = readable.resolve(page_len) {
-                return Ok(Err(error));
-            }
-            if let Err(error) = writable.resolve(page_len) {
-                return Ok(Err(error));
-            }
-            // Derivability decides the geometry class, not op-pattern arity:
-            // host-derivable geometry is Host class on every engine; a
-            // device-dependent envelope classifies DecodeEnvelope only when
-            // the engine has the needed device geometry ports, else it falls
-            // back to Host and blocks loudly on the first undecidable value.
-            let device_port_mask =
-                crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
+                    if let Err(error) = writable.resolve(page_len) {
+                        return Ok(Err(error));
+                    }
+                    // Derivability decides the geometry class, not op-pattern arity:
+                    // host-derivable geometry is Host class on every engine; a
+                    // device-dependent envelope classifies DecodeEnvelope only when
+                    // the engine has the needed device geometry ports, else it falls
+                    // back to Host and blocks loudly on the first undecidable value.
+                    let device_port_mask =
+                        crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
 
-            // Device-geometry pass: the program traces its full explicit
-            // geometry in-graph; the runtime only leases physical pages. If
-            // AttnMask binds a channel, the engine must be able to resolve it
-            // per-step (CUDA today cannot); otherwise it falls back to Host.
-            let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
-                matches!(binding.port, eta_ir::registry::Port::AttnMask)
-                    && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
-            });
-            let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
-                && (!needs_mask_port || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
-            let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
-                &prog.bound.container,
-            ) {
-                Some(_) if !devgeo_capable => {
-                    tracing::info!(
-                        "device-geometry program on an engine without device geometry ports \
+                    // Device-geometry pass: the program traces its full explicit
+                    // geometry in-graph; the runtime only leases physical pages. If
+                    // AttnMask binds a channel, the engine must be able to resolve it
+                    // per-step (CUDA today cannot); otherwise it falls back to Host.
+                    let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
+                        matches!(binding.port, eta_ir::registry::Port::AttnMask)
+                            && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
+                    });
+                    let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
+                        && (!needs_mask_port
+                            || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
+                    let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
+                        &prog.bound.container,
+                    ) {
+                        Some(_) if !devgeo_capable => {
+                            tracing::info!(
+                                "device-geometry program on an engine without device geometry ports \
                          (mask {device_port_mask:?}): falling back to host-evaluated \
                          serialized execution"
-                    );
-                    None
-                }
-                Some((b, fresh_dense, w_cont_dense)) => {
-                    if readable.start != 0
-                        || readable.end.is_some()
-                        || writable.start != 0
-                        || writable.end.is_some()
-                    {
-                        return Ok(Err(
+                            );
+                            None
+                        }
+                        Some((b, fresh_dense, w_cont_dense)) => {
+                            if readable.start != 0
+                                || readable.end.is_some()
+                                || writable.start != 0
+                                || writable.end.is_some()
+                            {
+                                return Ok(Err(
                                 "pipeline: device-geometry passes require full open readable and writable page spans"
                                     .to_string(),
                             ));
-                    }
-                    // Seed the lease with `B` fire-0 pages, one per lane.
-                    let reserved =
-                        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                            kv.reserve(bound_ws.id, b as u64)
-                        });
-                    let seed_pages: Vec<u32> = match reserved {
-                        Ok(range) => (range.start as u32..range.end as u32).collect(),
-                        Err(e) => {
-                            return Ok(Err(format!("pipeline: device-geometry seed alloc: {e}")));
+                            }
+                            // Seed the lease with `B` fire-0 pages, one per lane.
+                            let reserved = crate::store::registry::with_kv_lock(
+                                &stores.kv,
+                                "host-other",
+                                |kv| kv.reserve(bound_ws.id, b as u64),
+                            );
+                            let seed_pages: Vec<u32> = match reserved {
+                                Ok(range) => (range.start as u32..range.end as u32).collect(),
+                                Err(e) => {
+                                    return Ok(Err(format!(
+                                        "pipeline: device-geometry seed alloc: {e}"
+                                    )));
+                                }
+                            };
+                            let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
+                            lease.seed(seed_pages);
+                            let has_mask = prog.bound.container.ports.iter().any(|p| {
+                                matches!(p.port, eta_ir::registry::Port::AttnMask)
+                                    && matches!(p.source, eta_ir::container::PortSource::Channel(_))
+                            });
+                            Some(DevGeo {
+                                lease,
+                                b,
+                                fresh_dense,
+                                w_cont_dense,
+                                has_mask,
+                                pooled: false,
+                                qo_indptr: None,
+                            })
                         }
+                        None => None,
                     };
-                    let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
-                    lease.seed(seed_pages);
-                    let has_mask = prog.bound.container.ports.iter().any(|p| {
-                        matches!(p.port, eta_ir::registry::Port::AttnMask)
-                            && matches!(p.source, eta_ir::container::PortSource::Channel(_))
-                    });
-                    Some(DevGeo {
-                        lease,
-                        b,
-                        fresh_dense,
-                        w_cont_dense,
-                        has_mask,
-                        pooled: false,
-                        qo_indptr: None,
-                    })
-                }
-                None => None,
-            };
 
-            let taint = prog.geometry_taint();
-            // A device-carried decode that re-publishes EVERY descriptor port
-            // — tokens, positions, pages, page bounds, kv length, write
-            // targets — states its whole geometry in-graph, so the engine
-            // resolves it there and the host only leases the pool. Asked
-            // before the envelope class: an envelope still folds every port
-            // but the token on the host, and a loop whose accepted count is
-            // device-decided (a speculative window) has nothing for the host
-            // to fold.
-            let devgeo = match devgeo {
+                    let taint = prog.geometry_taint();
+                    // A device-carried decode that re-publishes EVERY descriptor port
+                    // — tokens, positions, pages, page bounds, kv length, write
+                    // targets — states its whole geometry in-graph, so the engine
+                    // resolves it there and the host only leases the pool. Asked
+                    // before the envelope class: an envelope still folds every port
+                    // but the token on the host, and a loop whose accepted count is
+                    // device-decided (a speculative window) has nothing for the host
+                    // to fold.
+                    let devgeo = match devgeo {
                 Some(devgeo) => Some(devgeo),
                 None if devgeo_capable
                     && !taint.host_derivable()
@@ -1626,80 +1642,91 @@ impl ProcessCtx {
                 }
                 None => None,
             };
-            let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
-                None
-            } else {
-                let mut why = String::new();
-                match crate::pipeline::fire::geometry::classify_decode_envelope_why(
-                    &prog.bound.container,
-                    &mut why,
-                ) {
-                    Ok(Some(envelope)) => {
-                        let required =
-                            crate::pipeline::fire::geometry::envelope_required_ports(&envelope);
-                        if device_port_mask.covers(required) {
-                            Some(envelope)
-                        } else {
-                            tracing::info!(
-                                "decode envelope on an engine without device geometry ports \
+                    let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
+                        None
+                    } else {
+                        let mut why = String::new();
+                        match crate::pipeline::fire::geometry::classify_decode_envelope_why(
+                            &prog.bound.container,
+                            &mut why,
+                        ) {
+                            Ok(Some(envelope)) => {
+                                let required =
+                                    crate::pipeline::fire::geometry::envelope_required_ports(
+                                        &envelope,
+                                    );
+                                if device_port_mask.covers(required) {
+                                    Some(envelope)
+                                } else {
+                                    tracing::info!(
+                                        "decode envelope on an engine without device geometry ports \
                                  (mask {device_port_mask:?}, needs {required:?}): falling \
                                  back to host-evaluated serialized execution"
-                            );
-                            None
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::info!(
-                            "not a decode envelope: {why}; falling back to \
+                                    );
+                                    None
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::info!(
+                                    "not a decode envelope: {why}; falling back to \
                              host-evaluated execution"
-                        );
-                        None
-                    }
-                    Err(reason) => {
-                        tracing::warn!(
-                            "device-dependent geometry is not a decode envelope ({reason}); \
+                                );
+                                None
+                            }
+                            Err(reason) => {
+                                tracing::warn!(
+                                    "device-dependent geometry is not a decode envelope ({reason}); \
                              falling back to host-evaluated execution — fires block loudly \
                              on values the host cannot derive"
-                        );
-                        None
-                    }
-                }
-            };
-            if decode_envelope.is_some() && (readable.start != 0 || readable.end.is_some()) {
-                return Ok(Err(
+                                );
+                                None
+                            }
+                        }
+                    };
+                    if decode_envelope.is_some() && (readable.start != 0 || readable.end.is_some())
+                    {
+                        return Ok(Err(
                     "pipeline: device-resolved passes require a full open readable page span"
                         .to_string(),
                 ));
-            }
-            let geometry_class = if devgeo.is_some() {
-                GeometryClass::DeviceGeometry
-            } else if decode_envelope.is_some() {
-                GeometryClass::DecodeEnvelope
-            } else {
-                GeometryClass::Host
-            };
-            (ws_rep, readable, writable, devgeo, decode_envelope, geometry_class)
-            } else {
-                // A float lane has no sequence, but the fire path seats
-                // lanes and holds fire leases by working set, so the host
-                // mints a SCRATCH one the guest never sees: no pages, no
-                // geometry, released with the pass.
-                let open = crate::pipeline::instance::KvPageSpan { start: 0, end: None };
-                (
-                    self.mint_scratch_working_set()?,
-                    open,
-                    open,
-                    None,
-                    None,
-                    GeometryClass::Host,
-                )
-            };
+                    }
+                    let geometry_class = if devgeo.is_some() {
+                        GeometryClass::DeviceGeometry
+                    } else if decode_envelope.is_some() {
+                        GeometryClass::DecodeEnvelope
+                    } else {
+                        GeometryClass::Host
+                    };
+                    (
+                        ws_rep,
+                        readable,
+                        writable,
+                        devgeo,
+                        decode_envelope,
+                        geometry_class,
+                    )
+                } else {
+                    // A float lane has no sequence, but the fire path seats
+                    // lanes and holds fire leases by working set, so the host
+                    // mints a SCRATCH one the guest never sees: no pages, no
+                    // geometry, released with the pass.
+                    let open = crate::pipeline::instance::KvPageSpan {
+                        start: 0,
+                        end: None,
+                    };
+                    (
+                        self.mint_scratch_working_set()?,
+                        open,
+                        open,
+                        None,
+                        None,
+                        GeometryClass::Host,
+                    )
+                };
             let rs_reps: Vec<u32> = rs_working_sets.iter().map(Resource::rep).collect();
             if float_rows.is_some() && !rs_reps.is_empty() {
                 self.release_scratch_working_set(ws_rep)?;
-                return Ok(Err(
-                    "a float lane binds no recurrent state".to_string()
-                ));
+                return Ok(Err("a float lane binds no recurrent state".to_string()));
             }
 
             let instance_id = crate::pipeline::instance::next_instance_id();
@@ -2189,7 +2216,11 @@ macro_rules! forward_pass_readings {
             self.core_stream(this, s).await
         }
 
-        async fn group(&mut self, this: Resource<ForwardPass>, id: u32) -> Anyhow<Result<(), String>> {
+        async fn group(
+            &mut self,
+            this: Resource<ForwardPass>,
+            id: u32,
+        ) -> Anyhow<Result<(), String>> {
             self.core_group(this, id).await
         }
     };
@@ -2373,7 +2404,6 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // pie:inferlet/forward-diffusion — paged KV plus a canvas denoised in place.
 // ---------------------------------------------------------------------------
@@ -2487,23 +2517,36 @@ mod tests {
     #[test]
     fn a_port_channel_is_validated_against_its_fact() {
         let latents = port("latents", models::PortKind::Latents, 64);
-        assert_eq!(validate_port_channel(&latents, &[256, 64], Dtype::F32), Ok(Some(256)));
-        assert!(validate_port_channel(&latents, &[256, 32], Dtype::F32)
-            .unwrap_err()
-            .contains("`latents`"));
+        assert_eq!(
+            validate_port_channel(&latents, &[256, 64], Dtype::F32),
+            Ok(Some(256))
+        );
+        assert!(
+            validate_port_channel(&latents, &[256, 32], Dtype::F32)
+                .unwrap_err()
+                .contains("`latents`")
+        );
         assert!(validate_port_channel(&latents, &[256 * 64], Dtype::F32).is_err());
         assert!(validate_port_channel(&latents, &[0, 64], Dtype::F32).is_err());
-        assert!(validate_port_channel(&latents, &[256, 64], Dtype::I32)
-            .unwrap_err()
-            .contains("f32"));
+        assert!(
+            validate_port_channel(&latents, &[256, 64], Dtype::I32)
+                .unwrap_err()
+                .contains("f32")
+        );
 
         let timestep = port("timestep", models::PortKind::LaneVector, 1);
         assert_eq!(validate_port_channel(&timestep, &[1], Dtype::F32), Ok(None));
-        assert_eq!(validate_port_channel(&timestep, &[1, 1], Dtype::F32), Ok(None));
+        assert_eq!(
+            validate_port_channel(&timestep, &[1, 1], Dtype::F32),
+            Ok(None)
+        );
         assert!(validate_port_channel(&timestep, &[2], Dtype::F32).is_err());
 
         let positions = port("positions", models::PortKind::AxisPositions, 3);
-        assert_eq!(validate_port_channel(&positions, &[256, 3], Dtype::F32), Ok(Some(256)));
+        assert_eq!(
+            validate_port_channel(&positions, &[256, 3], Dtype::F32),
+            Ok(Some(256))
+        );
     }
 
     /// Every `[rows, ·]` port of one pass carries the same rows, except a
@@ -2532,8 +2575,14 @@ mod tests {
     fn binding() -> AttentionBinding {
         AttentionBinding {
             kv_ws: 1,
-            readable: KvPageSpan { start: 0, end: None },
-            writable: KvPageSpan { start: 0, end: None },
+            readable: KvPageSpan {
+                start: 0,
+                end: None,
+            },
+            writable: KvPageSpan {
+                start: 0,
+                end: None,
+            },
             kv_len: 2,
             pages: 3,
             page_indptr: 4,
@@ -2558,7 +2607,10 @@ mod tests {
             Some("kv-working-set")
         );
         let mut next = binding();
-        next.writable = KvPageSpan { start: 0, end: Some(4) };
+        next.writable = KvPageSpan {
+            start: 0,
+            end: Some(4),
+        };
         assert_eq!(
             attention_rebind_diff(&binding(), &next),
             Some("writable-pages")

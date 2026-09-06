@@ -88,12 +88,14 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
         let caps = model::model().eta_caps();
-        Ok((caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
-            rows: caps.draft_block,
-            mask_token: caps.draft_mask_token,
-            bidirectional: caps.draft_bidirectional,
-            proposals_from: caps.draft_proposals_from,
-        }))
+        Ok(
+            (caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
+                rows: caps.draft_block,
+                mask_token: caps.draft_mask_token,
+                bidirectional: caps.draft_bidirectional,
+                proposals_from: caps.draft_proposals_from,
+            }),
+        )
     }
 
     /// Which forward-pass interface the bound model requires, keyed on state
@@ -137,17 +139,16 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     /// The latent space a denoiser works in; `None` for a text row.
     async fn latent(&mut self) -> Result<Option<pie::inferlet::model::LatentSpace>> {
-        Ok(model::model()
-            .generative()
-            .and_then(|g| g.latent)
-            .map(|l| pie::inferlet::model::LatentSpace {
+        Ok(model::model().generative().and_then(|g| g.latent).map(|l| {
+            pie::inferlet::model::LatentSpace {
                 channels: l.channels,
                 patch_t: l.patch_t,
                 patch_h: l.patch_h,
                 patch_w: l.patch_w,
                 spatial_compression: l.spatial_compression,
                 temporal_compression: l.temporal_compression,
-            }))
+            }
+        }))
     }
 
     /// The schedule the denoiser was trained under; `None` when nothing

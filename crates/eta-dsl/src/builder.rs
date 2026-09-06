@@ -43,6 +43,9 @@ pub struct Builder<'a> {
     stages: Vec<(Stage, StageClosure<'a>)>,
     vocab: u32,
     page_size: u32,
+    /// The read-out row count a pass with no token CSR states outright: a
+    /// float lane's rows are its latents port's, not an `EmbedIndptr`'s.
+    rows: Option<u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -53,7 +56,15 @@ impl<'a> Builder<'a> {
             stages: Vec::new(),
             vocab,
             page_size,
+            rows: None,
         }
+    }
+
+    /// State the read-out row count outright, for a pass that binds no
+    /// `Readout`/`EmbedIndptr` port to derive it from (a float lane: its
+    /// rows are its latents port's). Wins over the derived count.
+    pub fn rows_hint(&mut self, rows: u32) {
+        self.rows = Some(rows.max(1));
     }
 
     /// Bind a descriptor [`Port`] to a channel. Records the port's endpoint
@@ -95,6 +106,9 @@ impl<'a> Builder<'a> {
     /// channel, else the number of `EmbedIndptr` lanes. Saturating rather
     /// than truncating, since wrapping would silently under-read.
     fn rows(&self) -> u32 {
+        if let Some(rows) = self.rows {
+            return rows;
+        }
         if let Some(channel) = self.channel_port(Port::Readout) {
             return saturating_rows(channel.shape().numel()).max(1);
         }

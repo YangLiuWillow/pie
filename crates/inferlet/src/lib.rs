@@ -80,17 +80,29 @@ pub mod eta;
 
 pub mod chat;
 
+/// The sampler prelude for the generative families (imagegen design D4):
+/// a flow-matching schedule built from `model::schedule()`, the Euler step
+/// and guidance rules as epilogue math over `velocity()`, a seeded device
+/// noise draw, a positions-grid builder, and `encode_text`.
+pub mod latent;
+
 /// The runtime serves exactly one model; these are global functions over
 /// that single bound model. There is no `Model`/`Tokenizer` handle to pass
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        BlockDrafter, CanvasShape, ForwardKind, architecture, arena_block_size, canvas,
-        channel_capacity, default_system_speculation, draft_block, frame_size, kv_page_size,
-        max_embed_length, mtp_depth, name, output_vocab_size, pass_kind, prefill_chunk_hint,
-        rs_buffer_page_size,
-        rs_fold_granularity, rs_state_size, run_ahead_window, submit_deadline_us,
+        BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact, PortKind,
+        ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind, architecture, arena_block_size,
+        canvas, channel_capacity, default_system_speculation, draft_block, frame_size,
+        kv_page_size, latent, max_embed_length, max_latent_rows, mtp_depth, name,
+        output_vocab_size, pass_kind, prefill_chunk_hint, readings, rs_buffer_page_size,
+        rs_fold_granularity, rs_state_size, run_ahead_window, schedule, submit_deadline_us,
     };
+
+    /// The declared reading named `name`, if the bound model has one.
+    pub fn reading(name: &str) -> Option<ReadingFact> {
+        readings().into_iter().find(|reading| reading.name == name)
+    }
     // Tokenizer functions live in the `tokenizer` interface; re-exported here
     // so `model::encode`/`model::decode`/… read off `model` in inferlet source.
     pub use crate::pie::inferlet::tokenizer::{

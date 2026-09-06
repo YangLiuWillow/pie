@@ -642,9 +642,9 @@ pub fn register(
     // pinned specials) against the artifact's tokenizer before the template
     // resolves a marker, so a mismatched artifact refuses at boot.
     match models::tokenizer::contract_of(row.id) {
-        Some(contract) => contract.verify(&tokenizer).map_err(|fault| {
-            anyhow!("`{}` refuses this artifact's tokenizer: {fault}", row.id)
-        })?,
+        Some(contract) => contract
+            .verify(&tokenizer)
+            .map_err(|fault| anyhow!("`{}` refuses this artifact's tokenizer: {fault}", row.id))?,
         None => {
             return Err(anyhow!(
                 "this build serves {:?} but ships no tokenizer contract for \
@@ -681,7 +681,10 @@ pub fn register(
     let generative = catalog_row.generative.clone();
     if let Some(generative) = &generative {
         validate_generative(generative).map_err(|fault| {
-            anyhow!("`{}` states generative facts this runtime refuses: {fault}", row.id)
+            anyhow!(
+                "`{}` states generative facts this runtime refuses: {fault}",
+                row.id
+            )
         })?;
     }
 
@@ -725,7 +728,10 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
         if reading.name.is_empty() {
             return Err(format!("reading {at} has an empty name"));
         }
-        if generative.readings[..at].iter().any(|r| r.name == reading.name) {
+        if generative.readings[..at]
+            .iter()
+            .any(|r| r.name == reading.name)
+        {
             return Err(format!("reading `{}` is declared twice", reading.name));
         }
         if reading.readout_width == 0 {
@@ -749,7 +755,10 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
         }
         for (i, port) in reading.ports.iter().enumerate() {
             if port.name.is_empty() {
-                return Err(format!("reading `{}` port {i} has an empty name", reading.name));
+                return Err(format!(
+                    "reading `{}` port {i} has an empty name",
+                    reading.name
+                ));
             }
             if reading.ports[..i].iter().any(|p| p.name == port.name) {
                 return Err(format!(
@@ -819,7 +828,9 @@ pub fn media_pad() -> Option<u32> {
         // rather than a second table that can drift out of sync.
         let spelling = models::media::vision_front_end(arch)
             .map(|fe| fe.delimiters().placeholder)
-            .or_else(|| multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder))?;
+            .or_else(|| {
+                multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder)
+            })?;
         match m.tokenize(spelling)[..] {
             [id] => Some(id),
             // Tokenizer can't spell the arch's pad as one token: nothing to
@@ -1086,4 +1097,3 @@ impl Model {
         self.eta_caps
     }
 }
-

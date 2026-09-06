@@ -41,6 +41,7 @@ members = [
     "diffusion-baseline",
     "diffusion-lab",
     "diffusion-parity",
+    "latent-probe",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",
