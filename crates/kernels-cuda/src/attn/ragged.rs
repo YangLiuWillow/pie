@@ -8,9 +8,10 @@
 //! beside `attn_dense`, standing in for `attn::ragged`.
 //!
 //! **The kernel** is the vendored FlashInfer FA2 template
-//! `BatchPrefillWithRaggedKVCacheKernel` (`MaskMode::kNone`, NHD layout,
-//! bf16 in, fp32 accumulation, online softmax, bf16 out) — the same tensor-core
-//! kernel `attention.prefill` runs, reading k/v straight out of two row-major
+//! `BatchPrefillWithRaggedKVCacheKernel` (`MaskMode::kNone`, or `kCustom`
+//! under the per-group reference mask; NHD layout, bf16 in, fp32
+//! accumulation, online softmax, bf16 out) — the same tensor-core kernel
+//! `attention.prefill` runs, reading k/v straight out of two row-major
 //! rectangles. The paged arms take a host-built plan; this one builds its
 //! schedule on the device (`attn/ragged.cuh`'s `ragged_schedule`) from the
 //! group tables it is handed, so the entry is two launches on one stream and
