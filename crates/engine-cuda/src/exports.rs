@@ -73,6 +73,8 @@ pub struct Export {
 /// This load's declared exports (design §9), resolved once at boot.
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
+    /// The classes whose window writes the `out` seam (empty without one).
+    pub(crate) out_classes: model_ir::ClassSet,
     /// The trunk's logits. `None` for a plan whose readout is a float seam
     /// (`velocity`, `hidden`) — a denoiser has no logits — and a plan with
     /// neither is refused at boot, since a fire would compute nothing a
@@ -110,6 +112,57 @@ pub(crate) struct ReadoutSeam {
 }
 
 impl Exports {
+    /// The seam a lane of `class` reads back from — the export its OWN arm
+    /// writes (a multi-reading plan plants `hidden` on its encoder arm and
+    /// `velocity` on its denoise arm, design D1/D5): `out` when the class
+    /// writes it, else its `velocity`, else the last `hidden` its class
+    /// writes; a class that writes none falls back to the plan-wide
+    /// [`readout`](Exports::readout).
+    #[must_use]
+    pub(crate) fn readout_for(&self, class: usize) -> Option<ReadoutSeam> {
+        use engine::fire::ReadoutSeam as Seam;
+        if let Some(out) = self.out
+            && self.out_classes.contains(class)
+        {
+            return Some(ReadoutSeam {
+                seam: Seam::Logits,
+                value: out,
+            });
+        }
+        if let Some(velocity) = self.velocity_for(class) {
+            return Some(ReadoutSeam {
+                seam: Seam::Velocity,
+                value: velocity.value,
+            });
+        }
+        if let Some(hidden) = self.hidden_for(class) {
+            return Some(ReadoutSeam {
+                seam: Seam::Hidden,
+                value: hidden.value,
+            });
+        }
+        self.readout()
+    }
+
+    /// The velocity export a lane of `class` writes, else the plan's (for
+    /// a class writing none — the plan-wide answer keeps a text SKU's one
+    /// seam bound as before).
+    #[must_use]
+    pub(crate) fn velocity_for(&self, class: usize) -> Option<&Export> {
+        self.velocity
+            .as_ref()
+            .filter(|export| export.classes.contains(class))
+    }
+
+    /// The last hidden export a lane of `class` writes.
+    #[must_use]
+    pub(crate) fn hidden_for(&self, class: usize) -> Option<&Export> {
+        self.hidden
+            .iter()
+            .rev()
+            .find(|export| export.classes.contains(class))
+    }
+
     /// The seam a lane's rows are read back from: `out` when the plan has
     /// one, else `velocity`, else the last `hidden` — a plan with none was
     /// refused at [`Exports::of`].
@@ -194,6 +247,9 @@ impl Exports {
                 _ => None,
             });
         Ok(Exports {
+            out_classes: out.map_or_else(model_ir::ClassSet::default, |out| {
+                writer_classes(trace, compiled, out)
+            }),
             out,
             mtp: named(MTP_SEAM).into_iter().next(),
             scores,
@@ -214,6 +270,18 @@ impl Exports {
 /// the writing node is the one reading that cannot be fooled by a model text
 /// reusing an op.
 fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
+    // A merged export is written by its arms: every class that writes any
+    // arm reads the seam back from the merged column.
+    if let Some(model_ir::Def::Merge(arms)) = trace.values.get(value.0 as usize).map(|decl| &decl.def)
+    {
+        let mut classes = model_ir::ClassSet::default();
+        for (arm, _) in arms {
+            for class in writer_classes(trace, compiled, *arm).iter() {
+                classes.insert(class);
+            }
+        }
+        return classes;
+    }
     let mut outputs: Vec<ValueId> = Vec::new();
     let mut writers: Vec<u32> = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {

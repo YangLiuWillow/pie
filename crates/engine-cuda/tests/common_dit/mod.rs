@@ -551,24 +551,29 @@ impl Rig {
         if let Some(id) = self.programs.get(&rows) {
             return *id;
         }
-        let bound = bind(epilogue(rows), self.profile().clone()).expect("the epilogue binds");
+        let id = self.register(epilogue(rows), u64::from(rows));
+        self.programs.insert(rows, id);
+        id
+    }
+
+    /// Compile and register any epilogue container against this load's
+    /// profile; `salt` keeps two programs' hashes apart.
+    pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
+        let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend = Backend::parse("cuda").expect("the cuda backend");
         let registration = ProgramRegistration {
-            program_hash: 0xd17 ^ u64::from(rows),
+            program_hash: 0xd17 ^ salt,
             emitted_kernels: emit_program(backend, &stages, &bound),
             emitter_version: backend.emitter_version(),
             region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(&stages),
             launch,
             ..Default::default()
         };
-        let id = self
-            .engine
+        self.engine
             .register_program(&registration)
-            .expect("the program registers");
-        self.programs.insert(rows, id);
-        id
+            .expect("the program registers")
     }
 
     fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> u64 {
@@ -592,10 +597,16 @@ impl Rig {
     /// One lane's instance: its four channels registered and bound.
     pub fn lane(&mut self, rows: u32) -> LaneHandles {
         let program = self.program(rows);
+        self.lane_of(program, rows, WIDTH)
+    }
+
+    /// [`Rig::lane`] over a stated program, with an out channel `width`
+    /// wide.
+    pub fn lane_of(&mut self, program: u64, rows: u32, width: u32) -> LaneHandles {
         let latent = self.channel(vec![rows, WIDTH], HostRole::Writer);
         let timestep = self.channel(vec![1, 1], HostRole::Writer);
         let positions = self.channel(vec![rows, 2], HostRole::Writer);
-        let out = self.channel(vec![rows, WIDTH], HostRole::Reader);
+        let out = self.channel(vec![rows, width], HostRole::Reader);
         let bound = self
             .engine
             .bind_instance(&InstanceBinding {

@@ -758,92 +758,72 @@ impl FireCtx<'_> {
             }
             _ => None,
         };
-        // The readout seam: `out` (logits) when the plan has one, else the
-        // float readout it plants instead (`velocity`, then the last
-        // `hidden`) — design D3's "this kind's logits".
-        // A pixels-only plan (a VAE decoder, D8) has no row readout at all:
-        // its numbers come off the pixels seam below.
-        let readout = match self.exports.readout() {
-            Some(readout) => Some(readout),
-            None if pixels.is_some() => None,
-            None => {
-                return Err(Fault::Unbound {
-                    what: "a plan with no `out` seam and no float readout, which boot should \
-                           have refused"
-                        .to_string(),
-                });
-            }
-        };
-        let logits = match readout {
-            Some(readout) => {
-                let out = readout.value;
-                let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the {:?} readout seam, which the carve gave no rectangle",
-                        out.0, readout.seam
-                    ),
-                })?;
-                if !matches!(logits.dtype, Dtype::Bf16 | Dtype::F32) {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the {:?} readout seam landed as {:?}, which this shell cannot \
-                             read back",
-                            readout.seam, logits.dtype
-                        ),
-                    });
-                }
-                if readout.seam == engine::fire::ReadoutSeam::Logits && logits.dtype != Dtype::Bf16
-                {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "an out seam landed as {:?}, which this shell cannot read back",
-                            logits.dtype
-                        ),
-                    });
-                }
-                logits
-            }
-            None => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
-        };
-        let readout_seam = readout.map_or(engine::fire::ReadoutSeam::Pixels, |readout| readout.seam);
-        // The float seams an epilogue may point an intrinsic at, whether or
-        // not they are the readout: the velocity plane and the last hidden
-        // plane, each as the carve placed it.
-        let float_plane = |export: Option<&crate::exports::Export>,
-                           seam: &str|
-         -> Result<Option<kernels_cuda::Tensor>> {
-            let Some(export) = export else {
-                return Ok(None);
-            };
-            let plane = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, the `{seam}` export, which the carve gave no rectangle",
-                    export.value.0
-                ),
-            })?;
-            if !matches!(plane.dtype, Dtype::Bf16 | Dtype::F32) {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "a `{seam}` export landed as {:?}, which this shell cannot point an \
-                         intrinsic at",
-                        plane.dtype
-                    ),
-                });
-            }
-            Ok(Some(plane))
-        };
-        let velocity = float_plane(self.exports.velocity.as_ref(), "velocity")?;
-        let hidden = float_plane(self.exports.hidden.last(), "hidden")?;
-        // Which rows of the arena's logits rectangle each submitted lane reads and owns.
+        // Which rows of the arena's readout rectangles each submitted lane
+        // reads and owns, and the class its word landed in.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
         let mut first_row = vec![0u32; lane_count];
         let mut lane_rows = vec![0u32; lane_count];
+        let mut lane_class = vec![0usize; lane_count];
         for row in p.composition.lanes() {
             let at = row.source as usize;
             last_row[at] = row.row_offset + row.rows - 1;
             first_row[at] = row.row_offset;
             lane_rows[at] = row.rows;
+            lane_class[at] = row.class as usize;
+        }
+        // One export rectangle, as the carve placed it, checked for an
+        // element this shell can read back or point an intrinsic at.
+        let plane_of = |value: model_ir::ValueId, what: &str| -> Result<kernels_cuda::Tensor> {
+            let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "value {}, the {what} export, which the carve gave no rectangle",
+                    value.0
+                ),
+            })?;
+            if !matches!(plane.dtype, Dtype::Bf16 | Dtype::F32) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "the {what} export landed as {:?}, which this shell cannot read back",
+                        plane.dtype
+                    ),
+                });
+            }
+            Ok(plane)
+        };
+        // The readout seam, PER LANE, from the lane's class: `out` (logits)
+        // when its arm writes one, else the float readout its arm plants
+        // (`velocity`, then its last `hidden`) — design D3's "this kind's
+        // logits", and D5's several arms of one plan each reading back their
+        // own seam. A pixels-only plan (a VAE decoder, D8) has no row
+        // readout at all: its numbers come off the pixels seam below.
+        let mut lane_planes: Vec<Option<(engine::fire::ReadoutSeam, kernels_cuda::Tensor)>> =
+            vec![None; lane_count];
+        for lane in 0..lane_count {
+            match self.exports.readout_for(lane_class[lane]) {
+                Some(readout) => {
+                    let plane = plane_of(readout.value, &format!("{:?} readout", readout.seam))?;
+                    if readout.seam == engine::fire::ReadoutSeam::Logits
+                        && plane.dtype != Dtype::Bf16
+                    {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "an out seam landed as {:?}, which this shell cannot read back",
+                                plane.dtype
+                            ),
+                        });
+                    }
+                    lane_planes[lane] = Some((readout.seam, plane));
+                }
+                None if pixels.is_some() => {}
+                None => {
+                    return Err(Fault::Unbound {
+                        what: "a plan with no `out` seam and no float readout, which boot should \
+                               have refused"
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         // The capture columns' rectangles, one per exported attention layer.
@@ -871,7 +851,6 @@ impl FireCtx<'_> {
         }
 
         // The epilogue: intrinsics point at rows of the arena, read where they lie.
-        let vocab = u32::try_from(logits.width as usize).unwrap_or(u32::MAX);
         let storage_of = |plane: kernels_cuda::Tensor| {
             if plane.dtype == Dtype::F32 {
                 crate::program::launch::INTRINSIC_STORAGE_F32
@@ -938,6 +917,19 @@ impl FireCtx<'_> {
             // denoiser's epilogue reads every latent row's velocity, and a
             // hidden readout every row's state (`Readout::Rows` narrows the
             // logits row list, never these).
+            // Each from the lane's OWN arm (a multi-reading plan's denoise
+            // arm plants velocity, its encoder arm hidden): a lane whose arm
+            // plants none binds none, and a program reading it is refused at
+            // its mint by name.
+            let class = lane_class[lane];
+            let velocity = match self.exports.velocity_for(class) {
+                Some(export) => Some(plane_of(export.value, "velocity")?),
+                None => None,
+            };
+            let hidden = match self.exports.hidden_for(class) {
+                Some(export) => Some(plane_of(export.value, "hidden")?),
+                None => None,
+            };
             if let Some(plane) = velocity {
                 self.programs.bind_intrinsic(
                     attached.instance,
@@ -963,8 +955,13 @@ impl FireCtx<'_> {
             // The logits intrinsic is the out seam's alone: a plan whose
             // readout is a float seam binds none, and a program reading
             // `logits()` against it is refused at its mint by name.
-            if readout_seam != engine::fire::ReadoutSeam::Logits {
-                // Nothing to bind for `logits`.
+            let logits = match lane_planes[lane] {
+                Some((engine::fire::ReadoutSeam::Logits, plane)) => plane,
+                _ => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
+            };
+            let vocab = logits.width;
+            if logits.ptr == 0 {
+                // Nothing to bind for `logits`: this lane's arm plants none.
             } else if consecutive {
                 self.programs.bind_intrinsic(
                     attached.instance,
@@ -1084,8 +1081,7 @@ impl FireCtx<'_> {
         }
 
         Ok(Some(Readback {
-            logits,
-            seam: readout_seam,
+            lanes: lane_planes,
             columns,
             last_row,
             first_row,

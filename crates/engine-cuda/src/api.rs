@@ -1692,7 +1692,12 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
                 width,
                 values,
                 scores,
-                seam: step.settled.seam,
+                seam: step
+                    .settled
+                    .seams
+                    .get(lane)
+                    .copied()
+                    .unwrap_or(engine::fire::ReadoutSeam::Logits),
                 clips: Vec::new(),
             },
         });

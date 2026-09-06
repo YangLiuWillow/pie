@@ -680,9 +680,13 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     )
 }
 
+/// `x *= s`, in place. bf16, f16, or f32 — the last for a lane vector's
+/// chain (a `[Lanes, 1]` timestep scaled before its embedding), where the
+/// scalar is not rounded through the plane's element (`Elem<float>` is the
+/// identity) and the product rounds once at the store.
 pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.mul_scalar";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,

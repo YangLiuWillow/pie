@@ -10,11 +10,11 @@ use super::{Enqueued, Shell};
 /// carve, spent only if somebody asks.
 #[derive(Debug, Clone)]
 pub(crate) struct Readback {
-    /// The readout rectangle: the trunk logits (bf16), or the float seam a
-    /// plan plants instead (`velocity` / `hidden`, bf16 or f32).
-    pub(crate) logits: kernels_cuda::Tensor,
-    /// Which seam that rectangle is.
-    pub(crate) seam: engine::fire::ReadoutSeam,
+    /// Per submitted lane: the seam its rows read back from and that seam's
+    /// rectangle — the trunk logits (bf16), or the float seam the lane's arm
+    /// plants (`velocity` / `hidden`, bf16 or f32); `None` for a lane whose
+    /// answer is its pixels alone.
+    pub(crate) lanes: Vec<Option<(engine::fire::ReadoutSeam, kernels_cuda::Tensor)>>,
     /// One (layer, rectangle) per exported attention column.
     pub(crate) columns: Vec<(u32, kernels_cuda::Tensor)>,
     /// Per submitted lane: its last row.
@@ -50,8 +50,8 @@ pub struct Settled {
     pub rows: Vec<u32>,
     /// Each submitted lane's captured attention mass, empty for a lane that asked for none.
     pub scores: Vec<Vec<LayerScores>>,
-    /// Which export seam [`Settled::logits`] came off.
-    pub seam: engine::fire::ReadoutSeam,
+    /// Per submitted lane, which export seam its [`Settled::logits`] came off.
+    pub seams: Vec<engine::fire::ReadoutSeam>,
     /// Each submitted lane's decoded pixels (D8): one `f32` row per output
     /// voxel of its clips in submission order, beside each clip's output
     /// box. Empty for a lane that submitted no clip.
@@ -134,9 +134,13 @@ impl Shell {
             logits: Vec::new(),
             rows: Vec::new(),
             scores: Vec::new(),
-            seam: readback
-                .as_ref()
-                .map_or(engine::fire::ReadoutSeam::Logits, |readback| readback.seam),
+            seams: readback.as_ref().map_or_else(Vec::new, |readback| {
+                readback
+                    .lanes
+                    .iter()
+                    .map(|lane| lane.map_or(engine::fire::ReadoutSeam::Pixels, |(seam, _)| seam))
+                    .collect()
+            }),
             pixels: Vec::new(),
             readback,
         })
@@ -166,16 +170,21 @@ impl Shell {
             return Ok(());
         };
 
-        let logits = readback.logits;
-        let width = logits.width as usize;
-        // The element the rectangle is stored in: bf16 for logits, bf16 or
-        // f32 for a float seam.
-        let element = if logits.dtype == model_ir::Dtype::F32 { 4 } else { 2 };
         let lanes = readback.last_row.len();
         let mut taken = vec![Vec::new(); lanes];
         let mut counts = vec![0u32; lanes];
-        let mut raw = vec![0u8; width * element];
+        let mut raw = Vec::new();
         for lane in 0..lanes {
+            // This lane's own seam and rectangle; the element it is stored
+            // in is bf16 for logits, bf16 or f32 for a float seam.
+            let logits = readback.lanes[lane].map_or_else(
+                || kernels_cuda::Tensor::new(0, 0, 0, model_ir::Dtype::Bf16),
+                |(_, plane)| plane,
+            );
+            let width = logits.width as usize;
+            let element = if logits.dtype == model_ir::Dtype::F32 { 4 } else { 2 };
+            raw.clear();
+            raw.resize(width * element, 0);
             let owned = readback.lane_rows[lane];
             // A plan with no `out` seam (a VAE decode) has no logits to read.
             if owned == 0 || logits.width == 0 {
