@@ -151,6 +151,8 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="do not delete the temp dir")
     parser.add_argument("--debug-cli", action="store_true",
                         help="drive the debug `pie` (slow: minutes just to load the model)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="mirror the engine's own log, not just the inferlet's output")
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
 
@@ -176,7 +178,10 @@ def main() -> int:
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True,
                           timeout=args.timeout)
     sys.stdout.write(proc.stdout)
-    sys.stderr.write(proc.stderr)
+    # stderr only when something went wrong, or when asked: `pie run` boots a
+    # whole engine and its INFO log buries the three lines that matter.
+    if proc.returncode != 0 or args.verbose:
+        sys.stderr.write(proc.stderr)
     if proc.returncode != 0:
         print(f"❌ `pie run` exited {proc.returncode}")
         return 1
