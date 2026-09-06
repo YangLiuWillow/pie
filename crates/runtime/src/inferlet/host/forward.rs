@@ -1319,7 +1319,13 @@ impl ProcessCtx {
             // (see the float-rows decision below); every other pass ignores
             // this.
             let embed_ids: Option<usize> = {
-                let rep = self.ctx().table.get(&this)?.bindings.embed.map(|e| e.tokens);
+                let rep = self
+                    .ctx()
+                    .table
+                    .get(&this)?
+                    .bindings
+                    .embed
+                    .map(|e| e.tokens);
                 match rep {
                     Some(rep) => {
                         let resource: Resource<Channel> = Resource::new_borrow(rep);
@@ -2099,9 +2105,9 @@ impl ProcessCtx {
                         .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
                         .filter_map(|binding| binding.clip)
                         .collect(),
-                    // A cacheless encoder's ids come off this channel at
-                    // every fire; every other float lane seats zeros.
-                    embed: embed.map(|embed| embed.tokens),
+                    // A cacheless encoder's rows ARE its ids; every other
+                    // float lane seats a rectangle of zeros.
+                    embed: embed.is_some(),
                 }),
                 closed: false,
             };

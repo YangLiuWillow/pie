@@ -639,7 +639,7 @@ def roster() -> list[Gate]:
             name="wan-video",
             wraps=("the_wan_2_vae_answers_the_reference, then the model-agnostic "
                    "text-to-video guest on wan22-ti2v-5b.zt"),
-            expected="decode cos >= 0.999 per chunk and over the clip; a real mp4",
+            expected="decode cos >= 0.999 per chunk and clip (landed 0.999986); a real mp4",
             needs=[(g("wan22", "wan22_vae", "shapes.json"),
                     "python scripts/imagegen/wan22_golden.py --vae"),
                    (a("wan22-ti2v-5b.zt"),

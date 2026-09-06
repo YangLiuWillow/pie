@@ -961,4 +961,3 @@ pub(crate) fn classify_channels(
     }
     classes
 }
-

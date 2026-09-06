@@ -87,6 +87,17 @@ print(",".join(str(i) for i in tok("a red bicycle leaning on a blue wall")["inpu
 # 289,4062,188625,346,291,1350,369,289,15258,21006,1
 ```
 
+### The schedule is the family's FIXED shift
+
+`FlowMatchEuler`'s `rows` argument turns the stated shift into a base `mu`
+and bends it by the latent's row count — a resolution heuristic FLUX and
+Z-Image were trained with. A video family's rows count FRAMES as well as
+pixels, and neither video row in the tree rescales by them (Wan's scheduler
+says `use_dynamic_shifting: false` and its 5.0 IS the shift), so this guest
+passes `None`. Bending by a 1950-row volume instead put nineteen of twenty
+steps above sigma 0.58 and left the last one to do the denoising: it still
+produced a recognisable clip, which is exactly why it is written down.
+
 ## Gate
 
 ```bash

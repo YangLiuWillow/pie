@@ -1,7 +1,7 @@
 //! The float-lane fire path (imagegen design D1/D3): a pass whose reading
-//! declares no KV space and embeds no tokens — a DiT's denoise step, a VAE
-//! tile — fires ONE lane whose rows are its latents port's and whose only
-//! state is its channels. Nothing here is a sequence: no geometry ports,
+//! declares no KV space — a DiT's denoise step, a VAE tile, a CACHELESS
+//! ENCODER — fires ONE lane whose rows are its latents port's (or its ids')
+//! and whose only state is its channels. Nothing here is a sequence: no geometry ports,
 //! no KV grant, no page projection, no recurrent state. What remains of
 //! the ordinary path is kept exactly: the pipeline FIFO and its failure
 //! poisoning, channel wiring, the seat book (a lane is still one of the
@@ -10,7 +10,8 @@
 //! host shadow's advance.
 //!
 //! The lane the engine sees: `tokens` is `rows` zeros (a `Lane`'s row
-//! count is its token count, and the reading's class never embeds them),
+//! count is its token count, and most readings on this path embed none) or,
+//! for a cacheless encoder, the ids themselves,
 //! `kv` is the default (no pages: the shell owns nothing for it), `mask`
 //! is `None`, `readout` is every row (the epilogue reads a velocity or a
 //! hidden row per latent row), and `reading`/`stream`/`group`/`ports` are
@@ -61,7 +62,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     let (
         rows,
         clips,
-        embed_rep,
+        embed_ids,
         lane_facts,
         ws_rep,
         cells,
@@ -89,7 +90,25 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         (
             float.rows,
             float.clips.clone(),
-            float.embed,
+            // A CACHELESS ENCODER's ids: the `embed_tokens` port's value,
+            // resolved the way every other host-known descriptor is (the
+            // container's const payload, or the seed of the channel it
+            // binds). `None` for every other float lane, whose token
+            // rectangle is a formality.
+            float.embed.then(|| {
+                let container = &pass.instance.program.bound.container;
+                let values = pass.instance.channel_values();
+                container
+                    .ports
+                    .iter()
+                    .find(|binding| binding.port == eta_ir::registry::Port::EmbedTokens)
+                    .and_then(|binding| match &binding.source {
+                        eta_ir::container::PortSource::Const { data, .. } => Some(data.clone()),
+                        eta_ir::container::PortSource::Channel(chan) => {
+                            values.get(*chan as usize).cloned().flatten()
+                        }
+                    })
+            }),
             pass.lane.clone(),
             pass.kv_ws,
             pass.cells.clone(),
@@ -127,28 +146,19 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
 
     // A CACHELESS ENCODER's rows ARE its ids, so its token rectangle is the
     // ids themselves; every other float lane seats a rectangle of zeros
-    // whose only job is to give the lane `rows` rows. The ids are read off
-    // the embed channel's committed cell at every fire, not captured at
-    // bind: the same pass may be fired again with another prompt.
-    let tokens: Vec<u32> = match embed_rep {
-        Some(rep) => {
-            let resource: Resource<crate::pipeline::channel::Channel> = Resource::new_borrow(rep);
-            let cell = ctx.resources().get(&resource)?.cell.clone();
-            let ids = {
-                let cell = cell.lock().unwrap();
-                cell.peek_seed().or_else(|_| cell.clone().read())
-            };
-            match ids {
-                Ok(bytes) => bytes
-                    .chunks_exact(4)
-                    .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                    .collect(),
-                Err(error) => {
-                    return Ok(Err(format!(
-                        "pipeline: the cacheless encoder's token channel: {error}"
-                    )));
-                }
-            }
+    // whose only job is to give the lane `rows` rows.
+    let tokens: Vec<u32> = match embed_ids {
+        Some(Some(bytes)) => bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect(),
+        Some(None) => {
+            return Ok(Err(
+                "pipeline: this lane embeds tokens and its `embed_tokens` port binds a \
+                 channel with no host-known value; a cacheless encoder's ids are a seeded \
+                 channel's"
+                    .to_string(),
+            ));
         }
         None => vec![0; rows as usize],
     };

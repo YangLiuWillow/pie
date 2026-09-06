@@ -470,7 +470,11 @@ fn row_of(
     // checkpoint tensor, and `read_expr` reads the stored encoding off one.
     let want = checkpoint_dsl::encoding(w.dtype);
     let row = Expr::concat(0, parts);
-    let row = if want == stored { row } else { row.cast(want.clone()) };
+    let row = if want == stored {
+        row
+    } else {
+        row.cast(want.clone())
+    };
     b.push(checkpoint::contract::TensorContract::new(
         w.name.clone(),
         row,

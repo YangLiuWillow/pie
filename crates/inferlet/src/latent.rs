@@ -42,8 +42,8 @@ use eta_dsl::Tensor;
 pub mod prelude {
     pub use super::{
         DenoiseLoop, FlowMatchEuler, LaneClock, LaneRows, apg, at, cfg_combine, dynamic_shift,
-        encode_ids, encode_ids_rows, encode_text, euler_step, noise, positions_for,
-        positions_grid, rng_state, seed_or_step,
+        encode_ids, encode_ids_rows, encode_text, euler_step, noise, positions_for, positions_grid,
+        rng_state, seed_or_step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -735,14 +735,13 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
             },
         )?;
     }
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(width));
     });
     pass.submit(&pipe)?;
     let rows: Vec<f32> = out.take_host().await?;
     pipe.close();
-    let _ = len;
     Ok((rows, width))
 }
 

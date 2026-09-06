@@ -188,7 +188,11 @@ fn roles() -> Result<Roles> {
         .cloned()
         .ok_or("this model declares no token-less reading with a velocity readout")?;
     if denoise.has_kv {
-        return Err(format!("reading `{}` binds a kv space; a denoise pass binds none", denoise.name).into());
+        return Err(format!(
+            "reading `{}` binds a kv space; a denoise pass binds none",
+            denoise.name
+        )
+        .into());
     }
     // A decode arm lands PIXELS. The encoder lands pixels too — its pixels
     // are its INPUT — and the name is what separates them, in the design's
@@ -393,12 +397,7 @@ fn lane(
 /// the pair are visible: the trunk states the patch and the VAE states the
 /// clip, and nothing between them holds the index algebra.
 #[allow(clippy::too_many_arguments)]
-fn unpatchify(
-    rows: &[f32],
-    grid: [u32; 3],
-    patch: [u32; 3],
-    channels: u32,
-) -> Vec<f32> {
+fn unpatchify(rows: &[f32], grid: [u32; 3], patch: [u32; 3], channels: u32) -> Vec<f32> {
     let (gt, gh, gw) = (grid[0] as usize, grid[1] as usize, grid[2] as usize);
     let (pt, ph, pw) = (patch[0] as usize, patch[1] as usize, patch[2] as usize);
     let c = channels as usize;
@@ -468,7 +467,8 @@ async fn decode_frame(
     let pass = ForwardPass::new();
     pass.reading(&reading.name)?;
     pass.stream(model::LaneStream::Video)?;
-    let cell = Channel::from_shaped([clip_h, clip_w, port.width], clip.to_vec()).named("vae_latent");
+    let cell =
+        Channel::from_shaped([clip_h, clip_w, port.width], clip.to_vec()).named("vae_latent");
     pass.input(&port.name, &cell)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
     let readback = out.clone();
@@ -649,7 +649,16 @@ async fn main(input: Input) -> Result<Output> {
         }
         None => 8,
     };
-    let sched = FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?;
+    // **NO DYNAMIC SHIFT.** `FlowMatchEuler`'s `rows` argument turns the
+    // stated shift into a base `mu` and bends it by the latent's row count
+    // — a resolution heuristic FLUX and Z-Image were trained with. A video
+    // family's rows count FRAMES as well as pixels, and neither video row
+    // in the tree rescales by them (Wan's scheduler says
+    // `use_dynamic_shifting: false`, and its 5.0 is the shift itself), so
+    // bending by 1950 rows would put nineteen of twenty steps above sigma
+    // 0.58 and leave the last one to do the denoising. `None` takes the
+    // stated shift as the fixed one it is.
+    let sched = FlowMatchEuler::from_schedule(&fact, steps, None)?;
 
     // ---- the prompt, through whichever door the caller opened -------------
     let guidance = input.guidance.unwrap_or(1.0);
@@ -675,8 +684,7 @@ async fn main(input: Input) -> Result<Output> {
         }
     };
     let (hidden, hidden_width) = encoded;
-    let prompt_rows =
-        u32::try_from(hidden.len() / hidden_width.max(1) as usize).unwrap_or(0);
+    let prompt_rows = u32::try_from(hidden.len() / hidden_width.max(1) as usize).unwrap_or(0);
     let context = pad_context(hidden, hidden_width, &ports.context)?;
     let context_rows = context.shape().dims()[0];
     let negative = match (&input.negative_prompt_ids, &input.negative_prompt) {
@@ -845,7 +853,12 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     // ---- the decode: one fire per latent frame, in order ------------------
-    let clip = unpatchify(&last, [grid_t, grid_h, grid_w], [pt, ph, pw], space.channels);
+    let clip = unpatchify(
+        &last,
+        [grid_t, grid_h, grid_w],
+        [pt, ph, pw],
+        space.channels,
+    );
     let clip_h = grid_h * ph;
     let clip_w = grid_w * pw;
     let plane = (clip_h * clip_w * space.channels) as usize;

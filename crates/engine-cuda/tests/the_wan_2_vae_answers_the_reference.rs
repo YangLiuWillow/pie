@@ -31,13 +31,18 @@
 //!    last frames forward, which is what `feat_cache` does on the other
 //!    side. Gate: `cos >= 0.999`, `mean |err| <= 0.02` over the whole clip,
 //!    and the SAME gate per chunk, so a fire that read a stale cache says
-//!    which one it was.
+//!    which one it was. MEASURED, 5 latent frames of 30x52 into 17 frames
+//!    of 480x832: cos 0.999986, mean |err| 0.00244, max |err| 0.256, with
+//!    every chunk between 0.999984 and 0.999988 — full pixel parity, mid
+//!    block included (`spatial::attention_over(.., VoxelSegment::Frames(1),
+//!    ..)`), not a decoder-minus-attention.
 //! 2. *The frame caches MATTER.* The later-frames arm is fired a second
 //!    time on a FRESH slot — the same latent frame, the same everything,
 //!    but with every slab zeroed instead of carrying frame `k-1` — and the
 //!    pixels must move by more than the gate's tolerance. If they do not,
 //!    the state rows are not reaching the convolutions and a green cosine
 //!    would be measuring a cacheless decoder that happens to be close.
+//!    MEASURED: cos 0.9807, mean |err| 0.1250 — fifty times the gate.
 //! 3. *The head arm is not the later arm.* Firing the LATER arm on frame 0
 //!    lands four frames, not one; that is not a parity claim, it is the
 //!    claim that the two arms are actually two arms.
@@ -167,7 +172,12 @@ fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
 
 /// The word one lane of `reading` on the video stream carries.
 fn word(reading: u8) -> u64 {
-    Facts::of(&Request::new(1, false).on_stream(Stream::Video).in_reading(reading)).word()
+    Facts::of(
+        &Request::new(1, false)
+            .on_stream(Stream::Video)
+            .in_reading(reading),
+    )
+    .word()
 }
 
 /// The loaded decoder, held across the fires that share its caches.
@@ -259,6 +269,7 @@ fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
             recording: Recording::Off,
             ..Knobs::default()
         },
+        deferred_tier: true,
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),

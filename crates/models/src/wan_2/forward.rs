@@ -32,12 +32,14 @@
 //! **The context is 512 zero-padded rows, attended without a mask.** The
 //! `text` reading answers the prompt's `L` rows; the pipeline truncates
 //! to `L` and zero-pads to 512 (study §C.6), and the transformer attends
-//! every one of the 512 keys. The `context` port takes those 512 rows
-//! as the reference builds them — the guest allocates `[512, 4096]`
-//! zero-filled and writes the `L` real rows in front. (The IR cannot grow
-//! a lane; an SDK `encode_text` helper owning this pad is the follow-up.)
-//! The miniatures' goldens hand a 32-row random context; nothing here
-//! pins 512.
+//! every one of the 512 keys — the pad rows go through `text_embedder`
+//! into a nonzero constant that carries real attention mass, so a context
+//! lane of the prompt's own height is a different model. The IR cannot
+//! grow a lane, so the pad is the GUEST's, and the `context` port STATES
+//! its height (`PortFact::rows = 512`) rather than leaving a guest to
+//! discover it: `inferlet::latent`'s `pad_context` fills it from the fact.
+//! The miniatures' goldens hand a 32-row random context, and those rows
+//! (no encoder) state no height at all.
 //!
 //! **The latent row layout** is `(c, ph, pw)` — `patch_embedding`'s own
 //! `Conv3d` input order — on the way in AND on the way out: `proj_out`'s
@@ -86,11 +88,12 @@
 //! family-blind guest hands the arm the rows the denoise reading answered
 //! and spells no family's numbers.
 //!
-//! The mid block's single-head attention rides `spatial::attention` — the
-//! conv VAE's own arm, one head as wide as the row, stamped at 256/512/1024
-//! and segmenting per CLIP — and per clip is per frame precisely because a
-//! decode fire is one latent frame. `attention.ragged` would not serve it
-//! (stamped at head widths 64/128/256, and its CSR is a token-axis table).
+//! The mid block's single-head attention rides
+//! `spatial::attention_over(.., VoxelSegment::Frames(1), ..)` — the conv
+//! VAE's own arm, one head as wide as the row (1024 here), segmenting PER
+//! FRAME, which is the reshape the reference does. `attention.ragged` would
+//! not serve it (stamped at head widths 64/128/256, and its CSR is a
+//! token-axis table).
 //!
 //! The ENCODER is not traced: its `AvgDown3D` mean over a `(2, 2, 2)`
 //! window has no `Spatial` member, so `vae.encode` is refused by absence
@@ -101,7 +104,7 @@ use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
     Request, RopeForm, Stream, Value, Weight, ops, seam,
 };
-use model_ir::TimePad;
+use model_ir::{TimePad, VoxelSegment};
 
 use crate::{
     AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
@@ -213,7 +216,11 @@ impl Model {
                     width: d.text_dim,
                     streams: vec![Stream::Context],
                     at: None,
-                    rows: Some(CONTEXT_LEN),
+                    // The FLAGSHIP's contract: a row with the umT5 encoder
+                    // pads to 512. A miniature has no encoder and its
+                    // goldens hand a 32-row random context, so it states no
+                    // height and a guest binds what it has.
+                    rows: self.te.as_ref().map(|_| CONTEXT_LEN),
                 },
                 port("timestep", PortKind::LaneVector, 1, &[Stream::Video]),
                 port(
@@ -439,19 +446,6 @@ fn linear(w: &Linear, x: &Value) -> Value {
     ops::elemwise::add_bias(&w.bias, &ops::linear::matmul(x, &w.w))
 }
 
-/// A fresh copy of a lane vector. `elementwise.add_bias` folds its bias IN
-/// PLACE (the IR aliases `out_out` onto `out`), and `timestep_proj` is one
-/// vector the WHOLE STACK shares — `time_proj(silu(temb))` is computed once
-/// per fire and read by all thirty blocks — so a block must add its
-/// `scale_shift_table` to a COPY. Folding into the shared vector instead
-/// leaves block `k` modulating by `timestep_proj + sum(table_0..table_k)`,
-/// which is exact at one block and drifts further with every one after
-/// (the real row read cos 0.274 against diffusers, a miniature two blocks
-/// deep still read 0.9999).
-fn copy_of(v: &Value) -> Value {
-    ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(v, v))
-}
-
 /// The tables the video side's attentions need: the token→lane map, the
 /// rotary coordinates, the video selection's permutation and group CSR.
 struct VideoGeom {
@@ -627,7 +621,17 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     for (_, b) in arm.walk_layers(&dit.blocks) {
         // `scale_shift_table + timestep_proj`, in fp32, per lane — on a
         // COPY of the projection, see `copy_of`.
-        let e = ops::elemwise::add_bias(&b.table, &copy_of(&proj));
+        // `elementwise.add_bias` folds IN PLACE and `timestep_proj` is one
+        // vector the WHOLE STACK shares — `time_proj(silu(temb))` is
+        // computed once a fire and read by all thirty blocks — so a block
+        // adds its `scale_shift_table` to a fresh rectangle. Folding into
+        // the shared vector instead leaves block `k` modulating by
+        // `timestep_proj + sum(table_0..table_k)`: exact at one block, and
+        // drifting further with every one after (the real row read cos
+        // 0.274 against diffusers, a miniature two blocks deep still read
+        // 0.9999). `FoldThenRead` refuses that at trace time now; `copy`
+        // is the fresh rectangle.
+        let e = ops::elemwise::add_bias(&b.table, &ops::elemwise::copy(&proj));
         x = block(&x, &c, b, &e, d, &vg, &cg);
     }
 
@@ -673,17 +677,26 @@ fn resnet(x: &Value, g: &Value, r: &Resnet, arm: &Input<Facts>) -> Value {
 /// every position of ONE FRAME, behind its own RMS norm, with `to_qkv` and
 /// `proj` as 1×1 convs (a matmul on the voxel axis) and a plain residual.
 ///
-/// `spatial::attention` segments by CLIP — every query of a lane attends
-/// every voxel of that lane — and a decode arm's clip is one latent frame,
-/// so per clip is per frame and this is the reference's own attention.
-/// `sm_scale` is `1/√C` (`F.scaled_dot_product_attention`'s default over a
-/// `C`-wide single head), `C` = 1024 on this row, which is a width
-/// `spatial::attention` is stamped at.
+/// `VoxelSegment::Frames(1)` is the segmentation the reference does with a
+/// reshape: every query attends the `h·w` voxels of ITS OWN FRAME and
+/// nothing else, whatever the clip's `t`. Stating it (rather than leaning
+/// on a decode arm's clip being one frame) is what keeps this arm right if
+/// a clip ever carries several. `sm_scale` is `1/√C`
+/// (`F.scaled_dot_product_attention`'s default over a `C`-wide single
+/// head), `C` = 1024 on this row, a width `spatial::attention` is stamped
+/// at.
 fn mid_attention(x: &Value, g: &Value, a: &MidAttention) -> Value {
     let width = u32::try_from(a.proj.w.shape[0]).expect("a VAE row is narrower than 2^32");
     let h = ops::elemwise::rmsnorm(x, &a.norm, VAE_EPS);
     let (q, k, v) = ops::layout::split_qkv(&linear(&a.qkv, &h), width, width);
-    let o = spatial::attention(&q, &k, &v, g, (width as f32).sqrt().recip());
+    let o = spatial::attention_over(
+        &q,
+        &k,
+        &v,
+        g,
+        VoxelSegment::Frames(1),
+        (width as f32).sqrt().recip(),
+    );
     ops::elemwise::add(x, &linear(&a.proj, &o))
 }
 
