@@ -156,6 +156,18 @@ clip table below carries the offsets.
   `GridRule::out_extent`/`apply`/`growth` are the host twins.
 - **Ports and readouts.** `RuntimeInput::Voxels { port, channels }`
   `[Voxels, channels]` f32/bf16 (DSL `Input::voxels(port, channels, dtype)`);
+  a plan may read voxel ports of SEVERAL widths on several arms (Z-Image's
+  `vae.decode` reads 16 channels, its `vae.encode` 3): the CUDA shell reserves
+  the payload at the widest (`voxels::Seat.channels`) and reads a fire's
+  width off its payload (`Seat.widths`, `Tables.channels`, M0: one width a
+  fire), a `RuntimeInput::Voxels` bound at another width panics by name.
+  `models::PortKind::Voxels` / WIT `port-kind.voxels` name the port to a
+  guest: its channel is `[h, w, C]` (a still) or `[t, h, w, C]` (a clip), the
+  shape being the clip's box (`runtime::validate_port_channel`); the readout
+  is `models::ReadoutKind::Pixels` / WIT `readout-kind.pixels`. Every
+  planting of `seam::PIXELS` is its own export (`Exports.pixels`, one per arm
+  with its writer classes) and a fire reads back the planting of the class
+  its clips ran in (`Exports::pixels_for`);
   `Input::grid()`; `RuntimeInput::TokenGrid { p }` `[Clips, 4] i32`
   `{t/pt, h/ph, w/pw, token_row_offset}` (`Input::token_grid(p)`), the token
   side of the patchify pair — a clip's tokens are its lane's token rows, clips
@@ -165,10 +177,26 @@ clip table below carries the offsets.
   TWO values — `seam::at(seam::PIXELS, &[&y, &y_grid])` — so the reader
   slices the plane per clip through the output grid.
 - **Ops** (`model-ir/src/ops/spatial.rs`, DSL `ops::spatial`): `Conv3d { x,
-  grid, w, bias?, k, stride, pad, causal_t, time_pad: TimePad, cache?,
-  y_grid, y }` (bf16 in, fp32 accumulate, one rounding; `w` `[C_out,
-  taps·C_in]` tap-major channel-fastest); `GroupNorm { x, grid, groups,
-  weight, bias, eps, silu, y }` (fp32 Welford per clip per group);
+  grid, w, bias?, k, stride, pad, pad_back, causal_t, time_pad: TimePad,
+  cache?, y_grid, y }` (bf16 in, fp32 accumulate, one rounding; `w` `[C_out,
+  taps·C_in]` tap-major channel-fastest; `pad` is the zero padding IN FRONT
+  of each axis and `pad_back` BEHIND it — equal for a symmetric convolution,
+  `GridRule::Conv` carries both, and only the front pad shifts the kernel's
+  tap window, the back pad reaching it through the output box alone; DSL
+  `Conv::conv2d([3, 3], [2, 2], [0, 0]).pad_back([0, 1, 1])` is diffusers'
+  `Downsample2D`, `F.pad(x, (0, 1, 0, 1))` then a stride-2 3×3);
+  `GroupNorm { x, grid, groups, weight, bias, eps, silu, y }` (fp32 Welford
+  per clip per group); `Attention { q, k, v, grid, sm_scale, y }` — the conv
+  VAE's mid-block attention, ONE head as wide as the row, per clip over every
+  voxel of the clip, `q`/`k`/`v`/`y` all `[rows, C]` bf16 at one type (not
+  `attention.ragged`: that kernel is stamped at head widths 64/128/256 over
+  token-axis CSRs, and a VAE's head is its whole channel row); fp32 scores,
+  online softmax and accumulation, one rounding at the store; kernel
+  `spatial::attention(ctx, q, k, v, grid, sm_scale, &mut y)`
+  (`kernels/spatial/attn.cuh`, `C ∈ {256, 512, 1024}`, a warp-per-four-
+  queries online-softmax walk over the clip's keys, no flash tiling — a VAE
+  attends at its lowest resolution); DSL `spatial::attention(q, k, v, grid,
+  sm_scale)`;
   `UpsampleNearest { x, grid, factor, keep_first_frame, y_grid, y }`;
   `PixelShuffle`/`PixelUnshuffle { x, grid, r, y_grid, y }` (einops
   `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'`); `Patchify { x, grid, p,
@@ -237,7 +265,20 @@ clip table below carries the offsets.
   Tests: `model-dsl/tests/a_conv_decoder_traces_on_the_voxel_axis`,
   `model-compiler/tests/the_third_row_axis_carves_its_own_arena`,
   `model-exec/tests/the_voxel_axis_seriates_its_own_clips`,
-  `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU).
+  `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU),
+  `kernels-cuda/tests/the_spatial_attention_answers_the_cpu_reference` (GPU).
+- **The first real VAE (M1).** `models::z_image::vae` states the FLUX
+  16-channel `AutoencoderKL` as the flagship's `vae.decode` (latent `[h·w, 16]`
+  → pixels `[8h·8w, 3]` in `[-1, 1]`, the `z/scaling + shift` denormalise
+  inside the plan) and `vae.encode` (pixels → the posterior MEAN `[h·w, 16]`,
+  raw; the guest applies `(mean − shift)·scaling`) readings, both on the
+  `pixels` seam; `models/tests/the_z_image_vae_bakes`, and the GPU parity gate
+  `engine-cuda/tests/the_z_image_vae_answers_the_reference` against
+  `scripts/imagegen/zimage_golden.py --vae` (decode cos 0.99998, mean |err|
+  0.0023; encode at the bf16 reference's own distance, cos 0.9997). Known
+  limit: `layout.split_rows` launches its rows on `grid.y` and refuses past
+  65 535 rows, so a voxel-axis text must not split a wide rectangle's
+  columns (the encoder declares the mean's 16 `conv_out` rows instead).
 
 ## 7. How the CUDA engine serves §1–§2 (M0 round 2)
 

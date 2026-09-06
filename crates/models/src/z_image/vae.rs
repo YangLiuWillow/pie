@@ -26,7 +26,8 @@
 //!         · up3(res 256→128, res×2) · GroupNorm+SiLU · conv_out 128→3
 //! encode: conv_in 3→128 · down0(res×2 @128, ↓2) · down1(res 128→256, res, ↓2)
 //!         · down2(res 256→512, res, ↓2) · down3(res×2 @512) · mid
-//!         · GroupNorm+SiLU · conv_out 512→32 = [mean | logvar]
+//!         · GroupNorm+SiLU · conv_out 512→32 = [mean | logvar], of which
+//!         only the mean's 16 output channels are declared and read
 //! res:    x + conv2(silu(gn2(conv1(silu(gn1(x)))))), a 1×1 conv on the
 //!         skip where the width changes
 //! attn:   x + to_out(softmax(q·kᵀ/√512)·v), q/k/v off gn(x), one head
@@ -207,6 +208,10 @@ pub struct Vae {
     /// The `[CHANNELS]` row of [`SHIFT_FACTOR`], in the trunk's dtype — a
     /// weight because the IR has no scalar-add; derived at import.
     pub shift: Weight,
+    /// The encoder's `conv_out` is stored `[2·CHANNELS, 512, 3, 3]` (`[mean
+    /// | logvar]`); the plan declares its first `CHANNELS` output rows only
+    /// (the mean is the latent FLUX and Z-Image take), sliced at import.
+    pub encoder_out_stored: u32,
     pub decoder: Decoder,
     pub encoder: Encoder,
 }
@@ -253,6 +258,7 @@ impl Vae {
         }
         Vae {
             shift: Weight::sym("vae.shift", [u64::from(CHANNELS)], crate::dense(banks)),
+            encoder_out_stored: 2 * CHANNELS,
             decoder: Decoder {
                 conv_in: ConvW::at("vae.dec.conv_in", top, CHANNELS, TAPS3),
                 mid: Mid::at("vae.dec.mid", top, banks),
@@ -265,7 +271,7 @@ impl Vae {
                 down,
                 mid: Mid::at("vae.enc.mid", top, banks),
                 norm_out: Norm::at("vae.enc.norm_out", top),
-                conv_out: ConvW::at("vae.enc.conv_out", 2 * CHANNELS, top, TAPS3),
+                conv_out: ConvW::at("vae.enc.conv_out", CHANNELS, top, TAPS3),
             },
         }
     }
@@ -333,10 +339,10 @@ pub fn encode(arm: &Input<Facts>, vae: &Vae) -> Value {
     }
     h = mid(&h, &grid, &e.mid);
     let h = group_norm(&h, &grid, &e.norm_out, true);
-    let moments = conv3(&h, &grid, &e.conv_out);
-    // `DiagonalGaussianDistribution`: `[mean | logvar]`; the mean is the
-    // latent FLUX and Z-Image take.
-    let (mean, _logvar) = ops::layout::split_rows(&moments, CHANNELS);
+    // `DiagonalGaussianDistribution`'s `[mean | logvar]`, of which the
+    // plan's `conv_out` is the mean's rows alone (the latent FLUX and
+    // Z-Image take; the logvar is never computed).
+    let mean = conv3(&h, &grid, &e.conv_out);
     seam::at(seam::PIXELS, &[&mean, &grid]);
     mean
 }

@@ -423,6 +423,24 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
         if let Expr::Transmute { .. } = &tensor.expr {
             assert!(tensor.name.starts_with("vae."), "`{}`", tensor.name);
         }
+        // The encoder's `conv_out` declares the mean's 16 output rows of the
+        // stored 32: a slice of the transmuted kernel, and of its bias.
+        // (the bias through an internal `.head` step under its root cast).
+        if tensor.name == "vae.enc.conv_out" || tensor.name == "vae.enc.conv_out.bias.head" {
+            assert!(
+                format!("{:?}", tensor.expr).contains("Slice"),
+                "`{}` is sliced down to the mean's rows",
+                tensor.name
+            );
+        }
+        if tensor.name.starts_with("vae.enc.conv_out") {
+            assert_eq!(
+                tensor.shape.as_ref().map(|s| s[0]),
+                Some(16),
+                "`{}`",
+                tensor.name
+            );
+        }
         let ty = resolver
             .infer(&tensor.expr, &tensor.name)
             .unwrap_or_else(|why| panic!("`{}` does not type: {why}", tensor.name));
@@ -438,5 +456,8 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
         .iter()
         .filter(|t| matches!(&t.expr, Expr::Transmute { .. }))
         .count();
-    assert_eq!(transmuted, 62, "every conv kernel, and nothing else");
+    assert_eq!(
+        transmuted, 61,
+        "every conv kernel but the sliced encoder head, and nothing else"
+    );
 }

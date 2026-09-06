@@ -114,6 +114,28 @@ impl Model {
         })
     }
 
+    /// The VAE's contract alone, over a diffusers pipeline name space
+    /// (`vae.` prefix): what a load of the VAE by itself — the parity gate
+    /// `engine-cuda/tests/the_z_image_vae_answers_the_reference` — reads,
+    /// with the same reads the whole-model import states.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Illegible`] for a row with no VAE, or any read's refusal.
+    pub fn import_vae(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        let v = self.vae.as_ref().ok_or_else(|| Error::Illegible {
+            name: "vae".to_string(),
+            detail: "this row declares no VAE".to_string(),
+        })?;
+        let mut b = Builder::new(src, self.tp, platform);
+        vae(&mut b, src, v, Layout::Diffusers)?;
+        Ok(b.build())
+    }
+
     fn import_from(
         &self,
         src: &ztensor::Source,
@@ -286,7 +308,14 @@ fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Resul
     }
     mid_block(b, src, &e.mid, &at("encoder.mid_block")?)?;
     norm(b, &e.norm_out, &at("encoder.conv_norm_out")?)?;
-    conv(b, src, &e.conv_out, &at("encoder.conv_out")?)
+    // `[mean | logvar]` stored; the mean's output rows declared.
+    conv_head(
+        b,
+        src,
+        &e.conv_out,
+        &at("encoder.conv_out")?,
+        v.encoder_out_stored,
+    )
 }
 
 /// `UNetMidBlock2D`: `resnets.0`, `attentions.0`, `resnets.1`.
@@ -339,6 +368,64 @@ fn conv(b: &mut Builder, src: &ztensor::Source, c: &ConvW, stem: &str) -> Result
         Expr::src(&kernel).transmute(TensorType::raw(extents(&c.w), dtype)),
     )?;
     b.read(&c.bias, format!("{stem}.bias"))
+}
+
+/// A `Conv2d` of which the plan declares the FIRST `c.c_out` of `stored`
+/// output channels: the kernel transmuted to `[stored, C_in·kh·kw]` and
+/// sliced down axis 0, the bias sliced the same way, both cast as
+/// [`conv`] casts.
+fn conv_head(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    c: &ConvW,
+    stem: &str,
+    stored: u32,
+) -> Result<(), Error> {
+    let kernel = format!("{stem}.weight");
+    let encoding = stored_encoding(src, &kernel)?;
+    let Encoding::Raw(dtype) = encoding else {
+        return Err(Error::Illegible {
+            name: c.w.name.clone(),
+            detail: format!("`{kernel}` is stored {encoding:?}; a conv kernel is a raw plane"),
+        });
+    };
+    let mut natural = extents(&c.w);
+    natural[0] = i64::from(stored);
+    let rows = i64::from(c.c_out);
+    b.read_expr(
+        &c.w,
+        Expr::src(&kernel)
+            .transmute(TensorType::raw(natural, dtype))
+            .slice(0, 0, rows),
+    )?;
+    // `Cast` is a root-only kernel in the contract algebra (a slice under
+    // it counts its elements off the whole source), so the bias's slice is
+    // its own internal step in the stored dtype and the cast sits over it.
+    let bias = format!("{stem}.bias");
+    let stored = stored_encoding(src, &bias)?;
+    let want = checkpoint_dsl::encoding(c.bias.dtype);
+    let head = format!("{}.head", c.bias.name);
+    b.push(
+        TensorContract::new(
+            head.clone(),
+            Expr::src(&bias).slice(0, 0, rows),
+            extents(&c.bias),
+            stored.clone(),
+        )
+        .internal(),
+    );
+    let expr = if want == stored {
+        Expr::out(head)
+    } else {
+        Expr::out(head).cast(want.clone())
+    };
+    b.push(TensorContract::new(
+        c.bias.name.clone(),
+        expr,
+        extents(&c.bias),
+        want,
+    ));
+    Ok(())
 }
 
 /// A `nn.Linear`: `<stem>.weight` and `<stem>.bias`.

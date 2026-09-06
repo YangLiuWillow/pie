@@ -249,16 +249,18 @@ impl RsSeat<'_> {
                 let in_page = token % page_tokens;
                 let take = (page_tokens - in_page).min(count - done);
                 // The run's page `page` is whatever slot the list names, not `first_page + page`.
-                let page_slot = *pages.get(page as usize).ok_or(crate::error::Fault::Ceiling {
-                    what: "rs buffer pages",
-                    need: u64::from(page) + 1,
-                    have: pages.len() as u64,
-                })?;
+                let page_slot = *pages
+                    .get(page as usize)
+                    .ok_or(crate::error::Fault::Ceiling {
+                        what: "rs buffer pages",
+                        need: u64::from(page) + 1,
+                        have: pages.len() as u64,
+                    })?;
                 let slab = self.buffers.row(plane, page_slot, in_page)?;
-                let rows_at = rows.ptr
-                    + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
-                let bytes = usize::try_from(u64::from(take) * plane.width * elem)
-                    .unwrap_or(usize::MAX);
+                let rows_at =
+                    rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
+                let bytes =
+                    usize::try_from(u64::from(take) * plane.width * elem).unwrap_or(usize::MAX);
                 let (dst, src) = match verb {
                     RsMove::Scatter { .. } => (slab, rows_at),
                     _ => (rows_at, slab),
@@ -495,10 +497,7 @@ impl Standing {
 
     /// How many rows a launch in this region is gridded over, or `None` for the window's own row count — a shifting region takes its classes' rungs capped at the fire's bucket.
     pub(crate) fn rows(&self, span: MaskSpan) -> Option<u32> {
-        let Held::Captured {
-            plane, ceiling, ..
-        } = self.held
-        else {
+        let Held::Captured { plane, ceiling, .. } = self.held else {
             return None;
         };
         assert!(
@@ -658,7 +657,11 @@ impl<'c> Run<'c> {
 
     /// [`Standing`] for any `(region, run)` of this fire, off the same [`Ceilings`] the walk reads, so the ledger and the launch resolve one answer.
     pub(crate) fn standing_at(&self, region: u32, run: u32) -> Standing {
-        self.standing_as(region, run, matches!(self.ceilings.admit(region), Some(Admit::Captured)))
+        self.standing_as(
+            region,
+            run,
+            matches!(self.ceilings.admit(region), Some(Admit::Captured)),
+        )
     }
 
     /// `standing_at` with the captured clause stated by the caller: the grid ledger records every non-island region as captured.
@@ -727,7 +730,6 @@ impl<'c> Run<'c> {
     pub(crate) fn at_region(&self) -> u32 {
         self.place.region.get()
     }
-
 
     /// The FIRE-WIDE rectangle a value names, before any window is applied — what a copy's gather reads from and its scatter writes back to.
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
@@ -835,7 +837,8 @@ impl<'c> Run<'c> {
 
     /// The window the node being dispatched runs over — this region's, cut at the run the walk is on.
     pub(crate) fn window(&self) -> &'c Window {
-        self.windows.at(self.place.region.get(), self.place.run.get())
+        self.windows
+            .at(self.place.region.get(), self.place.run.get())
     }
 
     /// The rows of this window that are actually the node's, for a region answered `Fallback::Grouped`; `None` otherwise — an arm that takes this list must honour it.
@@ -1051,7 +1054,11 @@ impl<'c> Run<'c> {
     }
 
     /// One selection's D2 packing tables, as this fire staged them.
-    pub(crate) fn packing(&self, at: usize, select: model_ir::Selection) -> crate::inputs::PackingHandles {
+    pub(crate) fn packing(
+        &self,
+        at: usize,
+        select: model_ir::Selection,
+    ) -> crate::inputs::PackingHandles {
         self.fire
             .packings
             .iter()
@@ -1175,16 +1182,12 @@ impl<'c> Run<'c> {
             // Bound only when a lane of this fire carried an adapter; a fire none did stages nothing and never dispatches a node that would reach this arm (the correction's window is empty).
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's adapter ids, which no lane of it carried"
-                    )
+                    panic!("value {at} reads this fire's adapter ids, which no lane of it carried")
                 })
             }
             // The second row axis's runtime inputs, bound from what `enqueue` wrote; a fire whose lanes submitted no image binds none of them.
             Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
-                panic!(
-                    "value {at} reads this fire's patch rows, which no lane of it submitted"
-                )
+                panic!("value {at} reads this fire's patch rows, which no lane of it submitted")
             }),
             Def::Input(RuntimeInput::PatchSegments) => {
                 self.fire.patch_segments.unwrap_or_else(|| {
@@ -1194,14 +1197,12 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::PatchRoutes) => {
-                self.fire.patch_routes.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads where this fire's tower rows land, and no lane of it \
+            Def::Input(RuntimeInput::PatchRoutes) => self.fire.patch_routes.unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads where this fire's tower rows land, and no lane of it \
                          submitted an image"
-                    )
-                })
-            }
+                )
+            }),
             Def::Input(RuntimeInput::PatchEmbedRows) => {
                 self.fire.patch_embed_rows.unwrap_or_else(|| {
                     panic!(
@@ -1263,11 +1264,22 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::Voxels { .. }) => self.fire.voxels.unwrap_or_else(|| {
-                panic!("value {at} reads this fire's voxel port, which no lane of it fed")
-            }),
+            Def::Input(RuntimeInput::Voxels { channels, .. }) => {
+                let port = self.fire.voxels.unwrap_or_else(|| {
+                    panic!("value {at} reads this fire's voxel port, which no lane of it fed")
+                });
+                assert_eq!(
+                    port.width, *channels,
+                    "value {at} reads a {channels}-wide voxel port and this fire fed a {}-wide \
+                     one: the clips ran in another reading's class",
+                    port.width
+                );
+                port
+            }
             // The D2 row permutation of one selection: `[Tokens]` i32, fire-wide, staged per fire.
-            Def::Input(RuntimeInput::RowPermutation { select }) => self.packing(at, *select).permutation,
+            Def::Input(RuntimeInput::RowPermutation { select }) => {
+                self.packing(at, *select).permutation
+            }
             // The D3 float ports: rectangles the fire path filled from channel cells.
             Def::Input(RuntimeInput::Latents { port, .. }) => {
                 self.port(at, engine::fire::PortKind::Latents, *port)
@@ -1287,11 +1299,17 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken => return self.fire.lane_of_row,
                     GeomKind::GroupOfLane => {
                         return self.fire.group_of_lane.unwrap_or_else(|| {
-                            panic!("value {at} reads the group table, which this fire staged none of")
+                            panic!(
+                                "value {at} reads the group table, which this fire staged none of"
+                            )
                         });
                     }
-                    GeomKind::GroupIndptr { select } => return self.packing(at, *select).group_indptr,
-                    GeomKind::LaneIndptr { select } => return self.packing(at, *select).lane_indptr,
+                    GeomKind::GroupIndptr { select } => {
+                        return self.packing(at, *select).group_indptr;
+                    }
+                    GeomKind::LaneIndptr { select } => {
+                        return self.packing(at, *select).lane_indptr;
+                    }
                     GeomKind::ReferenceTag { select } => {
                         return self.packing(at, *select).reference_tag;
                     }
@@ -1358,7 +1376,8 @@ impl<'c> Run<'c> {
     /// The FA2 query axis's own reading of the same pairing — boundaries chosen by whether this region moves its own plane. FA2 has no seat offset, so its CSR must count from wherever `q` counts from. Goes over whole, never cut at `lane_offset`.
     pub(crate) fn ragged_q(&self, id: ValueId) -> RaggedTensor {
         let indptr = if self.plane_base() {
-            self.qo_indptr_absolute().unwrap_or_else(|| self.qo_indptr())
+            self.qo_indptr_absolute()
+                .unwrap_or_else(|| self.qo_indptr())
         } else {
             self.qo_indptr()
         };
@@ -1491,7 +1510,13 @@ impl<'c> Run<'c> {
                 slab,
                 table,
                 counts,
-            }) => (self.cut(id, slab), ExpertTable { table, hits: counts }),
+            }) => (
+                self.cut(id, slab),
+                ExpertTable {
+                    table,
+                    hits: counts,
+                },
+            ),
             Some(WeightRow::Planes { .. }) => panic!(
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \
                  does not read one"
@@ -1511,7 +1536,8 @@ impl<'c> Run<'c> {
                     return KvPool {
                         page_indptr: seat.map_or(pool.page_indptr, |seat| seat.page_indptr),
                         page_indices: seat.map_or(pool.page_indices, |seat| seat.page_indices),
-                        last_page_lens: seat.map_or(pool.last_page_lens, |seat| seat.last_page_lens),
+                        last_page_lens: seat
+                            .map_or(pool.last_page_lens, |seat| seat.last_page_lens),
                         row_valid: skip(pool.row_valid, 0, window.rows),
                         ..*pool
                     };
@@ -1727,7 +1753,11 @@ impl<'c> Run<'c> {
             .map(|(_, own)| own.min(standing.pad.bucket))
             .filter(|rows| *rows >= span.rows);
         // A gathered window's twins are re-cut with its lanes: page bounds as a fresh prefix sum, kv lengths in gathered order.
-        let (kv_indptr, kv_len) = match window.gathered.as_ref().and_then(|g| g.spaces.get(*space as usize)) {
+        let (kv_indptr, kv_len) = match window
+            .gathered
+            .as_ref()
+            .and_then(|g| g.spaces.get(*space as usize))
+        {
             Some(gathered) => (
                 gathered.page_indptr_host.as_slice(),
                 gathered.kv_len_host.as_slice(),
@@ -1760,20 +1790,31 @@ impl<'c> Run<'c> {
         };
         let live = Live {
             requests: span.lanes,
-            lane_offset: if standing.plane() { span.lane_offset } else { 0 },
+            lane_offset: if standing.plane() {
+                span.lane_offset
+            } else {
+                0
+            },
             row_offset: if standing.plane() { span.row_offset } else { 0 },
             // What this fire brought; [`Planning::rows`] is the carved twin.
             rows: span.rows,
         };
         // The two channels may part in exactly one direction: a carve is wider than the fire or the same, never narrower.
-        assert!(shape.num_requests >= live.requests, "a carve is never narrower than the fire");
-        assert!(shape.lane_offset >= live.lane_offset, "a carve starts at or before the fire");
         assert!(
-            shape.lane_offset + shape.num_requests >= live.lane_offset + live.requests
+            shape.num_requests >= live.requests,
+            "a carve is never narrower than the fire"
         );
+        assert!(
+            shape.lane_offset >= live.lane_offset,
+            "a carve starts at or before the fire"
+        );
+        assert!(shape.lane_offset + shape.num_requests >= live.lane_offset + live.requests);
         let rows = rows_ceiling.unwrap_or(span.rows);
         // The row axis's half of the same pin: a carve is wider than the fire or the same, never narrower.
-        assert!(rows >= live.rows, "a row carve is never narrower than the fire");
+        assert!(
+            rows >= live.rows,
+            "a row carve is never narrower than the fire"
+        );
         Planning {
             kv_indptr,
             kv_len,
@@ -1849,8 +1890,14 @@ impl<'c> Run<'c> {
                 StructSlot::Prefill(p) => write!(
                     sink,
                     "p{:?}{:?}{:?}{:?}{}{}{}{:?}",
-                    p.info, p.workspace, p.shape, p.window, p.total_tokens, p.causal,
-                    p.graph_capturable, p.mask_indptr
+                    p.info,
+                    p.workspace,
+                    p.shape,
+                    p.window,
+                    p.total_tokens,
+                    p.causal,
+                    p.graph_capturable,
+                    p.mask_indptr
                 ),
                 StructSlot::PrefillSm90(p) => write!(
                     sink,
@@ -1889,14 +1936,17 @@ impl<'c> Run<'c> {
     /// One built slot, whichever kind it holds — for the arm that routes on the kind (prefill's fa2/sm90 fork); the typed accessors below are the single-kind reads.
     pub(crate) fn slot(&self, id: ValueId) -> &StructSlot {
         let at = self.struct_at(id);
-        self.structs[at].as_ref().map(|(_, slot)| slot).unwrap_or_else(|| {
-            panic!(
-                "value {} holds no plan payload for run {} of its window; its plan \
+        self.structs[at]
+            .as_ref()
+            .map(|(_, slot)| slot)
+            .unwrap_or_else(|| {
+                panic!(
+                    "value {} holds no plan payload for run {} of its window; its plan \
                  op has not fired, and the prepare phase runs first",
-                id.0,
-                self.place.run.get(),
-            )
-        })
+                    id.0,
+                    self.place.run.get(),
+                )
+            })
     }
 
     /// The decode plan a consuming arm names.

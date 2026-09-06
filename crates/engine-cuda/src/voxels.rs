@@ -29,15 +29,20 @@ use kernels_cuda::Tensor;
 
 /// The voxel axis's reservation, or `None` for a load whose plan states no
 /// voxel row.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Seat {
     /// Most port voxel rows one fire may carry (`VoxelLadder::max_voxels`).
     pub rows: u64,
     /// Most clips one fire may carry (`VoxelLadder::max_clips`).
     pub clips: u64,
-    /// The port's channel count, or `0` for a plan that reads no voxel
-    /// port (a decoder fed by `spatial.unpatchify` from tokens).
+    /// The widest voxel port the plan reads (what the payload rectangle is
+    /// reserved at), or `0` for a plan that reads no voxel port (a decoder
+    /// fed by `spatial.unpatchify` from tokens).
     pub channels: u32,
+    /// Every voxel port width the plan reads, ascending — one per reading
+    /// that takes a clip (a VAE's decoder reads 16 channels, its encoder
+    /// 3). A fire's payload is at one of them (M0: one voxel class a fire).
+    pub widths: Vec<u32>,
     /// The port's element.
     pub dtype: Dtype,
     /// The patch a `RuntimeInput::TokenGrid` reader states, or `None` for
@@ -46,9 +51,14 @@ pub struct Seat {
 }
 
 impl Seat {
-    /// One port row's bytes.
+    /// One port element's bytes.
+    fn elem_bytes(&self) -> u64 {
+        model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+    }
+
+    /// One port row's bytes at the widest port.
     fn row_bytes(&self) -> u64 {
-        u64::from(self.channels) * model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+        u64::from(self.channels) * self.elem_bytes()
     }
 
     /// The seat a plan states, against a ladder: the ceilings are the
@@ -56,6 +66,7 @@ impl Seat {
     #[must_use]
     pub fn of(trace: &model_ir::Trace, ladder: &VoxelLadder) -> Seat {
         let mut channels = 0u32;
+        let mut widths: Vec<u32> = Vec::new();
         let mut dtype = Dtype::Bf16;
         let mut token_patch = None;
         for decl in &trace.values {
@@ -65,6 +76,9 @@ impl Seat {
                     model_ir::Ty::Tensor { dtype: d, .. },
                 ) => {
                     channels = channels.max(*c);
+                    if !widths.contains(c) {
+                        widths.push(*c);
+                    }
                     dtype = *d;
                 }
                 (model_ir::Def::Input(model_ir::RuntimeInput::TokenGrid { p }), _) => {
@@ -73,10 +87,12 @@ impl Seat {
                 _ => {}
             }
         }
+        widths.sort_unstable();
         Seat {
             rows: u64::from(ladder.max_voxels),
             clips: u64::from(ladder.max_clips),
             channels,
+            widths,
             dtype,
             token_patch,
         }
@@ -143,6 +159,10 @@ pub struct Tables {
     pub token_grid: Vec<i32>,
     /// The port payload, clips in fire order.
     pub payload: Vec<u8>,
+    /// The port width the payload's rows are at — one of the seat's
+    /// `widths`, the one this fire's reading takes; `0` for a fire that
+    /// fed no voxel port.
+    pub channels: u32,
     /// The recurrent slot of each clip's lane, in fire order.
     pub slots: Vec<i32>,
 }
@@ -156,8 +176,9 @@ impl Tables {
     /// # Errors
     ///
     /// [`Fault::VoxelPayload`] for a payload whose bytes are not `Σ t·h·w`
-    /// port rows, a clip box that does not divide by the token patch, or a
-    /// lane whose token rows are not its clips' token count.
+    /// port rows at a width the plan reads (or two lanes at two widths), a
+    /// clip box that does not divide by the token patch, or a lane whose
+    /// token rows are not its clips' token count.
     pub fn of(
         seat: &Seat,
         lanes: &[LaneRow],
@@ -166,7 +187,41 @@ impl Tables {
     ) -> Result<Tables> {
         let clips_total: usize = lanes.iter().map(|lane| lane.clips as usize).sum();
         let voxels_total: usize = lanes.iter().map(|lane| lane.voxels as usize).sum();
-        let row_bytes = seat.row_bytes() as usize;
+        // The payload's width is read off the first lane that fed one and
+        // must be a width the plan reads; every other lane agrees with it.
+        let elem = seat.elem_bytes() as usize;
+        let mut channels = 0u32;
+        if seat.channels > 0 {
+            for lane in lanes {
+                let Some(shot) = of_lane.get(lane.source as usize).copied().flatten() else {
+                    continue;
+                };
+                let voxels = shot.voxels() as usize;
+                let per_row = shot.payload.len().checked_div(voxels).unwrap_or(0);
+                let width = u32::try_from(per_row / elem.max(1)).unwrap_or(u32::MAX);
+                if elem == 0
+                    || voxels == 0
+                    || per_row * voxels != shot.payload.len()
+                    || per_row % elem != 0
+                    || !seat.widths.contains(&width)
+                {
+                    return Err(Fault::VoxelPayload {
+                        lane: lane.source,
+                        what: "the payload is not one port row per voxel of the clips at a \
+                               width the plan reads",
+                    });
+                }
+                if channels != 0 && channels != width {
+                    return Err(Fault::VoxelPayload {
+                        lane: lane.source,
+                        what: "two lanes fed voxel ports of two widths in one fire (M0: one \
+                               voxel class per fire)",
+                    });
+                }
+                channels = width;
+            }
+        }
+        let row_bytes = channels as usize * elem;
         let mut grid = vec![0i32; clips_total * 4];
         let mut token_grid = if seat.token_patch.is_some() {
             vec![0i32; clips_total * 4]
@@ -186,12 +241,6 @@ impl Tables {
                 });
             }
             let need = shot.voxels() as usize * row_bytes;
-            if seat.channels > 0 && shot.payload.len() != need {
-                return Err(Fault::VoxelPayload {
-                    lane: lane.source,
-                    what: "the payload is not one port row per voxel of the clips",
-                });
-            }
             if seat.channels > 0 {
                 let at = lane.voxel_offset as usize * row_bytes;
                 payload[at..at + need].copy_from_slice(shot.payload);
@@ -234,6 +283,7 @@ impl Tables {
             grid,
             token_grid,
             payload,
+            channels,
             slots,
         })
     }
@@ -270,7 +320,7 @@ impl Store {
     /// The seat this store was reserved at.
     #[must_use]
     pub fn seat(&self) -> Seat {
-        self.seat
+        self.seat.clone()
     }
 
     /// Bytes the reservation holds.
@@ -296,7 +346,7 @@ impl Store {
             });
         }
         let rows = (tables.payload.len() as u64)
-            .checked_div(self.seat.row_bytes())
+            .checked_div(u64::from(tables.channels) * self.seat.elem_bytes())
             .unwrap_or(0);
         if rows > self.seat.rows {
             return Err(Fault::Ceiling {
@@ -321,11 +371,11 @@ impl Store {
             grid: Tensor::new(base + self.grid, clips as u32, 4, Dtype::I32),
             token_grid: (!tables.token_grid.is_empty())
                 .then(|| Tensor::new(base + self.token_grid, clips as u32, 4, Dtype::I32)),
-            voxels: (self.seat.channels > 0).then(|| {
+            voxels: (tables.channels > 0).then(|| {
                 Tensor::new(
                     base + self.payload,
                     rows as u32,
-                    self.seat.channels,
+                    tables.channels,
                     self.seat.dtype,
                 )
             }),
