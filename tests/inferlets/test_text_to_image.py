@@ -213,6 +213,18 @@ def a_prompt_becomes_a_latent_a_vae_can_decode(args) -> None:
     # exploded one is the loop having gone wrong in a way the shape hides.
     assert 0.05 < report["std"] < 20.0, f"the final latent's scale is {report['std']}"
 
+    # THE DECODED EXIT (design D8/D11). A model that declares a `vae.decode`
+    # reading fires it in-guest and sends a PNG the runtime encoded: there is
+    # no latent blob, no sidecar and nothing for `decode_latent.py` to do,
+    # because the picture is already a picture.
+    if report.get("decoded"):
+        png = out_dir / report["file"]
+        assert png.exists(), f"the report says it sent {report['file']} and {out_dir} has it not"
+        how = check_png(png, args.size, args.size)
+        print(f"[OK] {png}  {png.stat().st_size:,} bytes  (checked by {how}) "
+              f"-- decoded in-guest by reading `{report['decode_reading']}`")
+        return
+
     # `send-file` carries no name, so `pie run -o` numbers what arrives; the
     # report says what that one file is.
     blobs = sorted(out_dir.glob("file-*.bin"))

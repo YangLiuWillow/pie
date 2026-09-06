@@ -49,15 +49,18 @@
 //!
 //! Two exits, and which one a model gets is its own fact.
 //!
-//! The intended one is D11: a `vae.decode` reading, whose pixels land in a
-//! host-held `frames` handle that `session::send_frames` encodes and
-//! streams to the client without ever entering linear memory. `z_image`
-//! declares that reading now — a `Voxels` port and a `Pixels` readout —
-//! but the two guest verbs it would take, a channel-fed voxel port and a
-//! `pixels()` intrinsic to read the seam back with, are not in the SDK
-//! yet. So this program NOTES the reading in its report and takes the
-//! other exit; the day those verbs land, the branch marked in `main` is
-//! the one place that changes.
+//! The intended one is D11, and it is wired: a model that declares a
+//! `vae.decode` reading — a `Voxels` port and a `Pixels` readout — gets its
+//! final latent unpatchified into the clip that port takes, fired on the
+//! voxel axis, and read back off the `pixels` seam with
+//! `intrinsics::pixels()`. `Channel::take_frames` turns that channel's cell
+//! into a host-held `frames` handle and `session::send_frames` encodes and
+//! streams it to the client, so the picture never enters linear memory.
+//!
+//! A model whose VAE is TRACED but not declared as a reading (FLUX.2 today:
+//! its decoder's mid-block attention has no kernel arm, so its pixels would
+//! not be the reference's) still takes the second exit, and the report says
+//! which reading it saw.
 //!
 //! The exit every model has today is the second: the final latent as raw
 //! little-endian f32 through `session::send_file`, with the geometry a
@@ -137,8 +140,9 @@ struct Output {
     /// reading) or the latent went out raw.
     decoded: bool,
     /// The decode reading this model declares, if any. Present with
-    /// `decoded: false` means the model HAS a decoder and this guest could
-    /// not drive it yet (see the branch's note).
+    /// `decoded: false` means the model states a pixels reading this run
+    /// could not drive — no voxel port to hand the clip to, or a latent the
+    /// loop left non-finite.
     decode_reading: Option<String>,
     /// The name the client should give what was sent.
     file: String,
@@ -389,6 +393,102 @@ fn lane(
     Ok(Lane { pass, held })
 }
 
+/// Unpatchify a denoise reading's final latent into the clip a `vae.decode`
+/// port takes: `[rows, C·ph·pw]` in `(c, ph, pw)` feature order becomes
+/// `[grid_h·ph, grid_w·pw, C]` row-major, which is the `[h, w, C]` shape a
+/// `Voxels` port channel declares (design D8).
+///
+/// The inverse of the patchify every DiT does at its embed, written out
+/// rather than called, because the guest is the only place both halves of
+/// the pair are visible: the trunk states the patch and the VAE states the
+/// clip, and nothing between them holds the index algebra.
+fn unpatchify(
+    rows: &[f32],
+    grid_h: u32,
+    grid_w: u32,
+    patch_h: u32,
+    patch_w: u32,
+    channels: u32,
+) -> Vec<f32> {
+    let (gh, gw) = (grid_h as usize, grid_w as usize);
+    let (ph, pw) = (patch_h as usize, patch_w as usize);
+    let c = channels as usize;
+    let (h, w) = (gh * ph, gw * pw);
+    let row_width = c * ph * pw;
+    let mut out = vec![0f32; h * w * c];
+    for a in 0..gh {
+        for b in 0..gw {
+            let row = (a * gw + b) * row_width;
+            for ci in 0..c {
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let src = row + ci * ph * pw + y * pw + x;
+                        let dst = (((a * ph + y) * w) + (b * pw + x)) * c + ci;
+                        out[dst] = rows[src];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fire the family's `vae.decode` reading over one clip and hand the pixels
+/// straight to the host's encoders (design D8 into D11).
+///
+/// The latent goes in as the port's CHANNEL — whose shape IS the clip's box,
+/// so the geometry the voxel axis needs travels with the numbers — and the
+/// answer comes back on the `pixels` seam, which the epilogue reads with
+/// `intrinsics::pixels()` and puts on one channel. `Channel::take_frames`
+/// turns that channel's cell into a `frames` handle host-side, so the picture
+/// never enters this module's address space on its way to the client.
+async fn decode_to_frames(
+    reading: &model::ReadingFact,
+    latent: &[f32],
+    clip_h: u32,
+    clip_w: u32,
+    pixel_h: u32,
+    pixel_w: u32,
+    pipe: &Pipeline,
+) -> Result<inferlet::frames::Frames> {
+    let port = reading
+        .ports
+        .iter()
+        .find(|p| p.kind == model::PortKind::Voxels)
+        .ok_or_else(|| {
+            format!(
+                "reading `{}` lands pixels but reads no voxel port; there is no clip to hand it",
+                reading.name
+            )
+        })?;
+    let want = (clip_h as usize) * (clip_w as usize) * (port.width as usize);
+    if latent.len() != want {
+        return Err(format!(
+            "the unpatchified latent is {} numbers and port `{}` wants {clip_h}x{clip_w}x{} \
+             = {want}",
+            latent.len(),
+            port.name,
+            port.width
+        )
+        .into());
+    }
+    let rows = pixel_h * pixel_w;
+    let width = reading.readout_width;
+    let pass = ForwardPass::new();
+    pass.reading(&reading.name)?;
+    pass.stream(model::LaneStream::Image)?;
+    let clip = Channel::from_shaped([clip_h, clip_w, port.width], latent).named("vae_latent");
+    pass.input(&port.name, &clip)?;
+    let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
+    let readback = out.clone();
+    pass.epilogue(move || {
+        readback.put(intrinsics::pixels(rows, width));
+    });
+    pass.submit(pipe).context("the vae.decode lane")?;
+    out.take_frames(pixel_w, pixel_h, 1, 0.0)
+        .map_err(Into::into)
+}
+
 /// One prompt's two lanes: the encoder rows and the latent they condition.
 struct Branch {
     context: Lane,
@@ -624,23 +724,60 @@ async fn main(input: Input) -> Result<Output> {
     let var = last.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
     let name = input.out.unwrap_or_else(|| "image".to_string());
     // THE DECODE BRANCH IS A BRANCH, NOT A REFUSAL. A model that declares a
-    // `vae.decode` reading with a voxel port and a pixels readout is one
-    // `frames` handle away from D11's exit — the pixels encoded host-side
-    // and streamed to the client without ever entering linear memory. What
-    // is not in the guest surface yet is the pair that would drive it: a
-    // channel-fed `Voxels` port and a `pixels()` intrinsic to read the seam
-    // back with. Until both land, this reports the reading it saw and takes
-    // the latent exit, so a row that grows a decoder keeps working and the
-    // report says exactly what is missing.
+    // `vae.decode` reading with a voxel port and a pixels readout gets D11's
+    // exit: the latent is unpatchified into the clip the port takes, the
+    // reading fires on the voxel axis, and the pixels go from the `pixels`
+    // seam into the host's PNG encoder without ever entering linear memory.
+    // A model that declares no such reading — because its VAE is traced but
+    // not stated as a reading, or because it has none — takes the latent
+    // exit as before, and the report says which reading it saw.
     let decode_reading = roles.decode.as_ref().map(|r| r.name.clone());
-    let (file, decoded, bytes) = {
-        let mut bytes = Vec::with_capacity(last.len() * 4);
-        for value in &last {
-            bytes.extend_from_slice(&value.to_le_bytes());
+    let (file, decoded, bytes) = match roles.decode.as_ref() {
+        Some(reading)
+            if reading
+                .ports
+                .iter()
+                .any(|p| p.kind == model::PortKind::Voxels)
+                && last.iter().all(|v| v.is_finite()) =>
+        {
+            let clip = unpatchify(
+                &last,
+                grid_h,
+                grid_w,
+                space.patch_h.max(1),
+                space.patch_w.max(1),
+                space.channels,
+            );
+            // A pipeline of its own: the denoise loop's are closed, and a
+            // VAE tile is one fire that shares nothing with them.
+            let vae_pipe = Pipeline::new();
+            let handle = decode_to_frames(
+                reading,
+                &clip,
+                grid_h * space.patch_h.max(1),
+                grid_w * space.patch_w.max(1),
+                height,
+                width,
+                &vae_pipe,
+            )
+            .await?;
+            vae_pipe.close();
+            let png = format!("{name}.png");
+            inferlet::session::send_frames(&handle, inferlet::frames::ImageFormat::Png, &png)
+                .map_err(|why| format!("session.send-frames: {why}"))?;
+            // The bytes never crossed, so there is no length to report; the
+            // picture's size is what the client got.
+            (png, true, 0)
         }
-        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        inferlet::session::send_file(&bytes);
-        (format!("{name}.latent.f32"), false, len)
+        _ => {
+            let mut bytes = Vec::with_capacity(last.len() * 4);
+            for value in &last {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            inferlet::session::send_file(&bytes);
+            (format!("{name}.latent.f32"), false, len)
+        }
     };
 
     Ok(Output {
