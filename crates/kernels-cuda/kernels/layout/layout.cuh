@@ -413,4 +413,60 @@ __global__ void scatter_rows(
     }
 }
 
+
+/// **THE SAME PERMUTATION, SEATED** (`.wiki/imagegen/design.md` D6's
+/// neighbours: a DiT packs `[text ‖ image ‖ refs]` into one joint sequence
+/// and unpacks the answer back into the streams it came from).
+///
+/// `pack_rows` is `o[i] = x[perm[i]]` and `unpack_rows` is `o[perm[i]] =
+/// x[i]` — the pair `gather_rows`/`scatter_rows` above already spells, with
+/// one difference that matters: these two are TRACED OPS over token rows, so
+/// they read the staged-geometry seat and the fallback copy does not. A
+/// `Fallback::Copy` moves a window the host cut; these move rows a graph
+/// body's replay must retire past `win[0]`.
+///
+/// `perm` is a row plane in the same frame as the launch's rows, so it moves
+/// with `win[1]`; the ROW IT NAMES is absolute, an index into the other
+/// rectangle, and never shifted.
+///
+/// `U` is a copy unit and never a number, exactly as above: no arithmetic, no
+/// dtype, so any element type moves unrounded.
+template <class U>
+__global__ void pack_rows(
+    const U* __restrict__ x,
+    const i32* __restrict__ perm,
+    U* __restrict__ o,
+    int units,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const U* src = x + static_cast<long long>(perm[row]) * units;
+    U* dst = o + static_cast<long long>(row) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
+template <class U>
+__global__ void unpack_rows(
+    const U* __restrict__ x,
+    const i32* __restrict__ perm,
+    U* __restrict__ o,
+    int units,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const U* src = x + static_cast<long long>(row) * units;
+    U* dst = o + static_cast<long long>(perm[row]) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
 }

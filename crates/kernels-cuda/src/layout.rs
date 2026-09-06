@@ -464,3 +464,95 @@ pub fn scatter_rows(
         [tight, *wide, index],
     )
 }
+
+/// The two seated halves of a row permutation, which differ only in which
+/// side of the copy the map indexes — so they are one body, and the pair
+/// cannot drift into a pack and an unpack that disagree about what the
+/// permutation means.
+fn permute_rows(
+    ctx: &Ctx,
+    op: &'static str,
+    entry: &str,
+    x: Tensor,
+    perm: Tensor,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    if perm.dtype != Dtype::I32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the permutation is {:?}, and a row map is i32 — one row named per moved row",
+                perm.dtype
+            ),
+        ));
+    }
+    let rows = nonzero(op, "rows to move", o.rows)?;
+    if perm.elements() < u64::from(rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "the permutation is {} x {} and this launch moves {rows} rows",
+                perm.rows, perm.width
+            ),
+        ));
+    }
+    if x.dtype != o.dtype || x.width != o.width {
+        return Err(refuse(
+            op,
+            format!(
+                "the source rectangle is {} x {:?} and the destination {} x {:?}; a row \
+                 permutation does not reshape",
+                x.width, x.dtype, o.width, o.dtype
+            ),
+        ));
+    }
+    let bytes = row_bytes(op, *o)?;
+    let (unit, width) = unit(bytes, x.ptr, o.ptr);
+    let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{unit}>")))
+            .apply(route_rows(rows, per_row)),
+        &[
+            x.arg(),
+            perm.arg(),
+            o.arg(),
+            stated(op, per_row)?.arg(),
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
+            ctx.stage(),
+        ],
+    )
+}
+
+/// Pack: `o[i] = x[perm[i]]`. The joint sequence a DiT attends over, laid
+/// down out of the streams it is built from.
+///
+/// Any element type whose row has a byte size moves: the kernel is a copy
+/// unit and no arithmetic, so nothing is rounded or promoted on the way. The
+/// unit is the widest of 16, 4 and 1 bytes the row's width and both addresses
+/// admit — a row that is a whole number of 16-byte units on aligned planes
+/// moves as `int4`.
+///
+/// The seated twin of [`gather_rows`], which serves the host's own window
+/// copies and reads no seat.
+///
+/// # Errors
+///
+/// [`Error::DtypeUnsupported`] for a packed element with no byte size, and a
+/// refusal for a permutation that is not one i32 per moved row, a rectangle
+/// that does not match the one beside it, or a zero-row launch.
+pub fn pack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    permute_rows(ctx, "layout.pack_rows", "pack_rows", x, perm, o)
+}
+
+/// Unpack: `o[perm[i]] = x[i]` — [`pack_rows`]'s map read the other way, so
+/// the pair round-trips a rectangle exactly. Rows the permutation does not
+/// name are not written.
+///
+/// # Errors
+///
+/// As [`pack_rows`].
+pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    permute_rows(ctx, "layout.unpack_rows", "unpack_rows", x, perm, o)
+}
