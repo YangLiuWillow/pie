@@ -248,14 +248,28 @@ interface model {
     // `boundary` is the sigma a two-backbone family hands over at (`none`
     // for one backbone), `pinned-sigmas` a distilled model's fixed sigma
     // list, descending, without the final 0 (empty when the guest builds
-    // its own). The SDK's `latent::FlowMatchEuler` is built from this.
+    // its own), and `stream-shifts` names the per-modality shifts of a
+    // family that runs several schedules at once. The SDK's
+    // `latent::FlowMatchEuler` is built from this.
     // `none` when no reading denoises.
+    record stream-shift {
+        // `stream` is a WIT keyword, so the lane's stream is spelled `lane`.
+        lane: lane-stream,
+        shift: f32,
+    }
+
     record schedule-fact {
         kind: schedule-kind,
         shift: f32,
         train-steps: u32,
         boundary: option<f32>,
         pinned-sigmas: list<f32>,
+        // The shift each STREAM's own sigma grid is built at, for a family
+        // whose modalities advance on different schedules inside ONE
+        // evaluation (MiniMax H3 runs video at 12 and audio at 3). Empty
+        // when `shift` serves every lane, which is every other family; a
+        // stream absent from the list takes `shift`.
+        stream-shifts: list<stream-shift>,
     }
     schedule: func() -> option<schedule-fact>;
 

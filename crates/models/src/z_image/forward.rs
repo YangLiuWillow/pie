@@ -285,6 +285,8 @@ impl Model {
                 train_steps: TRAIN_STEPS,
                 boundary: None,
                 pinned_sigmas: turbo_sigmas(self.shift),
+                // One backbone, one schedule: every lane takes `shift`.
+                stream_shifts: vec![],
             }),
             // 2048² at 16 px per row is 16 384 image rows, plus the widest
             // caption; the miniature's reference grid is 8 × 8.

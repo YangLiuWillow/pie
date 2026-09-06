@@ -49,6 +49,7 @@ members = [
     "zimage-vae-parity",
     "wan2-parity",
     "flux2-klein-parity",
+    "h3-parity",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",

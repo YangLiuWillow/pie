@@ -16,6 +16,10 @@ scripts/imagegen/
   zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
+  h3_golden.py        M5  MiniMax H3 miniature forward (vendored reference)
+  h3_parity.py        M5  drives pie's `minimax-h3-mini` row against it
+  vendor/minimax_h3/      a dependency-free transcription of H3's DiT --
+                          sglang's own package cannot be imported here
   golden_common.py        shared tap/hook/manifest plumbing
   compare.py              npz-vs-npz diff with tolerance gates
 ```
@@ -553,6 +557,62 @@ Both on latent `[1,16,5,16,16]` → S = 320 tokens, context `[1,32,64]`.
 | `wan22_mini_nano.safetensors` | 380,704 | `743e316070fbbf918e556b9e43d92b97` |
 | `wan22_mini_d128.safetensors` | 8,914,648 | `5707cde610525dbcec5ca1c95f21ec16` |
 | `wan22_mini_config.json` | 11,474 | `aab5a938c58f7864cbe2a03fe69bf47d` |
+
+### `h3_golden.py` → `/root/.cache/pie-imagegen/golden/minimax_h3/`
+
+**Miniature only, and the reference is VENDORED.** `sglang.multimodal_gen`
+cannot be imported in this checkout (its `__init__` pulls in starlette and the
+rest of the serving stack), so `vendor/minimax_h3/modeling.py` transcribes the
+eager arithmetic of `runtime/models/dits/minimax_h3.py` from sglang commit
+`6cee9285a3dd43e1f0270818aef7bf01a0568863`, class by class, with the upstream
+line numbers in its header. Only eager branches are kept: no TP, no
+quantization, no fused kernels, no adaLN cache, no sparse attention.
+
+`--mini` builds the study's §D.3 configuration (2 blocks, 1 refiner, dim 128,
+2 heads x 64, ffn 256, text_dim 64, 8 rope frequencies → 48 of 64 rotated;
+863,048 params) over a 21-row packed sequence: 3 text rows, 8 video rows
+(a 2 x 4 x 4 latent under the (1,2,2) patch), 6 audio rows (3 ticks, stereo,
+channel-major) and 4 keyframe rows. The four unique timesteps are
+`[0.35, 0.999, 0.62, 1.0]` — video, the pinned visual condition, audio, and the
+ref2va audio-reference slot nothing in FL2VA claims.
+
+It also **checks** the claim `crates/models/src/minimax_h3/forward.rs` makes
+about the packed row order: pie's `[text | video | audio | reference]` (lanes by
+stream code) and the reference's `[text | refs | audio | video]` answer at
+cos 1.0, because the joint attention is unmasked and every row's rotary
+coordinates travel with it.
+
+The checkpoint it writes uses the OFFICIAL tensor spellings — `qkv_proj`
+re-interleaved per head — so pie's import runs the same de-interleave the 66 GB
+flagship needs.
+
+Keys: `mini.in.{text_hidden,refined_text,video_rows,audio_rows,reference_rows,
+positions,token_tags,inverse_indices,unique_timesteps}`,
+`mini.out.{video,audio}`.
+
+### The pie side — `h3_parity.py`
+
+```bash
+python h3_golden.py --mini
+pie model import <dir with h3_mini.safetensors> --sku minimax-h3-mini-bf16-kv-bf16
+python h3_parity.py all --out /tmp/h3-parity --config ~/.pie/config.h3-mini.toml
+```
+
+The guest (`tests/inferlets/h3-parity`) runs the `refine` pass (the text lane
+alone) and then one `denoise` step of FOUR lanes in one attention group — text,
+video, audio, reference — one pipeline each, one timestep cell per pass. Use a
+PRIVATE config with its own `[server] port` and an `[engine] max_model_len` at
+least the packed row count times the submit depth.
+
+Measured (fp32 reference vs pie's bf16 trunk, one denoise step on one GPU):
+
+| tensor | shape | max-abs | rel | cos |
+|---|---|---:|---:|---:|
+| `mini.out.refined_text` | (3, 128) | 0.00025 | 0.0039 | 0.99999254 |
+| `mini.out.video` | (8, 96) | 0.00025 | 0.0027 | 0.99999653 |
+| `mini.out.audio` | (6, 32) | 0.00020 | 0.0025 | 0.99999699 |
+
+Gate: `--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`.
 
 ---
 
