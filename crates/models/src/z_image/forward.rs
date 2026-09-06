@@ -5,9 +5,13 @@
 //! |---|---|---|---|
 //! | `text` | one, `Text` | `embed(ids)`, `attention(kv)` | `hidden` `[L, 2560]`: Qwen3 layer −2 |
 //! | `refine` | one, `Context` | `caption` `[L32, 2560]`, `pad` `[L32, 1]`, `positions` `[L32, 3]` | `hidden` `[L32, 3840]`: the refined caption |
-//! | `denoise` | `Image` + `Context`, one group | image: `latents` `[N32, 64]`, `pad` `[N32, 1]`, `positions`, `timestep`; context: `context` `[L32, 3840]`, `positions`, `timestep` | `velocity` `[N32, 64]` on the image lane |
+//! | `denoise` | `Image` + `Context`, one group | image: `pad` `[N32, 1]`, `latents` `[N32, 64]`, `positions`, `timestep`; context: `context` `[L32, 3840]`, `positions`, `timestep` | `velocity` `[N32, 64]` on the image lane |
 //! | `vae.decode` | one, `Image`, one clip `{1, h, w}` | `latent` `[h·w, 16]` on the voxel axis | `pixels` `[8h·8w, 3]` in `[-1, 1]` |
 //! | `vae.encode` | one, `Image`, one clip `{1, H, W}` | `pixels` `[H·W, 3]` on the voxel axis | `pixels` `[H/8·W/8, 16]`: the posterior mean |
+//!
+//! (Port ORDER within a reading is load-bearing — an index is a port's
+//! position among its kind — and `(kind, index)` is seated once per plan
+//! at one width; `super::model::port` says how the readings share.)
 //!
 //! The two VAE readings ([`super::vae`]) exist on the flagship only (the
 //! miniature has no VAE) and run on the voxel axis: a lane submits one
@@ -20,18 +24,19 @@
 //! arrives already padded, its `pad` port flags each row (`0.0` real, `1.0`
 //! pad), and the plan overwrites every flagged row with the learned
 //! `x_pad_token` / `cap_pad_token` after its embedder (the reference's
-//! `torch.where(mask, pad_token, feats)`), at rotary position `(0, 0, 0)` —
-//! which the guest's positions must state. The pad rows are attended (study
+//! `torch.where(mask, pad_token, feats)`). The pad rows are attended (study
 //! §C.3); the velocity rows they produce are discarded by the guest. The
 //! `denoise` context lane binds no `pad`: its rows are the `refine`
 //! readout, pads included. The `timestep` is bound by BOTH denoise lanes
 //! (the same cell): the joint trunk modulates every row by its own lane's
 //! vector, caption rows included.
 //!
-//! Positions (`AxisPositions`, `[rows, 3]` f32, `(t, h, w)`): caption row
-//! `j` is `(1 + j, 0, 0)`; image patch `(a, b)` is `(L32 + 1, a, b)` — the
-//! image's temporal index depends on the caption's padded length (study
-//! §C.5); pad rows `(0, 0, 0)`.
+//! Positions (`AxisPositions`, `[rows, 3]` f32, `(t, h, w)`), as the
+//! reference's `_pad_with_ids` states them: caption row `j` is
+//! `(1 + j, 0, 0)` for EVERY row `j < L32`, pads included (the caption's
+//! coordinate grid spans its padded length); image patch `(a, b)` is
+//! `(L32 + 1, a, b)` — the image's temporal index depends on the caption's
+//! padded length (study §C.5) — and an image pad row is `(0, 0, 0)`.
 //!
 //! The timestep port takes the SCHEDULER timestep `σ · 1000` (what a generic
 //! `FlowMatchEuler` guest holds); the plan performs the reference's time
@@ -57,8 +62,8 @@ use model_dsl::{
 };
 
 use crate::{
-    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
-    ScheduleKind,
+    AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
+    ReadoutKind, ScheduleFact, ScheduleKind,
 };
 
 use super::model::{
@@ -129,6 +134,7 @@ impl Model {
             kind,
             width,
             streams: streams.to_vec(),
+            at: None,
         };
         let mut readings = Vec::new();
         if let (Some(index), Some(te)) = (codes.text, &self.te) {
@@ -140,6 +146,7 @@ impl Model {
                 streams: vec![Stream::Text],
                 // A sequence lane: ids and kv, no float port.
                 ports: vec![],
+                positions: None,
                 readout: ReadoutKind::Hidden,
                 readout_width: te.hidden,
             });
@@ -168,6 +175,14 @@ impl Model {
                     &[Stream::Context],
                 ),
             ],
+            // `(t, h, w)`, one lane: caption row `j` at `(1 + j, 0, 0)`,
+            // a pad row at the origin (study §C.5).
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 1,
+                image_follows_text: false,
+            }),
             readout: ReadoutKind::Hidden,
             readout_width: d.dim,
         });
@@ -178,14 +193,17 @@ impl Model {
             takes_tokens: false,
             streams: vec![Stream::Image, Stream::Context],
             ports: vec![
+                port("pad", PortKind::Latents, 1, &[Stream::Image]),
                 port(
                     "latents",
                     PortKind::Latents,
                     PATCH_FEATURES,
                     &[Stream::Image],
                 ),
-                port("pad", PortKind::Latents, 1, &[Stream::Image]),
-                port("context", PortKind::Context, d.dim, &[Stream::Context]),
+                // A Latents port (index 2), not a Context one: the plan's
+                // Context 0 is the raw caption at `cap_width`, and a
+                // `(kind, index)` pair is seated once per plan.
+                port("context", PortKind::Latents, d.dim, &[Stream::Context]),
                 port(
                     "timestep",
                     PortKind::LaneVector,
@@ -199,6 +217,17 @@ impl Model {
                     &[Stream::Image, Stream::Context],
                 ),
             ],
+            // `(t, h, w)`: the caption rides the TIME axis ahead of the
+            // image — caption row `j` at `(1 + j, 0, 0)`, image patch
+            // `(a, b)` at `(L32 + 1, a, b)` — so the image's time index
+            // follows the caption's padded length (study §C.5). Pad rows
+            // sit at the origin, which the guest's grid states.
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 1,
+                image_follows_text: true,
+            }),
             readout: ReadoutKind::Velocity,
             readout_width: PATCH_FEATURES,
         });
@@ -212,6 +241,10 @@ impl Model {
                 takes_tokens: false,
                 streams: vec![Stream::Image],
                 ports: vec![port("latent", PortKind::Voxels, CHANNELS, &[Stream::Image])],
+                // A VAE tile is a box on the voxel axis, not rows in a
+                // rotary space: it takes no positions and states no
+                // convention.
+                positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: super::vae::RGB,
             });
@@ -221,12 +254,17 @@ impl Model {
                 has_kv: false,
                 takes_tokens: false,
                 streams: vec![Stream::Image],
-                ports: vec![port(
-                    "pixels",
-                    PortKind::Voxels,
-                    super::vae::RGB,
-                    &[Stream::Image],
-                )],
+                // Voxel index ONE: the engine seats one rectangle per
+                // `(kind, index)` for the whole plan, and `vae.decode`'s
+                // latent clip is 16 wide at index 0.
+                ports: vec![PortFact {
+                    name: "pixels",
+                    kind: PortKind::Voxels,
+                    width: super::vae::RGB,
+                    streams: vec![Stream::Image],
+                    at: Some(super::model::port::PIXEL_VOXELS),
+                }],
+                positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: CHANNELS,
             });
@@ -430,7 +468,7 @@ fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
 /// unmodulated context-refiner blocks over the lane; `hidden` planted on
 /// the result inside the last block's layer mark.
 fn refine(arm: &Input<Facts>, d: &Dims, m: &Dit) {
-    let c = arm.context(port::CONTEXT, d.cap_width);
+    let c = arm.context(port::CAPTION, d.cap_width);
     let c = ops::elemwise::rmsnorm(&c, &m.cap_norm, NORM_EPS);
     let c = linear(&m.cap_embed, &c);
     let c = pad_rows(
@@ -510,7 +548,7 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     }
 
     // ---- the caption lane: already refined, pads included ---------------
-    let c = ctx.context(port::CONTEXT, d.dim);
+    let c = ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16);
 
     // ---- the joint trunk over `[image ‖ caption]` ------------------------
     let mut u = Value::merge(vec![x, c]);

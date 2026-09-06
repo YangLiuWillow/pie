@@ -91,8 +91,9 @@ pub mod latent;
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact, PortKind,
-        ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind, architecture, arena_block_size,
+        AxisRole, BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact,
+        PortKind, PositionConvention, ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
+        architecture, arena_block_size,
         canvas, channel_capacity, default_system_speculation, draft_block, frame_size,
         kv_page_size, latent, max_embed_length, max_latent_rows, mtp_depth, name,
         output_vocab_size, pass_kind, prefill_chunk_hint, readings, rs_buffer_page_size,

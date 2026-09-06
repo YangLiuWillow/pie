@@ -129,11 +129,14 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         })
         .collect();
     ports.sort_unstable();
+    // Two voxel INDICES, not one: the engine seats one rectangle per
+    // `(kind, index)` for the whole plan, so the 16-wide latent clip and the
+    // 3-wide pixel clip cannot share index 0.
     assert_eq!(
         ports,
         vec![
-            (0, vae::RGB, "Bf16".to_string()),
-            (0, model::CHANNELS, "Bf16".to_string())
+            (model::port::VOXELS, model::CHANNELS, "Bf16".to_string()),
+            (model::port::PIXEL_VOXELS, vae::RGB, "Bf16".to_string())
         ]
     );
     let pixels: Vec<&Seam> = plan

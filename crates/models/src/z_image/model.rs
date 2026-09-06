@@ -111,30 +111,44 @@ pub const TE_LAYERS: u32 = TE_DEPTH - 1;
 /// The most caption tokens a prompt renders to (`max_sequence_length`).
 pub const TE_MAX_TOKENS: u32 = 512;
 
-/// The float ports this text reads, by index within their kind and reading.
+/// The float ports this text reads, by index within their kind.
+///
 /// A port index is the family's own (`RuntimeInput::Latents { port, .. }`
 /// carries it) and is the position among ports of one kind in the reading's
 /// `ReadingFact::ports`, which is how the runtime resolves `input(name)`.
+/// But the ENGINE seats a `(kind, index)` pair once per PLAN
+/// (`IMAGEGEN_CONTRACT.md` §2: one `[max_tokens, width]` rectangle per
+/// pair, its first reader's width), so two readings may share a pair only
+/// at one width. That is why the pad flags come first in both readings
+/// (Latents 0 is `[rows, 1]` everywhere), why the image rows are Latents 1,
+/// and why the refined caption the `denoise` context lane binds is a
+/// Latents port too (index 2, `[rows, dim]`) rather than a second Context
+/// port 0 beside the raw caption's `[rows, cap_width]`.
 pub mod port {
-    /// `denoise`: the image lane's patch rows, `[rows, PATCH_FEATURES]` bf16.
-    pub const LATENTS: u8 = 0;
     /// `denoise`: the image lane's pad flags, `[rows, 1]` (`0` real, `1`
-    /// pad), the second latents port of the reading.
-    pub const PAD_IMAGE: u8 = 1;
+    /// pad), the first latents port of the reading.
+    pub const PAD_IMAGE: u8 = 0;
+    /// `denoise`: the image lane's patch rows, `[rows, PATCH_FEATURES]` bf16.
+    pub const LATENTS: u8 = 1;
+    /// `denoise`: the context lane's refined caption rows, `[rows, dim]`
+    /// bf16 — the `refine` readout, pads included.
+    pub const CONTEXT_REFINED: u8 = 2;
     /// `refine`: the caption lane's pad flags, `[rows, 1]`, its only
     /// latents port.
     pub const PAD_CAPTION: u8 = 0;
-    /// `refine`: the raw caption rows, `[rows, cap_width]` (Qwen3 layer −2);
-    /// `denoise`: the refined caption rows, `[rows, dim]`. Both the first
-    /// context port of their reading.
-    pub const CONTEXT: u8 = 0;
+    /// `refine`: the raw caption rows, `[rows, cap_width]` (Qwen3 layer −2),
+    /// the plan's one context port.
+    pub const CAPTION: u8 = 0;
     /// `denoise`: the scheduler timestep `σ·1000`, `[lanes, 1]`.
     pub const TIMESTEP: u8 = 0;
     /// `refine`, `denoise`: the three rotary coordinates per row, `[rows, 3]`.
     pub const POSITIONS: u8 = 0;
-    /// `vae.decode`: the latent clip, `[h·w, CHANNELS]`; `vae.encode`: the
-    /// pixel clip, `[H·W, 3]`. Each reading's only voxel port.
+    /// `vae.decode`: the latent clip, `[h·w, CHANNELS]`.
     pub const VOXELS: u8 = 0;
+    /// `vae.encode`: the pixel clip, `[H·W, 3]`. A second voxel index
+    /// because the engine seats one rectangle per `(kind, index)` for the
+    /// whole plan and the two clips are different widths.
+    pub const PIXEL_VOXELS: u8 = 1;
 }
 
 /// One row's shape, the numbers that differ between the shipped transformer

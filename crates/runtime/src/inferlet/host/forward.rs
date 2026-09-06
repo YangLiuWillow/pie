@@ -2584,6 +2584,7 @@ mod tests {
             kind,
             width,
             streams: Vec::new(),
+            at: None,
         }
     }
 

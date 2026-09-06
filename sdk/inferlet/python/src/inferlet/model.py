@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from wit_world.imports import model as _model
 
+AxisRole = _model.AxisRole
 ForwardKind = _model.ForwardKind
 LaneStream = _model.LaneStream
 PortKind = _model.PortKind

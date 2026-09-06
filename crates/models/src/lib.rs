@@ -15,6 +15,7 @@ pub mod qwen_3;
 pub mod qwen_4;
 pub mod template;
 pub mod tokenizer;
+pub mod wan_2;
 pub mod z_image;
 
 use std::sync::LazyLock;
@@ -129,6 +130,10 @@ pub struct ReadingFact {
     /// The float input ports, in the order the trace numbers them within
     /// each kind: the `n`th `Latents` port here is `Input::latents(n, ..)`.
     pub ports: Vec<PortFact>,
+    /// Where this reading's lanes place their rows in the rotary space
+    /// (design D7/D12), when it declares an `AxisPositions` port and its
+    /// layout fits [`PositionConvention`]. `None` otherwise.
+    pub positions: Option<PositionConvention>,
     /// Which export seam the epilogue reads (`logits()`, `velocity()`,
     /// `hidden()`).
     pub readout: ReadoutKind,
@@ -163,8 +168,8 @@ impl ReadingFact {
                 PortKind::AxisPositions => 3,
                 PortKind::Voxels => 4,
             };
-            let index = seen[slot];
-            seen[slot] = seen[slot].saturating_add(1);
+            let index = port.at.unwrap_or(seen[slot]);
+            seen[slot] = index.saturating_add(1);
             (index, port)
         })
     }
@@ -191,6 +196,16 @@ pub struct PortFact {
     /// reading. A pass on stream `s` must bind exactly the ports that list
     /// `s` (or list nothing).
     pub streams: Vec<Stream>,
+    /// The `RuntimeInput` index this port is read at, when it is not the
+    /// positional one. A port's index is normally its position among the
+    /// ports of its own kind IN THIS READING, which is what a family wants
+    /// when every reading reads the same rectangle. Two readings that read
+    /// one kind at DIFFERENT WIDTHS need different indices, because the
+    /// engine seats one rectangle per `(kind, index)` for the whole plan —
+    /// z_image's `vae.encode` takes its pixel clip at voxel index 1 so that
+    /// `vae.decode`'s 16-wide latent keeps index 0. Stating an index also
+    /// moves the positional counter past it.
+    pub at: Option<u8>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
@@ -210,6 +225,54 @@ pub enum PortKind {
     /// `[t, h, w, channels]` (or `[h, w, channels]` for a still), which is
     /// how the clip's box reaches the engine beside its rows.
     Voxels,
+}
+
+/// What one axis of an `AxisPositions` port means. The rotary space a DiT
+/// was trained in is 1..=4 axes wide and every family orders them
+/// differently; this names them so a guest can fill the grid without
+/// knowing the family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AxisRole {
+    /// Frame / reference / sequence index (FLUX's `T`, Z-Image's `t`).
+    Time,
+    /// The latent grid's row.
+    Height,
+    /// The latent grid's column.
+    Width,
+    /// A plain row-ordinal axis carried by one lane's rows alone (FLUX's
+    /// fourth `L` axis, which numbers the text rows).
+    Index,
+}
+
+/// **WHERE A READING'S LANES SIT IN THE ROTARY SPACE.**
+///
+/// A denoise reading's `AxisPositions` port takes one coordinate vector per
+/// row, and which coordinate goes where is a family contract the guest must
+/// not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s `(L + 1, a, b)`). This
+/// states it once, so one model-agnostic builder
+/// (`inferlet::latent::positions_for`) fills every family's grid:
+///
+/// - a `Text`/`Context` lane's row `j` sits at `text_origin + j` on axis
+///   `text_axis` and at 0 on every other axis;
+/// - an `Image` lane's patch `(a, b)` sits at `a` on the `Height` axis and
+///   `b` on the `Width` axis; on `text_axis` it sits at `text_origin +
+///   text_rows` when `image_follows_text`, else 0; on every remaining
+///   axis, 0.
+///
+/// `axes` has exactly the port's `width` entries. A family whose positions
+/// do not fit this shape states `None` and its guests build their own — a
+/// reference lane's `T` stride, for one, is not stated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionConvention {
+    /// One role per axis of the positions port, in the port's own order.
+    pub axes: Vec<AxisRole>,
+    /// Which axis a text/context lane numbers its rows on.
+    pub text_axis: u32,
+    /// The coordinate that lane's FIRST row sits at.
+    pub text_origin: u32,
+    /// The image lane's coordinate on `text_axis` is `text_origin +
+    /// text_rows` (Z-Image) rather than 0 (FLUX.2, mini-dit).
+    pub image_follows_text: bool,
 }
 
 /// Which export seam a reading's epilogue reads.
@@ -350,6 +413,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row
         // spells, so the generative rows identify nothing above them.
         z_image::skus(),
+        wan_2::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

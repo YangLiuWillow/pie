@@ -24,8 +24,8 @@ use model_dsl::{
 };
 
 use crate::{
-    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
-    ScheduleKind,
+    AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
+    ReadoutKind, ScheduleFact, ScheduleKind,
 };
 
 use super::model::{
@@ -136,7 +136,8 @@ fn denoise_reading(tap: Option<&str>) -> ReadingFact {
         kind,
         width,
         streams: streams.to_vec(),
-    };
+                at: None,
+        };
     ReadingFact {
         name: "denoise",
         index: DENOISE_READING,
@@ -180,6 +181,15 @@ fn denoise_reading(tap: Option<&str>) -> ReadingFact {
                 &[Stream::Text, Stream::Image],
             ),
         ],
+        // `(t, h, w)`: caption row `j` at `(j, 0, 0)`, image patch
+        // `(h, w)` at `(0, h, w)` — `mini_dit_ref.py`'s `text_positions` /
+        // `image_positions`.
+        positions: Some(PositionConvention {
+            axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+            text_axis: 0,
+            text_origin: 0,
+            image_follows_text: false,
+        }),
         readout: ReadoutKind::Velocity,
         readout_width: Tap::width(tap),
     }

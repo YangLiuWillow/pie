@@ -207,6 +207,15 @@ async fn main(input: Input) -> Result<Output> {
                 Channel::from_shaped([rows, port.width], vec![0f32; (rows * port.width) as usize])
                     .named(&port.name)
             }
+            // A voxel port is a VAE tile's box on the third row axis (D8),
+            // which is not a float lane this probe can plausibly fill.
+            model::PortKind::Voxels => {
+                return Err(format!(
+                    "reading `{}` declares a voxel port `{}`; the latent probe drives rows, \
+                     not a VAE tile",
+                    reading.name, port.name
+                ));
+            }
         };
         pass.input(&port.name, &ch)?;
         bound.push(port.name.clone());
