@@ -5,9 +5,9 @@
 //! parallel single-stream blocks over the joined sequence, three shared
 //! modulation linears for the whole trunk, a four-axis rope with a
 //! reference-index axis, behind a Qwen3-4B encoder read at three depths,
-//! and the `AutoencoderKLFlux2` decoder — one plan of three arms selected
-//! per lane by the fact word ([`forward`] states the table a guest programs
-//! against, and which arm is not yet a reading a guest can name).
+//! and the `AutoencoderKLFlux2` autoencoder ([`vae`], both ways) — one plan
+//! of four arms selected per lane by the fact word ([`forward`] states the
+//! table a guest programs against).
 //!
 //! Two rows: the flagship `black-forest-labs/FLUX.2-klein-4B` (bf16 on
 //! disk, Apache-2.0, four distilled steps, no guidance embedder) and the
@@ -23,6 +23,7 @@ pub mod import;
 pub mod model;
 pub mod template;
 pub mod tokenizer;
+pub mod vae;
 
 use model::Model;
 use model_dsl::Dtype;

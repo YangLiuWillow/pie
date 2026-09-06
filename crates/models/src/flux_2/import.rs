@@ -29,17 +29,23 @@
 //!   C_in·k²]` rectangle `Weight::conv_taps_major` declares (a transmute:
 //!   same bytes, the shell relabels at load); conv biases and group-norm
 //!   affines are cast to f32;
-//! * the frozen BatchNorm becomes three `[128]` planes: the deviation
-//!   `√(var + eps)` (`UnaryOp::Sqrt` over `bn.running_var + eps`) as
-//!   `standardize`'s scale, a zero fill as its bias, and the stored mean
-//!   as the `add_bias` after it;
+//! * the frozen BatchNorm becomes four `[128]` planes: the deviation
+//!   `√(var + eps)` (`UnaryOp::Sqrt` over `bn.running_var + eps`) as the
+//!   decode arm's `standardize` scale, a zero fill as its bias, the
+//!   stored mean as the `add_bias` after it, and the INVERSE deviation
+//!   `(var + eps)^(-1/2)` (`UnaryOp::Rsqrt` over the same sum) as the
+//!   encode arm's scale beside that mean;
+//! * `quant_conv` `[64, 64, 1, 1]` is declared at the posterior MEAN's
+//!   first 32 output rows (kernel and bias both sliced) — the slice sits
+//!   here and not on `encoder.conv_out`, whose 64 channels the 1×1 mixes;
 //! * the miniature ships fp32 and every bank is declared bf16, so each of
 //!   its reads is a cast;
 //! * the encoder's last nine layers and final norm are not read
 //!   (`model::TE_LAYERS`), nor is `lm_head` (tied, and not shipped).
 //!
-//! Not read at all: `vae.encoder.*` and `vae.quant_conv.*` (no encode arm
-//! yet — `forward.rs`), and `vae.bn.num_batches_tracked`.
+//! Not read at all: `vae.bn.num_batches_tracked` — a step counter of the
+//! training that froze the BatchNorm, which no forward reads. Every other
+//! one of the snapshot's 251 `vae.` tensors is read exactly once.
 
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType, UnaryOp};
 use checkpoint::types::Encoding;
@@ -47,9 +53,9 @@ use checkpoint_dsl::{Builder, Error, encoding, extents, stored_encoding};
 use model_dsl::{Platform, Weight};
 
 use super::model::{
-    Attn, Conv, DOUBLE_MOD_SLICES, Dit, GroupNorm, MidAttention, Model, Resnet, SINGLE_MOD_SLICES,
-    Swiglu, TE_HIDDEN, TextEncoder, VAE_BN_EPS, Vae,
+    Attn, DOUBLE_MOD_SLICES, Dit, Model, SINGLE_MOD_SLICES, Swiglu, TE_HIDDEN, TextEncoder,
 };
+use super::vae::{BN_EPS, ConvW, Mid, Norm, POSTERIOR_STORED, Proj, ResBlock, Vae};
 
 /// Where a checkpoint puts the components.
 #[derive(Clone, Copy)]
@@ -115,6 +121,28 @@ impl Model {
                 refusals.join("; ")
             ),
         })
+    }
+
+    /// The autoencoder's contract alone, over a diffusers pipeline name
+    /// space (`vae.` prefix): what a load of the VAE by itself — the
+    /// parity gate `engine-cuda/tests/the_flux_2_vae_answers_the_reference`
+    /// — reads, with the same reads the whole-model import states.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Illegible`] for a row with no VAE, or any read's refusal.
+    pub fn import_vae(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        let v = self.vae.as_ref().ok_or_else(|| Error::Illegible {
+            name: "vae".to_string(),
+            detail: "this row declares no VAE".to_string(),
+        })?;
+        let mut b = Builder::new(src, self.tp, platform);
+        vae(&mut b, src, v, Layout::Diffusers)?;
+        Ok(b.build())
     }
 
     fn import_from(
@@ -332,19 +360,20 @@ fn column_block(
     Ok(())
 }
 
-/// The VAE decoder side, `AutoencoderKLFlux2`'s own names under `vae.`.
+/// The whole autoencoder, `AutoencoderKLFlux2`'s own names under `vae.`:
+/// every one of the snapshot's 251 tensors but `bn.num_batches_tracked`.
 fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Result<(), Error> {
     let at = |tail: &str| layout.component("vae.", tail);
 
     batch_norm(b, src, v, &at("bn.running_mean")?, &at("bn.running_var")?)?;
     conv(b, src, &v.post_quant_conv, &at("post_quant_conv")?)?;
-    conv(b, src, &v.conv_in, &at("decoder.conv_in")?)?;
+    // The mean's rows of the `[mean | logvar]` mixer, kernel and bias.
+    conv_head(b, src, &v.quant_conv, &at("quant_conv")?, POSTERIOR_STORED)?;
 
-    resnet(b, src, &v.mid.resnet_0, &at("decoder.mid_block.resnets.0")?)?;
-    mid_attention(b, &v.mid.attention, &at("decoder.mid_block.attentions.0")?)?;
-    resnet(b, src, &v.mid.resnet_1, &at("decoder.mid_block.resnets.1")?)?;
-
-    for (i, up) in v.up_blocks.iter().enumerate() {
+    let d = &v.decoder;
+    conv(b, src, &d.conv_in, &at("decoder.conv_in")?)?;
+    mid_block(b, src, &d.mid, &at("decoder.mid_block")?)?;
+    for (i, up) in d.up.iter().enumerate() {
         for (r, block) in up.resnets.iter().enumerate() {
             resnet(
                 b,
@@ -362,14 +391,38 @@ fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Resul
             )?;
         }
     }
+    group_norm(b, &d.norm_out, &at("decoder.conv_norm_out")?)?;
+    conv(b, src, &d.conv_out, &at("decoder.conv_out")?)?;
 
-    group_norm(b, &v.norm_out, &at("decoder.conv_norm_out")?)?;
-    conv(b, src, &v.conv_out, &at("decoder.conv_out")?)
+    let e = &v.encoder;
+    conv(b, src, &e.conv_in, &at("encoder.conv_in")?)?;
+    for (i, down) in e.down.iter().enumerate() {
+        for (r, block) in down.resnets.iter().enumerate() {
+            resnet(
+                b,
+                src,
+                block,
+                &at(&format!("encoder.down_blocks.{i}.resnets.{r}"))?,
+            )?;
+        }
+        if let Some(c) = &down.downsample {
+            conv(
+                b,
+                src,
+                c,
+                &at(&format!("encoder.down_blocks.{i}.downsamplers.0.conv"))?,
+            )?;
+        }
+    }
+    mid_block(b, src, &e.mid, &at("encoder.mid_block")?)?;
+    group_norm(b, &e.norm_out, &at("encoder.conv_norm_out")?)?;
+    // Whole: `quant_conv` mixes the logvar half into the mean's rows.
+    conv(b, src, &e.conv_out, &at("encoder.conv_out")?)
 }
 
 /// A `nn.Conv2d`: the kernel `[C_out, C_in, k, k]` transmuted to the
 /// declared `[C_out, C_in·k²]` (the same bytes), and its bias.
-fn conv(b: &mut Builder, src: &ztensor::Source, c: &Conv, stem: &str) -> Result<(), Error> {
+fn conv(b: &mut Builder, src: &ztensor::Source, c: &ConvW, stem: &str) -> Result<(), Error> {
     let name = format!("{stem}.weight");
     let stored = stored_encoding(src, &name)?;
     b.read_expr(
@@ -379,12 +432,66 @@ fn conv(b: &mut Builder, src: &ztensor::Source, c: &Conv, stem: &str) -> Result<
     b.read(&c.bias, format!("{stem}.bias"))
 }
 
-fn group_norm(b: &mut Builder, n: &GroupNorm, stem: &str) -> Result<(), Error> {
+/// A `nn.Conv2d` of which the plan declares the FIRST `c.c_out` of
+/// `stored_rows` output channels: the kernel transmuted to `[stored_rows,
+/// C_in·k²]` and sliced down axis 0, the bias sliced the same way.
+fn conv_head(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    c: &ConvW,
+    stem: &str,
+    stored_rows: u32,
+) -> Result<(), Error> {
+    let kernel = format!("{stem}.weight");
+    let stored = stored_encoding(src, &kernel)?;
+    let mut natural = extents(&c.w);
+    natural[0] = i64::from(stored_rows);
+    let rows = i64::from(c.c_out);
+    b.read_expr(
+        &c.w,
+        Expr::src(&kernel)
+            .transmute(TensorType::new(natural, stored))
+            .slice(0, 0, rows),
+    )?;
+    // `Cast` is a root-only kernel in the contract algebra (a slice under
+    // it counts its elements off the whole source), so the bias's slice is
+    // its own internal step in the stored dtype and the cast sits over it.
+    let bias = format!("{stem}.bias");
+    let stored = stored_encoding(src, &bias)?;
+    let want = encoding(c.bias.dtype);
+    let head = format!("{}.head", c.bias.name);
+    b.push(
+        TensorContract::new(
+            head.clone(),
+            Expr::src(&bias).slice(0, 0, rows),
+            extents(&c.bias),
+            stored.clone(),
+        )
+        .internal(),
+    );
+    let expr = if want == stored {
+        Expr::out(head)
+    } else {
+        Expr::out(head).cast(want.clone())
+    };
+    b.push(TensorContract::new(
+        c.bias.name.clone(),
+        expr,
+        extents(&c.bias),
+        want,
+    ));
+    Ok(())
+}
+
+/// A `GroupNorm`'s affine planes, cast to the f32 the kernel reads.
+fn group_norm(b: &mut Builder, n: &Norm, stem: &str) -> Result<(), Error> {
     b.read(&n.weight, format!("{stem}.weight"))?;
     b.read(&n.bias, format!("{stem}.bias"))
 }
 
-fn resnet(b: &mut Builder, src: &ztensor::Source, r: &Resnet, stem: &str) -> Result<(), Error> {
+/// `ResnetBlock2D`: two norms, two convs, the `conv_shortcut` where the
+/// width changes.
+fn resnet(b: &mut Builder, src: &ztensor::Source, r: &ResBlock, stem: &str) -> Result<(), Error> {
     group_norm(b, &r.norm1, &format!("{stem}.norm1"))?;
     conv(b, src, &r.conv1, &format!("{stem}.conv1"))?;
     group_norm(b, &r.norm2, &format!("{stem}.norm2"))?;
@@ -395,23 +502,30 @@ fn resnet(b: &mut Builder, src: &ztensor::Source, r: &Resnet, stem: &str) -> Res
     Ok(())
 }
 
-fn mid_attention(b: &mut Builder, a: &MidAttention, stem: &str) -> Result<(), Error> {
-    group_norm(b, &a.norm, &format!("{stem}.group_norm"))?;
-    for (w, bias, name) in [
-        (&a.q, &a.q_bias, "to_q"),
-        (&a.k, &a.k_bias, "to_k"),
-        (&a.v, &a.v_bias, "to_v"),
-        (&a.out, &a.out_bias, "to_out.0"),
-    ] {
-        b.read(w, format!("{stem}.{name}.weight"))?;
-        b.read(bias, format!("{stem}.{name}.bias"))?;
-    }
-    Ok(())
+/// `UNetMidBlock2D`: `resnets.0`, `attentions.0`, `resnets.1`.
+fn mid_block(b: &mut Builder, src: &ztensor::Source, m: &Mid, stem: &str) -> Result<(), Error> {
+    resnet(b, src, &m.res0, &format!("{stem}.resnets.0"))?;
+    let a = &m.attn;
+    let n = |s: &str| format!("{stem}.attentions.0.{s}");
+    group_norm(b, &a.norm, &n("group_norm"))?;
+    biased(b, &a.q, &n("to_q"))?;
+    biased(b, &a.k, &n("to_k"))?;
+    biased(b, &a.v, &n("to_v"))?;
+    biased(b, &a.out, &n("to_out.0"))?;
+    resnet(b, src, &m.res1, &format!("{stem}.resnets.1"))
 }
 
-/// The frozen BatchNorm's three planes: `scale = √(var + eps)`, the zero
-/// bias `standardize` reads beside it (a fill in the declared dtype), and
-/// the mean.
+/// A biased `nn.Linear`: `<stem>.weight` and `<stem>.bias`.
+fn biased(b: &mut Builder, p: &Proj, stem: &str) -> Result<(), Error> {
+    b.read(&p.w, format!("{stem}.weight"))?;
+    b.read(&p.bias, format!("{stem}.bias"))
+}
+
+/// The frozen BatchNorm's four planes: the deviation `√(var + eps)`, its
+/// reciprocal `(var + eps)^(-1/2)`, the zero bias `standardize` reads
+/// beside the deviation on the decode arm (a fill in the declared dtype),
+/// and the mean, which is both the decode arm's `add_bias` and the encode
+/// arm's `standardize` bias.
 fn batch_norm(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -419,44 +533,46 @@ fn batch_norm(
     mean: &str,
     var: &str,
 ) -> Result<(), Error> {
-    // `√(var + eps)` is two kernels, and the load plan lowers a kernel only
-    // at the root of a step: the sum is one internal plane, the root another
-    // over it, and the published plane is that root, cast where the row's
-    // dtype is not the checkpoint's.
+    // `var + eps` then a function of it is two kernels, and the load plan
+    // lowers a kernel only at the root of a step: the sum is one internal
+    // plane, each root another over it, cast where the row's dtype is not
+    // the checkpoint's. The sum is stated once and both roots read it.
     let stored = stored_encoding(src, var)?;
     let shape = extents(&v.bn_scale);
     let var_eps = format!("{}.var_eps", v.bn_scale.name);
-    let std = format!("{}.std", v.bn_scale.name);
     b.push(
         TensorContract::new(
             var_eps.clone(),
-            Expr::src(var.to_string()).bias(VAE_BN_EPS),
+            Expr::src(var.to_string()).bias(BN_EPS),
             shape.clone(),
             stored.clone(),
         )
         .internal(),
     );
-    b.push(
-        TensorContract::new(
-            std.clone(),
-            Expr::out(var_eps).unary(UnaryOp::Sqrt),
+    for (plane, op) in [(&v.bn_scale, UnaryOp::Sqrt), (&v.bn_rscale, UnaryOp::Rsqrt)] {
+        let root = format!("{}.of_var", plane.name);
+        b.push(
+            TensorContract::new(
+                root.clone(),
+                Expr::out(var_eps.clone()).unary(op),
+                shape.clone(),
+                stored.clone(),
+            )
+            .internal(),
+        );
+        let want = encoding(plane.dtype);
+        let published = if want == stored {
+            Expr::out(root)
+        } else {
+            Expr::out(root).cast(want.clone())
+        };
+        b.push(TensorContract::new(
+            plane.name.clone(),
+            published,
             shape.clone(),
-            stored.clone(),
-        )
-        .internal(),
-    );
-    let want = encoding(v.bn_scale.dtype);
-    let published = if want == stored {
-        Expr::out(std)
-    } else {
-        Expr::out(std).cast(want.clone())
-    };
-    b.push(TensorContract::new(
-        v.bn_scale.name.clone(),
-        published,
-        shape,
-        want,
-    ));
+            want,
+        ));
+    }
     b.read(&v.bn_mean, mean.to_string())?;
     let want = encoding(v.bn_zero.dtype);
     let Encoding::Raw(dtype) = want.clone() else {

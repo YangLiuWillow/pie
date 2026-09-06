@@ -123,6 +123,11 @@ pub enum UnaryOp {
     /// `out = sqrt(x)`, defined for `x >= 0`: a standard deviation from a
     /// stored variance (a frozen BatchNorm's `running_var + eps`).
     Sqrt,
+    /// `out = 1 / sqrt(x)`, defined for `x > 0`: the INVERSE deviation of
+    /// the same frozen BatchNorm — what normalises where [`Self::Sqrt`]
+    /// denormalises, and the one form the affine fragment cannot reach
+    /// (it multiplies and adds, it never divides).
+    Rsqrt,
 }
 
 impl UnaryOp {
@@ -132,6 +137,7 @@ impl UnaryOp {
         match self {
             Self::NegLn => (-x).ln(),
             Self::Sqrt => x.sqrt(),
+            Self::Rsqrt => x.sqrt().recip(),
         }
     }
 
@@ -141,6 +147,7 @@ impl UnaryOp {
         match self {
             Self::NegLn => x < 0.0,
             Self::Sqrt => x >= 0.0,
+            Self::Rsqrt => x > 0.0,
         }
     }
 
@@ -150,6 +157,7 @@ impl UnaryOp {
         match self {
             Self::NegLn => "strictly negative",
             Self::Sqrt => "non-negative",
+            Self::Rsqrt => "strictly positive",
         }
     }
 }
