@@ -153,10 +153,20 @@ impl Shell {
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, u64::from(boot.pages))?;
+        // A model that denoises fires every projection at a canvas of
+        // rows; its 8-bit dense projections are decoded to bf16 once here
+        // rather than on every fire (`weights::decoded_dense_bytes`).
+        let decode_dense = landing.iter().flatten().any(model_ir::Request::denoise);
+        let decoded_dense = if decode_dense {
+            crate::weights::decoded_dense_bytes(&boot.trace)
+        } else {
+            0
+        };
         // The accounting sentence refuses ahead of every allocation.
         let accounting = crate::store::admit_the_card(
             boot.knobs.gpu_mem_utilization,
             boot.residency.device_demand(),
+            decoded_dense,
             &boot.trace,
             paging,
         )?;
@@ -172,6 +182,7 @@ impl Shell {
                 boot.world.rank,
                 boot.world.size,
             ),
+            decode_dense,
         )?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;

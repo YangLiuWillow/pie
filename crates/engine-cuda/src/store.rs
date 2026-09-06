@@ -148,6 +148,7 @@ pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
 pub fn admit_the_card(
     utilization: f64,
     weights: u64,
+    extra_resident: u64,
     trace: &Trace,
     paging: Paging,
 ) -> Result<Accounting> {
@@ -155,10 +156,13 @@ pub fn admit_the_card(
         .iter()
         .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
         .sum();
+    // `extra_resident`: device bytes the load holds beside the weight tier
+    // (`weights::decoded_dense_bytes`), after the sentinel is resolved.
     let weights = match weights {
         0 => full,
         stated => stated.min(full),
-    };
+    }
+    .saturating_add(extra_resident);
     let accounting = Accounting::of(
         card_bytes()?,
         utilization,
@@ -812,8 +816,39 @@ impl Pools {
         }
     }
 
-    /// The atomic multi-arena commit: every arena is asked for the prefix its watermark names, and the whole set moves or none does. Only [`Pools::release_to`] ever lowers a watermark.
+    /// The atomic multi-arena commit: every arena is asked for what its
+    /// watermark names, and the whole set moves or none does. Only
+    /// [`Pools::release_to`] ever lowers a watermark.
+    ///
+    /// A kv plane is asked for the units its addressed pages touch when
+    /// `kv_ranges` states them (`(first page, count)` runs, the frame's
+    /// seats), and for the prefix below `kv_pages` otherwise. The plane is
+    /// laid out slot-major, so the prefix backs every slot below the
+    /// highest addressed one whole — a 300-token sequence in slot seven
+    /// cost seven slots' ceiling of kv until the ranges form.
     fn commit_to(&mut self, kv_pages: u32, state_slots: u32) -> Result<Commit> {
+        self.commit_ranges(kv_pages, state_slots, None)
+    }
+
+    /// [`Pools::commit_to`] with the kv planes backed only under the
+    /// addressed page runs.
+    pub fn commit_frame(
+        &mut self,
+        demand: engine::frame::Demand,
+        kv_ranges: &[(u64, u64)],
+    ) -> Result<()> {
+        match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
+    }
+
+    fn commit_ranges(
+        &mut self,
+        kv_pages: u32,
+        state_slots: u32,
+        kv_ranges: Option<&[(u64, u64)]>,
+    ) -> Result<Commit> {
         let kv_pages = kv_pages.max(self.committed_kv_pages);
         let state_slots = state_slots.max(self.committed_state_slots);
         let page_size = self.paging.page_size;
@@ -827,14 +862,26 @@ impl Pools {
         let mut targets = Vec::new();
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
-                let bytes = watermark_bytes(shape, at, kv_pages, state_slots, page_size);
-                targets.push(elastic::Target { arena, bytes });
+                let want = match (shape, kv_ranges) {
+                    (Shape::Kv { .. }, Some(ranges)) => {
+                        // One page's bytes on this plane: the watermark of one page.
+                        let page_bytes = watermark_bytes(shape, at, 1, 0, page_size);
+                        elastic::Want::Ranges(
+                            ranges
+                                .iter()
+                                .map(|&(first, count)| (first * page_bytes, count * page_bytes))
+                                .collect(),
+                        )
+                    }
+                    _ => elastic::Want::Prefix(watermark_bytes(shape, at, kv_pages, state_slots, page_size)),
+                };
+                targets.push(elastic::Target { arena, want });
             }
         }
         for row in pooled.iter_mut() {
             let bytes = row.watermark_bytes(kv_pages, page_size);
             for arena in row.planes.iter_mut() {
-                targets.push(elastic::Target { arena, bytes });
+                targets.push(elastic::Target { arena, want: elastic::Want::Prefix(bytes) });
             }
         }
         let outcome = elastic::commit_atomically(pool, &mut targets)?;

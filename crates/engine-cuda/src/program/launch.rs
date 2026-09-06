@@ -576,7 +576,7 @@ impl Rings {
         Ok(out)
     }
 
-    fn shape_of(&self, channel: usize) -> Result<ChannelShape> {
+    pub(crate) fn shape_of(&self, channel: usize) -> Result<ChannelShape> {
         self.shapes.get(channel).copied().ok_or_else(|| {
             Fault::program(
                 "program::launch",
@@ -872,6 +872,7 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
     let values = plan.value_types.len();
     let mut lifetimes = vec![
         Lifetime {
+            dead: false,
             def: 0,
             last: 0,
             reusable: false,
@@ -945,6 +946,14 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
         life.class_last = class_of(life.launch_last, value);
         if life.class_last == 0 {
             life.last = life.last.max(region_last[life.launch_last as usize]);
+        }
+    }
+    // A stream's registers (`LaunchRegion::spent`) never land in scratch.
+    for fused in &plan.fused {
+        for &value in &fused.spent {
+            if let Some(life) = lifetimes.get_mut(value as usize) {
+                life.dead = true;
+            }
         }
     }
     Some(lifetimes)
@@ -1407,9 +1416,11 @@ impl Prepared {
         let lanes = self.filled as usize;
         self.pending
             .zero_span_on(stream, 0, lanes * self.channel_count as usize)?;
-        // An unwritten value slot must read back as zero.
-        self.scratch
-            .zero_span_on(stream, 0, lanes * self.scratch_stride as usize)?;
+        // The value scratch is NOT zeroed here. Every slot a region reads
+        // is written earlier in the same stage (the trace is SSA; a slot a
+        // stream keeps in registers is `dead` and never read), so a zero
+        // fill bought nothing but its bytes — and at a denoiser's 555 MB
+        // per lane that was 0.8 ms of every step.
         Ok(())
     }
 

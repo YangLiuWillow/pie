@@ -22,6 +22,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
 use kernels_cuda::linear::moe::GroupSeat;
+use kernels_cuda::linear::quant::OffsetKind;
 use model_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Buffer;
@@ -60,6 +61,37 @@ pub struct Weights {
     /// `Some` means some spilled dense planes are read out of device slots
     /// that rotate during the fire; weight-table addresses never move.
     rotor: Option<crate::rotate::Rotor>,
+    /// The 8-bit dense projections decoded to bf16 once at load, for a
+    /// model whose every fire is wide (see [`decoded_dense_bytes`]). The
+    /// table's rows point into these; the packed planes stay in the store
+    /// unread.
+    decoded: Vec<Buffer>,
+}
+
+/// Whether a param is an 8-bit dense projection a load may decode once:
+/// MLX affine codes at eight bits over a two-dimensional weight. Routed
+/// banks are three-dimensional and the select reads their codes directly.
+fn decodes_at_load(param: &model_ir::Param) -> bool {
+    param.dtype == Dtype::U8g64 && param.shape.len() == 2
+}
+
+/// The bf16 bytes [`Weights::resident`] adds when `decode_dense` is on:
+/// every [`decodes_at_load`] param at two bytes an element. A denoiser
+/// fires every projection at a canvas of rows, where the fused 8-bit
+/// GEMV loses to cuBLAS over a decoded tile and the per-fire decode was
+/// 150 launches and 3.8 ms of a 44 ms step; decoding once at load trades
+/// that for the bf16 row's memory. Zero for a model that decodes.
+#[must_use]
+pub fn decoded_dense_bytes(trace: &Trace) -> u64 {
+    trace
+        .params
+        .iter()
+        .filter(|param| decodes_at_load(param))
+        .map(|param| {
+            let (rows, width) = rectangle(&param.shape);
+            rows.saturating_mul(width).saturating_mul(2)
+        })
+        .sum()
 }
 
 /// One declared adapter bank: where its slots are and how big they are.
@@ -755,6 +787,7 @@ impl Weights {
         plan: crate::experts::Plan,
         stream: *mut core::ffi::c_void,
         target: StorageTarget,
+        decode_dense: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -895,6 +928,7 @@ impl Weights {
         let pairings = pairings(&landing, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
+        let mut decoded: Vec<Buffer> = Vec::new();
         for (at, place) in places.iter().enumerate() {
             // A registered plane is reserved and zeroed; `register_adapter` fills it.
             if !landed[at] && trace.params[at].source == ParamSource::Checkpoint {
@@ -906,6 +940,42 @@ impl Weights {
             // A split-plane bank is two handles under one `Def::Weight`,
             // both bound as `U8`: `rows x width` is the byte rectangle.
             let row = match pairings.get(trace.params[at].name.as_str()) {
+                // A resident 8-bit dense projection of a model that fires
+                // wide: decoded to bf16 here, once, and seated as a dense row.
+                Some(pairing)
+                    if decode_dense
+                        && decodes_at_load(&trace.params[at])
+                        && experts
+                            .as_ref()
+                            .and_then(|tier| tier.group_handles(at))
+                            .is_none() =>
+                {
+                    let codes = packed(experts.as_ref(), &store, &places, at)?;
+                    let scales = packed(experts.as_ref(), &store, &places, pairing.scales)?;
+                    let biases = match pairing.biases {
+                        Some(biases) => Some(packed(experts.as_ref(), &store, &places, biases)?),
+                        None => None,
+                    };
+                    let (n, k) = (place.rows, place.width);
+                    let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
+                    let plane = Buffer::zeroed(bytes)?;
+                    // SAFETY: `stream` is the load's stream, live for the load.
+                    let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+                    let tile = kernels_cuda::linear::quant::decode_into(
+                        &ctx,
+                        "linear.matmul",
+                        codes,
+                        scales,
+                        OffsetKind::Post,
+                        biases,
+                        Dtype::Bf16,
+                        plane.ptr(),
+                        n,
+                        k,
+                    )?;
+                    decoded.push(plane);
+                    WeightRow::Dense(tile)
+                }
                 // A streamed group carries its seat: the fixed-address cell the select reads.
                 Some(pairing) => WeightRow::Planes {
                     // `U4g64tiled` marks the tiled relabelling.
@@ -970,6 +1040,7 @@ impl Weights {
             experts,
             from_cache,
             rotor: None,
+            decoded,
         })
     }
 
@@ -1212,10 +1283,10 @@ impl Weights {
         &self.table
     }
 
-    /// Every byte the store holds.
+    /// Every byte the store holds, and the decoded dense planes beside it.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.store.bytes() as u64
+        self.store.bytes() as u64 + self.decoded.iter().map(|b| b.bytes() as u64).sum::<u64>()
     }
 }
 

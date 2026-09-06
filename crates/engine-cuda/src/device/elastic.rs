@@ -297,11 +297,14 @@ impl PhysicalPool {
     }
 }
 
-/// A fixed virtual range whose backing grows and trims from the tail; `base`
-/// never changes after `reserve`.
+/// A fixed virtual range whose backing is mapped one unit at a time, wherever
+/// a frame addresses; `base` never changes after `reserve`.
 ///
-/// Each kv-row plane gets its own arena, so a partial commit can't leave
-/// pages mid-row unmapped.
+/// Each kv-row plane gets its own arena. A plane is laid out slot-major
+/// (`Paging::base(slot)`), so backing only the units a frame's pages touch
+/// — rather than every unit below the highest addressed one — is what lets
+/// a 300-token sequence in slot seven cost its own pages and not slots
+/// zero to six's ceiling (§26–29 of the diffusion study).
 #[derive(Debug)]
 pub struct Arena {
     label: &'static str,
@@ -315,14 +318,39 @@ pub struct Arena {
     /// This arena's handle size: the pool's, or the arena's own size if
     /// smaller.
     map_unit: u64,
-    /// Mapped handles, in address order. `handles[i]` backs
-    /// `base + i * map_unit`.
-    handles: Vec<u64>,
+    /// Per unit, the handle backing `base + i * map_unit`, if mapped.
+    units: Vec<Option<u64>>,
+    /// How many of `units` are mapped.
+    mapped: u64,
     /// Unmapped handles cached for reuse, avoiding a `cuMemCreate` round trip
     /// on the next grow.
     cached: Vec<u64>,
     /// The most `committed_bytes` has ever been.
     high_water: u64,
+}
+
+/// What a commit asks an arena to have backed.
+#[derive(Debug, Clone)]
+pub enum Want {
+    /// Everything below `bytes` (a recurrent slab's slots, a pooled row).
+    Prefix(u64),
+    /// The byte ranges `(offset, len)` a frame addresses; the units they
+    /// touch are backed, nothing between them.
+    Ranges(Vec<(u64, u64)>),
+}
+
+impl Want {
+    /// The highest byte the want reaches, for the ceiling check.
+    fn reach(&self) -> u64 {
+        match self {
+            Want::Prefix(bytes) => *bytes,
+            Want::Ranges(ranges) => ranges
+                .iter()
+                .map(|&(offset, len)| offset.saturating_add(len))
+                .max()
+                .unwrap_or(0),
+        }
+    }
 }
 
 impl Arena {
@@ -349,7 +377,8 @@ impl Arena {
                 max_bytes: 0,
                 virtual_bytes: 0,
                 map_unit,
-                handles: Vec::new(),
+                units: Vec::new(),
+                mapped: 0,
                 cached: Vec::new(),
                 high_water: 0,
             });
@@ -377,7 +406,8 @@ impl Arena {
                 max_bytes,
                 virtual_bytes,
                 map_unit,
-                handles: Vec::new(),
+                units: vec![None; (virtual_bytes / map_unit) as usize],
+                mapped: 0,
                 cached: Vec::new(),
                 high_water: 0,
             })
@@ -400,10 +430,34 @@ impl Arena {
         self.max_bytes
     }
 
-    /// How far past [`Arena::base`] is readable right now.
+    /// Bytes backed right now (units mapped, wherever they lie).
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.handles.len() as u64 * self.map_unit
+        self.mapped * self.map_unit
+    }
+
+    /// The units a want names, ascending and deduplicated.
+    fn units_of(&self, want: &Want) -> Vec<usize> {
+        if self.map_unit == 0 {
+            return Vec::new();
+        }
+        let mut units: Vec<usize> = match want {
+            Want::Prefix(bytes) => (0..align_up(*bytes, self.map_unit) / self.map_unit)
+                .map(|u| u as usize)
+                .collect(),
+            Want::Ranges(ranges) => ranges
+                .iter()
+                .filter(|&&(_, len)| len > 0)
+                .flat_map(|&(offset, len)| {
+                    let first = offset / self.map_unit;
+                    let last = (offset + len - 1) / self.map_unit;
+                    (first..=last).map(|u| u as usize)
+                })
+                .collect(),
+        };
+        units.sort_unstable();
+        units.dedup();
+        units
     }
 
     /// The most that has ever been.
@@ -412,35 +466,41 @@ impl Arena {
         self.high_water
     }
 
-    /// `bytes`, rounded up to this arena's map unit.
+    /// The units a want asks for, checked against the arena's ceiling.
     ///
     /// # Errors
     ///
-    /// [`Fault::Ceiling`] for a target past the arena's ceiling.
-    pub fn target_bytes(&self, bytes: u64) -> Result<u64> {
-        if bytes > self.max_bytes {
+    /// [`Fault::Ceiling`] for a want past the arena's ceiling.
+    pub fn target_units(&self, want: &Want) -> Result<Vec<usize>> {
+        let reach = want.reach();
+        if reach > self.max_bytes {
             return Err(Fault::Ceiling {
                 what: "bytes of an elastic arena",
-                need: bytes,
+                need: reach,
                 have: self.max_bytes,
             });
         }
-        Ok(align_up(bytes, self.map_unit))
+        Ok(self.units_of(want))
     }
-
-    /// Pages needed from the pool to reach `bytes`; cached handles cost
+    /// Whether unit `u` is not backed (or does not exist).
+    fn unbacked(&self, u: usize) -> bool {
+        self.units.get(u).is_none_or(Option::is_none)
+    }
+    /// Bytes the arena comes to once `units` are backed: what the pool is
+    /// priced on for the ceiling.
+    fn target_bytes_of(&self, units: &[usize]) -> u64 {
+        let fresh = units.iter().filter(|&&u| self.unbacked(u)).count() as u64;
+        self.committed_bytes() + fresh * self.map_unit
+    }
+    /// Pages needed from the pool to back `units`; cached handles cost
     /// nothing to re-map.
-    fn growth_pages(&self, target: u64) -> u64 {
-        let committed = self.committed_bytes();
-        if target <= committed {
-            return 0;
-        }
-        let needed = (target - committed) / self.map_unit;
-        let fresh = needed.saturating_sub(self.cached.len() as u64);
+    fn growth_pages(&self, units: &[usize]) -> u64 {
+        let fresh = units.iter().filter(|&&u| self.unbacked(u)).count() as u64;
+        let fresh = fresh.saturating_sub(self.cached.len() as u64);
         pages_for_bytes(fresh * self.map_unit)
     }
 
-    /// Map physical pages under the tail until `target` is readable.
+    /// Map physical pages under every unit of `units` not yet backed.
     ///
     /// Caller has already reserved the pages; this only maps, and rolls back
     /// to the start on partial failure.
@@ -449,34 +509,38 @@ impl Arena {
     ///
     /// [`Fault::Runtimeless`], [`Fault::Device`] for the map or the access
     /// descriptor.
-    fn grow(&mut self, pool: &PhysicalPool, target: u64) -> Result<()> {
-        let before = self.committed_bytes();
+    fn grow(&mut self, pool: &PhysicalPool, units: &[usize]) -> Result<()> {
         let cached_before = self.cached.len();
-        if target <= before {
-            return Ok(());
-        }
-        while self.committed_bytes() < target {
+        let mut fresh: Vec<usize> = Vec::new();
+        for &unit in units {
+            if !self.unbacked(unit) || unit >= self.units.len() {
+                continue;
+            }
             let reused = self.cached.pop();
             let handle = match reused {
                 Some(handle) => handle,
                 None => match pool.acquire_handle(self.map_unit) {
                     Ok(handle) => handle,
                     Err(fault) => {
-                        self.rollback(pool, before, cached_before);
+                        self.rollback(pool, &fresh, cached_before);
                         return Err(fault);
                     }
                 },
             };
-            let at = self.base + self.handles.len() as u64 * self.map_unit;
+            let at = self.base + unit as u64 * self.map_unit;
             match self.map(pool, at, handle) {
-                Ok(()) => self.handles.push(handle),
+                Ok(()) => {
+                    self.units[unit] = Some(handle);
+                    self.mapped += 1;
+                    fresh.push(unit);
+                }
                 Err(fault) => {
                     if reused.is_some() {
                         self.cached.push(handle);
                     } else {
                         pool.release_handle(handle);
                     }
-                    self.rollback(pool, before, cached_before);
+                    self.rollback(pool, &fresh, cached_before);
                     return Err(fault);
                 }
             }
@@ -484,7 +548,6 @@ impl Arena {
         self.high_water = self.high_water.max(self.committed_bytes());
         Ok(())
     }
-
     /// One handle, mapped and made readable at `at`.
     fn map(&self, pool: &PhysicalPool, at: u64, handle: u64) -> Result<()> {
         #[cfg(feature = "cuda")]
@@ -516,14 +579,15 @@ impl Arena {
         }
     }
 
-    /// Undo a partial grow: unmap back to `bytes`, caching handles up to
-    /// `cached_goal` and releasing the rest.
-    fn rollback(&mut self, pool: &PhysicalPool, bytes: u64, cached_goal: usize) {
-        let target = align_up(bytes, self.map_unit);
-        while self.committed_bytes() > target && !self.handles.is_empty() {
-            let at = self.base + (self.handles.len() as u64 - 1) * self.map_unit;
-            self.unmap(at);
-            let handle = self.handles.pop().unwrap_or(0);
+    /// Undo a partial grow: unmap the units it mapped, caching handles up
+    /// to `cached_goal` and releasing the rest.
+    fn rollback(&mut self, pool: &PhysicalPool, fresh: &[usize], cached_goal: usize) {
+        for &unit in fresh.iter().rev() {
+            let Some(handle) = self.units.get_mut(unit).and_then(Option::take) else {
+                continue;
+            };
+            self.mapped = self.mapped.saturating_sub(1);
+            self.unmap(self.base + unit as u64 * self.map_unit);
             if self.cached.len() < cached_goal {
                 self.cached.push(handle);
             } else {
@@ -531,24 +595,24 @@ impl Arena {
             }
         }
     }
-
-    /// Unmap the tail down to `bytes` and tell the pool.
+    /// Unmap every backed unit outside `want` and tell the pool. Best
+    /// effort: releases whole map units only.
     ///
-    /// Keeps one handle cached (not released) when 2+ remain, since a trim is
-    /// usually followed by a grow. Returns pages actually handed back.
-    pub fn release_tail(&mut self, pool: &mut PhysicalPool, bytes: u64) -> u64 {
-        let target = align_up(bytes, self.map_unit);
-        let target_handles = if self.map_unit == 0 {
-            0
-        } else {
-            target / self.map_unit
-        };
-        let cache_goal = usize::from(target_handles >= 2);
+    /// Keeps one handle cached (not released) when 2+ units stay, since a
+    /// trim is usually followed by a grow. Returns pages actually handed back.
+    pub fn release_outside(&mut self, pool: &mut PhysicalPool, want: &Want) -> u64 {
+        let keep = self.units_of(want);
+        let cache_goal = usize::from(keep.len() >= 2);
         let mut released = 0u64;
-        while self.committed_bytes() > target && !self.handles.is_empty() {
-            let at = self.base + (self.handles.len() as u64 - 1) * self.map_unit;
-            self.unmap(at);
-            let handle = self.handles.pop().unwrap_or(0);
+        for unit in 0..self.units.len() {
+            if keep.binary_search(&unit).is_ok() {
+                continue;
+            }
+            let Some(handle) = self.units[unit].take() else {
+                continue;
+            };
+            self.mapped = self.mapped.saturating_sub(1);
+            self.unmap(self.base + unit as u64 * self.map_unit);
             if self.cached.len() < cache_goal {
                 self.cached.push(handle);
             } else {
@@ -566,7 +630,10 @@ impl Arena {
         pool.mark_uncommitted(pages);
         pages
     }
-
+    /// [`Arena::release_outside`] down to a prefix: the tail above `bytes`.
+    pub fn release_tail(&mut self, pool: &mut PhysicalPool, bytes: u64) -> u64 {
+        self.release_outside(pool, &Want::Prefix(bytes))
+    }
     fn unmap(&self, at: u64) {
         #[cfg(feature = "cuda")]
         {
@@ -592,7 +659,12 @@ impl Arena {
     /// [`Fault::Ceiling`] naming this arena.
     pub fn span(&self, offset: u64, len: u64) -> Result<u64> {
         let end = offset.saturating_add(len);
-        if end > self.committed_bytes() {
+        let backed = self.map_unit != 0
+            && end <= self.virtual_bytes
+            && (len == 0
+                || ((offset / self.map_unit)..=((end - 1) / self.map_unit))
+                    .all(|u| !self.unbacked(u as usize)));
+        if !backed {
             return Err(Fault::Ceiling {
                 what: self.label,
                 need: end,
@@ -609,9 +681,11 @@ impl Drop for Arena {
         {
             use cudarc::driver::sys as dr;
 
-            while let Some(handle) = self.handles.pop() {
-                let at = self.base + self.handles.len() as u64 * self.map_unit;
-                self.unmap(at);
+            for unit in 0..self.units.len() {
+                let Some(handle) = self.units[unit].take() else {
+                    continue;
+                };
+                self.unmap(self.base + unit as u64 * self.map_unit);
                 // SAFETY: this arena's own handle, released once.
                 unsafe {
                     let _ = dr::cuMemRelease(handle);
@@ -637,8 +711,8 @@ impl Drop for Arena {
 #[derive(Debug)]
 pub struct Target<'a> {
     pub arena: &'a mut Arena,
-    /// Bytes that must be readable afterwards.
-    pub bytes: u64,
+    /// What must be backed afterwards.
+    pub want: Want,
 }
 
 /// The answer to one atomic multi-arena commit.
@@ -678,10 +752,10 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     let mut growth = 0u64;
     let mut wanted = Vec::with_capacity(targets.len());
     for target in targets.iter() {
-        let bytes = target.arena.target_bytes(target.bytes)?;
-        required = required.saturating_add(pages_for_bytes(bytes));
-        growth = growth.saturating_add(target.arena.growth_pages(bytes));
-        wanted.push(bytes);
+        let units = target.arena.target_units(&target.want)?;
+        required = required.saturating_add(pages_for_bytes(target.arena.target_bytes_of(&units)));
+        growth = growth.saturating_add(target.arena.growth_pages(&units));
+        wanted.push(units);
     }
     if growth == 0 {
         // Already fully mapped: nothing to check or reserve.
@@ -702,18 +776,24 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
             budget: pool.budget_pages(),
         });
     }
-    // Snapshot for rollback on partial failure.
-    let was: Vec<(u64, usize)> = targets
+    // Snapshot for rollback on partial failure: the units each arena did
+    // not have before, and its cache depth.
+    let was: Vec<(Vec<usize>, usize)> = targets
         .iter()
-        .map(|target| (target.arena.committed_bytes(), target.arena.cached.len()))
+        .zip(&wanted)
+        .map(|(target, units)| {
+            let fresh: Vec<usize> =
+                units.iter().copied().filter(|&u| target.arena.unbacked(u)).collect();
+            (fresh, target.arena.cached.len())
+        })
         .collect();
     let mut done = 0usize;
-    for (target, bytes) in targets.iter_mut().zip(&wanted) {
-        if let Err(fault) = target.arena.grow(pool, *bytes) {
+    for (target, units) in targets.iter_mut().zip(&wanted) {
+        if let Err(fault) = target.arena.grow(pool, units) {
             // The failed arena already rolled itself back; unwind the ones
             // before it, tail first.
-            for (undone, &(bytes, cached)) in targets[..done].iter_mut().zip(&was[..done]).rev() {
-                undone.arena.rollback(pool, bytes, cached);
+            for (undone, (fresh, cached)) in targets[..done].iter_mut().zip(&was[..done]).rev() {
+                undone.arena.rollback(pool, fresh, *cached);
             }
             pool.unreserve(growth);
             return Err(fault);

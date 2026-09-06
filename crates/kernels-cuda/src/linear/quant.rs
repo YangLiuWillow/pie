@@ -397,6 +397,73 @@ pub fn decoded_plane(
     Ok(Tensor::new(tile, n, k, Dtype::Bf16))
 }
 
+/// [`decoded_plane`] into a buffer the CALLER owns rather than fire
+/// scratch: the resident decode a load makes once, for a projection every
+/// fire would otherwise re-decode. `dst` holds `n * k` bf16.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_into(
+    ctx: &Ctx,
+    op: &'static str,
+    codes: Tensor,
+    scales: Tensor,
+    offset: OffsetKind,
+    biases: Option<Tensor>,
+    factor: Dtype,
+    dst: u64,
+    n: u32,
+    k: u32,
+) -> Result<Tensor, Error> {
+    let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if codes.rows != n {
+        return Err(refuse(
+            op,
+            format!("the code plane holds {} rows and the entry states {n}", codes.rows),
+        ));
+    }
+    let bits: u32 = if codes.width == k {
+        8
+    } else if codes.width * 2 == k {
+        4
+    } else if codes.width * 4 == k {
+        2
+    } else {
+        return Err(refuse(
+            op,
+            format!("a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits", codes.width),
+        ));
+    };
+    let groups = scales.width / 2;
+    if groups == 0 || !k.is_multiple_of(groups) {
+        return Err(refuse(
+            op,
+            format!("{groups} factors do not group a {k}-wide row into whole groups"),
+        ));
+    }
+    let group = k / groups;
+    let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
+                 ::pie::i32({group})>",
+                offset.axis()
+            )),
+        )
+        .apply(Launch::flat(words, BLOCK)),
+        &[
+            codes.arg(),
+            scales.arg(),
+            biases.map_or(ArgValue::ABSENT, |b| b.arg()),
+            ArgValue::Ptr(dst),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+        ],
+    )?;
+    Ok(Tensor::new(dst, n, k, Dtype::Bf16))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_via_dense(
     ctx: &Ctx,
