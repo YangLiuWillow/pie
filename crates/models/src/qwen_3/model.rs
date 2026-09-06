@@ -190,6 +190,25 @@ pub const QWEN36_35B_A3B_DFLASH: dflash::Head = dflash::Head {
     attn_bias: false,
 };
 
+/// `z-lab/Qwen3.5-9B-DFlash`: the v1 shape against the 32-layer 9B —
+/// eight taps, six layers (five sliding at 4096, then one full), the
+/// trunk's hidden 4096 and MLP 12288, the Qwen3.5 mask id.
+pub const QWEN35_9B_DFLASH: dflash::Head = dflash::Head {
+    taps: &[1, 5, 9, 13, 17, 21, 25, 29],
+    windows: &[Some(4_096), Some(4_096), Some(4_096), Some(4_096), Some(4_096), None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 12_288,
+    theta: 10_000_000.0,
+    block: 16,
+    mask_token: 248_077,
+    proposals_from: 1,
+    conv: None,
+    readout: dflash::Readout::Argmax,
+    attn_bias: false,
+};
+
 /// Which draft-head recipe an artifact carries. Read by `Model::new` (which
 /// pieces to declare) and `import` (which tensors to bind); irrelevant once
 /// the trace is built.
@@ -763,10 +782,19 @@ impl Model {
     /// 4096, 16 query heads over 4 kv, GDN 16 key × 32 value heads of 128,
     /// MLP 12288, its own `lm_head`.
     pub fn d9b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            kv,
-            tp,
+        Model::new(w, kv, tp, Model::d9b_dims())
+    }
+
+    /// The 9B with z-lab's block drafter overlaid (`Qwen3.5-9B-DFlash`).
+    pub fn d9b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::d9b_dims();
+        d.draft = Some(Recipe::DFlash);
+        d.dflash_head = Some(&QWEN35_9B_DFLASH);
+        Model::new(w, kv, tp, d)
+    }
+
+    fn d9b_dims() -> Dims {
+        {
             Dims {
                 hidden: 4096,
                 layers: 32,
@@ -788,8 +816,8 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
-            },
-        )
+            }
+        }
     }
 
     /// Qwen3.6-27B: a SKU of this family, not a separate one —

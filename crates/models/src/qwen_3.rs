@@ -68,6 +68,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::d2b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "qwen35-d9b-dflash",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::d9b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "qwen35-d9b",
             1,
             [Dtype::U4g64],
