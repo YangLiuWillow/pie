@@ -24,6 +24,10 @@
 //! (f) the rope states three axes summing to the head, interleaved
 //! (g) the plan bakes on every platform, and the image class is the one the
 //!     velocity export lives in
+//! (h) the row's `Generative` facts say what the trace actually reads: one
+//!     reading, three streams, five ports whose kind-relative indices are
+//!     the ones the trace numbers, and a velocity readout at the plan's
+//!     own width
 //! ```
 
 use std::collections::BTreeSet;
@@ -34,6 +38,7 @@ use model_dsl::{
 };
 use models::mini_dit::forward::Facts;
 use models::mini_dit::model;
+use models::{PortKind, ReadoutKind};
 
 const SKU: &str = "mini-dit-bf16-kv-bf16";
 
@@ -412,4 +417,124 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
         node.op.aliases(&mut pairs);
         assert_eq!(pairs.len(), 1, "a gated fold is in place on its residual");
     }
+}
+
+/// (h) — the guest-facing facts and the trace are one statement.
+///
+/// The runtime resolves `input("latents")` to `RuntimeInput::Latents { port }`
+/// by counting ports of that kind in declaration order, so a reordered
+/// `ports` list would feed the caption rows into the cross-attention and
+/// still typecheck. This is what says it does not.
+#[test]
+fn the_generative_facts_are_the_ports_the_trace_reads() {
+    let row = models::sku(SKU).expect("the row is in the catalog");
+    let facts = row
+        .generative
+        .as_ref()
+        .expect("the first generative row states its readings");
+    assert_eq!(facts.readings.len(), 1, "one reading, today");
+    let reading = &facts.readings[0];
+    assert_eq!(reading.name, "denoise");
+    assert_eq!(reading.index, models::mini_dit::forward::DENOISE_READING);
+    assert!(!reading.has_kv, "a denoise pass binds no kv");
+    assert!(!reading.takes_tokens, "and embeds no tokens");
+    assert_eq!(
+        reading.streams,
+        vec![Stream::Text, Stream::Image, Stream::Context]
+    );
+    assert_eq!(reading.readout, ReadoutKind::Velocity);
+    assert_eq!(reading.readout_width, model::PATCH_FEATURES);
+
+    // The port a name resolves to, as the host resolves it: the index among
+    // ports of the same kind, in declaration order.
+    let at = |name: &str| {
+        let (index, port) = reading.port(name).unwrap_or_else(|| {
+            panic!("the reading declares no port `{name}`");
+        });
+        (index, port.kind, port.width)
+    };
+    assert_eq!(
+        at("latents"),
+        (
+            model::port::LATENTS,
+            PortKind::Latents,
+            model::PATCH_FEATURES
+        )
+    );
+    assert_eq!(
+        at("text"),
+        (model::port::TEXT, PortKind::Context, model::TEXT_WIDTH)
+    );
+    assert_eq!(
+        at("context"),
+        (
+            model::port::CONTEXT,
+            PortKind::Context,
+            model::CONTEXT_WIDTH
+        )
+    );
+    assert_eq!(
+        at("timestep"),
+        (model::port::TIMESTEP, PortKind::LaneVector, 1)
+    );
+    assert_eq!(
+        at("positions"),
+        (
+            model::port::POSITIONS,
+            PortKind::AxisPositions,
+            u32::from(model::ROPE_AXES)
+        )
+    );
+
+    // And the same five ports, at the same indices, are what the trace binds.
+    let plan = trace(Platform::Cuda);
+    let mut traced: Vec<(PortKind, u8, u32)> = plan
+        .values
+        .iter()
+        .filter_map(|decl| match &decl.def {
+            Def::Input(RuntimeInput::Latents { port, width }) => {
+                Some((PortKind::Latents, *port, *width))
+            }
+            Def::Input(RuntimeInput::Context { port, width }) => {
+                Some((PortKind::Context, *port, *width))
+            }
+            Def::Input(RuntimeInput::LaneVector { port, width }) => {
+                Some((PortKind::LaneVector, *port, *width))
+            }
+            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
+                Some((PortKind::AxisPositions, *port, u32::from(*axes)))
+            }
+            _ => None,
+        })
+        .collect();
+    traced.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
+    let mut declared: Vec<(PortKind, u8, u32)> = reading
+        .ports_indexed()
+        .map(|(index, port)| (port.kind, index, port.width))
+        .collect();
+    declared.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
+    assert_eq!(
+        traced, declared,
+        "the facts a guest binds by and the inputs the plan reads are one list"
+    );
+
+    // The latent space and the schedule the reference states.
+    let latent = facts.latent.expect("a denoiser states its latent space");
+    assert_eq!(
+        (
+            latent.channels,
+            latent.patch_h,
+            latent.patch_w,
+            latent.patch_t
+        ),
+        (model::CHANNELS, model::PATCH, model::PATCH, 1)
+    );
+    assert_eq!(
+        latent.channels * latent.patch_t * latent.patch_h * latent.patch_w,
+        model::PATCH_FEATURES,
+        "a latent row is exactly the head's output row"
+    );
+    let schedule = facts.schedule.as_ref().expect("and its schedule");
+    assert_eq!(schedule.kind, models::ScheduleKind::Flow);
+    assert_eq!(schedule.pinned_sigmas, vec![1.0, 0.75, 0.5, 0.25]);
 }

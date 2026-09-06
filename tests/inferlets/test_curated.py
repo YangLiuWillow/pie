@@ -1135,6 +1135,19 @@ async def test_greedy_decoding_is_the_same_alone_and_in_a_crowd(client, args):
             )
 
 
+# ── THE FLOAT-PORT LOOP (`.wiki/imagegen/design.md` D1/D3/D4) ───────────────
+#
+# **WANTS A LOAD WITH A LATENT READING, AND SAYS SO RATHER THAN FAILING.** A
+# text row declares no readings (`model.readings()` is empty), so the probe
+# refuses by name and `test_latent_probe` reports a skip — the correct answer
+# for that load. The run that exercises the door names the mini-DiT row:
+#
+#     tests/inferlets/test_latent_probe.py --model <mini-dit> --sku mini-dit-...
+#
+# REQUIRES MODEL: mini-dit.
+from test_latent_probe import test_latent_probe_closes_the_loop  # noqa: E402
+
+
 def tests():
     return [
         test_chat_completion,
@@ -1180,6 +1193,8 @@ def tests():
         test_snapkv_attention,
         test_image_captioning,
         test_image_captioning_beside_text_lanes,
+        # requires model: mini-dit (skips on a text row)
+        test_latent_probe_closes_the_loop,
     ]
 
 

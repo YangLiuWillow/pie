@@ -27,14 +27,13 @@ patchify is a reshape.
 
 WHAT THIS CANNOT DO YET
 -----------------------
-`run` needs three things that are not on `dev` at the time of writing: the
-`reading` / `input` / `stream` / `group` verbs on `pie:inferlet/forward`
-(design D1/D2), the engine's staging of the float ports and the `velocity`
-readback (D3), and the CUDA dispatch arms for `attention.ragged`,
-`layout.{pack,unpack}_rows`, `elementwise.{modulate,gated_residual_add,
-sinusoid,silu,rope_axes}`.  `case`, `collect` and `compare` are useful on
-their own the moment a pie-side answer exists, however it was produced, and
-`run` says exactly what is missing rather than failing obscurely.
+The guest side is complete: the `reading` / `input` / `stream` / `group` verbs
+and the `velocity()` intrinsic have landed.  What `run` still needs is the
+CUDA dispatch arms for `attention.ragged`, `layout.{pack,unpack}_rows` and
+`elementwise.{modulate,gated_residual_add,sinusoid,silu,rope_axes}`, which
+`engine-cuda` refuses by name today.  `case`, `collect` and `compare` are
+useful on their own the moment a pie-side answer exists, however it was
+produced, and `run` says what failed rather than failing obscurely.
 """
 
 from __future__ import annotations

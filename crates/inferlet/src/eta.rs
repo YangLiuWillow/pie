@@ -21,6 +21,7 @@ use crate::pie::inferlet::forward as wit_attention;
 use crate::pie::inferlet::forward_diffusion as wit_diffusion;
 use crate::pie::inferlet::forward_hybrid as wit_hybrid;
 use crate::pie::inferlet::forward_recurrent as wit_recurrent;
+pub use crate::pie::inferlet::model::LaneStream;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
@@ -638,6 +639,36 @@ pub trait PassWit: Sized + 'static {
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
 
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
+
+    /// The reading-and-ports verbs (design D1), carried by `forward` and
+    /// `forward-diffusion`; the recurrent and hybrid interfaces refuse them
+    /// by name.
+    fn reading(&self, name: &str) -> Result<(), String> {
+        Err(format!(
+            "this pass interface carries no readings; `reading(\"{name}\")` is a `forward` / \
+             `forward-diffusion` verb"
+        ))
+    }
+    fn input(&self, port: &str, _ch: &wit_channel::Channel) -> Result<(), String> {
+        Err(format!(
+            "this pass interface carries no float ports; `input(\"{port}\")` is a `forward` / \
+             `forward-diffusion` verb"
+        ))
+    }
+    fn stream(&self, _s: LaneStream) -> Result<(), String> {
+        Err(
+            "this pass interface carries no streams; `stream` is a `forward` / \
+             `forward-diffusion` verb"
+                .to_string(),
+        )
+    }
+    fn group(&self, _id: u32) -> Result<(), String> {
+        Err(
+            "this pass interface carries no groups; `group` is a `forward` / \
+             `forward-diffusion` verb"
+                .to_string(),
+        )
+    }
 }
 
 impl PassWit for wit_attention::ForwardPass {
@@ -667,6 +698,18 @@ impl PassWit for wit_attention::ForwardPass {
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
         wit_attention::submit(on, slots)
     }
+    fn reading(&self, name: &str) -> Result<(), String> {
+        wit_attention::ForwardPass::reading(self, name)
+    }
+    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
+        wit_attention::ForwardPass::input(self, port, ch)
+    }
+    fn stream(&self, s: LaneStream) -> Result<(), String> {
+        wit_attention::ForwardPass::stream(self, s)
+    }
+    fn group(&self, id: u32) -> Result<(), String> {
+        wit_attention::ForwardPass::group(self, id)
+    }
 }
 
 impl PassWit for wit_diffusion::ForwardPass {
@@ -694,6 +737,18 @@ impl PassWit for wit_diffusion::ForwardPass {
     }
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
         wit_diffusion::submit(on, slots)
+    }
+    fn reading(&self, name: &str) -> Result<(), String> {
+        wit_diffusion::ForwardPass::reading(self, name)
+    }
+    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
+        wit_diffusion::ForwardPass::input(self, port, ch)
+    }
+    fn stream(&self, s: LaneStream) -> Result<(), String> {
+        wit_diffusion::ForwardPass::stream(self, s)
+    }
+    fn group(&self, id: u32) -> Result<(), String> {
+        wit_diffusion::ForwardPass::group(self, id)
     }
 }
 
@@ -847,6 +902,13 @@ struct ForwardInner {
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
+    /// The float ports bound by [`Pass::input`], each with its channel.
+    /// The prologue reads every one so the program declares it (the host
+    /// feeds a port off the instance's own channel arena).
+    port_inputs: Vec<(String, DslChannel)>,
+    /// The latents port's rows, stated to the builder outright: a float
+    /// lane has no token CSR to size its read-out from.
+    latent_rows: Option<u32>,
 }
 
 /// A [`KvGeometry`] with claimed ports and resolved WIT handles, held until state-binding.
@@ -985,8 +1047,70 @@ impl<W: PassWit> Pass<W> {
                 program_attached: false,
                 adapter_lowrank_sites: 0,
                 adapter_scale_sites: 0,
+                port_inputs: Vec::new(),
+                latent_rows: None,
             }),
         }
+    }
+
+    /// Which of the family's declared readings this pass runs
+    /// (`model::readings()`): `"text"`, `"denoise"`, `"vae.decode"`, ...
+    /// Optional when the model declares at most one. Before the program.
+    pub fn reading(&self, name: &str) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.wit.reading(name)
+    }
+
+    /// Bind `ch` to the reading's float port `port` (`reading-fact.ports`),
+    /// read at every submit from the channel's committed cell. The host
+    /// checks the channel's shape against the port; this side makes sure
+    /// the program declares the channel (a prologue read) and, for the
+    /// latents port, sizes the read-out (`velocity()` / `hidden()`) to
+    /// its rows.
+    pub fn input(&self, port: &str, ch: &Channel) -> Result<(), String> {
+        {
+            let inner = self.inner.borrow();
+            if inner.program_attached {
+                return Err("forward pass program is already attached".to_string());
+            }
+            if inner.port_inputs.iter().any(|(bound, _)| bound == port) {
+                return Err(format!("port `{port}` is already bound on this pass"));
+            }
+        }
+        let wit = ch.wit();
+        self.wit.input(port, wit.as_ref())?;
+        let latents = crate::model::readings().iter().any(|reading| {
+            reading
+                .ports
+                .iter()
+                .any(|fact| fact.name == port && fact.kind == crate::model::PortKind::Latents)
+        });
+        let mut inner = self.inner.borrow_mut();
+        if latents && let Some(&rows) = ch.shape().dims().first() {
+            inner.latent_rows = Some(rows);
+        }
+        inner.port_inputs.push((port.to_string(), ch.dsl()));
+        Ok(())
+    }
+
+    /// Which lane stream this pass's rows are (design D2). Default `Text`;
+    /// a reading with several streams takes one pass per stream.
+    pub fn stream(&self, stream: LaneStream) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.wit.stream(stream)
+    }
+
+    /// Put this pass's lanes in attention group `id` within a frame, so
+    /// the passes of one request attend each other's rows.
+    pub fn group(&self, id: u32) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.wit.group(id)
     }
 
     fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {
@@ -1292,10 +1416,38 @@ impl<W: PassWit> Pass<W> {
         }
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
+        if let Some(rows) = inner.latent_rows {
+            builder.rows_hint(rows);
+        }
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
+        // Every port-fed channel is read in the prologue, so the program
+        // declares it whether or not a stage of the author's touches it: a
+        // read is the one effect with no consequence (nothing is consumed,
+        // nothing written), and it is what makes a seeded control channel
+        // a latest-value cell the host may `set`.
+        let port_channels: Vec<DslChannel> =
+            inner.port_inputs.iter().map(|(_, ch)| ch.clone()).collect();
+        let author_prologue = inner
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == Stage::Prologue)
+            .map(|(_, body)| body);
+        if !port_channels.is_empty() {
+            builder.stage(Stage::Prologue, move || {
+                for ch in &port_channels {
+                    let _ = ch.read();
+                }
+                if let Some(body) = author_prologue {
+                    body();
+                }
+            });
+        }
         for (stage, body) in &inner.stages {
+            if *stage == Stage::Prologue && !inner.port_inputs.is_empty() {
+                continue;
+            }
             builder.stage(*stage, body);
         }
         let traced = builder.build().map_err(|error| error.to_string())?;
@@ -1561,8 +1713,8 @@ impl Default for Pipeline {
 /// `eta::prelude`: importing a pass type requires naming its kind.
 pub mod shared_prelude {
     pub use super::{
-        Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length,
+        Channel, KvBinding, KvGeometry, LaneStream, PageGrant, Pipeline, RsGeometry, RsWorkingSet,
+        TOKEN_PAD, WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length,
         prefill_chunk_hint, prefill_chunks,
     };
     /// Every inferlet returns `inferlet::Result` and uses `model`, so both ride the prelude.

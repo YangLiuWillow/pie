@@ -703,6 +703,33 @@ class ForwardPass:
         else:
             raise InferletError("bind_state: a recurrent-only model has no KV geometry to bind")
 
+    # -- readings and float ports (imagegen design D1) ---------------------------
+
+    def reading(self, name: str) -> None:
+        """Which of the family's declared readings (`model.readings()`) this
+        pass runs — `"text"`, `"denoise"`, `"vae.decode"`, ... Optional when
+        the model declares at most one; before the program."""
+        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "reading")
+        _wit(self.wit.reading, name, what="reading")
+
+    def input(self, port: str, ch: Channel) -> None:
+        """Bind `ch` to the reading's float port `port`, read at every submit
+        from its committed cell. The host validates the shape; the program
+        must declare the channel (read it in a stage — the Rust SDK adds a
+        prologue read; here the author's stages must touch it)."""
+        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "input")
+        _wit(self.wit.input, port, ch._wit(), what="input")
+
+    def stream(self, s: "_wit_model.LaneStream") -> None:
+        """Which lane stream this pass's rows are (`model.LaneStream`)."""
+        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "stream")
+        _wit(self.wit.stream, s, what="stream")
+
+    def group(self, id: int) -> None:
+        """Put this pass's lanes in attention group `id` within a frame."""
+        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "group")
+        _wit(self.wit.group, int(id), what="group")
+
     # -- diffusion --------------------------------------------------------------
 
     def canvas(self, mode: "_wit_diffusion.Mode") -> None:

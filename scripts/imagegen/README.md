@@ -288,13 +288,13 @@ batch element is one run (the golden's batch of 2 carries two timesteps), and
 the harness stacks them back into the golden's `[2, ...]` shapes.  Patchify is
 checked against the reference's own `patches` tensor on every invocation.
 
-**It cannot run end to end yet.**  `run` needs the `reading` / `input` /
-`stream` / `group` verbs design D1/D2 adds to `pie:inferlet/forward`, the
-engine's staging of the float ports and the `velocity` readback (D3), and the
-CUDA dispatch arms for `attention.ragged`, `layout.{pack,unpack}_rows` and
-`elementwise.{modulate,gated_residual_add,sinusoid,silu,rope_axes}`.  The
-inferlet's body is behind its `imagegen-wit` feature until the first of those
-lands, so the fixture workspace still builds.
+**It cannot run end to end yet.**  The guest side is complete — the
+`reading` / `input` / `stream` / `group` verbs and the `velocity()` intrinsic
+have landed — but `run` still needs the CUDA dispatch arms for
+`attention.ragged`, `layout.{pack,unpack}_rows` and
+`elementwise.{modulate,gated_residual_add,sinusoid,silu,rope_axes}`, which
+`engine-cuda` refuses by name today (the row sits in that shell's
+`CANNOT_SERVE` list with exactly those eight ops).
 
 ---
 

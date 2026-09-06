@@ -17,8 +17,11 @@ pub const HEADS: u32 = 4;
 pub const HEAD_DIM: u32 = 64;
 /// SwiGLU intermediate: `HIDDEN * mlp_ratio` at ratio 2.
 pub const INTER: u32 = 512;
-/// `in_channels * patch_size²` — the width of one patch row, in and out.
-pub const PATCH_FEATURES: u32 = 64;
+/// The latent's channels, and the patch extent along each spatial axis.
+pub const CHANNELS: u32 = 16;
+pub const PATCH: u32 = 2;
+/// `CHANNELS * PATCH²` — the width of one patch row, in and out.
+pub const PATCH_FEATURES: u32 = CHANNELS * PATCH * PATCH;
 /// The caption stream's width: this model's text tokens arrive already at
 /// trunk width, so the text port needs no projection.
 pub const TEXT_WIDTH: u32 = 256;

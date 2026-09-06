@@ -24,6 +24,7 @@ fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> boo
 }
 
 pub mod context;
+pub mod float;
 pub mod geometry;
 pub mod kv;
 pub mod lease;
@@ -1002,6 +1003,10 @@ fn stamp_lane_words(
             // The denoise reading and the bidirectional lane are one fact
             // stated twice: the model's class and the engine's mask bits.
             lane.bidirectional,
+            // The lane's stream and the pass's reading (design D1/D2),
+            // stamped by `LaneFacts::stamp` before the words are.
+            crate::pipeline::instance::stream_of_lane(lane.stream),
+            lane.reading,
         );
     }
 }
@@ -1283,6 +1288,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
+        // Float lane: no sequence, no geometry ports; its rows are a
+        // port's and its only state is its channels.
+        if ctx.resources().get(&fwd)?.float.is_some() {
+            return float::fire_float_lane(ctx, this, fwd, frame).await;
+        }
         // Point this pass's channels at this pipeline's FIFO so take/read
         // await the right queue; every pass binding a channel must submit
         // on one pipeline.
@@ -1418,6 +1428,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut req = crate::engine::FireRequest::default();
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
+        // Reading, stream, group and port feeds ride every lane (D1/D2).
+        ctx.resources().get(&fwd)?.lane.stamp(&mut req);
         // Every fire through here fires a `BoundForwardPass`: the engine
         // runs its pass after the forward with this lane's logits row bound
         // as the `logits` intrinsic.
@@ -2893,6 +2905,7 @@ async fn fire_device_geometry<C: FireContext>(
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);
+    ctx.resources().get(&fwd)?.lane.stamp(&mut req);
     // A lane of several rows reads out the rows its `readout` port names
     // (all of a verify window's, for the verifier), lane-relative; the port
     // is a seeded, never-put channel, so the host shadow knows it. One token

@@ -23,6 +23,11 @@ use model_dsl::{
     Request, RopeForm, Stream, Value, Weight, ops, seam,
 };
 
+use crate::{
+    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
+    ScheduleKind,
+};
+
 use super::model::{
     CrossAttn, HEAD_DIM, INTER, LN_EPS, Linear, MOD_SLICES, Model, RMS_EPS, ROPE_AXES, ROPE_DIMS,
     ROPE_THETA, SM_SCALE, SelfAttn, Side, Swiglu, TIMESTEP_DIM, TIMESTEP_FLIP_SIN_COS,
@@ -40,105 +45,78 @@ pub const STREAM_BASE: u8 = 0;
 pub const DENOISE_BIT: u8 = 6;
 
 /// Which reading index the runtime stamps a denoise lane with — the position
-/// of `"denoise"` in [`READINGS`].
+/// of `"denoise"` in [`readings`].
 pub const DENOISE_READING: u8 = 0;
 
-// ---------------------------------------------------------------------------
-// TODO(R2-RUNTIME): the `Generative` facts a reading declares.
-//
-// The runtime-side struct this table is meant to become (`models::Generative`
-// / `models::ReadingFact`, the `Sku::generative` column beside
-// `Sku::diffusion`) has not landed on `dev` at the time this family was
-// written, so the readings are stated here as a const table for the runtime
-// to adopt verbatim. When it lands:
-//
-//   * add `generative: Some(Generative { readings: READINGS })` to the row
-//     in `crates/models/src/mini_dit.rs` (the `gemma_4_diffusion::skus()`
-//     precedent: overwrite the macro's `None` after the fact);
-//   * delete this comment and re-type `Reading`/`Port` as the shared types;
-//   * the guest reaches the same names through `reading(name)` and
-//     `input(port, ch)` (design D1).
-// ---------------------------------------------------------------------------
-
-/// What one declared reading is: its name, the fact bit a lane in it carries,
-/// the ports it reads and the seams it exports.
-pub struct Reading {
-    pub name: &'static str,
-    pub bit: u8,
-    pub ports: &'static [Port],
-    pub exports: &'static [&'static str],
-}
-
-/// One input port of a reading, as a guest binds it: the name it is bound by,
-/// which streams' lanes carry data for it, the `RuntimeInput` port index and
-/// the width the plan reads.
+/// This family's generative facts (design D12): what a guest sizes a job
+/// from and what `forward-pass.reading` / `input` resolve against.
 ///
-/// `streams` is a LIST because a port is not always one lane's. A row port
-/// belongs to the one stream whose rows it fills; a `LaneVector` is read once
-/// per lane, and every lane whose class modulates has to carry it. The
-/// context lane's timestep cell is written and never read — its class runs
-/// one projection and no modulation — so it is not listed.
-pub struct Port {
-    pub name: &'static str,
-    pub kind: PortKind,
-    pub streams: &'static [Stream],
-    pub port: u8,
-    pub width: u32,
+/// The row is a denoiser and nothing else, so there is one reading. Its
+/// latent space is the identity — `mini-dit` has no VAE, and its "pixels"
+/// are its latent cells — and its schedule is the rectified flow the
+/// reference's four-step Euler run uses.
+#[must_use]
+pub fn generative() -> Generative {
+    Generative {
+        readings: vec![denoise_reading()],
+        latent: Some(LatentSpace {
+            channels: super::model::CHANNELS,
+            patch_t: 1,
+            patch_h: super::model::PATCH,
+            patch_w: super::model::PATCH,
+            // No VAE: one latent cell IS one cell of the reference's
+            // `[C, H, W]` array, so both compressions are the identity.
+            spatial_compression: 1,
+            temporal_compression: 1,
+        }),
+        schedule: Some(ScheduleFact {
+            kind: ScheduleKind::Flow,
+            shift: 1.0,
+            train_steps: 1000,
+            boundary: None,
+            // `mini_dit_ref.py`'s `euler_sigmas`, without its trailing zero
+            // (the schedule appends that itself).
+            pinned_sigmas: vec![1.0, 0.75, 0.5, 0.25],
+        }),
+        // A synthetic row: the reference's grid is 8 x 8 patch rows, and a
+        // pass big enough for a 128 x 128 latent at patch 2 covers anything
+        // this family will be asked for.
+        max_rows: 4096,
+    }
 }
 
-/// The port kinds this family uses — the `RuntimeInput` float ports of D3,
-/// named the way `engine::fire::PortKind` names them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PortKind {
-    Latents,
-    Context,
-    LaneVector,
-    AxisPositions,
+/// The one reading. Port ORDER is load-bearing: a port's index is its
+/// position among the ports of its own kind, so `text` before `context` is
+/// what makes them `Input::context(0, ..)` and `Input::context(1, ..)` —
+/// the numbering `model::port` states and the trace reads.
+///
+/// `streams` lists every lane the request submits. It is the whole set, not
+/// one port's: a row port fills one stream's rows, but the `timestep` lane
+/// vector is read once per lane and every class that modulates needs it,
+/// while the context lane's cell is written and never read (its class runs
+/// one projection and no modulation).
+fn denoise_reading() -> ReadingFact {
+    let port = |name, kind, width| PortFact { name, kind, width };
+    ReadingFact {
+        name: "denoise",
+        index: DENOISE_READING,
+        // A denoise pass holds nothing between fires and embeds no tokens:
+        // both `attention` and `embed` are refused by name on it, and the
+        // image lane's row count comes from the latents channel.
+        has_kv: false,
+        takes_tokens: false,
+        streams: vec![Stream::Text, Stream::Image, Stream::Context],
+        ports: vec![
+            port("latents", PortKind::Latents, super::model::PATCH_FEATURES),
+            port("text", PortKind::Context, super::model::TEXT_WIDTH),
+            port("context", PortKind::Context, super::model::CONTEXT_WIDTH),
+            port("timestep", PortKind::LaneVector, 1),
+            port("positions", PortKind::AxisPositions, u32::from(ROPE_AXES)),
+        ],
+        readout: ReadoutKind::Velocity,
+        readout_width: super::model::PATCH_FEATURES,
+    }
 }
-
-/// The readings this family declares. One, today.
-pub const READINGS: &[Reading] = &[Reading {
-    name: "denoise",
-    bit: DENOISE_BIT,
-    ports: &[
-        Port {
-            name: "latents",
-            kind: PortKind::Latents,
-            streams: &[Stream::Image],
-            port: port::LATENTS,
-            width: super::model::PATCH_FEATURES,
-        },
-        Port {
-            name: "text",
-            kind: PortKind::Context,
-            streams: &[Stream::Text],
-            port: port::TEXT,
-            width: super::model::TEXT_WIDTH,
-        },
-        Port {
-            name: "context",
-            kind: PortKind::Context,
-            streams: &[Stream::Context],
-            port: port::CONTEXT,
-            width: super::model::CONTEXT_WIDTH,
-        },
-        Port {
-            name: "timestep",
-            kind: PortKind::LaneVector,
-            streams: &[Stream::Text, Stream::Image],
-            port: port::TIMESTEP,
-            width: 1,
-        },
-        Port {
-            name: "positions",
-            kind: PortKind::AxisPositions,
-            streams: &[Stream::Text, Stream::Image],
-            port: port::POSITIONS,
-            width: ROPE_AXES as u32,
-        },
-    ],
-    exports: &[seam::VELOCITY.name],
-}];
 
 /// The per-lane facts: which stream the lane's rows are, and which reading
 /// its pass runs.

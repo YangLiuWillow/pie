@@ -160,8 +160,23 @@ pub(crate) fn send_event(
 }
 
 /// Sends a binary file to a client for a specific process.
-pub(crate) fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::File { process_id, data })
+///
+/// `name` is the file name the inferlet suggested, when it suggested one:
+/// `session.send-frames` and `send-pcm` do, plain `send-file` does not.
+pub(crate) fn send_file(
+    client_id: ClientId,
+    process_id: ProcessId,
+    data: Bytes,
+    name: Option<String>,
+) -> Result<()> {
+    CLIENT_SERVICES.send(
+        &client_id,
+        SessionMessage::File {
+            process_id,
+            data,
+            name,
+        },
+    )
 }
 
 /// Registers a file waiter for a process. Returns the file bytes when the client delivers them.
@@ -204,8 +219,13 @@ enum SessionMessage {
         event: String,
         value: String,
     },
-    /// Binary file to push to the client.
-    File { process_id: ProcessId, data: Bytes },
+    /// Binary file to push to the client, under the name the inferlet
+    /// suggested when it suggested one.
+    File {
+        process_id: ProcessId,
+        data: Bytes,
+        name: Option<String>,
+    },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
     /// Register a file waiter for a process (client → process delivery).
@@ -299,8 +319,12 @@ impl ServiceHandler for Session {
             } => {
                 self.send_process_event(process_id, &event, value).await;
             }
-            SessionMessage::File { process_id, data } => {
-                self.send_file_download(process_id, data).await;
+            SessionMessage::File {
+                process_id,
+                data,
+                name,
+            } => {
+                self.send_file_download(process_id, data, name).await;
             }
             SessionMessage::ReceiveFile { process_id, sender } => {
                 self.file_waiters.insert(process_id, sender);

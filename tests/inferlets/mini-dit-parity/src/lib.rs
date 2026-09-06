@@ -2,51 +2,38 @@
 //! `scripts/imagegen/mini_dit_ref.py` handed PyTorch — the patch rows, the
 //! caption rows, the cross-attention context, the timestep and the three
 //! rotary coordinates per row — and reads back the velocity the head
-//! predicts, as JSON the harness turns into an `.npz`.
+//! predicts, as JSON `scripts/imagegen/mini_dit_parity.py` turns into an
+//! `.npz` under the golden's own key names.
 //!
 //! Two modes: one step against `mini_dit_dump_bf16.npz`'s `velocity`, and
 //! the four-step Euler schedule against `mini_dit_euler_bf16.npz`'s
 //! `euler.v{0..3}` / `euler.x{1..4}`.
 //!
-//! # THIS PROGRAM IS WRITTEN AGAINST A WIT THAT HAS NOT LANDED
+//! # THREE LANES, ONE GROUP, ONE FIRE
 //!
-//! Design D1 adds two verbs to `pie:inferlet/forward`, and D2 two more:
+//! `mini-dit`'s `denoise` reading declares three streams (D2), so one step
+//! is three passes — caption, image, context — each stating its
+//! [`stream`](inferlet::eta::attention::ForwardPass::stream) and all in one
+//! [`group`](inferlet::eta::attention::ForwardPass::group), which is what
+//! lets the caption rows join the image rows' attention and the context
+//! rows serve as block 2's keys. Neither `attention` nor `embed` is called
+//! on any of them: a denoise reading declares no kv space and no tokens,
+//! and the image lane's row count comes from its latents channel.
 //!
-//! ```text
-//! /// Which of the family's declared readings this pass runs.
-//! reading: func(name: string) -> result<_, error>;
-//! /// Bind a channel to one of the reading's declared input ports, read
-//! /// at every submit.
-//! input:   func(port: string, ch: borrow<channel>) -> result<_, error>;
-//! /// Which stream this pass's rows are (D2: a lane is (request, stream)).
-//! stream:  func(s: stream) -> result<_, error>;
-//! /// Which attention group they join — the lanes of one request.
-//! group:   func(id: u32) -> result<_, error>;
-//! ```
+//! Only the image lane reads out — the caption stream ends after block 1,
+//! and the head is image-only — so only it carries an epilogue.
 //!
-//! Until the runtime carries them the body below is behind the
-//! `imagegen-wit` feature (off by default), so the fixture workspace still
-//! builds. What it assumes, and what the runtime agent should check against
-//! the WIT it actually lands:
+//! # WHY THE EULER LOOP IS ON THE HOST
 //!
-//! * **one `ForwardPass` per lane**, three per step (caption, image,
-//!   context), tied into one fire by a shared `group` — the reading of D2
-//!   under which "a request submits several lanes, one per stream";
-//! * **a lane's row count comes from its ports' channel shapes**, since a
-//!   denoise reading binds no `embed`;
-//! * **`intrinsics::velocity()`** is the image lane's readout, gated by the
-//!   reading's export seams exactly as `logits()` is by `has_logits`;
-//! * **`attention(..)` is not called at all** — a denoise reading declares
-//!   no kv space and must refuse it by name.
-//!
-//! The Euler update is done on the HOST here (take the velocity, step the
-//! latent, feed it back) rather than in the epilogue. D4 puts it in the
-//! epilogue once `velocity()` and the latent cell are both reachable from a
-//! program; a host loop over four steps is the same arithmetic and is what
-//! a parity harness wants to see anyway.
-#![cfg(feature = "imagegen-wit")]
-
-use inferlet::eta::attention::prelude::*;
+//! `latent-probe` integrates on the device, which is what a real sampler
+//! does (D4) and what a real guest should copy. A parity harness wants the
+//! opposite: every step's velocity AND every step's latent, at the
+//! reference's own numbers, with nothing folded together. So this program
+//! takes the velocity after each fire and steps the latent itself. The
+//! arithmetic is `FlowMatchEuler`'s and the sigmas are the model's own
+//! (`model::schedule()`), so what is checked is still the schedule the
+//! family declares.
+use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -77,7 +64,7 @@ struct Input {
 
 /// One batch element of the reference's fixed inputs, flattened row-major.
 /// The harness writes the same numbers `mini_dit_ref.py` fed torch: the
-/// patchified latent (never the `[C, H, W]` latent), the caption rows, the
+/// patchified latent (never the `[C, H, W]` array), the caption rows, the
 /// context rows, one timestep, and the `(t, h, w)` coordinates of every row.
 #[derive(Deserialize)]
 struct Case {
@@ -93,11 +80,11 @@ struct Case {
     context: Vec<f32>,
     context_rows: u32,
     context_width: u32,
-    /// The `(t, h, w)` of every caption row then every image row, in the
-    /// packed order the plan reads (`Stream::Text` before `Stream::Image`).
+    /// `[rows, 3]` each, in the packed order the plan reads (`Stream::Text`
+    /// before `Stream::Image`).
     text_positions: Vec<f32>,
     image_positions: Vec<f32>,
-    /// One step's timestep, or — in `--euler` — the schedule.
+    /// One step's timestep, or — under `--euler` — the schedule.
     timestep: f32,
     #[serde(default)]
     sigmas: Vec<f32>,
@@ -109,11 +96,14 @@ struct Case {
 
 #[derive(Serialize)]
 struct Output {
-    /// `[image_rows, patch_features]` — one step's velocity, the reference's
-    /// `final.tokens` before its unpatchify. The harness unpatchifies.
+    /// `[image_rows, patch_features]` — the reference's `final.tokens`
+    /// before its unpatchify. The harness unpatchifies.
     velocity: Vec<f32>,
     image_rows: u32,
     patch_features: u32,
+    /// The sigmas actually stepped, so a schedule mismatch reads as one.
+    #[serde(default)]
+    sigmas: Vec<f32>,
     /// `--euler`: the velocity of every step, and the latent after each.
     #[serde(default)]
     euler_v: Vec<Vec<f32>>,
@@ -121,89 +111,106 @@ struct Output {
     euler_x: Vec<Vec<f32>>,
 }
 
-/// The three lanes of one denoise step, submitted as one group.
-struct Step<'a> {
-    case: &'a Case,
-    pipe: &'a Pipeline,
-    group: u32,
+/// The port names this family's `denoise` reading declares. Read off
+/// `model::readings()` rather than typed in, so a renamed port fails here
+/// with the model's own vocabulary instead of at the host.
+struct Ports {
+    latents: String,
+    text: String,
+    context: String,
+    timestep: String,
+    positions: String,
+    axes: u32,
+    velocity_width: u32,
 }
 
-impl Step<'_> {
-    /// One fire; answers the `[image_rows * patch_features]` velocity.
-    async fn run(&self, latents: &[f32], timestep: f32) -> Result<Vec<f32>> {
-        let case = self.case;
-        let tag = |what: &str| format!("{what}_g{}", self.group);
-        let rows = case.image_rows;
-        let width = case.patch_features;
+fn ports(reading: &model::ReadingFact) -> Result<Ports> {
+    let named = |name: &str| -> Result<&model::PortFact> {
+        reading
+            .ports
+            .iter()
+            .find(|port| port.name == name)
+            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
+    };
+    Ok(Ports {
+        latents: named("latents")?.name.clone(),
+        text: named("text")?.name.clone(),
+        context: named("context")?.name.clone(),
+        timestep: named("timestep")?.name.clone(),
+        positions: named("positions")?.name.clone(),
+        axes: named("positions")?.width,
+        velocity_width: reading.readout_width,
+    })
+}
 
-        // The caption lane: `Context` port 0, 256 wide. Its rows carry the
-        // fixed random embeddings the reference used — this model has no
-        // text encoder, which is exactly why it is a useful M0 fixture.
-        let caption = ForwardPass::new();
-        caption.reading("denoise")?;
-        caption.stream(Stream::Text)?;
-        caption.group(self.group)?;
-        caption.input(
-            "text",
-            &Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
-                .named(&tag("text")),
-        )?;
-        caption.input(
-            "positions",
-            &Channel::from_shaped([case.text_rows, 3u32], case.text_positions.as_slice())
-                .named(&tag("txt_pos")),
-        )?;
-        caption.input(
-            "timestep",
-            &Channel::from([timestep]).named(&tag("txt_t")),
-        )?;
+/// One denoise step: three lanes, one group, one fire, one velocity.
+async fn step(
+    case: &Case,
+    ports: &Ports,
+    reading: &str,
+    pipe: &Pipeline,
+    group: u32,
+    latents: &[f32],
+    timestep: f32,
+) -> Result<Vec<f32>> {
+    let tag = |what: &str| format!("{what}_g{group}");
+    let rows = case.image_rows;
+    let width = case.patch_features;
+    let t = Channel::from([timestep]).named(&tag("t"));
 
-        // The context lane: `Context` port 1, 512 wide, keys and values for
-        // block 2's cross-attention and nothing else. No positions: the Wan
-        // contract gives cross-attention no rope.
-        let context = ForwardPass::new();
-        context.reading("denoise")?;
-        context.stream(Stream::Context)?;
-        context.group(self.group)?;
-        context.input(
-            "context",
-            &Channel::from_shaped(
-                [case.context_rows, case.context_width],
-                case.context.as_slice(),
-            )
-            .named(&tag("ctx")),
-        )?;
+    // The caption lane. Its rows are fixed random 256-wide embeddings —
+    // this family has no text encoder, which is what makes it an M0 fixture
+    // and not a model. It modulates, so it carries the timestep too.
+    let caption = ForwardPass::new();
+    caption.reading(reading)?;
+    caption.stream(LaneStream::Text)?;
+    caption.group(group)?;
+    let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
+        .named(&tag("text"));
+    let txt_pos =
+        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
+            .named(&tag("txt_pos"));
+    caption.input(&ports.text, &txt)?;
+    caption.input(&ports.positions, &txt_pos)?;
+    caption.input(&ports.timestep, &t)?;
 
-        // The image lane: the latents in, the velocity out.
-        let velocity = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
-        let image = ForwardPass::new();
-        image.reading("denoise")?;
-        image.stream(Stream::Image)?;
-        image.group(self.group)?;
-        image.input(
-            "latents",
-            &Channel::from_shaped([rows, width], latents).named(&tag("latents")),
-        )?;
-        image.input(
-            "positions",
-            &Channel::from_shaped([rows, 3u32], case.image_positions.as_slice())
-                .named(&tag("img_pos")),
-        )?;
-        image.input("timestep", &Channel::from([timestep]).named(&tag("img_t")))?;
-        let out = velocity.clone();
-        image.epilogue(move || {
-            // The denoise reading's `logits()`: `[image rows, C·p²]`.
-            out.put(intrinsics::velocity());
-        });
+    // The context lane: block 2's cross-attention keys and values, and
+    // nothing else. No positions — the Wan contract gives cross-attention
+    // no rope — and no timestep, since its class never modulates.
+    let context = ForwardPass::new();
+    context.reading(reading)?;
+    context.stream(LaneStream::Context)?;
+    context.group(group)?;
+    let ctx = Channel::from_shaped(
+        [case.context_rows, case.context_width],
+        case.context.as_slice(),
+    )
+    .named(&tag("ctx"));
+    context.input(&ports.context, &ctx)?;
 
-        // One group, one fire: the lanes are submitted together and the
-        // group table is what lets the caption rows join the image rows'
-        // attention.
-        caption.submit(self.pipe).context("caption lane")?;
-        context.submit(self.pipe).context("context lane")?;
-        image.submit(self.pipe).context("image lane")?;
-        velocity.take_host::<Vec<f32>>().await.map_err(Into::into)
-    }
+    // The image lane: the latents in, the velocity out.
+    let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
+    let image = ForwardPass::new();
+    image.reading(reading)?;
+    image.stream(LaneStream::Image)?;
+    image.group(group)?;
+    let x = Channel::from_shaped([rows, width], latents).named(&tag("latents"));
+    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+        .named(&tag("img_pos"));
+    image.input(&ports.latents, &x)?;
+    image.input(&ports.positions, &img_pos)?;
+    image.input(&ports.timestep, &t)?;
+    let velocity_width = ports.velocity_width;
+    let readback = out.clone();
+    image.epilogue(move || {
+        // The denoise reading's `logits()`: `[image rows, C·p²]`.
+        readback.put(intrinsics::velocity(velocity_width));
+    });
+
+    caption.submit(pipe).context("caption lane")?;
+    context.submit(pipe).context("context lane")?;
+    image.submit(pipe).context("image lane")?;
+    out.take_host::<Vec<f32>>().await.map_err(Into::into)
 }
 
 #[inferlet::main]
@@ -237,45 +244,98 @@ async fn main(input: Input) -> Result<Output> {
     let case: Case =
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
 
+    let reading = model::readings()
+        .into_iter()
+        .find(|reading| !reading.takes_tokens && reading.readout == model::ReadoutKind::Velocity)
+        .ok_or("this model declares no token-less reading with a velocity readout")?;
+    if reading.has_kv {
+        return Err(format!(
+            "reading `{}` binds a kv space; the parity pass binds none",
+            reading.name
+        )
+        .into());
+    }
+    if reading.readout_width != case.patch_features {
+        return Err(format!(
+            "the model reads a {}-wide velocity and the case carries {}-wide patch rows",
+            reading.readout_width, case.patch_features
+        )
+        .into());
+    }
+    let max_rows = model::max_latent_rows();
+    if max_rows > 0 && case.image_rows > max_rows {
+        return Err(format!(
+            "{} rows exceed the model's {max_rows} latent rows a pass",
+            case.image_rows
+        )
+        .into());
+    }
+    let ports = ports(&reading)?;
     let pipe = Pipeline::new();
     let mut out = Output {
         velocity: Vec::new(),
         image_rows: case.image_rows,
         patch_features: case.patch_features,
+        sigmas: Vec::new(),
         euler_v: Vec::new(),
         euler_x: Vec::new(),
     };
 
     if !input.euler {
-        let step = Step {
-            case: &case,
-            pipe: &pipe,
-            group: 0,
-        };
-        out.velocity = step.run(&case.latents, case.timestep).await?;
+        out.velocity = step(
+            &case,
+            &ports,
+            &reading.name,
+            &pipe,
+            0,
+            &case.latents,
+            case.timestep,
+        )
+        .await?;
         pipe.close();
         return Ok(out);
     }
 
-    // The reference's flow-matching schedule: `t = sigma * t_scale`,
-    // `x += (sigma[i+1] - sigma[i]) * v`. Host arithmetic, one group per
-    // step, because a step's latents are the previous step's answer.
-    if case.sigmas.len() < case.steps as usize + 1 {
-        return Err("an Euler run wants steps + 1 sigmas".into());
-    }
-    let mut x = case.latents.clone();
-    for step in 0..case.steps {
-        let sigma = case.sigmas[step as usize];
-        let next = case.sigmas[step as usize + 1];
-        let v = Step {
-            case: &case,
-            pipe: &pipe,
-            group: step,
+    // The schedule the model declares, checked against the one the golden
+    // was generated under: a silent disagreement here would look like a
+    // numerics bug in the trunk.
+    let steps = case.steps.max(1);
+    let sched = match model::schedule() {
+        Some(fact) => FlowMatchEuler::from_schedule(&fact, steps, Some(case.image_rows))?,
+        None => FlowMatchEuler::from_sigmas(case.sigmas.clone(), case.t_scale.max(1.0) as u32),
+    };
+    if !case.sigmas.is_empty() {
+        let drift = sched
+            .sigmas
+            .iter()
+            .zip(&case.sigmas)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        if sched.sigmas.len() != case.sigmas.len() || drift > 1e-6 {
+            return Err(format!(
+                "the model's schedule is {:?} and the golden's is {:?}",
+                sched.sigmas, case.sigmas
+            )
+            .into());
         }
-        .run(&x, sigma * case.t_scale)
+    }
+    out.sigmas = sched.sigmas.clone();
+
+    let mut x = case.latents.clone();
+    for i in 0..steps {
+        let v = step(
+            &case,
+            &ports,
+            &reading.name,
+            &pipe,
+            i,
+            &x,
+            sched.timestep(i),
+        )
         .await?;
+        let dt = sched.dt(i);
         for (xi, vi) in x.iter_mut().zip(&v) {
-            *xi += (next - sigma) * vi;
+            *xi += dt * vi;
         }
         out.euler_v.push(v);
         out.euler_x.push(x.clone());

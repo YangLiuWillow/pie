@@ -41,6 +41,16 @@
 // Legal stages: prologue, on_attn_proj, on_attn, epilogue — the attention
 // interface's. Valid only when `model.pass-kind()` == diffusion.
 //
+// READINGS AND PORTS (imagegen design D1): this interface gains
+// `forward`'s `reading` / `input` / `stream` / `group`, word for word, so
+// a diffusion family with float ports (HunyuanImage 3: 4096 latent rows
+// beside the timestep tokens, pinned prefix pages, writable canvas slots)
+// binds `input("latents")` beside `embed`. `canvas(mode)` stays: it is the
+// attention MODE (causal / bidirectional), a state-kind fact this
+// interface owns; `reading` is the family's ARM, an open set. A family
+// declaring readings makes `attention`/`embed` conditional exactly as
+// `forward.wit` states.
+//
 // All four interfaces deliberately DUPLICATE `embed` / `readout` / `program`
 // / `submit` and their geometry records rather than sharing a `pass-body`
 // (D3): the host keeps one private `PassCore`, and full separation makes
@@ -53,6 +63,7 @@ interface forward-diffusion {
     use pipeline.{pipeline};
     /// The one media-span type, `forward`'s (see `forward-hybrid`).
     use forward.{media-span};
+    use model.{lane-stream};
 
     /// Attention geometry, field for field `forward`'s. Declared separately
     /// per interface ON PURPOSE (D8/D3).
@@ -84,11 +95,28 @@ interface forward-diffusion {
     resource forward-pass {
         constructor();
 
-        /// State binding. REQUIRED — `forward.attention`, unchanged.
+        /// State binding. REQUIRED — `forward.attention`, unchanged — on
+        /// every reading that declares a KV space (a diffusion text's one
+        /// implicit reading does); refused by name on one that does not.
         attention: func(
             kv:   borrow<kv-working-set>,
             geom: kv-geometry,
         ) -> result<_, error>;
+
+        /// `forward.reading`, unchanged: which declared reading this pass
+        /// runs. Optional when the model declares at most one.
+        reading: func(name: string) -> result<_, error>;
+
+        /// `forward.input`, unchanged: bind a channel to one of the
+        /// reading's float ports, read (committed cell) at every submit.
+        input: func(port: string, ch: borrow<channel>) -> result<_, error>;
+
+        /// `forward.stream`, unchanged: which lane stream this pass is.
+        %stream: func(s: lane-stream) -> result<_, error>;
+
+        /// `forward.group`, unchanged: the attention group this pass's
+        /// lanes join within a frame.
+        group: func(id: u32) -> result<_, error>;
 
         /// The reading. REQUIRED: a diffusion pass with no mode is not
         /// submittable, because neither reading is a default the host may
@@ -122,9 +150,24 @@ interface forward-diffusion {
             weights: list<f32>,
         ) -> result<_, error>;
 
+        /// The same taps, read off two of this pass's own channels at every
+        /// submit instead of staged from the host: `rows` a `[length, taps]`
+        /// u32 channel of ids, `weights` a `[length, taps]` f32 channel. A
+        /// persistent binding, set once before the loop; each submit reads
+        /// the channels' COMMITTED cells, so an epilogue that writes the
+        /// next step's taps keeps them loop-carried (`take` then `put`) and
+        /// the guest seeds them with zeros for the first step. The whole
+        /// denoising loop then runs without a host copy a step.
+        self-conditioning-from: func(
+            rows: borrow<channel>,
+            weights: borrow<channel>,
+        ) -> result<_, error>;
+
         /// Bind embedding token ids and CSR row indptr. Both are channels.
         /// On a `denoise` pass the tokens are the canvas — random ids on the
-        /// first step, whatever the guest's sampler wrote after.
+        /// first step, whatever the guest's sampler wrote after. Required
+        /// on a reading that embeds tokens, refused on one that does not
+        /// (`forward.embed`'s rule).
         embed: func(
             tokens: borrow<channel>,
             indptr: borrow<channel>,

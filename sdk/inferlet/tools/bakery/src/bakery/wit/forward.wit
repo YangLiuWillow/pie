@@ -31,9 +31,42 @@
 // record must never move another's ABI.
 
 // THIS FILE: pure attention. llama_like, gemma*, mixtral, kimi, deepseek_v4,
-// glm5, qwen3_vl, csm. Valid only when `model.pass-kind()` == attention.
+// glm5, qwen3_vl, csm — and the generative families' stateless passes
+// (imagegen design D1): a DiT's text encoder, its denoise step, a VAE tile.
+// Valid only when `model.pass-kind()` == attention.
 //
 // Legal stages: prologue, on_attn_proj, on_attn, epilogue.
+//
+// READINGS AND PORTS, NOT A FIFTH INTERFACE (design D1). The four
+// interfaces are split by what the HOST keeps between fires. Seen that way
+// a DiT denoise step and a VAE tile keep NOTHING between fires — the
+// latent is a guest channel — so they are `forward` passes with no KV
+// bound, and a text encoder is a `forward` pass whose KV is discarded
+// after. What those passes lack is not a state kind but PORTS, and the
+// port mechanism already exists in miniature (`forward-diffusion.
+// self-conditioning-from` binds guest channels as model inputs read at
+// every submit). So `forward` gains two verbs, and `forward-diffusion`
+// the same two:
+//
+//   `reading(name)`  which of the family's declared readings (its guarded
+//                    arms: `"text"`, `"denoise"`, `"vae.decode"`, ...) this
+//                    pass runs — the set of readings is OPEN across the
+//                    zoo, the set of state kinds stays CLOSED;
+//   `input(port, ch)` bind a channel to one of the reading's float ports.
+//
+// With them, `attention` and `embed` are no longer unconditionally
+// required: a reading that declares no KV space refuses `attention` by
+// name, one that embeds no tokens refuses `embed`, and `program` demands
+// exactly what the reading declares (`model.readings()`). `pass-kind()`
+// stays honest: a DiT family reports `attention` because its encoder and
+// its denoiser are both attention-kind passes; an H2O or SnapKV inferlet
+// pointed at one fails loudly at `logits()`, not silently.
+//
+// `stream(s)` and `group(id)` are the lane half of design D2: a request
+// whose rows join several streams (an MM-DiT's text and image rectangles)
+// submits ONE PASS PER STREAM, each stamped with its stream, and puts
+// them in one attention group within a frame so they attend each other
+// through `attention.ragged`. Neither is a state kind either.
 //
 // The resource name `forward-pass` is shared by all three interfaces: WIT
 // scopes resource names to their interface, so this is legal and the generated
@@ -46,6 +79,7 @@ interface forward {
     use working-set.{kv-working-set, page-span};
     use pipeline.{pipeline};
     use media.{image, audio};
+    use model.{lane-stream};
 
     /// One attached media span, by the resource the guest is holding.
     ///
@@ -87,18 +121,64 @@ interface forward {
     resource forward-pass {
         constructor();
 
-        /// State binding. REQUIRED -- a pass with no attention binding is not
-        /// submittable.
+        /// State binding. REQUIRED on every reading that declares a KV
+        /// space (`reading-fact.has-kv`, and every text model's one
+        /// implicit reading) -- such a pass with no attention binding is
+        /// not submittable. REFUSED by name on a reading without one (a
+        /// denoise step, a VAE tile): nothing there is a sequence.
         attention: func(
             kv:   borrow<kv-working-set>,
             geom: kv-geometry,
         ) -> result<_, error>;
 
         /// Bind embedding token ids and CSR row indptr. Both are channels.
+        /// REQUIRED on a reading that embeds tokens (`reading-fact.
+        /// takes-tokens`, every text model's), REFUSED on one that does
+        /// not; the lane's row count then comes from the `latents` port's
+        /// channel shape.
         embed: func(
             tokens: borrow<channel>,
             indptr: borrow<channel>,
         ) -> result<_, error>;
+
+        /// Which of the family's declared readings this pass runs
+        /// (`model.readings()`) -- the arm its lanes are stamped with.
+        /// Generalizes `forward-diffusion.canvas(mode)`: the set of
+        /// readings is open across the zoo (`"text"`, `"denoise"`,
+        /// `"denoise.low"`, `"refine"`, `"vae.encode"`, `"vae.decode"`,
+        /// `"upsample"`), while the set of state kinds stays closed.
+        /// Optional when the model declares one reading (or none: a text
+        /// model's implicit reading); refused by name for a name the model
+        /// does not declare. Set before `program`; one reading per pass
+        /// for its life.
+        reading: func(name: string) -> result<_, error>;
+
+        /// Bind a channel to one of the reading's declared float input
+        /// ports (`reading-fact.ports`, by name), read at every submit:
+        /// the channel's COMMITTED cell is the port's value for this lane's
+        /// rows, so `set` or an epilogue `put` advances it and the whole
+        /// denoising loop runs without a host copy a step. Generalizes
+        /// `self-conditioning-from`. The channel's shape is validated
+        /// against the port here (`[rows, width]` for latents / context /
+        /// axis-positions, `[width]` or `[1, width]` for a lane vector),
+        /// and it must be bound into this pass's program (the SDK reads
+        /// it in the prologue when nothing else does). Every port the
+        /// reading declares must be bound before `program`.
+        input: func(port: string, ch: borrow<channel>) -> result<_, error>;
+
+        /// Which lane stream this pass's rows are (design D2). Derived from
+        /// nothing: a reading with several streams means the guest submits
+        /// one pass per stream, and states which this is. Default `text`.
+        /// Refused for a stream the reading does not list. Set before
+        /// `program`.
+        %stream: func(s: lane-stream) -> result<_, error>;
+
+        /// Put this pass's lanes in attention group `id` (design D2): the
+        /// lanes of every pass in one frame that names the same group
+        /// attend each other's rows through `attention.ragged`. Unset is a
+        /// group of the pass's own. Set before `program`; the id is the
+        /// guest's, scoped to a frame.
+        group: func(id: u32) -> result<_, error>;
 
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;

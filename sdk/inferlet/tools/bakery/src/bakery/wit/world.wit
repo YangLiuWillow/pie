@@ -17,6 +17,7 @@ world inferlet {
     import reasoning;
     import media;
     import speech;
+    import frames;              // pixel / sample output, encoded host-side
     import session;
     import system;
 

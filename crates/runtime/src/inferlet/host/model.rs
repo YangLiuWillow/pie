@@ -8,6 +8,67 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
+/// A catalog stream as the WIT enum spells it.
+pub fn lane_stream(stream: models::Stream) -> pie::inferlet::model::LaneStream {
+    use pie::inferlet::model::LaneStream;
+    match stream {
+        models::Stream::Text => LaneStream::Text,
+        models::Stream::Image => LaneStream::Image,
+        models::Stream::Video => LaneStream::Video,
+        models::Stream::Audio => LaneStream::Audio,
+        models::Stream::Context => LaneStream::Context,
+        models::Stream::Reference => LaneStream::Reference,
+    }
+}
+
+/// The WIT enum as the catalog spells it.
+pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> models::Stream {
+    use pie::inferlet::model::LaneStream;
+    match stream {
+        LaneStream::Text => models::Stream::Text,
+        LaneStream::Image => models::Stream::Image,
+        LaneStream::Video => models::Stream::Video,
+        LaneStream::Audio => models::Stream::Audio,
+        LaneStream::Context => models::Stream::Context,
+        LaneStream::Reference => models::Stream::Reference,
+    }
+}
+
+/// One catalog reading as `model.readings()` answers it.
+fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingFact {
+    use pie::inferlet::model::{PortKind, ReadoutKind};
+    pie::inferlet::model::ReadingFact {
+        name: reading.name.to_string(),
+        index: reading.index,
+        has_kv: reading.has_kv,
+        takes_tokens: reading.takes_tokens,
+        streams: reading.streams.iter().copied().map(lane_stream).collect(),
+        ports: reading
+            .ports
+            .iter()
+            .map(|port| pie::inferlet::model::PortFact {
+                name: port.name.to_string(),
+                kind: match port.kind {
+                    models::PortKind::Latents => PortKind::Latents,
+                    models::PortKind::LaneVector => PortKind::LaneVector,
+                    models::PortKind::Context => PortKind::Context,
+                    models::PortKind::AxisPositions => PortKind::AxisPositions,
+                },
+                width: port.width,
+                // Every float port is fed from an f32 channel: the WIT dtype
+                // set has no bf16, and the engine marshals at the feed.
+                dtype: pie::inferlet::types::Dtype::F32,
+            })
+            .collect(),
+        readout: match reading.readout {
+            models::ReadoutKind::Logits => ReadoutKind::Logits,
+            models::ReadoutKind::Velocity => ReadoutKind::Velocity,
+            models::ReadoutKind::Hidden => ReadoutKind::Hidden,
+        },
+        readout_width: reading.readout_width,
+    }
+}
+
 impl pie::inferlet::model::Host for ProcessCtx {
     async fn name(&mut self) -> Result<String> {
         Ok(model::model().name().to_string())
@@ -27,12 +88,14 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
         let caps = model::model().eta_caps();
-        Ok((caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
-            rows: caps.draft_block,
-            mask_token: caps.draft_mask_token,
-            bidirectional: caps.draft_bidirectional,
-            proposals_from: caps.draft_proposals_from,
-        }))
+        Ok(
+            (caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
+                rows: caps.draft_block,
+                mask_token: caps.draft_mask_token,
+                bidirectional: caps.draft_bidirectional,
+                proposals_from: caps.draft_proposals_from,
+            }),
+        )
     }
 
     /// Which forward-pass interface the bound model requires, keyed on state
@@ -66,6 +129,51 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 hidden: d.hidden,
                 self_cond_taps: d.self_cond_taps,
             }))
+    }
+
+    /// The family's readings (design D12), in index order; empty for a
+    /// text row.
+    async fn readings(&mut self) -> Result<Vec<pie::inferlet::model::ReadingFact>> {
+        Ok(model::model().readings().iter().map(reading_fact).collect())
+    }
+
+    /// The latent space a denoiser works in; `None` for a text row.
+    async fn latent(&mut self) -> Result<Option<pie::inferlet::model::LatentSpace>> {
+        Ok(model::model().generative().and_then(|g| g.latent).map(|l| {
+            pie::inferlet::model::LatentSpace {
+                channels: l.channels,
+                patch_t: l.patch_t,
+                patch_h: l.patch_h,
+                patch_w: l.patch_w,
+                spatial_compression: l.spatial_compression,
+                temporal_compression: l.temporal_compression,
+            }
+        }))
+    }
+
+    /// The schedule the denoiser was trained under; `None` when nothing
+    /// denoises.
+    async fn schedule(&mut self) -> Result<Option<pie::inferlet::model::ScheduleFact>> {
+        use pie::inferlet::model::ScheduleKind;
+        Ok(model::model()
+            .generative()
+            .and_then(|g| g.schedule.as_ref())
+            .map(|s| pie::inferlet::model::ScheduleFact {
+                kind: match s.kind {
+                    models::ScheduleKind::Flow => ScheduleKind::Flow,
+                    models::ScheduleKind::Epsilon => ScheduleKind::Epsilon,
+                    models::ScheduleKind::V => ScheduleKind::V,
+                },
+                shift: s.shift,
+                train_steps: s.train_steps,
+                boundary: s.boundary,
+                pinned_sigmas: s.pinned_sigmas.clone(),
+            }))
+    }
+
+    /// The most latent rows one pass carries; 0 without a float lane.
+    async fn max_latent_rows(&mut self) -> Result<u32> {
+        Ok(model::model().generative().map_or(0, |g| g.max_rows))
     }
 
     /// LM-head output dimension (`hf_config.vocab_size`), not the tokenizer

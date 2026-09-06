@@ -98,11 +98,14 @@ checkpoint = { path = "../checkpoint", default-features = false }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# Host-side media decode: only the container formats the host accepts.
+# Host-side media decode and encode: only the container formats the host
+# accepts (in) or writes (out). `webp` is here for `frames.encode(webp)`; it
+# pulls the pure-Rust `image-webp`, whose encoder is lossless-only.
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
     "gif",
+    "webp",
 ] }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
@@ -111,6 +114,17 @@ wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
 wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
 libc = "0.2"
+# The CUDA driver, for `codec::nvenc`'s encode session only: the engine owns
+# every other device call. Pinned to `engine-cuda`'s version (see the `cuda`
+# feature) because cargo unifies features across the graph.
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "fallback-dynamic-loading",
+] }
+# `dlopen` for `libnvidia-encode.so.1`. Same major as the one cudarc already
+# links, so this adds a dependency edge and not a crate.
+libloading = { version = "0.9", optional = true }
 # default-features off so `default-tls` (native-tls → openssl) is never pulled
 # in: it dynamically links libssl.so.1.1, which breaks the manylinux_2_28
 # release binary on OpenSSL-3 distros. rustls links statically.
@@ -143,7 +157,13 @@ default = []
 # runtime selected (every device call answers `Fault::Runtimeless`), so naming
 # the dep alone links a shell that cannot bind a device. If a second CUDA ABI
 # ever returns, the version returns to the feature name — never a bare alias.
-cuda = ["dep:engine-cuda", "engine-cuda/cuda"]
+# `dep:cudarc` and `dep:libloading` ride along for `codec::nvenc`: opening an
+# NVENC session needs a CUDA context (cudarc's, so the encoder shares the
+# engine's primary context rather than opening a second one), and
+# `libnvidia-encode.so.1` is reached by `dlopen` exactly the way cudarc reaches
+# every CUDA library. The `cudarc` version and feature set must match
+# `engine-cuda`'s, since cargo unifies them into one build.
+cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
 # The Metal shell. `engine-metal` is target-gated rather than feature-gated, so
 # this flag alone is not a build that links a device: every `#[cfg]` reading it
 # pairs it with `target_vendor = "apple"`.
