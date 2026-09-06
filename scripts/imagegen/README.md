@@ -24,6 +24,7 @@ scripts/imagegen/
   hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
   golden_common.py        shared tap/hook/manifest plumbing
   compare.py              npz-vs-npz diff with tolerance gates
+  gates.py                EVERY gate above, one command, one table (§6)
 ```
 
 ---
@@ -753,3 +754,116 @@ PASS
 
 For the Z-Image RMSNorm bit-exactness gate (`z-image.md` §K.2 asks for
 `torch.equal` on norm outputs, not a tolerance) use `--tol 0 --keys '*norm*'`.
+
+---
+
+## 6. `gates.py` — every gate above, one command
+
+Six families landed with their own harnesses, their own flags and their own
+idioms, and for a while nobody had run them together on one tree.  `gates.py`
+does: it drives every parity gate this effort built, in a fixed order, and
+prints one table plus a machine-readable summary line and an exit code.  A
+person should be able to run it and tell at a glance whether `dev` is healthy.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python scripts/imagegen/gates.py            # all of it
+python scripts/imagegen/gates.py --list                            # the roster
+python scripts/imagegen/gates.py --only flux2-klein --only wan-mini
+python scripts/imagegen/gates.py --json /tmp/gates.json            # the table, as data
+```
+
+It re-implements nothing.  Every number in the table is printed by a harness
+or by `compare.py`, and every PASS/FAIL is a harness's own exit status; this
+file is the roster, the plumbing and the reaper.
+
+### The roster, and what each expected number means
+
+| gate | what it wraps | expected | what the number is |
+|---|---|---|---|
+| `mini-dit` | `mini_dit_parity.py all`, and `--euler` | cos ≥ 0.9999 (0.99996) | the M0 synthetic DiT, one step and the four-step Euler run, against the bf16-emulated reference (§3). The gate is the measured bf16 drift of a three-block trunk. |
+| `zimage-mini` | `zimage_parity.py --mode mini`, `--mode mini_pad` | ≥ 0.9999 (0.999985) | the random-init Z-Image miniature, once on exact rows and once on rows that NEED padding (48→64 image, 40→64 caption). |
+| `zimage-turbo` | `zimage_parity.py gate` | text 0.99999, turbo 0.9998, steps 0.9972, PSNR ≥ 33 dB | the flagship: the `text` reading, the step-0 `denoise`, the whole text→refine→denoise `chain`, then the eight-step trajectory, then the VAE decode of both final latents. |
+| `flux2-mini` | `flux2_parity.py all` | 0.99999 | the FLUX.2 miniature's one denoise step over three lanes of one group (text, target, references). |
+| `flux2-klein` | `flux2_klein_parity.py all` | per-step velocities ≥ 0.999, PSNR ≥ 34 dB | the real klein-4B row: `text.hidden`, `dit.step0.out` and `probe.step{0..3}.out` are gated; the four-step trajectory and the picture's PSNR are reported. |
+| `flux2-vae` | `cargo test -p engine-cuda --features cuda --test the_flux_2_vae_answers_the_reference` | decode 0.99999, encode 0.99995 | the autoencoder alone, host-fed, against the fp32 diffusers reference. |
+| `zimage-vae` | `zimage_vae_parity.py all`, then `the_z_image_vae_answers_the_reference` | 0.99998 | the same VAE reading twice: once fired FROM A GUEST through the real runtime, once from the host. The two roads must agree with the reference to the same distance. |
+| `wan-mini` | `wan22_parity.py all`, `all --pertoken` | 0.999925, and the conditioning must MOVE | the `d128` miniature under both timestep forms (scalar, and TI2V's per-token one), each followed by the `conditioning` claim: zeroing the umT5 context must move the velocity by more than the gate's own slack. |
+| `h3-mini` | `h3_parity.py all` | refined-text / video / audio ≥ 0.9999 | MiniMax H3's `refine` pass and one four-lane `denoise` step, three readouts. |
+| `hy3-mini` | `hy3_parity.py all` | velocity 0.999997, plus two claims | HunyuanImage 3's whole denoise step in three fires, plus `the prefix conditions the canvas` and `the prefix K/V is reused exactly` (D10's claim: after step 0 the prefix is never recomputed). |
+| `ltx2-mini` | `ltx2_parity.py all`, `all --refine`, `matters` | cos ≥ 0.9999 | the LTX-2.5 miniature's four-lane joint step, its two connector passes, and the claim that every conditioning stream moves the answer. The README states no landed number for this family; the harness's own `--cos-tol` is the gate. |
+| `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. FLUX.2 hands back the final latent (its VAE is traced, not a declared reading), so the gate finishes with `decode_latent.py` and then checks the PNG magic, its box and its size. |
+
+**The endpoint gates for distilled trajectories are BELOW the bf16 floor by
+design, and are reported rather than gated.**  Both `zimage`'s eight-step
+trajectory and `flux2-klein`'s four-step one integrate a schedule whose last
+step takes a large σ to 0, which amplifies a per-step velocity difference
+several-fold.  Each harness records its own measured **fp32-reference floor** —
+the distance the SAME diffusers transformer in fp32 reaches against the
+recorded bf16 dump:
+
+- `zimage_parity.py`, `TOLERANCES["steps"]`: replaying the eight steps in fp32
+  lands cos **0.99726** against the recorded `latent.final`. The gate is
+  `--cos-tol 0.995`; the per-STEP claims (`--stop 1` at 0.9999985, the step-0
+  velocity at 0.99966) are where 0.999 belongs.
+- `flux2_klein_parity.py`, its NUMERICS header: fp32 reads cos **0.999618** on
+  the velocity and **0.997510** on `latent.final` against the bf16 golden —
+  i.e. an exact fp32 computation is FARTHER from the golden than pie is. The
+  per-step velocities are gated at 0.999 and the endpoint is checked as PSNR
+  after the decode.
+
+A trajectory number below those floors is not a bug in the engine; a
+per-step velocity below 0.999 is.
+
+### The three rules the runner enforces itself
+
+Each has been paid for once already.
+
+- **Its own config, its own port.**  Every gate gets
+  `~/.pie/config.gates-<name>.toml`, written fresh each run, with its own
+  `[server] port` (probed free before it is written), its own
+  `fs_scratch_dir`, and `[engine] max_model_len` at rows × submit depth —
+  never the 4096 default, which kills a 1024² job on its second fire.  Several
+  agents share this box and a shared config file has been repointed at another
+  artifact mid-run, which reads exactly like a numerics regression.
+- **A missing artifact or golden is a `skip`, not a `FAIL`.**  Each gate names
+  the files it needs; when one is absent the row says `skip` and the reason
+  names the file and the command that would make it (`pie model import …`,
+  `python <family>_golden.py --mini`).  A red table means a regression.
+- **Every gate reaps its server in a `finally`.**  A failed `pie run` has left
+  a process holding 35 GiB of a card, and the NEXT gate then died with a
+  misleading elastic-memory message.  Each step runs in its own process
+  session, so the whole tree can be killed on a timeout, and afterwards the
+  runner sweeps `/proc` for any `pie` still carrying THIS gate's config path.
+  The config path is the marker, so a server belonging to another agent on the
+  box is never a candidate.
+
+### The output
+
+```
+gate      status  measured      expected                        note
+--------  ------  ------------  ------------------------------  ----
+mini-dit  pass    cos 0.999956  cos >= 0.9999 (landed 0.99996)
+
+gates: verdict=HEALTHY total=1 pass=1 fail=0 skip=0 error=0 seconds=18 mini-dit=pass
+```
+
+The last line is the machine-readable one: `key=value` pairs, then one
+`name=status` per gate.  Exit is 0 when nothing failed (a skip does not fail
+the run) and 1 otherwise.  `--json PATH` writes the same table as data, and the
+full transcript of every command — servers' logs included — lands in
+`<out>/gates.log`.
+
+### The state the roster found (2026-09-06)
+
+Eleven of the twelve gates pass and reproduce the number their family
+recorded, to the last digit the table prints.  The one red row is
+`flux2-mini`, and it is not drift: the guest
+`tests/inferlets/flux2-parity/src/lib.rs` submits all THREE passes of its one
+attention group down ONE `Pipeline`, and a pipeline is serial — the three
+arrive as one lane and count once.  `97bdf6185` (frame-seal) made that a
+named refusal ("attention group 0 never composed: 3 live forward passes name
+the group and only 1 of them reached the runtime on a lane of its own"); the
+0.99999 predates it, when the same shape silently fired the image lane alone
+and a random-init miniature's missing caption sat under the tolerance.  Its
+siblings — `mini-dit-parity`, `zimage-parity`, `flux2-klein-parity`,
+`ltx2-parity` — already give each lane a pipeline of its own.
