@@ -18,7 +18,6 @@ fn text() -> ReadingFact {
         has_kv: true,
         takes_tokens: true,
         streams: Vec::new(),
-            at: None,
         ports: Vec::new(),
         readout: ReadoutKind::Hidden,
         readout_width: 512,
