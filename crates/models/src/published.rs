@@ -80,6 +80,7 @@ pub fn lookup(target: &str, drafter: &str) -> Option<&'static Published> {
 /// Every published head this build knows for `target`.
 pub fn for_target(target: &str) -> impl Iterator<Item = &'static Published> {
     let wanted = target.to_ascii_lowercase().replace("--", "/");
-    PUBLISHED.iter().filter(move |p| p.target.to_ascii_lowercase() == wanted)
+    PUBLISHED
+        .iter()
+        .filter(move |p| p.target.to_ascii_lowercase() == wanted)
 }
-

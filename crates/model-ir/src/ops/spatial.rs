@@ -62,11 +62,14 @@ pub enum TimePad {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GridRule {
     /// A convolution: `(n + front + back - k) / stride + 1` per axis, the
-    /// time axis padded only in front under `causal_t`.
+    /// front pad `pad`, the back pad `pad_back` (a symmetric convolution
+    /// states them equal), the time axis padded only in front under
+    /// `causal_t`.
     Conv {
         k: [u32; 3],
         stride: [u32; 3],
         pad: [u32; 3],
+        pad_back: [u32; 3],
         causal_t: bool,
     },
     /// Nearest upsample: `(t·ft, h·fh, w·fw)`, or `1 + (t-1)·ft` frames
@@ -93,6 +96,7 @@ impl GridRule {
                 k,
                 stride,
                 pad,
+                pad_back,
                 causal_t,
             } => {
                 let axis = |n: u32, k: u32, s: u32, front: u32, back: u32| {
@@ -100,11 +104,11 @@ impl GridRule {
                         .checked_sub(k)
                         .map(|span| span / s.max(1) + 1)
                 };
-                let back_t = if causal_t { 0 } else { pad[0] };
+                let back_t = if causal_t { 0 } else { pad_back[0] };
                 Some([
                     axis(t, k[0], stride[0], pad[0], back_t)?,
-                    axis(h, k[1], stride[1], pad[1], pad[1])?,
-                    axis(w, k[2], stride[2], pad[2], pad[2])?,
+                    axis(h, k[1], stride[1], pad[1], pad_back[1])?,
+                    axis(w, k[2], stride[2], pad[2], pad_back[2])?,
                 ])
             }
             GridRule::Upsample {
@@ -174,9 +178,14 @@ pub enum Spatial {
     /// a checkpoint's natural `[C_out, C_in·kt·kh·kw]` rectangle is
     /// relabelled once at load (`ParamLayout::ConvTapsMajor`); `bias` is
     /// `[C_out]` f32. `y_grid` is `Grid { rule: Conv {..} }` of `grid`.
-    /// `cache`: a `Def::Cache` state slab for the front frames under
-    /// `causal_t` (module doc), read before and written after the launch.
-    /// fp32 accumulation, one rounding at the store.
+    /// `pad` is the zero padding IN FRONT of each axis and `pad_back` the
+    /// padding BEHIND it (`F.pad(x, (0, 1, 0, 1))` before a stride-2 conv,
+    /// the diffusers `Downsample2D`, is `pad [0, 0, 0]`, `pad_back [0, 1,
+    /// 1]`); a symmetric convolution states them equal. Only the front pad
+    /// shifts the tap window; the back pad reaches the kernel through the
+    /// output box alone. `cache`: a `Def::Cache` state slab for the front
+    /// frames under `causal_t` (module doc), read before and written after
+    /// the launch. fp32 accumulation, one rounding at the store.
     Conv3d {
         x: ValueId,
         grid: ValueId,
@@ -185,6 +194,7 @@ pub enum Spatial {
         k: [u32; 3],
         stride: [u32; 3],
         pad: [u32; 3],
+        pad_back: [u32; 3],
         causal_t: bool,
         time_pad: TimePad,
         cache: Option<ValueId>,
@@ -203,6 +213,24 @@ pub enum Spatial {
         bias: ValueId,
         eps: f32,
         silu: bool,
+        y: ValueId,
+    },
+    /// The conv VAE's mid-block attention: ONE head as wide as the row,
+    /// per clip over every voxel of the clip — `y = softmax(q·kᵀ ·
+    /// sm_scale) · v` with `q`, `k`, `v`, `y` all `[rows, C]` bf16 on the
+    /// voxel axis, segments read off `grid`. Not `attention.ragged`: that
+    /// kernel is stamped at head widths 64/128/256 and a VAE's head is its
+    /// whole channel row (512 on the FLUX VAE), and its CSR is a token-axis
+    /// table. fp32 scores, fp32 online softmax (the reference's
+    /// `upcast_softmax`), fp32 accumulation, one rounding at the store. A
+    /// plain online-softmax walk over the clip's keys, not a flash tiling:
+    /// a VAE attends at its lowest resolution (`h·w` of a few thousand).
+    Attention {
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        grid: ValueId,
+        sm_scale: f32,
         y: ValueId,
     },
     /// Nearest-neighbour upsample by `factor = [ft, fh, fw]`; frame 0 is
@@ -285,6 +313,7 @@ impl Operands for Spatial {
                 bias,
                 ..
             } => sink.extend([*x, *grid, *weight, *bias]),
+            Self::Attention { q, k, v, grid, .. } => sink.extend([*q, *k, *v, *grid]),
             Self::UpsampleNearest {
                 x, grid, y_grid, ..
             }
@@ -303,6 +332,7 @@ impl Operands for Spatial {
             Self::Grid { y, .. }
             | Self::Conv3d { y, .. }
             | Self::GroupNorm { y, .. }
+            | Self::Attention { y, .. }
             | Self::UpsampleNearest { y, .. }
             | Self::PixelShuffle { y, .. }
             | Self::PixelUnshuffle { y, .. }
@@ -317,6 +347,7 @@ impl Operands for Spatial {
             Self::Grid { .. }
             | Self::Conv3d { .. }
             | Self::GroupNorm { .. }
+            | Self::Attention { .. }
             | Self::UpsampleNearest { .. }
             | Self::PixelShuffle { .. }
             | Self::PixelUnshuffle { .. }
@@ -329,6 +360,7 @@ impl Operands for Spatial {
             Self::Grid { .. } => "spatial.grid",
             Self::Conv3d { .. } => "spatial.conv3d",
             Self::GroupNorm { .. } => "spatial.group_norm",
+            Self::Attention { .. } => "spatial.attention",
             Self::UpsampleNearest { .. } => "spatial.upsample_nearest",
             Self::PixelShuffle { .. } => "spatial.pixel_shuffle",
             Self::PixelUnshuffle { .. } => "spatial.pixel_unshuffle",
@@ -351,6 +383,7 @@ mod tests {
             k: [3, 3, 3],
             stride: [1, 2, 2],
             pad: [1, 1, 1],
+            pad_back: [1, 1, 1],
             causal_t: false,
         };
         assert_eq!(conv.out_extent([5, 7, 8]), Some([5, 4, 4]));
@@ -358,9 +391,21 @@ mod tests {
             k: [3, 3, 3],
             stride: [1, 1, 1],
             pad: [2, 1, 1],
+            pad_back: [2, 1, 1],
             causal_t: true,
         };
         assert_eq!(causal.out_extent([5, 7, 8]), Some([5, 7, 8]));
+        // diffusers' `Downsample2D`: `F.pad(x, (0, 1, 0, 1))` then a 3x3
+        // stride-2 convolution with no padding of its own halves an even box.
+        let down = GridRule::Conv {
+            k: [1, 3, 3],
+            stride: [1, 2, 2],
+            pad: [0, 0, 0],
+            pad_back: [0, 1, 1],
+            causal_t: false,
+        };
+        assert_eq!(down.out_extent([1, 64, 64]), Some([1, 32, 32]));
+        assert_eq!(down.out_extent([1, 7, 9]), Some([1, 3, 4]));
         let up = GridRule::Upsample {
             factor: [2, 2, 2],
             keep_first_frame: true,

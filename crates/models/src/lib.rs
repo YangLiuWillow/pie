@@ -14,8 +14,8 @@ pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
 pub mod template;
-pub mod z_image;
 pub mod tokenizer;
+pub mod z_image;
 
 use std::sync::LazyLock;
 
@@ -67,7 +67,8 @@ pub struct Sku {
     pub trace: model_dsl::TraceFn,
     pub classify: ClassifyFn,
     pub import: ImportFn,
-    pub template: fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
+    pub template:
+        fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
     pub tokenizer: &'static tokenizer::Contract,
     /// The canvas a block-diffusion text denoises; `None` for every
     /// autoregressive row. What `model.pass-kind()` reads `diffusion` off,
@@ -153,13 +154,14 @@ impl ReadingFact {
 
     /// Every port with its kind-relative index, in declaration order.
     pub fn ports_indexed(&self) -> impl Iterator<Item = (u8, &PortFact)> + '_ {
-        let mut seen = [0u8; 4];
+        let mut seen = [0u8; 5];
         self.ports.iter().map(move |port| {
             let slot = match port.kind {
                 PortKind::Latents => 0,
                 PortKind::LaneVector => 1,
                 PortKind::Context => 2,
                 PortKind::AxisPositions => 3,
+                PortKind::Voxels => 4,
             };
             let index = seen[slot];
             seen[slot] = seen[slot].saturating_add(1);
@@ -203,6 +205,11 @@ pub enum PortKind {
     Context,
     /// `RuntimeInput::AxisPositions`: `[rows, axes]` f32, `1..=4` axes.
     AxisPositions,
+    /// `RuntimeInput::Voxels` (design D8): `[t·h·w, channels]` on the voxel
+    /// axis, one clip per lane — a VAE's tile. The channel is
+    /// `[t, h, w, channels]` (or `[h, w, channels]` for a still), which is
+    /// how the clip's box reaches the engine beside its rows.
+    Voxels,
 }
 
 /// Which export seam a reading's epilogue reads.
@@ -214,6 +221,10 @@ pub enum ReadoutKind {
     Velocity,
     /// `seam::HIDDEN`, `intrinsics::hidden(width)`.
     Hidden,
+    /// `seam::PIXELS` (design D8): one row per output voxel of the lane's
+    /// clip, `[t'·h'·w', width]`, read back with the clip's output box
+    /// (`engine::fire::ReadoutSeam::Pixels`).
+    Pixels,
 }
 
 /// The latent space a family's denoiser works in: what one latent row is

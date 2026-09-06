@@ -146,8 +146,12 @@ pub const SELF_COND_TAPS: u32 = 64;
 /// width differs, the drafter's does not.
 const ASSISTANT_HIDDEN: u32 = 1024;
 const ASSISTANT_INTER: u32 = 8192;
-const ASSISTANT_READINGS: [Reading; 4] =
-    [Reading::Sliding, Reading::Sliding, Reading::Sliding, Reading::Global];
+const ASSISTANT_READINGS: [Reading; 4] = [
+    Reading::Sliding,
+    Reading::Sliding,
+    Reading::Sliding,
+    Reading::Global,
+];
 /// Chained drafts per verify. Every chain step is a head pass paid whether
 /// or not the window uses it, and on the M1 Max a verify row costs 0.5–0.6
 /// of a first row, so the only window that pays for itself is `k = 1`:
@@ -551,32 +555,32 @@ impl Model {
 
     fn e4b_dims() -> Dims {
         Dims {
-                tower: None,
-                self_cond: false,
-                self_cond_w: None,
-                draft: false,
-                assistant: false,
-                dflash: None,
-                hidden: 2560,
-                layers: 42,
-                full_every: 6,
-                q_heads: 8,
-                kv_heads: 2,
-                head_dim: 256,
-                global_head_dim: 512,
-                global_kv_heads: 2,
-                global_rotary_dim: 128,
-                theta_local: 10_000.0,
-                theta_global: 1_000_000.0,
-                sm_scale: 1.0,
-                intermediate: 10_240,
-                vocab: 262_144,
-                shared_tail: Some(18),
-                ple_dim: Some(256),
-                softcap: Some(30.0),
-                window: 512,
-                norm_eps: 1e-6,
-                moe: None,
+            tower: None,
+            self_cond: false,
+            self_cond_w: None,
+            draft: false,
+            assistant: false,
+            dflash: None,
+            hidden: 2560,
+            layers: 42,
+            full_every: 6,
+            q_heads: 8,
+            kv_heads: 2,
+            head_dim: 256,
+            global_head_dim: 512,
+            global_kv_heads: 2,
+            global_rotary_dim: 128,
+            theta_local: 10_000.0,
+            theta_global: 1_000_000.0,
+            sm_scale: 1.0,
+            intermediate: 10_240,
+            vocab: 262_144,
+            shared_tail: Some(18),
+            ple_dim: Some(256),
+            softcap: Some(30.0),
+            window: 512,
+            norm_eps: 1e-6,
+            moe: None,
         }
     }
 
@@ -621,36 +625,36 @@ impl Model {
     }
 
     fn b31_dims() -> Dims {
-            Dims {
-                tower: None,
-                self_cond: false,
-                self_cond_w: None,
-                draft: false,
-                assistant: false,
-                dflash: None,
-                hidden: 5376,
-                layers: 60,
-                full_every: 6,
-                q_heads: 32,
-                kv_heads: 16,
-                head_dim: 256,
-                global_head_dim: 512,
-                global_kv_heads: 4,
-                global_rotary_dim: 128,
-                theta_local: 10_000.0,
-                theta_global: 1_000_000.0,
-                sm_scale: 1.0,
-                intermediate: 21_504,
-                vocab: 262_144,
-                shared_tail: None,
-                ple_dim: None,
-                softcap: Some(30.0),
-                // `text_config.sliding_window`, from the checkpoint. Distinct
-                // from e4b's 512; the two stacks are separate models.
-                window: 1024,
-                norm_eps: 1e-6,
-                moe: None,
-            }
+        Dims {
+            tower: None,
+            self_cond: false,
+            self_cond_w: None,
+            draft: false,
+            assistant: false,
+            dflash: None,
+            hidden: 5376,
+            layers: 60,
+            full_every: 6,
+            q_heads: 32,
+            kv_heads: 16,
+            head_dim: 256,
+            global_head_dim: 512,
+            global_kv_heads: 4,
+            global_rotary_dim: 128,
+            theta_local: 10_000.0,
+            theta_global: 1_000_000.0,
+            sm_scale: 1.0,
+            intermediate: 21_504,
+            vocab: 262_144,
+            shared_tail: None,
+            ple_dim: None,
+            softcap: Some(30.0),
+            // `text_config.sliding_window`, from the checkpoint. Distinct
+            // from e4b's 512; the two stacks are separate models.
+            window: 1024,
+            norm_eps: 1e-6,
+            moe: None,
+        }
     }
 
     /// The mixture SKU: 30 layers, hidden 2816. Global layers are
@@ -719,38 +723,38 @@ impl Model {
     }
 
     fn a4b_dims() -> Dims {
-            Dims {
-                tower: None,
-                self_cond: false,
-                self_cond_w: None,
-                draft: false,
-                assistant: false,
-                dflash: None,
-                hidden: 2816,
-                layers: 30,
-                full_every: 6,
-                q_heads: 16,
-                kv_heads: 8,
-                head_dim: 256,
-                global_head_dim: 512,
-                global_kv_heads: 2,
-                global_rotary_dim: 128,
-                theta_local: 10_000.0,
-                theta_global: 1_000_000.0,
-                sm_scale: 1.0,
-                intermediate: 2112,
-                vocab: 262_144,
-                shared_tail: None,
-                ple_dim: None,
-                softcap: Some(30.0),
-                window: 1024,
-                norm_eps: 1e-6,
-                moe: Some(MoeDims {
-                    experts: 128,
-                    top_k: 8,
-                    inter: 704,
-                }),
-            }
+        Dims {
+            tower: None,
+            self_cond: false,
+            self_cond_w: None,
+            draft: false,
+            assistant: false,
+            dflash: None,
+            hidden: 2816,
+            layers: 30,
+            full_every: 6,
+            q_heads: 16,
+            kv_heads: 8,
+            head_dim: 256,
+            global_head_dim: 512,
+            global_kv_heads: 2,
+            global_rotary_dim: 128,
+            theta_local: 10_000.0,
+            theta_global: 1_000_000.0,
+            sm_scale: 1.0,
+            intermediate: 2112,
+            vocab: 262_144,
+            shared_tail: None,
+            ple_dim: None,
+            softcap: Some(30.0),
+            window: 1024,
+            norm_eps: 1e-6,
+            moe: Some(MoeDims {
+                experts: 128,
+                top_k: 8,
+                inter: 704,
+            }),
+        }
     }
 
     fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
@@ -877,11 +881,7 @@ impl Model {
                         Moe {
                             router_norm: norm("router_norm", hidden),
                             router_norm_eps: d.norm_eps,
-                            router: Weight::sym(
-                                n("router"),
-                                [m.experts as u64, hidden],
-                                gate,
-                            ),
+                            router: Weight::sym(n("router"), [m.experts as u64, hidden], gate),
                             per_expert_scale: Weight::sym(
                                 n("per_expert_scale"),
                                 [m.experts as u64],
@@ -1146,7 +1146,8 @@ impl Model {
                     taps: SELF_COND_TAPS,
                     pre_norm: Weight::sym("self_cond.pre_norm", [hidden], dense),
                     norm_eps: d.norm_eps,
-                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], sw).packed([iw, iw]),
+                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], sw)
+                        .packed([iw, iw]),
                     inter: intermediate,
                     down: Weight::sym("self_cond.down", [hidden, iw], sw).rows(),
                 }
@@ -1175,5 +1176,4 @@ impl Model {
 /// changed by editing this line and re-tracing.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-impl Model {
- }
+impl Model {}

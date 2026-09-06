@@ -477,20 +477,12 @@ impl ForwardHybrid for Model {
                 Some(x) => {
                     // Dense-layer FFN output would go straight to
                     // `post_ffw_norm`; here it has a routed sibling to sum with first.
-                    let h1 = ops::elemwise::rmsnorm(
-                        &f,
-                        &x.post_ffw_norm_1,
-                        x.post_ffw_norm_1_eps,
-                    );
+                    let h1 = ops::elemwise::rmsnorm(&f, &x.post_ffw_norm_1, x.post_ffw_norm_1_eps);
                     // Both branches and the router read `y` (the
                     // post-attention residual), not the dense branch's norm output.
                     let (routes, weights) = ops::linear::moe_topk_softmax_scaled(
                         &ops::linear::matmul(
-                            &ops::elemwise::rmsnorm(
-                                &y,
-                                &x.router_norm,
-                                x.router_norm_eps,
-                            ),
+                            &ops::elemwise::rmsnorm(&y, &x.router_norm, x.router_norm_eps),
                             &x.router,
                         ),
                         &x.per_expert_scale,
@@ -514,8 +506,7 @@ impl ForwardHybrid for Model {
                     };
                     let hidden =
                         ops::linear::mlp_geglu_tanh_packed(&select(&moe_in, &x.gate_up), x.inter);
-                    let routed =
-                        ops::linear::moe_weighted_sum(&select(&hidden, &x.down), &weights);
+                    let routed = ops::linear::moe_weighted_sum(&select(&hidden, &x.down), &weights);
                     // `down` is rows-cut so each rank holds a partial; weights
                     // are replicated, so summing then reducing equals
                     // reducing then summing.
@@ -524,11 +515,8 @@ impl ForwardHybrid for Model {
                     } else {
                         routed
                     };
-                    let h2 = ops::elemwise::rmsnorm(
-                        &routed,
-                        &x.post_ffw_norm_2,
-                        x.post_ffw_norm_2_eps,
-                    );
+                    let h2 =
+                        ops::elemwise::rmsnorm(&routed, &x.post_ffw_norm_2, x.post_ffw_norm_2_eps);
                     ops::elemwise::residual_add(&h1, &h2)
                 }
             };
@@ -626,8 +614,10 @@ impl ForwardHybrid for Model {
                 &dy,
             );
             let mlp_in = ops::elemwise::rmsnorm(&dy, &a.pre_ffw_norm, a.norm_eps);
-            let act =
-                ops::linear::mlp_geglu_tanh_packed(&ops::linear::matmul(&mlp_in, &a.gate_up), a.inter);
+            let act = ops::linear::mlp_geglu_tanh_packed(
+                &ops::linear::matmul(&mlp_in, &a.gate_up),
+                a.inter,
+            );
             let f = ops::linear::matmul(&act, &a.down);
             let f = if m.tp > 1 {
                 ops::collective::all_reduce(&f)
@@ -695,9 +685,11 @@ impl ForwardHybrid for Model {
                 for w in &a.layers {
                     let at = &w.attn;
                     let (d, kv_heads, win) = match at.reading {
-                        Reading::Sliding => {
-                            (m.sliding.head_dim, m.sliding.kv_heads, Some(m.sliding.window))
-                        }
+                        Reading::Sliding => (
+                            m.sliding.head_dim,
+                            m.sliding.kv_heads,
+                            Some(m.sliding.window),
+                        ),
                         Reading::Global => (m.global.head_dim, m.global.kv_heads, None),
                     };
                     let AttnBanks::Shared { q_proj } = &at.banks else {

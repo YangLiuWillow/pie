@@ -99,9 +99,11 @@ pub(crate) struct Exports {
     /// planted in, in plan order. The LAST one is what a `hidden()`
     /// intrinsic and a `ReadoutSeam::Hidden` readback read.
     pub(crate) hidden: Vec<Export>,
-    /// The pixel plane and its `[Clips, 4]` grid (D8), for a plan whose
-    /// text plants `seam::PIXELS` on both; `None` otherwise.
-    pub(crate) pixels: Option<(ValueId, ValueId)>,
+    /// The pixel planes and their `[Clips, 4]` grids (D8), one per
+    /// planting of `seam::PIXELS` in plan order — a VAE plants one on its
+    /// decode arm and one on its encode arm — each with the classes whose
+    /// arm writes the plane; empty for a plan that plants none.
+    pub(crate) pixels: Vec<(Export, ValueId)>,
 }
 
 /// Which seam a fire's host readback mirrors, and the value it reads.
@@ -112,6 +114,21 @@ pub(crate) struct ReadoutSeam {
 }
 
 impl Exports {
+    /// The pixel plane and grid a lane of `class` reads back from: the
+    /// planting whose arm the class runs, else — for a plan with one
+    /// planting — that one.
+    #[must_use]
+    pub(crate) fn pixels_for(&self, class: Option<usize>) -> Option<(ValueId, ValueId)> {
+        class
+            .and_then(|class| {
+                self.pixels
+                    .iter()
+                    .find(|(export, _)| export.classes.contains(class))
+            })
+            .or_else(|| (self.pixels.len() == 1).then(|| &self.pixels[0]))
+            .map(|(export, grid)| (export.value, *grid))
+    }
+
     /// The seam a lane of `class` reads back from — the export its OWN arm
     /// writes (a multi-reading plan plants `hidden` on its encoder arm and
     /// `velocity` on its denoise arm, design D1/D5): `out` when the class
@@ -201,10 +218,9 @@ impl Exports {
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
             .and_then(|seam| seam.values.first().copied());
-        let float_readout = trace
-            .seams
-            .iter()
-            .any(|seam| FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty());
+        let float_readout = trace.seams.iter().any(|seam| {
+            FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty()
+        });
         if out.is_none() && !float_readout {
             return Err(Fault::Unbound {
                 what: format!(
@@ -215,14 +231,13 @@ impl Exports {
             });
         }
         let named = |name: &str| -> Vec<Export> {
-            trace.seams
+            trace
+                .seams
                 .iter()
                 .filter(|seam| seam.seam == name)
                 .flat_map(|seam| {
                     let layer = seam.layer.unwrap_or(0);
-                    seam.values
-                        .iter()
-                        .map(move |value| (layer, *value))
+                    seam.values.iter().map(move |value| (layer, *value))
                 })
                 .map(|(layer, value)| Export {
                     value,
@@ -241,11 +256,19 @@ impl Exports {
         let pixels = trace
             .seams
             .iter()
-            .find(|seam| seam.seam == PIXELS_SEAM)
-            .and_then(|seam| match seam.values.as_slice() {
-                [plane, grid, ..] => Some((*plane, *grid)),
+            .filter(|seam| seam.seam == PIXELS_SEAM)
+            .filter_map(|seam| match seam.values.as_slice() {
+                [plane, grid, ..] => Some((
+                    Export {
+                        value: *plane,
+                        layer: seam.layer.unwrap_or(0),
+                        classes: writer_classes(trace, compiled, *plane),
+                    },
+                    *grid,
+                )),
                 _ => None,
-            });
+            })
+            .collect();
         Ok(Exports {
             out_classes: out.map_or_else(model_ir::ClassSet::default, |out| {
                 writer_classes(trace, compiled, out)
@@ -272,7 +295,8 @@ impl Exports {
 fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
     // A merged export is written by its arms: every class that writes any
     // arm reads the seam back from the merged column.
-    if let Some(model_ir::Def::Merge(arms)) = trace.values.get(value.0 as usize).map(|decl| &decl.def)
+    if let Some(model_ir::Def::Merge(arms)) =
+        trace.values.get(value.0 as usize).map(|decl| &decl.def)
     {
         let mut classes = model_ir::ClassSet::default();
         for (arm, _) in arms {
@@ -302,7 +326,6 @@ fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
     }
     classes
 }
-
 
 /// The classes whose window runs an `attention.masked` arm.
 ///
@@ -754,11 +777,15 @@ impl Feeds {
                     .iter()
                     .find(|(seat, _)| {
                         let (kind, port) = match *input {
-                            RuntimeInput::Latents { port, .. } => (engine::fire::PortKind::Latents, port),
+                            RuntimeInput::Latents { port, .. } => {
+                                (engine::fire::PortKind::Latents, port)
+                            }
                             RuntimeInput::LaneVector { port, .. } => {
                                 (engine::fire::PortKind::LaneVector, port)
                             }
-                            RuntimeInput::Context { port, .. } => (engine::fire::PortKind::Context, port),
+                            RuntimeInput::Context { port, .. } => {
+                                (engine::fire::PortKind::Context, port)
+                            }
                             RuntimeInput::AxisPositions { port, .. } => {
                                 (engine::fire::PortKind::AxisPositions, port)
                             }

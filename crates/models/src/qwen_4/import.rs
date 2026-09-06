@@ -3,10 +3,10 @@
 use checkpoint::contract::{Expr, ModelContract};
 
 use super::model::{Layer, Mixer, Mlp, Model};
-use model_dsl::Weight;
 use crate::qwen_3::import::{flattened, squeezed};
-use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, extents};
+use model_dsl::Platform;
+use model_dsl::Weight;
 
 #[derive(Clone, Copy)]
 enum Layout {
@@ -91,7 +91,8 @@ impl Model {
 
     fn import_from_safetensors(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
         let mut b = Builder::new(src, self.tp, platform);
@@ -165,7 +166,10 @@ impl Model {
     /// The same census, names only — checked against a snapshot's `weight_map`.
     #[must_use]
     pub fn mlx_source_names(&self) -> Vec<String> {
-        self.mlx_planes().into_iter().map(|(_, name)| name).collect()
+        self.mlx_planes()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
     }
 
     // Deliberately not read: `self_attn.indexer.*` (the QSA indexer, which the
@@ -194,7 +198,10 @@ impl Model {
             // converter's name pattern missed them). Both layouts therefore
             // hold the original's zero-centred weight, and the plus-one norm
             // in the forward puts the one back.
-            reads.push(Read::One(&mtp.norm_embed, n("pre_fc_norm_embedding.weight")));
+            reads.push(Read::One(
+                &mtp.norm_embed,
+                n("pre_fc_norm_embedding.weight"),
+            ));
             reads.push(Read::One(&mtp.norm_hidden, n("pre_fc_norm_hidden.weight")));
             reads.push(Read::One(&mtp.fc_embed, n("fc_embedding.weight")));
             // `fc_hidden` applies per stream: the one stored plane, `streams`
@@ -209,14 +216,26 @@ impl Model {
                 &|tail: &str| layout.mtp(&format!("layers.0.{tail}")),
                 &mut reads,
             );
-            reads.push(Read::Norm(&mtp.mixer.norm, n("hyper_connection_mixer.hc_norm.weight")));
-            reads.push(Read::One(&mtp.mixer.down, n("hyper_connection_mixer.input_mix_weight_down.weight")));
-            reads.push(Read::One(&mtp.mixer.up, n("hyper_connection_mixer.input_mix_weight_up.weight")));
+            reads.push(Read::Norm(
+                &mtp.mixer.norm,
+                n("hyper_connection_mixer.hc_norm.weight"),
+            ));
+            reads.push(Read::One(
+                &mtp.mixer.down,
+                n("hyper_connection_mixer.input_mix_weight_down.weight"),
+            ));
+            reads.push(Read::One(
+                &mtp.mixer.up,
+                n("hyper_connection_mixer.input_mix_weight_up.weight"),
+            ));
         }
 
         if let Some(t) = &self.tower {
             let v = |leaf: &str| layout.tower(leaf);
-            reads.push(Read::PatchEmbed(&t.patch_embed, v("patch_embed.proj.weight")));
+            reads.push(Read::PatchEmbed(
+                &t.patch_embed,
+                v("patch_embed.proj.weight"),
+            ));
             reads.push(Read::One(&t.patch_embed_bias, v("patch_embed.proj.bias")));
             reads.push(Read::One(&t.pos_embed, v("pos_embed.weight")));
             for (l, blk) in t.blocks.iter().enumerate() {
@@ -290,107 +309,106 @@ fn layer_reads<'a>(
     n: &dyn Fn(&str) -> String,
     reads: &mut Vec<Read<'a>>,
 ) {
-
-        match &w.mixer {
-            Mixer::Attn(a) => {
-                // Stored q_proj is the fused query|gate bank: [2 · q_heads · head_dim, hidden].
-                reads.push(Read::One(&a.qg_proj, n("self_attn.q_proj.weight")));
-                reads.push(Read::One(&a.k_proj, n("self_attn.k_proj.weight")));
-                reads.push(Read::One(&a.v_proj, n("self_attn.v_proj.weight")));
-                reads.push(Read::One(&a.o_proj, n("self_attn.o_proj.weight")));
-                reads.push(Read::Norm(&a.q_norm, n("self_attn.q_norm.weight")));
-                reads.push(Read::Norm(&a.k_norm, n("self_attn.k_norm.weight")));
-            }
-            Mixer::Gdn(g) => {
-                reads.push(Read::Concat(
-                    &g.in_qkvz,
-                    vec![
-                        n("linear_attn.in_proj_qkv.weight"),
-                        n("linear_attn.in_proj_z.weight"),
-                    ],
-                ));
-                reads.push(Read::Concat(
-                    &g.in_ba,
-                    vec![
-                        n("linear_attn.in_proj_b.weight"),
-                        n("linear_attn.in_proj_a.weight"),
-                    ],
-                ));
-                reads.push(Read::Squeeze(&g.conv, n("linear_attn.conv1d.weight")));
-                reads.push(Read::One(&g.dt_bias, n("linear_attn.dt_bias")));
-                reads.push(Read::One(&g.a_log, n("linear_attn.A_log")));
-                // Not plus-one-scaled; mlx_lm does not fold it either.
-                reads.push(Read::One(&g.norm, n("linear_attn.norm.weight")));
-                reads.push(Read::One(&g.out_proj, n("linear_attn.out_proj.weight")));
-            }
+    match &w.mixer {
+        Mixer::Attn(a) => {
+            // Stored q_proj is the fused query|gate bank: [2 · q_heads · head_dim, hidden].
+            reads.push(Read::One(&a.qg_proj, n("self_attn.q_proj.weight")));
+            reads.push(Read::One(&a.k_proj, n("self_attn.k_proj.weight")));
+            reads.push(Read::One(&a.v_proj, n("self_attn.v_proj.weight")));
+            reads.push(Read::One(&a.o_proj, n("self_attn.o_proj.weight")));
+            reads.push(Read::Norm(&a.q_norm, n("self_attn.q_norm.weight")));
+            reads.push(Read::Norm(&a.k_norm, n("self_attn.k_norm.weight")));
         }
-
-        let sites = [
-            (&w.attn_res, "attn_hyper_connection"),
-            (&w.mlp_res, "mlp_hyper_connection"),
-        ];
-        for (res, site) in sites {
-            reads.push(Read::Norm(&res.norm, n(&format!("{site}.hc_norm.weight"))));
-            reads.push(Read::One(
-                &res.down,
-                n(&format!("{site}.input_mix_weight_down.weight")),
+        Mixer::Gdn(g) => {
+            reads.push(Read::Concat(
+                &g.in_qkvz,
+                vec![
+                    n("linear_attn.in_proj_qkv.weight"),
+                    n("linear_attn.in_proj_z.weight"),
+                ],
             ));
-            reads.push(Read::One(
-                &res.up,
-                n(&format!("{site}.input_mix_weight_up.weight")),
+            reads.push(Read::Concat(
+                &g.in_ba,
+                vec![
+                    n("linear_attn.in_proj_b.weight"),
+                    n("linear_attn.in_proj_a.weight"),
+                ],
             ));
-            if let Some(inject) = &res.inject {
-                reads.push(Read::One(
-                    inject,
-                    n(&format!("{site}.block_inject_weight.weight")),
-                ));
-            }
+            reads.push(Read::Squeeze(&g.conv, n("linear_attn.conv1d.weight")));
+            reads.push(Read::One(&g.dt_bias, n("linear_attn.dt_bias")));
+            reads.push(Read::One(&g.a_log, n("linear_attn.A_log")));
+            // Not plus-one-scaled; mlx_lm does not fold it either.
+            reads.push(Read::One(&g.norm, n("linear_attn.norm.weight")));
+            reads.push(Read::One(&g.out_proj, n("linear_attn.out_proj.weight")));
         }
+    }
 
-        match &w.mlp {
-            Mlp::Dense { .. } => unreachable!("every qwen4 layer routes"),
-            Mlp::Routed {
-                router,
-                gate_up,
-                down,
-                shared_gate_up,
-                shared_down,
-                shared_gate,
-                ..
-            } => {
-                reads.push(Read::One(router, n("mlp.gate.weight")));
-                // transformers stores gate_up fused; mlx_lm splits it into
-                // switch_mlp.{gate,up}_proj and this rejoins them.
-                match layout {
-                    Layout::Transformers => {
-                        reads.push(Read::One(gate_up, n("mlp.experts.gate_up_proj")));
-                        reads.push(Read::One(down, n("mlp.experts.down_proj")));
-                    }
-                    Layout::Mlx => {
-                        reads.push(Read::Concat(
-                            gate_up,
-                            vec![
-                                n("mlp.switch_mlp.gate_proj.weight"),
-                                n("mlp.switch_mlp.up_proj.weight"),
-                            ],
-                        ));
-                        reads.push(Read::One(down, n("mlp.switch_mlp.down_proj.weight")));
-                    }
+    let sites = [
+        (&w.attn_res, "attn_hyper_connection"),
+        (&w.mlp_res, "mlp_hyper_connection"),
+    ];
+    for (res, site) in sites {
+        reads.push(Read::Norm(&res.norm, n(&format!("{site}.hc_norm.weight"))));
+        reads.push(Read::One(
+            &res.down,
+            n(&format!("{site}.input_mix_weight_down.weight")),
+        ));
+        reads.push(Read::One(
+            &res.up,
+            n(&format!("{site}.input_mix_weight_up.weight")),
+        ));
+        if let Some(inject) = &res.inject {
+            reads.push(Read::One(
+                inject,
+                n(&format!("{site}.block_inject_weight.weight")),
+            ));
+        }
+    }
+
+    match &w.mlp {
+        Mlp::Dense { .. } => unreachable!("every qwen4 layer routes"),
+        Mlp::Routed {
+            router,
+            gate_up,
+            down,
+            shared_gate_up,
+            shared_down,
+            shared_gate,
+            ..
+        } => {
+            reads.push(Read::One(router, n("mlp.gate.weight")));
+            // transformers stores gate_up fused; mlx_lm splits it into
+            // switch_mlp.{gate,up}_proj and this rejoins them.
+            match layout {
+                Layout::Transformers => {
+                    reads.push(Read::One(gate_up, n("mlp.experts.gate_up_proj")));
+                    reads.push(Read::One(down, n("mlp.experts.down_proj")));
                 }
-                reads.push(Read::Concat(
-                    shared_gate_up,
-                    vec![
-                        n("mlp.shared_expert.gate_proj.weight"),
-                        n("mlp.shared_expert.up_proj.weight"),
-                    ],
-                ));
-                reads.push(Read::One(
-                    shared_down,
-                    n("mlp.shared_expert.down_proj.weight"),
-                ));
-                reads.push(Read::One(shared_gate, n("mlp.shared_expert_gate.weight")));
+                Layout::Mlx => {
+                    reads.push(Read::Concat(
+                        gate_up,
+                        vec![
+                            n("mlp.switch_mlp.gate_proj.weight"),
+                            n("mlp.switch_mlp.up_proj.weight"),
+                        ],
+                    ));
+                    reads.push(Read::One(down, n("mlp.switch_mlp.down_proj.weight")));
+                }
             }
+            reads.push(Read::Concat(
+                shared_gate_up,
+                vec![
+                    n("mlp.shared_expert.gate_proj.weight"),
+                    n("mlp.shared_expert.up_proj.weight"),
+                ],
+            ));
+            reads.push(Read::One(
+                shared_down,
+                n("mlp.shared_expert.down_proj.weight"),
+            ));
+            reads.push(Read::One(shared_gate, n("mlp.shared_expert_gate.weight")));
         }
+    }
 }
 
 /// One read of this import: the plane it lands in, and the source name (or

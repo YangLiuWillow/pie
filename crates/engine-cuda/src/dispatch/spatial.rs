@@ -31,11 +31,13 @@ fn rule(rule: GridRule) -> spatial::GridRule {
             k,
             stride,
             pad,
+            pad_back,
             causal_t,
         } => spatial::GridRule::Conv {
             k,
             stride,
             pad,
+            pad_back,
             causal_t,
         },
         GridRule::Upsample {
@@ -69,6 +71,7 @@ impl Run<'_> {
                 k,
                 stride,
                 pad,
+                pad_back,
                 causal_t,
                 time_pad,
                 cache,
@@ -79,6 +82,7 @@ impl Run<'_> {
                     k: *k,
                     stride: *stride,
                     pad: *pad,
+                    pad_back: *pad_back,
                     causal_t: *causal_t,
                     time_pad: match time_pad {
                         TimePad::Zero => spatial::TimePad::Zero,
@@ -171,6 +175,22 @@ impl Run<'_> {
                 self.tensor(*bias),
                 *eps,
                 *silu,
+                &mut self.tensor(*y),
+            ),
+            Spatial::Attention {
+                q,
+                k,
+                v,
+                grid,
+                sm_scale,
+                y,
+            } => spatial::attention(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+                self.tensor(*grid),
+                *sm_scale,
                 &mut self.tensor(*y),
             ),
             Spatial::UpsampleNearest {

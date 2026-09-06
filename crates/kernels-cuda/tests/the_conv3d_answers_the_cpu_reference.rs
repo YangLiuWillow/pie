@@ -138,7 +138,7 @@ fn k3(stride: u32, pad: [u32; 3], causal_t: bool, time_pad: TimePad) -> Conv3d {
     Conv3d {
         k: [3, 3, 3],
         stride: [stride; 3],
-        pad,
+        pad,        pad_back: pad,
         causal_t,
         time_pad,
     }
@@ -200,6 +200,7 @@ fn cases() -> Vec<Case> {
                 k: [3, 1, 1],
                 stride: [2, 1, 1],
                 pad: [1, 0, 0],
+                pad_back: [1, 0, 0],
                 causal_t: true,
                 time_pad: TimePad::Zero,
             },

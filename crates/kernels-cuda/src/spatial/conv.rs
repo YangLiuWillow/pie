@@ -71,9 +71,14 @@ pub struct Conv3d {
     pub k: [u32; 3],
     /// `[st, sh, sw]`.
     pub stride: [u32; 3],
-    /// `[pt, ph, pw]`: symmetric zero padding, except that under
-    /// `causal_t` `pt` is the front-only time padding.
+    /// `[pt, ph, pw]`: the zero padding IN FRONT of each axis (under
+    /// `causal_t` `pt` is the front-only time padding).
     pub pad: [u32; 3],
+    /// The zero padding BEHIND each axis; equal to `pad` for a symmetric
+    /// convolution, ignored on the time axis under `causal_t`. The kernel
+    /// never reads it: only the front pad shifts the tap window, and the
+    /// back pad reaches it through the output box (`o_grid`) alone.
+    pub pad_back: [u32; 3],
     /// Time is padded in front only, from the cache when one is given.
     pub causal_t: bool,
     /// What the front frames read under `causal_t` without a cache.
@@ -88,6 +93,7 @@ impl Conv3d {
             k: [1, k[0], k[1]],
             stride: [1, stride[0], stride[1]],
             pad: [0, pad[0], pad[1]],
+            pad_back: [0, pad[0], pad[1]],
             causal_t: false,
             time_pad: TimePad::Zero,
         }
@@ -110,11 +116,11 @@ impl Conv3d {
                 .checked_sub(k)
                 .map(|span| span / s.max(1) + 1)
         };
-        let back_t = if self.causal_t { 0 } else { self.pad[0] };
+        let back_t = if self.causal_t { 0 } else { self.pad_back[0] };
         Some([
             axis(t, self.k[0], self.stride[0], self.pad[0], back_t)?,
-            axis(h, self.k[1], self.stride[1], self.pad[1], self.pad[1])?,
-            axis(w, self.k[2], self.stride[2], self.pad[2], self.pad[2])?,
+            axis(h, self.k[1], self.stride[1], self.pad[1], self.pad_back[1])?,
+            axis(w, self.k[2], self.stride[2], self.pad[2], self.pad_back[2])?,
         ])
     }
 }

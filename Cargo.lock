@@ -3057,6 +3057,7 @@ dependencies = [
  "checkpoint-dsl",
  "model-compiler",
  "model-dsl",
+ "model-ir",
  "serde_json",
  "tokenizer",
  "ztensor",

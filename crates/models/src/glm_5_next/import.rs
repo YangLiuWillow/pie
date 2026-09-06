@@ -124,7 +124,10 @@ impl Model {
             b: Builder::new(src, self.tp, platform),
             from,
         };
-        b.read(&self.embed, "model.language_model.embed_tokens.weight".into())?;
+        b.read(
+            &self.embed,
+            "model.language_model.embed_tokens.weight".into(),
+        )?;
         b.read(&self.final_norm, "model.language_model.norm.weight".into())?;
         b.read(&self.head, "lm_head.weight".into())?;
 
@@ -160,7 +163,11 @@ impl Model {
         let held = |own: &str| matches!(from, From::Own) && src.get(own).is_some();
         let mut b = Land {
             b: b.b,
-            from: if held("vision.post_norm") { From::Own } else { From::Source },
+            from: if held("vision.post_norm") {
+                From::Own
+            } else {
+                From::Source
+            },
         };
         if let Some(t) = &self.tower {
             tower(src, &mut b, &|s: &str| format!("{new}{VISUAL}{s}"), t)?;
@@ -168,7 +175,11 @@ impl Model {
         let Some(mtp) = &self.mtp else {
             return Ok(b.b.build());
         };
-        b.from = if held("mtp.enorm") { From::Own } else { From::Source };
+        b.from = if held("mtp.enorm") {
+            From::Own
+        } else {
+            From::Source
+        };
         let n = |s: &str| format!("{new}{HEAD}{s}");
         let hidden = i64::from(self.hidden);
         b.read(&mtp.enorm, n("enorm.weight"))?;
@@ -199,7 +210,11 @@ fn tower(
     // The Conv3d kernel `[hidden, C, T, P, P]` is already stored in the
     // matmul bank's byte order (a transmute).
     b.read_expr(&t.patch_embed, || {
-        reshaped(src, v("patch_embed.proj.weight"), vec![i64::from(t.hidden), i64::from(t.patch_width)])
+        reshaped(
+            src,
+            v("patch_embed.proj.weight"),
+            vec![i64::from(t.hidden), i64::from(t.patch_width)],
+        )
     })?;
     b.read(&t.patch_embed_bias, v("patch_embed.proj.bias"))?;
     for (l, blk) in t.blocks.iter().enumerate() {
@@ -218,8 +233,14 @@ fn tower(
         ] {
             b.read(weight, from)?;
         }
-        b.read_concat(&blk.gate_up, vec![n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
-        b.read_concat(&blk.gate_up_bias, vec![n("mlp.gate_proj.bias"), n("mlp.up_proj.bias")])?;
+        b.read_concat(
+            &blk.gate_up,
+            vec![n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+        )?;
+        b.read_concat(
+            &blk.gate_up_bias,
+            vec![n("mlp.gate_proj.bias"), n("mlp.up_proj.bias")],
+        )?;
     }
     b.read(&t.post_norm, v("post_layernorm.weight"))?;
     // The Conv2d kernel `[out, C, kh, kw]` flattens to `(c, kh, kw)` columns;
@@ -238,7 +259,10 @@ fn tower(
     b.read(&m.proj, v("merger.proj.weight"))?;
     b.read(&m.norm, v("merger.post_projection_norm.weight"))?;
     b.read(&m.norm_bias, v("merger.post_projection_norm.bias"))?;
-    b.read_concat(&m.gate_up, vec![v("merger.gate_proj.weight"), v("merger.up_proj.weight")])?;
+    b.read_concat(
+        &m.gate_up,
+        vec![v("merger.gate_proj.weight"), v("merger.up_proj.weight")],
+    )?;
     b.read(&m.down, v("merger.down_proj.weight"))?;
     Ok(())
 }
@@ -320,7 +344,10 @@ fn indexer(b: &mut Land, n: &dyn Fn(&str) -> String, ix: &Indexer) -> Result<(),
     b.read(&ix.weights_proj, n("self_attn.indexer.weights_proj.weight"))?;
     b.read(&ix.k_norm, n("self_attn.indexer.k_norm.weight"))?;
     b.read(&ix.k_norm_bias, n("self_attn.indexer.k_norm.bias"))?;
-    b.read(&ix.kpool_ape, n("self_attn.indexer.index_kpool_compress_ape"))?;
+    b.read(
+        &ix.kpool_ape,
+        n("self_attn.indexer.index_kpool_compress_ape"),
+    )?;
     b.read(
         &ix.kpool_gate,
         n("self_attn.indexer.index_kpool_compress_gate"),
