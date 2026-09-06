@@ -1295,6 +1295,55 @@ impl Shell {
         // before it is read by every fire for the life of the load.
         handles.seal();
 
+        // **THE ARENA IS WIRED TOO, AND A STREAMED LOAD'S SOURCE IS PAGE
+        // CACHE IN THE SAME RAM.** The planning admit (`api.rs`) ran before
+        // the axes were compiled and could not see the scratch they reserve;
+        // and on unified memory the seats a streamed tier copies in are read
+        // out of the artifact's page cache, which the wired tier squeezes out
+        // of physical memory once the two together exceed it — the seats then
+        // fall to the disk and the fire crawls rather than refusing (a
+        // streamed A3B at 12 GiB with a 10240-row forward read 0.7 tok/s where
+        // a 512-row forward read 54). Refuse both here, naming the numbers.
+        {
+            let kv_pool = crate::store::pool_demand(&boot.trace, paging)?;
+            let acct = crate::store::accounting::Accounting::with_scratch(
+                device.working_set(),
+                crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+                boot.residency.device_demand(),
+                compiled.arena.bytes,
+                kv_pool,
+            );
+            acct.admit(Some(boot.residency.device_demand()), crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION)?;
+            let source = boot.residency.source_bytes();
+            let ram = Context::physical_memory();
+            let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
+            // Five sixths: the sixth is the system's and the page cache's
+            // slack. Measured on a 48 GB M4 Pro with the A3B at 12 GiB — a
+            // 37.9 GB demand served at 54 tok/s, a 43.5 GB one crawled at 0.7.
+            if source > 0 && ram > 0 && wired + source > ram - ram / 6 {
+                return Err(Fault::Residency(format!(
+                    "this streamed load wires {wired} bytes (weights {weights}, arena scratch \
+                     {scratch} at `[engine] max_forward_tokens`, kv pool {pool}, driver floor \
+                     {floor}) and reads its {source} streamed bytes out of the artifact's page \
+                     cache — the same {ram} bytes of unified memory. Together they exceed \
+                     five sixths of it, so the cache would be squeezed out and every seat \
+                     copy would come from the disk: the load would crawl, not page. Lower \
+                     `[model] device_weight_budget` or `[engine] max_forward_tokens`, or \
+                     hold the model resident on a box that fits it.",
+                    weights = acct.weights,
+                    scratch = acct.scratch,
+                    pool = acct.minimum,
+                    floor = acct.floor,
+                )));
+            }
+            if std::env::var_os("PIE_TIER_TRACE").is_some_and(|v| v != "0") {
+                eprintln!(
+                    "residency: wired {wired} (weights {} scratch {} kv {} floor {}), streamed \
+                     source {source}, working set {}, ram {ram}",
+                    acct.weights, acct.scratch, acct.minimum, acct.floor, acct.working_set
+                );
+            }
+        }
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         // The buffered planes, read off the same trace: one page slot per

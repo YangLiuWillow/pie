@@ -177,14 +177,27 @@ impl Plan {
                 .map(|stride| (u64::from(n) * stride).next_multiple_of(crate::weights::ALIGN))
                 .sum()
         };
-        let floor = dense + seats(1);
+        // A pass seats half the slab (`pass_group`) and one row of a fire
+        // routes to the router's fan-out of experts, so the slab must seat
+        // twice that — or a one-row fire is refused at its first cut.
+        let fan = groups
+            .iter()
+            .filter_map(|group| fan_out(trace, group.routes))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let need = (1..=u32::MAX)
+            .find(|&n| pass_group(n) >= fan)
+            .unwrap_or(fan);
+        let floor = dense + seats(need);
         if budget < floor {
             return Err(Fault::Residency(format!(
                 "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
-                 demand {dense} resident and its {} routed bands need one expert seat \
-                 each on top, which is {floor} before a second expert is seated. Dense \
-                 planes do not stream in this build, so the budget cannot be met by \
-                 holding less. Raise it to at least {floor}, or state `None`.",
+                 demand {dense} resident and its {} routed bands need {need} expert \
+                 seats each on top (a row routes to {fan} experts and a pass seats half \
+                 the slab), which is {floor}. Dense planes do not stream in this build, \
+                 so the budget cannot be met by holding less. Raise it to at least \
+                 {floor}, or state `None`.",
                 bands.len(),
             )));
         }
@@ -193,13 +206,13 @@ impl Plan {
         let experts = groups[0].experts;
         let slack = budget - dense;
         let mut slots = 0u32;
-        for n in (1..=experts).rev() {
+        for n in (need..=experts.max(need)).rev() {
             if seats(n) <= slack {
                 slots = n;
                 break;
             }
         }
-        debug_assert!(slots >= 1, "the floor check above proved one seat fits");
+        debug_assert!(slots >= need, "the floor check above proved the seats fit");
 
         for band in &mut bands {
             band.slots = slots;
