@@ -1141,7 +1141,9 @@ impl Bodies {
                         let launch = !at.eager_twin && nth >= from && nth < upto;
                         nth += 1;
                         if launch {
+                            crate::serve::btrace::mark("pre_launch");
                             exec.launch(at.stream)?;
+                            crate::serve::btrace::mark("launch");
                         } else {
                             walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                         }

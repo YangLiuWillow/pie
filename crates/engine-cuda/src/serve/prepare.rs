@@ -92,6 +92,7 @@ impl FrameShell for Shell {
         {
             self.reap_guests_at("prepare")?;
         }
+        super::btrace::mark("reap");
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         for attached in attachments {
@@ -320,6 +321,7 @@ impl FrameShell for Shell {
             media_of[at] = Some(shot);
         }
 
+        super::btrace::mark("ports");
         // 1. Lane words in; `compose_axes` seriates the patch axis beside
         // the token one.
         let submitted: Vec<FireLane> = lanes
@@ -847,6 +849,7 @@ impl FrameShell for Shell {
             (ids, ws)
         };
 
+        super::btrace::mark("lanes");
         // 2b. Admission: the union demand of this step, committed atomically
         // before any of it runs. A demand is a watermark (highest addressed
         // page/slot + 1), not a count, since the arenas grow at the tail.
@@ -937,6 +940,7 @@ impl FrameShell for Shell {
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
 
+        super::btrace::mark("admit");
         // 4. Windows: every template region resolved against this
         // composition's class table. A region that doesn't seat whole gets
         // `Fallback::Split` unless copies are enabled and the fallback table
@@ -1086,6 +1090,7 @@ impl FrameShell for Shell {
         }
         let geometries = geometries;
 
+        super::btrace::mark("windows");
         // 5. Staging slot, claimed last (after every possible refusal above
         // has had its chance), host only. The slot's pinned bytes back the
         // async H2D `enqueue` issues, so nothing may reuse them until the
