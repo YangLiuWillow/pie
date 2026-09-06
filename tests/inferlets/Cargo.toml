@@ -45,6 +45,7 @@ members = [
     "mini-dit-parity",
     "flux2-parity",
     "zimage-parity",
+    "wan2-parity",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",
