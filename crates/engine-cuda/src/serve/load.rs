@@ -7,7 +7,7 @@ use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
     Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
-    media_classes, regions_lane_shifting, regions_shifting,
+    media_classes, regions_lane_shifting, regions_launching_schedules, regions_shifting,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -181,6 +181,7 @@ impl Shell {
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
+        let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
         let paging = Paging::of(
             boot.page_size,
             boot.context,
@@ -397,6 +398,7 @@ impl Shell {
             media,
             shifted,
             lane_shifted,
+            schedule_readers,
             adapters: crate::blob::Adapters::new(adapter_seats),
             scores,
             held: vec![0; boot.slots as usize],

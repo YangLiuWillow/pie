@@ -384,6 +384,9 @@ pub struct Ceilings<'c> {
     /// Which regions this fire's body actually holds. Captured stretches run from the graph; the islands between are re-issued eagerly.
     pub admits: &'c [Admit],
 
+    /// Per `Trace::values` id: which region's launch READS that attention schedule ([`crate::exports::regions_launching_schedules`]), or `None` for a schedule no launch reads and for one two regions read. [`Run::planning`] carves a schedule at THIS region's standing and not at the standing of the prepare region that builds it — the two are never the same region, and only the launcher is handed a boundary vector.
+    pub readers: &'c [Option<u32>],
+
     /// What this fire's body key says each class may be carved over — this fire's own class table. `None` for every fire off the bodies path, and then [`Standing`] takes no ceiling at all.
     pub carve: Option<Carve<'c>>,
 }
@@ -469,6 +472,33 @@ impl Standing {
     /// Does this region address off its plane's base?
     fn plane(&self) -> bool {
         matches!(self.held, Held::Captured { plane: true, .. })
+    }
+
+    /// **DOES THIS REGION'S LAUNCH COUNT FROM THE FIRE'S OWN ZERO?** — true
+    /// for a region a graph holds that either moves its own base
+    /// ([`plane`](Standing::plane)) or has nothing to move because its window
+    /// IS the fire ([`whole`](Standing::whole)).
+    ///
+    /// The one predicate the schedule and the launch that reads it must both
+    /// answer, and they answer it about the SAME region ([`Run::planning`]
+    /// resolves the launcher's standing, never the builder's). Where it is
+    /// true, [`Run::planning`] carves the schedule at the key's lane ceiling
+    /// and [`Run::ragged_q`] hands the launch the fire's whole boundary
+    /// vector, padded to that ceiling — the pair `attn::lanes_carry` checks.
+    /// Where it is false, the schedule takes this fire's own live lanes and
+    /// the launch takes the window's own rebased vector. Either way the two
+    /// agree by construction; it is answering them off two regions that made
+    /// them disagree.
+    ///
+    /// `whole` earns its half honestly: a window that covers every row of the
+    /// fire covers every lane of it too, at lane offset zero, so its rebased
+    /// vector IS the absolute one over the fire's lanes and the padded
+    /// reading merely runs further.
+    fn absolute(&self) -> bool {
+        match self.held {
+            Held::Eager => false,
+            Held::Captured { plane, .. } => plane || self.whole,
+        }
     }
 
     /// Does this region own a retirement? True for a region a graph holds whose window is the whole fire, or whose ops read the seat's start; nothing else.
@@ -655,6 +685,28 @@ impl<'c> Run<'c> {
         standing
     }
 
+    /// The [`Standing`] one attention schedule is carved at: the standing of the region whose launch READS it ([`Ceilings::readers`]), at this run.
+    ///
+    /// Falls back to an eager standing — no row ceiling, no lane ceiling, no plane base — for a schedule no launch reads, for one two regions read, and for a reader region this fire did not cut this run of. All three carve the plan at the fire's own live geometry, which every launch can honour whatever its own standing turns out to be.
+    fn reading_standing(&self, plan: ValueId) -> Standing {
+        let run = self.place.run.get();
+        let here = self.place.region.get();
+        let eager = || self.standing_as(here, run, false);
+        let Some(region) = self
+            .ceilings
+            .readers
+            .get(plan.0 as usize)
+            .copied()
+            .flatten()
+        else {
+            return eager();
+        };
+        if run >= self.windows.runs(region) {
+            return eager();
+        }
+        self.standing_at(region, run)
+    }
+
     /// [`Standing`] for any `(region, run)` of this fire, off the same [`Ceilings`] the walk reads, so the ledger and the launch resolve one answer.
     pub(crate) fn standing_at(&self, region: u32, run: u32) -> Standing {
         self.standing_as(
@@ -790,6 +842,11 @@ impl<'c> Run<'c> {
     /// Does this region get its plane's base instead of its window's? Requires the region to be graph-held, every op shifted, and the window an interval.
     fn plane_base(&self) -> bool {
         self.standing().plane()
+    }
+
+    /// Does this region's launch count rows and lanes from the fire's own zero — [`Standing::absolute`], the predicate the schedule's carve is gated on too. Wider than [`plane_base`](Run::plane_base) by exactly the whole-fire windows, which have nothing to shift.
+    fn absolute_base(&self) -> bool {
+        self.standing().absolute()
     }
 
     /// Where this region's live row count is read from, or `0` — [`here`](Run::here)'s twin, bounding how far below its extent a launch may stop.
@@ -1358,9 +1415,9 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The FA2 query axis's own reading of the same pairing — boundaries chosen by whether this region moves its own plane. FA2 has no seat offset, so its CSR must count from wherever `q` counts from. Goes over whole, never cut at `lane_offset`.
+    /// The FA2 query axis's own reading of the same pairing — boundaries chosen by whether this region counts from the fire's own zero ([`Standing::absolute`]). FA2 has no seat offset, so its CSR must count from wherever `q` counts from, and it must run as far as the schedule this launch reads was carved: the two are one predicate, asked of one region.
     pub(crate) fn ragged_q(&self, id: ValueId) -> RaggedTensor {
-        let indptr = if self.plane_base() {
+        let indptr = if self.absolute_base() {
             self.qo_indptr_absolute()
                 .unwrap_or_else(|| self.qo_indptr())
         } else {
@@ -1707,13 +1764,25 @@ impl<'c> Run<'c> {
         let window = self.window();
         let span = window.span();
         // How wide this schedule may be carved: the key's ceilings for any plan the bodies path can serve, `None` otherwise — keeps the hash stable across batch sizes.
-        let standing = self.standing();
+        //
+        // THE CARVE IS THE LAUNCHER'S STANDING, NOT THE BUILDER'S. A region
+        // holds one phase, so the `Phase::Prepare` region a plan op stands in
+        // is never the region the launch stands in — and a prepare region
+        // holds nothing but `crate::PLANNED` ops, which makes it read as
+        // shifting for free (it names no kernel that could address the wrong
+        // row) even where the trunk region reading its schedule does not.
+        // Carving at the builder's ceiling would name 32 requests to a launch
+        // `Run::ragged_q` hands a one-lane vector, which `attn::lanes_carry`
+        // refuses. `no_schedule_straddles_its_readers` pins the two regions to
+        // one mask, so they see one window and one span; it does not pin them
+        // to one region, and `shifted`/`lane_shifted` are per region.
+        let standing = self.reading_standing(plan);
         let carve = standing.ceiling();
         // The same arithmetic read as lanes. The lane reading is the token axis's alone; a patch region takes its window's own lane pair.
         let carve_lanes = standing.lane_carve();
         // How many lanes, and where they count from: `(origin, count)`, or `None` for this window's own pair — gated on graph-held, resolved span, and plane-base.
         let ceiling: Option<(u32, u32)> = standing
-            .plane()
+            .absolute()
             .then_some(carve_lanes)
             .flatten()
             .and_then(|(before, own)| {

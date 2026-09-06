@@ -81,6 +81,7 @@ impl Shell {
             airborne: &self.airborne,
             scores: self.scores.as_ref(),
             shifted: &self.shifted,
+            schedule_readers: &self.schedule_readers,
             decoding: &self.decoding,
             seq,
         };
@@ -126,6 +127,8 @@ struct FireCtx<'a> {
     airborne: &'a Airborne,
     scores: Option<&'a Scores>,
     shifted: &'a [bool],
+    /// Per `Trace::values` id: which region's launch reads that attention schedule — what [`crate::run::Ceilings::readers`] carries.
+    schedule_readers: &'a [Option<u32>],
     decoding: &'a model_ir::ClassSet,
     /// The step this fire settles at.
     seq: u64,
@@ -664,6 +667,7 @@ impl FireCtx<'_> {
             bodied: p.bodied,
             shifted: self.shifted,
             admits: p.admits.as_ref(),
+            readers: self.schedule_readers,
             carve: p.bodied.then(|| record::Carve {
                 per_axis: model_ir::PerAxis::new([
                     Some(record::AxisCarve {

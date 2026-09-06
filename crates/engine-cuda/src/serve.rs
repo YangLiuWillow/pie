@@ -125,6 +125,9 @@ pub struct Shell {
     shifted: Vec<bool>,
     /// Per template region: every op finds its own lane.
     lane_shifted: Vec<bool>,
+    /// Per `Trace::values` id: which region's launch reads that attention
+    /// schedule — the region whose ceilings it must be carved at.
+    schedule_readers: Vec<Option<u32>>,
     /// Which fact bit puts a lane in the correction's window, or `None`.
     adapter_fact: Option<u32>,
     /// The shared-adapter store.
