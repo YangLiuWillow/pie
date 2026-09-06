@@ -235,6 +235,25 @@ pub fn residual_add(x: &Value, y: &Value) -> Value {
     y_out
 }
 
+/// A fresh rectangle holding what `x` holds.
+///
+/// **WHY A MODEL EVER WANTS ONE.** The in-place ops ([`add_bias`],
+/// [`mul_scalar`], [`clamp_learned`], [`standardize`], …) declare an alias
+/// `(out, in)`, and the arena folds every one of them onto its operand
+/// unconditionally — no copy is minted for an operand something else still
+/// reads. So a value read more than once may be folded over at most once, and
+/// the second reader must be handed a copy. `check`'s `FoldThenRead` refuses a
+/// plan that forgets; this is what it is asking for.
+///
+/// `2x · ½`, both steps exact in every float format this IR carries — the
+/// doubling and the halving are exponent arithmetic. Two launches, one fresh
+/// rectangle. A family that has a scale or a fold to do to the copy anyway
+/// should fold the ½ into that instead of calling this (z-image's `2z` then
+/// `z / scale` is the pattern).
+pub fn copy(x: &Value) -> Value {
+    mul_scalar(0.5, &add(x, x))
+}
+
 pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     let r = out.rec();
     let out_out = r.fresh(out.ty().clone());
