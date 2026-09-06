@@ -3,7 +3,7 @@
 //!
 //! Three components under one plan (design D5): the Qwen3-4B text encoder
 //! ([`TextEncoder`], `te.`), the FLUX.2 transformer ([`Dit`], `dit.`) and
-//! the `AutoencoderKLFlux2` decoder ([`Vae`], `vae.`). The numbers are the
+//! the `AutoencoderKLFlux2` ([`super::vae::Vae`], `vae.`). The numbers are the
 //! snapshot's `transformer/config.json`, `text_encoder/config.json` and
 //! `vae/config.json` (study §C.2, §C.8, §C.9), restated here because a
 //! family's dims are Rust constants and a `config.json` is carried, never
@@ -17,7 +17,7 @@ use model_dsl::{Dtype, Weight};
 /// channels — the pixel-unshuffle the VAE wrapper performs, so the
 /// transformer's `patch_size` is 1 and it never sees a grid.
 pub const IN_CHANNELS: u32 = 128;
-/// The VAE's latent channels before the 2×2 packing.
+/// The VAE's latent channels before the 2×2 packing (`latent_channels`).
 pub const VAE_CHANNELS: u32 = 32;
 /// The packing factor along each spatial axis between the VAE latent
 /// (`/8`) and the DiT token (`/16`).
@@ -98,19 +98,6 @@ pub const TE_MAX_TOKENS: u32 = 512;
 /// `joint_attention_dim` of the flagship: the three taps side by side.
 pub const TE_CONTEXT_WIDTH: u32 = 3 * TE_HIDDEN;
 
-/// `AutoencoderKLFlux2` (`vae/config.json`): `block_out_channels`, two
-/// resnets per encoder level (three per decoder level), 32-group norms at
-/// eps 1e-6, one attention in each mid block, the frozen BatchNorm over the
-/// 128 packed channels at eps 1e-4.
-pub const VAE_BLOCK_CHANNELS: [u32; 4] = [128, 256, 512, 512];
-pub const VAE_GROUPS: u32 = 32;
-pub const VAE_EPS: f32 = 1e-6;
-pub const VAE_BN_EPS: f32 = 1e-4;
-/// Decoder resnets per level (`layers_per_block + 1`).
-pub const VAE_DECODER_RESNETS: u32 = 3;
-/// A 3×3 conv's taps (`kt = 1`).
-pub const TAPS_3X3: u32 = 9;
-
 /// The float ports this text reads, by index within their kind and
 /// reading. A port index is the family's own (`RuntimeInput::Latents {
 /// port, .. }` carries it) and is the position among ports of one kind in
@@ -133,9 +120,13 @@ pub mod port {
     pub const GUIDANCE: u8 = 1;
     /// `denoise`: the four rotary coordinates per row, `[rows, 4]`.
     pub const POSITIONS: u8 = 0;
-    /// `vae.decode`: the packed latent, `[voxels, 128]` bf16 at token
+    /// `vae.decode`: the packed latent clip, `[voxels, 128]` bf16 at token
     /// resolution (`/16`), BatchNorm-normalised as the denoiser holds it.
     pub const VOXELS: u8 = 0;
+    /// `vae.encode`: the pixel clip, `[voxels, 3]` in `[-1, 1]`. A second
+    /// voxel index because the engine seats one rectangle per `(kind,
+    /// index)` for the whole plan and the two clips are different widths.
+    pub const PIXEL_VOXELS: u8 = 1;
 }
 
 /// One row's shape: the numbers that differ between the shipped
@@ -414,193 +405,6 @@ impl TextEncoder {
     }
 }
 
-/// One 2-D convolution of the VAE: the kernel as the checkpoint stores it
-/// (`[C_out, C_in·k²]`, declared tap-major) and its bias.
-pub struct Conv {
-    pub w: Weight,
-    pub bias: Weight,
-    pub c_in: u32,
-    pub c_out: u32,
-    pub k: u32,
-}
-
-impl Conv {
-    fn at(name: &str, c_out: u32, c_in: u32, k: u32, banks: Dtype) -> Conv {
-        let taps = k * k;
-        Conv {
-            w: Weight::sym(
-                name,
-                [u64::from(c_out), u64::from(c_in) * u64::from(taps)],
-                banks,
-            )
-            .conv_taps_major(c_in, taps),
-            bias: Weight::sym(format!("{name}.bias"), [u64::from(c_out)], Dtype::F32),
-            c_in,
-            c_out,
-            k,
-        }
-    }
-}
-
-/// A `GroupNorm(32, C)` with affine parameters.
-pub struct GroupNorm {
-    pub weight: Weight,
-    pub bias: Weight,
-}
-
-impl GroupNorm {
-    fn at(name: &str, channels: u32) -> GroupNorm {
-        GroupNorm {
-            weight: Weight::sym(name, [u64::from(channels)], Dtype::F32),
-            bias: Weight::sym(format!("{name}.bias"), [u64::from(channels)], Dtype::F32),
-        }
-    }
-}
-
-/// `ResnetBlock2D`: `norm1 → silu → conv1 → norm2 → silu → conv2`, added to
-/// the input (through a 1×1 `conv_shortcut` when the channels change).
-pub struct Resnet {
-    pub norm1: GroupNorm,
-    pub conv1: Conv,
-    pub norm2: GroupNorm,
-    pub conv2: Conv,
-    pub shortcut: Option<Conv>,
-}
-
-impl Resnet {
-    fn at(prefix: &str, c_in: u32, c_out: u32, banks: Dtype) -> Resnet {
-        Resnet {
-            norm1: GroupNorm::at(&format!("{prefix}.norm1"), c_in),
-            conv1: Conv::at(&format!("{prefix}.conv1"), c_out, c_in, 3, banks),
-            norm2: GroupNorm::at(&format!("{prefix}.norm2"), c_out),
-            conv2: Conv::at(&format!("{prefix}.conv2"), c_out, c_out, 3, banks),
-            shortcut: (c_in != c_out)
-                .then(|| Conv::at(&format!("{prefix}.shortcut"), c_out, c_in, 1, banks)),
-        }
-    }
-}
-
-/// The mid block's single-head attention over every position of a clip
-/// (`Attention(heads=1, dim_head=C)`, biased projections, a residual).
-///
-/// **Declared and imported, not yet traced** (`forward::vae_decode`): its
-/// head is 512 wide, past what `attention.ragged` serves (64/128/256), and
-/// the voxel axis has no per-clip indptr for it to segment by. The weights
-/// are read so the artifact is whole when the arm lands.
-pub struct MidAttention {
-    pub norm: GroupNorm,
-    pub q: Linear,
-    pub q_bias: Weight,
-    pub k: Linear,
-    pub k_bias: Weight,
-    pub v: Linear,
-    pub v_bias: Weight,
-    pub out: Linear,
-    pub out_bias: Weight,
-}
-
-impl MidAttention {
-    fn at(prefix: &str, channels: u32, banks: Dtype) -> MidAttention {
-        let dense = crate::dense(banks);
-        let c = u64::from(channels);
-        let proj = |s: &str| Weight::sym(format!("{prefix}.{s}"), [c, c], banks);
-        let bias = |s: &str| Weight::sym(format!("{prefix}.{s}.bias"), [c], dense);
-        MidAttention {
-            norm: GroupNorm::at(&format!("{prefix}.norm"), channels),
-            q: proj("q"),
-            q_bias: bias("q"),
-            k: proj("k"),
-            k_bias: bias("k"),
-            v: proj("v"),
-            v_bias: bias("v"),
-            out: proj("out"),
-            out_bias: bias("out"),
-        }
-    }
-}
-
-/// `UNetMidBlock2D`: resnet, attention, resnet.
-pub struct MidBlock {
-    pub resnet_0: Resnet,
-    pub attention: MidAttention,
-    pub resnet_1: Resnet,
-}
-
-/// One `UpDecoderBlock2D`: three resnets and, on all but the last level, a
-/// nearest 2× upsample followed by a 3×3 conv.
-pub struct UpBlock {
-    pub resnets: Vec<Resnet>,
-    pub upsample: Option<Conv>,
-}
-
-/// The `AutoencoderKLFlux2` decoder side: the frozen BatchNorm's affine,
-/// `post_quant_conv`, and the conv decoder from 32 latent channels to RGB.
-pub struct Vae {
-    /// The BatchNorm denormalisation `z·√(var+eps) + mean` as two ops read
-    /// it: `standardize` (`(x − bias)·scale`) with a ZERO bias and `scale =
-    /// √(var+eps)`, then `add_bias` of `mean` — all `[128]`, the deviation
-    /// derived at import from `bn.running_var`, the zero a fill. (The
-    /// one-op form `bias = −mean/√(var+eps)` wants a quotient of two planes
-    /// the contract algebra does not state.)
-    pub bn_zero: Weight,
-    pub bn_scale: Weight,
-    pub bn_mean: Weight,
-    pub post_quant_conv: Conv,
-    pub conv_in: Conv,
-    pub mid: MidBlock,
-    pub up_blocks: Vec<UpBlock>,
-    pub norm_out: GroupNorm,
-    pub conv_out: Conv,
-}
-
-impl Vae {
-    fn flux2(banks: Dtype) -> Vae {
-        let dense = crate::dense(banks);
-        let top = VAE_BLOCK_CHANNELS[VAE_BLOCK_CHANNELS.len() - 1];
-        // The decoder walks `block_out_channels` reversed: 512, 512, 256, 128.
-        let mut c_in = top;
-        let up_blocks = VAE_BLOCK_CHANNELS
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(i, &c_out)| {
-                let prefix = format!("vae.up.{i}");
-                let resnets = (0..VAE_DECODER_RESNETS)
-                    .map(|r| {
-                        Resnet::at(
-                            &format!("{prefix}.res.{r}"),
-                            if r == 0 { c_in } else { c_out },
-                            c_out,
-                            banks,
-                        )
-                    })
-                    .collect();
-                c_in = c_out;
-                UpBlock {
-                    resnets,
-                    upsample: (i + 1 < VAE_BLOCK_CHANNELS.len())
-                        .then(|| Conv::at(&format!("{prefix}.upsample"), c_out, c_out, 3, banks)),
-                }
-            })
-            .collect();
-        Vae {
-            bn_zero: Weight::sym("vae.bn.zero", [u64::from(IN_CHANNELS)], dense),
-            bn_scale: Weight::sym("vae.bn.scale", [u64::from(IN_CHANNELS)], dense),
-            bn_mean: Weight::sym("vae.bn.mean", [u64::from(IN_CHANNELS)], dense),
-            post_quant_conv: Conv::at("vae.post_quant", VAE_CHANNELS, VAE_CHANNELS, 1, banks),
-            conv_in: Conv::at("vae.conv_in", top, VAE_CHANNELS, 3, banks),
-            mid: MidBlock {
-                resnet_0: Resnet::at("vae.mid.res.0", top, top, banks),
-                attention: MidAttention::at("vae.mid.attn", top, banks),
-                resnet_1: Resnet::at("vae.mid.res.1", top, top, banks),
-            },
-            up_blocks,
-            norm_out: GroupNorm::at("vae.norm_out", VAE_BLOCK_CHANNELS[0]),
-            conv_out: Conv::at("vae.conv_out", 3, VAE_BLOCK_CHANNELS[0], 3, banks),
-        }
-    }
-}
-
 /// The whole text.
 pub struct Model {
     pub tp: u32,
@@ -614,8 +418,10 @@ pub struct Model {
     /// and its conditioning rows are random, so it declares no `text`
     /// reading.
     pub te: Option<TextEncoder>,
-    /// `None` on the miniature, for the same reason.
-    pub vae: Option<Vae>,
+    /// The `AutoencoderKLFlux2` ([`super::vae`]), `None` on the miniature
+    /// for the same reason: the `vae.decode` / `vae.encode` readings exist
+    /// iff this does.
+    pub vae: Option<super::vae::Vae>,
 }
 
 impl Model {
@@ -629,7 +435,7 @@ impl Model {
             tp,
             d,
             Some(TextEncoder::qwen3_4b(&d, banks)),
-            Some(Vae::flux2(banks)),
+            Some(super::vae::Vae::flux2(banks)),
         )
     }
 
@@ -641,7 +447,13 @@ impl Model {
         Model::new(banks, tp, Dims::mini(), None, None)
     }
 
-    fn new(banks: Dtype, tp: u32, d: Dims, te: Option<TextEncoder>, vae: Option<Vae>) -> Model {
+    fn new(
+        banks: Dtype,
+        tp: u32,
+        d: Dims,
+        te: Option<TextEncoder>,
+        vae: Option<super::vae::Vae>,
+    ) -> Model {
         assert_eq!(
             tp, 1,
             "this text ships one-rank rows; tp {tp} is not a world it states"
