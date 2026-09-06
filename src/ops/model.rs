@@ -21,6 +21,7 @@ use clap::Subcommand;
 use crate::local::hf::runtime_snapshot_allow_patterns;
 use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
+pub mod facts;
 pub mod import;
 
 #[derive(Subcommand, Debug)]
@@ -227,6 +228,11 @@ struct Artifact {
     /// as large as the archive it came from, and a model with three of them
     /// occupies four times what the archive line alone would suggest.
     runtimes: Vec<RuntimeBuild>,
+    /// **WHAT THIS ROW CAN DO**, when the row it was stamped with is a
+    /// generative one (design D12): its readings, its latent space and its
+    /// schedule. A text row reports `None`, which is the same absence as a
+    /// `.zt` with no stamp on it.
+    generative: Option<facts::GenerativeFacts>,
 }
 
 #[derive(serde::Serialize)]
@@ -312,6 +318,27 @@ impl crate::ui::Report for ModelList {
                     format!("{from}{by}"),
                 ],
             ));
+            // **WHAT IT CAN DO**, under what it is. Indented for the same
+            // reason the runtime builds below are: it is a fact ABOUT the row
+            // on the line above, not a second row. Only generative rows get
+            // it -- a text row's readings are one implicit arm and saying so
+            // on every line would be noise on every line.
+            if let Some(generative) = &artifact.generative {
+                table.push(Row::new(
+                    Mark::Plain,
+                    [
+                        "  generative".to_string(),
+                        String::new(),
+                        if generative.text_to_image() {
+                            "text-to-image".to_string()
+                        } else {
+                            String::new()
+                        },
+                        generative.summary(),
+                        String::new(),
+                    ],
+                ));
+            }
             // Indented under the archive they came from, because that is the
             // relationship: a build is derived and deleting it costs a
             // rebuild, where deleting the archive costs a re-import.
@@ -464,6 +491,7 @@ fn list() -> Result<Answer> {
                         runtime_quant: r.runtime_quant.clone(),
                     })
                     .collect(),
+                generative: facts::of(e.sku.as_deref()),
                 name: e.name,
                 sku: e.sku,
                 backend: e.backend,
@@ -536,6 +564,7 @@ fn info(name: String) -> Result<Answer> {
                 runtime_quant: r.runtime_quant.clone(),
             })
             .collect(),
+        generative: facts::of(entry.sku.as_deref()),
         name: entry.name,
         root: entry.root,
         files: entry.files,
@@ -565,6 +594,9 @@ pub struct ModelInfo {
     written_by: Option<String>,
     source: Option<String>,
     runtimes: Vec<RuntimeBuild>,
+    /// The generative facts of the stamped row (design D12); `None` for a
+    /// text row or an unstamped `.zt`.
+    generative: Option<facts::GenerativeFacts>,
 }
 
 impl crate::ui::Report for ModelInfo {
@@ -619,6 +651,112 @@ impl crate::ui::Report for ModelInfo {
             );
         }
         table.print(palette);
+
+        // **THE GENERATIVE BLOCK.** After the storage facts, because it is
+        // about what the row does rather than about the file, and before the
+        // `[model]` snippet, because a person reading down the page decides
+        // here whether this is the artifact they want to paste.
+        if let Some(generative) = &self.generative {
+            println!("\n{}", palette.bold("Generative"));
+            let mut table = Table::new([Align::Left, Align::Left], 1);
+            let mut row =
+                |k: &str, v: String| table.push(Row::new(Mark::Plain, [k.to_string(), v]));
+            if let Some(latent) = &generative.latent {
+                let (w, h) = latent.pixels_per_row();
+                row(
+                    "latent",
+                    format!("{} (one row is {w}x{h} pixels)", latent.line()),
+                );
+            }
+            if let Some(schedule) = &generative.schedule {
+                row("schedule", schedule.line());
+                if !schedule.pinned_sigmas.is_empty() {
+                    // Printed in full: a distilled row's step count is not a
+                    // preference, and these are the numbers a guest will use
+                    // whatever `--steps` says.
+                    row(
+                        "sigmas",
+                        schedule
+                            .pinned_sigmas
+                            .iter()
+                            .map(|s| format!("{s:.4}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                row("train steps", schedule.train_steps.to_string());
+            }
+            row("max latent rows", generative.max_latent_rows.to_string());
+            table.print(palette);
+
+            // Plain lines, not a `Table`: the ports of one reading run to
+            // five entries and `Table` cuts its last column to the terminal,
+            // so the half that says what a guest has to bind was the half
+            // that disappeared. A long line a terminal wraps is worth more
+            // here than a short line pie truncated.
+            println!("\n{}", palette.bold("Readings"));
+            let name_width = generative
+                .readings
+                .iter()
+                .map(|r| r.name.chars().count())
+                .max()
+                .unwrap_or(0);
+            let binds_of = |reading: &facts::Reading| {
+                // The two booleans a guest finds a reading BY:
+                // `takes_tokens` says "this one can be told something in
+                // words", `has_kv` says "this one is an attention pass with
+                // a cache". Spelled out rather than shown as flags, because
+                // the point of this screen is that nobody should have to
+                // look them up.
+                let mut binds = Vec::new();
+                if reading.tokens {
+                    binds.push("tokens");
+                }
+                if reading.kv {
+                    binds.push("kv");
+                }
+                if binds.is_empty() {
+                    "no tokens, no kv".to_string()
+                } else {
+                    binds.join(" + ")
+                }
+            };
+            let binds_width = generative
+                .readings
+                .iter()
+                .map(|r| binds_of(r).chars().count())
+                .max()
+                .unwrap_or(0);
+            for reading in &generative.readings {
+                println!(
+                    "  {}  {}  {}  -> {} {}",
+                    palette.accent(format!("{:<name_width$}", reading.name)),
+                    palette.dim(format!("#{}", reading.index)),
+                    format!("{:<binds_width$}", binds_of(reading)),
+                    reading.readout,
+                    reading.readout_width,
+                );
+                if !reading.ports.is_empty() {
+                    println!(
+                        "  {}  {}  {}  {}",
+                        " ".repeat(name_width),
+                        "  ",
+                        " ".repeat(binds_width),
+                        palette.dim(format!("<- {}", reading.ports.join(", "))),
+                    );
+                }
+            }
+            if generative.text_to_image() {
+                println!(
+                    "  {}",
+                    palette.dim(
+                        "this row has a text reading and a denoise reading: \
+                         `pie run text-to-image -- --prompt \"...\"` drives it."
+                    )
+                );
+            }
+        }
+
         // The `sku` row above is a name the import takes back: a snapshot
         // that fits several rows was converted for one of them, and this is
         // the string that asks for a different one.

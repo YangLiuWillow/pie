@@ -229,7 +229,7 @@ impl Model {
                 image_follows_text: true,
             }),
             readout: ReadoutKind::Velocity,
-            readout_width: PATCH_FEATURES,
+            readout_width: Tap::width(Tap::from_env().as_deref(), d),
         });
         if let (Some(decode), Some(encode), Some(_)) =
             (codes.vae_decode, codes.vae_encode, &self.vae)
@@ -285,6 +285,8 @@ impl Model {
                 train_steps: TRAIN_STEPS,
                 boundary: None,
                 pinned_sigmas: turbo_sigmas(self.shift),
+                // One backbone, one schedule: every lane takes `shift`.
+                stream_shifts: vec![],
             }),
             // 2048² at 16 px per row is 16 384 image rows, plus the widest
             // caption; the miniature's reference grid is 8 × 8.
@@ -307,6 +309,57 @@ pub fn turbo_sigmas(shift: f32) -> Vec<f32> {
         .map(|i| 1.0 - i as f32 / 8.0)
         .map(|sigma| shift * sigma / (1.0 + (shift - 1.0) * sigma))
         .collect()
+}
+
+/// **THE PARITY HARNESS'S BISECTION KNOB**, the `mini_dit::forward::Tap`
+/// idiom spelled for this row. Thirty-four blocks between a caption and a
+/// velocity say nothing about WHERE two runs diverged, so
+/// `PIE_Z_IMAGE_TAP=<key>` makes the `denoise` reading plant
+/// [`seam::VELOCITY`] on ONE intermediate and stop there; the guest's
+/// `velocity(width)` then reads that rectangle off its own lane's rows and
+/// `scripts/imagegen/zimage_parity.py` diffs it against the matching
+/// `zimage_golden.py --taps` key.
+///
+/// The keys, in the order the arm computes them: `latents` (the port as it
+/// landed), `x_linear` (`x_embedder`, the golden's `x.embed`), `x_embed`
+/// (its pad rows substituted), `normed0` / `scaled0` and `b0.{q,k,v,attn,
+/// out,norm2,res1,ffn,ffn_norm2,res2}` inside noise refiner 0, `refiner{l}`,
+/// `x_refined` (the golden's `x.refined`), `layer{l}` (joint block `l`, the
+/// golden's `layer{l}.out` — this one carries BOTH lanes, so a guest that
+/// reads the context lane back too gets its caption half), `final_norm` and
+/// `final_linear` (the golden's `out.0`, before the sign flip).
+///
+/// **A tap TRUNCATES the plan.** The seam is an export that runs at the end
+/// of the plan, so a seam planted on a live intermediate while the rest of
+/// the arm still runs reads whatever recycled that buffer — the tap must be
+/// the last thing the arm computes. Truncating drops the ports the rest of
+/// the arm would have read, so a tapped arm reads the context port up front
+/// and merges the tapped rectangle with it: the plan keeps declaring the
+/// port the context lane feeds, and the merge covers both classes.
+///
+/// This is the one place this family reads the environment, and it is read
+/// at catalog time, for a row nothing real is served by.
+pub struct Tap;
+
+impl Tap {
+    /// The environment variable, read at catalog time.
+    pub const ENV: &'static str = "PIE_Z_IMAGE_TAP";
+
+    /// The requested tap, or `None` for the model as it is.
+    #[must_use]
+    pub fn from_env() -> Option<String> {
+        std::env::var(Self::ENV).ok().filter(|key| !key.is_empty())
+    }
+
+    /// The width of the rectangle a tap exports: the patch features at the
+    /// arm's own two rectangles, the trunk width everywhere else.
+    #[must_use]
+    pub fn width(key: Option<&str>, d: &Dims) -> u32 {
+        match key {
+            None | Some("latents") | Some("final_linear") => PATCH_FEATURES,
+            Some(_) => d.dim,
+        }
+    }
 }
 
 /// The per-lane facts: which stream the lane's rows are, and which reading
@@ -530,13 +583,27 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
         mask: RaggedMask::None,
     };
     let x = img.latents(port::LATENTS, PATCH_FEATURES, Dtype::Bf16);
+    // [`Tap`]: the bisect's context rows, read up front so a TRUNCATED plan
+    // still declares the port the context lane feeds.
+    let tap = Tap::from_env().unwrap_or_default();
+    let c_early = (!tap.is_empty()).then(|| ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16));
+    // `tap!(key, value)`: under [`Tap`] `key`, seam the image rectangle
+    // merged with the context lane's own (narrowed to the same width, so
+    // the merge is one rectangle) and return there.
+    macro_rules! tap {
+        ($name:expr, $v:expr) => {
+            if tap == $name {
+                return seam_tapped($v, c_early.expect("a tapped arm reads the context port"));
+            }
+        };
+    }
+    tap!("latents", x.clone());
     let x = linear(&m.x_embed, &x);
-    let mut x = pad_rows(
-        &x,
-        &img.latents(port::PAD_IMAGE, 1, Dtype::Bf16),
-        &m.x_pad_mod,
-    );
-    for (_, block) in img.walk_layers(&m.noise_refiner) {
+    tap!("x_linear", x.clone());
+    let flag = img.latents(port::PAD_IMAGE, 1, Dtype::Bf16);
+    let mut x = pad_rows(&x, &flag, &m.x_pad_mod);
+    tap!("x_embed", x.clone());
+    for (l, block) in img.walk_layers(&m.noise_refiner) {
         let mods = adaln4(
             &linear(
                 block.ada.as_ref().expect("a noise refiner is modulated"),
@@ -544,15 +611,34 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
             ),
             d.dim,
         );
-        x = run_block(&x, block, Some((&mods, &img_lanes)), d, &own);
+        if l == 0 {
+            tap!(
+                "normed0",
+                ops::elemwise::rmsnorm(&x, &block.attn_norm1, NORM_EPS)
+            );
+            tap!("scaled0", {
+                let h = ops::elemwise::rmsnorm(&x, &block.attn_norm1, NORM_EPS);
+                ops::elemwise::modulate(&h, &mods.scale_msa, Some(&img_lanes), ModulateForm::Scale)
+            });
+        }
+        let want = if l == 0 { tap.as_str() } else { "" };
+        let (next, hit) = run_block_tapped(&x, block, Some((&mods, &img_lanes)), d, &own, want);
+        if let Some(hit) = hit {
+            return seam_tapped(hit, c_early.expect("a tapped arm reads the context port"));
+        }
+        x = next;
+        tap!(format!("refiner{l}"), x.clone());
     }
 
+    tap!("x_refined", x.clone());
     // ---- the caption lane: already refined, pads included ---------------
-    let c = ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16);
+    let c = c_early
+        .clone()
+        .unwrap_or_else(|| ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16));
 
     // ---- the joint trunk over `[image ‖ caption]` ------------------------
     let mut u = Value::merge(vec![x, c]);
-    for (_, block) in arm.walk_layers(&m.layers) {
+    for (l, block) in arm.walk_layers(&m.layers) {
         let mods = adaln4(
             &linear(
                 block.ada.as_ref().expect("a joint block is modulated"),
@@ -561,6 +647,14 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
             d.dim,
         );
         u = run_block(&u, block, Some((&mods, &lanes)), d, &joint);
+        if tap == format!("layer{l}") {
+            // Both lanes already: the merge is `u`'s own two classes, so
+            // the context lane reads its caption half of the same seam.
+            let (ui, ci) = u.split(&Facts::image());
+            let both = Value::merge(vec![ui, ci]);
+            seam::at(seam::VELOCITY, &[&both]);
+            return both;
+        }
     }
 
     // ---- the final layer, image rows only ---------------------------------
@@ -569,13 +663,16 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     let scale = linear(&m.final_ada, &ops::elemwise::silu(&temb));
     let (scale_img, _) = scale.split(&Facts::image());
     let (ui, _) = u.split(&Facts::image());
+
     let h = ops::elemwise::modulate(
         &ops::elemwise::layernorm_no_scale(&ui, FINAL_LN_EPS),
         &scale_img,
         Some(&img_lanes),
         ModulateForm::Scale,
     );
+    tap!("final_norm", h.clone());
     let v = linear(&m.final_linear, &h);
+    tap!("final_linear", v.clone());
     // The reference pipeline's `noise_pred = -noise_pred`.
     let velocity = ops::elemwise::mul_scalar(-1.0, &v);
     seam::at(seam::VELOCITY, &[&velocity]);
@@ -594,6 +691,22 @@ struct Geom {
 /// One biased projection.
 fn linear(w: &Linear, x: &Value) -> Value {
     ops::elemwise::add_bias(&w.bias, &ops::linear::matmul(x, &w.w))
+}
+
+/// [`Tap`]'s seam: the tapped image rectangle merged with the context
+/// lane's rows narrowed to the same width — the plan then declares the port
+/// that lane feeds (a truncated arm never reaches its own read of it) and
+/// every class of the merge is covered.
+fn seam_tapped(image: Value, context: Value) -> Value {
+    let width = u32::try_from(image.width()).unwrap_or(u32::MAX);
+    let context = if u64::from(width) < context.width() {
+        ops::layout::split_rows(&context, width).0
+    } else {
+        context
+    };
+    let both = Value::merge(vec![image, context]);
+    seam::at(seam::VELOCITY, &[&both]);
+    both
 }
 
 /// Overwrite the flagged rows with the learned pad token: the `[rows, 1]`
@@ -642,6 +755,28 @@ fn adaln4(m: &Value, dim: u32) -> Mods {
 /// `to_qkv` → per-head QK RMSNorm → three-axis interleaved rope → ragged
 /// attention over the packed segments → `to_out`; the MLP is SwiGLU.
 fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &Geom) -> Value {
+    run_block_tapped(x, b, mods, d, g, "").0
+}
+
+/// [`run_block`] with a [`Tap`] hook: the second half of the answer is the
+/// tapped intermediate, for the caller to seam and return there (a seam
+/// planted while the rest of the arm still runs reads a recycled buffer).
+fn run_block_tapped(
+    x: &Value,
+    b: &Block,
+    mods: Option<(&Mods, &Value)>,
+    d: &Dims,
+    g: &Geom,
+    tap: &str,
+) -> (Value, Option<Value>) {
+    let mut hit: Option<Value> = None;
+    macro_rules! tap {
+        ($name:expr, $v:expr) => {
+            if tap == $name {
+                hit = Some($v);
+            }
+        };
+    }
     let dim = d.dim;
     let hd = d.head_dim;
     let scaled = |normed: &Value, s: &Value, lanes: &Value| {
@@ -666,6 +801,9 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         )
     };
     let (q, k) = (turn(&q, &b.attn.q_norm), turn(&k, &b.attn.k_norm));
+    tap!("b0.q", q.clone());
+    tap!("b0.k", k.clone());
+    tap!("b0.v", v.clone());
     let o = ops::attn::ragged(
         &ops::layout::pack_rows(&q, &g.perm),
         &ops::layout::pack_rows(&k, &g.perm),
@@ -677,12 +815,16 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         g.mask,
     );
     let o = ops::layout::unpack_rows(&o, &g.perm);
+    tap!("b0.attn", o.clone());
     let o = ops::linear::matmul(&o, &b.attn.out);
+    tap!("b0.out", o.clone());
     let o = ops::elemwise::rmsnorm(&o, &b.attn_norm2, NORM_EPS);
+    tap!("b0.norm2", o.clone());
     let x = match mods {
         Some((m, lanes)) => ops::elemwise::gated_residual_add(x, &m.gate_msa, &o, Some(lanes)),
         None => ops::elemwise::residual_add(&o, x),
     };
+    tap!("b0.res1", x.clone());
 
     let h = ops::elemwise::rmsnorm(&x, &b.ffn_norm1, NORM_EPS);
     let h = match mods {
@@ -693,11 +835,15 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         &ops::linear::mlp_swiglu(&ops::linear::matmul(&h, &b.mlp.gate_up), d.inter),
         &b.mlp.down,
     );
+    tap!("b0.ffn", f.clone());
     let f = ops::elemwise::rmsnorm(&f, &b.ffn_norm2, NORM_EPS);
-    match mods {
+    tap!("b0.ffn_norm2", f.clone());
+    let out = match mods {
         Some((m, lanes)) => ops::elemwise::gated_residual_add(&x, &m.gate_mlp, &f, Some(lanes)),
         None => ops::elemwise::residual_add(&f, &x),
-    }
+    };
+    tap!("b0.res2", out.clone());
+    (out, hit)
 }
 
 // `TE_HIDDEN` is the caption width the flagship's `refine` port states;

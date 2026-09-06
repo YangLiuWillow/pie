@@ -147,6 +147,50 @@ impl Frames {
         })
     }
 
+    /// Build a handle from a `pixels` seam's plane: `count * height * width`
+    /// rows of RGB f32 in the model's own `[-1, 1]`, one row per output voxel
+    /// in `(t, h, w)` order — which is presentation order — mapped to RGB8 by
+    /// `(x + 1) / 2` and clamped.
+    ///
+    /// The clamp is deliberate. A VAE's last convolution is not bounded, and
+    /// the reference pipelines clamp too; refusing an overshoot would turn a
+    /// picture that is right everywhere but four pixels into no picture at
+    /// all.
+    pub fn from_pixels(
+        values: &[f32],
+        width: u32,
+        height: u32,
+        count: u32,
+        fps: f32,
+    ) -> Result<Self, String> {
+        if width == 0 || height == 0 || count == 0 {
+            return Err(format!(
+                "frames.from-channel: a handle needs a non-zero extent, got \
+                 {width}x{height} x{count}"
+            ));
+        }
+        let want = (width as u64) * (height as u64) * (count as u64) * 3;
+        if values.len() as u64 != want {
+            return Err(format!(
+                "frames.from-channel: the cell holds {} f32 and {count} frame(s) of \
+                 {width}x{height} RGB is {want}; a `pixels` seam lands one row per \
+                 output voxel, three wide",
+                values.len()
+            ));
+        }
+        let bytes = values
+            .iter()
+            .map(|v| (((v + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+        Ok(Self {
+            store: FrameStore::Host(bytes),
+            width,
+            height,
+            count,
+            fps,
+        })
+    }
+
     /// The whole encoder dispatch. One place, so the refusals read the same
     /// way whichever door reached them (`frames.encode` or
     /// `session.send-frames`).
@@ -274,6 +318,45 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
         fps: f32,
     ) -> Result<Result<Resource<Frames>, String>> {
         match Frames::from_rgb8(bytes, width, height, count, fps) {
+            Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    /// The VAE road (design D8/D11): the channel's committed cell becomes a
+    /// handle without the pixels entering linear memory. The take is the same
+    /// one `channel.take-blocking` does — same await discipline, same poison —
+    /// and the only difference is that the bytes stop here.
+    async fn from_channel(
+        &mut self,
+        ch: Resource<super::forward::Channel>,
+        width: u32,
+        height: u32,
+        count: u32,
+        fps: f32,
+    ) -> Result<Result<Resource<Frames>, String>> {
+        let cell = match super::forward::materialize_channel_blocking(
+            self,
+            ch,
+            super::forward::ChannelReadMode::Take,
+        )
+        .await?
+        {
+            Ok(bytes) => bytes,
+            Err(why) => return Ok(Err(why)),
+        };
+        if !cell.len().is_multiple_of(4) {
+            return Ok(Err(format!(
+                "frames.from-channel: the cell is {} bytes, which is not whole f32 rows; \
+                 a `pixels` seam's channel is f32",
+                cell.len()
+            )));
+        }
+        let values: Vec<f32> = cell
+            .chunks_exact(4)
+            .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        match Frames::from_pixels(&values, width, height, count, fps) {
             Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
             Err(e) => Ok(Err(e)),
         }

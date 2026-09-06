@@ -280,7 +280,13 @@ async def _stream_inferlet_output_async(
                     )
 
                 elif event == Event.File:
-                    pass
+                    # Announced, not dropped. `message` is a `ReceivedFile`:
+                    # bytes carrying the name the inferlet suggested, so the
+                    # one line this can print is a useful one.
+                    typer.echo(
+                        f"[Instance {short_id}] File: "
+                        f"{message.file_name('(unnamed)')} ({len(message)} bytes)"
+                    )
 
     finally:
         # Restore original signal handler

@@ -5,7 +5,17 @@
 //! |---|---|---|---|
 //! | `text` | one, `Text` | `embed(ids)`, `attention(kv)` | `hidden` `[L, dim]`: the layer-{9,18,27} stack, through `context_embedder` |
 //! | `denoise` | `Text` + `Image` (+ `Reference`), one group | text: `context`, `positions`, `timestep` (+ `guidance`); image, reference: `latents`, `positions`, `timestep` (+ `guidance`) | `velocity` `[N, 128]` on the image lane |
-//! | `vae.decode` (arm only, see below) | one, `Image` | `voxels` `[V, 128]` + the grid | `pixels` `[256·V, 3]` |
+//! | `vae.decode` | one, `Image`, one clip `{1, h, w}` | `latent` `[h·w, 128]` on the voxel axis | `pixels` `[16h·16w, 3]` in `[-1, 1]` |
+//! | `vae.encode` | one, `Image`, one clip `{1, H, W}` | `pixels` `[H·W, 3]` on the voxel axis | `pixels` `[H/16·W/16, 128]`: the normalised posterior MEAN |
+//!
+//! The two VAE readings ([`super::vae`]) exist on the flagship only (the
+//! miniature's checkpoint is the transformer alone). Each runs ONE clip a
+//! lane, its `Voxels` port's channel is `[h, w, C]`, and it reads its
+//! pixels back off the `pixels` seam beside the output grid. The port is
+//! the DiT's own 128-wide `/16` grid on both arms — the 2×2 pixel shuffle
+//! and the frozen BatchNorm live INSIDE the plan, so a guest hands the
+//! denoiser's rows over and gets the denoiser's rows back ([`super::vae`]
+//! states why that is the boundary).
 //!
 //! **Sequence layout.** The joint attention packs a group's lanes by
 //! stream code — Text (0), Image (1), Reference (5) — which is the
@@ -48,19 +58,6 @@
 //! prefill has no key mask), or hand the native length; the family states
 //! the truncation bound (`TE_MAX_TOKENS`), not a pad target.
 //!
-//! **`vae.decode` is traced, imported, and NOT declared in the facts.** Two
-//! things stop it being a reading a guest can name: `models::PortKind` and
-//! `ReadoutKind` have no `Voxels`/`Pixels` (the facts vocabulary of
-//! `IMAGEGEN_CONTRACT.md` §6 stops at the engine), and the mid block's
-//! single-head attention (`head_dim = 512`, per clip) has neither a kernel
-//! arm (`attention.ragged` serves 64/128/256) nor a voxel-axis indptr to
-//! segment by. The arm below is the whole decoder MINUS that attention,
-//! so its pixels are not the reference's yet; every other node of it
-//! bakes and dispatches on CUDA. The encoder is not traced either: its
-//! `Downsample2D` pads asymmetrically (`(0, 1, 0, 1)`), which
-//! `GridRule::Conv` cannot state.
-
-use model_dsl::ops::spatial;
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
     Request, RopeForm, Stream, Value, Weight, ops, seam,
@@ -72,10 +69,10 @@ use crate::{
 };
 
 use super::model::{
-    Attn, Conv, DOUBLE_MOD_SLICES, Dit, Embedder, GUIDANCE_SCALE, GroupNorm, HEAD_DIM, IN_CHANNELS,
-    Model, NORM_EPS, PACK, ROPE_AXES, ROPE_DIMS, ROPE_THETA, Resnet, SINGLE_MOD_SLICES, SM_SCALE,
-    Swiglu, T_FLIP_SIN_COS, T_FREQ_DIM, T_MAX_PERIOD, T_SCALE, TE_LAYERS, TE_MAX_TOKENS, TE_TAPS,
-    TOKEN_COMPRESSION, TRAIN_STEPS, TextEncoder, VAE_EPS, VAE_GROUPS, Vae, port,
+    Attn, DOUBLE_MOD_SLICES, Dit, Embedder, GUIDANCE_SCALE, HEAD_DIM, IN_CHANNELS, Model, NORM_EPS,
+    ROPE_AXES, ROPE_DIMS, ROPE_THETA, SINGLE_MOD_SLICES, SM_SCALE, Swiglu, T_FLIP_SIN_COS,
+    T_FREQ_DIM, T_MAX_PERIOD, T_SCALE, TE_LAYERS, TE_MAX_TOKENS, TE_TAPS, TOKEN_COMPRESSION,
+    TRAIN_STEPS, TextEncoder, port,
 };
 
 /// The bit the one-hot stream facts start at (D2): bits 0..6 are the six
@@ -84,7 +81,7 @@ pub const STREAM_BASE: u8 = 0;
 
 /// The two bits the reading index lives in, as a plain binary code: bit
 /// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Four codes:
-/// `text`, `denoise`, `vae.decode`, and one reserved for `vae.encode`.
+/// `text`, `denoise`, `vae.decode`, `vae.encode`.
 pub const READING_LO: u8 = 6;
 pub const READING_HI: u8 = 7;
 
@@ -97,9 +94,9 @@ pub const READING_HI: u8 = 7;
 pub struct Readings {
     pub text: Option<u8>,
     pub denoise: u8,
-    /// The VAE decoder arm's code, on a row that carries a VAE. Traced,
-    /// not declared in the facts (see the module doc).
+    /// The two VAE arms' codes, on a row that carries a VAE.
     pub vae_decode: Option<u8>,
+    pub vae_encode: Option<u8>,
 }
 
 impl Model {
@@ -116,10 +113,12 @@ impl Model {
         let text = self.te.as_ref().map(|_| take());
         let denoise = take();
         let vae_decode = self.vae.as_ref().map(|_| take());
+        let vae_encode = self.vae.as_ref().map(|_| take());
         Readings {
             text,
             denoise,
             vae_decode,
+            vae_encode,
         }
     }
 
@@ -203,12 +202,59 @@ impl Model {
             readout: ReadoutKind::Velocity,
             readout_width: IN_CHANNELS,
         });
+        // The two voxel readings, on a row that carries the autoencoder.
+        // Both put the port at the DiT's own 128-wide `/16` grid
+        // ([`super::vae`]); the readout is the other side of the same
+        // `pixels` seam.
+        if let (Some(decode), Some(encode), Some(_)) =
+            (codes.vae_decode, codes.vae_encode, &self.vae)
+        {
+            readings.push(ReadingFact {
+                name: "vae.decode",
+                index: decode,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Image],
+                ports: vec![port(
+                    "latent",
+                    PortKind::Voxels,
+                    IN_CHANNELS,
+                    &[Stream::Image],
+                )],
+                // A VAE tile is a box on the voxel axis, not rows in a
+                // rotary space: it takes no positions and states no
+                // convention.
+                positions: None,
+                readout: ReadoutKind::Pixels,
+                readout_width: super::vae::RGB,
+            });
+            readings.push(ReadingFact {
+                name: "vae.encode",
+                index: encode,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Image],
+                // Voxel index ONE: the engine seats one rectangle per
+                // `(kind, index)` for the whole plan, and `vae.decode`'s
+                // packed latent clip is 128 wide at index 0.
+                ports: vec![PortFact {
+                    name: "pixels",
+                    kind: PortKind::Voxels,
+                    width: super::vae::RGB,
+                    streams: vec![Stream::Image],
+                    at: Some(port::PIXEL_VOXELS),
+                }],
+                positions: None,
+                readout: ReadoutKind::Pixels,
+                readout_width: IN_CHANNELS,
+            });
+        }
         Generative {
             readings,
             // Stated as the denoiser holds it: a token is 128 channels at
             // /16, one cell, no further patching. The VAE's own 32 channels
-            // at /8 are the `vae.decode` arm's business (`model::VAE_CHANNELS`,
-            // `PACK`).
+            // at /8 are the VAE arms' business (`model::VAE_CHANNELS`,
+            // `model::PACK`) and never leave them.
             latent: Some(LatentSpace {
                 channels: IN_CHANNELS,
                 patch_t: 1,
@@ -230,6 +276,8 @@ impl Model {
                 // klein is distilled to four steps; these are its sigmas at
                 // 1024² (the golden's `sigmas[:-1]`).
                 pinned_sigmas: sigmas(4096, 4),
+                // One backbone, one schedule: every lane takes `shift`.
+                stream_shifts: vec![],
             }),
             // 1024² target + four 1024² references (the API's klein cap) +
             // the 512-token prompt; the miniature's job is 64 + 128 + 32.
@@ -359,8 +407,11 @@ impl ForwardHybrid for Model {
             text_encode(arm(code), te);
         }
         let velocity = denoise(arm(codes.denoise), self);
-        if let (Some(code), Some(vae)) = (codes.vae_decode, &self.vae) {
-            vae_decode(arm(code), vae);
+        if let (Some(decode), Some(encode), Some(vae)) =
+            (codes.vae_decode, codes.vae_encode, &self.vae)
+        {
+            super::vae::decode(arm(decode), vae);
+            super::vae::encode(arm(encode), vae);
         }
         velocity
     }
@@ -711,73 +762,4 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     let velocity = ops::linear::matmul(&h, &dit.proj_out);
     seam::at(seam::VELOCITY, &[&velocity]);
     velocity
-}
-
-/// A 2-D convolution of the decoder over the voxel axis: `k×k`, stride 1,
-/// `same` padding (`k = 3` pads 1, `k = 1` pads 0).
-fn conv(x: &Value, grid: &Value, c: &Conv) -> (Value, Value) {
-    let pad = c.k / 2;
-    spatial::conv3d(
-        x,
-        grid,
-        &c.w,
-        Some(&c.bias),
-        spatial::Conv::conv2d([c.k, c.k], [1, 1], [pad, pad]),
-        None,
-    )
-}
-
-/// `GroupNorm(32) → SiLU`, fused.
-fn norm_silu(x: &Value, grid: &Value, n: &GroupNorm) -> Value {
-    spatial::group_norm(x, grid, VAE_GROUPS, &n.weight, &n.bias, VAE_EPS, true)
-}
-
-/// `ResnetBlock2D`, box-keeping: the grid in is the grid out.
-fn resnet(x: &Value, grid: &Value, r: &Resnet) -> Value {
-    let h = norm_silu(x, grid, &r.norm1);
-    let (h, _) = conv(&h, grid, &r.conv1);
-    let h = norm_silu(&h, grid, &r.norm2);
-    let (h, _) = conv(&h, grid, &r.conv2);
-    let skip = match &r.shortcut {
-        Some(c) => conv(x, grid, c).0,
-        None => x.clone(),
-    };
-    ops::elemwise::add(&skip, &h)
-}
-
-/// The `vae.decode` arm: BatchNorm denormalise → 2×2 pixel shuffle →
-/// `post_quant_conv` → the conv decoder → `pixels`. See the module doc for
-/// the mid-block attention it does not yet carry.
-fn vae_decode(arm: &Input<Facts>, vae: &Vae) {
-    let g0 = arm.grid();
-    let z = arm.voxels(port::VOXELS, IN_CHANNELS, Dtype::Bf16);
-    // `standardize` is in place and a port's cell is never overwritten, so
-    // the rows are copied first — a factor-1 nearest upsample is the one
-    // fresh box-keeping copy the voxel axis has.
-    let (z, g0) = spatial::upsample_nearest(&z, &g0, [1, 1, 1], false);
-    let z = ops::elemwise::standardize(&z, &vae.bn_zero, &vae.bn_scale);
-    let z = ops::elemwise::add_bias(&vae.bn_mean, &z);
-    let (z, g) = spatial::pixel_shuffle(&z, &g0, [1, PACK, PACK]);
-    let (z, g) = conv(&z, &g, &vae.post_quant_conv);
-    let (mut x, mut g) = conv(&z, &g, &vae.conv_in);
-
-    x = resnet(&x, &g, &vae.mid.resnet_0);
-    // UNSERVED: `vae.mid.attn` — see the module doc.
-    x = resnet(&x, &g, &vae.mid.resnet_1);
-
-    for up in &vae.up_blocks {
-        for r in &up.resnets {
-            x = resnet(&x, &g, r);
-        }
-        if let Some(c) = &up.upsample {
-            let (y, gy) = spatial::upsample_nearest(&x, &g, [1, 2, 2], false);
-            let (y, gy) = conv(&y, &gy, c);
-            x = y;
-            g = gy;
-        }
-    }
-
-    let x = norm_silu(&x, &g, &vae.norm_out);
-    let (pixels, g) = conv(&x, &g, &vae.conv_out);
-    seam::at(seam::PIXELS, &[&pixels, &g]);
 }

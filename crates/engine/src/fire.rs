@@ -256,6 +256,17 @@ pub struct Lane {
     /// declares; a declared port with no feed is a refusal by name.
     #[serde(default)]
     pub ports: Vec<PortFeed>,
+    /// This lane's reading binds NO kv space (a denoiser's float lane on a
+    /// model that also carries an encoder's cache): its rows are latents,
+    /// its slot holds no tokens before or after the fire, and the shell
+    /// must neither count them nor carry a count over to the next fire.
+    /// Without it a shell-owned slot (empty `kv.pages`) counts every fire's
+    /// rows as kv tokens, and the fourth 4096-row step of a 1024² job is
+    /// refused as 16384 tokens in one slot. `false` for every sequence
+    /// lane, whose count is the runtime's (`kv.pages` + `kv.held`) or the
+    /// shell's own.
+    #[serde(default)]
+    pub kv_less: bool,
 }
 
 /// A lane's stream: which of the model's rectangles its rows belong to.

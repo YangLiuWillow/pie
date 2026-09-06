@@ -12,6 +12,20 @@ interface session {
     // Sends a file to the remote user client
     send-file: func(data: blob);
 
+    /// `send-file` with a suggested file name, so what arrives at the client
+    /// is a named file rather than an anonymous blob.
+    ///
+    /// The bytes are already a guest value here -- that is what makes this
+    /// `send-file` and not `send-frames`. What it adds is the one thing
+    /// `send-file` cannot say: WHAT THE FILE IS. `pie run -o DIR` writes an
+    /// unnamed file as `file-0000.bin`, which is the right answer for a blob
+    /// nobody described and the wrong one for a guest that knows it just
+    /// produced `image.latent.f32`.
+    ///
+    /// `name` is a suggestion and not a path, exactly as in `send-frames`:
+    /// the host keeps the last component and the client sanitises again.
+    send-file-as: func(data: blob, name: string);
+
     // Receives an incoming file from the remote user client
     receive-file: async func() -> option<blob>;
 

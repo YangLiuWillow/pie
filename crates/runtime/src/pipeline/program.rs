@@ -7,7 +7,6 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use lru::LruCache;
 use eta_compiler::codegen::cuda::region_analysis::RegionAnalysis;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
@@ -17,6 +16,7 @@ use eta_ir::container_hash;
 use eta_ir::op::Op;
 use eta_ir::registry::{ModelProfile, Port};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
+use lru::LruCache;
 
 /// Registration-time pricing: per-instance costs computed once per program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,7 +232,8 @@ impl Registry {
                 matches!(
                     op,
                     Op::IntrinsicVal {
-                        intr: eta_ir::op::IntrinsicId::MtpLogits | eta_ir::op::IntrinsicId::MtpDrafts,
+                        intr: eta_ir::op::IntrinsicId::MtpLogits
+                            | eta_ir::op::IntrinsicId::MtpDrafts,
                         ..
                     }
                 )
@@ -269,7 +270,6 @@ impl Registry {
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
-
 }
 
 /// Compute registration-time pricing from the decoded container.
@@ -300,8 +300,9 @@ fn price(c: &TraceContainer) -> Pricing {
     };
     // A float lane's program (design D1) binds neither port: its read-out
     // rows are the leading extent of the `velocity()` / `hidden()` /
-    // `logits()` value it materializes, sized by the SDK from the latents
-    // port's rows.
+    // `pixels()` / `logits()` value it materializes, sized by the SDK from
+    // the latents port's rows — or, for a VAE reading (D8), from the clip
+    // the guest states, which is what a pixels epilogue reads back.
     let intrinsic_rows = || {
         c.stages
             .iter()
@@ -311,6 +312,7 @@ fn price(c: &TraceContainer) -> Pricing {
                     intr:
                         eta_ir::op::IntrinsicId::Velocity
                         | eta_ir::op::IntrinsicId::Hidden
+                        | eta_ir::op::IntrinsicId::Pixels
                         | eta_ir::op::IntrinsicId::Logits,
                     shape,
                     ..
@@ -427,6 +429,7 @@ pub fn model_profile() -> ModelProfile {
         m.num_layers(),
         m.eta_caps(),
         crate::model::velocity_facts(m.readings()),
+        crate::model::pixels_facts(m.readings()),
     )
 }
 
@@ -438,6 +441,7 @@ fn profile_from(
     num_layers: u32,
     eta: crate::model::EtaCaps,
     (has_velocity, velocity_width): (bool, u32),
+    (has_pixels, pixels_width): (bool, u32),
 ) -> ModelProfile {
     ModelProfile {
         vocab,
@@ -456,6 +460,8 @@ fn profile_from(
         has_attn_page_mask: eta.has_attn_page_mask,
         has_velocity,
         velocity_width,
+        has_pixels,
+        pixels_width,
         // Second-party kernels the backend advertises. `envelope_dot` is
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.
@@ -470,7 +476,6 @@ fn profile_from(
         },
     }
 }
-
 
 #[cfg(test)]
 mod pricing_tests {

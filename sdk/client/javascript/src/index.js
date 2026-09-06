@@ -50,6 +50,60 @@ function hashBytes(bytes) {
 }
 
 /**
+ * One complete file an inferlet sent, with the name it suggested.
+ *
+ * A `Buffer` SUBCLASS, deliberately. The `file` event has always carried the
+ * payload and nothing else, so every program written against this client does
+ * `const [kind, data] = await proc.recv()` and then writes `data`. Returning
+ * an object with `{data, name}` would break all of them to add one field.
+ * Subclassing means the payload is still a Buffer -- `data.length`,
+ * `fs.writeFileSync(p, data)`, `data.subarray(0, 8)` all unchanged -- and
+ * `data.name` is the new fact beside it.
+ *
+ * `name` is `null` for `session.send-file`, which carries no name, and a
+ * string for `session.send-file-as`, `send-frames` and `send-pcm`, which do.
+ * It is a SUGGESTION off the wire: run it through `fileName()` before joining
+ * it to a directory.
+ */
+export class ReceivedFile extends Buffer {
+    /**
+     * @param {Buffer} data The file's bytes.
+     * @param {string|null} name The name the inferlet suggested, or null.
+     * @returns {ReceivedFile}
+     */
+    // `wrap`, not `from`: `Buffer.from` is inherited here and means something
+    // else, and a static that shadows it with different semantics is a trap.
+    static wrap(data, name) {
+        // `Object.setPrototypeOf` rather than `new`: Buffer's constructor is
+        // deprecated and `Buffer.concat` is what produced these bytes, so the
+        // subclass is put on afterwards rather than copying a megabyte to
+        // construct it a second time.
+        const file = Object.setPrototypeOf(data, ReceivedFile.prototype);
+        file.name = name ?? null;
+        return file;
+    }
+
+    /**
+     * A name safe to join onto a directory: the directory part, `..` and NUL
+     * stripped, with `fallback` standing in when nothing usable is left.
+     *
+     * The server sanitises on the way out too; this is the check that counts,
+     * because a client does not get to assume the server it is talking to is
+     * the one that wrote that code.
+     *
+     * @param {string} fallback
+     * @returns {string}
+     */
+    fileName(fallback = 'file.bin') {
+        const raw = this.name || '';
+        const tail = raw.replace(/\\/g, '/').split('/').pop();
+        const base = tail.replace(/\0/g, '').trim();
+        if (base === '' || base === '.' || base === '..') return fallback;
+        return base;
+    }
+}
+
+/**
  * Represents a running process on the server.
  */
 export class Process {
@@ -223,7 +277,7 @@ export class PieClient {
 
     /** @private */
     async _handleFileChunk(message) {
-        const { process_id, file_hash, chunk_index, total_chunks, chunk_data } = message;
+        const { process_id, file_hash, chunk_index, total_chunks, chunk_data, name } = message;
 
         if (!this.processEventQueues.has(process_id)) return;
 
@@ -233,6 +287,12 @@ export class PieClient {
                 buffer: [],
                 totalChunks: total_chunks,
                 processId: process_id,
+                // The name rides on every chunk; the first is the one that is
+                // guaranteed to have been seen, so it is the one remembered.
+                // Undefined when the inferlet named nothing -- and undefined
+                // is also what a server built before the field existed sends,
+                // which is why this reads as "no name" and not as an error.
+                name: name ?? null,
             });
         }
 
@@ -244,7 +304,8 @@ export class PieClient {
             const completeData = Buffer.concat(download.buffer);
             const computedHash = hashBytes(completeData);
             if (computedHash === file_hash && this.processEventQueues.has(download.processId)) {
-                this.processEventQueues.get(download.processId).put(['file', completeData]);
+                const file = ReceivedFile.wrap(completeData, download.name);
+                this.processEventQueues.get(download.processId).put(['file', file]);
             }
         }
     }

@@ -11,6 +11,7 @@ pub mod hunyuan_image_3;
 pub mod kimi_k3;
 pub mod media;
 pub mod mini_dit;
+pub mod minimax_h3;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
@@ -322,6 +323,12 @@ pub struct ScheduleFact {
     /// A distilled model's pinned sigma list, descending, `1.0 -> 0.0`
     /// exclusive of the final zero; empty when the guest builds its own.
     pub pinned_sigmas: Vec<f32>,
+    /// The shift each STREAM's own grid is built at, for a family whose
+    /// modalities advance on different schedules inside one step (MiniMax
+    /// H3 runs video at 12 and audio at 3 in the same evaluation). Empty
+    /// when [`shift`](ScheduleFact::shift) serves every lane, which is
+    /// every other family; a stream absent from the list takes `shift`.
+    pub stream_shifts: Vec<(Stream, f32)>,
 }
 
 /// Which prediction target the schedule's velocity is.
@@ -413,6 +420,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         // spells, so the generative rows identify nothing above them.
         z_image::skus(),
         wan_2::skus(),
+        minimax_h3::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

@@ -759,6 +759,15 @@ fn intrinsic_type_ok(
                 && shape.dims()[0] >= 1
                 && shape.dims()[1] == profile.velocity_width
         }
+        // A pixels row's width is the model's when its VAE plants one width
+        // (an RGB decoder); a model planting several (decode RGB, encode a
+        // 16-channel mean) states `0` and the row count alone is checked.
+        IntrinsicId::Pixels => {
+            dtype == Dtype::F32
+                && shape.rank() == 2
+                && shape.dims()[0] >= 1
+                && (profile.pixels_width == 0 || shape.dims()[1] == profile.pixels_width)
+        }
         IntrinsicId::ValueHead => dtype == Dtype::F32 && shape.rank() == 1,
         IntrinsicId::Query => dtype == Dtype::F32 && shape.rank() >= 1,
         IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),

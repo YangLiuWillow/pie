@@ -53,9 +53,12 @@ impl Shell {
     /// The `out` seam's row width — the vocabulary; errors on a symbolic
     /// width, or on a plan whose readout is a float seam and has no `out`.
     pub fn out_width(&self) -> Result<u64> {
-        let out = self.exports.out.ok_or_else(|| crate::error::Fault::Unbound {
-            what: "a plan with no `out` seam has no vocabulary width".to_string(),
-        })?;
+        let out = self
+            .exports
+            .out
+            .ok_or_else(|| crate::error::Fault::Unbound {
+                what: "a plan with no `out` seam has no vocabulary width".to_string(),
+            })?;
         kv::width_of(&self.trace, out)
     }
 
@@ -67,6 +70,29 @@ impl Shell {
         kv::width_of(&self.trace, export.value)
             .ok()
             .and_then(|width| u32::try_from(width).ok())
+    }
+
+    /// The `pixels()` intrinsic's gate and width (`seam::PIXELS`, design
+    /// D8), read off the plan's plantings: available iff the plan plants
+    /// one at all, and as wide as a pixels row when every planting agrees —
+    /// `0` when they do not (a VAE's decode lands RGB and its encode a
+    /// 16-channel mean), which tells bind to check rank and rows alone.
+    /// The runtime's `model::pixels_facts` derives the same pair off the
+    /// family's readings.
+    #[must_use]
+    pub fn pixels_facts(&self) -> (bool, u32) {
+        let mut widths = self.exports.pixels_widths(&self.trace);
+        let Some(first) = widths.next() else {
+            return (false, 0);
+        };
+        (
+            true,
+            if widths.all(|width| width == first) {
+                first
+            } else {
+                0
+            },
+        )
     }
 
     /// Which export seam this load's readout rows come off, and the width of
@@ -115,7 +141,9 @@ impl Shell {
     /// Planes per lane in the slab — exported attention layers × query heads; `0` if unobserved.
     #[must_use]
     pub fn score_planes(&self) -> u32 {
-        self.scores.as_ref().map_or(0, crate::scores::Scores::planes)
+        self.scores
+            .as_ref()
+            .map_or(0, crate::scores::Scores::planes)
     }
 
     /// Query heads each exported layer contributes to the slab; `0` if unobserved.
@@ -281,7 +309,11 @@ impl Shell {
         (
             self.compiled.streams.streams,
             self.compiled.streams.events,
-            self.compiled.regions.iter().filter(|r| r.stream != 0).count(),
+            self.compiled
+                .regions
+                .iter()
+                .filter(|r| r.stream != 0)
+                .count(),
             self.device.lanes(),
         )
     }
@@ -342,5 +374,4 @@ impl Shell {
     pub fn envelopes_resolved() -> u64 {
         crate::program::ports::resolved()
     }
-
 }

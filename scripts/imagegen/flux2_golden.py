@@ -4,13 +4,21 @@ flux2_golden.py -- reference dump for FLUX.2-klein-4B (M2).
 
     CUDA_VISIBLE_DEVICES=0 python flux2_golden.py --full     # ~14 GB VRAM
     python flux2_golden.py --mini                            # CPU, seconds
+    CUDA_VISIBLE_DEVICES=0 python flux2_golden.py --vae      # seconds
 
 Outputs -> $PIE_IMAGEGEN_GOLDEN/flux2/
     flux2_golden.npz   Qwen3 layer-{9,18,27} concat text embeddings + text_ids,
-                       initial (packed) noise + latent_ids, step-0 transformer inputs
-                       and velocity, per-step latents, final latent, decoded RGB
+                       the encoder's input ids + key mask, initial (packed) noise +
+                       latent_ids, every step's transformer inputs and velocity,
+                       per-step latents, final latent, decoded RGB
     flux2_golden.png
     flux2_mini.npz / flux2_mini.safetensors / flux2_mini_config.json
+    flux2_vae.npz      --vae: a 32x32 packed latent (DiT space, 128 channels at
+                       /16) and its fp32 decode (512x512, [-1, 1]); that image
+                       and the normalised posterior mean it encodes back to
+    flux2_vae/*.f32    the same planes as raw little-endian f32 in the
+                       row-per-voxel `[h*w, C]` layout pie's voxel axis reads,
+                       plus shapes.json -- what the Rust parity gate loads
 
 klein-4B is the distilled SKU: 4 steps, `guidance_embeds: false` in its transformer
 config, so no guidance embedding is fed.  Text encoder is Qwen3 (not Mistral) and
@@ -68,9 +76,25 @@ def run_full(d: str, dtype=torch.bfloat16):
                                       text_encoder_out_layers=(9, 18, 27))
     tap.put("prompt_embeds", pe); tap.put("text_ids", tids)
     print(f"  prompt embeds {tuple(pe.shape)}  text_ids {tuple(tids.shape)}")
+    # The exact ids the pipeline fed Qwen3 (`_get_qwen3_prompt_embeds`): the
+    # chat template with one user turn, the generation cue, thinking off,
+    # right-padded to 512 with `<|endoftext|>` under a key mask. pie's
+    # `text` reading runs the unpadded prefix, so a parity check compares
+    # the rows the mask keeps.
+    rendered = pipe.tokenizer.apply_chat_template(
+        [{"role": "user", "content": PROMPT}], tokenize=False,
+        add_generation_prompt=True, enable_thinking=False)
+    enc = pipe.tokenizer(rendered, return_tensors="pt", padding="max_length",
+                         truncation=True, max_length=512)
+    tap.put("text.input_ids", enc["input_ids"][0].numpy().astype(np.int64))
+    tap.put("text.attention_mask", enc["attention_mask"][0].numpy().astype(np.int64))
+    n_real = int(enc["attention_mask"].sum())
+    print(f"  {n_real} real tokens: {enc['input_ids'][0][:n_real].tolist()}")
 
     r1 = hook_prepare_latents(pipe, tap)
-    r2 = hook_transformer(pipe.transformer, tap, "dit", steps=(0,))
+    # Every step's transformer call, so a trajectory diverging past step 0
+    # can be placed: `dit.step{i}.in.*` / `dit.step{i}.out`.
+    r2 = hook_transformer(pipe.transformer, tap, "dit", steps=tuple(range(STEPS)))
     r3 = hook_scheduler(pipe, tap)
     g = torch.Generator("cpu").manual_seed(SEED)
     out = pipe(prompt=PROMPT, height=SIZE, width=SIZE, num_inference_steps=STEPS,
@@ -147,13 +171,102 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     npz_keys(tap)
 
 
+VAE_TOKENS = 32   # a 32x32 token grid at /16: the 512x512 image the Rust gate decodes
+
+
+def run_vae(d: str, device="cuda"):
+    """The autoencoder alone, fp32 (`force_upcast`), on one 32x32 token grid.
+
+    `AutoencoderKLFlux2` codes at 32 channels on a /8 grid; the pipeline packs a
+    2x2 block of those into one 128-channel cell at /16 and normalises THAT by
+    the frozen `bn` (`_patchify_latents`, then
+    `(x - running_mean)/sqrt(running_var + eps)`), which is what the transformer
+    holds.  So this dump cuts at the 128-wide /16 grid on both sides -- the same
+    boundary `models::flux_2::vae` puts its port at:
+
+        decode: latent * bn_std + bn_mean -> _unpatchify_latents -> vae.decode
+        encode: vae.encode(...).mean -> _patchify_latents -> (x - bn_mean)/bn_std
+
+    The latent is the centre crop of `--full`'s final packed latent (a real one,
+    so the decode is a real picture) or, without that file, a seeded normal.
+    Every plane also lands as raw f32 in the `[h*w, C]` row-per-voxel layout
+    pie's voxel axis reads.
+    """
+    from diffusers import AutoencoderKLFlux2
+    from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
+
+    vae = (AutoencoderKLFlux2.from_pretrained(REPO, subfolder="vae", torch_dtype=torch.float32)
+           .to(device).eval())
+    cfg = vae.config
+    ch = cfg.latent_channels * cfg.patch_size[0] * cfg.patch_size[1]   # 32 * 2 * 2 = 128
+    n = VAE_TOKENS
+    full = os.path.join(d, "flux2_golden.npz")
+    if os.path.exists(full):
+        z = np.load(full)["latent.final"]              # [1, tokens, 128], row-major (h, w)
+        z = z.reshape(z.shape[-2], z.shape[-1])
+        side = int(round(z.shape[0] ** 0.5))
+        assert side * side == z.shape[0], f"{z.shape[0]} packed tokens are not a square"
+        z = z.reshape(side, side, ch)
+        h0 = (side - n) // 2
+        z = z[h0:h0 + n, h0:h0 + n]                    # [n, n, 128]
+        z = np.ascontiguousarray(z.transpose(2, 0, 1))  # [128, n, n]
+        source = f"centre {n}x{n} crop of flux2_golden.npz latent.final ({side}x{side})"
+    else:
+        g = torch.Generator().manual_seed(7)
+        z = torch.randn(ch, n, n, generator=g).numpy()
+        source = "seed 7 normal"
+    z = torch.from_numpy(np.ascontiguousarray(z)).to(device=device, dtype=torch.float32)[None]
+
+    bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(device, torch.float32)
+    bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + cfg.batch_norm_eps).to(
+        device, torch.float32)
+    unpatchify = Flux2KleinPipeline._unpatchify_latents
+    patchify = Flux2KleinPipeline._patchify_latents
+
+    with torch.no_grad():
+        x = vae.decode(unpatchify(z * bn_std + bn_mean), return_dict=False)[0]   # [1, 3, 16n, 16n]
+        mean = vae.encode(x, return_dict=False)[0].mean                          # [1, 32, 2n, 2n]
+        packed = (patchify(mean) - bn_mean) / bn_std                             # [1, 128, n, n]
+
+    tap = Tap()
+    tap.put("vae.latent", z[0])
+    tap.put("vae.pixels", x[0])
+    tap.put("vae.mean", packed[0])
+    tap.put("vae.bn_running_mean", vae.bn.running_mean)
+    tap.put("vae.bn_running_var", vae.bn.running_var)
+    tap.put("vae.batch_norm_eps", float(cfg.batch_norm_eps))
+    tap.save(os.path.join(d, "flux2_vae.npz"))
+
+    raw = os.path.join(d, "flux2_vae")
+    os.makedirs(raw, exist_ok=True)
+    shapes = {}
+    for key, t in (("latent", z[0]), ("pixels", x[0]), ("mean", packed[0])):
+        chw = t.detach().float().cpu().numpy()
+        hwc = np.ascontiguousarray(chw.transpose(1, 2, 0)).astype("<f4")   # [h, w, C] -> rows of C
+        hwc.tofile(os.path.join(raw, f"{key}.f32"))
+        shapes[key] = {"t": 1, "h": int(chw.shape[1]), "w": int(chw.shape[2]),
+                       "channels": int(chw.shape[0])}
+    shapes["batch_norm_eps"] = float(cfg.batch_norm_eps)
+    shapes["latent_channels"] = int(cfg.latent_channels)
+    shapes["patch_size"] = list(cfg.patch_size)
+    shapes["source"] = source
+    with open(os.path.join(raw, "shapes.json"), "w") as f:
+        json.dump(shapes, f, indent=2)
+    back = (packed - z).abs().max()
+    print(f"  vae: latent {tuple(z.shape)} ({source}) -> pixels {tuple(x.shape)} "
+          f"[{float(x.min()):.3f}, {float(x.max()):.3f}] -> mean {tuple(packed.shape)}; "
+          f"round trip max |mean - latent| {float(back):.4f}")
+    npz_keys(tap)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
+    ap.add_argument("--vae", action="store_true")
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
-    if not (a.full or a.mini):
+    if not (a.full or a.mini or a.vae):
         a.full = a.mini = True
     d = outdir(MODEL)
     torch.set_grad_enabled(False)
@@ -161,6 +274,8 @@ def main():
         print("== mini =="); run_mini(d, a.device)
     if a.full:
         print("== full =="); run_full(d)
+    if a.vae:
+        print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu")
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED, "steps": STEPS, "size": SIZE})
 
 

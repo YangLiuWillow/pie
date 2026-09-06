@@ -181,7 +181,12 @@ impl Shell {
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
-        let paging = Paging::of(boot.page_size, boot.context, boot.slots, u64::from(boot.pages))?;
+        let paging = Paging::of(
+            boot.page_size,
+            boot.context,
+            boot.slots,
+            u64::from(boot.pages),
+        )?;
         // A model that denoises fires every projection at a canvas of
         // rows; its 8-bit dense projections are decoded to bf16 once here
         // rather than on every fire (`weights::decoded_dense_bytes`).
@@ -359,7 +364,6 @@ impl Shell {
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(model_ir::RowAxis::Patches).is_some();
-        let voxel_plan = voxels.is_some();
         let mut shell = Shell {
             device,
             accounting,
@@ -404,10 +408,15 @@ impl Shell {
             pad: boot.knobs.pad(),
             golden: boot.knobs.golden(),
             golden_arm: Golden::Off,
-            // M0 (D8): a plan on the voxel axis is served eagerly — the
-            // arming pass fires synthetic lanes that carry no clip, and the
-            // spatial kernels read no seat, so no body could replay one.
-            bodies: boot.knobs.bodies() && !voxel_plan,
+            // ARMING IS PER AXIS (D8). A plan that states voxel rows used to
+            // have its bodies switched off wholesale, which served a flagship's
+            // DiT eagerly for no reason but the VAE standing beside it in the
+            // same artifact. The eagerness belongs to the voxel REGIONS, and
+            // that is where it lives now: `Windows::admit_axes` marks every
+            // region on `RowAxis::Voxels` an island, so a body holds the token
+            // regions and re-issues the spatial launches at the fire's own
+            // clip geometry.
+            bodies: boot.knobs.bodies(),
             // Megabytes to bytes, once, at the seam the boot document crosses.
             bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
             arming: false,

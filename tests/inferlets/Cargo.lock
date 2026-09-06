@@ -187,6 +187,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux2-klein-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "flux2-parity"
 version = "0.1.0"
 dependencies = [
@@ -306,6 +314,14 @@ dependencies = [
 
 [[package]]
 name = "gumbel-watermark"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "h3-parity"
 version = "0.1.0"
 dependencies = [
  "inferlet",
@@ -941,6 +957,14 @@ dependencies = [
 
 [[package]]
 name = "zimage-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "zimage-vae-parity"
 version = "0.1.0"
 dependencies = [
  "inferlet",
