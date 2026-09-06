@@ -493,13 +493,14 @@ CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
     --out /tmp/flux2-klein-parity --config ~/.pie/config.flux2-klein.toml
 ```
 
-The config needs `[engine] max_model_len = 32768` (rows × submit depth),
-`[model] model` at the artifact, and — the one that is not obvious —
-`[runtime] submit_deadline = "10s"` with `silence_timeout = "300s"`: at the
-50 ms default the cohort gate seals the denoise group's FIRST frame with
-the image lane alone and the velocity comes back unconditioned (cos ≈ 0.535
-against the golden, cos 0.9999 against a no-text reference). `run` refuses a
-config that does not state it.
+The config needs `[engine] max_model_len = 32768` (rows × submit depth) and
+`[model] model` at the artifact. It needs nothing said about `[runtime]
+submit_deadline` any more: this parity used to demand `"10s"` because at the
+50 ms default the cohort gate sealed the denoise group's FIRST frame with
+the image lane alone and the velocity came back unconditioned (cos ≈ 0.535
+against the golden, cos 0.9999 against a no-text reference). A stated cohort
+is now fired whole or not at all — the deadline is a density knob again, and
+this harness runs at the default so that a partial group would show up here.
 
 Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
 

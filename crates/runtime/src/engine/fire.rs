@@ -63,9 +63,14 @@ pub struct FireRequest {
     /// request's process name the group its lanes join, this one included.
     /// A group composes only when its passes are members of ONE step, and
     /// the wait-all gate cannot await a pipeline it has never seen — so the
-    /// scheduler holds the seal, leashed by the submit deadline, until this
+    /// scheduler holds this request's lanes out of every seal until this
     /// many lanes of the group have arrived for their first frame. `None`
     /// for a pass in no group.
+    ///
+    /// A stated cohort is a PROMISE: the runtime fires the group whole or
+    /// not at all, and a cohort that never completes ends the process with a
+    /// named error rather than a fire over whoever showed up. State it only
+    /// for passes that will really submit.
     pub cohort: Option<u32>,
 }
 

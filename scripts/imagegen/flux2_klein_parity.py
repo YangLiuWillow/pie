@@ -70,18 +70,23 @@ With `--native` the guest also runs the trajectory over pie's OWN text rows
 this is a different conditioning and is reported, not gated):
 `native.latent.final`, decoded as `native.png`.
 
-THE CONFIG NEEDS A LONGER SUBMIT DEADLINE
-----------------------------------------
-The two lanes of a denoise group compose into one fire only while the
-scheduler's cohort gate holds the boundary, and that gate is leashed by
-`[runtime] submit_deadline` (50 ms by default). A 1024^2 job's first submit
-carries a 6 MB seeded `context` channel and a 2 MB `latents` one across the
-guest boundary, which under load takes longer than that: the leash then
-seals the group's first frame with the IMAGE lane alone and the velocity
-comes back UNCONDITIONED (cos ~0.535 against the golden, and cos 0.9999
-against a reference run with no text at all). Set `submit_deadline = "10s"`
-and `silence_timeout = "300s"` under `[runtime]`; `run` refuses a config
-that does not.
+THE SUBMIT DEADLINE IS NOT A KNOB THIS HARNESS TOUCHES
+-----------------------------------------------------
+It used to be. The two lanes of a denoise group compose into one fire only
+if the scheduler seals them into one frame, and that wait was once leashed
+by `[runtime] submit_deadline` (50 ms): a 1024^2 job's first submit carries
+a 6 MB seeded `context` channel and a 2 MB `latents` one across the guest
+boundary, took longer than the leash under load, and the group's first frame
+sealed with the IMAGE lane alone -- an UNCONDITIONED velocity reported as a
+success (cos ~0.535 against the golden, cos 0.9999 against a reference run
+with no text at all). This script demanded `submit_deadline = "10s"` to
+paper over it.
+
+The runtime now keeps the promise instead: a STATED cohort fires whole or
+not at all, so the deadline cannot buy or cost correctness here (see
+`crates/runtime/src/scheduler/frame.rs`, `group_short` / `cohort_verdict`).
+The demand is gone, and this harness runs at the 50 ms DEFAULT on purpose --
+if a partial group is ever sealed again, this parity is what says so.
 
 THE CASE CROSSES AS FILES
 -------------------------
@@ -251,24 +256,10 @@ def scratch_base(config: str) -> str:
     if not base:
         raise SystemExit(f"{config}: set `[sandbox] fs_scratch_dir` to a directory of its own")
     os.makedirs(base, exist_ok=True)
-    # The cohort leash, see the module doc: a 50 ms deadline seals a denoise
-    # group's first frame with one lane and the answer is silently
-    # unconditioned.
-    deadline = cfg.get("runtime", {}).get("submit_deadline")
-    if not deadline or not _seconds(deadline) >= 1.0:
-        raise SystemExit(
-            f"{config}: set `[runtime] submit_deadline` to at least \"1s\" (\"10s\" is what this "
-            f"harness runs) and `silence_timeout` to at least that; at the 50 ms default the "
-            f"denoise group's first frame seals with the image lane alone")
+    # No `submit_deadline` demand here, deliberately: see the module doc.
+    # The runtime keeps a stated cohort whole, so the default 50 ms leash is
+    # what this parity runs under and what it proves safe.
     return base
-
-
-def _seconds(text: str) -> float:
-    """A `[runtime]` duration (`"50ms"`, `"10s"`, `"5m"`) in seconds."""
-    m = re.fullmatch(r"\s*([0-9.]+)\s*(ms|s|m|h)?\s*", str(text))
-    if not m:
-        return 0.0
-    return float(m.group(1)) * {"ms": 1e-3, None: 1.0, "s": 1.0, "m": 60.0, "h": 3600.0}[m.group(2)]
 
 
 def run(args) -> None:

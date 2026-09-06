@@ -173,6 +173,15 @@ struct ArrivedFire {
     rows: usize,
 }
 
+/// One live fire measured into a wave while a partition is assembled
+/// ([`FramePolicy::seal`]) — the arrival's fields with its wave resolved.
+struct PlacedFire {
+    wave: usize,
+    fire_id: u64,
+    rows: usize,
+    tokens: usize,
+}
+
 struct PendingFrame {
     seq: u64,
     /// Fires this frame is declared to hold; lowered on a mid-frame submit
@@ -217,6 +226,11 @@ struct LaneState {
     /// owed). Cleared by any accepted fire or debt owed. `None` = not timed.
     clock_from: Option<Instant>,
     frames: VecDeque<PendingFrame>,
+    /// **THE ATTENTION GROUP THIS LANE JOINS** (design D2), as its fires
+    /// stated it. Owner-scoped: the key is `(owner, group)`. `None` for a
+    /// lane in no group — the overwhelming majority, and the reason the
+    /// group rules below cost an ungrouped fleet one `Option` test.
+    group: Option<u32>,
     /// Fired into the current boundary, or written off by
     /// [`FramePolicy::close_boundary`]. Cleared on every new boundary; a
     /// lane joining mid-boundary starts fired (waits for the next gate).
@@ -230,11 +244,58 @@ struct Cohort {
     expected: u32,
     arrived: BTreeSet<ProcessId>,
     since: Instant,
+    /// Already reported as breached, so the verdict is handed to the worker
+    /// once. The entry stays until the process's leave purges it — it must
+    /// keep holding its lanes out of every seal while the kill is in
+    /// flight, or the partial group would fire on the way out.
+    condemned: bool,
 }
 
 impl Cohort {
     fn complete(&self) -> bool {
         self.arrived.len() as u64 >= u64::from(self.expected)
+    }
+}
+
+/// Why the policy is asking the worker to end a process. The worker turns
+/// this into the guest-visible error, so it says plainly what the guest did
+/// wrong.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Doom {
+    /// Silent past the silence timeout with nothing owed and no
+    /// `forward.park()`.
+    Abandoned,
+    /// A STATED attention-group cohort (design D2) that never completed: a
+    /// pipeline of the group never submitted its first fire, so the group
+    /// could never compose. See [`FramePolicy::cohort_verdict`].
+    CohortNeverComplete {
+        group: u32,
+        expected: u32,
+        arrived: u32,
+    },
+}
+
+impl std::fmt::Display for Doom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Abandoned => f.write_str(
+                "pipeline abandoned: silent past the silence timeout without submitting \
+                 and without calling forward.park()",
+            ),
+            Self::CohortNeverComplete {
+                group,
+                expected,
+                arrived,
+            } => write!(
+                f,
+                "attention group {group} never composed: its passes stated a cohort of \
+                 {expected} pipelines and only {arrived} submitted a first fire before the \
+                 silence timeout. A group attends inside ONE fire, so the runtime will not \
+                 fire it short — every forward pass that names a group must submit into the \
+                 group's first frame (a pipeline that named the group and then never \
+                 submitted is the bug; a pass that means to sit out must not name the group)"
+            ),
+        }
     }
 }
 
@@ -253,6 +314,23 @@ enum GateVerdict {
 }
 
 impl LaneState {
+    /// The attention group this lane joins, owner-scoped — the key both
+    /// [`FramePolicy::cohorts`] and the group rules in `seal` use. Group
+    /// ids are per-process, so an unowned lane joins nothing.
+    fn group_key(&self) -> Option<(ProcessId, u32)> {
+        self.owner.zip(self.group)
+    }
+
+    /// Whether this lane still owes its attention group a fire: it is a
+    /// member (awaited, or dropped from the boundary by the submit leash
+    /// and so still expected) whose next frame is not fully submitted. A
+    /// lane that called `forward.park()` said it is sitting out and owes
+    /// nothing.
+    fn owes_its_group(&self) -> bool {
+        (self.awaited || self.leashed)
+            && !self.frames.front().is_some_and(PendingFrame::is_complete)
+    }
+
     /// Does this lane deny the wait-all gate? Blocks while a member whose
     /// next frame is not complete. `relax` is [`gate_contributed`] AND the
     /// device busy; `owes` is the runtime's debt to this lane.
@@ -290,10 +368,9 @@ pub(super) enum FramePlan {
     Hold(Duration),
     /// No sealed work and no seal candidates: park until an arrival.
     Park,
-    /// These processes were silent past the silence timeout without ever
-    /// parking: abandoned, not merely slow. The worker terminates them; the
-    /// policy has already dropped their lanes.
-    Terminate(Vec<ProcessId>),
+    /// These processes cannot be served any longer: each is named with the
+    /// reason the guest is told. The worker terminates them.
+    Terminate(Vec<(ProcessId, Doom)>),
 }
 
 /// The stamped fire ids still in the worker queue, sorted (sorted-push +
@@ -359,10 +436,14 @@ pub(super) struct FramePolicy {
     /// `(owner, group)`. A group composes only when its passes are members
     /// of one step, and the gate can await only pipelines it has seen: the
     /// first lane of a fresh group would seal alone. So a lane's first
-    /// arrival under a group holds the seal until the cohort its request
-    /// declares has arrived, leashed by the submit deadline like any silent
-    /// member. Steady state needs none of this — every member is awaited
-    /// then — so a cohort is dropped the moment it completes.
+    /// arrival under a group holds ITS OWN LANES out of every seal (see
+    /// [`FramePolicy::group_short`]) until the cohort its request declares
+    /// has arrived — never the gate, so a slow sibling costs its own
+    /// request and not the fleet, and never a partial fire, so the stated
+    /// group is kept whole or the request dies by name
+    /// ([`FramePolicy::cohort_verdict`]). Steady state needs no cohort —
+    /// every member is awaited then, and `group_short` keeps them
+    /// together — so a cohort is dropped the moment it completes.
     cohorts: BTreeMap<(ProcessId, u32), Cohort>,
     /// Successor pool: bring-up processes whose lane hasn't fired yet.
     /// While `pending_slots > 0`, one of these is about to take a slot,
@@ -440,6 +521,13 @@ impl FramePolicy {
         // Out of the way unless a test asks for it, to avoid the leash
         // firing on the same driven clock.
         self.silence_timeout = Duration::from_secs(86_400);
+        self
+    }
+
+    /// Override the silence timeout — the VERDICT clock. Tests only.
+    #[cfg(test)]
+    fn with_silence_timeout(mut self, timeout: Duration) -> Self {
+        self.silence_timeout = timeout;
         self
     }
 
@@ -525,6 +613,14 @@ impl FramePolicy {
                 rows,
             },
         );
+        // The group rides every fire of the lane, not just its first: it is
+        // what keeps the group whole in steady state, long after the cohort
+        // that gathered its first frame was forgotten.
+        if let Some((group, _)) = cohort
+            && let Some(lane) = self.lanes.get_mut(&stamp.lane)
+        {
+            lane.group = Some(group);
+        }
         if let (Some(began), Some(stats)) = (accept_began, &self.stats) {
             use std::sync::atomic::Ordering::Relaxed;
             stats
@@ -567,11 +663,15 @@ impl FramePolicy {
         if self.lanes.contains_key(&lane) {
             return;
         }
-        let entry = self.cohorts.entry((owner, group)).or_insert_with(|| Cohort {
-            expected,
-            arrived: BTreeSet::new(),
-            since: Instant::now(),
-        });
+        let entry = self
+            .cohorts
+            .entry((owner, group))
+            .or_insert_with(|| Cohort {
+                expected,
+                arrived: BTreeSet::new(),
+                since: Instant::now(),
+                condemned: false,
+            });
         // A later member may count more siblings than the first did (one
         // named the group after the first submitted): the largest claim is
         // the cohort's.
@@ -582,16 +682,92 @@ impl FramePolicy {
         }
     }
 
-    /// How many attention-group cohorts are still gathering: each holds
-    /// the gate like a missing member, until it completes or has waited
-    /// the submit deadline out (a sibling that never submits is the
-    /// guest's bug, and costs it a boundary, not the fleet).
-    fn cohorts_missing(&mut self, now: Instant) -> usize {
-        let leash = self.submit_deadline;
-        self.cohorts.retain(|_, cohort| {
-            !cohort.complete() && now.saturating_duration_since(cohort.since) < leash
-        });
-        self.cohorts.len()
+    /// **A STATED COHORT IS A PROMISE THE RUNTIME KEEPS, NOT A PREFERENCE.**
+    /// A cohort still short past the SILENCE TIMEOUT ends its process, by
+    /// name; it never ends in a fire over whoever showed up.
+    ///
+    /// It used to end in one. The cohort was leashed by `submit_deadline`
+    /// (50 ms) like a silent lane, and expiry dropped the entry and let the
+    /// boundary seal — so a 1024² job whose first submit carries ~6 MB of
+    /// seeded `context` plus ~2 MB of `latents` sealed the denoise group's
+    /// first frame with the IMAGE lane alone, ran an unconditioned denoise,
+    /// and reported success (cos 0.535 against the golden, 0.9999 against a
+    /// deliberately text-free reference — silently, plausibly wrong).
+    ///
+    /// The two clocks are not interchangeable, and that is the whole fix:
+    /// `submit_deadline` is a LEASH, which drops a slow lane from a
+    /// boundary so the fleet keeps moving and costs it only latency;
+    /// `silence_timeout` is a VERDICT, generous by construction, and a
+    /// verdict is the only thing a stated cohort may end in. A leash may
+    /// never be spent on a cohort, because dropping a member of a group
+    /// changes the ANSWER, not the schedule. What makes the leash
+    /// unnecessary here is that a gathering cohort no longer holds the gate
+    /// at all — it holds only its own lanes out of `seal` — so a sibling
+    /// that is merely slow costs its own request a few milliseconds and the
+    /// fleet nothing.
+    fn cohort_verdict(&mut self, now: Instant) -> Vec<(ProcessId, Doom)> {
+        if self.cohorts.is_empty() {
+            return Vec::new();
+        }
+        let timeout = self.silence_timeout;
+        let mut doomed = Vec::new();
+        for ((owner, group), cohort) in self.cohorts.iter_mut() {
+            if cohort.condemned || now.saturating_duration_since(cohort.since) < timeout {
+                continue;
+            }
+            cohort.condemned = true;
+            doomed.push((
+                *owner,
+                Doom::CohortNeverComplete {
+                    group: *group,
+                    expected: cohort.expected,
+                    arrived: cohort.arrived.len() as u32,
+                },
+            ));
+        }
+        doomed
+    }
+
+    /// Whether a stated attention group is still assembling somewhere: a
+    /// cohort gathering its first frame, or a lane holding a frame it
+    /// cannot seal until its groupmates arrive. The policy must not park in
+    /// that state — nothing else would wake it, and the verdict above is
+    /// only ever read from an evaluation.
+    fn group_assembling(&self) -> bool {
+        !self.cohorts.is_empty()
+            || self
+                .lanes
+                .values()
+                .any(|lane| !lane.frames.is_empty() && self.group_short(lane))
+    }
+
+    /// **WHETHER THIS LANE'S ATTENTION GROUP WOULD FIRE SHORT** (design D2).
+    /// A group composes only when its passes are members of ONE step, so a
+    /// lane whose group is not all here may not seal — in either of the two
+    /// ways a group can be incomplete:
+    ///
+    /// - its first frame's cohort is still gathering (the gate can await
+    ///   only pipelines it has seen, and the group's others have not fired
+    ///   yet), or
+    /// - a sibling the gate does await owes this boundary a fire — INCLUDING
+    ///   one the submit leash just dropped from the wait-set, which is
+    ///   precisely when a group would otherwise fire half of itself.
+    ///
+    /// This is the rule that makes a partial group impossible by
+    /// construction rather than by timing: it is asked on every seal path
+    /// (strict, ready-mode, mid-boundary partition, budget partition), so
+    /// there is no route by which some lanes of a group reach a fire
+    /// without the rest.
+    fn group_short(&self, lane: &LaneState) -> bool {
+        let Some(key) = lane.group_key() else {
+            return false;
+        };
+        if self.cohorts.contains_key(&key) {
+            return true;
+        }
+        self.lanes
+            .values()
+            .any(|other| other.group_key() == Some(key) && other.owes_its_group())
     }
 
     fn record_arrival(&mut self, stamp: FrameStamp, owner: Option<ProcessId>, fire: ArrivedFire) {
@@ -627,6 +803,7 @@ impl FramePolicy {
             leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
+            group: None,
             // A lane arriving mid-boundary is not a member of it; one
             // arriving between boundaries is picked up by the next gate.
             fired_this_boundary: true,
@@ -988,10 +1165,14 @@ impl FramePolicy {
         self.idle_dumped = false;
     }
 
+    /// A lane whose front frame could actually be sealed now. A lane whose
+    /// attention group would fire short is NOT a candidate: counting it as
+    /// one would only spin the ready-mode boundary against a seal that
+    /// refuses it.
     fn have_seal_candidate(&self) -> bool {
-        self.lanes
-            .values()
-            .any(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
+        self.lanes.values().any(|lane| {
+            lane.frames.front().is_some_and(PendingFrame::is_complete) && !self.group_short(lane)
+        })
     }
 
     /// Whether a boundary is open: some awaited lane hasn't fired into it
@@ -1043,6 +1224,13 @@ impl FramePolicy {
                 if !lane.frames.front().is_some_and(PendingFrame::is_complete) {
                     continue;
                 }
+                // Its stated group is not all here: this lane waits for its
+                // groupmates, not for a partition. Asked HERE, on the one
+                // path every seal takes, so no mode and no timing can route
+                // around it.
+                if self.group_short(lane) {
+                    continue;
+                }
                 if mid_boundary && lane.fired_this_boundary {
                     continuing.push(*lane_id);
                 } else {
@@ -1069,55 +1257,118 @@ impl FramePolicy {
             let mut wave_rows = vec![0usize; k];
             let mut members: HashSet<ProcessId> = HashSet::new();
             let mut dropped_empty = false;
-            for lane_id in order {
-                let Some(lane) = self.lanes.get_mut(&lane_id) else {
-                    continue;
-                };
-                let Some(front) = lane.frames.front() else {
-                    continue;
-                };
-                let frame_complete_at = front.complete_at;
-                let live: Vec<&ArrivedFire> = front
-                    .fires
-                    .iter()
-                    .filter(|fire| fire.fire_id.is_some())
-                    .collect();
-                if live.is_empty() {
-                    lane.frames.pop_front();
-                    dropped_empty = true;
+            // **UNITS, NOT LANES.** A stated attention group's lanes attend
+            // each other inside ONE fire, so they enter a partition
+            // together or not at all. Without this the first-fit below
+            // would defer one lane of a group over the row/token budget and
+            // fire the rest without it — the same silent wrongness as
+            // sealing a cohort short, one boundary later. An ungrouped lane
+            // is a unit of one, which is the fleet's whole population.
+            let mut units: Vec<Vec<ProcessId>> = Vec::with_capacity(order.len());
+            let mut placed: BTreeSet<ProcessId> = BTreeSet::new();
+            for lane_id in &order {
+                if !placed.insert(*lane_id) {
                     continue;
                 }
-                let fits = live.iter().all(|fire| {
-                    let wave = (fire.slot as usize).min(k - 1);
-                    wave_rows[wave] + fire.rows.max(1) <= max_wave_rows
-                        && wave_tokens[wave] + fire.tokens <= max_wave_tokens
-                });
-                if !fits {
-                    // Over budget: the lane seals into a later partition.
-                    continue;
-                }
-                for fire in live {
-                    let wave = (fire.slot as usize).min(k - 1);
-                    wave_rows[wave] += fire.rows.max(1);
-                    wave_tokens[wave] += fire.tokens;
-                    let fire_id = fire.fire_id.expect("live fire has an id");
-                    waves[wave].push(fire_id);
-                    fire_waves.insert(fire_id, wave);
-                }
-                members.insert(lane_id);
-                // Turnaround sample: last retirement to this completion is
-                // the whole result -> guest -> resubmit round trip.
-                if let (Some(done), Some(from)) = (frame_complete_at, lane.retired_at) {
-                    let us = done.saturating_duration_since(from).as_micros() as u64;
-                    if let Some(stats) = &self.stats {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        stats.fire.quorum.turnaround_sum_us.fetch_add(us, Relaxed);
-                        stats.fire.quorum.turnaround_n.fetch_add(1, Relaxed);
-                        stats.fire.quorum.turnaround_max_us.fetch_max(us, Relaxed);
+                match self.lanes.get(lane_id).and_then(LaneState::group_key) {
+                    None => units.push(vec![*lane_id]),
+                    Some(key) => {
+                        let unit: Vec<ProcessId> = order
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                self.lanes.get(id).and_then(LaneState::group_key) == Some(key)
+                            })
+                            .collect();
+                        placed.extend(unit.iter().copied());
+                        units.push(unit);
                     }
                 }
-                lane.served = true;
-                lane.frames.pop_front();
+            }
+            for unit in units {
+                // Measure the unit whole, then commit it whole.
+                let mut unit_fires: Vec<(ProcessId, Vec<PlacedFire>)> =
+                    Vec::with_capacity(unit.len());
+                let mut unit_rows = vec![0usize; k];
+                let mut unit_tokens = vec![0usize; k];
+                let mut short = false;
+                for lane_id in &unit {
+                    let Some(lane) = self.lanes.get_mut(lane_id) else {
+                        short = true;
+                        continue;
+                    };
+                    let Some(front) = lane.frames.front() else {
+                        short = true;
+                        continue;
+                    };
+                    let live: Vec<PlacedFire> = front
+                        .fires
+                        .iter()
+                        .filter_map(|fire| {
+                            fire.fire_id.map(|fire_id| PlacedFire {
+                                wave: (fire.slot as usize).min(k - 1),
+                                fire_id,
+                                rows: fire.rows.max(1),
+                                tokens: fire.tokens,
+                            })
+                        })
+                        .collect();
+                    if live.is_empty() {
+                        // Every fire was rejected at admission: drop the
+                        // frame, the lane's next front may be sealable.
+                        lane.frames.pop_front();
+                        dropped_empty = true;
+                        short = true;
+                        continue;
+                    }
+                    // The budget test is per fire against what is already
+                    // in the partition PLUS what this unit's earlier lanes
+                    // put there — for a unit of one, exactly the first-fit
+                    // rule as it always was.
+                    let fits = live.iter().all(|fire| {
+                        wave_rows[fire.wave] + unit_rows[fire.wave] + fire.rows <= max_wave_rows
+                            && wave_tokens[fire.wave] + unit_tokens[fire.wave] + fire.tokens
+                                <= max_wave_tokens
+                    });
+                    if !fits {
+                        short = true;
+                        continue;
+                    }
+                    for fire in &live {
+                        unit_rows[fire.wave] += fire.rows;
+                        unit_tokens[fire.wave] += fire.tokens;
+                    }
+                    unit_fires.push((*lane_id, live));
+                }
+                if short {
+                    // Over budget, or a groupmate that cannot join: the
+                    // whole unit seals into a later partition.
+                    continue;
+                }
+                for (lane_id, live) in unit_fires {
+                    for fire in &live {
+                        wave_rows[fire.wave] += fire.rows;
+                        wave_tokens[fire.wave] += fire.tokens;
+                        waves[fire.wave].push(fire.fire_id);
+                        fire_waves.insert(fire.fire_id, fire.wave);
+                    }
+                    members.insert(lane_id);
+                    let lane = self.lanes.get_mut(&lane_id).expect("measured lane exists");
+                    let frame_complete_at = lane.frames.front().and_then(|front| front.complete_at);
+                    // Turnaround sample: last retirement to this completion
+                    // is the whole result -> guest -> resubmit round trip.
+                    if let (Some(done), Some(from)) = (frame_complete_at, lane.retired_at) {
+                        let us = done.saturating_duration_since(from).as_micros() as u64;
+                        if let Some(stats) = &self.stats {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            stats.fire.quorum.turnaround_sum_us.fetch_add(us, Relaxed);
+                            stats.fire.quorum.turnaround_n.fetch_add(1, Relaxed);
+                            stats.fire.quorum.turnaround_max_us.fetch_max(us, Relaxed);
+                        }
+                    }
+                    lane.served = true;
+                    lane.frames.pop_front();
+                }
             }
             if fire_waves.is_empty() {
                 // Nothing sealable; retry only if a frame with no live fire
@@ -1398,10 +1649,18 @@ ready_age_newest={}us",
                 self.idle_dumped = false;
                 return FramePlan::Park;
             }
+            // A stated cohort that never completed: the request dies here,
+            // by name. It is never released into a fire over whoever showed
+            // up — see `cohort_verdict`.
+            let doomed = self.cohort_verdict(now);
+            if !doomed.is_empty() {
+                return FramePlan::Terminate(doomed);
+            }
             // `missing` counts awaited lanes whose next frame isn't fully
-            // submitted; an idle member is waited for like any other — and
-            // an attention group still gathering its first frame's cohort.
-            let mut missing = self.cohorts_missing(now);
+            // submitted; an idle member is waited for like any other. A
+            // gathering cohort is NOT counted: it holds its own lanes out
+            // of `seal` and lets the rest of the fleet through.
+            let mut missing = 0;
             // The submit deadline's clock is armed here per lane: it stops
             // only for debts owed to this lane, and isn't gated on
             // `executing` — a silent member must be found even while
@@ -1484,7 +1743,12 @@ ready_age_newest={}us",
                 // breach on more than one of them in a single pass.
                 expired.sort_unstable();
                 expired.dedup();
-                return FramePlan::Terminate(expired);
+                return FramePlan::Terminate(
+                    expired
+                        .into_iter()
+                        .map(|pid| (pid, Doom::Abandoned))
+                        .collect(),
+                );
             }
             if super::worker::wave_trace() {
                 super::worker::wave_trace_emit(format!(
@@ -1572,6 +1836,14 @@ ready_age_newest={}us",
                 Some(plan) => return plan,
                 // Ready lanes exist but none can seal (all busy in an
                 // executing round partition): retirements re-decide.
+                None if self.group_assembling() => {
+                    // Except when a group is assembling: nothing would wake
+                    // the policy from a park (its groupmate's arrival is
+                    // the only event, and a group that will never assemble
+                    // has no event at all), and `cohort_verdict` above is
+                    // only read from an evaluation. Poll instead.
+                    return FramePlan::Hold(Duration::from_micros(GATHER_POLL_US));
+                }
                 None => return FramePlan::Park,
             }
         }
@@ -1738,24 +2010,185 @@ mod tests {
         assert_eq!(sealed, vec![4, 5, 6]);
     }
 
-    /// The cohort's leash: a sibling that never submits is the guest's bug
-    /// and costs it a boundary, not the fleet — past the submit deadline the
-    /// gate seals with who is there.
+    /// **A STATED COHORT IS NEVER SEALED SHORT.** A guest that states a
+    /// cohort of two and whose second lane is LATE — later than the submit
+    /// deadline, which is what a 1024² first submit carrying ~6 MB of seeded
+    /// `context` plus ~2 MB of `latents` actually is under load — gets its
+    /// group whole and late, never a fire over the first lane alone. The
+    /// leash used to release the cohort here and the fire that followed was
+    /// an unconditioned denoise reported as a success (cos 0.535 against the
+    /// golden, 0.9999 against a text-free reference).
     #[test]
-    fn a_cohort_that_never_completes_is_released_by_the_submit_deadline() {
+    fn a_stated_cohort_is_never_sealed_short() {
         let leash = Duration::from_millis(50);
         let mut policy = FramePolicy::new(1, 64, 4096, None)
             .with_seal_mode_ready(false)
             .with_submit_deadline(leash);
+        let owner = pid();
+        let (image, text) = (pid(), pid());
+        let now = Instant::now();
+        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
+        let queued: QueuedFireIds = [1].into_iter().collect();
+        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)));
+        // Past the leash, and past it again: the deadline that drops a
+        // silent LANE from a boundary may never drop a stated group's
+        // member, because that changes the answer and not the schedule.
+        for late in [leash + Duration::from_millis(1), leash * 20] {
+            match plan(&mut policy, &queued, now + late) {
+                FramePlan::Hold(_) => {}
+                plan => panic!("the image lane must not fire without its group, got {plan:?}"),
+            }
+        }
+        // The straggler lands, and the whole group fires in one frame.
+        let landed = now + leash * 20;
+        policy.on_fire_enqueued(stamp(text, 0, 0, 1), Some(owner), 2, 16, 1, Some((7, 2)));
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        let mut sealed = fires(&plan(&mut policy, &queued, landed));
+        sealed.sort_unstable();
+        assert_eq!(sealed, vec![1, 2], "the late cohort still seals whole");
+    }
+
+    /// A cohort that never completes is a guest bug, and the runtime says so
+    /// by name: past the SILENCE TIMEOUT (the verdict clock — the submit
+    /// deadline is a leash and can only cost latency) the whole request is
+    /// terminated with what the guest got wrong, and the lane that did
+    /// arrive never fires.
+    #[test]
+    fn a_cohort_that_never_completes_kills_its_request_by_name() {
+        let silence = Duration::from_secs(30);
+        let mut policy = FramePolicy::new(1, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(Duration::from_millis(50))
+            .with_silence_timeout(silence);
         let owner = pid();
         let lone = pid();
         let now = Instant::now();
         policy.on_fire_enqueued(stamp(lone, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
         let queued: QueuedFireIds = [1].into_iter().collect();
         assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)));
-        let later = now + leash + Duration::from_millis(1);
-        assert_eq!(fires(&plan(&mut policy, &queued, later)), vec![1]);
-        assert!(policy.cohorts.is_empty(), "an expired cohort is dropped");
+
+        // A hair past the timeout, which is measured from the arrival and
+        // not from the test's clock.
+        let verdict = plan(&mut policy, &queued, now + silence + Duration::from_secs(1));
+        let FramePlan::Terminate(doomed) = &verdict else {
+            panic!("a cohort short past the silence timeout ends the request, got {verdict:?}");
+        };
+        assert_eq!(
+            doomed,
+            &vec![(
+                owner,
+                Doom::CohortNeverComplete {
+                    group: 7,
+                    expected: 2,
+                    arrived: 1,
+                },
+            )]
+        );
+        let said = doomed[0].1.to_string();
+        assert!(
+            said.contains("attention group 7") && said.contains("never submitted"),
+            "the error names the group and the guest's mistake: {said}"
+        );
+        // Condemned once, and still never fired: the kill is in flight, and
+        // the lane must not slip into a partition on its way out.
+        match plan(&mut policy, &queued, now + silence * 3) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("a condemned cohort neither repeats nor fires, got {plan:?}"),
+        }
+    }
+
+    /// **THE SUBMIT LEASH MUST NOT SPLIT A GROUP IN STEADY STATE EITHER.**
+    /// The cohort is forgotten once it completes, so from the second frame
+    /// on the group is held together by lane membership alone — and the
+    /// leash, whose whole job is to drop a silent member so the boundary can
+    /// seal, is exactly the thing that would fire half a group. It drops the
+    /// lane from the boundary (the fleet keeps moving) and the groupmate
+    /// still does not fire without it.
+    #[test]
+    fn a_group_never_fires_short_when_the_leash_drops_a_member() {
+        let leash = Duration::from_millis(50);
+        let mut policy = FramePolicy::new(1, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(leash);
+        let owner = pid();
+        let (image, text) = (pid(), pid());
+        let now = Instant::now();
+        // First frame: the cohort gathers and the pair fires.
+        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
+        policy.on_fire_enqueued(stamp(text, 0, 0, 1), Some(owner), 2, 16, 1, Some((7, 2)));
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, now)).len(), 2);
+        policy.on_frame_retired([image, text]);
+        assert!(policy.cohorts.is_empty(), "steady state keeps no cohort");
+
+        // Second frame: only the image lane resubmits, and stays alone past
+        // the leash.
+        policy.on_fire_enqueued(stamp(image, 1, 0, 1), Some(owner), 3, 8, 1, Some((7, 2)));
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        for late in [Duration::ZERO, leash + Duration::from_millis(1), leash * 10] {
+            match plan(&mut policy, &queued, now + late) {
+                FramePlan::Hold(_) => {}
+                plan => panic!("half a group must never fire, got {plan:?}"),
+            }
+        }
+        policy.on_fire_enqueued(stamp(text, 1, 0, 1), Some(owner), 4, 16, 1, Some((7, 2)));
+        let queued: QueuedFireIds = [3, 4].into_iter().collect();
+        let mut sealed = fires(&plan(&mut policy, &queued, now + leash * 10));
+        sealed.sort_unstable();
+        assert_eq!(sealed, vec![3, 4]);
+    }
+
+    /// A gathering cohort holds ITS OWN lanes, never the gate: an unrelated
+    /// lane fires while the group is still assembling, so a guest's late
+    /// sibling costs its own request and not the fleet. (This is what makes
+    /// the leash unnecessary — and therefore removable — above.)
+    #[test]
+    fn a_gathering_cohort_holds_its_own_lanes_and_not_the_fleet() {
+        let mut policy = FramePolicy::new(1, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(Duration::from_millis(50));
+        let owner = pid();
+        let grouped = pid();
+        let stranger = pid();
+        let now = Instant::now();
+        policy.on_fire_enqueued(stamp(grouped, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
+        policy.on_fire_enqueued(stamp(stranger, 0, 0, 1), Some(stranger), 2, 8, 1, None);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, now)),
+            vec![2],
+            "the ungrouped lane fires; the grouped one waits for its group"
+        );
+    }
+
+    /// The row/token budgets partition a boundary, and a group must not be
+    /// what they cut: both lanes of a group wait for a partition that holds
+    /// them both rather than firing one now and one next.
+    #[test]
+    fn a_group_is_never_split_across_two_partitions() {
+        // First-fit runs in lane-id order, so the ids are pinned: the
+        // stranger's 2 rows are placed first, and then only ONE of the
+        // group's two 4-row lanes fits the 8-row wave. First-fit used to
+        // take it and defer the other.
+        let mut policy = FramePolicy::new(1, 8, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(Duration::from_millis(50));
+        let owner = ProcessId::from_u128(9);
+        let stranger = ProcessId::from_u128(1);
+        let (image, text) = (ProcessId::from_u128(2), ProcessId::from_u128(3));
+        let now = Instant::now();
+        policy.on_fire_enqueued(stamp(stranger, 0, 0, 1), Some(stranger), 1, 2, 2, None);
+        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 2, 4, 4, Some((7, 2)));
+        policy.on_fire_enqueued(stamp(text, 0, 0, 1), Some(owner), 3, 4, 4, Some((7, 2)));
+        let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, now)),
+            vec![1],
+            "the group does not fit beside the stranger, so it takes the next partition whole"
+        );
+        let mut group_frame = fires(&plan(&mut policy, &queued, now));
+        group_frame.sort_unstable();
+        assert_eq!(group_frame, vec![2, 3], "the group's lanes ride one frame");
     }
 
     /// Wait-all regression: an incomplete lane blocks the seal (the
