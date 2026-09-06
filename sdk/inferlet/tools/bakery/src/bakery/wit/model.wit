@@ -133,6 +133,47 @@ interface model {
         streams: list<lane-stream>,
     }
 
+    // What one axis of an `axis-positions` port means. The rotary space a
+    // DiT was trained in is 1..=4 axes wide and every family orders them
+    // differently; this names them so a guest can fill the grid without
+    // knowing the family.
+    enum axis-role {
+        // Frame / reference / sequence index (FLUX's `T`, Z-Image's `t`).
+        time,
+        // The latent grid's row.
+        height,
+        // The latent grid's column.
+        width,
+        // A plain row-ordinal axis, carried by one lane's rows alone
+        // (FLUX's fourth `L` axis, which numbers the text rows).
+        index,
+    }
+
+    // WHERE A READING'S LANES SIT IN THE ROTARY SPACE (design D7/D12).
+    //
+    // A denoise reading's `axis-positions` port takes one coordinate vector
+    // per row, and which coordinate goes where is a family contract the
+    // guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
+    // `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
+    // builds both from the same code:
+    //
+    //   * a TEXT or CONTEXT lane's row `j` sits at `text-origin + j` on
+    //     axis `text-axis`, and at 0 on every other axis;
+    //   * an IMAGE lane's patch `(a, b)` sits at `a` on the `height` axis
+    //     and `b` on the `width` axis; on `text-axis` it sits at
+    //     `text-origin + text-rows` when `image-follows-text`, else 0; on
+    //     every remaining axis, 0.
+    //
+    // `axes` has exactly the port's `width` entries. A family whose
+    // positions do not fit this shape states `none` and its guests build
+    // their own (a reference lane's `T` offset, for one, is not here).
+    record position-convention {
+        axes: list<axis-role>,
+        text-axis: u32,
+        text-origin: u32,
+        image-follows-text: bool,
+    }
+
     // Which export seam a reading's epilogue reads: `logits()` for a text
     // head, `velocity()` for a denoiser, `hidden()` for an encoder.
     enum readout-kind {
@@ -147,7 +188,8 @@ interface model {
     // (else refused) on its pass, `takes-tokens` the same for `embed`;
     // `streams` are the lane streams a request submits (one pass per
     // stream, `forward-pass.stream`; empty means text only); `ports` are
-    // the float ports `forward-pass.input` binds; `readout`/`readout-width`
+    // the float ports `forward-pass.input` binds; `positions` says where
+    // its lanes' rows sit in the rotary space; `readout`/`readout-width`
     // say what the epilogue may read and how wide one row is (the
     // `velocity(width)` / `hidden(width)` declaration to make).
     record reading-fact {
@@ -157,6 +199,10 @@ interface model {
         takes-tokens: bool,
         streams: list<lane-stream>,
         ports: list<port-fact>,
+        // How this reading's lanes place their rows in the rotary space,
+        // when it declares an `axis-positions` port and states a
+        // convention for it. `none` otherwise.
+        positions: option<position-convention>,
         readout: readout-kind,
         readout-width: u32,
     }

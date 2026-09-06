@@ -50,8 +50,8 @@ use model_dsl::{
 };
 
 use crate::{
-    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
-    ScheduleKind,
+    AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
+    ReadoutKind, ScheduleFact, ScheduleKind,
 };
 
 use super::model::{
@@ -127,6 +127,7 @@ impl Model {
                 streams: vec![Stream::Text],
                 // A sequence lane: ids and kv, no float port.
                 ports: vec![],
+                positions: None,
                 readout: ReadoutKind::Hidden,
                 readout_width: te.hidden,
             });
@@ -155,6 +156,14 @@ impl Model {
                     &[Stream::Context],
                 ),
             ],
+            // `(t, h, w)`, one lane: caption row `j` at `(1 + j, 0, 0)`,
+            // a pad row at the origin (study §C.5).
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 1,
+                image_follows_text: false,
+            }),
             readout: ReadoutKind::Hidden,
             readout_width: d.dim,
         });
@@ -186,6 +195,17 @@ impl Model {
                     &[Stream::Image, Stream::Context],
                 ),
             ],
+            // `(t, h, w)`: the caption rides the TIME axis ahead of the
+            // image — caption row `j` at `(1 + j, 0, 0)`, image patch
+            // `(a, b)` at `(L32 + 1, a, b)` — so the image's time index
+            // follows the caption's padded length (study §C.5). Pad rows
+            // sit at the origin, which the guest's grid states.
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 1,
+                image_follows_text: true,
+            }),
             readout: ReadoutKind::Velocity,
             readout_width: PATCH_FEATURES,
         });

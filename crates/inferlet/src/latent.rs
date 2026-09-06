@@ -31,18 +31,18 @@
 //! ```
 
 use crate::eta::{
-    Channel, KvGeometry, Pipeline, WorkingSet, broadcast, gather, intrinsics, max_elem, min_elem,
-    normal, reduce_sum, reshape, sqrt,
+    Channel, KvGeometry, Pipeline, WorkingSet, attention::ForwardPass, broadcast, eq, gather,
+    intrinsics, max_elem, min_elem, normal, reduce_sum, reshape, select, sqrt,
 };
-use crate::model::{ReadoutKind, ScheduleFact, ScheduleKind};
+use crate::model::{AxisRole, PositionConvention, ReadoutKind, ScheduleFact, ScheduleKind};
 use eta_dsl::Tensor;
 
 /// The glob-import surface for a sampler author: everything here plus the
 /// attention pass prelude (a DiT's passes are `forward` passes).
 pub mod prelude {
     pub use super::{
-        FlowMatchEuler, apg, cfg_combine, dynamic_shift, encode_text, euler_step, noise,
-        positions_grid, rng_state,
+        DenoiseLoop, FlowMatchEuler, LaneClock, LaneRows, apg, at, cfg_combine, dynamic_shift,
+        encode_text, euler_step, noise, positions_for, positions_grid, rng_state, seed_or_step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -304,6 +304,254 @@ pub fn positions_grid(t: u32, h: u32, w: u32, offsets: [f32; 3]) -> Vec<f32> {
     grid
 }
 
+/// Which lane's rows a [`positions_for`] grid is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRows {
+    /// A text or context lane of `rows` rows, numbered along the
+    /// convention's `text_axis`.
+    Sequence(u32),
+    /// An image lane over an `h × w` latent-row grid, `h`-major (the packed
+    /// order every family's `positions` port reads).
+    Grid { h: u32, w: u32 },
+}
+
+/// The `[rows, axes]` f32 grid one lane binds to a reading's
+/// `AxisPositions` port, built from the family's own
+/// [`PositionConvention`](crate::model::PositionConvention) so the guest
+/// never spells a rotary layout.
+///
+/// `text_rows` is how many rows the request's TEXT lane carries — the image
+/// grid needs it when the family stacks the image behind the caption on one
+/// axis (`image_follows_text`); pass 0 for a lane set with no text lane.
+///
+/// Rows come out in the port's own order: `Sequence` numbers row `j` at
+/// `text_origin + j` on `text_axis` and 0 elsewhere; `Grid` puts `a` on the
+/// `Height` axis, `b` on the `Width` axis, the image's caption offset on
+/// `text_axis`, and 0 on everything else.
+#[must_use]
+pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows: u32) -> Vec<f32> {
+    let axes = convention.axes.len();
+    let text_axis = convention.text_axis as usize;
+    let origin = convention.text_origin as f32;
+    match lane {
+        LaneRows::Sequence(rows) => {
+            let mut grid = vec![0f32; rows as usize * axes];
+            for j in 0..rows as usize {
+                if let Some(cell) = grid.get_mut(j * axes + text_axis) {
+                    *cell = origin + j as f32;
+                }
+            }
+            grid
+        }
+        LaneRows::Grid { h, w } => {
+            let follow = if convention.image_follows_text {
+                origin + text_rows as f32
+            } else {
+                0.0
+            };
+            let mut grid = Vec::with_capacity((h * w) as usize * axes);
+            for a in 0..h {
+                for b in 0..w {
+                    for (axis, role) in convention.axes.iter().enumerate() {
+                        grid.push(if axis == text_axis {
+                            follow
+                        } else {
+                            match role {
+                                AxisRole::Height => a as f32,
+                                AxisRole::Width => b as f32,
+                                AxisRole::Time | AxisRole::Index => 0.0,
+                            }
+                        });
+                    }
+                }
+            }
+            grid
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The step loop
+// ---------------------------------------------------------------------------
+
+/// The loop-carried clock of ONE denoise lane: which fire it is on, the
+/// `timestep` cell its pass binds, and the schedule's timestep vector it
+/// gathers the next one out of.
+///
+/// **EVERY LANE OF A STEP NEEDS ITS OWN.** A seeded channel attaches to one
+/// pass only (the runtime's channel-role rule), so the lanes of one denoise
+/// group cannot share a timestep cell; each carries a copy and each advances
+/// it in its own epilogue, which is what keeps the group on one fire index.
+///
+/// Fire 0 is the SEED — its velocity is discarded and its `dt` is 0 — and
+/// step `i` is fire `i + 1`.
+#[derive(Clone)]
+pub struct LaneClock {
+    /// `[1] u32`: the fire index this lane's next epilogue reads.
+    pub step: Channel,
+    /// `[1] f32`: the cell the `timestep` port is bound to.
+    pub timestep: Channel,
+    /// `[fires + 1] f32`: every fire's timestep, with one trailing 0 so the
+    /// last fire's advance gathers something.
+    ts: Channel,
+}
+
+impl LaneClock {
+    /// Install this lane's epilogue: `body` runs with the fire index `k`
+    /// this fire is on, then the clock advances to `k + 1`. A lane that only
+    /// modulates (a text lane) passes a body that does nothing; the image
+    /// lane's body is the Euler update.
+    pub fn drive(&self, pass: &ForwardPass, body: impl Fn(&Tensor) + 'static) {
+        let step = self.step.clone();
+        let timestep = self.timestep.clone();
+        let ts = self.ts.clone();
+        pass.epilogue(move || {
+            let k = step.take();
+            body(&k);
+            let next = &k + 1u32;
+            timestep.take();
+            timestep.put(at(&ts.read(), &next));
+            step.put(&next);
+        });
+    }
+}
+
+/// **ONE DENOISE LOOP: ONE PIPELINE PER LANE, ONE CLOCK PER LANE.**
+///
+/// A denoise step is one fire carrying every lane of one request (D2), and a
+/// group composes only when its passes are members of that one step: the
+/// scheduler never seats two passes of one pipeline in one step, so `n` lanes
+/// down one pipeline are `n` fires, each attending alone. `n` pipelines with
+/// one pass each, submitted back to back, are what the wait-all seal composes
+/// into one fire — and the runtime holds a fresh group's first frame for the
+/// cohort its passes declare, so the first step needs no priming.
+///
+/// This owns those pipelines and the per-lane clocks and nothing else: the
+/// passes, their ports and their epilogue arithmetic stay the guest's.
+///
+/// ```ignore
+/// let mut loops = DenoiseLoop::new(&sched);
+/// let text_clock = loops.lane("text");
+/// let image_clock = loops.lane("image");
+/// // ... build `text` and `image` passes, binding `clock.timestep` ...
+/// text_clock.drive(&text, |_| {});
+/// image_clock.drive(&image, move |k| {
+///     seed_or_step(k, &x, &intrinsics::velocity(w), &dts, &rng, shape, Some(&out));
+/// });
+/// for _ in 0..loops.fires() {
+///     loops.fire(&[&text, &image])?;
+/// }
+/// loops.close();
+/// ```
+pub struct DenoiseLoop {
+    pipes: Vec<Pipeline>,
+    /// Fire `k`'s Euler `dt`: 0 on the seed fire, one trailing 0 past the
+    /// end. The integrating lane gathers this by fire index.
+    dts: Vec<f32>,
+    ts: Vec<f32>,
+    fires: u32,
+}
+
+impl DenoiseLoop {
+    /// The loop `sched` describes, with a seed fire ahead of its steps:
+    /// `sched.steps() + 1` fires in all.
+    #[must_use]
+    pub fn new(sched: &FlowMatchEuler) -> DenoiseLoop {
+        let mut ts = vec![sched.timestep(0)];
+        ts.extend(sched.timesteps());
+        ts.push(0.0);
+        let mut dts = vec![0.0];
+        dts.extend(sched.dts());
+        dts.push(0.0);
+        DenoiseLoop {
+            pipes: Vec::new(),
+            dts,
+            ts,
+            fires: sched.steps() + 1,
+        }
+    }
+
+    /// How many fires the loop runs: one seed plus one per step.
+    #[must_use]
+    pub fn fires(&self) -> u32 {
+        self.fires
+    }
+
+    /// Add a lane, in the order its pass is submitted, and hand back its
+    /// clock. `tag` names the lane's channels in a trace.
+    pub fn lane(&mut self, tag: &str) -> LaneClock {
+        self.pipes.push(Pipeline::new());
+        LaneClock {
+            step: Channel::from([0u32]).named(&format!("{tag}_step")),
+            timestep: Channel::from([self.ts[0]]).named(&format!("{tag}_t")),
+            ts: Channel::from(self.ts.clone()).named(&format!("{tag}_ts")),
+        }
+    }
+
+    /// A `[fires + 1] f32` channel of every fire's Euler `dt`, for the lane
+    /// that integrates. One per epilogue that gathers it, for the same
+    /// channel-role reason [`LaneClock`] states.
+    #[must_use]
+    pub fn dts(&self, tag: &str) -> Channel {
+        Channel::from(self.dts.clone()).named(&format!("{tag}_dts"))
+    }
+
+    /// Submit one fire: `passes[i]` rides lane `i`'s pipeline, in the order
+    /// the lanes were added. Refuses a count that is not the lane count — a
+    /// missing lane is a group that never composes.
+    pub fn fire(&self, passes: &[&ForwardPass]) -> Result<(), String> {
+        if passes.len() != self.pipes.len() {
+            return Err(format!(
+                "this loop has {} lanes and {} passes were submitted; every lane of a group must \
+                 fire in the same step",
+                self.pipes.len(),
+                passes.len()
+            ));
+        }
+        for (i, pass) in passes.iter().enumerate() {
+            pass.submit(&self.pipes[i])
+                .map_err(|why| format!("lane {i}: {why}"))?;
+        }
+        Ok(())
+    }
+
+    /// Close every lane's pipeline.
+    pub fn close(&self) {
+        for pipe in &self.pipes {
+            pipe.close();
+        }
+    }
+}
+
+/// The Euler epilogue body of an image lane: on fire 0 SEED the latent from
+/// the keyed RNG state (the model's velocity over the empty cell is
+/// discarded), on every later fire integrate `x ← x + dt(k)·v`, and — when
+/// `out` is given — publish the result for the host to read.
+///
+/// `velocity` is what this fire predicts: the lane's own
+/// `intrinsics::velocity(width)`, or a CFG-combined one.
+pub fn seed_or_step(
+    k: &Tensor,
+    x: &Channel,
+    velocity: &Tensor,
+    dts: &Channel,
+    rng: &Channel,
+    shape: [u32; 2],
+    out: Option<&Channel>,
+) {
+    let current = x.take();
+    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
+    let state = rng.take();
+    let fresh = noise(shape, &state);
+    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
+    let next = select(&first, &fresh, &stepped);
+    x.put(&next);
+    if let Some(out) = out {
+        out.put(&next);
+    }
+    rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+
 /// Encode `prompt` with the family's text reading: tokenize, run one
 /// `forward` pass in `reading` (`"text"` for every family that has one)
 /// with `embed` + `attention` over a fresh working set, read `hidden()` at
@@ -328,7 +576,21 @@ pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String>
         ));
     }
     let width = fact.readout_width;
-    let ids: Vec<i32> = crate::model::encode(prompt)
+    // THE TEMPLATE IS THE FAMILY'S, AND THE `chat` SURFACE IS WHERE IT
+    // LIVES. Every text encoder in the generative zoo is an instruct model
+    // whose reference pipeline renders one user turn plus the generation
+    // cue (`apply_chat_template(add_generation_prompt=True)`) before it
+    // tokenizes — FLUX.2 klein's Qwen3 with the empty think block,
+    // Z-Image's Qwen3 without it. A guest that hands the bare prompt gets
+    // an embedding the DiT was never conditioned on, so the template is not
+    // optional and it is not the guest's to spell: `first_user` + `cue` are
+    // the bound model's own rendering. Padding stays the family's (the
+    // encode arm's), so nothing is added here.
+    let mut ids_u32 = crate::chat::first_user(prompt);
+    ids_u32.extend(crate::chat::cue());
+    let cap = crate::eta::max_embed_length().max(1);
+    ids_u32.truncate(cap);
+    let ids: Vec<i32> = ids_u32
         .into_iter()
         .map(|id| i32::try_from(id).unwrap_or(0))
         .collect();
@@ -446,6 +708,76 @@ mod tests {
             vec![
                 10.0, 0.0, 0.0, 10.0, 0.0, 1.0, 10.0, 1.0, 0.0, 10.0, 1.0, 1.0
             ]
+        );
+    }
+
+    /// FLUX.2's `(T, H, W, L)`: the text rows number the fourth axis, the
+    /// image grid rides `(h, w)` at `T = 0` and `L = 0`.
+    #[test]
+    fn a_grid_then_index_convention_numbers_text_on_its_own_axis() {
+        let flux = PositionConvention {
+            axes: vec![
+                AxisRole::Time,
+                AxisRole::Height,
+                AxisRole::Width,
+                AxisRole::Index,
+            ],
+            text_axis: 3,
+            text_origin: 0,
+            image_follows_text: false,
+        };
+        assert_eq!(
+            positions_for(&flux, LaneRows::Sequence(2), 2),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            positions_for(&flux, LaneRows::Grid { h: 2, w: 2 }, 2),
+            vec![
+                0.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 1.0, 1.0, 0.0,
+            ]
+        );
+    }
+
+    /// Z-Image's `(t, h, w)`: caption row `j` at `(1 + j, 0, 0)` and the
+    /// image behind it at `(text_rows + 1, a, b)`.
+    #[test]
+    fn a_text_time_prefix_convention_stacks_the_image_behind_the_caption() {
+        let z = PositionConvention {
+            axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+            text_axis: 0,
+            text_origin: 1,
+            image_follows_text: true,
+        };
+        assert_eq!(
+            positions_for(&z, LaneRows::Sequence(2), 2),
+            vec![1.0, 0.0, 0.0, 2.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            positions_for(&z, LaneRows::Grid { h: 1, w: 2 }, 32),
+            vec![33.0, 0.0, 0.0, 33.0, 0.0, 1.0]
+        );
+    }
+
+    /// mini-dit's `(t, h, w)`: caption row `j` at `(j, 0, 0)`, image patch
+    /// `(h, w)` at `(0, h, w)` — the same builder, no offsets.
+    #[test]
+    fn a_grid_only_convention_leaves_the_time_axis_at_zero() {
+        let mini = PositionConvention {
+            axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+            text_axis: 0,
+            text_origin: 0,
+            image_follows_text: false,
+        };
+        assert_eq!(
+            positions_for(&mini, LaneRows::Sequence(2), 2),
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            positions_for(&mini, LaneRows::Grid { h: 2, w: 1 }, 2),
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
         );
     }
 }

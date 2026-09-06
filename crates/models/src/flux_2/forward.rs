@@ -67,8 +67,8 @@ use model_dsl::{
 };
 
 use crate::{
-    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
-    ScheduleKind,
+    AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
+    ReadoutKind, ScheduleFact, ScheduleKind,
 };
 
 use super::model::{
@@ -144,6 +144,7 @@ impl Model {
                 streams: vec![Stream::Text],
                 // A sequence lane: ids and kv, no float port.
                 ports: vec![],
+                positions: None,
                 readout: ReadoutKind::Hidden,
                 readout_width: d.dim,
             });
@@ -183,6 +184,21 @@ impl Model {
             takes_tokens: false,
             streams: every.to_vec(),
             ports,
+            // `(T, H, W, L)`: the target grid on `(h, w)` at `T = 0`, a
+            // text row `j` at `(0, 0, 0, j)` — `_prepare_{text,latent}_ids`.
+            // (A reference lane's `T = 10·(i + 1)` is the family's, not the
+            // convention's; a guest that binds references states it.)
+            positions: Some(PositionConvention {
+                axes: vec![
+                    AxisRole::Time,
+                    AxisRole::Height,
+                    AxisRole::Width,
+                    AxisRole::Index,
+                ],
+                text_axis: 3,
+                text_origin: 0,
+                image_follows_text: false,
+            }),
             readout: ReadoutKind::Velocity,
             readout_width: IN_CHANNELS,
         });

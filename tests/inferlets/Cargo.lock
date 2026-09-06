@@ -736,6 +736,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "text-to-image"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "token-healing"
 version = "0.1.0"
 dependencies = [

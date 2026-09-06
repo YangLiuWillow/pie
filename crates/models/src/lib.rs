@@ -128,6 +128,10 @@ pub struct ReadingFact {
     /// The float input ports, in the order the trace numbers them within
     /// each kind: the `n`th `Latents` port here is `Input::latents(n, ..)`.
     pub ports: Vec<PortFact>,
+    /// Where this reading's lanes place their rows in the rotary space
+    /// (design D7/D12), when it declares an `AxisPositions` port and its
+    /// layout fits [`PositionConvention`]. `None` otherwise.
+    pub positions: Option<PositionConvention>,
     /// Which export seam the epilogue reads (`logits()`, `velocity()`,
     /// `hidden()`).
     pub readout: ReadoutKind,
@@ -203,6 +207,54 @@ pub enum PortKind {
     Context,
     /// `RuntimeInput::AxisPositions`: `[rows, axes]` f32, `1..=4` axes.
     AxisPositions,
+}
+
+/// What one axis of an `AxisPositions` port means. The rotary space a DiT
+/// was trained in is 1..=4 axes wide and every family orders them
+/// differently; this names them so a guest can fill the grid without
+/// knowing the family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AxisRole {
+    /// Frame / reference / sequence index (FLUX's `T`, Z-Image's `t`).
+    Time,
+    /// The latent grid's row.
+    Height,
+    /// The latent grid's column.
+    Width,
+    /// A plain row-ordinal axis carried by one lane's rows alone (FLUX's
+    /// fourth `L` axis, which numbers the text rows).
+    Index,
+}
+
+/// **WHERE A READING'S LANES SIT IN THE ROTARY SPACE.**
+///
+/// A denoise reading's `AxisPositions` port takes one coordinate vector per
+/// row, and which coordinate goes where is a family contract the guest must
+/// not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s `(L + 1, a, b)`). This
+/// states it once, so one model-agnostic builder
+/// (`inferlet::latent::positions_for`) fills every family's grid:
+///
+/// - a `Text`/`Context` lane's row `j` sits at `text_origin + j` on axis
+///   `text_axis` and at 0 on every other axis;
+/// - an `Image` lane's patch `(a, b)` sits at `a` on the `Height` axis and
+///   `b` on the `Width` axis; on `text_axis` it sits at `text_origin +
+///   text_rows` when `image_follows_text`, else 0; on every remaining
+///   axis, 0.
+///
+/// `axes` has exactly the port's `width` entries. A family whose positions
+/// do not fit this shape states `None` and its guests build their own — a
+/// reference lane's `T` stride, for one, is not stated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionConvention {
+    /// One role per axis of the positions port, in the port's own order.
+    pub axes: Vec<AxisRole>,
+    /// Which axis a text/context lane numbers its rows on.
+    pub text_axis: u32,
+    /// The coordinate that lane's FIRST row sits at.
+    pub text_origin: u32,
+    /// The image lane's coordinate on `text_axis` is `text_origin +
+    /// text_rows` (Z-Image) rather than 0 (FLUX.2, mini-dit).
+    pub image_follows_text: bool,
 }
 
 /// Which export seam a reading's epilogue reads.
