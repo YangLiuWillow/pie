@@ -237,6 +237,39 @@ pub(crate) fn analyze_direct_argmax(
     analysis
 }
 
+/// The row geometry a region is launched over, when it is row-parallel.
+pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u64, u32)> {
+    region
+        .row_value
+        .and_then(|witness| stage.normalized.value_types.get(witness as usize))
+        .and_then(|ty| crate::plan::value_rows(&ty.dims))
+        .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX))
+}
+
+/// Per value, how a row block of `geometry` sees it: 1 = its row of a value
+/// of the geometry, 2 = its element of a per-row vector, 0 = whole.
+pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, u32)) -> Vec<u8> {
+    let (fixed, extent) = geometry;
+    stage
+        .normalized
+        .value_types
+        .iter()
+        .map(|ty| {
+            let alias = region.row_alias;
+            if ty.dims.len() >= 2
+                && crate::plan::value_rows(&ty.dims)
+                    .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
+            {
+                1
+            } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
+                2
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
 /// `emit_fused_region_cuda`.
 pub fn emit_fused_region(
     entry_name: &str,
@@ -274,32 +307,11 @@ pub fn emit_fused_region(
     // vector (kind 2: what a row reduction writes one element of) as its
     // element, and everything else whole — through a block-local descriptor
     // table and a per-value byte shift, so the helpers below run unchanged.
-    let row_geometry = region
-        .row_value
-        .and_then(|witness| stage.normalized.value_types.get(witness as usize))
-        .and_then(|ty| crate::plan::value_rows(&ty.dims))
-        .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX));
+    let row_geometry = row_geometry(stage, region);
     let row_parallel = row_geometry.is_some();
-    if let Some((fixed, extent)) = row_geometry {
-        let kinds: Vec<String> = stage
-            .normalized
-            .value_types
-            .iter()
-            .map(|ty| {
-                let alias = region.row_alias;
-                if ty.dims.len() >= 2
-                    && crate::plan::value_rows(&ty.dims)
-                        .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
-                {
-                    "1u"
-                } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
-                    "2u"
-                } else {
-                    "0u"
-                }
-                .to_string()
-            })
-            .collect();
+    let row_kinds: Vec<u8> = row_geometry.map_or_else(Vec::new, |geometry| row_kinds(stage, region, geometry));
+    if row_geometry.is_some() {
+        let kinds: Vec<String> = row_kinds.iter().map(|k| format!("{k}u")).collect();
         let count = kinds.len().max(1);
         let _ = writeln!(source, "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};", kinds.join(", "));
         let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_rowdesc[{count}u];");
@@ -345,12 +357,31 @@ pub fn emit_fused_region(
 ");
     }
 
-    for &node in &region.nodes {
-        let node = node.index();
+    // The barrier-and-status block every op (and every stream) ends with.
+    const TAIL: &str = "    __syncthreads();\n    if (status.state != 1u) {\n      if (threadIdx.x == 0u) *commit = 0u;\n      return;\n    }\n";
+    let streams = row_parallel.then(|| {
+        super::stream::Streams::new(stage, region, &ops, &bases, &row_kinds, &direct.intrinsic, &skipped)
+    });
+
+    let mut at = 0usize;
+    while at < region.nodes.len() {
+        let node = region.nodes[at].index();
+        at += 1;
         let op = &ops[node];
         let base = bases[node];
         if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
+        }
+        // A stream: this op and the elementwise run after it, one pass.
+        if let Some(streams) = &streams {
+            let mut pointer = |value: u32| {
+                let value = aliases.resolve(value);
+                format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
+            };
+            if let Some(covered) = super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL) {
+                at += covered - 1;
+                continue;
+            }
         }
         // A reshape's result element count must be no larger than its
         // source's (both runtimes copy the result's element count out of
@@ -419,11 +450,7 @@ pub fn emit_fused_region(
 
         emit_body(&mut source, stage, op, node, &direct.intrinsic, &slots);
 
-        source.push_str("    __syncthreads();\n");
-        source.push_str("    if (status.state != 1u) {\n");
-        source.push_str("      if (threadIdx.x == 0u) *commit = 0u;\n");
-        source.push_str("      return;\n");
-        source.push_str("    }\n");
+        source.push_str(TAIL);
         if op.tag == tags::CHAN_PUT {
             source.push_str("    if (threadIdx.x == 0u) pending_flags[channel_index] = 1u;\n");
             source.push_str("    __syncthreads();\n");

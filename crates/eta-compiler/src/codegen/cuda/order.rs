@@ -75,6 +75,12 @@ const ORDER_FULL_ROW: u32 = 0;
 /// `sort_desc`, walk the radix sort with its two order arrays.
 pub const TOP_K_SELECT_MAX: u32 = 1024;
 
+/// The keys a `top_k` select keeps in shared memory once two radix passes
+/// have fixed a 16-bit prefix: the keys at that prefix. Eight bytes each
+/// (key and index), so 32 KB; a prefix more popular than this keeps the
+/// full-row passes.
+pub const TOP_K_SELECT_POOL: u32 = 4096;
+
 /// The kernel body, after the six `constexpr`s the emitter writes (worker
 /// cap, input value id, two result value ids, result width, full-row
 /// sentinel). Every `__syncthreads()` is reached by the whole block: loop
@@ -251,6 +257,9 @@ const BODY_SELECT: &str = r#"
   __shared__ m1_u32 sel_hist[256];
   __shared__ m1_u32 sel_warp[32];
   __shared__ m1_u64 sel_cand[kSelectCap];
+  __shared__ m1_u64 sel_pool[kSelectPool];
+  __shared__ m1_u32 sel_pool_fill;
+  __shared__ m1_u32 sel_in_bin;
   __shared__ m1_u32 sel_fill;
   __shared__ m1_u32 sel_digit;
   __shared__ m1_u32 sel_below;
@@ -261,18 +270,38 @@ const BODY_SELECT: &str = r#"
   if (order_count != 0u) {
     for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
       const m1_u32 order_base = order_row * order_len;
-      // 1. The `order_count`-th smallest key, one 8-bit digit per pass.
+      // 1. The `order_count`-th smallest key by radix select, one 8-bit
+      // digit a pass. The first two passes read the row; the keys still
+      // under the 16-bit prefix are then few (a row of logits shares its
+      // sign and exponent, rarely its top mantissa bits), so they are
+      // gathered once into shared memory and the last two digits and the
+      // compaction are decided there: three reads of the row, not five.
+      // A prefix too popular for the pool (`kSelectPool`) keeps reading the
+      // row, as before.
       m1_u32 prefix = 0u;
       m1_u32 want = order_count;
+      m1_u32 pooled = 0xFFFFFFFFu;
+      if (threadIdx.x == 0u) {
+        sel_fill = 0u;
+        sel_pool_fill = 0u;
+      }
+      __syncthreads();
       for (m1_u32 pass = 0u; pass < 4u; ++pass) {
         const m1_u32 shift = 24u - pass * 8u;
         const m1_u32 fixed = pass == 0u ? 0u : (0xFFFFFFFFu << (shift + 8u));
         for (m1_u32 b = threadIdx.x; b < 256u; b += blockDim.x) sel_hist[b] = 0u;
         __syncthreads();
-        for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
-          const m1_u32 key = m1_desc_key(m1_load_f(
-              order_input, order_base + i, order_input_desc.dtype));
-          if ((key & fixed) == prefix) atomicAdd(&sel_hist[(key >> shift) & 255u], 1u);
+        if (pooled == 0xFFFFFFFFu) {
+          for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
+            const m1_u32 key = m1_desc_key(m1_load_f(
+                order_input, order_base + i, order_input_desc.dtype));
+            if ((key & fixed) == prefix) atomicAdd(&sel_hist[(key >> shift) & 255u], 1u);
+          }
+        } else {
+          for (m1_u32 i = threadIdx.x; i < pooled; i += blockDim.x) {
+            const m1_u32 key = (m1_u32)(sel_pool[i] >> 32);
+            if ((key & fixed) == prefix) atomicAdd(&sel_hist[(key >> shift) & 255u], 1u);
+          }
         }
         __syncthreads();
         if (threadIdx.x == 0u) {
@@ -285,49 +314,96 @@ const BODY_SELECT: &str = r#"
           }
           sel_digit = digit;
           sel_below = below;
+          sel_in_bin = sel_hist[digit];
         }
         __syncthreads();
         prefix |= sel_digit << shift;
         want -= sel_below;
+        const m1_u32 in_bin = sel_in_bin;
         __syncthreads();
+        if (pass == 1u && in_bin <= kSelectPool) {
+          // Gather: a key under the 16-bit prefix is a winner whatever its
+          // low bits (the sort below orders them); a key at the prefix
+          // joins the pool the remaining digits are decided in.
+          for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
+            const m1_u32 key = m1_desc_key(m1_load_f(
+                order_input, order_base + i, order_input_desc.dtype));
+            const m1_u32 high = key & 0xFFFF0000u;
+            if (high < prefix) {
+              const m1_u32 at = atomicAdd(&sel_fill, 1u);
+              if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
+            } else if (high == prefix) {
+              const m1_u32 at = atomicAdd(&sel_pool_fill, 1u);
+              if (at < kSelectPool) sel_pool[at] = ((m1_u64)key << 32) | (m1_u64)i;
+            }
+          }
+          __syncthreads();
+          pooled = sel_pool_fill;
+          __syncthreads();
+        }
       }
       const m1_u32 threshold = prefix;
       const m1_u32 less_count = order_count - want;
       const m1_u32 equal_take = want;
-      // 2. Compaction, one coalesced window of the row per step: keys below
-      // the threshold in any order, keys equal to it by ascending index.
+      // 2. Compaction, one coalesced window a step over the row, or over
+      // the pool once gathered: keys below the threshold in any order,
+      // keys equal to it by ascending index. Pool entries were appended by
+      // atomics, so their index order is not their position order; the
+      // rank walks them in index order by a window over the ROW's indices
+      // is not possible here, and instead the equal keys are ranked by
+      // counting the pool's smaller indices, which is small work on a
+      // small pool.
       if (threadIdx.x == 0u) {
-        sel_fill = 0u;
         sel_equal_seen = 0u;
       }
       __syncthreads();
-      for (m1_u32 window = 0u; window < order_len; window += blockDim.x) {
-        const m1_u32 i = window + threadIdx.x;
-        const bool valid = i < order_len;
-        const m1_u32 key = valid
-            ? m1_desc_key(m1_load_f(order_input, order_base + i, order_input_desc.dtype))
-            : 0xFFFFFFFFu;
-        if (valid && key < threshold) {
-          const m1_u32 at = atomicAdd(&sel_fill, 1u);
-          if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
-        }
-        const bool equal = valid && key == threshold;
-        const unsigned ballot = __ballot_sync(0xffffffffu, equal);
-        if (sel_lane == 0u) sel_warp[sel_warp_id] = __popc(ballot);
-        __syncthreads();
-        if (threadIdx.x == 0u) {
-          m1_u32 run = sel_equal_seen;
-          for (m1_u32 w = 0u; w < sel_warps; ++w) {
-            const m1_u32 c = sel_warp[w];
-            sel_warp[w] = run;
-            run += c;
+      if (pooled == 0xFFFFFFFFu) {
+        for (m1_u32 window = 0u; window < order_len; window += blockDim.x) {
+          const m1_u32 i = window + threadIdx.x;
+          const bool valid = i < order_len;
+          const m1_u32 key = valid
+              ? m1_desc_key(m1_load_f(order_input, order_base + i, order_input_desc.dtype))
+              : 0xFFFFFFFFu;
+          if (valid && key < threshold) {
+            const m1_u32 at = atomicAdd(&sel_fill, 1u);
+            if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
           }
-          sel_equal_seen = run;
+          const bool equal = valid && key == threshold;
+          const unsigned ballot = __ballot_sync(0xffffffffu, equal);
+          if (sel_lane == 0u) sel_warp[sel_warp_id] = __popc(ballot);
+          __syncthreads();
+          if (threadIdx.x == 0u) {
+            m1_u32 run = sel_equal_seen;
+            for (m1_u32 w = 0u; w < sel_warps; ++w) {
+              const m1_u32 c = sel_warp[w];
+              sel_warp[w] = run;
+              run += c;
+            }
+            sel_equal_seen = run;
+          }
+          __syncthreads();
+          if (equal) {
+            const m1_u32 rank = sel_warp[sel_warp_id] + __popc(ballot & ((1u << sel_lane) - 1u));
+            if (rank < equal_take) sel_cand[less_count + rank] = ((m1_u64)key << 32) | (m1_u64)i;
+          }
+          __syncthreads();
         }
-        __syncthreads();
-        if (equal) {
-          const m1_u32 rank = sel_warp[sel_warp_id] + __popc(ballot & ((1u << sel_lane) - 1u));
-          if (rank < equal_take) sel_cand[less_count + rank] = ((m1_u64)key << 32) | (m1_u64)i;
+      } else {
+        for (m1_u32 at = threadIdx.x; at < pooled; at += blockDim.x) {
+          const m1_u64 entry = sel_pool[at];
+          const m1_u32 key = (m1_u32)(entry >> 32);
+          const m1_u32 index = (m1_u32)entry;
+          if (key < threshold) {
+            const m1_u32 slot = atomicAdd(&sel_fill, 1u);
+            if (slot < kSelectCap) sel_cand[slot] = entry;
+          } else if (key == threshold) {
+            m1_u32 rank = 0u;
+            for (m1_u32 j = 0u; j < pooled; ++j) {
+              const m1_u64 other = sel_pool[j];
+              rank += ((m1_u32)(other >> 32) == threshold && (m1_u32)other < index) ? 1u : 0u;
+            }
+            if (rank < equal_take) sel_cand[less_count + rank] = entry;
+          }
         }
         __syncthreads();
       }
@@ -448,6 +524,7 @@ pub fn emit_order_region(
     if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
         let cap = width.next_power_of_two().max(2);
         let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
+        let _ = writeln!(source, "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;");
         source.push_str(BODY_SELECT);
     } else {
         source.push_str(BODY);

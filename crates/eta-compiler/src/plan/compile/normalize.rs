@@ -120,8 +120,9 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
     let stage_program = &bound.container.stages[stage_index];
     let original_types = &bound.stage_types[stage_index];
     let (result_bases, producer) = result_layout(&stage_program.ops);
-    let keep = live_ops(stage_program, &result_bases, &producer);
+    let mut keep = live_ops(stage_program, &result_bases, &producer);
     let redundant = redundant_select_broadcasts(stage_program, original_types, &result_bases);
+    let folded_broadcasts = row_vector_broadcasts(stage_program, original_types, &producer, &mut keep);
 
     let mut value_map = vec![u32::MAX; original_types.len()];
     let mut normalized_ops: Vec<Op> = Vec::new();
@@ -147,6 +148,19 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         }
 
         let mut op = original_op.clone();
+        // A per-row vector reshaped to `[rows, 1]` and broadcast to
+        // `[rows, cols]` is the vector's own broadcast (leading axes align,
+        // see `can_broadcast_to`). The DSL spells a row's scalar this way —
+        // `broadcast(reshape(m, [n, 1]), [n, v])` — and the row-parallel
+        // emitters fuse a broadcast of a per-row scalar into the stream that
+        // reads it but materialise one of a `[n, 1]` value: a whole `[n, v]`
+        // scratch write per fire, then a read of it per pass. Fold the
+        // reshape away here so the stream sees the vector.
+        if let Op::Broadcast { value, .. } = &mut op
+            && let Some(source) = folded_broadcasts[op_index]
+        {
+            *value = source;
+        }
         op.map_operands(|value| {
             let mapped = value_map[value as usize];
             debug_assert_ne!(mapped, u32::MAX, "live op references removed value");
@@ -223,6 +237,67 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         channel_bindings: Vec::new(),
         names: Vec::new(),
     }
+}
+
+/// Per op, the vector a `Broadcast` of a `Reshape(vector, [n, 1])` may read
+/// directly (leading axes align, see `can_broadcast_to`), `None` elsewhere.
+/// A reshape every consumer of which folds this way is marked dead in
+/// `keep`: left alive it would sit between the regions as its own launch.
+pub(crate) fn row_vector_broadcasts(
+    stage_program: &eta_ir::container::StageProgram,
+    original_types: &[eta_ir::types::ValueType],
+    producer: &[NodeIndex],
+    keep: &mut [bool],
+) -> Vec<Option<ValueId>> {
+    let ops = &stage_program.ops;
+    let mut folds: Vec<Option<ValueId>> = vec![None; ops.len()];
+    // Consumers per value, to know when a reshape is read only by folds.
+    let mut uses = vec![0u32; original_types.len()];
+    let mut folded_uses = vec![0u32; original_types.len()];
+    for op in ops {
+        for value in op.operands() {
+            uses[value as usize] += 1;
+        }
+    }
+    for (op_index, op) in ops.iter().enumerate() {
+        let Op::Broadcast { value, shape } = op else {
+            continue;
+        };
+        let reshape = producer[*value as usize].index();
+        let Op::Reshape {
+            value: source,
+            shape: mid,
+        } = &ops[reshape]
+        else {
+            continue;
+        };
+        if mid.rank() == 2
+            && mid.dims()[1] == 1
+            && original_types[*source as usize].shape.rank() == 1
+            && shape.rank() == 2
+            && shape.dims()[0] == mid.dims()[0]
+        {
+            folds[op_index] = Some(*source);
+            folded_uses[*value as usize] += 1;
+        }
+    }
+    for (op_index, op) in ops.iter().enumerate() {
+        if let Op::Reshape { .. } = op {
+            let out = op_index;
+            // A reshape has one result; its value id is its producer slot.
+            let value = producer
+                .iter()
+                .position(|p| p.index() == out)
+                .map(|v| v as u32);
+            if let Some(v) = value
+                && uses[v as usize] > 0
+                && folded_uses[v as usize] == uses[v as usize]
+            {
+                keep[out] = false;
+            }
+        }
+    }
+    folds
 }
 
 pub(crate) fn result_layout(ops: &[Op]) -> (Vec<ValueId>, Vec<NodeIndex>) {

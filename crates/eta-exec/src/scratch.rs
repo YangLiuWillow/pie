@@ -84,6 +84,11 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
 pub struct Lifetime {
     pub def: u32,
     pub last: u32,
+    /// Whether the value never touches scratch at all: a stream's
+    /// register (`eta_compiler::codegen::cuda::stream`), read only inside
+    /// the pass that defines it. A dead value takes no slot; its offset is
+    /// the dummy region's and nothing forms a pointer to it.
+    pub dead: bool,
     /// Whether this value may take an offset an earlier value vacated. Only
     /// a result its op always writes in full qualifies: a never-reused slot
     /// reads back as zero (the per-fire clear), a reused one as whatever
@@ -231,6 +236,11 @@ pub fn layout_reusing(
             }
             step = Some(life.def);
         }
+        if life.dead {
+            values[i] = 0;
+            spans[i] = 0;
+            continue;
+        }
         let descriptor = &descriptors[i];
         // Every CUDA consumer of the temporary arena works one row at a
         // time (`m1_reduce_*`, `ptir_parallel_reduce_f32`, the order
@@ -300,6 +310,7 @@ mod tests {
     /// One launch per step, every value sequential.
     fn life(def: u32, last: u32) -> Lifetime {
         Lifetime {
+            dead: false,
             def,
             last,
             reusable: true,
@@ -313,6 +324,7 @@ mod tests {
     /// A value of one many-block launch (steps `def..=last` inside it).
     fn rowed(def: u32, last: u32, launch: u32, class: u64) -> Lifetime {
         Lifetime {
+            dead: false,
             def,
             last,
             reusable: true,
@@ -418,5 +430,24 @@ mod tests {
             layout_reusing(&descriptors, &[life(0, 0)], 0).unwrap(),
             layout(&descriptors).unwrap()
         );
+    }
+
+    /// A stream's register never lands: a dead value takes no slot and the
+    /// live ones lay out as if it were not there.
+    #[test]
+    fn a_dead_value_takes_no_slot() {
+        // Three values alive at once, so none can take another's slot.
+        let descriptors = [desc(1024), desc(1024), desc(1024)];
+        let mut lifetimes = [life(0, 2), life(1, 2), life(2, 2)];
+        let with = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");
+        lifetimes[1].dead = true;
+        let without = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");
+        assert_eq!(without.values[1], 0, "a dead value's offset is the dummy region's");
+        assert_eq!(
+            without.total + align_up(4096).unwrap(),
+            with.total,
+            "the dead value's slot is the whole difference"
+        );
+        assert_eq!(without.values[2], without.values[0] + align_up(4096).unwrap());
     }
 }

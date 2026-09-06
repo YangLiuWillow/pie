@@ -10,6 +10,8 @@ pub mod region_analysis;
 pub mod runtime;
 pub mod scan;
 pub mod singleton;
+mod stream;
+pub use stream::spent_values;
 pub mod validate;
 
 pub use fused::emit_fused_region;
@@ -27,7 +29,7 @@ use alloc::string::String;
 /// the engine's compile cache keys on it. Also keys the negative tier
 /// (cached `Deterministic` compile failures), so a bump is how a stale
 /// refusal is forgotten.
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 28;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 31;
 
 /// The kernel this backend compiles for one region of a stage: the single
 /// place that decides which emitter a region goes through.

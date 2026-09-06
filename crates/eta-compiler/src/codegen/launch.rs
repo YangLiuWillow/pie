@@ -278,6 +278,12 @@ pub struct LaunchRegion {
     /// block per lane.
     #[serde(default)]
     pub row_value: Option<u32>,
+    /// Values a CUDA stream keeps in registers and never stores
+    /// (`codegen::cuda::stream`): read only inside the pass that defines
+    /// them, so an engine that lays scratch out by liveness gives them no
+    /// slot. Empty for every region another emitter handles.
+    #[serde(default)]
+    pub spent: Vec<u32>,
     /// The plan's `Region::row_alias`: the static row count standing for
     /// the geometry's symbolic rows, if any.
     #[serde(default)]
@@ -722,8 +728,8 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
             .collect(),
         channel_bindings: normalized.channel_bindings.clone(),
         names: normalized.names.clone(),
-        singleton: lower_partition(&stage.singleton),
-        fused: lower_partition(&stage.fused),
+        singleton: lower_partition(stage, &stage.singleton),
+        fused: lower_partition(stage, &stage.fused),
         used_extents: grouped.used_extents,
         channel_rules: grouped.channel_rules,
         error: grouped.error,
@@ -784,12 +790,17 @@ fn rng(byte: u8) -> RngKind {
     }
 }
 
-fn lower_partition(partition: &RegionPartition) -> Vec<LaunchRegion> {
-    partition.regions.iter().map(lower_region).collect()
+fn lower_partition(stage: &CompiledStage, partition: &RegionPartition) -> Vec<LaunchRegion> {
+    partition
+        .regions
+        .iter()
+        .map(|region| lower_region(stage, region))
+        .collect()
 }
 
-fn lower_region(region: &Region) -> LaunchRegion {
+fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
     LaunchRegion {
+        spent: crate::codegen::cuda::spent_values(stage, region),
         kind: region.kind,
         schedule: region.schedule as u8,
         // `LaunchRegion` is the engine ABI, which has one integer space;
