@@ -1,8 +1,10 @@
 //! `attention.ragged` captures into a CUDA graph after one eager warm fire
 //! (which sizes its schedule slab) and replays correctly with new operand
-//! bytes and a rewritten seat: the same body, recorded over three groups,
-//! serves a fire of two groups starting at group one when `win[2..4]` say
-//! so — the `Reads::RowsAndLanes` bargain.
+//! bytes and a rewritten group TABLE: the same body, recorded over three
+//! groups, serves a fire whose table leaves group 0 empty — the arm reads no
+//! seat word, every group it serves is in the table it was handed (the
+//! engine pads the table with empty segments), so a rewritten seat changes
+//! nothing and a rewritten table changes everything.
 //!
 //! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_replays_from_a_captured_graph`
 
@@ -43,6 +45,20 @@ fn upload(at: u64, values: &[u16]) {
 }
 
 fn upload_u32(at: u64, values: &[u32]) {
+    unsafe {
+        check(
+            rt::cudaMemcpy(
+                at as *mut c_void,
+                values.as_ptr().cast(),
+                core::mem::size_of_val(values),
+                rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ),
+            "cudaMemcpy H2D",
+        );
+    }
+}
+
+fn upload_i32(at: u64, values: &[i32]) {
     unsafe {
         check(
             rt::cudaMemcpy(
@@ -162,9 +178,11 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
         );
     }
 
-    // Replay two: the seat now names groups 1 and 2 only. Group 0's rows keep
-    // the bytes replay one left there; groups 1 and 2 are recomputed over
-    // fresh bytes.
+    // Replay two: the table now leaves group 0 empty (its bound repeats
+    // group 1's start), the seat is rewritten to name groups 1 and 2 and is
+    // not read. Group 0's rows keep the bytes replay one left there; groups
+    // 1 and 2 are recomputed over fresh bytes, and the eager twin over the
+    // same table agrees.
     let (q2, _) = lcg.row(rows * qw);
     let (k2, _) = lcg.row(rows * kw);
     let (v2, _) = lcg.row(rows * kw);
@@ -172,7 +190,10 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     upload(k_at, &k2);
     upload(v_at, &v2);
     upload_u32(win_at, &[rows as u32, 0, 2, 1]);
-    fire(&ctx, o_eager).expect("the eager twin over every group");
+    let mut emptied = table.clone();
+    emptied[0] = emptied[1];
+    upload_i32(table_at, &emptied);
+    fire(&ctx, o_eager).expect("the eager twin over the rewritten table");
     unsafe {
         check(rt::cudaGraphLaunch(exec, stream.cast()), "cudaGraphLaunch");
     }
