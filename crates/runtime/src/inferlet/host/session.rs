@@ -40,6 +40,21 @@ fn suggested_name(name: &str, extension: &str) -> String {
     }
 }
 
+/// The last component of a suggested name, with nothing forced onto it.
+///
+/// [`suggested_name`]'s sibling for a door that carries no format: it strips
+/// the directory part the same way and falls back the same way, and stops
+/// there because there is no extension this door could know to add.
+fn bare_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let base = base.trim_matches('.');
+    if base.is_empty() {
+        "output".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
 /// The shared tail of `send-frames` and `send-pcm`: hand the encoded bytes to
 /// the client without them ever having been a guest value.
 async fn stream_out(ctx: &mut ProcessCtx, bytes: Vec<u8>, name: String) -> Result<()> {
@@ -73,6 +88,22 @@ impl pie::inferlet::session::Host for ProcessCtx {
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
             server::send_file(client_id, process_id, data.into(), None)?;
+        }
+        Ok(())
+    }
+
+    /// `send-file`, but the blob arrives at the client under a name.
+    ///
+    /// Stripped to a bare name the way the frame doors strip theirs, so a
+    /// guest cannot name its output `../../etc/passwd`. No extension is
+    /// forced, which is the one place this differs from them: `send-frames`
+    /// knows the format it just encoded and `send-file-as` does not, so
+    /// whatever the guest says about the suffix stands.
+    async fn send_file_as(&mut self, data: Vec<u8>, name: String) -> Result<()> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let process_id = self.id();
+        if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
+            server::send_file(client_id, process_id, data.into(), Some(bare_name(&name)))?;
         }
         Ok(())
     }

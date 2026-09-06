@@ -135,7 +135,14 @@ fn write_snapshot(dir: &Path, dtype: &str) {
 // deletion: a backend that starts persisting a fusion again fails here and
 // says so, which is what the old assertion did in the other direction.
 
+// An engineless build refuses this import EARLIER, and for a different and
+// equally correct reason: it cannot say which setup to convert for, because
+// an artifact is a setup and the backend is stamped in it. That refusal has
+// its own sentence and is not what this claim is about, so the claim states
+// the build it needs rather than asserting one sentence against a binary
+// that can only produce the other.
 #[test]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan", feature = "wgpu"))]
 fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
     let staging = tempfile::tempdir().expect("staging");
     write_snapshot(staging.path(), "F32");

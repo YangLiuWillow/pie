@@ -136,7 +136,6 @@ pub struct Channel {
 /// embeds nothing, appends no KV, and advances no position.
 pub const TOKEN_PAD: i32 = -1;
 
-
 impl Channel {
     /// `Channel::new([shape], dtype)` at capacity 1.
     pub fn new(shape: impl IntoShape, dtype: Dtype) -> Channel {
@@ -258,6 +257,26 @@ impl Channel {
         self.dsl().note_host_take();
         let raw = self.wit().take().await;
         self.decode_host::<T>(raw, "take")
+    }
+
+    /// Take this channel's cell as a `frames` handle, WITHOUT the pixels
+    /// entering linear memory (design D8/D11). The VAE road: a `vae.decode`
+    /// pass's epilogue puts `intrinsics::pixels(rows, 3)` here, and this
+    /// hands the plane to the host's encoders — `[-1, 1]` f32, one row per
+    /// output voxel in `(t, h, w)` order, mapped to RGB8 with a clamp.
+    ///
+    /// Consumes the cell, exactly as [`take_host`](Self::take_host) does,
+    /// and waits on the fire that fills it the same way.
+    pub fn take_frames(
+        &self,
+        width: u32,
+        height: u32,
+        count: u32,
+        fps: f32,
+    ) -> Result<crate::pie::inferlet::frames::Frames, String> {
+        self.dsl().note_host_take();
+        crate::pie::inferlet::frames::Frames::from_channel(&self.wit(), width, height, count, fps)
+            .map_err(|why| format!("{}: {why}", self.host_label("take-frames")))
     }
 
     /// Peek a cell on the host (leaves it full). Same as
@@ -1018,7 +1037,6 @@ mod page_declaration_tests {
         let inclusive = PageDeclaration::from_range(2..=5).unwrap();
         assert_eq!((inclusive.start, inclusive.end), (2, Some(6)));
     }
-
 }
 
 impl<W: PassWit> Pass<W> {
@@ -1504,7 +1522,6 @@ pub fn channel_capacity() -> usize {
     (crate::model::channel_capacity() as usize).max(2)
 }
 
-
 /// Tokens per KV page (cached); prefer [`WorkingSet::page_size`] when a
 /// working set is in hand.
 pub fn kv_page_size() -> u32 {
@@ -1725,7 +1742,6 @@ pub mod shared_prelude {
     };
     /// Every inferlet returns `inferlet::Result` and uses `model`, so both ride the prelude.
     pub use crate::{Context, Result, model};
-    pub use std::ops::ControlFlow;
     /// Only `Stage`; dtypes are spelled `dtype::f32` and friends.
     pub use eta_dsl::Stage;
     pub use eta_dsl::dtype;
@@ -1740,6 +1756,7 @@ pub mod shared_prelude {
         scalar_gather, scatter_add, scatter_set, select, sign, sin, sink_window_mask,
         sliding_window_mask, softmax, sort_desc, sqrt, top_k, transpose,
     };
+    pub use std::ops::ControlFlow;
 }
 
 // ---------------------------------------------------------------------------
@@ -1974,7 +1991,9 @@ pub mod diffusion {
         pub use crate::eta::shared_prelude::*;
     }
 
-    use super::{Tensor, and, cast, cumsum, dtype, eq, iota, le, lt, reduce_sum, scatter_set, sort_desc};
+    use super::{
+        Tensor, and, cast, cumsum, dtype, eq, iota, le, lt, reduce_sum, scatter_set, sort_desc,
+    };
 
     /// The reference schedule: `t_min + (t_max - t_min) * remaining / max`,
     /// with `remaining` counting DOWN from `max` on the first step to 1 on
@@ -2048,4 +2067,3 @@ pub mod hybrid {
         pub use crate::eta::shared_prelude::*;
     }
 }
-

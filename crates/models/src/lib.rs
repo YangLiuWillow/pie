@@ -7,10 +7,12 @@ pub mod gemma_4_diffusion;
 pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
+pub mod hunyuan_image_3;
 pub mod kimi_k3;
 pub mod ltx_2;
 pub mod media;
 pub mod mini_dit;
+pub mod minimax_h3;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
@@ -147,10 +149,11 @@ impl ReadingFact {
     /// The port named `name`, with its index among ports of its kind —
     /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
     #[must_use]
-    /// The index is [`ports_indexed`](ReadingFact::ports_indexed)'s, so a
-    /// port that STATES its index (`PortFact::at`) resolves to that one and
-    /// not to its position among its kind.
     pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
+        // Through `ports_indexed`, so a port that STATES its index
+        // (`PortFact::at`) resolves to the index the trace reads it at and
+        // not to its position — the two differ exactly when two readings
+        // read one kind at different widths.
         self.ports_indexed().find(|(_, port)| port.name == name)
     }
 
@@ -321,6 +324,12 @@ pub struct ScheduleFact {
     /// A distilled model's pinned sigma list, descending, `1.0 -> 0.0`
     /// exclusive of the final zero; empty when the guest builds its own.
     pub pinned_sigmas: Vec<f32>,
+    /// The shift each STREAM's own grid is built at, for a family whose
+    /// modalities advance on different schedules inside one step (MiniMax
+    /// H3 runs video at 12 and audio at 3 in the same evaluation). Empty
+    /// when [`shift`](ScheduleFact::shift) serves every lane, which is
+    /// every other family; a stream absent from the list takes `shift`.
+    pub stream_shifts: Vec<(Stream, f32)>,
 }
 
 /// Which prediction target the schedule's velocity is.
@@ -404,6 +413,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         glm_5::skus(),
         glm_5_next::skus(),
         gpt_oss::skus(),
+        hunyuan_image_3::skus(),
         kimi_k3::skus(),
         qwen_3::skus(),
         qwen_4::skus(),
@@ -412,6 +422,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         z_image::skus(),
         wan_2::skus(),
         ltx_2::skus(),
+        minimax_h3::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

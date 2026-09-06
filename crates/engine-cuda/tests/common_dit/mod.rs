@@ -506,9 +506,31 @@ impl Rig {
     /// [`Rig::load`] over another plan traced under [`NAME`] (its weights
     /// drawn for it).
     pub fn load_plan(plan: Trace, weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
+        Rig::load_recording(
+            plan,
+            weights,
+            max_tokens,
+            buckets,
+            engine_cuda::Recording::default(),
+        )
+    }
+
+    /// [`Rig::load_plan`] with the recording knob stated. `Recording::Bodies
+    /// { mem_megabytes: 0 }` serves bodies but lets the arming pass arm none,
+    /// so every fire captures its own body and WALKS it — which is what a
+    /// flagship whose readings the arming pass cannot synthesize does, and
+    /// the only state in which a launch resolves its own boundary vector.
+    pub fn load_recording(
+        plan: Trace,
+        weights: &Weights,
+        max_tokens: u32,
+        buckets: Vec<u32>,
+        recording: engine_cuda::Recording,
+    ) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
-        let boot = engine_cuda::DeviceBoot::default();
+        let mut boot = engine_cuda::DeviceBoot::default();
+        boot.knobs.recording = recording;
         let mut engine =
             engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
         let loaded = engine

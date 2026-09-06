@@ -182,7 +182,11 @@ impl Shell {
                 |(_, plane)| plane,
             );
             let width = logits.width as usize;
-            let element = if logits.dtype == model_ir::Dtype::F32 { 4 } else { 2 };
+            let element = if logits.dtype == model_ir::Dtype::F32 {
+                4
+            } else {
+                2
+            };
             raw.clear();
             raw.resize(width * element, 0);
             let owned = readback.lane_rows[lane];

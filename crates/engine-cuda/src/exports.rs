@@ -18,6 +18,9 @@
 //!   PER REGION instead of per class: which regions hold nothing but ops that
 //!   address off the staged seat's start ([`crate::shifted`]), and can
 //!   therefore be replayed somewhere other than the fire's row zero.
+//! * [`regions_launching_schedules`] — which region LAUNCHES each attention
+//!   schedule, so a schedule is carved at the ceilings of the region that
+//!   reads it rather than the prepare region that built it.
 //! * [`regions_lane_shifting`] — the same reading one AXIS over
 //!   ([`crate::lane_shifted`]): which regions hold nothing but ops that find
 //!   their own LANE inside the fire, and can therefore be replayed somewhere
@@ -127,6 +130,18 @@ impl Exports {
             })
             .or_else(|| (self.pixels.len() == 1).then(|| &self.pixels[0]))
             .map(|(export, grid)| (export.value, *grid))
+    }
+
+    /// Every pixels planting's row width, in plan order — one per
+    /// `seam::PIXELS` the text plants. A planting whose width is symbolic
+    /// is skipped rather than guessed, so a plan of only symbolic pixel
+    /// widths reads as planting none.
+    pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
+        self.pixels.iter().filter_map(move |(export, _)| {
+            crate::store::kv::width_of(trace, export.value)
+                .ok()
+                .and_then(|width| u32::try_from(width).ok())
+        })
     }
 
     /// The seam a lane of `class` reads back from — the export its OWN arm
@@ -732,6 +747,17 @@ impl Feeds {
                     width: u32::from(axes),
                     dtype,
                 }),
+                // The voxel port (D8). It is a seat like any other for the
+                // purpose of "which class must feed this", but its rectangle
+                // is NOT in the inputs store: the payload lives in
+                // `voxels::Store`, below the fire's other inputs, so
+                // `seats()` keeps it out of the token-axis carve.
+                RuntimeInput::Voxels { port, channels } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::Voxels,
+                    port,
+                    width: channels,
+                    dtype,
+                }),
                 RuntimeInput::RowPermutation { select }
                 | RuntimeInput::Geometry {
                     kind:
@@ -829,8 +855,15 @@ impl Feeds {
 
     /// The port seats alone, in the store's order.
     #[must_use]
+    /// The port rectangles the INPUTS store carves — every seat but the
+    /// voxel one, whose payload the voxel store reserves at the ladder's
+    /// ceilings instead (design D8).
     pub(crate) fn seats(&self) -> Vec<crate::inputs::PortSeat> {
-        self.ports.iter().map(|(seat, _)| *seat).collect()
+        self.ports
+            .iter()
+            .map(|(seat, _)| *seat)
+            .filter(|seat| seat.kind != engine::fire::PortKind::Voxels)
+            .collect()
     }
 }
 
@@ -857,4 +890,76 @@ fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
         }
     }
     classes
+}
+
+/// **WHICH TEMPLATE REGION LAUNCHES EACH ATTENTION SCHEDULE** — one entry per
+/// `Trace::values` id, holding the region of the node that READS that
+/// schedule. `None` for a value no launch reads, and `None` again when two
+/// regions read one: nothing can then speak for both, and the caller carves
+/// nothing rather than carve at the wrong region's ceilings.
+///
+/// **THIS IS [`regions_shifting`]'S CONSUMER SIDE, AND IT EXISTS BECAUSE THE
+/// TWO REGIONS ARE NEVER THE SAME ONE.** A schedule is BUILT in a
+/// `Phase::Prepare` region — a region holds one phase, so a planner op never
+/// shares a region with the launch that reads it — and such a region holds
+/// nothing but [`crate::PLANNED`] ops, so [`regions_shifting`] reads it as
+/// shifting for free: it names no kernel that could address the wrong row.
+/// The region that LAUNCHES the schedule answers for itself, and a trunk
+/// region carrying one `linear.matmul` (`Reads::Nothing`) does not shift.
+///
+/// So the ceilings a schedule is carved at — how many requests it names, and
+/// which lane it counts them from — must be the LAUNCHER's and not the
+/// builder's. It is the launch that is handed a boundary vector, and
+/// `Run::ragged_q` picks that vector off the launcher's own standing:
+/// carving at the builder's ceiling hands a 32-request schedule a one-lane
+/// vector, which `kernels_cuda::attn`'s `lanes_carry` refuses by name.
+///
+/// `model_exec::store::check::no_schedule_straddles_its_readers` pins the two
+/// regions to one MASK, so they see one window and one span; it does not pin
+/// them to one region, and the `shifted`/`lane_shifted` bits are per region.
+#[must_use]
+pub(crate) fn regions_launching_schedules(
+    trace: &Trace,
+    compiled: &CompiledModel,
+) -> Vec<Option<u32>> {
+    let mut out: Vec<Option<u32>> = vec![None; trace.values.len()];
+    let mut claimed: Vec<bool> = vec![false; trace.values.len()];
+    let mut inputs: Vec<ValueId> = Vec::new();
+    for (at, region) in compiled.template().iter().enumerate() {
+        let here = u32::try_from(at).unwrap_or(u32::MAX);
+        for node in region.nodes.clone() {
+            let Some(node) = trace.nodes.get(node as usize) else {
+                continue;
+            };
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            for id in &inputs {
+                let at = id.0 as usize;
+                // A host struct is the only thing a plan op defines and the
+                // only thing a launch reads it as; a rectangle operand says
+                // nothing about schedules.
+                if !trace
+                    .values
+                    .get(at)
+                    .is_some_and(|decl| matches!(decl.ty, model_ir::Ty::Struct(_)))
+                {
+                    continue;
+                }
+                let Some(slot) = out.get_mut(at) else {
+                    continue;
+                };
+                if claimed[at] {
+                    // A second region reading one schedule: neither can speak
+                    // for the other, so nobody does.
+                    if *slot != Some(here) {
+                        *slot = None;
+                    }
+                } else {
+                    claimed[at] = true;
+                    *slot = Some(here);
+                }
+            }
+        }
+    }
+    out
 }

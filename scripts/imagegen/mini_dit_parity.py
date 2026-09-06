@@ -32,7 +32,9 @@ each on ITS OWN pipeline: the scheduler seals a frame from every live
 pipeline and never seats two passes of one pipeline in one step, so three
 passes down one pipeline would be three fires, each lane attending alone.
 The runtime holds a fresh group's first frame for its cohort (`FireRequest::
-cohort`), so the three seal together from the first step.
+cohort`), so the three seal together from the first step -- and keeps holding
+it: a stated cohort is sealed whole or the request dies by name, never as a
+fire over whichever lanes were quick enough.
 
 BISECTION
 ---------

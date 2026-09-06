@@ -17,7 +17,7 @@
 //! SDK's one-token-per-lane lowering is the standing example), so batch
 //! assembly is a concatenation rather than several simultaneous CSR merges.
 
-use engine::fire::{Step, KvDelta, Lane};
+use engine::fire::{KvDelta, Lane, Step};
 use eta_ir::registry::GeometryClass;
 
 use crate::engine::completion::TerminalCell;
@@ -47,6 +47,13 @@ pub struct FireRequest {
     /// Defaults to `false`. Which boundary it runs at is not a field —
     /// `batch` always stamps [`Boundary::Epilogue`](engine::fire::Boundary::Epilogue).
     pub boundary_program: bool,
+    /// The VAE clips this request's pass submitted on the voxel axis
+    /// (design D8), keyed by lane; empty for every request with no tile.
+    /// `payload` is empty: a runtime pass feeds its voxel port from a
+    /// CHANNEL (`PortKind::Voxels` in `Lane::ports`), so what travels here
+    /// is the clip's box alone — the geometry a channel cell cannot carry.
+    /// Rebased on concatenation like [`media`](FireRequest::media).
+    pub voxels: Vec<engine::fire::StepVoxels>,
     /// The media spans this request's pass attached, keyed by lane; empty
     /// for every text-only request. `lane` indexes this request's own
     /// [`lanes`](FireRequest::lanes) (a submission can't know which step it
@@ -56,9 +63,14 @@ pub struct FireRequest {
     /// request's process name the group its lanes join, this one included.
     /// A group composes only when its passes are members of ONE step, and
     /// the wait-all gate cannot await a pipeline it has never seen — so the
-    /// scheduler holds the seal, leashed by the submit deadline, until this
+    /// scheduler holds this request's lanes out of every seal until this
     /// many lanes of the group have arrived for their first frame. `None`
     /// for a pass in no group.
+    ///
+    /// A stated cohort is a PROMISE: the runtime fires the group whole or
+    /// not at all, and a cohort that never completes ends the process with a
+    /// named error rather than a fire over whoever showed up. State it only
+    /// for passes that will really submit.
     pub cohort: Option<u32>,
 }
 
@@ -86,7 +98,9 @@ impl FireRequest {
 
     /// Every page id its lanes name.
     pub fn pages(&self) -> impl Iterator<Item = u32> + '_ {
-        self.lanes.iter().flat_map(|lane| lane.kv.pages.iter().copied())
+        self.lanes
+            .iter()
+            .flat_map(|lane| lane.kv.pages.iter().copied())
     }
 
     /// The first lane, for the single-lane requests that are almost all of

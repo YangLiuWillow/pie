@@ -35,7 +35,11 @@ const PINNED: &[(&str, u16, u64)] = &[
     // spliced runtimes (`fused_block0.cuh`, `ptir_m1_runtime_body.cuh`)
     // gained arms -- which moves every emitted kernel's bytes, not only
     // those of a program using them.
-    ("cuda", 37, 0x4ec5_db32_5486_dbb8),
+    // 37 -> 38: `IntrinsicId::Pixels` joined the intrinsic set (design D8),
+    // and the emitted preamble's per-intrinsic side tables are pitched by
+    // `IntrinsicId::SLOTS` -- so every emitted kernel's bytes move, not only
+    // those of a program that reads the new one.
+    ("cuda", 38, 0xeed7_a136_c421_b1fa),
     // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and

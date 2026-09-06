@@ -1,0 +1,472 @@
+---
+title: Generating images
+description: Import a generative model, run the text-to-image inferlet, and save what comes back
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Generating images
+
+Pie serves diffusion models the same way it serves language models: the engine
+owns the weights and the traced forward passes, and an inferlet owns the
+algorithm. For a text-to-image model the algorithm is a sampler, so the guest
+is the thing that decides the schedule, seeds the latent, and steps it. This
+page walks the whole path: import a model, look at what it can do, run the
+`text-to-image` inferlet, and save the file it sends back.
+
+Read this after [Loading and selecting models](./loading). It assumes you have
+a CUDA build of `pie` and a GPU with room for the model.
+
+The generative support is new and the surfaces on this page move. Where a step
+is not finished, this page says so.
+
+## Import a model
+
+`pie model import` fetches a checkpoint and converts it into the `.zt` artifact
+the engine serves. A diffusers pipeline works the same way a language model
+does: name the repository, and name the catalog row to import it as.
+
+```bash
+pie model import black-forest-labs/FLUX.2-klein-4B --sku flux2-klein-4b-bf16-kv-bf16
+```
+
+`--sku '?'` lists every row the build ships. The generative rows are the ones
+whose names are a family plus a size: `flux2-klein-4b`, `z-image-turbo`,
+`wan2.2-ti2v-5b`.
+
+An import writes into `$PIE_HOME/models/<name>/archive.zt`. Point a config at
+it and set two engine keys:
+
+```toml
+[model]
+model = "flux2-klein-4b"
+
+[engine]
+type = "cuda_native"
+device = ["cuda:0"]
+graphs = "on"
+# A 1024x1024 job is 4096 latent rows per lane, and the frame carries two
+# fires' worth. The 4096 default refuses the second fire by name.
+max_model_len = 32768
+```
+
+## See what the row can do
+
+`pie model list` reports one extra line for a generative row. Everything on it
+comes from the catalog, so the listing opens no tensors:
+
+```console
+$ pie model list
+Artifacts (~/.pie/models):
+    flux2-klein-4b  13.2GiB  694 tensors  flux2-klein-4b-bf16-kv-bf16 · cuda  ← black-forest-labs/FLUX.2-klein-4B
+      generative           text-to-image  4 readings · latent 128 ch, patch 1x1, /16 px · flow, shift 9.89, 4 pinned sigmas
+```
+
+`text-to-image` in the third column means the row has both readings a prompt
+needs: one that takes tokens and hands back hidden rows, and one that takes no
+tokens and predicts a velocity. A row with only a denoiser (a fixture with no
+text encoder, for instance) has no way to be told what to draw, and the guest
+refuses it by name rather than drawing something arbitrary.
+
+`pie model info` prints the rest:
+
+```console
+$ pie model info flux2-klein-4b
+flux2-klein-4b
+    sku         flux2-klein-4b-bf16-kv-bf16
+    backend     cuda
+    size        13.2GiB
+    tensors     694
+    ...
+
+Generative
+    latent           128 ch, patch 1x1, /16 px (one row is 16x16 pixels)
+    schedule         flow, shift 9.89, 4 pinned sigmas
+    sigmas           1.0000, 0.9674, 0.9081, 0.7672
+    train steps      1000
+    max latent rows  20992
+
+Readings
+  text        #0  tokens + kv       -> hidden 3072
+  denoise     #1  no tokens, no kv  -> velocity 128
+                                    <- latents[128], context[3072], timestep[1], positions[4]
+  vae.decode  #2  no tokens, no kv  -> pixels 3
+                                    <- latent[128]
+  vae.encode  #3  no tokens, no kv  -> pixels 128
+                                    <- pixels[3]
+```
+
+Three numbers on that screen decide what you can ask for.
+
+- **One row is 16x16 pixels.** A requested width and height round down to a
+  multiple of it. 1024 is legal, 1000 is not and becomes 992.
+- **Four pinned sigmas.** This row is distilled onto that trajectory, so four
+  steps is its default and not a preference.
+- **20992 max latent rows.** A 1024x1024 job is 4096 rows, so it fits with
+  room to spare. `2048x2048` is 16384 and also fits; `4096x4096` does not.
+
+Add `--json` to either command to get the same facts as a document.
+
+## Run it
+
+```bash
+pie run text-to-image -o ./out -- \
+    --prompt "a red bicycle leaning on a blue wall" \
+    --width 1024 --height 1024 --steps 4 --seed 0 --out image
+```
+
+`pie run` boots a one-shot engine, runs the inferlet, prints what it produces,
+and exits. Everything after `--` belongs to the inferlet: `--prompt hi` arrives
+as `{"prompt": "hi"}`. `-o DIR` is `pie run`'s own flag and says where to write
+the files the inferlet sends.
+
+The bare name `text-to-image` resolves in three places, in order: the
+`tests/inferlets` directory of the checkout you are standing in, the local
+cache, then the registry. The first is what makes this line work in a source
+tree with no path in it. Build the guest once:
+
+```bash
+cd tests/inferlets && cargo build -p text-to-image --release --target wasm32-wasip2
+```
+
+If you have not, `pie run` says so and prints that line. To run a guest of your
+own from anywhere, pass its build and its manifest instead:
+
+```bash
+pie run --path ./target/wasm32-wasip2/release/my_guest.wasm --manifest ./Pie.toml -- --prompt "..."
+```
+
+The run prints a header, the file it wrote, and the inferlet's report:
+
+```console
+Running text-to-image@0.1.0 on default
+  from tests/inferlets/target/wasm32-wasip2/release/text_to_image.wasm
+
+[wrote ./out/image.latent.f32 (2097152 bytes)]
+{"model":"default","architecture":"flux_2","reading":"denoise","width":1024,"height":1024,
+ "grid_h":64,"grid_w":64,"rows":4096,"row_width":128,"steps":4,"seed":0,
+ "sigmas":[1.0,0.967384,0.90814394,0.7672,0.0],"context_rows":20,
+ "decoded":false,"decode_reading":"vae.decode","file":"image.latent.f32","bytes":2097152,
+ "non_finite":0,"mean":0.1292766,"std":1.0496714}
+```
+
+## What comes back
+
+Pixels never enter the guest's memory. A `vae.decode` reading lands its output
+on the `pixels` seam; the pass's epilogue reads that seam with
+`intrinsics::pixels()` and puts it on a channel; `Channel::take_frames` turns
+that channel's cell into a host-held `frames` handle without lifting it into
+linear memory; and `session.send-frames` encodes it and streams the bytes to
+the client. The client receives a file with the name the inferlet suggested,
+and `pie run -o DIR` writes it there under that name. On a row that takes this
+exit the file is `image.png`, the report says `"decoded": true`, and there is
+nothing left to do.
+
+Which exit a model gets is its own fact. A model whose VAE is traced but not
+declared as a reading takes the other one, and FLUX.2 is such a model today:
+its decoder's mid-block attention has no kernel arm, so its pixels would not be
+the reference implementation's. The guest then sends the final latent as raw
+little-endian f32 through `session.send-file-as`, under a name that says what
+it is, and returns the geometry a decoder needs as its JSON report. Write the
+report beside the latent and finish the job with the checkpoint's own VAE:
+
+```bash
+python scripts/imagegen/decode_latent.py \
+    --latent ./out/image.latent.f32 \
+    --sidecar ./out/image.json \
+    --model-dir ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/ \
+    --out ./out/image.png
+```
+
+```console
+latent  64x64x128  mean +0.1293  std 1.0498
+prompt  'a red bicycle leaning on a blue wall'  steps 4  seed 0
+wrote   ./out/image.png  1024x1024
+```
+
+`decode_latent.py` is family-aware where the guest is not: the sidecar carries
+the geometry, and the VAE's own normalization is the decode arm's business, so
+the script reads `--family`. When FLUX.2's decoder gains its kernel arm the run
+sends `image.png` directly and this step goes away.
+
+## Inside the inferlet
+
+`tests/inferlets/text-to-image/src/lib.rs` names no model family. It asks the
+bound model four questions and builds the job out of the answers. This section
+quotes the parts worth copying into a guest of your own.
+
+### It finds its readings by role
+
+A generative model declares several *readings*: guarded arms of one traced
+graph, selected per lane. The guest picks the two it needs by what they do, not
+by what they are called.
+
+```rust
+let text = readings
+    .iter()
+    .find(|r| r.takes_tokens && r.readout == model::ReadoutKind::Hidden)
+    .cloned()
+    .ok_or("this model has no text reading")?;
+let denoise = readings
+    .iter()
+    .find(|r| !r.takes_tokens && r.readout == model::ReadoutKind::Velocity)
+    .cloned()
+    .ok_or(
+        "this model declares no token-less reading with a velocity readout, so nothing \
+            here denoises",
+    )?;
+```
+
+The refusals are part of the contract. Point this guest at a model with no text
+encoder and it says `this model has no text reading` and stops.
+
+### It sizes the latent from a fact
+
+`model::latent()` states what one latent row is in VAE terms. The pixel size
+rounds to it:
+
+```rust
+let space = model::latent().ok_or(
+    "this model states no latent space, so its denoise reading cannot be sized from pixels",
+)?;
+let cell_h = space.spatial_compression.max(1) * space.patch_h.max(1);
+let cell_w = space.spatial_compression.max(1) * space.patch_w.max(1);
+let height = (input.height.unwrap_or(1024) / cell_h).max(1) * cell_h;
+let width = (input.width.unwrap_or(1024) / cell_w).max(1) * cell_w;
+let grid_h = height / cell_h;
+let grid_w = width / cell_w;
+let rows = grid_h * grid_w;
+```
+
+### It takes the schedule from the model
+
+A distilled row carries the trajectory it was distilled onto. Its length is the
+step count, so `--steps` has a default the model chose:
+
+```rust
+let fact = model::schedule().ok_or("this model states no schedule; nothing here denoises")?;
+let steps = match input.steps.filter(|s| *s > 0) {
+    Some(steps) => steps,
+    None if !fact.pinned_sigmas.is_empty() => {
+        u32::try_from(fact.pinned_sigmas.len()).unwrap_or(8)
+    }
+    None => 8,
+};
+let sched = FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?;
+```
+
+### It binds ports by kind
+
+A denoise reading declares float input ports. The guest walks them and binds a
+channel to each, choosing by `PortKind` rather than by name:
+
+```rust
+for port in &reading.ports {
+    let ch = match port.kind {
+        model::PortKind::Latents if !latents_bound && latents.is_some() => {
+            latents_bound = true;
+            latents.unwrap().clone()
+        }
+        model::PortKind::Context if !context_bound && context.is_some() => {
+            context_bound = true;
+            context.unwrap().clone()
+        }
+        model::PortKind::AxisPositions => {
+            Channel::from_shaped([rows, port.width], positions.to_vec()).named(&name)
+        }
+        model::PortKind::LaneVector if port.name == ports.timestep && !timestep_bound => {
+            timestep_bound = true;
+            clock.timestep.clone()
+        }
+        // elided: the guidance port, the unused-port zero fill, and the
+        // refusal for a voxel port. See the file.
+    };
+    pass.input(&port.name, &ch)?;
+}
+```
+
+Where a lane's rows sit in the rotary space is a family contract, and families
+disagree about it. FLUX.2 puts the image grid at `(0, h, w, 0)` and text row
+`j` at `(0, 0, 0, j)`; Z-Image puts the caption first and the image behind it.
+The reading states the convention (`ReadingFact::positions`) and
+`latent::positions_for` fills either grid from the same code.
+
+### The sampler is an epilogue
+
+The step rule runs on the device, at the tail of the same fire that produced
+the velocity. Nothing crosses into WebAssembly except a handle.
+
+```rust
+image_clock.drive(&image_lane.pass, move |k| {
+    seed_or_step(
+        k,
+        &x,
+        &intrinsics::velocity(velocity_width),
+        &dts,
+        &rng,
+        shape,
+        Some(&readback),
+    );
+});
+```
+
+`seed_or_step` is one Euler integration with the seed folded into it: fire 0
+draws the latent from a keyed normal on the device, and every later fire
+advances `x <- x + (sigma' - sigma) * v`.
+
+```rust
+pub fn seed_or_step(
+    k: &Tensor, x: &Channel, velocity: &Tensor, dts: &Channel,
+    rng: &Channel, shape: [u32; 2], out: Option<&Channel>,
+) {
+    let current = x.take();
+    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
+    let state = rng.take();
+    let fresh = noise(shape, &state);
+    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
+    let next = select(&first, &fresh, &stepped);
+    x.put(&next);
+    if let Some(out) = out {
+        out.put(&next);
+    }
+    rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+```
+
+The latent is 2 MB at 1024x1024. It stays on the device for the whole loop.
+
+## What the model answers
+
+These are the functions the `model` interface adds for a generative row. A
+guest that reads them is a guest for every family that answers them.
+
+| Function | Answer |
+| --- | --- |
+| `readings()` | Every reading, in index order: its name, whether it has a KV space, whether it takes tokens, its float input ports, the streams its lanes carry, where its rows sit in the rotary space, and which seam its epilogue reads. |
+| `latent()` | The latent space: VAE channels, patch extents, spatial and temporal compression. `None` for a row with no denoiser. |
+| `schedule()` | The trained schedule: flow, epsilon or v-prediction; the timestep shift; the training step count; the handover sigma for a two-backbone family; the pinned sigma list for a distilled one. |
+| `max_latent_rows()` | The most latent rows one pass may carry. `0` for a row with no float lane. |
+
+One reading carries these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | What `forward-pass.reading` takes. `"text"`, `"denoise"`, `"denoise.low"`, `"vae.decode"`. |
+| `index` | The arm's fact value. Position in the list agrees with it. |
+| `has_kv` | `attention(kv, geom)` is required on its pass. A DiT's denoise reading declares none and refuses one. |
+| `takes_tokens` | `embed(tokens, indptr)` is required. When false the lane's row count comes from the latents port. |
+| `streams` | Which lane streams a request submits, one pass each, all in one attention group. |
+| `ports` | The float input ports: name, kind, row width, and which streams carry them. |
+| `positions` | The rotary convention: one role per axis, which axis a text lane numbers its rows on, its origin, and whether the image follows the caption. `None` when the layout does not fit that shape. |
+| `readout` | Which seam the epilogue reads: `logits`, `velocity`, `hidden` or `pixels`. |
+| `readout_width` | That row's width: the vocabulary for logits, the latent width for a velocity. |
+
+## From a client library
+
+`pie run` is one client. Any of the three client libraries can launch the same
+inferlet against a serving pie and save what it sends. The file event carries
+the name the inferlet suggested; sanitize it before joining it to a directory,
+because it came off the wire.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use client::client::{Client, ProcessEvent};
+
+let client = Client::connect_with_identity("ws://127.0.0.1:8231/v1/ws", "example").await?;
+client.authenticate("example", &None).await?;
+let mut process = client
+    .launch_process(
+        "text-to-image@0.1.0".to_string(),
+        r#"{"prompt":"a red bicycle leaning on a blue wall","steps":4,"out":"image"}"#.to_string(),
+        true,
+    )
+    .await?;
+
+loop {
+    match process.recv().await? {
+        ProcessEvent::File(file) => {
+            // `file_name` sanitizes what came off the wire: a suggested name
+            // is not a path this program has to trust.
+            let name = file.file_name("output.bin");
+            std::fs::write(format!("./out/{name}"), &file.data)?;
+            println!("wrote {name} ({} bytes)", file.data.len());
+        }
+        ProcessEvent::Return(report) => {
+            println!("{report}");
+            break;
+        }
+        ProcessEvent::Error(message) => {
+            eprintln!("the inferlet failed: {message}");
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from pie_client import Event, PieClient
+
+async with PieClient("ws://127.0.0.1:8231/v1/ws") as client:
+    await client.authenticate("example")
+    process = await client.launch_process(
+        "text-to-image@0.1.0",
+        {"prompt": "a red bicycle leaning on a blue wall", "steps": 4, "out": "image"},
+    )
+    while True:
+        event, value = await process.recv()
+        if event is Event.File:
+            # `value` is a ReceivedFile: bytes, with `.name` beside them.
+            path = value.save("./out", fallback="output.bin")
+            print(f"wrote {path} ({len(value):,} bytes)")
+        elif event in (Event.Return, Event.Error):
+            break
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import fs from 'node:fs';
+import path from 'node:path';
+import { PieClient } from '@pie-project/client';
+
+const client = new PieClient('ws://127.0.0.1:8231/v1/ws');
+await client.connect();
+const proc = await client.launchProcess('text-to-image@0.1.0', {
+    prompt: 'a red bicycle leaning on a blue wall', steps: 4, out: 'image',
+});
+
+for (;;) {
+    const { event, value } = await proc.recv();
+    if (event === 'file') {
+        // `value` is a ReceivedFile: a Buffer, with `.name` beside it.
+        const file = path.join('./out', value.fileName('output.bin'));
+        fs.writeFileSync(file, value);
+        console.log(`wrote ${file} (${value.length} bytes)`);
+    } else if (event === 'return' || event === 'error') {
+        break;
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+The full programs are `sdk/client/python/examples/text_to_image.py` and
+`sdk/client/javascript/examples/text-to-image.mjs`.
+
+## Next steps
+
+- [Loading and selecting models](./loading) covers binding to a model from
+  inside an inferlet.
+- [Multimodal input](./multimodal) is the other direction: images and audio
+  going in rather than coming out.
+- [Running an inferlet](../tutorial/run) covers `pie run` in general.

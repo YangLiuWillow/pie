@@ -660,3 +660,24 @@ def test_latent_step_matches_rust():
     out.note_host_take()
     norm_out.note_host_take()
     check("latent_step", b.build())
+
+
+def test_vae_readback_matches_rust():
+    """`sdk_goldens.rs::vae_readback` — a VAE reading's epilogue (design D8):
+    the one golden that carries `Intrinsic.PIXELS`, so a port that drifts on
+    the new intrinsic's wire id fails here. The rows are declared, not
+    hinted: a VAE lane's token rows are not its clip's voxels."""
+    rows, rgb = 16, 3
+    out = ch_new([rows, rgb], dtype.f32, "pixels_out")
+
+    b = Builder(VOCAB, PAGE)
+
+    def epilogue():
+        px = intrinsics.pixels(rows, rgb)
+        shifted = add(px, 1.0)
+        unit = mul(shifted, 0.5)
+        out.put_tensor(unit)
+
+    b.stage(Stage.EPILOGUE, epilogue)
+    out.note_host_take()
+    check("vae_readback", b.build())

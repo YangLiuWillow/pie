@@ -274,13 +274,16 @@ impl Model {
                 // The distilled row shifts nothing: its sigmas are pinned.
                 // (The dev row's resolution-dependent `mu` — base 0.95 at
                 // 1024 tokens, max 2.05 at 4096 — is a second checkpoint's,
-                // not this one's.) The audio stream runs the SAME list on
-                // its own scheduler cursor, so one `pinned_sigmas` states
-                // both and `ScheduleFact` needs no per-stream field.
+                // not this one's.)
                 shift: 1.0,
                 train_steps: TRAIN_STEPS,
                 boundary: None,
                 pinned_sigmas: DISTILLED_SIGMAS.to_vec(),
+                // The audio stream keeps its OWN scheduler cursor and runs
+                // the same eight sigmas on it (`denoising.py:1584` clones
+                // the scheduler), so one list states both and no stream
+                // takes a shift of its own.
+                stream_shifts: Vec::new(),
             }),
             // 960x544x121 is 8160 video + 126 audio + two 1024-row contexts;
             // 1920x1088 is 32640 video. The miniature's job is far smaller,

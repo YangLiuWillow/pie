@@ -64,6 +64,14 @@ def velocity(width: int) -> Tensor:
     return intrinsic_val(Intrinsic.VELOCITY, shape_of([rows, max(width, 1)]), activation_type)
 
 
+def pixels(rows: int, width: int) -> Tensor:
+    """The pixels a VAE reading lands (design D8), `[rows, width]` F32 at the
+    epilogue: one row per OUTPUT voxel of the lane's clip. `rows` is declared
+    (a VAE lane has no token rows to derive it from); `width` is checked at
+    bind against the model's `pixels_width` when it states one."""
+    return intrinsic_val(Intrinsic.PIXELS, shape_of([max(rows, 1), max(width, 1)]), activation_type)
+
+
 def query(width: int) -> Tensor:
     """This layer's projected query (attn taps), `[width]`."""
     return intrinsic_val(Intrinsic.QUERY, shape_of([max(width, 1)]), activation_type)

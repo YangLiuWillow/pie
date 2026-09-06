@@ -235,12 +235,17 @@ __global__ void split_rows_vec8(
     const u32* __restrict__ win)
 {
     constexpr int VEC = 8;
-    const int n = blockIdx.y;
+    // Rows on `grid.x`, column tiles on `grid.y`: `gridDim.y` is capped at
+    // 65535 by every compute capability, and a 64k-row fire is a real
+    // composition (a 65536-token ceiling, a VAE's voxel rectangle), so the
+    // unbounded axis carries the rows. `grid.x` stays affine in rows, which
+    // is what the rebind laws fit.
+    const int n = blockIdx.x;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total = left_dim + right_dim;
-    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+    const int i = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
     if (i >= total) return;
     const uint4 v = *reinterpret_cast<const uint4*>(src + (long long)plane_row * total + i);
     if (i < left_dim) {

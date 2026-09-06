@@ -238,11 +238,21 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
         assert_eq!(sinusoids, want, "{sku}");
     }
 
-    // The flagship's readings are `text` then `denoise`, dense from 0, and
-    // its voxel arm is traced but not a reading a guest can name.
+    // The flagship's readings are `text`, `denoise` and the two voxel
+    // arms, dense from 0 (the VAE pair is
+    // `tests/the_flux_2_vae_bakes.rs`'s claim; here only its place in the
+    // order).
     let klein = row(KLEIN).generative.as_ref().unwrap();
     let names: Vec<(&str, u8)> = klein.readings.iter().map(|r| (r.name, r.index)).collect();
-    assert_eq!(names, vec![("text", 0), ("denoise", 1)]);
+    assert_eq!(
+        names,
+        vec![
+            ("text", 0),
+            ("denoise", 1),
+            ("vae.decode", 2),
+            ("vae.encode", 3)
+        ]
+    );
     let text = &klein.readings[0];
     assert!(text.has_kv && text.takes_tokens && text.ports.is_empty());
     assert_eq!(text.readout, ReadoutKind::Hidden);
@@ -290,11 +300,19 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
         );
     }
     let mini = models::flux_2::model::Model::mini(Dtype::Bf16, 1).readings();
-    assert_eq!((mini.text, mini.denoise, mini.vae_decode), (None, 0, None));
+    assert_eq!(
+        (mini.text, mini.denoise, mini.vae_decode, mini.vae_encode),
+        (None, 0, None, None)
+    );
     let klein = models::flux_2::model::Model::klein_4b(Dtype::Bf16, 1).readings();
     assert_eq!(
-        (klein.text, klein.denoise, klein.vae_decode),
-        (Some(0), 1, Some(2))
+        (
+            klein.text,
+            klein.denoise,
+            klein.vae_decode,
+            klein.vae_encode
+        ),
+        (Some(0), 1, Some(2), Some(3))
     );
 }
 

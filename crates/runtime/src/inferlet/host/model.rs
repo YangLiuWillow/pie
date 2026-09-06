@@ -190,6 +190,14 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 train_steps: s.train_steps,
                 boundary: s.boundary,
                 pinned_sigmas: s.pinned_sigmas.clone(),
+                stream_shifts: s
+                    .stream_shifts
+                    .iter()
+                    .map(|&(stream, shift)| pie::inferlet::model::StreamShift {
+                        lane: lane_stream(stream),
+                        shift,
+                    })
+                    .collect(),
             }))
     }
 
