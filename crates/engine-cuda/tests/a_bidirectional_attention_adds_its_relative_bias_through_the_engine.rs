@@ -19,15 +19,13 @@
 //! device is present.
 //!
 //! The first test loads with `Graphs::Shaped` — eager, on graph-shaped
-//! schedules — and passes. The second is the same fire under the load's
-//! default knobs (bodies armed at load and replayed), and is IGNORED: on
-//! `dev` a single-class plan of this shape replayed from the bucket-64 body
-//! lands fire rows 16..32 wrong (a band the size of the smallest bucket;
-//! the same rows go wrong under `RaggedMask::None`, and eager / shaped
-//! schedules agree with the host on every split), which is a defect of the
-//! replay path in `engine-cuda/src/serve`, not of the bias arm. It is left
-//! here, named, for the arming golden to be turned on once that path is
-//! fixed.
+//! schedules. The second is the same fire under the load's default knobs
+//! (bodies armed at load and replayed from the bucket-64 body): a kv-less
+//! plan's per-lane tables (the packing CSRs, the group and slot ids) are
+//! staged at the body's lane ceiling, padded with empty segments, rather
+//! than at the fire's own lane count — a shorter staging left the tail as
+//! the last arming fire's bounds, which the replayed ragged kernel read as
+//! live groups over rows 16..32.
 
 #![cfg(feature = "cuda")]
 
@@ -96,7 +94,6 @@ fn three_lanes_of_unequal_length_land_the_host_reference() {
 }
 
 #[test]
-#[ignore = "dev's body replay lands fire rows 16..32 of this single-class plan wrong (also under RaggedMask::None); eager and shaped schedules agree with the host — a serve-path defect, see the file doc"]
 fn the_same_fire_lands_the_host_reference_from_an_armed_body() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");

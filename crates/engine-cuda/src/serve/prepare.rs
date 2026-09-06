@@ -1438,6 +1438,7 @@ impl FrameShell for Shell {
                 // How far this fire's own rows go before the bucket's
                 // padding starts.
                 live_rows: rows,
+                lane_reach: lane_carve,
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
