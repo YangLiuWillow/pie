@@ -70,7 +70,31 @@ pub fn estimate(
     }
 
     // Otherwise, the smallest chunk whose work items still fit the grid.
-    let mut low = (128 / req.page_size).max(1);
+    //
+    // **THE FLOOR IS ONE PAGE, NOT FLASHINFER'S `128 / page_size`.** That
+    // reference floor keeps a chunk at least 128 tokens wide, which at a
+    // low lane count collapses a whole decode into ONE work item — one block
+    // per kv head carrying the entire attention, at 128 threads, latency
+    // bound with nothing to hide it. The search below is already bounded by
+    // the grid (it raises the chunk until the work items fit), so the floor
+    // only decides how much of a granted grid a small batch is allowed to
+    // use. Measured single-stream at a 512-token context: gemma-4-E4B tp2
+    // 91.7 -> 96.2 tok/s (+4.9%, three runs each, <0.2% spread), tp1 +3.5%,
+    // qwen3.5-0.8b tp1 +2.3%; batch-32 throughput unchanged (that shape
+    // already fills the grid). The decode kernel itself goes 14.5 -> 5.5 us
+    // per call; the extra partials cost ~0.01 ms/step more in the merge.
+    //
+    // **THIS CHANGES TOKENS AT NEAR-TIES.** A different chunking is a
+    // different float reduction order, so the merged logits differ in the
+    // last bits: gemma stayed byte-identical over 64 tokens, qwen3.5
+    // diverged at token 15. Both splits are valid attention — but a golden
+    // recorded against the old floor will not replay. `PIE_DECODE_LEGACY_FLOOR`
+    // restores it for exactly that comparison.
+    let mut low = if std::env::var_os("PIE_DECODE_LEGACY_FLOOR").is_some() {
+        (128 / req.page_size).max(1)
+    } else {
+        1
+    };
     let mut high = pages.iter().copied().max().unwrap_or(0);
     while low < high {
         let mid = u32::midpoint(low, high);
