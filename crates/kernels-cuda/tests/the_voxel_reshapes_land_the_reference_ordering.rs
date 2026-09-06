@@ -50,6 +50,7 @@ fn pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example() {
         Tensor::new(x_at, rows as u32, 4, Dtype::Bf16),
         Tensor::new(grid_at, 1, 4, Dtype::I32),
         [1, 2, 2],
+        0,
         &mut o,
         Tensor::new(o_grid_at, 1, 4, Dtype::I32),
     )
@@ -91,7 +92,7 @@ fn pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference() {
     let g = Tensor::new(grid_at, 2, 4, Dtype::I32);
     let og = Tensor::new(o_grid_at, 2, 4, Dtype::I32);
     let mut up = Tensor::new(up_at, rows_up as u32, c as u32, Dtype::Bf16);
-    pixel_shuffle(&ctx, x_t, g, R, &mut up, og).expect("the shuffle fires");
+    pixel_shuffle(&ctx, x_t, g, R, 0, &mut up, og).expect("the shuffle fires");
     let mut back = Tensor::new(back_at, rows as u32, (c * vol) as u32, Dtype::Bf16);
     pixel_unshuffle(&ctx, up, og, R, &mut back, g).expect("the unshuffle fires");
     gpu.sync();

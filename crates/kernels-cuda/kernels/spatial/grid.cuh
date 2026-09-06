@@ -40,6 +40,28 @@ __device__ __forceinline__ int lane_of(const int* __restrict__ grid, int lanes, 
     return -1;
 }
 
+/// The row range `[begin, end)` of the ATTENTION BLOCK a query row sits
+/// in. `seg_frames` is `0` for one block per lane (the image VAEs' mid
+/// block) and `n > 0` for one block per run of `n` frames inside the lane
+/// (Wan 2.2's mid block attends one frame at a time, `n = 1`); a lane whose
+/// frame count is not a multiple leaves a short run at the end. `local` is
+/// the row's offset inside the lane.
+__device__ __forceinline__ void segment_of(
+    const Lane& g, int local, int seg_frames, int& begin, int& end)
+{
+    if (seg_frames <= 0) {
+        begin = g.off;
+        end = g.off + g.voxels();
+        return;
+    }
+    const int plane = g.plane();
+    const int frame = plane > 0 ? local / plane : 0;
+    const int first = frame / seg_frames * seg_frames;
+    const int last = min(first + seg_frames, g.t);
+    begin = g.off + first * plane;
+    end = g.off + last * plane;
+}
+
 /// A voxel's `(t, h, w)` inside its lane.
 struct Voxel {
     int t;

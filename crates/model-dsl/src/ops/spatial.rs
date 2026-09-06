@@ -17,7 +17,7 @@
 //! still hands a grid back, and a text may keep using `g`.)
 
 use super::*;
-use model_ir::{GridRule, ParamLayout, RowAxis, Spatial, TimePad};
+use model_ir::{GridRule, ParamLayout, RowAxis, Spatial, TimePad, VoxelSegment};
 
 /// The grid table's type: `[Clips, 4]` i32.
 fn grid_ty() -> Ty {
@@ -309,8 +309,29 @@ pub fn group_norm(
 /// the voxel axis at one type and grid; fresh `y` at `q`'s type. Not
 /// `attn::ragged`, whose kernel is stamped at head widths 64/128/256 over
 /// token-axis CSRs; a VAE's head is its whole channel row.
+///
+/// [`attention_over`] is the same op segmented by something narrower than
+/// the clip.
 #[must_use]
 pub fn attention(q: &Value, k: &Value, v: &Value, grid: &Value, sm_scale: f32) -> Value {
+    attention_over(q, k, v, grid, VoxelSegment::Clip, sm_scale)
+}
+
+/// [`attention`] over the block [`VoxelSegment`] names rather than the
+/// whole clip: `VoxelSegment::Frames(1)` attends each frame on its own
+/// (Wan 2.2's mid block), `Frames(n)` a run of `n` frames. The
+/// segmentation is read off the same `[Clips, 4]` grid the rectangle
+/// travels with — the voxel axis's answer to the token axis's
+/// `GroupIndptr`/`LaneIndptr`.
+#[must_use]
+pub fn attention_over(
+    q: &Value,
+    k: &Value,
+    v: &Value,
+    grid: &Value,
+    segment: VoxelSegment,
+    sm_scale: f32,
+) -> Value {
     expect_voxels("`spatial::attention`'s query", q);
     expect_grid("`spatial::attention`'s grid", grid);
     assert!(
@@ -325,6 +346,10 @@ pub fn attention(q: &Value, k: &Value, v: &Value, grid: &Value, sm_scale: f32) -
         Dtype::Bf16,
         "`spatial::attention` reads bf16 rows"
     );
+    assert!(
+        segment != VoxelSegment::Frames(0),
+        "`spatial::attention` over `Frames(0)` is a block with no rows in it"
+    );
     let r = q.rec();
     let y = r.fresh(q.ty().clone());
     r.push(
@@ -333,6 +358,7 @@ pub fn attention(q: &Value, k: &Value, v: &Value, grid: &Value, sm_scale: f32) -
             k: k.id(),
             v: v.id(),
             grid: grid.id(),
+            segment,
             sm_scale,
             y: y.id(),
         },
@@ -379,8 +405,22 @@ pub fn upsample_nearest(
 }
 
 /// Depth to space by `r`: `[rows, C·r1·r2·r3]` into `[rows·r1·r2·r3, C]`.
+/// [`pixel_shuffle_trimming`] drops leading frames from the result.
 #[must_use]
 pub fn pixel_shuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
+    pixel_shuffle_trimming(x, grid, r, 0)
+}
+
+/// [`pixel_shuffle`] with a causal temporal upsampler's ANCHOR DROP: the
+/// first `trim_t` frames of the shuffled result are thrown away, so a clip
+/// of `t` frames lands `t·r1 - trim_t` of them (LTX-2.5's
+/// `LTXVideoUpsampler3d` drops `r1 - 1`). The same flavour of statement as
+/// [`upsample_nearest`]'s `keep_first_frame`: a time rule the box carries
+/// and the rows follow. `y` keeps the untrimmed `VoxelsTimes(r1·r2·r3)`
+/// row dim and over-allocates — the grid says which rows are live, and a
+/// clip the trim would empty lands none.
+#[must_use]
+pub fn pixel_shuffle_trimming(x: &Value, grid: &Value, r: [u32; 3], trim_t: u32) -> (Value, Value) {
     expect_voxels("`spatial::pixel_shuffle`'s input", x);
     expect_grid("`spatial::pixel_shuffle`'s grid", grid);
     let vol = volume(r);
@@ -389,7 +429,7 @@ pub fn pixel_shuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
         "{} channels do not unpack by a {r:?} block",
         x.width()
     );
-    let rule = GridRule::Shuffle { r };
+    let rule = GridRule::Shuffle { r, trim_t };
     let rec = x.rec();
     let y_grid = self::grid(grid, rule);
     let y = rec.fresh(tensor(
@@ -402,6 +442,7 @@ pub fn pixel_shuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
             x: x.id(),
             grid: grid.id(),
             r,
+            trim_t,
             y_grid: y_grid.id(),
             y: y.id(),
         },

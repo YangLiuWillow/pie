@@ -56,6 +56,61 @@ pub enum TimePad {
     Replicate,
 }
 
+/// How the voxel rows of one clip split into ATTENTION BLOCKS — the voxel
+/// axis's answer to the token axis's `GroupIndptr` / `LaneIndptr`
+/// (`IMAGEGEN_CONTRACT.md` §1), which say the same thing about token rows.
+///
+/// A CSR would need a rectangle whose length is the segment count, which on
+/// this axis is `Σ t` over the clips and so is not a dim any budget states.
+/// It does not need one: the segments a VAE attends over are REGULAR — a
+/// whole clip, or a fixed run of frames inside it — so the `[Clips, 4]`
+/// grid that already travels beside every voxel rectangle carries the
+/// table, and this enum says how to read it. `segment.bounds(box, row)` is
+/// the host twin of what the kernel computes per query row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VoxelSegment {
+    /// One block per clip: every voxel of the clip attends every other
+    /// (the image VAEs' mid block — FLUX's, Z-Image's).
+    #[default]
+    Clip,
+    /// One block per run of `frames` consecutive frames of the clip: a
+    /// query sees the `frames · h · w` voxels of its own run and nothing
+    /// else. `Frames(1)` is Wan 2.2's mid block, which attends each frame
+    /// on its own; a clip whose `t` is not a multiple leaves a short run at
+    /// the end. `Frames(0)` is refused by the shells as a segment that
+    /// holds no rows.
+    Frames(u32),
+}
+
+impl VoxelSegment {
+    /// The frame range `[begin, end)` of the block a voxel in frame
+    /// `frame` of a `t`-frame clip attends.
+    #[must_use]
+    pub fn frames(self, t: u32, frame: u32) -> (u32, u32) {
+        match self {
+            VoxelSegment::Clip => (0, t),
+            VoxelSegment::Frames(0) => (frame, frame),
+            VoxelSegment::Frames(per) => {
+                let begin = frame / per * per;
+                (begin, (begin + per).min(t))
+            }
+        }
+    }
+
+    /// The row range `[begin, end)` — relative to the clip's `row_offset` —
+    /// that the voxel at clip-local row `row` of a `[t, h, w]` clip
+    /// attends. `None` for a row outside the clip.
+    #[must_use]
+    pub fn bounds(self, [t, h, w]: [u32; 3], row: u32) -> Option<(u32, u32)> {
+        let plane = h * w;
+        if plane == 0 || row >= t * plane {
+            return None;
+        }
+        let (begin, end) = self.frames(t, row / plane);
+        Some((begin * plane, end * plane))
+    }
+}
+
 /// How one op's output box follows from its input box, per clip — what
 /// [`Spatial::Grid`] applies on the device and what a DSL wrapper reads to
 /// type the output rows.
@@ -78,8 +133,16 @@ pub enum GridRule {
         factor: [u32; 3],
         keep_first_frame: bool,
     },
-    /// Depth to space: `(t·r1, h·r2, w·r3)`.
-    Shuffle { r: [u32; 3] },
+    /// Depth to space: `(t·r1, h·r2, w·r3)`, less the first `trim_t`
+    /// frames of the result. The trim is the causal video VAEs' ANCHOR
+    /// DROP: a temporal upsampler expands one latent frame into `r1`
+    /// sample frames and then throws the leading `r1 - 1` of them away, so
+    /// a clip of `t` latent frames lands `t·r1 - trim_t` sample frames
+    /// (LTX-2.5's `LTXVideoUpsampler3d`, study §I.9). `trim_t = 0` is the
+    /// plain shuffle, and the same flavour of statement as
+    /// [`Upsample::keep_first_frame`](GridRule::Upsample): a time rule that
+    /// the box carries and the rows follow.
+    Shuffle { r: [u32; 3], trim_t: u32 },
     /// Space to depth: `(t/r1, h/r2, w/r3)`; every box must divide.
     Unshuffle { r: [u32; 3] },
 }
@@ -122,7 +185,12 @@ impl GridRule {
                 };
                 Some([t_out, h * factor[1], w * factor[2]])
             }
-            GridRule::Shuffle { r } => Some([t * r[0], h * r[1], w * r[2]]),
+            GridRule::Shuffle { r, trim_t } => {
+                // The anchor drop cannot eat the whole clip: a box it
+                // empties is a box this rule does not map.
+                let t_out = (t * r[0]).checked_sub(trim_t).filter(|n| *n > 0)?;
+                Some([t_out, h * r[1], w * r[2]])
+            }
             GridRule::Unshuffle { r } => {
                 if r.iter().any(|&x| x == 0) || t % r[0] != 0 || h % r[1] != 0 || w % r[2] != 0 {
                     return None;
@@ -139,7 +207,10 @@ impl GridRule {
         match self {
             GridRule::Conv { .. } | GridRule::Unshuffle { .. } => 1,
             GridRule::Upsample { factor, .. } => factor[0] * factor[1] * factor[2],
-            GridRule::Shuffle { r } => r[0] * r[1] * r[2],
+            // The trim only removes rows, so the block volume still bounds
+            // the growth: a trimmed shuffle lands inside the rectangle a
+            // plain one would.
+            GridRule::Shuffle { r, .. } => r[0] * r[1] * r[2],
         }
     }
 
@@ -216,9 +287,11 @@ pub enum Spatial {
         y: ValueId,
     },
     /// The conv VAE's mid-block attention: ONE head as wide as the row,
-    /// per clip over every voxel of the clip — `y = softmax(q·kᵀ ·
-    /// sm_scale) · v` with `q`, `k`, `v`, `y` all `[rows, C]` bf16 on the
-    /// voxel axis, segments read off `grid`. Not `attention.ragged`: that
+    /// over the block `segment` names — `y = softmax(q·kᵀ · sm_scale) · v`
+    /// with `q`, `k`, `v`, `y` all `[rows, C]` bf16 on the voxel axis, the
+    /// blocks read off `grid` through
+    /// [`VoxelSegment`]: the whole clip (the image VAEs) or a run of
+    /// frames inside it (Wan 2.2's mid block attends one frame at a time). Not `attention.ragged`: that
     /// kernel is stamped at head widths 64/128/256 and a VAE's head is its
     /// whole channel row (512 on the FLUX VAE), and its CSR is a token-axis
     /// table. fp32 scores, fp32 online softmax (the reference's
@@ -230,6 +303,7 @@ pub enum Spatial {
         k: ValueId,
         v: ValueId,
         grid: ValueId,
+        segment: VoxelSegment,
         sm_scale: f32,
         y: ValueId,
     },
@@ -247,11 +321,16 @@ pub enum Spatial {
     },
     /// Depth to space: `[rows, C·r1·r2·r3]` over `(t, h, w)` into
     /// `[rows·r1·r2·r3, C]` over `(t·r1, h·r2, w·r3)`, einops
-    /// `'b (c r1 r2 r3) t h w -> b c (t r1) (h r2) (w r3)'`.
+    /// `'b (c r1 r2 r3) t h w -> b c (t r1) (h r2) (w r3)'`, LESS the first
+    /// `trim_t` frames of the result — a causal temporal upsampler's anchor
+    /// drop (`GridRule::Shuffle`). `y_grid` is `Grid { rule: Shuffle { r,
+    /// trim_t } }` of `grid`, so `y`'s live rows shrink with the box while
+    /// its dim keeps the untrimmed `VoxelsTimes(r1·r2·r3)` allocation.
     PixelShuffle {
         x: ValueId,
         grid: ValueId,
         r: [u32; 3],
+        trim_t: u32,
         y_grid: ValueId,
         y: ValueId,
     },
@@ -372,7 +451,7 @@ impl Operands for Spatial {
 
 #[cfg(test)]
 mod tests {
-    use super::GridRule;
+    use super::{GridRule, VoxelSegment};
 
     /// The host rule agrees with the shapes `torch` lands: a k=3 s=2 p=1
     /// conv halves (rounding up), a causal one pads its time front only,
@@ -418,5 +497,56 @@ mod tests {
         );
         let table = up.apply(&[1, 2, 2, 0, 3, 4, 4, 4]).expect("both boxes map");
         assert_eq!(table, vec![1, 4, 4, 0, 5, 8, 8, 16]);
+    }
+
+    /// A trimmed shuffle is the plain one minus its leading frames: the box
+    /// loses `trim_t` frames, the offsets prefix-sum over the SHORTER
+    /// boxes, and a trim that would empty a clip maps nothing.
+    #[test]
+    fn a_trimmed_shuffle_drops_its_anchor_frames_from_the_box() {
+        let plain = GridRule::Shuffle {
+            r: [2, 2, 2],
+            trim_t: 0,
+        };
+        let trimmed = GridRule::Shuffle {
+            r: [2, 2, 2],
+            trim_t: 1,
+        };
+        assert_eq!(plain.out_extent([3, 4, 5]), Some([6, 8, 10]));
+        assert_eq!(trimmed.out_extent([3, 4, 5]), Some([5, 8, 10]));
+        // The rectangle a trimmed shuffle lands still fits the untrimmed
+        // growth, which is what the row dim allocates.
+        assert_eq!(trimmed.growth(), 8);
+        assert_eq!(
+            trimmed.apply(&[1, 1, 1, 0, 3, 4, 5, 1]),
+            Some(vec![1, 2, 2, 0, 5, 8, 10, 4])
+        );
+        // `t·r1 == trim_t` leaves no frame at all, which is no box.
+        assert_eq!(
+            GridRule::Shuffle {
+                r: [1, 2, 2],
+                trim_t: 1
+            }
+            .out_extent([1, 2, 2]),
+            None
+        );
+    }
+
+    /// The two regular blocks a spatial attention segments by, read off a
+    /// clip's box alone: the whole clip, or the run of frames a query sits
+    /// in (short at the end when `t` does not divide).
+    #[test]
+    fn a_voxel_segment_reads_its_block_off_the_clips_box() {
+        let clip = [3, 2, 2];
+        assert_eq!(VoxelSegment::Clip.bounds(clip, 0), Some((0, 12)));
+        assert_eq!(VoxelSegment::Clip.bounds(clip, 11), Some((0, 12)));
+        for (row, want) in [(0, (0, 4)), (3, (0, 4)), (4, (4, 8)), (11, (8, 12))] {
+            assert_eq!(VoxelSegment::Frames(1).bounds(clip, row), Some(want));
+        }
+        // Two frames a block over three frames: the tail block is short.
+        assert_eq!(VoxelSegment::Frames(2).bounds(clip, 0), Some((0, 8)));
+        assert_eq!(VoxelSegment::Frames(2).bounds(clip, 9), Some((8, 12)));
+        // A row past the clip is no row.
+        assert_eq!(VoxelSegment::Frames(1).bounds(clip, 12), None);
     }
 }

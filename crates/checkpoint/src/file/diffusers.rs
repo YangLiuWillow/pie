@@ -43,6 +43,27 @@
 //! (`aux.`), minus the byte copy: prefixing renames a catalog, so no pipeline
 //! is rewritten to be read.
 //!
+//! # A component may keep its weights ONE FOLDER DOWN
+//!
+//! MiniMax H3's `FL2VA/video_vae/` holds a dozen `.py` files, a
+//! `config.json` and a `source/` subdirectory, and the weights are in the
+//! subdirectory: `video_vae/source/model.safetensors`. So [`weight_files`]
+//! looks in the component folder first and, finding nothing there, in each
+//! of its immediate subdirectories.
+//!
+//! **One level, and only when the folder itself holds none.** The descent
+//! is not a walk: a component that keeps its own safetensors beside its
+//! config never looks deeper (so the common case costs one `read_dir` it
+//! was already doing), and a component that does not is answered by the
+//! first of its subfolders — in sorted order — that holds a set. Deeper
+//! nesting is not searched, because nothing ships it and an unbounded walk
+//! over a snapshot directory would sooner or later read a tokenizer's
+//! cache or a `.git` object as a weight file.
+//!
+//! This does NOT relax the rule below: the descent is INTO a component,
+//! never up out of one. A bundle at the top of the snapshot is still not
+//! read.
+//!
 //! # A top-level bundle beside a pipeline is IGNORED
 //!
 //! FLUX.2 ships `flux-2-klein-4b.safetensors` at the top of the snapshot
@@ -200,7 +221,8 @@ fn pair(entry: &serde_json::Value) -> Option<(String, String)> {
     Some((library.as_str()?.to_string(), class.as_str()?.to_string()))
 }
 
-/// The safetensors set one component directory holds.
+/// The safetensors set one component holds — in its own directory, or one
+/// folder below it.
 ///
 /// Each stem is tried whole before the next, so a directory holding both a
 /// `model.safetensors` and a `diffusion_pytorch_model.safetensors` reads as
@@ -211,7 +233,28 @@ fn pair(entry: &serde_json::Value) -> Option<(String, String)> {
 /// lone unsharded file, else the numbered shards on the disk. The index is
 /// preferred because it is the checkpoint's own statement of which files
 /// belong together, and a directory can hold a stale extra shard.
+///
+/// When the component's own directory holds no set at all, its immediate
+/// subdirectories are asked in sorted order and the first that answers is
+/// the component's (MiniMax H3's `video_vae/source/`). The descent stops
+/// there — see the module header for why one level and no further.
 fn weight_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let here = weight_files_in(dir)?;
+    if !here.is_empty() {
+        return Ok(here);
+    }
+    for sub in subdirectories(dir) {
+        let below = weight_files_in(&sub)?;
+        if !below.is_empty() {
+            return Ok(below);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// [`weight_files`] against ONE directory, with no descent — the rule the
+/// stems state, applied where it is asked.
+fn weight_files_in(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     for stem in STEMS {
         let index = dir.join(format!("{stem}.safetensors.index.json"));
         if index.is_file() {
@@ -227,6 +270,27 @@ fn weight_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
         }
     }
     Ok(Vec::new())
+}
+
+/// A component's immediate subdirectories, sorted, hidden ones dropped —
+/// the one level [`weight_files`] descends into.
+fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// The shard files a `*.safetensors.index.json` weight map names, unique and

@@ -16,7 +16,9 @@ namespace pie::spatial {
 
 /// `GridRule`, flattened: `kind` 0 conv (`a` k, `b` stride, `c` front pad,
 /// `d` back pad, `flag` causal_t), 1 upsample (`a` factor, `flag`
-/// keep_first_frame), 2 shuffle (`a` r), 3 unshuffle (`a` r).
+/// keep_first_frame), 2 shuffle (`a` r, `flag` trim_t — the frames a
+/// causal temporal upsampler drops off the front of the result), 3
+/// unshuffle (`a` r).
 struct RuleGeom {
     int kind;
     int a0, a1, a2;
@@ -55,7 +57,11 @@ __global__ void grid_rule(const int* __restrict__ grid, int* __restrict__ out, R
                 ow = w * g.a2;
                 break;
             case 2:
-                ot = t * g.a0; oh = h * g.a1; ow = w * g.a2;
+                // The anchor drop; a box it empties maps to no rows at all.
+                ot = t * g.a0 - g.flag;
+                oh = h * g.a1;
+                ow = w * g.a2;
+                ok = ot > 0;
                 break;
             default:
                 ok = g.a0 > 0 && g.a1 > 0 && g.a2 > 0
