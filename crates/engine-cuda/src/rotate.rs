@@ -655,6 +655,7 @@ mod tests {
             &Budgets {
                 tokens: Budget::new(4, 256),
                 patches: None,
+                voxels: None,
             },
             &DeviceProfile::default(),
         )

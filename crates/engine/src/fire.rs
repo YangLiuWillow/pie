@@ -289,6 +289,12 @@ pub enum PortKind {
     Context,
     /// `RuntimeInput::AxisPositions { port, axes }`: `[rows, axes]` f32.
     AxisPositions,
+    /// `RuntimeInput::Voxels { port, channels }`: `[voxels, channels]`
+    /// f32/bf16 on the voxel axis (design D8) — a VAE's input tile, fed
+    /// device-to-device from a channel cell whose rows are the lane's
+    /// clips' voxels in `(t, h, w)` order. The clips' boxes travel as
+    /// [`StepVoxels::clips`] beside it (a channel cell carries no grid).
+    Voxels,
 }
 
 /// One float port fed from a channel: the channel's committed cell at
@@ -740,6 +746,70 @@ impl StepMedia {
     }
 }
 
+/// One lane's VAE clips (design D8): the boxes of the tiles it submits on
+/// the voxel axis, and — for a host-fed port — their rows. Mirrors
+/// [`StepMedia`] one axis over: a lane's clips are one concatenation with
+/// one payload order, and the shell places them in the fire's voxel
+/// rectangle.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StepVoxels {
+    /// Which lane of this step the clips belong to; rebased by the batcher
+    /// like [`Attachment::lane`].
+    pub lane: u32,
+    /// Each clip's box `[t, h, w]` at the voxel port's resolution, in
+    /// submission order. A clip is at least one voxel on every side.
+    pub clips: Vec<[u32; 3]>,
+    /// The port's rows for a HOST-fed port: `Σ t·h·w` rows of the plan's
+    /// declared channel count, `f32` (converted to the port's element by
+    /// the shell), clips concatenated in `clips`' order. Empty when the
+    /// port is channel-fed ([`PortKind::Voxels`] in [`Lane::ports`]) or
+    /// the plan reads no voxel port (a decoder that unpatchifies tokens).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<f32>,
+}
+
+impl StepVoxels {
+    /// How many port voxel rows these clips total.
+    #[must_use]
+    pub fn voxels(&self) -> u64 {
+        self.clips
+            .iter()
+            .map(|[t, h, w]| u64::from(*t) * u64::from(*h) * u64::from(*w))
+            .sum()
+    }
+
+    /// Checks what the boxes alone can settle; the channel count is the
+    /// plan's own number, refused at the shell instead.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] with the first thing that is wrong.
+    pub fn validate(&self) -> Result<()> {
+        if self.clips.is_empty() {
+            return Err(Error::Invalid(format!(
+                "lane {} carries a voxel row naming no clips; a lane with no clip \
+                 constructs no voxel row at all",
+                self.lane
+            )));
+        }
+        if self.clips.iter().any(|b| b.iter().any(|&n| n == 0)) {
+            return Err(Error::Invalid(format!(
+                "lane {} submits a clip with a zero side",
+                self.lane
+            )));
+        }
+        if !self.payload.is_empty() && self.payload.len() as u64 % self.voxels() != 0 {
+            return Err(Error::Invalid(format!(
+                "lane {} submits {} values for {} voxels, which is not a whole row per voxel",
+                self.lane,
+                self.payload.len(),
+                self.voxels()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// One forward pass over the assembled batch — one step of a frame (1..=k
 /// steps, sealed in order).
 ///
@@ -755,6 +825,10 @@ pub struct Step {
     /// every text-only fire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<StepMedia>,
+    /// The VAE clips this fire's lanes submitted on the voxel axis (D8),
+    /// keyed by lane; empty for every fire with no tile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voxels: Vec<StepVoxels>,
 }
 
 impl Step {
@@ -833,6 +907,26 @@ impl Step {
                 )));
             }
             media.validate(lane.rows())?;
+        }
+        // And the voxel rows, the same way.
+        for (index, voxels) in self.voxels.iter().enumerate() {
+            if self.lanes.get(voxels.lane as usize).is_none() {
+                return Err(Error::Invalid(format!(
+                    "voxel row {index} names lane {} of the {lanes} this fire has",
+                    voxels.lane
+                )));
+            }
+            if self.voxels[..index]
+                .iter()
+                .any(|earlier| earlier.lane == voxels.lane)
+            {
+                return Err(Error::Invalid(format!(
+                    "lane {} carries two voxel rows, at voxel row {index}; a lane's \
+                     clips are one concatenation with one payload order",
+                    voxels.lane
+                )));
+            }
+            voxels.validate()?;
         }
         Ok(())
     }
@@ -937,6 +1031,11 @@ pub struct LaneReadout {
     /// unless the lane set [`Lane::captures_scores`].
     #[serde(default)]
     pub scores: Vec<LayerScores>,
+    /// Under [`ReadoutSeam::Pixels`]: each clip's output box `[t, h, w]`,
+    /// in submission order, so `values` splits into clips as `Σ t·h·w`
+    /// rows each. Empty for every other seam.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clips: Vec<[u32; 3]>,
 }
 
 /// The export seam a readout row came off.
@@ -949,6 +1048,10 @@ pub enum ReadoutSeam {
     Velocity,
     /// `seam::HIDDEN`: a hidden-state export, `[rows, W]`.
     Hidden,
+    /// `seam::PIXELS` (D8): a VAE decode's pixels, one row per output voxel
+    /// of the lane's clips in submission order, `[rows, C]`; the clips'
+    /// output boxes are [`LaneReadout::clips`].
+    Pixels,
 }
 
 /// The receipt for one accepted fire. A synchronous shell fills

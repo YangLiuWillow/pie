@@ -138,6 +138,8 @@ fn cuda_budgets(
         // Both absent: the shell derives a ladder from the loaded text.
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
+        max_voxels: None,
+        max_clips: None,
     }
 }
 
@@ -534,6 +536,8 @@ pub(crate) fn create_engine_backend(
                     // states it.
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
+                    max_voxels: None,
+                    max_clips: None,
                 },
                 model_ir::Platform::Metal,
             )
@@ -575,6 +579,8 @@ pub(crate) fn create_engine_backend(
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
+                    max_voxels: None,
+                    max_clips: None,
                 },
                 model_ir::Platform::Vulkan,
             )
@@ -628,6 +634,8 @@ pub(crate) fn create_engine_backend(
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
+                    max_voxels: None,
+                    max_clips: None,
                 },
                 model_ir::Platform::Wgpu,
             )

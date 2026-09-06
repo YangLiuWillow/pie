@@ -309,6 +309,7 @@ pub(crate) fn build_frame_submission(
                 lanes,
                 attachments,
                 media: build.media,
+                voxels: Vec::new(),
             },
             terminal_cells: build.terminal_cells,
             instances,

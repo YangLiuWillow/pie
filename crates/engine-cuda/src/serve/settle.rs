@@ -22,6 +22,20 @@ pub(crate) struct Readback {
     pub(crate) lane_rows: Vec<u32>,
     /// Per submitted lane: whether it asked to capture.
     pub(crate) captures: Vec<bool>,
+    /// The pixel plane and its grid (D8), for a fire that decoded clips.
+    pub(crate) pixels: Option<PixelsReadback>,
+}
+
+/// Where a VAE decode's pixels are: the `pixels` seam's plane, its
+/// `[clips, 4]` output grid, and each lane's clip run in it.
+#[derive(Debug, Clone)]
+pub(crate) struct PixelsReadback {
+    /// `[voxel rows·k, C]` on the voxel axis.
+    pub(crate) plane: kernels_cuda::Tensor,
+    /// `[clips, 4]` i32 at the OUTPUT resolution.
+    pub(crate) grid: kernels_cuda::Tensor,
+    /// Per submitted lane: `(clip_offset, clips)` in the fire's clip order.
+    pub(crate) lane_clips: Vec<(u32, u32)>,
 }
 
 /// What a settled step answers; the readouts are empty until [`Shell::read_out`].
@@ -33,6 +47,10 @@ pub struct Settled {
     pub rows: Vec<u32>,
     /// Each submitted lane's captured attention mass, empty for a lane that asked for none.
     pub scores: Vec<Vec<LayerScores>>,
+    /// Each submitted lane's decoded pixels (D8): one `f32` row per output
+    /// voxel of its clips in submission order, beside each clip's output
+    /// box. Empty for a lane that submitted no clip.
+    pub pixels: Vec<(Vec<f32>, Vec<[u32; 3]>)>,
     /// Where to read them from, or `None` for the arming pass.
     pub(super) readback: Option<Readback>,
 }
@@ -111,6 +129,7 @@ impl Shell {
             logits: Vec::new(),
             rows: Vec::new(),
             scores: Vec::new(),
+            pixels: Vec::new(),
             readback,
         })
     }
@@ -147,7 +166,8 @@ impl Shell {
         let mut raw = vec![0u8; width * 2];
         for lane in 0..lanes {
             let owned = readback.lane_rows[lane];
-            if owned == 0 {
+            // A plan with no `out` seam (a VAE decode) has no logits to read.
+            if owned == 0 || logits.width == 0 {
                 continue;
             }
             let chosen: Vec<u32> = match want.get(lane) {
@@ -215,9 +235,54 @@ impl Shell {
             }
         }
 
+        // The pixels (D8): the output grid comes back first, then each
+        // lane's clips' rows out of the plane in clip order.
+        let mut pixels: Vec<(Vec<f32>, Vec<[u32; 3]>)> = vec![(Vec::new(), Vec::new()); lanes];
+        if let Some(seat) = readback.pixels.as_ref() {
+            let clips = seat.grid.rows as usize;
+            let mut grid = vec![0u8; clips * 16];
+            self.arena.read(seat.grid.ptr, &mut grid)?;
+            let grid: Vec<i32> = grid
+                .chunks_exact(4)
+                .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let channels = seat.plane.width as usize;
+            let element = model_compiler::arena::elem_bytes(seat.plane.dtype).unwrap_or(0) as usize;
+            let mut raw: Vec<u8> = Vec::new();
+            for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
+                let mut values = Vec::new();
+                let mut boxes = Vec::with_capacity(count as usize);
+                for clip in first..first + count {
+                    let at = clip as usize * 4;
+                    let [t, h, w, off] = [grid[at], grid[at + 1], grid[at + 2], grid[at + 3]];
+                    let voxels = t as usize * h as usize * w as usize;
+                    boxes.push([t as u32, h as u32, w as u32]);
+                    let bytes = voxels * channels * element;
+                    raw.clear();
+                    raw.resize(bytes, 0);
+                    self.arena.read(
+                        seat.plane.ptr + off as u64 * channels as u64 * element as u64,
+                        &mut raw,
+                    )?;
+                    match seat.plane.dtype {
+                        model_ir::Dtype::F32 => values.extend(
+                            raw.chunks_exact(4)
+                                .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]])),
+                        ),
+                        _ => values.extend(
+                            raw.chunks_exact(2)
+                                .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]]))),
+                        ),
+                    }
+                }
+                pixels[lane] = (values, boxes);
+            }
+        }
+
         settled.logits = taken;
         settled.rows = counts;
         settled.scores = scores;
+        settled.pixels = pixels;
         Ok(())
     }
 }

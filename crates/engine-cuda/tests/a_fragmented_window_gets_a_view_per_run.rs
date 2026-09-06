@@ -87,7 +87,7 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
     let refusal = Windows::of(
         &plan,
         &compiled,
-        model_ir::PerAxis::new([&ascending, &WindowTable::default()]),
+        model_ir::PerAxis::new([&ascending, &WindowTable::default(), &WindowTable::default()]),
         &indptr(&vec![1; count]),
         engine_cuda::window::Copies::off(),
         test_slots(),

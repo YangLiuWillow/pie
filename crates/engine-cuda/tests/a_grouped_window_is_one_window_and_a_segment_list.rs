@@ -84,7 +84,7 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let lanes = one_lane_per_class(&grouped);
     let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
-    let mut windows = Windows::of(&plan, &grouped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
+    let mut windows = Windows::of(&plan, &grouped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
 
     let packed = windows.packed();
     // Nonzero base so a missing offset shows up as wrong, not coincidentally right.
