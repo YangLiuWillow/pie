@@ -44,6 +44,7 @@ members = [
     "latent-probe",
     "mini-dit-parity",
     "flux2-parity",
+    "zimage-parity",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",
