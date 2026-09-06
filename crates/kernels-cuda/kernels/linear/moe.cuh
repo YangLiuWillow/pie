@@ -437,6 +437,81 @@ __global__ void moe_topk_sigmoid_bias(
     }
 }
 
+// Sigmoid routing with `S` sink experts riding the row after the `E` routed
+// logits (Inkling's shared experts): the choice is top-`K` of sigmoid + bias
+// over the routed `E` alone; the weights are every chosen score and every
+// sink score over their common sum, times `scaling` and `global_scale[0]`
+// when one is bound. Routes land `[K picks | E, E+1, .. E+S-1]`, `K + S`
+// wide, so a select over a bank of `E + S` experts serves the sinks as
+// fixed routes.
+template <class T>
+__global__ void moe_topk_sigmoid_sink(
+    const T* __restrict__ logits,
+    i32* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    const float* __restrict__ correction_bias,
+    const float* __restrict__ global_scale,
+    int E,
+    int S,
+    int K,
+    float scaling,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int tid = threadIdx.x;
+    const int W = E + S;
+    const T* row = logits + static_cast<long long>(plane_row) * W;
+    __shared__ float scores[kRouterMaxExperts];
+    __shared__ float orig_scores[kRouterMaxExperts];
+    __shared__ bool taken[kRouterMaxExperts];
+
+    for (int e = tid; e < W; e += blockDim.x) {
+        const float x = Elem<T>::to_f32(row[e]);
+        const float s = 1.f / (1.f + expf(-x));
+        orig_scores[e] = s;
+        scores[e] = (e < E && correction_bias != nullptr) ? s + correction_bias[e] : s;
+        taken[e] = false;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        i32* idx = topk_idx + static_cast<long long>(plane_row) * (K + S);
+        float* w = topk_w + static_cast<long long>(plane_row) * (K + S);
+        float sum = 0.f;
+        const int picks = K < E ? K : E;
+        for (int k = 0; k < picks; ++k) {
+            int best_i = -1;
+            float best_v = -flt_max();
+            for (int e = 0; e < E; ++e) {
+                if (taken[e]) continue;
+                const float v = scores[e];
+                if (best_i < 0 || v > best_v) {
+                    best_v = v;
+                    best_i = e;
+                }
+            }
+            idx[k] = best_i;
+            w[k] = orig_scores[best_i];
+            sum += orig_scores[best_i];
+            taken[best_i] = true;
+        }
+        for (int k = picks; k < K; ++k) {
+            idx[k] = -1;
+            w[k] = 0.f;
+        }
+        for (int s = 0; s < S; ++s) {
+            idx[K + s] = E + s;
+            w[K + s] = orig_scores[E + s];
+            sum += orig_scores[E + s];
+        }
+        const float g = global_scale != nullptr ? global_scale[0] : 1.f;
+        const float scale = scaling * g / (sum + 1e-20f);
+        for (int k = 0; k < K + S; ++k) w[k] *= scale;
+    }
+}
+
 template <class T>
 __global__ void moe_topk_sigmoid(
     const T* __restrict__ logits,

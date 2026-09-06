@@ -122,7 +122,10 @@ impl Run<'_> {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
             // Fused by the CUDA load only (`model_ir::fuse::gemm_epilogues`).
-            Linear::MatmulGeglu { .. } | Linear::LmHeadSoftcap { .. } => {
+            Linear::MatmulGeglu { .. }
+            | Linear::LmHeadSoftcap { .. }
+            | Linear::RelBias { .. }
+            | Linear::MoeTopkSigmoidSink { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
             Linear::MlpGegluTanhPacked {

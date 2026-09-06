@@ -127,6 +127,81 @@ pub fn prefill(
     o
 }
 
+/// Decode with a learned relative-position bias (`Attention::DecodeRel`):
+/// `bias` is `[rows, heads · extent]` f32 from [`super::linear::rel_bias`];
+/// `log_scaling` is `(floor, alpha)` for the log attention scaling past a
+/// position floor, `None` for a layer without it.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rel(
+    q: &Value,
+    plan: &Value,
+    pages: ValueId,
+    bias: &Value,
+    window: Option<u32>,
+    head_dim: u32,
+    extent: u32,
+    sm_scale: f32,
+    log_scaling: Option<(u32, f32)>,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
+    r.push(
+        Attention::DecodeRel {
+            q: q.id(),
+            plan: plan.id(),
+            cache: pages,
+            bias: bias.id(),
+            window,
+            head_dim,
+            extent,
+            sm_scale,
+            log_floor,
+            log_alpha,
+            o: o.id(),
+        },
+        &[q, plan, bias],
+    );
+    o
+}
+
+/// Prefill with the same bias (`Attention::PrefillRel`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_rel(
+    q: &Value,
+    plan: &Value,
+    pages: ValueId,
+    bias: &Value,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    extent: u32,
+    sm_scale: f32,
+    log_scaling: Option<(u32, f32)>,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    let (log_floor, log_alpha) = log_scaling.unwrap_or((0, 0.0));
+    r.push(
+        Attention::PrefillRel {
+            q: q.id(),
+            plan: plan.id(),
+            cache: pages,
+            bias: bias.id(),
+            window,
+            head_dim,
+            kv_heads,
+            extent,
+            sm_scale,
+            log_floor,
+            log_alpha,
+            o: o.id(),
+        },
+        &[q, plan, bias],
+    );
+    o
+}
+
 pub fn masked(
     q: &Value,
     plan: &Value,
@@ -359,6 +434,41 @@ pub fn ssm_causal_conv1d_chunked_dilated(
             state,
             conv_width,
             dilation,
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
+/// Inkling's short convolution, decode form (`Attention::ShortConv`):
+/// `y = x + conv(x)`, no activation, over the recurrent conv's state slab.
+pub fn short_conv(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Attention::ShortConv {
+            x: x.id(),
+            weight: r.weight(weight),
+            state,
+            conv_width,
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
+/// Prefill form of [`short_conv`].
+pub fn short_conv_chunked(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Attention::ShortConvChunked {
+            x: x.id(),
+            weight: r.weight(weight),
+            state,
+            conv_width,
             y: y.id(),
         },
         &[x],

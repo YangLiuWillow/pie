@@ -237,6 +237,78 @@ pub fn topk_sigmoid(
     )
 }
 
+/// Sigmoid routing with `sink` shared experts riding the logit row after the
+/// `experts` routed ones (`Linear::MoeTopkSigmoidSink`): the choice is top-k
+/// over the routed scores plus `bias`; the weights are every chosen score and
+/// every sink score over their common sum, times `scaling` and the bound
+/// `global_scale`. Routes and weights are `top_k + sink` wide.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_sigmoid_sink(
+    ctx: &Ctx,
+    logits: Tensor,
+    correction_bias: Option<Tensor>,
+    global_scale: Option<Tensor>,
+    experts: u32,
+    top_k: u32,
+    sink: u32,
+    scaling: f32,
+    routes: &mut Tensor,
+    weights: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_topk_sigmoid_sink";
+    let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let fan = top_k
+        .checked_add(sink)
+        .ok_or_else(|| refuse(OP, "the fan-out does not count"))?;
+    ranked_planes(OP, logits, fan, routes, weights);
+    nonzero(OP, "rows", logits.rows)?;
+    nonzero(OP, "the fan-out this router states", top_k)?;
+    let width = experts
+        .checked_add(sink)
+        .ok_or_else(|| refuse(OP, "the expert count does not count"))?;
+    if logits.width != width {
+        return Err(refuse(
+            OP,
+            format!(
+                "the router's row is {} wide and the statement names {experts} routed + {sink} sink experts",
+                logits.width
+            ),
+        ));
+    }
+    if width > MAX_EXPERTS {
+        return Err(refuse(
+            OP,
+            format!(
+                "the expert count is {width}, above the {MAX_EXPERTS} scores this router \
+                 stages in shared memory"
+            ),
+        ));
+    }
+    if let Some(bias) = &correction_bias {
+        debug_assert_eq!(bias.dtype, Dtype::F32, "`{OP}` reads an f32 correction bias");
+    }
+    if let Some(scale) = &global_scale {
+        debug_assert_eq!(scale.dtype, Dtype::F32, "`{OP}` reads an f32 global scale");
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")))
+            .apply(rms(logits.rows)),
+        &[
+            logits.arg(),
+            routes.arg(),
+            weights.arg(),
+            correction_bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+            global_scale.map_or(ArgValue::ABSENT, |scale| scale.arg()),
+            stated(OP, experts)?.arg(),
+            stated(OP, sink)?.arg(),
+            stated(OP, top_k)?.arg(),
+            scaling.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// Sigmoid routing with a per-expert correction bias; weights pass through
 /// sqrt-softplus.
 #[allow(clippy::too_many_arguments)]

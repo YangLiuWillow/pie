@@ -564,6 +564,8 @@ fn writes_cache(op: &Operation) -> bool {
             // write is invisible in `outputs`.
             Attention::SsmCausalConv1d { .. }
             | Attention::SsmCausalConv1dChunked { .. }
+            | Attention::ShortConv { .. }
+            | Attention::ShortConvChunked { .. }
             | Attention::SsmGatedDelta { .. }
             | Attention::SsmGatedDeltaChunked { .. }
             | Attention::SsmKdaStep { .. }
@@ -576,6 +578,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PlanPrefill { .. }
             | Attention::Decode { .. }
             | Attention::Prefill { .. }
+            | Attention::DecodeRel { .. }
+            | Attention::PrefillRel { .. }
             | Attention::Masked { .. }
             // The tower's attention touches no sequence cache at all.
             | Attention::Dense { .. }

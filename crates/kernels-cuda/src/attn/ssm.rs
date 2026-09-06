@@ -15,7 +15,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
@@ -163,6 +163,24 @@ fn conv_extents(
     ))
 }
 
+/// What a conv tap lands: the recurrent mixers' `silu(acc)`, or Inkling's
+/// short convolution's `x + acc` (`conv_out` in `ssm.cuh`). Spelled as the
+/// template tail every conv kernel takes after its element type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConvOut {
+    Silu,
+    Residual,
+}
+
+impl ConvOut {
+    const fn args(self) -> &'static str {
+        match self {
+            ConvOut::Silu => "<::pie::bf16>",
+            ConvOut::Residual => "<::pie::bf16, false, true>",
+        }
+    }
+}
+
 pub fn causal_conv1d(
     ctx: &Ctx,
     x: Tensor,
@@ -173,12 +191,42 @@ pub fn causal_conv1d(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d";
-    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    let (channels, c, k) = conv_extents(OP, x, y, conv_width)?;
-    let dil = stated(OP, nonzero(OP, "the conv's dilation", dilation)?)?;
-    let rows = nonzero(OP, "rows", x.rows)?;
+    conv1d_update(ctx, OP, x, weight, state, conv_width, dilation, y, ConvOut::Silu)
+}
+
+/// Decode form of Inkling's short convolution (`Attention::ShortConv`):
+/// `y = x + conv(x)`, no activation, the same state slab as the recurrent
+/// mixers' conv.
+pub fn short_conv(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.short_conv";
+    conv1d_update(ctx, OP, x, weight, state, conv_width, 1, y, ConvOut::Residual)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_update(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    out: ConvOut,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    let (channels, c, k) = conv_extents(op, x, y, conv_width)?;
+    let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
+    let rows = nonzero(op, "rows", x.rows)?;
     seated(
-        OP,
+        op,
         state,
         "ssm_causal_conv1d_update_batched",
         false,
@@ -201,13 +249,16 @@ pub fn causal_conv1d(
         state.slot_ids.arg(),
         state.conv_stride.arg(),
         y.arg(),
-        stated(OP, rows)?.arg(),
+        stated(op, rows)?.arg(),
         c.arg(),
         k.arg(),
     ];
     let (entrypoint, launch) = if vectors {
         (
-            "::pie::attn::ssm_causal_conv1d_update_batched_vec8<::pie::bf16>",
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_update_batched_vec8{}",
+                out.args()
+            )),
             Launch::grid(
                 [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
                 [CONV_BLOCK, 1, 1],
@@ -216,13 +267,16 @@ pub fn causal_conv1d(
     } else {
         args.push(dil.arg());
         (
-            "::pie::attn::ssm_causal_conv1d_update_batched<::pie::bf16>",
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_update_batched{}",
+                out.args()
+            )),
             Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
         )
     };
     // ctx.stage(): the region's live-rows word, or ABSENT.
     args.push(ctx.stage());
-    ctx.fire(OP, Fire::at(FILE, entrypoint).apply(launch), &args)
+    ctx.fire(op, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
 /// Prefill form: walks the fire's request boundaries, one grid row per
@@ -238,6 +292,34 @@ pub fn causal_conv1d_chunked(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
+    conv1d_chunked(ctx, OP, x, weight, state, conv_width, dilation, y, ConvOut::Silu)
+}
+
+/// Prefill form of Inkling's short convolution (`Attention::ShortConvChunked`).
+pub fn short_conv_chunked(
+    ctx: &Ctx,
+    x: RaggedTensor,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.short_conv_chunked";
+    conv1d_chunked(ctx, OP, x, weight, state, conv_width, 1, y, ConvOut::Residual)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_chunked(
+    ctx: &Ctx,
+    op: &'static str,
+    x: RaggedTensor,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    out: ConvOut,
+) -> Result<(), Error> {
 
     const CHANNEL_TILE_FROM: u32 = 8;
 
@@ -245,14 +327,17 @@ pub fn causal_conv1d_chunked(
 
     const PER_CHANNEL_BLOCK: u32 = 64;
 
-    dtype_dispatch!(OP, x.data.dtype, { Bf16 => () });
-    let (channels, c, k) = conv_extents(OP, x.data, y, conv_width)?;
-    let dil = stated(OP, nonzero(OP, "the conv's dilation", dilation)?)?;
-    let lanes = requests(OP, x)?;
-    seated(OP, state, "ssm_causal_conv1d_chunked_batched", true, true, true)?;
+    dtype_dispatch!(op, x.data.dtype, { Bf16 => () });
+    let (channels, c, k) = conv_extents(op, x.data, y, conv_width)?;
+    let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
+    let lanes = requests(op, x)?;
+    seated(op, state, "ssm_causal_conv1d_chunked_batched", true, true, true)?;
     let (entrypoint, launch) = if lanes >= CHANNEL_TILE_FROM {
         (
-            "::pie::attn::ssm_causal_conv1d_chunked_batched_channel_tile<::pie::bf16>",
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched_channel_tile{}",
+                out.args()
+            )),
             Launch::grid(
                 [channels.div_ceil(TILE_BLOCK), lanes, 1],
                 [TILE_BLOCK, 1, 1],
@@ -260,12 +345,15 @@ pub fn causal_conv1d_chunked(
         )
     } else {
         (
-            "::pie::attn::ssm_causal_conv1d_chunked_batched<::pie::bf16>",
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched{}",
+                out.args()
+            )),
             Launch::grid([channels, lanes, 1], [PER_CHANNEL_BLOCK, 1, 1]),
         )
     };
     ctx.fire(
-        OP,
+        op,
         Fire::at(FILE, entrypoint).apply(launch),
         &[
             x.data.arg(),

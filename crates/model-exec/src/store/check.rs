@@ -43,6 +43,8 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
             | Attention::DecodeLse { plan, .. }
             | Attention::Prefill { plan, .. }
             | Attention::PrefillLse { plan, .. }
+            | Attention::DecodeRel { plan, .. }
+            | Attention::PrefillRel { plan, .. }
             | Attention::Masked { plan, .. } => *plan,
             _ => continue,
         };

@@ -294,6 +294,12 @@ class Plan:
     attn_res_block_size: int | None = None
     # drop the vision tower and flatten `text_cfg_key` to the top level
     text_only: bool = False
+    # Router planes whose expert axis carries `sink` extra rows AFTER the
+    # routed bank -- Inkling's `gate.weight` is `[256 routed + 2 shared,
+    # hidden]`. The carve keeps the routed prefix and those trailing rows,
+    # so the shared experts keep their logits.
+    sink_suffixes: tuple[str, ...] = ()
+    sink_rows: int = 0
 
 
 def _text_cfg(cfg: dict, plan: Plan) -> dict:
@@ -449,6 +455,35 @@ def _rewrite_kimi_k3(cfg: dict, plan: Plan) -> None:
 
     if plan.text_only:
         _flatten_text_only(cfg, plan)
+
+
+def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # Both per-layer lists live in `text_config`: `layer_types` says sliding
+    # vs full, and `layer_rope_theta` is 0 on the full layers (NoPE) -- a cut
+    # that kept one list and not the other would rotate a layer the source
+    # never rotated.
+    tc = _text_cfg(cfg, plan)
+    for key in ("layer_types", "layer_rope_theta"):
+        if isinstance(tc.get(key), list):
+            tc[key] = _slice_list(tc[key], plan.src_layers)
+
+
+def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    # `local_layer_ids` names the sliding layers by index; the cut renumbers.
+    if isinstance(tc.get("local_layer_ids"), list):
+        local = set(tc["local_layer_ids"])
+        tc["local_layer_ids"] = [i for i, src in enumerate(plan.src_layers) if src in local]
+    # `dense_mlp_idx` is "the first N layers are dense": a prefix.
+    if isinstance(tc.get("dense_mlp_idx"), int):
+        tc["dense_mlp_idx"] = _prefix_count(plan, "dense_mlp_idx", tc["dense_mlp_idx"])
+    # The MTP heads are a separate bring-up (and `model.mtp.*` is not under
+    # the layer prefix, so none of their planes survive).
+    if isinstance(cfg.get("mtp_config"), dict):
+        cfg["mtp_config"]["num_nextn_predict_layers"] = 0
+        cfg["mtp_config"]["local_layer_ids"] = []
 
 
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
@@ -1173,6 +1208,51 @@ FAMILIES: dict[str, dict[str, Any]] = {
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^mm_projector\.")),
     ),
+    "muse_glimmer": dict(
+        layer_prefix="model.language_model.layers.",
+        # Dense: no expert bank, nothing to slice by expert.
+        expert_re=None,
+        router_suffixes=(),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight"),
+        # Period 4 (three sliding, one full/NoPE): the first period and the
+        # last, so the miniature omits the middle of the stack rather than
+        # its tail, and both readings and both rope regimes appear twice.
+        default_layers="0-3,48-51",
+        config_rewrite=_rewrite_muse_glimmer,
+        text_cfg_key="text_config",
+        # The tower is kept so the miniature loads unmodified as
+        # `MuseGlimmerForConditionalGeneration`; pie's text row ignores it.
+        keep_res=(re.compile(r"^model\.vision_"),),
+    ),
+    "inkling_mm_model": dict(
+        layer_prefix="model.llm.layers.",
+        # Stacked on dim 0: one `experts.w13_weight` / `w2_weight` per layer.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.bias",
+            "mlp.experts.w13_weight",
+            "mlp.experts.w2_weight",
+        ),
+        # `gate.weight` is `[258, hidden]`: 256 routed rows, then the two
+        # shared experts' -- kept as routed prefix + trailing pair.
+        sink_suffixes=("mlp.gate.weight",),
+        sink_rows=2,
+        globals_keep=("model.llm.embed.weight",
+                      "model.llm.embed_norm.weight",
+                      "model.llm.norm.weight",
+                      "model.llm.unembed.weight"),
+        # Layers 0-1 are the dense pair (local), 2-4 and 6 local sparse, 5
+        # the first global (`local_layer_ids` skips 5, 11, ...): every layer
+        # kind, both relative-bias extents, one whole 6-period.
+        default_layers="0-6",
+        config_rewrite=_rewrite_inkling,
+        text_cfg_key="text_config",
+        # The vision hMLP and the audio embedding are a few planes; kept so
+        # the miniature loads unmodified as `InklingForConditionalGeneration`.
+        keep_res=(re.compile(r"^model\.visual\."), re.compile(r"^model\.audio\.")),
+    ),
     "gpt_oss": dict(
         layer_prefix="model.layers.",
         # gpt-oss stacks the whole expert bank on dim 0 of a handful of
@@ -1393,6 +1473,8 @@ def main() -> int:
         text_only=args.text_only,
         part_re=fam.get("part_re"),
         parts=parts or None,
+        sink_suffixes=fam.get("sink_suffixes", ()),
+        sink_rows=fam.get("sink_rows", 0),
     )
     # Which source rows the hashed table is re-cut from is pure arithmetic over
     # the config, and it decides which shards get read at all -- so it is
@@ -1554,6 +1636,13 @@ def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
             tail = tail.split(".", 1)[-1] if "." in tail else tail
             if tail in plan.router_suffixes and t.shape and t.shape[0] > router_rows:
                 ot.rows = router_rows
+            if tail in plan.sink_suffixes and t.shape and t.shape[0] > router_rows + plan.sink_rows:
+                # Routed prefix, then the trailing sink rows: two pieces of the
+                # one source tensor, fetched whole (it is a few megabytes).
+                ot.pieces = [Piece(t, 0, router_rows),
+                             Piece(t, t.shape[0] - plan.sink_rows, plan.sink_rows)]
+                ot.rows = router_rows + plan.sink_rows
+                full.add(src_name)
             if tail.endswith("gate.tid2eid"):
                 ot.mod = router_rows
         if ot.rows is None:
@@ -1562,7 +1651,7 @@ def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
     for ot in outs:
         # A source tensor reused by two outputs with different slices has to be
         # fetched whole; only mark the prefix when every use agrees.
-        if ot.rows is not None and ot.src.name not in full:
+        if ot.rows is not None and ot.pieces is None and ot.src.name not in full:
             ot.src.keep_rows = ot.rows
     return outs
 

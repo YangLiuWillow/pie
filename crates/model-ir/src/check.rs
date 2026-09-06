@@ -367,6 +367,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Dense { .. } => &[(In(3), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
+            Attention::DecodeRel { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (In(3), F32)],
+            Attention::PrefillRel { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
             Attention::MergeLse { .. } => &[(In(1), F32), (In(3), F32), (Out(1), F32)],
             Attention::LogitSoftcap { .. } => &[],
@@ -385,7 +387,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
             }
-            Attention::SsmCausalConv1d { .. } | Attention::SsmCausalConv1dChunked { .. } => {
+            Attention::SsmCausalConv1d { .. }
+            | Attention::SsmCausalConv1dChunked { .. }
+            | Attention::ShortConv { .. }
+            | Attention::ShortConvChunked { .. } => {
                 &[(In(2), CACHE)]
             }
             Attention::BlockDynConv { .. } => &[],
@@ -444,8 +449,11 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::MoeTopkSoftmax { .. }
             | Linear::MoeTopkSoftmaxScaled { .. }
             | Linear::MoeTopkSigmoid { .. }
+            | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MoeTopkSqrtSoftplus { .. }
             | Linear::MoePredictRoute { .. } => &[(Out(0), I32), (Out(1), F32)],
+            // The relative-position profile lands f32 for the score to add.
+            Linear::RelBias { .. } => &[(Out(0), F32)],
             // The lookup router lands the same pair off a token-id column and
             // an I64 table: the ids are the fire's own `RuntimeInput::Tokens`
             // stream, i32 like every other id column in this table.

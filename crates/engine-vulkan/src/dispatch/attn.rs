@@ -197,7 +197,11 @@ impl Run<'_> {
             // name rather than approximated.
             Attention::Masked { causal: false, .. }
             | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+            | Attention::SelectorWalk { .. }
+            | Attention::DecodeRel { .. }
+            | Attention::PrefillRel { .. }
+            | Attention::ShortConv { .. }
+            | Attention::ShortConvChunked { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Attention::Masked {
                 q,
                 plan,
