@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod deepseek_v4;
 pub mod drafter;
+pub mod flux_2;
 pub mod gemma_4;
 pub mod gemma_4_diffusion;
 pub mod glm_5;
@@ -326,6 +327,7 @@ macro_rules! skus {
 static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
     [
         deepseek_v4::skus(),
+        flux_2::skus(),
         gemma_4::skus(),
         gemma_4_diffusion::skus(),
         glm_5::skus(),
