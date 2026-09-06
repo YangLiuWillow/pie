@@ -163,6 +163,13 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
             crate::ui::short_path(&source.path)
         );
     }
+    // **A PIPELINE'S COMPONENT SET IS PRINTED BEFORE ANYTHING IS READ.** It
+    // is the first thing an operator needs to see about a generative
+    // snapshot — which components came down, which prefix each takes, and
+    // that a bundle beside them is not being read — and printing it here
+    // means `--dry-run` reports it whether or not this build ships a row
+    // that claims the checkpoint.
+    report_pipeline(&source.path)?;
     let mut metadata = parse_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
     // An overlay onto an artifact is written into that artifact, and its
@@ -363,6 +370,14 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
     }
     if let Some(config) = &config {
         meta.push((meta_name(CONFIG_OBJECT), config.clone()));
+    }
+    for (folder, bytes) in carry_component_configs(&source)? {
+        let object = component_config_object(&folder);
+        println!(
+            "convert: carrying the {folder} component's config.json ({} bytes) as {object}",
+            bytes.len()
+        );
+        meta.push((meta_name(&object), bytes));
     }
 
     let started = std::time::Instant::now();
@@ -1638,12 +1653,21 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
     if source.path.is_file() {
         return None;
     }
-    let json = source.path.join("tokenizer.json");
-    if json.exists() {
-        return Some(json);
+    // A diffusers pipeline keeps its tokenizer one level down, in
+    // `tokenizer/`, beside the component folders rather than beside the
+    // weights — the weights are one level down too. Looked at second, so a
+    // snapshot that has both keeps meaning what it meant.
+    for dir in [source.path.clone(), source.path.join("tokenizer")] {
+        let json = dir.join("tokenizer.json");
+        if json.exists() {
+            return Some(json);
+        }
+        let tiktoken = dir.join("tiktoken.model");
+        if tiktoken.exists() {
+            return Some(tiktoken);
+        }
     }
-    let tiktoken = source.path.join("tiktoken.model");
-    tiktoken.exists().then_some(tiktoken)
+    None
 }
 
 fn backend_word(platform: Platform) -> String {
@@ -1814,18 +1838,117 @@ fn yields<'a>(
 }
 
 /// Carries the source's `config.json` into the artifact, verbatim.
+///
+/// A diffusers pipeline has no top-level `config.json` — what it has instead
+/// is `model_index.json`, the file that names its components — so that is
+/// what lands at `model/config` for one. Each component's own `config.json`
+/// lands beside it; see [`carry_component_configs`].
 pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
     if source.path.is_file() {
         return Ok(None);
     }
-    let path = source.path.join("config.json");
-    if !path.exists() {
-        return Ok(None);
+    for name in ["config.json", checkpoint::file::diffusers::PIPELINE_INDEX] {
+        let path = source.path.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let raw = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        serde_json::from_slice::<serde_json::Value>(&raw)
+            .map_err(|err| anyhow!("cannot parse {}: {err}", path.display()))?;
+        return Ok(Some(raw));
     }
-    let raw = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-    serde_json::from_slice::<serde_json::Value>(&raw)
-        .map_err(|err| anyhow!("cannot parse {}: {err}", path.display()))?;
-    Ok(Some(raw))
+    Ok(None)
+}
+
+/// Every component's own JSON, as `(folder, bytes)`, for a source that is a
+/// diffusers pipeline; empty for anything else.
+///
+/// The pipeline's own `model_index.json` is NOT in here — it is what
+/// [`carry_config`] already carried as `model/config`.
+pub(crate) fn carry_component_configs(source: &Source) -> Result<Vec<(String, Vec<u8>)>> {
+    if !checkpoint::file::diffusers::is_pipeline(&source.path) {
+        return Ok(Vec::new());
+    }
+    Ok(checkpoint::file::diffusers::configs(&source.path)
+        .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?
+        .into_iter()
+        .filter(|(folder, _)| !folder.is_empty())
+        .collect())
+}
+
+/// Where a pipeline component's `config.json` lands in the artifact.
+///
+/// [`CONFIG_OBJECT`] is `model/config`, the checkpoint's own descriptor; a
+/// component's sits one level inside it, under the folder name diffusers
+/// gave it — `model/transformer/config`, `model/vae/config`. The FOLDER, not
+/// the tensor prefix: the config is diffusers' statement about diffusers'
+/// component, and `dit.` is pie's name for the weights.
+fn component_config_object(folder: &str) -> String {
+    let root = CONFIG_OBJECT.strip_suffix("/config").unwrap_or("model");
+    format!("{root}/{folder}/config")
+}
+
+/// Prints what a diffusers pipeline holds, and says nothing for anything
+/// else.
+///
+/// One line per component: the folder, the prefix its tensors take in the
+/// artifact's name space, how many files and how many bytes it is, and the
+/// `[library, class]` `model_index.json` recorded. Then, when there is one,
+/// the top-level bundle that is deliberately NOT read.
+fn report_pipeline(path: &Path) -> Result<()> {
+    use checkpoint::file::diffusers;
+
+    if !diffusers::is_pipeline(path) {
+        return Ok(());
+    }
+    let components = diffusers::components(path)
+        .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+    println!(
+        "convert: {} is a diffusers pipeline of {} component(s)",
+        crate::ui::short_path(path),
+        components.len()
+    );
+    for component in &components {
+        let bytes: u64 = component
+            .weights
+            .iter()
+            .filter_map(|file| std::fs::metadata(file).ok())
+            .map(|meta| meta.len())
+            .sum();
+        println!(
+            "convert:   {:<16} -> `{}` {} file(s), {} ({} {})",
+            component.folder,
+            component.prefix,
+            component.weights.len(),
+            crate::ui::bytes(bytes),
+            component.library,
+            component.class,
+        );
+    }
+    for bundle in bundles_beside(path) {
+        println!(
+            "convert:   {bundle} sits beside them and is NOT read: a pipeline's \
+             weights are its components, and a single-file bundle is the same \
+             weights again for another tool"
+        );
+    }
+    Ok(())
+}
+
+/// Top-level `*.safetensors` files in a pipeline directory — FLUX.2's
+/// `flux-2-klein-4b.safetensors` and its kind.
+fn bundles_beside(path: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "safetensors"))
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    found.sort();
+    found
 }
 
 /// Compiles the source's tokenizer into its canonical form, if it has one.

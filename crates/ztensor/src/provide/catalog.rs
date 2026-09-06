@@ -194,6 +194,31 @@ impl Catalog {
         self.entries.into_iter()
     }
 
+    /// This catalog with every name rewritten by `f`.
+    ///
+    /// `f` must be injective over the names in it — two names mapped onto
+    /// one would silently lose an entry, so a collision is refused rather
+    /// than resolved by precedence, the same rule
+    /// [`Source::merge`](crate::Source::merge) applies across files.
+    pub(crate) fn renamed(self, f: impl Fn(&str) -> String) -> crate::Result<Catalog> {
+        let attributes = self.attributes;
+        let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+        for (name, entry) in self.entries {
+            let renamed = f(&name);
+            if let Some(previous) = entries.insert(renamed.clone(), entry) {
+                let _ = previous;
+                return Err(crate::Error::reject(
+                    crate::Rule::NameCollision,
+                    format!("renaming {name:?} to {renamed:?} displaces a tensor already there"),
+                ));
+            }
+        }
+        Ok(Catalog {
+            entries,
+            attributes,
+        })
+    }
+
     pub(crate) fn rebase(&mut self, f: impl Fn(StoreId) -> StoreId) {
         for entry in self.entries.values_mut() {
             match &mut entry.payload {

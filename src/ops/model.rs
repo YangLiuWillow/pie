@@ -117,13 +117,20 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     // refusal. `Snapshot::at` used to draw the line by returning `None`; this
     // draws it by looking, which is the same read the door would do first
     // anyway.
-    let weights = std::fs::read_dir(&snap).is_ok_and(|entries| {
-        entries.filter_map(|entry| entry.ok()).any(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".safetensors") || name.ends_with(".zt")
-        })
-    });
+    // **A DIFFUSERS PIPELINE KEEPS ITS WEIGHTS ONE LEVEL DOWN.** Z-Image and
+    // Wan 2.2 have nothing but JSON and subfolders at the top of the
+    // snapshot, so the flat listing below says "no safetensors" about a
+    // 20 GiB checkpoint. `model_index.json` is the statement that the
+    // components are the checkpoint; `checkpoint::file::diffusers` reads it.
+    let pipeline = checkpoint::file::diffusers::is_pipeline(&snap);
+    let weights = pipeline
+        || std::fs::read_dir(&snap).is_ok_and(|entries| {
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".safetensors") || name.ends_with(".zt")
+            })
+        });
     if !weights {
         return (false, "no safetensors".to_string());
     }
@@ -148,6 +155,14 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     };
     match runtime::engine::load::identify(&snap, platform) {
         Ok(sku) => (true, sku.to_string()),
+        // **A PIPELINE THIS BUILD SHIPS NO ROW FOR IS STILL A CHECKPOINT.**
+        // Identification is "the first catalog row whose contract builds",
+        // and the generative families are not in the catalog yet, so every
+        // pipeline answers no row at all. That is a fact about this build,
+        // not about the snapshot, and it is worth a different cell than the
+        // language-model "no SKU" — the operator has the weights, and what
+        // is missing is a family text.
+        Err(_) if pipeline => (false, "(no row)".to_string()),
         // One line, because this is a table cell. The full per-candidate
         // account is what `pie model import` prints when the load is
         // actually attempted.
