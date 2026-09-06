@@ -95,7 +95,14 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         ("pixels", vae::RGB, model::CHANNELS)
     );
     assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    assert_eq!(encode.port("pixels").map(|(index, _)| index), Some(0));
+    // The pixel clip STATES its index (`PortFact::at`), because the engine
+    // seats one voxel rectangle per index for the whole plan and the decode
+    // reading's 16-wide latent holds index 0. `ReadingFact::port` answers
+    // what `ports_indexed` does, which is the index the runtime binds at.
+    assert_eq!(
+        encode.port("pixels").map(|(index, _)| index),
+        Some(model::port::PIXEL_VOXELS)
+    );
     assert_eq!(decode.index, 3);
     assert_eq!(encode.index, 4);
 

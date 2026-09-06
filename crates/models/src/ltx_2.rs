@@ -17,6 +17,35 @@
 //! eight pinned distilled sigmas, no CFG) and the miniature
 //! `scripts/imagegen/ltx2_golden.py --mini` writes — two blocks, two heads a
 //! side at the REAL head widths, which is the parity fixture.
+//!
+//! # THREE FAULTS THIS TEXT FOUND, AND WHERE THEY WERE FIXED
+//!
+//! The first family with a modulation chain PER STREAM is the first to put
+//! two lane vectors of one shape in two classes, and the first to read one
+//! checkpoint tensor twice in one plane. Both broke silently:
+//!
+//! * **The arena aliased two live lane rectangles.** `RowExpr::cut_per_class`
+//!   said a `Dim::Lanes` value's rows are cut per class, so two of one shape
+//!   in two classes were placed at one offset as "two row windows of one
+//!   column" — but a lane-shaped chain is launched WITHOUT the staged seat
+//!   (`IMAGEGEN_CONTRACT.md` §7) and writes EVERY lane, so the video's
+//!   modulation vector and the audio's clobbered each other. Fixed in
+//!   `model_compiler::arena` (`Lanes` no longer cuts). Any two-stream text
+//!   with a per-stream conditioning vector was exposed to this.
+//! * **A cast from a run-collapsed source was refused.** `[x | x]` — this
+//!   family's head reads `[embedded_timestep | embedded_timestep]` — lowers
+//!   to ONE run repeated, whose extent carries its elements in
+//!   `element_bytes` rather than in `dims`, and the cast's element-count
+//!   check compared runs against elements. Fixed in
+//!   `checkpoint::executor::walk` (the check is now on the bytes the cast
+//!   PRODUCED). `wan_2`'s `head_proj` states the same doubling and would
+//!   have hit it the moment its miniature was imported.
+//! * **`elementwise.add_bias` folds IN PLACE.** One adaLN head serves all 48
+//!   blocks, so a block that added its `scale_shift_table` straight onto that
+//!   shared vector handed the next block the sum of every table before it.
+//!   This text copies first (`forward::table_add`), and
+//!   `the_ltx_2_rows_bake`'s claim (j) is the guard. **`wan_2::forward` does
+//!   the same thing to its `time_proj` vector and is still to be fixed.**
 
 pub mod forward;
 pub mod import;
