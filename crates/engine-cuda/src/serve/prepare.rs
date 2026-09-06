@@ -22,6 +22,19 @@ use super::{
 /// mask). `enqueue`: stream-only (prologue, memsets, staging write, tables,
 /// schedule, the walk). `settle`: post-sync (readback, capture, epilogue,
 /// `held`).
+/// How many resolved window tables a shell keeps (see step 4 of `prepare`).
+const WINDOWS_MEMO: usize = 8;
+
+/// One resolved window table and what it was resolved from.
+pub(super) struct WindowsMemo {
+    tables: [model_exec::fire::WindowTable; 2],
+    indptr_host: Vec<i32>,
+    bucket: u32,
+    copies: bool,
+    windows: Windows,
+    packed: Vec<i32>,
+}
+
 impl FrameShell for Shell {
     type Step<'a> = StepView<'a>;
     type Prepared<'a> = Prepared<'a>;
@@ -899,6 +912,7 @@ impl FrameShell for Shell {
             }
         }
         self.pools.commit_frame(demand, &kv_ranges)?;
+        super::btrace::mark("commit_frame");
 
         // 3. Page arithmetic, once per kv space.
         let indptr_host = kv::indptr(&seats)?;
@@ -907,6 +921,7 @@ impl FrameShell for Shell {
         let mut geometries = (0..self.spaces)
             .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
             .collect::<Result<Vec<_>>>()?;
+        super::btrace::mark("page_arith");
         // 3b. Explicit write descriptor overrides the derived `have + r`
         // landing, since several lanes appending into one shared pool would
         // otherwise collide at `have + 0`.
@@ -959,24 +974,63 @@ impl FrameShell for Shell {
         // key; only `self.copies` (toggled per fire by `Shell::set_copies`)
         // sits outside it.
         let copies_here = copies && masks.iter().all(|lane| lane.mask.is_none());
-        let mut windows = Windows::of(
-            &self.trace,
-            &self.compiled,
-            // One table per row axis, addressed by the axis.
-            model_ir::PerAxis::new([
-                composition.table(model_ir::RowAxis::Tokens),
-                composition.table(model_ir::RowAxis::Patches),
-            ]),
-            &indptr_host,
-            crate::window::Copies {
-                bucket,
-                enabled: copies_here,
-                spaces: &geometries,
-            },
-            // Fixed-width slots, so a recorded body's baked `indptr`
-            // pointer is right for every fire of its key.
-            self.inputs.window_slots(),
-        )?;
+        // **THE SAME COMPOSITION RESOLVES THE SAME WINDOWS.** Everything
+        // `Windows::of` reads besides the load constants is the two class
+        // tables, the row prefix sums, the bucket and the copy flag — and a
+        // steady decode frame hands it the same four every step. Resolving
+        // afresh walked every template region for ~110 us a frame, so the
+        // last few answers are kept and handed back by equality (no hash to
+        // collide). A table with a gathered window is never memoised: its
+        // payload is built from this fire's page geometry.
+        let class_tables = [
+            composition.table(model_ir::RowAxis::Tokens),
+            composition.table(model_ir::RowAxis::Patches),
+        ];
+        let held = self.windows_memo.iter().position(|memo| {
+            memo.bucket == bucket
+                && memo.copies == copies_here
+                && memo.indptr_host == indptr_host
+                && memo.tables[0] == *class_tables[0]
+                && memo.tables[1] == *class_tables[1]
+        });
+        let (mut windows, boundaries) = match held {
+            Some(at) => {
+                let memo = &self.windows_memo[at];
+                (memo.windows.clone(), memo.packed.clone())
+            }
+            None => {
+                let windows = Windows::of(
+                    &self.trace,
+                    &self.compiled,
+                    // One table per row axis, addressed by the axis.
+                    model_ir::PerAxis::new([class_tables[0], class_tables[1]]),
+                    &indptr_host,
+                    crate::window::Copies {
+                        bucket,
+                        enabled: copies_here,
+                        spaces: &geometries,
+                    },
+                    // Fixed-width slots, so a recorded body's baked `indptr`
+                    // pointer is right for every fire of its key.
+                    self.inputs.window_slots(),
+                )?;
+                let packed = windows.packed();
+                if windows.copied() == 0 {
+                    if self.windows_memo.len() >= WINDOWS_MEMO {
+                        self.windows_memo.remove(0);
+                    }
+                    self.windows_memo.push(WindowsMemo {
+                        tables: [class_tables[0].clone(), class_tables[1].clone()],
+                        indptr_host: indptr_host.clone(),
+                        bucket,
+                        copies: copies_here,
+                        windows: windows.clone(),
+                        packed: packed.clone(),
+                    });
+                }
+                (windows, packed)
+            }
+        };
         // The synthetic pass is not the last fire anybody means.
         if !arming {
             self.last = FireCost {
@@ -984,11 +1038,12 @@ impl FrameShell for Shell {
                 copied: windows.copied(),
             };
         }
-        let boundaries = windows.packed();
+        super::btrace::mark("windows_of");
 
         // 4b. Mask bits, expanded here once, off the same `have`/`rows` the
         // page geometry used. `None` means no lane masked.
         let staged = crate::mask::stage(&masks)?;
+        super::btrace::mark("mask");
 
         // Body key's class ladder, built from the key's own coordinates
         // (bucket, decode class, lane ceiling), not this fire's actual
@@ -1020,6 +1075,7 @@ impl FrameShell for Shell {
         } else {
             (Vec::new().into(), true)
         };
+        super::btrace::mark("segmentation");
         let bodied = records_bodies
             && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
             && Self::keyable_units(&self.compiled)
@@ -1031,6 +1087,7 @@ impl FrameShell for Shell {
             // operator), through a memo since it's a function of the key.
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
+        super::btrace::mark("cuttable");
 
         // Arming pins the key a synthetic fire landed on
         // (`Shell::arm_bodies`).

@@ -364,6 +364,7 @@ impl Shell {
             arming: false,
             armed_body: None,
             segments: std::collections::HashMap::new(),
+            windows_memo: Vec::new(),
             last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();

@@ -390,6 +390,7 @@ impl FireCtx<'_> {
             })
             .collect();
 
+        super::btrace::mark("seats");
         let bindings = FireBindings {
             tokens: handles.tokens,
             positions: handles.positions,
@@ -505,6 +506,7 @@ impl FireCtx<'_> {
                 lanes: &p.rs.moves,
             });
         }
+        super::btrace::mark("run_new");
         // A buffered fire and a rotating load are not graph-replayable: both walk.
         let records = self.graphs.records()
             && !p.rs.buffered

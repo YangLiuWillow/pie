@@ -173,6 +173,98 @@ impl Buffer {
         }
     }
 
+    /// [`Buffer::stage_from`] for several spans in ONE runtime call
+    /// (`cudaMemcpyBatchAsync`), falling back to one call per span where the
+    /// runtime refuses the batch. A frame stages its fifteen input vectors
+    /// off one pinned slot, and fifteen `cudaMemcpyAsync` calls cost ~3 us
+    /// of host time each on the engine thread's critical path.
+    ///
+    /// # Safety
+    ///
+    /// Every `src .. src + len` must be a live, page-locked host allocation
+    /// that stays unwritten until the copies complete on `stream`.
+    /// # Errors: [`Fault::Ceiling`] for a span past this allocation, [`Fault::Device`] for a copy.
+    pub unsafe fn stage_batch_from(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        spans: &[(u64, *const u8, usize)],
+    ) -> Result<()> {
+        for &(offset, _, len) in spans {
+            self.span(offset, len)?;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            /// Set once the runtime refuses a batch: every later call goes span by span.
+            static REFUSED: AtomicBool = AtomicBool::new(false);
+
+            let live: Vec<(u64, *const u8, usize)> = spans
+                .iter()
+                .copied()
+                .filter(|&(_, _, len)| len > 0)
+                .collect();
+            if live.is_empty() {
+                return Ok(());
+            }
+            if live.len() > 1 && !REFUSED.load(Ordering::Relaxed) {
+                let dsts: Vec<*mut core::ffi::c_void> = live
+                    .iter()
+                    .map(|&(offset, _, _)| (self.ptr + offset) as *mut core::ffi::c_void)
+                    .collect();
+                let srcs: Vec<*const core::ffi::c_void> =
+                    live.iter().map(|&(_, src, _)| src.cast()).collect();
+                let sizes: Vec<usize> = live.iter().map(|&(_, _, len)| len).collect();
+                let mut device: i32 = 0;
+                // SAFETY: plain query.
+                let _ = unsafe { rt::cudaGetDevice(&raw mut device) };
+                let mut attrs = [rt::cudaMemcpyAttributes {
+                    srcAccessOrder: rt::cudaMemcpySrcAccessOrder::cudaMemcpySrcAccessOrderStream,
+                    srcLocHint: rt::cudaMemLocation {
+                        type_: rt::cudaMemLocationType::cudaMemLocationTypeHost,
+                        id: 0,
+                    },
+                    dstLocHint: rt::cudaMemLocation {
+                        type_: rt::cudaMemLocationType::cudaMemLocationTypeDevice,
+                        id: device,
+                    },
+                    flags: 0,
+                }];
+                let mut attrs_at = [0usize];
+                // SAFETY: every destination span is checked above; the sources are the caller's promise.
+                let status = unsafe {
+                    rt::cudaMemcpyBatchAsync(
+                        dsts.as_ptr(),
+                        srcs.as_ptr(),
+                        sizes.as_ptr(),
+                        live.len(),
+                        attrs.as_mut_ptr(),
+                        attrs_at.as_mut_ptr(),
+                        1,
+                        stream.cast(),
+                    )
+                };
+                if status == rt::cudaError::cudaSuccess {
+                    return Ok(());
+                }
+                // Clear the sticky error and take the span-by-span road from now on.
+                let _ = unsafe { rt::cudaGetLastError() };
+                REFUSED.store(true, Ordering::Relaxed);
+            }
+            for (offset, src, len) in live {
+                // SAFETY: as above, one span at a time.
+                unsafe { self.stage_from(stream, offset, src, len)? };
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = stream;
+            Err(Fault::Runtimeless)
+        }
+    }
+
     /// Copy `len` bytes from a host address on `stream` — [`Buffer::stage`]'s
     /// twin, but genuinely asynchronous since the source is pinned memory.
     ///
