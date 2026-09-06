@@ -230,6 +230,13 @@ struct LaneState {
     /// stated it. Owner-scoped: the key is `(owner, group)`. `None` for a
     /// lane in no group — the overwhelming majority, and the reason the
     /// group rules below cost an ungrouped fleet one `Option` test.
+    ///
+    /// Set by any fire that states a group and never cleared, because the
+    /// two mistakes are not symmetric: a stale membership costs a hold that
+    /// the silence timeout bounds, while forgetting one costs a fire that
+    /// attends half its group and answers plausibly. A pipeline is a lane
+    /// of one group for its life anyway — `latent::DenoiseLoop` owns one
+    /// pipeline per lane and closes it, which purges the lane.
     group: Option<u32>,
     /// Fired into the current boundary, or written off by
     /// [`FramePolicy::close_boundary`]. Cleared on every new boundary; a
