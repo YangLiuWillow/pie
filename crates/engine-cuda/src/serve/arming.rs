@@ -703,6 +703,7 @@ impl Shell {
                 // [`Shell::golden_real`] is the one caller that states
                 // anything else.
                 held: lane.held,
+                kv_less: false,
                 // The arming pass resolves no port, so it crosses no space.
                 translation: &[],
                 mask: lane.mask.as_ref(),

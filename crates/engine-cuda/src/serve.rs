@@ -677,6 +677,9 @@ pub struct Prepared<'a> {
     seats: Vec<Seat>,
     /// Each lane's stated page table, parallel to `seats`; empty for the shell's.
     tables: Vec<std::borrow::Cow<'a, [u32]>>,
+    /// Parallel to `seats`: the lane binds no kv space, so its slot's count
+    /// stays where it was (`Seated::kv_less`).
+    kv_less_seats: Vec<bool>,
     /// Page arithmetic, once per kv space.
     geometries: Vec<kv::Geometry>,
     /// How many page ids the first space carved.

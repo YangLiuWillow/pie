@@ -27,6 +27,9 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
     /// How many kv tokens the slot already holds. `None` asks the shell.
     pub held: Option<u32>,
+    /// The lane's reading binds no kv space (`engine::Lane::kv_less`): its
+    /// seat holds 0 tokens every fire and the shell's count never moves.
+    pub kv_less: bool,
     /// The working set's flat table for a device-geometry lane; empty otherwise.
     pub translation: &'a [u32],
     /// An explicit attention mask over the lane's readable extent.
@@ -67,6 +70,7 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            kv_less: false,
             translation: &[],
             mask: None,
             adapter: None,

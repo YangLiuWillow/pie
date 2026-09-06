@@ -1392,6 +1392,7 @@ impl Cuda {
                     },
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    kv_less: lane.kv_less,
                     // `pages` is already pool ids; this is the table the
                     // ports resolved off the rings still have to go through.
                     translation: &lane.kv.translation,

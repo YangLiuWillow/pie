@@ -119,6 +119,9 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         lanes: vec![::engine::Lane {
             tokens: vec![0; rows as usize],
             readout: ::engine::Readout::Rows((0..rows).collect()),
+            // A float lane binds no kv space: the shell seats no tokens
+            // for it and carries no count between fires.
+            kv_less: true,
             ..::engine::Lane::default()
         }],
         ..crate::engine::FireRequest::default()
