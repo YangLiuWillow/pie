@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 use checkpoint::contract::ModelContract;
 use model_dsl::Dtype;
 
-pub use model_dsl::{ClassifyFn, Platform, Request, biases_name, scales_name};
+pub use model_dsl::{ClassifyFn, Platform, Request, Stream, biases_name, scales_name};
 
 /// What a SKU is: the text it serves, the numeric forms its weight banks are
 /// stored in (dense first, then routed experts when they differ), the kv
@@ -71,6 +71,187 @@ pub struct Sku {
     /// stated by the family beside its rows rather than derived from a
     /// name.
     pub diffusion: Option<Diffusion>,
+    /// What a generative family (a DiT, a VAE, an encoder-plus-denoiser
+    /// composite) states about its readings, latent space and schedule —
+    /// the facts `model.readings()`/`latent()`/`schedule()` answer (design
+    /// D12). `None` for every text row, which has one implicit reading and
+    /// no latent. Set beside `diffusion`, never derived from a name.
+    pub generative: Option<Generative>,
+}
+
+/// A generative family's guest-facing facts (design D12): the readings its
+/// plan carries as guarded arms, the latent space its denoiser works in,
+/// the schedule it was trained under, and the widest latent row count one
+/// pass may carry. Everything a guest sizes a job from, so it never parses
+/// `architecture()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Generative {
+    /// The plan's readings, in `index` order: index `i` is `Request::in_reading(i)`,
+    /// the arm a lane stamped `reading = i` runs. `0` is the family's
+    /// default arm. Names are the family's (`"text"`, `"denoise"`,
+    /// `"denoise.low"`, `"vae.decode"`, ...); a guest names one per pass.
+    pub readings: Vec<ReadingFact>,
+    /// The latent space the denoise/VAE readings work in; `None` for a
+    /// family with no latent (an encoder-only row).
+    pub latent: Option<LatentSpace>,
+    /// The noise schedule the denoiser was trained under; `None` when no
+    /// reading denoises.
+    pub schedule: Option<ScheduleFact>,
+    /// The most latent rows one pass may carry (`Budget::max_tokens` for a
+    /// float lane, D13): the guest sizes its latent channels under this.
+    pub max_rows: u32,
+}
+
+/// One reading of a generative plan: which streams a request submits lanes
+/// on, what it binds, what it reads back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadingFact {
+    /// The name a guest passes to `forward-pass.reading`.
+    pub name: &'static str,
+    /// `Request::in_reading`'s index — the arm's fact value. Unique per
+    /// family; the position in `Generative::readings` must agree.
+    pub index: u8,
+    /// This reading declares a KV space: `attention(kv, geom)` is required
+    /// on its pass. `false` refuses it by name (a DiT's denoise, a VAE).
+    pub has_kv: bool,
+    /// This reading embeds token rows: `embed(tokens, indptr)` is required
+    /// on its pass. `false` refuses it; the lane's row count then comes
+    /// from the latents port's channel shape.
+    pub takes_tokens: bool,
+    /// Which lane streams a request submits — one pass per stream when
+    /// there are several (`forward-pass.stream`), all in one attention
+    /// group. Empty means `Text` only.
+    pub streams: Vec<Stream>,
+    /// The float input ports, in the order the trace numbers them within
+    /// each kind: the `n`th `Latents` port here is `Input::latents(n, ..)`.
+    pub ports: Vec<PortFact>,
+    /// Which export seam the epilogue reads (`logits()`, `velocity()`,
+    /// `hidden()`).
+    pub readout: ReadoutKind,
+    /// The readout row's width: the vocabulary for logits, `C·p^k` for a
+    /// velocity, the hidden width for a hidden readout.
+    pub readout_width: u32,
+}
+
+impl ReadingFact {
+    /// The port named `name`, with its index among ports of its kind —
+    /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
+    #[must_use]
+    pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
+        let port = self.ports.iter().find(|port| port.name == name)?;
+        let index = self
+            .ports
+            .iter()
+            .take_while(|p| p.name != name)
+            .filter(|p| p.kind == port.kind)
+            .count();
+        Some((u8::try_from(index).unwrap_or(u8::MAX), port))
+    }
+
+    /// Every port with its kind-relative index, in declaration order.
+    pub fn ports_indexed(&self) -> impl Iterator<Item = (u8, &PortFact)> + '_ {
+        let mut seen = [0u8; 4];
+        self.ports.iter().map(move |port| {
+            let slot = match port.kind {
+                PortKind::Latents => 0,
+                PortKind::LaneVector => 1,
+                PortKind::Context => 2,
+                PortKind::AxisPositions => 3,
+            };
+            let index = seen[slot];
+            seen[slot] = seen[slot].saturating_add(1);
+            (index, port)
+        })
+    }
+}
+
+/// One float input port a reading declares (design D3), as the guest binds
+/// it with `forward-pass.input(name, channel)`. The channel is always `f32`
+/// on the guest side (`types.dtype` has no bf16); the model's own element
+/// type is the engine's marshal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortFact {
+    /// The name the family states (`"latents"`, `"timestep"`, `"context"`,
+    /// `"positions"`, `"guidance"`, ...).
+    pub name: &'static str,
+    /// Which `RuntimeInput` kind feeds it, and so what shape the channel is.
+    pub kind: PortKind,
+    /// The row width: `channels` for latents/context/lane-vector, the axis
+    /// count for axis positions. Latents and context channels are
+    /// `[rows, width]`; a lane vector is `[width]` or `[1, width]`.
+    pub width: u32,
+}
+
+/// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PortKind {
+    /// `RuntimeInput::Latents`: `[rows, width]`, the lane's own rows.
+    Latents,
+    /// `RuntimeInput::LaneVector`: one `[width]` row per lane (timestep,
+    /// guidance, per-modality sigma).
+    LaneVector,
+    /// `RuntimeInput::Context`: `[rows, width]`, a context lane's rows.
+    Context,
+    /// `RuntimeInput::AxisPositions`: `[rows, axes]` f32, `1..=4` axes.
+    AxisPositions,
+}
+
+/// Which export seam a reading's epilogue reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadoutKind {
+    /// `seam::OUT`, `intrinsics::logits()`.
+    Logits,
+    /// `seam::VELOCITY`, `intrinsics::velocity(width)`.
+    Velocity,
+    /// `seam::HIDDEN`, `intrinsics::hidden(width)`.
+    Hidden,
+}
+
+/// The latent space a family's denoiser works in: what one latent row is
+/// and how it maps back to pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatentSpace {
+    /// VAE latent channels.
+    pub channels: u32,
+    /// Patch extents: one latent row is `patch_t × patch_h × patch_w`
+    /// latent cells, so a row carries `channels · patch_t · patch_h ·
+    /// patch_w` values.
+    pub patch_t: u32,
+    pub patch_h: u32,
+    pub patch_w: u32,
+    /// Pixels per latent cell along height and width.
+    pub spatial_compression: u32,
+    /// Frames per latent cell along time (1 for an image model).
+    pub temporal_compression: u32,
+}
+
+/// The noise schedule a denoiser was trained under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleFact {
+    pub kind: ScheduleKind,
+    /// The trained timestep shift (`1.0` = none); a flow model's `mu`
+    /// base when it shifts dynamically by token count.
+    pub shift: f32,
+    /// Training steps the timestep axis is scaled by (1000 for the
+    /// diffusers families).
+    pub train_steps: u32,
+    /// The sigma at which a two-backbone family hands over from its high-
+    /// noise arm to its low-noise arm; `None` for one backbone.
+    pub boundary: Option<f32>,
+    /// A distilled model's pinned sigma list, descending, `1.0 -> 0.0`
+    /// exclusive of the final zero; empty when the guest builds its own.
+    pub pinned_sigmas: Vec<f32>,
+}
+
+/// Which prediction target the schedule's velocity is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScheduleKind {
+    /// Rectified flow: `v = x1 - x0`, `x <- x + (sigma' - sigma) · v`.
+    Flow,
+    /// DDPM-style epsilon prediction.
+    Epsilon,
+    /// v-prediction.
+    V,
 }
 
 /// A block-diffusion row's canvas: how many tokens one block is, and the
@@ -128,6 +309,7 @@ macro_rules! skus {
                 template: $template,
                 tokenizer: $tokenizer,
                 diffusion: None,
+                generative: None,
             }
         } ),+ ]
     };

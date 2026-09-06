@@ -678,6 +678,12 @@ pub fn register(
     })?;
     let classify = catalog_row.classify;
     let diffusion = catalog_row.diffusion;
+    let generative = catalog_row.generative.clone();
+    if let Some(generative) = &generative {
+        validate_generative(generative).map_err(|fault| {
+            anyhow!("`{}` states generative facts this runtime refuses: {fault}", row.id)
+        })?;
+    }
 
     let model = Arc::new(Model {
         name,
@@ -692,11 +698,106 @@ pub fn register(
         vocab_size,
         num_layers,
         diffusion,
+        generative,
     });
     MODEL.set(model).map_err(|_| {
         anyhow!("a model is already registered; the runtime serves exactly one model")
     })?;
     Ok(())
+}
+
+/// What a family's generative facts must satisfy for the host to resolve
+/// readings and ports by name: indices dense from 0 in declaration order,
+/// names unique, port names unique within a reading, widths non-zero, a
+/// velocity/hidden readout stating its width, at most four axes on a
+/// positions port, one velocity width across readings (the eta
+/// `ModelProfile` carries one).
+pub fn validate_generative(generative: &models::Generative) -> Result<(), String> {
+    let mut velocity_width = None;
+    for (at, reading) in generative.readings.iter().enumerate() {
+        if usize::from(reading.index) != at {
+            return Err(format!(
+                "reading `{}` sits at position {at} but states index {}; readings are \
+                 listed in index order, dense from 0",
+                reading.name, reading.index
+            ));
+        }
+        if reading.name.is_empty() {
+            return Err(format!("reading {at} has an empty name"));
+        }
+        if generative.readings[..at].iter().any(|r| r.name == reading.name) {
+            return Err(format!("reading `{}` is declared twice", reading.name));
+        }
+        if reading.readout_width == 0 {
+            return Err(format!(
+                "reading `{}` states a zero-width readout",
+                reading.name
+            ));
+        }
+        if reading.readout == models::ReadoutKind::Velocity {
+            match velocity_width {
+                None => velocity_width = Some(reading.readout_width),
+                Some(width) if width != reading.readout_width => {
+                    return Err(format!(
+                        "reading `{}` reads a velocity {} wide beside another reading's {width}; \
+                         the eta profile carries one velocity width",
+                        reading.name, reading.readout_width
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        for (i, port) in reading.ports.iter().enumerate() {
+            if port.name.is_empty() {
+                return Err(format!("reading `{}` port {i} has an empty name", reading.name));
+            }
+            if reading.ports[..i].iter().any(|p| p.name == port.name) {
+                return Err(format!(
+                    "reading `{}` declares port `{}` twice",
+                    reading.name, port.name
+                ));
+            }
+            if port.width == 0 {
+                return Err(format!(
+                    "reading `{}` port `{}` states a zero width",
+                    reading.name, port.name
+                ));
+            }
+            if port.kind == models::PortKind::AxisPositions && port.width > 4 {
+                return Err(format!(
+                    "reading `{}` port `{}` states {} axes; a positions port carries 1..=4",
+                    reading.name, port.name, port.width
+                ));
+            }
+        }
+        if !reading.takes_tokens
+            && !reading
+                .ports
+                .iter()
+                .any(|port| port.kind == models::PortKind::Latents)
+        {
+            return Err(format!(
+                "reading `{}` embeds no tokens and declares no latents port; nothing states \
+                 its lane's row count",
+                reading.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `velocity()` intrinsic's gate and width, read off the family's
+/// readings (design D12): available iff some reading reads back a velocity,
+/// and as wide as that reading's readout row. `validate_generative` has
+/// already refused readings that disagree on the width, so the first one
+/// is the family's. The engine fills its side of the same profile from the
+/// plan's `seam::VELOCITY` rectangle; both must agree, and both come from
+/// the family's one statement.
+pub fn velocity_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
+    readings
+        .iter()
+        .find(|reading| reading.readout == models::ReadoutKind::Velocity)
+        .map_or((false, 0), |reading| (true, reading.readout_width))
 }
 
 /// Returns the single registered model. Panics if called before bootstrap
@@ -758,6 +859,11 @@ pub struct Model {
     /// autoregressive row. Read off the catalog row at registration; what
     /// `pass-kind() == diffusion` and `canvas()` answer from.
     diffusion: Option<models::Diffusion>,
+    /// A generative family's readings, latent space and schedule (design
+    /// D12); `None` for a text row. What `model.readings()` / `latent()` /
+    /// `schedule()` / `max-latent-rows()` answer from, and what
+    /// `forward-pass.reading` / `input` resolve against.
+    generative: Option<models::Generative>,
 }
 
 /// RS (recurrent-state) working-set capabilities surfaced to inferlets via
@@ -916,6 +1022,8 @@ impl Model {
         media: bool,
         block_draft: bool,
         denoise: bool,
+        stream: models::Stream,
+        reading: u8,
     ) -> u64 {
         (self.classify)(
             &models::Request::new(query_len, custom_mask)
@@ -924,7 +1032,9 @@ impl Model {
                 .capturing_scores(captures_scores)
                 .with_media(media)
                 .drafting_a_block(block_draft)
-                .denoising(denoise),
+                .denoising(denoise)
+                .on_stream(stream)
+                .in_reading(reading),
         )
     }
 
@@ -933,6 +1043,29 @@ impl Model {
     /// autoregressive one.
     pub fn diffusion(&self) -> Option<models::Diffusion> {
         self.diffusion
+    }
+
+    /// The generative facts the family states, or `None` for a text row.
+    pub fn generative(&self) -> Option<&models::Generative> {
+        self.generative.as_ref()
+    }
+
+    /// The readings the family declares, in index order; empty for a text
+    /// row (one implicit reading).
+    pub fn readings(&self) -> &[models::ReadingFact] {
+        self.generative
+            .as_ref()
+            .map_or(&[], |generative| generative.readings.as_slice())
+    }
+
+    /// The reading a pass runs when it names none: the family's only
+    /// reading, or `None` when it must choose (several) or there is
+    /// nothing to choose (a text row, whose implicit reading is index 0).
+    pub fn sole_reading(&self) -> Option<&models::ReadingFact> {
+        match self.readings() {
+            [only] => Some(only),
+            _ => None,
+        }
     }
 
     pub fn kv_page_size(&self) -> u32 {
