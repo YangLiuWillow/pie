@@ -461,7 +461,8 @@ pub fn precast_point(op: &'static str, form: &str, bm: i32, bn: i32) -> Result<&
 
 /// The routed tiled point whose weight loader dequantizes straight to `half`, stamped at gs=64/b=4 alone.
 pub fn routed_fp16_point(op: &'static str, bm: i32, bn: i32) -> Result<&'static str, Error> {
-    check(op, &TILES, bm, "row tile")?;
+    // The fp16 routed family is the one stamped at the 8-row rung too.
+    check(op, &ROW_TILES, bm, "row tile")?;
     check(op, &TILES, bn, "column tile")?;
     Ok(symbol(&format!(
         "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"

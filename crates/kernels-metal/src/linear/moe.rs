@@ -36,7 +36,7 @@ const QMM_GROUP: [u32; 3] = [32, 2, 2];
 const QMM_BK: u32 = 32;
 
 /// The three row tiles a routed GEMM is compiled for, narrow first.
-const MOE_TILE_ROWS: [u32; 3] = [16, 32, 64];
+const MOE_TILE_ROWS: [u32; 4] = [8, 16, 32, 64];
 
 /// The column tiles it is compiled for, narrow first.
 const MOE_TILE_COLS: [u32; 3] = [16, 32, 64];
@@ -57,16 +57,24 @@ pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
 /// routing decline rather than doing extra arithmetic.
 #[must_use]
 pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
-    if !should_batch(pairs, experts, tuning.moe_batch_min_per_expert) {
+    // Two doors into the sorted arm: enough pairs per expert, or — for a
+    // fire whose few rows share their experts, a verify block — enough
+    // pairs in all (`moe_batch_min_pairs`, 0 keeps this door shut).
+    let by_pairs = tuning.moe_batch_min_pairs > 0 && pairs >= tuning.moe_batch_min_pairs;
+    if !should_batch(pairs, experts, tuning.moe_batch_min_per_expert) && !by_pairs {
         return 1;
     }
     let per = pairs / experts;
     if per >= tuning.moe_tile_wide_per {
-        return MOE_TILE_ROWS[2];
+        return MOE_TILE_ROWS[3];
     }
     if per >= tuning.moe_tile_mid_per {
+        MOE_TILE_ROWS[2]
+    } else if per >= 1 {
         MOE_TILE_ROWS[1]
     } else {
+        // Fewer pairs than experts: the touched experts hold a few rows each,
+        // and the 8-row tile pads them least.
         MOE_TILE_ROWS[0]
     }
 }
@@ -858,7 +866,7 @@ pub fn matmul_select_batched(
     let fan = selected(op, x, routes, y)?;
     routed_bank(op, x, bank)?;
     let pairs = y.rows;
-    let tile = tile_rows(pairs, experts, tuning);
+    let mut tile = tile_rows(pairs, experts, tuning);
     if tile <= 1 {
         return Ok(false);
     }
@@ -869,10 +877,20 @@ pub fn matmul_select_batched(
         return Ok(false);
     }
     let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
+    // Only the fp16 affine-4/64 family is stamped at the 8-row rung; the
+    // others take the 16-row tile they always took.
+    if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
+        tile = MOE_TILE_ROWS[1];
+    }
     let Some(point) = batched_point(op, bank, bias.is_some(), tile, bn, fp16)? else {
         return Ok(false);
     };
-    let padded = sorted_rows(pairs, experts, tuning);
+    let padded = {
+        // `sorted_rows` at THIS tile (it may have been widened just above).
+        let touched = pairs.min(experts);
+        let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
+        bound.div_ceil(tile) * tile
+    };
     debug_assert!(
         scratch.x.rows >= padded && scratch.y.rows >= padded,
         "`{op}`'s sorted stack is `sorted_rows` deep"
@@ -947,7 +965,7 @@ pub fn matmul_select_batched(
                     stated(op, tile)?,
                     1,
                 )?,
-                QMM_GROUP,
+                crate::linear::quant::qmm_group(stated(op, tile)?),
             )),
         &args,
     )?;

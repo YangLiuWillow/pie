@@ -153,6 +153,25 @@ pub struct DeviceTuning {
     /// arm names.
     pub moe_batch_min_per_expert: u32,
 
+    /// Pairs (token rows x top_k) at which the mixture sorts and batches
+    /// REGARDLESS of pairs per expert — the door for a verify block, whose
+    /// 8-16 rows route to a few experts each (gemma-4-26B-A4B: ~5 rows an
+    /// expert), where the matvec arm dequantizes every expert once per pair
+    /// and the sorted arm's 8-row tile once per expert.
+    ///
+    /// Default: 0 — the door is shut, and [`moe_batch_min_per_expert`]
+    /// alone decides. **MEASURED AND IT LOSES** (gemma-4-26B-A4B, M4 Pro,
+    /// 2026-09-06, `moe_batch_min_pairs = 64`): the 8-row verify's routed
+    /// projections went 18.8 ms (matvec, 64 pairs) to 44.6 ms (8-row tile,
+    /// ~20 experts touched), the 16-row 34.6 to 56.4. With a few rows an
+    /// expert the tile launches ~20 x 22 threadgroups, each walking 88 k
+    /// steps behind barriers: latency-bound, where the matvec's one
+    /// threadgroup per (pair, output block) fills the machine. The knob
+    /// stays so the next kernel shape can be measured the same way.
+    ///
+    /// [`moe_batch_min_per_expert`]: Self::moe_batch_min_per_expert
+    pub moe_batch_min_pairs: u32,
+
     /// The widest row group the vector point folds into one weight fetch.
     ///
     /// Default: 2. `1` disables the fold and restores `quant_qmv.metal`'s
@@ -236,6 +255,7 @@ impl Default for DeviceTuning {
             gdn_scan_lanes: 32,
             gdn_scan_rows: 4,
             moe_batch_min_per_expert: 2,
+            moe_batch_min_pairs: 0,
             qmv_rows_max: 8,
             qmv_rows_packs: 1,
             stream_rows_per_cut: 0,
@@ -295,6 +315,7 @@ impl DeviceTuning {
             gdn_scan_lanes,
             gdn_scan_rows,
             moe_batch_min_per_expert,
+            moe_batch_min_pairs,
             qmv_rows_max,
             qmv_rows_packs,
             stream_rows_per_cut,
@@ -341,6 +362,7 @@ pub struct Overrides {
     pub gdn_scan_lanes: Option<u32>,
     pub gdn_scan_rows: Option<u32>,
     pub moe_batch_min_per_expert: Option<u32>,
+    pub moe_batch_min_pairs: Option<u32>,
     pub qmv_rows_max: Option<u32>,
     pub qmv_rows_packs: Option<u32>,
     pub stream_rows_per_cut: Option<u32>,
