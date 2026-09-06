@@ -1165,6 +1165,14 @@ impl Run<'_> {
                             ref_start: self.reference_start_of(*q_tags),
                         }
                     }
+                    // The table is a `[heads, 2·max_len − 1]` plan constant
+                    // (`Dim::Const` rows), handed whole like the group tables.
+                    model_ir::RaggedMask::RelativeBias { table, max_len } => {
+                        kernels_cuda::attn_ragged::RaggedMask::RelativeBias {
+                            table: self.tensor(*table),
+                            max_len: *max_len,
+                        }
+                    }
                 };
                 kernels_cuda::attn_ragged::ragged(
                     self.ctx(),

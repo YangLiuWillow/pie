@@ -5,6 +5,8 @@ use super::*;
 
 pub use model_ir::ops::elemwise::Yarn;
 
+use crate::Recorder;
+
 pub fn rmsnorm(x: &Value, weight: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -843,6 +845,72 @@ pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale:
             y: y.id(),
         },
         &[t],
+    );
+    y
+}
+
+/// The dense relative-position bias table a bidirectional encoder layer's
+/// attention adds to its logits: `[heads, 2·max_len − 1]` f32, column
+/// `d + max_len − 1` holding `embedding[bucket(d)][h]` for the signed
+/// distance `d = kj − qi`, `bucket` being the T5 relative-position bucket
+/// function (Hugging Face's `_relative_position_bucket`; the exact
+/// statement is on [`Elementwise::RelativeBucketBias`]). `embedding` is the
+/// checkpoint's `[num_buckets, heads]` plane (`relative_attention_bias.weight`).
+/// A constant of the plan — it reads no activation, so it takes the
+/// recorder ([`Input::recorder`](crate::Input::recorder)) rather than a
+/// value — traced once per layer that owns an embedding and handed to
+/// [`attn::relative_bias`](super::attn::relative_bias). `max_len` is the
+/// longest segment the table answers exactly.
+pub fn relative_bucket_bias(
+    r: &Recorder,
+    embedding: &Weight,
+    max_len: u32,
+    num_buckets: u32,
+    max_distance: f32,
+    bidirectional: bool,
+) -> Value {
+    assert!(
+        embedding.shape.len() == 2 && embedding.shape[0] == u64::from(num_buckets),
+        "`{}` is {:?}; a bucket embedding is `[num_buckets = {num_buckets}, heads]`",
+        embedding.name,
+        embedding.shape
+    );
+    assert!(
+        matches!(embedding.dtype, Dtype::Bf16 | Dtype::F32),
+        "`{}` is {:?}; the table reads a bf16 or f32 embedding",
+        embedding.name,
+        embedding.dtype
+    );
+    let directional = if bidirectional {
+        num_buckets / 2
+    } else {
+        num_buckets
+    };
+    let max_exact = directional / 2;
+    assert!(max_exact > 0, "{num_buckets} buckets leave no exact band");
+    assert!(
+        max_distance > max_exact as f32,
+        "max_distance {max_distance} is at or below max_exact {max_exact}"
+    );
+    assert!(max_len > 0, "a table over no positions has no width");
+    let heads = embedding.shape[1];
+    let y = r.fresh(Ty::Tensor {
+        shape: vec![
+            Dim::Const(heads),
+            Dim::Const(2 * u64::from(max_len) - 1),
+        ],
+        dtype: Dtype::F32,
+    });
+    r.push(
+        Elementwise::RelativeBucketBias {
+            embedding: r.weight(embedding),
+            max_len,
+            num_buckets,
+            max_distance,
+            bidirectional,
+            y: y.id(),
+        },
+        &[],
     );
     y
 }

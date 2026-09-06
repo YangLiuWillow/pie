@@ -1289,6 +1289,42 @@ pub fn ragged(
     o.under(q.cond())
 }
 
+/// The [`RaggedMask::RelativeBias`] a [`ragged`] attention adds from
+/// `table`, a `[heads, 2·max_len − 1]` f32 value
+/// ([`elemwise::relative_bucket_bias`](super::elemwise::relative_bucket_bias),
+/// or any constant the text computes — an ALiBi slope table), checked here
+/// where the value is at hand: one row per query head of the attention it
+/// is handed to (which `ragged` cannot see through an id), the width the
+/// arm reads.
+#[must_use]
+pub fn relative_bias(table: &Value, max_len: u32) -> RaggedMask {
+    assert!(
+        max_len > 0,
+        "a relative bias over no positions has no width"
+    );
+    assert_eq!(
+        table.dtype(),
+        Dtype::F32,
+        "the relative bias table is f32, not {:?}",
+        table.dtype()
+    );
+    assert_eq!(
+        table.width(),
+        2 * u64::from(max_len) - 1,
+        "the relative bias table is {} wide and max_len {max_len} reads 2 · max_len − 1",
+        table.width()
+    );
+    assert!(
+        matches!(table.rows(), Dim::Const(_)),
+        "the relative bias table is a plan constant, `[heads, 2·max_len − 1]`, not {:?} rows",
+        table.rows()
+    );
+    RaggedMask::RelativeBias {
+        table: table.id(),
+        max_len,
+    }
+}
+
 /// Bidirectional attention over the patch window, block-diagonal per image.
 /// `segments` is the patch axis's indptr: patch row `n` attends over the rows
 /// of the image whose span contains it, both ways, and nothing else.
