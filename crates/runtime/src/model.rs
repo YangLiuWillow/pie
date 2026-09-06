@@ -582,6 +582,29 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "flux_2",
     },
+    // Wan 2.2 TI2V-5B (M3). `layers` is the umT5-xxl encoder's depth the
+    // `text` reading runs; `vocab` is that encoder's embedding width, which
+    // the reading embeds by — no reading of this family has logits.
+    Row {
+        id: "wan22-ti2v-5b-bf16-kv-bf16",
+        layers: 24,
+        vocab: 256_384,
+        arch: "wan_2",
+    },
+    // The miniatures: the transformer alone, two blocks, no encoder and so
+    // no vocabulary.
+    Row {
+        id: "wan22-mini-d128-bf16-kv-bf16",
+        layers: 2,
+        vocab: 0,
+        arch: "wan_2",
+    },
+    Row {
+        id: "wan22-mini-nano-bf16-kv-bf16",
+        layers: 2,
+        vocab: 0,
+        arch: "wan_2",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
