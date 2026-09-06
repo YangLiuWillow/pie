@@ -149,9 +149,6 @@ impl ReadingFact {
     /// The port named `name`, with its index among ports of its kind —
     /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
     #[must_use]
-    /// The index is [`ports_indexed`](ReadingFact::ports_indexed)'s, so a
-    /// port that STATES its index (`PortFact::at`) resolves to that one and
-    /// not to its position among its kind.
     pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
         // Through `ports_indexed`, so a port that STATES its index
         // (`PortFact::at`) resolves to the index the trace reads it at and

@@ -228,8 +228,16 @@ fn side(
         &[1, 0, 2, 4, 3, 5, 7, 6, 8],
     )?;
     // `[5, dim]`: the four scale/shift rows and the gate, split into two
-    // planes because they add two different global vectors.
-    let av = format!("{stem}.scale_shift_table_a2v_ca_{}", av_stem(prefix));
+    // planes because they add two different global vectors. The shipped
+    // checkpoint spells this table the way sglang's module tree does
+    // (`<stream>_a2v_cross_attn_scale_shift_table`) and NOT the way the
+    // upstream ltx-core one does (`scale_shift_table_a2v_ca_<stream>`,
+    // which `LTX2_PARAM_NAMES_MAPPING` rewrites); the four global adaLN
+    // heads keep the ltx-core spelling. Read off the snapshot's index.
+    let av = format!(
+        "{stem}.{stream}_a2v_cross_attn_scale_shift_table",
+        stream = av_stem(prefix)
+    );
     banded(b, src, &s.av_ss_table, &av, dim, 0, AV_SS_SLICES)?;
     banded(
         b,

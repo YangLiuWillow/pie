@@ -24,12 +24,16 @@ they self-verify against, and the SP/TP/perturbation/cache-dit machinery
 dropped. It is NOT a general LTX-2 implementation: it serves the miniature
 golden and nothing else.
 
-NAMES. The module tree spells the HUGGING FACE checkpoint's names, not
-sglang's renamed ones, so that `state_dict()` here and the shipped
-`transformer/` + `connectors/` folders read under one `crates/models/src/
-ltx_2/import.rs`: `proj_in`, `time_embed`, `transformer_blocks.N.attn1.to_q`,
-`ff.net.0.proj`, `scale_shift_table_a2v_ca_video`, `video_text_proj_in`, ...
-(the mapping sglang applies in reverse — `LTX2_PARAM_NAMES_MAPPING`).
+NAMES. The module tree spells the SHIPPED CHECKPOINT's names, verified
+against `Lightricks/LTX-2.5-Diffusers`'s own safetensors index, so that
+`state_dict()` here and the shipped `transformer/` + `connectors/` folders
+read under one `crates/models/src/ltx_2/import.rs`: `proj_in`, `time_embed`,
+`transformer_blocks.N.attn1.to_q`, `ff.net.0.proj`, `video_text_proj_in`.
+The checkpoint is not consistent about which side of
+`LTX2_PARAM_NAMES_MAPPING` it stands on — the per-block cross-modal tables
+carry sglang's names (`video_a2v_cross_attn_scale_shift_table`) while the
+four global adaLN heads carry ltx-core's (`av_cross_attn_video_scale_shift`)
+— so both spellings appear below, each as the index has it.
 """
 
 from __future__ import annotations
@@ -460,8 +464,8 @@ class LTX2TransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(9, d) / d**0.5)
         self.audio_scale_shift_table = nn.Parameter(torch.randn(9, a) / a**0.5)
-        self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.randn(5, d))
-        self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.randn(5, a))
+        self.video_a2v_cross_attn_scale_shift_table = nn.Parameter(torch.randn(5, d))
+        self.audio_a2v_cross_attn_scale_shift_table = nn.Parameter(torch.randn(5, a))
         self.prompt_scale_shift_table = nn.Parameter(torch.randn(2, d))
         self.audio_prompt_scale_shift_table = nn.Parameter(torch.randn(2, a))
 
@@ -538,8 +542,8 @@ class LTX2TransformerBlock(nn.Module):
         nv = rms_no_weight(hidden_states, eps)
         na = rms_no_weight(audio_hidden_states, eps)
 
-        vt = self.scale_shift_table_a2v_ca_video
-        at = self.scale_shift_table_a2v_ca_audio
+        vt = self.video_a2v_cross_attn_scale_shift_table
+        at = self.audio_a2v_cross_attn_scale_shift_table
         v_ss = (
             vt[:4][None, None] .to(temb_ca_scale_shift)
             + temb_ca_scale_shift.reshape(b, temb_ca_scale_shift.shape[1], 4, -1)

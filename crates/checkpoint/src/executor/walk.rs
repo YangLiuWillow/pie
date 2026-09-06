@@ -12,6 +12,7 @@ use std::collections::HashSet;
 
 use super::iq_grid;
 use super::{Progress, Residency};
+use crate::consume::SourceLedger;
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
@@ -19,7 +20,6 @@ use crate::codec::mlx::decode_mlx_affine_codes;
 use crate::codec::mlx::mlx_affine_group_params_bits;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
 use crate::codec::rows::{EncodeOperand, encode_rows};
-use crate::consume::SourceLedger;
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
 use crate::executor::sink::TensorSink;
@@ -149,9 +149,8 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
             StorageInstr::Allocate { buffer, .. } | StorageInstr::Fill { buffer, .. } => {
                 touch(*buffer);
             }
-            StorageInstr::ExtentWrite { dest, .. } | StorageInstr::GatherWrite { dest, .. } => {
-                touch(dest.buffer)
-            }
+            StorageInstr::ExtentWrite { dest, .. }
+            | StorageInstr::GatherWrite { dest, .. } => touch(dest.buffer),
             StorageInstr::BulkExtentWrite { .. } => {}
             StorageInstr::TileMap {
                 inputs,
