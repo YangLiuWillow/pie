@@ -255,9 +255,12 @@ impl std::fmt::Display for PlannerError {
                 cause,
             } => write!(
                 f,
-                "KV pool starved: {need} pages asked, {free} free of {total}, {}, and no \
-                 fire in flight anywhere to complete and free pages",
-                cause.describe()
+                "{} pool starved: {need} {} asked, {free} free of {total}, {}, and no \
+                 fire in flight anywhere to complete and free {}",
+                if matches!(cause, StarveCause::NoRsSlots) { "state" } else { "KV" },
+                if matches!(cause, StarveCause::NoRsSlots) { "slots" } else { "pages" },
+                cause.describe(),
+                if matches!(cause, StarveCause::NoRsSlots) { "slots" } else { "pages" },
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }
