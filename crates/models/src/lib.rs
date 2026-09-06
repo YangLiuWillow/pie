@@ -8,6 +8,7 @@ pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod kimi_k3;
+pub mod ltx_2;
 pub mod media;
 pub mod mini_dit;
 pub mod published;
@@ -146,15 +147,11 @@ impl ReadingFact {
     /// The port named `name`, with its index among ports of its kind —
     /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
     #[must_use]
+    /// The index is [`ports_indexed`](ReadingFact::ports_indexed)'s, so a
+    /// port that STATES its index (`PortFact::at`) resolves to that one and
+    /// not to its position among its kind.
     pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
-        let port = self.ports.iter().find(|port| port.name == name)?;
-        let index = self
-            .ports
-            .iter()
-            .take_while(|p| p.name != name)
-            .filter(|p| p.kind == port.kind)
-            .count();
-        Some((u8::try_from(index).unwrap_or(u8::MAX), port))
+        self.ports_indexed().find(|(_, port)| port.name == name)
     }
 
     /// Every port with its kind-relative index, in declaration order.
@@ -414,6 +411,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         // spells, so the generative rows identify nothing above them.
         z_image::skus(),
         wan_2::skus(),
+        ltx_2::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),
