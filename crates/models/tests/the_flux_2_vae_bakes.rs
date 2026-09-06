@@ -101,7 +101,15 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         ("pixels", vae::RGB, model::IN_CHANNELS)
     );
     assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    assert_eq!(encode.port("pixels").map(|(index, _)| index), Some(0));
+    // Its STATED index, not its position: `ReadingFact::port` resolves
+    // through `ports_indexed`, so a port carrying `at` answers with the
+    // index the TRACE reads it at. `vae.encode`'s only voxel port is read
+    // at index 1 so `vae.decode`'s latent clip keeps 0, and the runtime
+    // must bind it there or the shell seats the wrong width.
+    assert_eq!(
+        encode.port("pixels").map(|(index, _)| index),
+        Some(model::port::PIXEL_VOXELS)
+    );
     assert_eq!(
         (decode.ports[0].at, encode.ports[0].at),
         (None, Some(model::port::PIXEL_VOXELS)),

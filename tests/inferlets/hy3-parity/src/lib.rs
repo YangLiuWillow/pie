@@ -3,25 +3,38 @@
 //! `scripts/imagegen/hy3_golden.py --mini` drove the reference — and two
 //! claims about the thing this family exists to do.
 //!
-//! # What runs here, and what cannot yet
+//! # One whole denoise step, in three fires
 //!
 //! A denoise step of this family is THREE fires (`crates/models/src/
-//! hunyuan_image_3/forward.rs` says why): `image.in` (the conv `patch_embed`
-//! on the voxel axis), `denoise` (the trunk), `image.out` (the conv
-//! `final_layer`). **The two voxel arms are not drivable from a guest
-//! today**: the SDK has no channel-fed `Voxels` port and no `pixels()`
-//! intrinsic to read a voxel-axis seam back with — the same gap
-//! `tests/inferlets/text-to-image` records for `z_image`'s `vae.decode`. So
-//! this program drives the two token-axis readings and takes the image
-//! head's rows from the golden:
+//! hunyuan_image_3/forward.rs` says why the conv image head cannot share
+//! the trunk's plan unit), and this program runs all three end to end —
+//! each one fed pie's OWN answer to the one before, so the velocity it
+//! lands is the step:
 //!
 //! ```text
-//! encode    the prompt prefix, causal, its K/V ARE the sequence  -> logits
-//! denoise   the canvas: h*w image rows whose input is the golden's
-//!           patch_embed output, plus ONE <timestep> row the plan lands
-//!           from the lane's timestep vector, bidirectional over
-//!           [prefix | canvas] against the pages `encode` wrote  -> hidden
+//! encode     the prompt prefix, causal, its K/V ARE the sequence -> logits
+//! image.in   the noisy latent as a `[h, w, 32]` CLIP on the voxel axis,
+//!            through `patch_embed`'s 3x3 convs and its adaptive group
+//!            norm                                        -> pixels [h*w, D]
+//! denoise    the canvas: those h*w rows through the `latents` port plus
+//!            ONE <timestep> row the plan lands from the lane's timestep
+//!            vector, bidirectional over [prefix | canvas] against the
+//!            pages `encode` wrote                         -> hidden
+//! image.out  those rows back on the voxel axis through `final_layer`
+//!                                                        -> pixels [h*w, 32]
 //! ```
+//!
+//! The two voxel arms bind their clip as a CHANNEL whose shape is the box
+//! (`[h, w, C + 256]`, design D8) and read their seam with
+//! `intrinsics::pixels(rows, width)`. The timestep's sinusoid rides in the
+//! SAME rectangle, appended to every voxel row: the CUDA shell seats one
+//! voxel width a fire and refuses a lane that feeds two, and a voxel-axis
+//! lane broadcast (which is what an adaGN vector wants) does not exist.
+//! The one host round trip is between
+//! `denoise` and `image.out`: the trunk hands back `[h*w + 1, D]` token
+//! rows and the voxel arm wants `[h, w, D]` without the `<timestep>` row,
+//! and dropping a row is not something this program can spell on the
+//! device. A production guest would carry it in an epilogue.
 //!
 //! # Four fires, three claims
 //!
@@ -31,6 +44,9 @@
 //! C  A's working set again  -> denoise(t1)   THE PREFIX PAGES ARE FROZEN
 //! D  prefill(prompt) fresh  -> denoise(t1)   ... and C is exactly D
 //! ```
+//!
+//! (A, B, C and D below are the DENOISE fires; `image.in` runs once and
+//! `image.out` once, over A's rows.)
 //!
 //! **B is the claim that the canvas is CONDITIONED.** A denoise fire whose
 //! image rows silently attended only themselves would still match a
@@ -111,9 +127,18 @@ struct Case {
     canvas_positions: Vec<f32>,
     /// `[image_rows + 1]`: the SEQUENCE position of each canvas row.
     canvas_sequence: Vec<u32>,
-    /// `[image_rows, hidden]` — `patch_embed(x_t, time_embed(t))`, which
-    /// the `image.in` reading would have produced.
-    rows: Vec<f32>,
+    /// The clip's box: `image_rows == token_h * token_w`.
+    token_h: u32,
+    token_w: u32,
+    /// `[token_h * token_w, latent_channels]` — the noisy latent x_t in
+    /// raster order, what `image.in` convolves.
+    latent: Vec<f32>,
+    latent_channels: u32,
+    /// `timestep_embedding(t, 256)`, one row, replicated over the clip's
+    /// voxels by this program: the two adaGN embedders read it there
+    /// because a voxel-axis lane vector has no broadcast (see
+    /// `model::port::TFREQ_VOXELS`).
+    tfreq: Vec<f32>,
     hidden: u32,
     /// The scheduler timestep `σ·1000` of step 0, and of the step the two
     /// KV-reuse fires run.
@@ -138,8 +163,15 @@ struct Output {
     /// prefill: the harness asserts these agree exactly.
     canvas_hidden_reused: Vec<f32>,
     canvas_hidden_fresh: Vec<f32>,
+    /// `[image_rows, hidden]` — `patch_embed(x_t, time_embed(t))` off the
+    /// voxel axis, which is what the canvas lane was then fed.
+    image_in_rows: Vec<f32>,
+    /// `[image_rows, latent_channels]` — the flow-matching velocity, the
+    /// whole step's answer.
+    velocity: Vec<f32>,
     image_rows: u32,
     hidden: u32,
+    latent_channels: u32,
 }
 
 fn reading(name: &'static str) -> Result<model::ReadingFact> {
@@ -235,12 +267,14 @@ fn prefill(
 
 /// One `denoise` fire over `ws`'s pages at `timestep`: the canvas lane's
 /// `h*w + 1` rows, read back on the `hidden` seam.
+#[allow(clippy::too_many_arguments)]
 fn denoise_step(
     case: &Case,
     shape: &Shape,
     denoise: &model::ReadingFact,
     ws: &WorkingSet,
     pipe: &Pipeline,
+    image_rows: &[f32],
     timestep: f32,
     tag: &str,
 ) -> Result<Channel> {
@@ -252,7 +286,7 @@ fn denoise_step(
     // `[canvas_len, hidden]`: one row the plan overwrites (its bytes are
     // never read), then the image head's rows.
     let mut rows = vec![0.0f32; case.hidden as usize];
-    rows.extend_from_slice(&case.rows);
+    rows.extend_from_slice(image_rows);
     // The generalized causal mask, dense `[rows, keys]` row-major: an image
     // row sees every key, the `<timestep>` row sees itself and the prefix.
     let mask: Vec<bool> = (0..canvas_len)
@@ -316,6 +350,52 @@ fn denoise_step(
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{tag}` denoise step"))?;
+    Ok(out)
+}
+
+/// One fire of a VOXEL arm: the clip bound as the port's channel, whose
+/// shape IS the box (design D8), read back on the `pixels` seam.
+///
+/// `clip` is `[h*w, channels]` in raster order and the timestep's sinusoid
+/// is appended to EVERY row, because the arm reads one packed rectangle:
+/// the CUDA shell seats one voxel width a fire and refuses a lane that
+/// feeds two (`IMAGEGEN_CONTRACT.md` §6). The model text splits the
+/// columns back apart (`super::model::port::LATENT_VOXELS`).
+fn voxel_arm(
+    case: &Case,
+    arm: &model::ReadingFact,
+    pipe: &Pipeline,
+    clip_port: &str,
+    clip: &[f32],
+    channels: u32,
+    tag: &str,
+) -> Result<Channel> {
+    let rows = case.token_h * case.token_w;
+    let freq = u32::try_from(case.tfreq.len()).map_err(|_| "a sinusoid too wide")?;
+    let width_in = channels + freq;
+    let mut packed = Vec::with_capacity((rows * width_in) as usize);
+    for row in 0..rows as usize {
+        let at = row * channels as usize;
+        packed.extend_from_slice(&clip[at..at + channels as usize]);
+        packed.extend_from_slice(&case.tfreq);
+    }
+    let pass = ForwardPass::new();
+    pass.reading(&arm.name)?;
+    // A `forward-diffusion` pass states its attention MODE even where the
+    // reading declares no KV space and binds none.
+    pass.canvas(Mode::Encode)?;
+    pass.stream(LaneStream::Image)?;
+    let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice())
+        .named(&format!("clip_{tag}"));
+    pass.input(clip_port, &x)?;
+    let width = arm.readout_width;
+    let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
+    let readback = out.clone();
+    pass.epilogue(move || {
+        readback.put(intrinsics::pixels(rows, width));
+    });
+    pass.submit(pipe)
+        .with_context(|| format!("the `{}` lane", arm.name))?;
     Ok(out)
 }
 
@@ -406,11 +486,41 @@ async fn main(input: Input) -> Result<Output> {
     };
     let pipe = Pipeline::new();
 
+    // ---- the image head, going in: `patch_embed` on the voxel axis -------
+    let image_in = reading("image.in")?;
+    let image_out = reading("image.out")?;
+    if image_in.readout_width != case.hidden {
+        return Err(format!(
+            "`image.in` lands {}-wide rows and the case's trunk is {} wide",
+            image_in.readout_width, case.hidden
+        )
+        .into());
+    }
+    let rows_channel = voxel_arm(
+        &case,
+        &image_in,
+        &pipe,
+        &port_of(&image_in, "latent")?,
+        &case.latent,
+        case.latent_channels,
+        "in",
+    )?;
+    let image_in_rows = rows_channel.take_host::<Vec<f32>>().await?;
+
     // ---- A: the prompt's prefix, then step 0 -----------------------------
     let ws_a = WorkingSet::new();
     reserve(&ws_a)?;
     let (argmax, max) = prefill(&case, &shape, &encode, &ws_a, &pipe, &case.prefix, "a")?;
-    let a = denoise_step(&case, &shape, &denoise, &ws_a, &pipe, case.timestep, "a")?;
+    let a = denoise_step(
+        &case,
+        &shape,
+        &denoise,
+        &ws_a,
+        &pipe,
+        &image_in_rows,
+        case.timestep,
+        "a",
+    )?;
     let encode_argmax = argmax.take_host::<Vec<i32>>().await?;
     let encode_max = max.take_host::<Vec<f32>>().await?;
     let canvas_hidden = a.take_host::<Vec<f32>>().await?;
@@ -419,7 +529,16 @@ async fn main(input: Input) -> Result<Output> {
     let ws_b = WorkingSet::new();
     reserve(&ws_b)?;
     prefill(&case, &shape, &encode, &ws_b, &pipe, &case.prefix_alt, "b")?;
-    let b = denoise_step(&case, &shape, &denoise, &ws_b, &pipe, case.timestep, "b")?;
+    let b = denoise_step(
+        &case,
+        &shape,
+        &denoise,
+        &ws_b,
+        &pipe,
+        &image_in_rows,
+        case.timestep,
+        "b",
+    )?;
     let canvas_hidden_uncond = b.take_host::<Vec<f32>>().await?;
 
     // ---- C: step 1 over A's pages, whose prefix nothing has touched -------
@@ -429,6 +548,7 @@ async fn main(input: Input) -> Result<Output> {
         &denoise,
         &ws_a,
         &pipe,
+        &image_in_rows,
         case.timestep_next,
         "c",
     )?;
@@ -444,10 +564,25 @@ async fn main(input: Input) -> Result<Output> {
         &denoise,
         &ws_d,
         &pipe,
+        &image_in_rows,
         case.timestep_next,
         "d",
     )?;
     let canvas_hidden_fresh = d.take_host::<Vec<f32>>().await?;
+
+    // ---- the image head, coming out: `final_layer` over A's rows ---------
+    // The `<timestep>` row is row 0 of the canvas lane and no voxel of the
+    // clip; the rest are the clip's rows in raster order.
+    let velocity_channel = voxel_arm(
+        &case,
+        &image_out,
+        &pipe,
+        &port_of(&image_out, "rows")?,
+        &canvas_hidden[case.hidden as usize..],
+        case.hidden,
+        "out",
+    )?;
+    let velocity = velocity_channel.take_host::<Vec<f32>>().await?;
     pipe.close();
 
     Ok(Output {
@@ -457,7 +592,10 @@ async fn main(input: Input) -> Result<Output> {
         canvas_hidden_uncond,
         canvas_hidden_reused,
         canvas_hidden_fresh,
+        image_in_rows,
+        velocity,
         image_rows: case.image_rows,
         hidden: case.hidden,
+        latent_channels: case.latent_channels,
     })
 }

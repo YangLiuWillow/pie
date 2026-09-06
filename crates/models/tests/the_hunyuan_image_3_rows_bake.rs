@@ -196,29 +196,29 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         assert_eq!(denoise.readout, ReadoutKind::Hidden);
         assert_eq!(denoise.readout_width, d.hidden);
 
+        // ONE voxel port an arm, the timestep's sinusoid packed beside the
+        // clip: the CUDA shell seats one voxel width a fire.
         let image_in = &facts.readings[usize::from(IMAGE_IN)];
         assert_eq!(
             at(image_in, "latent"),
             (
                 model::port::LATENT_VOXELS,
                 PortKind::Voxels,
-                model::LATENT_CHANNELS
+                model::LATENT_CHANNELS + model::T_FREQ_DIM
             )
         );
-        assert_eq!(
-            at(image_in, "tfreq"),
-            (
-                model::port::TFREQ_VOXELS,
-                PortKind::Voxels,
-                model::T_FREQ_DIM
-            )
-        );
+        assert_eq!(image_in.ports.len(), 1);
         assert_eq!(image_in.readout_width, d.hidden);
         let image_out = &facts.readings[usize::from(IMAGE_OUT)];
         assert_eq!(
             at(image_out, "rows"),
-            (model::port::ROW_VOXELS, PortKind::Voxels, d.hidden)
+            (
+                model::port::ROW_VOXELS,
+                PortKind::Voxels,
+                d.hidden + model::T_FREQ_DIM
+            )
         );
+        assert_eq!(image_out.ports.len(), 1);
         assert_eq!(image_out.readout, ReadoutKind::Pixels);
         assert_eq!(image_out.readout_width, model::LATENT_CHANNELS);
     }

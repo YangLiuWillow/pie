@@ -638,8 +638,11 @@ python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.t
 The config must be the run's OWN (its own `[server] port`), and
 `[engine] max_model_len` at least the sequence.
 
-Four fires, three claims: `A` prefill(prompt) then denoise(t0) — what the
-golden gates; `B` prefill(`<cfg>`-masked prompt) then denoise(t0) — THE PREFIX
+**A whole denoise step, in three fires, each fed pie's own answer to the one
+before**: `image.in` (the conv `patch_embed` on the voxel axis), `denoise`
+(the trunk over the frozen prefix pages), `image.out` (the conv
+`final_layer`). Plus three more denoise fires that make two claims the golden
+diff cannot: `B` prefill(`<cfg>`-masked prompt) then denoise(t0) — THE PREFIX
 MATTERS; `C` denoise(t1) over A's pages and `D` denoise(t1) after a fresh
 prefill — THE PREFIX K/V IS REUSED EXACTLY.
 
@@ -647,18 +650,26 @@ Measured 2026-09-06 (fp32 golden vs bf16 weights and bf16 activations):
 
 | tensor | shape | cos | max-abs |
 |---|---|---|---|
-| `denoise.hidden.image` | (64, 256) | 0.999996 | 0.0013 |
+| `image_in.rows` | (64, 256) | 0.999991 | 0.0012 |
+| `denoise.hidden.image` | (64, 256) | 0.999989 | 0.0016 |
 | `denoise.hidden.timestep_row` | (256,) | 0.999993 | 0.00046 |
-| `uncond.hidden.image` | (64, 256) | 0.999996 | 0.0013 |
+| `uncond.hidden.image` | (64, 256) | 0.999989 | 0.0015 |
 | `uncond.hidden.timestep_row` | (256,) | 0.999993 | 0.00047 |
+| **`image_out.velocity.rows`** | (64, 32) | **0.999997** | **0.00012** |
 | `encode.max` | (9,) | 0.999998 | 5.8e-05 |
 
 ```
 [claim] PASS the prefix conditions the canvas: <cfg> moves the <timestep> row
-        rel 0.0214 (reference 0.0213, 0.1% off) and the image rows rel 0.0032
+        rel 0.0214 (reference 0.0213, 0.1% off) and the image rows rel 0.0031
         (reference 0.0020)
 [claim] PASS the prefix K/V is reused exactly: max-abs 0.000e+00
 ```
+
+Two shell rules shape the voxel arms: the CUDA shell seats **one voxel width
+a fire**, so the timestep's sinusoid rides packed into the clip's own
+rectangle (`[h, w, 32 + 256]` going in, `[h, w, D + 256]` coming out) and the
+model text splits the columns; and a voxel-axis lane broadcast does not
+exist, which is why the sinusoid is per voxel at all.
 
 **The conditioning gate is stated against the reference, not as a constant.**
 On this two-layer random-init miniature the prompt moves the image rows by rel
@@ -667,11 +678,10 @@ which is causal over the prefix and nothing else, by rel 0.021. A guessed
 absolute threshold would fail a correct model here and pass an unconditioned
 one on a deeper row.
 
-Not yet compared: the conv image head's two VOXEL arms (`image.in` =
-`patch_embed`, `image.out` = `final_layer`).  The SDK has no channel-fed
-`Voxels` port and no `pixels()` intrinsic, so the case hands pie the golden's
-own `patch_embed` rows and stops before `final_layer` -- the same gap
-`tests/inferlets/text-to-image` records for `z_image`'s `vae.decode`.
+The one host round trip is between `denoise` and `image.out`: the trunk hands
+back `[h*w + 1, D]` token rows and the voxel arm wants `[h, w, D]` without the
+`<timestep>` row, and dropping a row is not something the guest can spell on
+the device today. A production loop would carry it in an epilogue.
 
 ---
 

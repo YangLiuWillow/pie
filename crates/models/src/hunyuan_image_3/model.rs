@@ -121,21 +121,26 @@ pub mod port {
     /// `encode`, `denoise`: the two rotary coordinates `(y, x')` per row —
     /// `x'` pre-scaled, see [`rope_x_scale`].
     pub const POSITIONS: u8 = 0;
-    /// `image.in`: the noisy latent, `[h·w, 32]` on the voxel axis.
+    /// `image.in`: the noisy latent WITH the timestep's sinusoid beside it,
+    /// `[h·w, 32 + 256]` on the voxel axis, split by the trace.
+    ///
+    /// **TWO THINGS FORCE ONE PACKED PORT.** The sinusoid rides per VOXEL
+    /// because a voxel-axis lane broadcast does not exist:
+    /// `elementwise.modulate` takes a `[Lanes, ·]` vector only through a
+    /// `[Tokens]` lane map, and `linear.matmul` takes bf16 activations
+    /// only, so the adaGN vector can be neither computed once per lane and
+    /// broadcast onto voxel rows nor derived there from an f32 sinusoid.
+    /// And it rides in the SAME rectangle because the CUDA shell seats one
+    /// voxel width a fire (`IMAGEGEN_CONTRACT.md` §6, "M0: one width a
+    /// fire") and refuses a lane that feeds two. Cost: 4096 × 256 f32 =
+    /// 4 MB a fire, and the two `Linear`s stay bf16 on the voxel axis with
+    /// exactly the reference's arithmetic.
     pub const LATENT_VOXELS: u8 = 0;
-    /// `image.in`, `image.out`: `timestep_embedding(t, 256)` replicated
-    /// over the clip's voxels. **A voxel-axis lane broadcast is what this
-    /// stands in for**: `elementwise.modulate` takes a `[Lanes, ·]` vector
-    /// only through a `[Tokens]` lane map, and `linear.matmul` takes bf16
-    /// activations only, so the adaGN vector can be neither computed once
-    /// per lane and broadcast onto voxel rows nor derived there from an f32
-    /// sinusoid. Handing the SINUSOID per voxel (4096 × 256 f32 = 4 MB a
-    /// fire) keeps the two `Linear`s on the voxel axis in bf16 and the
-    /// arithmetic exactly the reference's.
-    pub const TFREQ_VOXELS: u8 = 1;
-    /// `image.out`: the trunk's hidden rows for the image span,
-    /// `[h·w, hidden]` on the voxel axis.
-    pub const ROW_VOXELS: u8 = 2;
+    /// `image.out`: the trunk's hidden rows for the image span with the
+    /// same sinusoid beside them, `[h·w, hidden + 256]`. Its own index:
+    /// the engine seats one rectangle per `(kind, index)` for the whole
+    /// plan, and this one is another width.
+    pub const ROW_VOXELS: u8 = 1;
 }
 
 /// One row's transformer shape.

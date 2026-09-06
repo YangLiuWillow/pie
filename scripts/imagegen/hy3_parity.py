@@ -29,9 +29,17 @@ Nothing here imports torch.
 
 WHAT IS COMPARED
 ----------------
+The WHOLE denoise step, in three fires, each fed pie's own answer to the one
+before:
+
+`image_in.rows`    `patch_embed(x_t, time_embed(t))` off the voxel axis: the
+                   3x3 convs and the adaptive group norm.
 `denoise.hidden`   the trunk's rows for the canvas — the `h*w` image rows in
                    raster order and then the `<timestep>` row — with `ln_f`
                    NOT applied, which is what `final_layer` consumes.
+`image_out.velocity.rows`
+                   `final_layer(rows, time_embed_2(t))`: the flow-matching
+                   velocity, and so the step's whole answer.
 `encode.max`       the causal text pass's winning logit per row, and the
                    argmax as an agreement COUNT beside it. (The full
                    `[L, 133120]` plane is 5 MB of JSON, and two token ids do
@@ -40,8 +48,10 @@ WHAT IS COMPARED
 MEASURED (2026-09-06, `hunyuanimage3-mini-bf16-kv-bf16` on one Blackwell,
 fp32 golden vs bf16 weights and bf16 activations):
 
-    denoise.hidden.image        (64, 256)   cos 0.999996   max-abs 0.0013
+    image_in.rows               (64, 256)   cos 0.999991   max-abs 0.0012
+    denoise.hidden.image        (64, 256)   cos 0.999989   max-abs 0.0016
     denoise.hidden.timestep_row (256,)      cos 0.999993   max-abs 0.00046
+    image_out.velocity.rows     (64,  32)   cos 0.999997   max-abs 0.00012
     encode.max                  (9,)        cos 0.999998   max-abs 5.8e-05
     prefill argmax                          8 / 9 rows agree
 
@@ -58,14 +68,6 @@ WHAT ELSE IS CLAIMED
 `[claim] the prefix K/V is reused exactly`  step 1 over the frozen prefix
     pages must equal step 1 after a fresh prefill, to `REUSE_MAX_ABS`. This
     is design D10's whole claim: after step 0 the prefix is never recomputed.
-
-WHAT IS NOT
------------
-The two voxel arms (`image.in` = `patch_embed`, `image.out` = `final_layer`).
-The SDK has no channel-fed `Voxels` port and no `pixels()` intrinsic yet, so
-the case hands pie the golden's OWN `patch_embed` rows and stops before
-`final_layer`. When those two verbs land, the same case grows two more fires
-and the comparison reaches the velocity.
 
 THE ROTARY POSITIONS
 --------------------
@@ -190,7 +192,19 @@ def cases(args) -> list[str]:
         "image_rows": int(n),
         "canvas_positions": scaled(canvas_pos),
         "canvas_sequence": [int(p) for p in canvas_seq],
-        "rows": dump["image_in.rows"].reshape(-1).astype(np.float32).tolist(),
+        "token_h": int(layout["token_h"]),
+        "token_w": int(layout["token_w"]),
+        # The noisy latent as the clip's raster rows: the dump holds it
+        # `[1, C, h, w]`, the voxel port wants `[h*w, C]`.
+        "latent": dump["latent"][0]
+        .transpose(1, 2, 0)
+        .reshape(-1)
+        .astype(np.float32)
+        .tolist(),
+        "latent_channels": int(dump["latent"].shape[1]),
+        # `timestep_embedding(t, 256)`: the guest replicates it over the
+        # clip's voxels, which is how the two adaGN embedders read it.
+        "tfreq": dump["tfreq"].reshape(-1).astype(np.float32).tolist(),
         "hidden": hidden,
         "timestep": float(layout["timestep"]),
         # Step 1's timestep: the two KV-reuse fires run at it, one over the
@@ -203,6 +217,7 @@ def cases(args) -> list[str]:
         json.dump(case, f)
     print(
         f"[case] prefix {len(prefix)} rows, canvas {n} + 1 rows at hidden {hidden}, "
+        f"clip {layout['token_h']}x{layout['token_w']}x{case['latent_channels']}, "
         f"x-scale {scale:.6f} -> {path}"
     )
     return [path]
@@ -326,18 +341,25 @@ def collect(args) -> str:
     # vocabulary apart and a rounding error in the logits). It is reported
     # as an agreement COUNT beside the winning logit, which is comparable.
     uncond = np.asarray(doc["canvas_hidden_uncond"], dtype=np.float32).reshape(n + 1, hidden)
+    channels = int(doc["latent_channels"])
     mine = {
+        "image_in.rows": np.asarray(doc["image_in_rows"], dtype=np.float32).reshape(n, hidden),
         "denoise.hidden.image": rows[1:],
         "denoise.hidden.timestep_row": rows[0],
         "uncond.hidden.image": uncond[1:],
         "uncond.hidden.timestep_row": uncond[0],
+        "image_out.velocity.rows": np.asarray(doc["velocity"], dtype=np.float32).reshape(
+            n, channels
+        ),
         "encode.max": np.asarray(doc["encode_max"], dtype=np.float32),
     }
     theirs = {
+        "image_in.rows": dump["image_in.rows"],
         "denoise.hidden.image": dump["denoise.hidden.image"],
         "denoise.hidden.timestep_row": dump["denoise.hidden.timestep_row"],
         "uncond.hidden.image": dump["uncond.hidden.image"],
         "uncond.hidden.timestep_row": dump["uncond.hidden.timestep_row"],
+        "image_out.velocity.rows": dump["image_out.velocity.rows"],
         "encode.max": logits.max(axis=-1).astype(np.float32),
     }
     a = os.path.join(args.out, "hy3_mini_pie.npz")

@@ -5,8 +5,8 @@
 //! |---|---|---|---|---|
 //! | `encode` | one, `Text` | `embed(ids)`, `attention(kv)`, `positions` `[L, 2]` | causal (prefill / decode) | `out` `[L, vocab]` |
 //! | `denoise` | one, `Image` | `embed(ids)`, `attention(kv)`, `latents` `[N+1, hidden]`, `special` `[N+1, 1]`, `timestep`, `positions` `[N+1, 2]` | the guest's `[rows, kv]` slab: causal prefix ∪ the canvas block | `hidden` `[N+1, hidden]` |
-//! | `image.in` | one, `Image`, one clip `{1, h, w}` | `latent` `[h·w, 32]`, `tfreq` `[h·w, 256]` on the voxel axis | — | `pixels` `[h·w, hidden]` |
-//! | `image.out` | one, `Image`, one clip `{1, h, w}` | `rows` `[h·w, hidden]`, `tfreq` `[h·w, 256]` on the voxel axis | — | `pixels` `[h·w, 32]` — the velocity |
+//! | `image.in` | one, `Image`, one clip `{1, h, w}` | `latent` `[h·w, 32 + 256]` on the voxel axis — the noisy latent BESIDE the timestep's sinusoid | — | `pixels` `[h·w, hidden]` |
+//! | `image.out` | one, `Image`, one clip `{1, h, w}` | `rows` `[h·w, hidden + 256]`, likewise | — | `pixels` `[h·w, 32]` — the velocity |
 //!
 //! # Why a denoise step is three fires
 //!
@@ -141,20 +141,12 @@ impl Model {
                 has_kv: false,
                 takes_tokens: false,
                 streams: vec![Stream::Image],
-                ports: vec![
-                    port(
-                        "latent",
-                        PortKind::Voxels,
-                        LATENT_CHANNELS,
-                        Some(port::LATENT_VOXELS),
-                    ),
-                    port(
-                        "tfreq",
-                        PortKind::Voxels,
-                        T_FREQ_DIM,
-                        Some(port::TFREQ_VOXELS),
-                    ),
-                ],
+                ports: vec![port(
+                    "latent",
+                    PortKind::Voxels,
+                    LATENT_CHANNELS + T_FREQ_DIM,
+                    Some(port::LATENT_VOXELS),
+                )],
                 positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: d.hidden,
@@ -165,15 +157,12 @@ impl Model {
                 has_kv: false,
                 takes_tokens: false,
                 streams: vec![Stream::Image],
-                ports: vec![
-                    port("rows", PortKind::Voxels, d.hidden, Some(port::ROW_VOXELS)),
-                    port(
-                        "tfreq",
-                        PortKind::Voxels,
-                        T_FREQ_DIM,
-                        Some(port::TFREQ_VOXELS),
-                    ),
-                ],
+                ports: vec![port(
+                    "rows",
+                    PortKind::Voxels,
+                    d.hidden + T_FREQ_DIM,
+                    Some(port::ROW_VOXELS),
+                )],
                 positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: LATENT_CHANNELS,
@@ -195,8 +184,10 @@ impl Model {
                 train_steps: TRAIN_STEPS,
                 boundary: None,
                 // `FlowMatchDiscreteScheduler` builds `linspace(1, 0, N+1)`
-                // through the static shift; nothing is pinned.
+                // through the static shift; nothing is pinned, and one
+                // stream carries the whole schedule.
                 pinned_sigmas: vec![],
+                stream_shifts: vec![],
             }),
             // Every entry of the resolution group is ≈4096 image tokens
             // plus the `<timestep>` row; the prompt prefix and any
@@ -530,8 +521,12 @@ fn resblock(x: &Value, g: &Value, r: &ResBlock, temb: &Value) -> Value {
 /// this axis's own layout, so nothing is traced for it.
 fn image_in(arm: &Input<Facts>, m: &Model) {
     let g = arm.grid();
-    let z = arm.voxels(port::LATENT_VOXELS, LATENT_CHANNELS, Dtype::Bf16);
-    let freqs = arm.voxels(port::TFREQ_VOXELS, T_FREQ_DIM, Dtype::Bf16);
+    let clip = arm.voxels(
+        port::LATENT_VOXELS,
+        LATENT_CHANNELS + T_FREQ_DIM,
+        Dtype::Bf16,
+    );
+    let (z, freqs) = ops::layout::split_rows(&clip, LATENT_CHANNELS);
     let temb = embedder(&m.time_embed, &freqs);
     let (h, g1) = conv(&z, &g, &m.patch_embed.conv_in);
     let x = resblock(&h, &g1, &m.patch_embed.res, &temb);
@@ -543,8 +538,8 @@ fn image_in(arm: &Input<Facts>, m: &Model) {
 /// 3×3)`. The rows it lands are the flow-matching velocity.
 fn image_out(arm: &Input<Facts>, m: &Model) {
     let g = arm.grid();
-    let rows = arm.voxels(port::ROW_VOXELS, m.dims.hidden, Dtype::Bf16);
-    let freqs = arm.voxels(port::TFREQ_VOXELS, T_FREQ_DIM, Dtype::Bf16);
+    let clip = arm.voxels(port::ROW_VOXELS, m.dims.hidden + T_FREQ_DIM, Dtype::Bf16);
+    let (rows, freqs) = ops::layout::split_rows(&clip, m.dims.hidden);
     let temb = embedder(&m.time_embed_2, &freqs);
     let x = resblock(&rows, &g, &m.final_layer.res, &temb);
     let h = spatial::group_norm(
