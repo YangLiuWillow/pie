@@ -472,6 +472,49 @@ python flux2_parity.py all --out /tmp/flux2-parity --config ~/.pie/config.flux2-
 Measured (bf16 pie vs the fp32 golden): max-abs 0.0059, rel 0.0044, cos
 0.99999 — under the mini-dit gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`).
 
+#### The REAL row — `flux2_klein_parity.py`
+
+`tests/inferlets/flux2-klein-parity` is the `flux2-klein-4b` row against the
+same dump: the `text` reading over the family's chat template (the ids are
+checked against `text.input_ids` exactly), one `denoise` step over the
+golden's own step-0 inputs, one independent step per sigma from the
+reference's own latent, and the four-step Euler trajectory, then both final
+latents through the diffusers VAE.
+
+```bash
+# ~3 min to import, ~2 min to run
+pie model import ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/ \
+    --sku flux2-klein-4b-bf16-kv-bf16 --out ~/.cache/pie-imagegen/flux2-klein-4b.zt
+CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
+    --out /tmp/flux2-klein-parity --config ~/.pie/config.flux2-klein.toml
+```
+
+The config needs `[engine] max_model_len = 32768` (rows × submit depth),
+`[model] model` at the artifact, and — the one that is not obvious —
+`[runtime] submit_deadline = "10s"` with `silence_timeout = "300s"`: at the
+50 ms default the cohort gate seals the denoise group's FIRST frame with
+the image lane alone and the velocity comes back unconditioned (cos ≈ 0.535
+against the golden, cos 0.9999 against a no-text reference). `run` refuses a
+config that does not state it.
+
+Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
+
+| reading | cos | gate |
+|---|---|---|
+| `text.hidden` (20 rows × 3072) | 0.999993 | ≥ 0.999 ✓ |
+| `dit.step0.out` | 0.999552 | ≥ 0.999 ✓ |
+| `probe.step{0,1,2,3}.out` | 0.999552 / 0.999125 / 0.999615 / 0.999767 | ≥ 0.999 ✓ |
+| `latent.final` (four Euler steps) | 0.997903 | reported |
+| PSNR(`pie.png`, `golden.png`) | 34.87 dB | reported |
+
+The trajectory is REPORTED, not gated: klein is distilled to four steps
+whose last takes σ 0.767 → 0, which amplifies a velocity difference about
+sixfold, and bf16 alone moves the step-0 velocity by 4e-4 in cosine. The
+SAME diffusers transformer in fp32 reads cos 0.999618 on the velocity and
+**0.997510** on `latent.final` against this bf16 dump — i.e. an exact fp32
+computation is FARTHER from the golden than pie is. The per-step velocities
+are what the model is gated on.
+
 ### `wan22_golden.py` → `/root/.cache/pie-imagegen/golden/wan22/`
 
 `WanPipeline` on TI2V-5B, 480x832, **17 frames**, **8 steps**, seed 0, bf16 DiT with

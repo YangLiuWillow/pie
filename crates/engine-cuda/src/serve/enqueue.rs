@@ -1195,8 +1195,9 @@ impl FireCtx<'_> {
         }
 
         // The sequences are longer — only the slots this shell counts for.
-        for (seat, table) in p.seats.iter().zip(&p.tables) {
+        for ((seat, table), kv_less) in p.seats.iter().zip(&p.tables).zip(&p.kv_less_seats) {
             if table.is_empty()
+                && !kv_less
                 && let Some(slot) = self.held.get_mut(seat.slot as usize)
             {
                 *slot = seat.have + seat.rows;

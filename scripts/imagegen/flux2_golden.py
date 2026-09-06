@@ -8,8 +8,9 @@ flux2_golden.py -- reference dump for FLUX.2-klein-4B (M2).
 
 Outputs -> $PIE_IMAGEGEN_GOLDEN/flux2/
     flux2_golden.npz   Qwen3 layer-{9,18,27} concat text embeddings + text_ids,
-                       initial (packed) noise + latent_ids, step-0 transformer inputs
-                       and velocity, per-step latents, final latent, decoded RGB
+                       the encoder's input ids + key mask, initial (packed) noise +
+                       latent_ids, every step's transformer inputs and velocity,
+                       per-step latents, final latent, decoded RGB
     flux2_golden.png
     flux2_mini.npz / flux2_mini.safetensors / flux2_mini_config.json
     flux2_vae.npz      --vae: a 32x32 packed latent (DiT space, 128 channels at
@@ -75,9 +76,25 @@ def run_full(d: str, dtype=torch.bfloat16):
                                       text_encoder_out_layers=(9, 18, 27))
     tap.put("prompt_embeds", pe); tap.put("text_ids", tids)
     print(f"  prompt embeds {tuple(pe.shape)}  text_ids {tuple(tids.shape)}")
+    # The exact ids the pipeline fed Qwen3 (`_get_qwen3_prompt_embeds`): the
+    # chat template with one user turn, the generation cue, thinking off,
+    # right-padded to 512 with `<|endoftext|>` under a key mask. pie's
+    # `text` reading runs the unpadded prefix, so a parity check compares
+    # the rows the mask keeps.
+    rendered = pipe.tokenizer.apply_chat_template(
+        [{"role": "user", "content": PROMPT}], tokenize=False,
+        add_generation_prompt=True, enable_thinking=False)
+    enc = pipe.tokenizer(rendered, return_tensors="pt", padding="max_length",
+                         truncation=True, max_length=512)
+    tap.put("text.input_ids", enc["input_ids"][0].numpy().astype(np.int64))
+    tap.put("text.attention_mask", enc["attention_mask"][0].numpy().astype(np.int64))
+    n_real = int(enc["attention_mask"].sum())
+    print(f"  {n_real} real tokens: {enc['input_ids'][0][:n_real].tolist()}")
 
     r1 = hook_prepare_latents(pipe, tap)
-    r2 = hook_transformer(pipe.transformer, tap, "dit", steps=(0,))
+    # Every step's transformer call, so a trajectory diverging past step 0
+    # can be placed: `dit.step{i}.in.*` / `dit.step{i}.out`.
+    r2 = hook_transformer(pipe.transformer, tap, "dit", steps=tuple(range(STEPS)))
     r3 = hook_scheduler(pipe, tap)
     g = torch.Generator("cpu").manual_seed(SEED)
     out = pipe(prompt=PROMPT, height=SIZE, width=SIZE, num_inference_steps=STEPS,
