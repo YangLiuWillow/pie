@@ -141,7 +141,21 @@ fn scalars(pass: &ForwardPass, ports: &Ports, case: &Case, tag: &str) -> Result<
 }
 
 /// One denoise step: three lanes, one group, one fire, one velocity.
-async fn step(case: &Case, ports: &Ports, reading: &str, pipe: &Pipeline) -> Result<Vec<f32>> {
+/// One pipeline per lane of the group (see [`step`]).
+struct Pipes {
+    text: Pipeline,
+    reference: Pipeline,
+    image: Pipeline,
+}
+
+/// ONE PIPELINE PER LANE. A pipeline is serial — the scheduler never seats
+/// two of its passes in one step — so three passes down one pipeline are
+/// three fires of one lane each, the attention group never forms, and the
+/// image lane denoises with no caption and no reference. That reads as a
+/// plausible answer: on a miniature whose random-init caption is small, it
+/// even passed this file's own tolerance, which is how it went unnoticed
+/// until the frame gate began refusing a group that could not compose.
+async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Result<Vec<f32>> {
     let group = 0;
     let rows = case.image_rows;
     let width = case.channels;
@@ -201,11 +215,13 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipe: &Pipeline) -> Res
         readback.put(intrinsics::velocity(velocity_width));
     });
 
-    text.submit(pipe).context("text lane")?;
+    text.submit(&pipes.text).context("text lane")?;
     if let Some(reference) = &reference {
-        reference.submit(pipe).context("reference lane")?;
+        reference
+            .submit(&pipes.reference)
+            .context("reference lane")?;
     }
-    image.submit(pipe).context("image lane")?;
+    image.submit(&pipes.image).context("image lane")?;
     out.take_host::<Vec<f32>>().await.map_err(Into::into)
 }
 
@@ -266,9 +282,15 @@ async fn main(input: Input) -> Result<Output> {
             "the case carries a guidance scale and this row declares no guidance port".into(),
         );
     }
-    let pipe = Pipeline::new();
-    let velocity = step(&case, &ports, &reading.name, &pipe).await?;
-    pipe.close();
+    let pipes = Pipes {
+        text: Pipeline::new(),
+        reference: Pipeline::new(),
+        image: Pipeline::new(),
+    };
+    let velocity = step(&case, &ports, &reading.name, &pipes).await?;
+    pipes.text.close();
+    pipes.reference.close();
+    pipes.image.close();
     Ok(Output {
         velocity,
         image_rows: case.image_rows,
