@@ -472,7 +472,7 @@ def roster() -> list[Gate]:
         Gate(
             name="zimage-turbo",
             wraps="zimage_parity.py gate (text/turbo/chain/steps, then decode)",
-            expected="text 0.99999, turbo 0.9998, steps 0.9972, PSNR >= 33 dB",
+            expected="text 0.99999, turbo 0.9998, steps 0.9961-0.9972, PSNR 32.8-33.3 dB",
             needs=[(g("z-image", "zimage_golden.npz"), "python scripts/imagegen/zimage_golden.py --full"),
                    (a("z-image-turbo.zt"),
                     f"{IMPORT} <Z-Image-Turbo snapshot> --sku z-image-turbo-bf16-kv-bf16 "
