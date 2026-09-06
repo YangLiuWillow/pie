@@ -602,6 +602,44 @@ inline void m1_reduce_integer_part(
   }
 }
 
+// A scatter's read-modify-write over its indices, after the base has been
+// copied into the result: one thread owns it, since indices may repeat. The
+// streamed form runs the copy as a grid pass and this on a threadgroup of
+// its own; the single-lane and grouped walks call it from thread 0.
+inline void m1_scatter_rmw(
+    uint tag,
+    const device uchar* a1,
+    const device uchar* a2,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    const M1ValueDesc d2) {
+  const uint rest = d0.rank == 0 ? 1u : d0.len / max(d0.dims[0], 1u);
+  const uint n0 = d0.rank == 0 ? 1u : d0.dims[0];
+  const bool scalar = d2.len == 1 && d1.len * rest != 1;
+  for (uint k = 0; k < d1.len; ++k) {
+    const long index = m1_load_index(a1, k, d1.dtype);
+    if (index < 0 || uint(index) >= n0) continue;
+    for (uint r = 0; r < rest; ++r) {
+      const uint dst = uint(index) * rest + r;
+      const uint src = scalar ? 0u : k * rest + r;
+      if (d0.dtype == 0) {
+        const float value = m1_load_f(a2, src, d2.dtype);
+        m1_store_f(o0, dst, tag == 0x62 ? m1_load_f(o0, dst, 0) + value : value);
+      } else if (d0.dtype == 1) {
+        const int value = m1_load_i(a2, src, d2.dtype);
+        m1_store_i(o0, dst, tag == 0x62 ? int(uint(m1_load_i(o0, dst, 1)) + uint(value)) : value);
+      } else if (d0.dtype == 2) {
+        const uint value = m1_load_u(a2, src, d2.dtype);
+        m1_store_u(o0, dst, tag == 0x62 ? m1_load_u(o0, dst, 2) + value : value);
+      } else {
+        const bool value = m1_load_b(a2, src, d2.dtype);
+        m1_store_b(o0, dst, value);
+      }
+    }
+  }
+}
+
 // One op, walked by `nthreads` threads of which this is `tid`. `0, 1` is the
 // serial walk every single-lane kernel takes. Every op whose elements are
 // independent strides its loop by `nthreads`; an op whose walk carries state
@@ -1209,30 +1247,7 @@ inline void ptir_m1_execute_part(
     m1_copy_typed_range(a0, o0, d0.len, d0.dtype, tid, nthreads);
     if (nthreads > 1u) threadgroup_barrier(mem_flags::mem_device);
     if (tid != 0) return;
-    const uint rest = d0.rank == 0 ? 1u : d0.len / max(d0.dims[0], 1u);
-    const uint n0 = d0.rank == 0 ? 1u : d0.dims[0];
-    const bool scalar = d2.len == 1 && d1.len * rest != 1;
-    for (uint k = 0; k < d1.len; ++k) {
-      const long index = m1_load_index(a1, k, d1.dtype);
-      if (index < 0 || uint(index) >= n0) continue;
-      for (uint r = 0; r < rest; ++r) {
-        const uint dst = uint(index) * rest + r;
-        const uint src = scalar ? 0u : k * rest + r;
-        if (d0.dtype == 0) {
-          const float value = m1_load_f(a2, src, d2.dtype);
-          m1_store_f(o0, dst, p.tag == 0x62 ? m1_load_f(o0, dst, 0) + value : value);
-        } else if (d0.dtype == 1) {
-          const int value = m1_load_i(a2, src, d2.dtype);
-          m1_store_i(o0, dst, p.tag == 0x62 ? int(uint(m1_load_i(o0, dst, 1)) + uint(value)) : value);
-        } else if (d0.dtype == 2) {
-          const uint value = m1_load_u(a2, src, d2.dtype);
-          m1_store_u(o0, dst, p.tag == 0x62 ? m1_load_u(o0, dst, 2) + value : value);
-        } else {
-          const bool value = m1_load_b(a2, src, d2.dtype);
-          m1_store_b(o0, dst, value);
-        }
-      }
-    }
+    m1_scatter_rmw(p.tag, a1, a2, o0, d0, d1, d2);
     return;
   }
   if (p.tag == 0x64) {

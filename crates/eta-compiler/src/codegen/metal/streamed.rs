@@ -499,6 +499,25 @@ fn direct_wide(
                 let _ = writeln!(compute, "{v} = {};", typed_load(dout, &pa(0), "x", d0));
             }
         }
+        tags::GATHER => {
+            // `out[i] = src[idx[i]]` for a source of rank one (or a scalar),
+            // where the runtime's row-major walk has one element per index;
+            // an index out of range reads as zero, as the runtime answers.
+            let (d0, d1) = (d0?, d1?);
+            let src = arg(0)?;
+            if value_types.get(src as usize).is_none_or(|ty| ty.dims.len() > 1) {
+                return None;
+            }
+            let s1 = stride(1, &mut pre);
+            let _ = writeln!(pre, "    const uint n0_{node} = descriptors[{src}].len;");
+            let index = load(1, 1, d1, &s1);
+            let _ = writeln!(
+                compute,
+                "{{ const int idx = {index}; {v} = (idx >= 0 && uint(idx) < n0_{node}) ? {} : {}(0); }}",
+                typed_load(dout, &pa(0), "uint(idx)", d0),
+                msl_type(dout)
+            );
+        }
         tags::RESHAPE | tags::CHAN_TAKE | tags::CHAN_READ => {
             // A materialised copy, element `i` of `n`.
             if dout == 3 && op.tag != tags::RESHAPE {
@@ -558,14 +577,14 @@ const MAX_SPLIT_REDUCTIONS: usize = 64;
 /// What a node becomes, before scheduling.
 enum Plan {
     /// A direct element-independent op (see [`direct_wide`]); `scalar` when
-    /// its result has one element by shape, `remaps` when it reads an
-    /// operand at an index other than its own (a broadcast).
+    /// its result has one element by shape, `cross` the operands it reads at
+    /// an index other than its own (a broadcast's or gather's source).
     Direct {
         base: u32,
         len: Vec<Dimension>,
         scalar: bool,
         reads: Vec<u32>,
-        remaps: bool,
+        cross: Vec<u32>,
     },
     /// An intrinsic gather, strided over the grid; `single_row` when its
     /// value's rows are one by shape, so its element mapping is the grid's.
@@ -592,6 +611,14 @@ enum Plan {
     },
     /// A stateful walk or a fused threadgroup pattern on one threadgroup.
     Single(String),
+    /// A scatter: the base copied into the result as a grid pass, then the
+    /// read-modify-write over the indices on one threadgroup.
+    Scatter {
+        copy: String,
+        rmw: String,
+        base_len: Vec<Dimension>,
+        result: u32,
+    },
     /// A fixed-tree reduction; `split` when it is over a single row of a
     /// non-bool dtype and may take the partial/final form.
     Reduce {
@@ -737,21 +764,29 @@ impl Scheduler<'_> {
             writes.insert(f.result);
         }
         for (node, base) in core::mem::take(&mut self.pending_scalars) {
-            let code = self.direct(node, base);
-            let dout = wire_dtype(self.value_types, base).unwrap_or(0);
-            text.push_str(&code.pre);
-            text.push_str(&code.decl.replace("      ", "    "));
-            text.push_str("    { const uint i = 0u;\n");
-            for line in code.compute.lines() {
-                let _ = writeln!(text, "      {line}");
-            }
-            let _ = writeln!(text, "      if (m4_gtid == 0u) {} }}", code.store);
-            let r = format!("r_{base}");
-            let _ = writeln!(text, "    const uint {r} = {};", bits_of(dout, &format!("v_{node}")));
-            self.regs.insert(base, r);
+            text.push_str(&self.scalar_inline(node, base));
             writes.insert(base);
         }
         (text, writes)
+    }
+
+    /// One scalar op as every thread computes it: its bits land in the
+    /// register `r_<value>`, thread 0 stores the value.
+    fn scalar_inline(&mut self, node: u32, base: u32) -> String {
+        let code = self.direct(node, base);
+        let dout = wire_dtype(self.value_types, base).unwrap_or(0);
+        let mut text = String::new();
+        text.push_str(&code.pre);
+        text.push_str(&code.decl.replace("      ", "    "));
+        text.push_str("    { const uint i = 0u;\n");
+        for line in code.compute.lines() {
+            let _ = writeln!(text, "      {line}");
+        }
+        let _ = writeln!(text, "      if (m4_gtid == 0u) {} }}", code.store);
+        let r = format!("r_{base}");
+        let _ = writeln!(text, "    const uint {r} = {};", bits_of(dout, &format!("v_{node}")));
+        self.regs.insert(base, r);
+        text
     }
 
     /// Start a dispatch sized by `value`, with the owed prologue.
@@ -1130,6 +1165,20 @@ pub fn emit_streamed_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         let plan = match kind {
+            StepKind::Single if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET) => {
+                Plan::Scatter {
+                    copy: format!(
+                        "    m1_copy_typed_range({}, {}, descriptors[lane_params[{node}].a0].len, descriptors[lane_params[{node}].a0].dtype, m4_gtid, m4_gthreads);\n",
+                        slots.a0, slots.o0
+                    ),
+                    rmw: format!(
+                        "    if (m4_group.x != 0) return;\n    if (m3_tid == 0) m1_scatter_rmw({}u, {}, {}, {}, descriptors[lane_params[{node}].a0], descriptors[lane_params[{node}].a1], descriptors[lane_params[{node}].a2]);\n",
+                        op.tag, slots.a1, slots.a2, slots.o0
+                    ),
+                    base_len: reads.first().map_or_else(Vec::new, |&v| key_of(v)),
+                    result: base,
+                }
+            }
             StepKind::Wide if op.tag == tags::CHAN_PUT => Plan::Put {
                 text: format!(
                     "{generic_wide}    if (m4_gtid == 0) pending_flags[pending_index_{}] = 1;\n",
@@ -1147,8 +1196,12 @@ pub fn emit_streamed_region(
                         base,
                         scalar: len.is_empty(),
                         len,
+                        cross: if matches!(op.tag, tags::BROADCAST | tags::GATHER) {
+                            reads.first().copied().into_iter().collect()
+                        } else {
+                            Vec::new()
+                        },
                         reads,
-                        remaps: op.tag == tags::BROADCAST,
                     }
                 } else {
                     // The runtime's strided ops read their operands at their
@@ -1258,34 +1311,44 @@ pub fn emit_streamed_region(
                 base,
                 scalar: true,
                 reads,
+                cross,
                 ..
             } => {
-                // A scalar rides in the next prologue, where every thread
-                // computes it. Its operands are scalars — memory written by
-                // earlier dispatches, or registers of that prologue — so a
-                // dispatch that wrote one of them at the grid mapping, or
-                // that is already running its passes, closes first.
+                // A scalar is computed by every thread and stored by thread 0.
+                // Its operands are scalars: registers, or memory written by
+                // earlier dispatches. In an open dispatch it can run between
+                // the passes as long as none of them wrote an operand at the
+                // grid mapping (another thread's store); otherwise it waits
+                // for the next prologue and the open dispatch closes.
                 let wrote = sched
                     .open
                     .as_ref()
                     .is_some_and(|o| reads.iter().any(|v| o.writes.contains(v)));
-                if wrote || sched.open.as_ref().is_some_and(|o| o.len.is_some()) {
-                    sched.flush_open();
+                let _ = cross;
+                if sched.open.is_some() && !wrote {
+                    sched.close_loop();
+                    let text = sched.scalar_inline(node, *base);
+                    let o = sched.open.as_mut().expect("open");
+                    o.passes.push_str(&text);
+                    o.prologue_writes.insert(*base);
+                } else {
+                    if wrote {
+                        sched.flush_open();
+                    }
+                    sched.pending_scalars.push((node, *base));
                 }
-                sched.pending_scalars.push((node, *base));
             }
             Plan::Direct {
                 base,
                 len,
                 reads,
-                remaps,
+                cross,
                 ..
             } => {
-                let cross = *remaps;
                 let regs = sched.regs.clone();
                 sched.ensure_open(*base, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len)
-                        && !(cross && reads.iter().any(|v| o.writes.contains(v)))
+                        && !cross.iter().any(|v| o.writes.contains(v))
                         // A register operand is read from the register; a
                         // prologue value read from memory would race thread 0.
                         && !reads
@@ -1413,6 +1476,28 @@ pub fn emit_streamed_region(
                     sched.cases.push_str("    return;\n  }\n");
                     sched.steps.push(streamed_step(*input, StepKind::Reduce));
                 }
+            }
+            Plan::Scatter {
+                copy,
+                rmw,
+                base_len,
+                result,
+            } => {
+                // The copy reads the base at its own index: a pass of the open
+                // dispatch, or one of its own. The read-modify-write then needs
+                // the whole copy in place, so it is a dispatch of one group.
+                sched.ensure_open(*result, StepKind::Wide, base_len, |o| {
+                    o.len.as_ref().is_none_or(|l| l == base_len)
+                });
+                sched.close_loop();
+                let o = sched.open.as_mut().expect("opened");
+                o.passes.push_str(copy);
+                o.writes.insert(*result);
+                sched.flush_open();
+                let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
+                sched.cases.push_str(rmw);
+                sched.cases.push_str("    return;\n  }\n");
+                sched.steps.push(streamed_step(*result, StepKind::Single));
             }
             Plan::Single(text) => {
                 sched.flush_pending();
