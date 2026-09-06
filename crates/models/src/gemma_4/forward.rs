@@ -325,7 +325,10 @@ impl ForwardHybrid for Model {
                     k_norm,
                     k_norm_eps,
                 } => {
-                    if model_dsl::platform() == Platform::Cuda && at.reading == Reading::Sliding {
+                    // The fused decode write covers both readings on CUDA: a
+                    // full rope on the sliding layers, the global layers' partial
+                    // one by its rotated width. It norms both heads at one epsilon.
+                    if model_dsl::platform() == Platform::Cuda && *k_norm_eps == at.q_norm_eps {
                         let (fast_x, rest_x) = normed.split(&fused);
                         let (fast_pos, rest_pos) = positions.split(&fused);
                         let qf = ops::custom::qkv_fused_qknorm_rope_vnorm_write(
@@ -339,7 +342,14 @@ impl ForwardHybrid for Model {
                             pages,
                             &inputs.write_page(&at.kv),
                             &inputs.write_offset(&at.kv),
-                            m.sliding.theta,
+                            match at.reading {
+                                Reading::Global => m.global.theta,
+                                Reading::Sliding => m.sliding.theta,
+                            },
+                            match at.reading {
+                                Reading::Global => m.global.rotary_dim,
+                                Reading::Sliding => d,
+                            },
                             &fast_pos,
                         );
                         let qr = qkv_unfused(

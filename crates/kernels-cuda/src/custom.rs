@@ -34,6 +34,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     kv_heads: u32,
     head_dim: u32,
     theta: f32,
+    rotary_dim: u32,
     q: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
@@ -53,6 +54,15 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
              norms, so serving this would normalise k at q's epsilon",
         ));
     }
+    if rotary_dim == 0 || rotary_dim > head_dim || rotary_dim % 2 != 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a rotated width of {rotary_dim} does not sit evenly in a {head_dim}-wide head"
+            ),
+        ));
+    }
+    let rotary = stated(OP, rotary_dim)?;
     let head_dim = count(OP, "the head width this fused write states", head_dim)?;
     let kv_heads = count(OP, "the kv head count this fused write states", kv_heads)?;
 
@@ -121,6 +131,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 hnd_layout.arg(),
                 theta.arg(),
                 q_norm_eps.arg(),
+                rotary.arg(),
             ],
         );
     }
@@ -154,6 +165,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             hnd_layout.arg(),
             theta.arg(),
             q_norm_eps.arg(),
+            rotary.arg(),
         ],
     )
 }

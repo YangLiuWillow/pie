@@ -27,7 +27,8 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     int page_size,
     bool hnd_layout,
     float theta,
-    float eps)
+    float eps,
+    int rotary_dim)
 {
     const int r = blockIdx.x;
 
@@ -152,6 +153,11 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
             const float ang = static_cast<float>(pos) * freq;
             __sincosf(ang, &sin_v, &cos_v);
         }
+        // Past the rotated width (a partial rope): normed, unrotated.
+        if (dim_pair >= rotary_dim / 2) {
+            cos_v = 1.f;
+            sin_v = 0.f;
+        }
         dst[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
         dst[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
     }
@@ -180,7 +186,8 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     int page_size,
     bool hnd_layout,
     float theta,
-    float eps)
+    float eps,
+    int rotary_dim)
 {
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = HEAD_DIM / 32;
@@ -274,6 +281,11 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
             const float ang = static_cast<float>(pos) * freq;
             __sincosf(ang, &sin_v, &cos_v);
         }
+        // Past the rotated width (a partial rope): normed, unrotated.
+        if (dim_pair >= rotary_dim / 2) {
+            cos_v = 1.f;
+            sin_v = 0.f;
+        }
         vals[i] = vals[i] * cos_v + signed_pair * sin_v;
     }
 
@@ -350,7 +362,8 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv(
     int page_size,
     bool hnd_layout,
     float theta,
-    float eps)
+    float eps,
+    int rotary_dim)
 {
     const int row = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -446,6 +459,11 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv(
         const float ang = static_cast<float>(pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
+        // Past the rotated width (a partial rope): normed, unrotated.
+        if (dim_pair >= rotary_dim / 2) {
+            cos_v = 1.f;
+            sin_v = 0.f;
+        }
         dst[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
         dst[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
     }
