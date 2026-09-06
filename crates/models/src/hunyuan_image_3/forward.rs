@@ -94,6 +94,7 @@ impl Model {
             width,
             streams: vec![],
             at,
+            rows: None,
         };
         let readings = vec![
             ReadingFact {

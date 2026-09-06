@@ -447,27 +447,32 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
             }
         }
     }
-    let has_embed = container
-        .ports
-        .iter()
-        .any(|binding| binding.port == Port::EmbedTokens);
-    if has_embed
-        && !container
-            .ports
-            .iter()
-            .any(|binding| binding.port == Port::KvLen)
-    {
-        return Err(ValidateError::EmbedTokensWithoutKvLen);
-    }
-    if has_embed {
-        for port in [
-            Port::Positions,
-            Port::Pages,
-            Port::PageIndptr,
-            Port::WSlot,
-            Port::WOff,
-        ] {
-            if !container.ports.iter().any(|binding| binding.port == port) {
+    // **A TRACE THAT ATTENDS BINDS ITS WHOLE GEOMETRY.** The rule is on the
+    // GEOMETRY, not on the tokens: a container that binds any one of the
+    // page-table ports binds all of them plus `kv_len`, so nothing infers a
+    // readable extent or a write slot it was not told.
+    //
+    // Embedding tokens no longer implies attending. A CACHELESS ENCODER —
+    // bidirectional, holding nothing between fires, its rows attending each
+    // other inside the arm over the lane's own indptr (Wan 2.2's umT5) —
+    // binds `embed_tokens` and NO geometry, and a page table for it would be
+    // a table of nothing. Such a container is a float lane that happens to
+    // carry ids (`runtime::pipeline::fire::float`).
+    const GEOMETRY: [Port; 5] = [
+        Port::Positions,
+        Port::Pages,
+        Port::PageIndptr,
+        Port::WSlot,
+        Port::WOff,
+    ];
+    let bound = |port: Port| container.ports.iter().any(|binding| binding.port == port);
+    let attends = bound(Port::KvLen) || GEOMETRY.iter().copied().any(bound);
+    if attends {
+        if !bound(Port::KvLen) {
+            return Err(ValidateError::EmbedTokensWithoutKvLen);
+        }
+        for port in GEOMETRY {
+            if !bound(port) {
                 return Err(ValidateError::EmbedTokensWithoutGeometry { port });
             }
         }

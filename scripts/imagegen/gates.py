@@ -376,6 +376,23 @@ def ltx_readout(text: str) -> str:
     return "  ".join(bits)
 
 
+def wan_video_readout(text: str) -> str:
+    bits = []
+    host = rust_cos_readout(text)
+    if host != "cos ?":
+        bits.append(f"vae {host}")
+    cold = re.search(r"cacheless frame \d+: cos ([0-9.]+)", text)
+    if cold:
+        bits.append(f"cacheless {float(cold.group(1)):.4f}")
+    clip = re.search(r"\[gates\] clip: (\S+)", text)
+    size = re.search(r"\[gates\] (\d+)x(\d+) mp4, (\d+) frames", text)
+    if size:
+        bits.append(f"{size.group(1)}x{size.group(2)}x{size.group(3)} mp4")
+    if clip:
+        bits.append(clip.group(1))
+    return "  ".join(bits) or "no clip"
+
+
 def t2i_readout(text: str) -> str:
     png = re.search(r"\[gates\] picture: (\S+)", text)
     size = re.search(r"\[gates\] (\d+)x(\d+) PNG", text)
@@ -416,6 +433,19 @@ def cargo_test(name):
     def build(ctx, gate):
         return ([ctx.cargo, "test", "-p", "engine-cuda", "--features", "cuda",
                  "--test", name, "--", "--nocapture"], REPO)
+    return build
+
+
+def t2v_step(prompt_ids, width, height, frames, steps, seed):
+    def build(ctx, gate):
+        out = os.path.join(ctx.out, gate.name, "clip")
+        os.makedirs(out, exist_ok=True)
+        return ([ctx.python, os.path.join(HERE, "gates.py"), "--text-to-video",
+                 "--config", ctx.configs[gate.name], "--out", out,
+                 "--pie", ctx.pie, "--prompt-ids", prompt_ids,
+                 "--width", str(width), "--height", str(height),
+                 "--frames", str(frames), "--steps", str(steps),
+                 "--seed", str(seed)], REPO)
     return build
 
 
@@ -606,6 +636,34 @@ def roster() -> list[Gate]:
             timeout=2400,
         ),
         Gate(
+            name="wan-video",
+            wraps=("the_wan_2_vae_answers_the_reference, then the model-agnostic "
+                   "text-to-video guest on wan22-ti2v-5b.zt"),
+            expected="decode cos >= 0.999 per chunk and over the clip; a real mp4",
+            needs=[(g("wan22", "wan22_vae", "shapes.json"),
+                    "python scripts/imagegen/wan22_golden.py --vae"),
+                   (a("wan22-ti2v-5b.zt"),
+                    f"{IMPORT} <Wan2.2-TI2V-5B-Diffusers snapshot, with a tokenizer.json "
+                    f"pie can compile beside it> --sku wan22-ti2v-5b-bf16-kv-bf16 "
+                    f"--out {a('wan22-ti2v-5b.zt')}")],
+            # 1950 latent rows plus a 512-row context lane, times the submit
+            # depth: a video job wants far more headroom than an image one.
+            config=dict(port=8612, model=a("wan22-ti2v-5b.zt"), rows=131072, mem=0.90,
+                        timeout="1800s"),
+            steps=[("the VAE against the reference",
+                    cargo_test("the_wan_2_vae_answers_the_reference")),
+                   # umT5's SentencePiece Unigram tokenizer does not compile
+                   # in pie (`models::wan_2::tokenizer`), so the prompt goes
+                   # in as ids: the reference tokenizer's encoding of
+                   # "a red bicycle leaning on a blue wall", the golden's
+                   # own prompt.
+                   ("prompt -> clip",
+                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                             832, 480, 17, 20, 0))],
+            readout=wan_video_readout,
+            timeout=5400,
+        ),
+        Gate(
             name="text-to-image",
             wraps="the model-agnostic guest on flux2-klein-4b.zt, 4 steps at 1024^2",
             expected="a real PNG",
@@ -713,6 +771,76 @@ def text_to_image(args) -> int:
 
 
 # ----------------------------------------------------------------------------
+# the text-to-video gate, which is a `pie run` and then a real mp4
+# ----------------------------------------------------------------------------
+
+def text_to_video(args) -> int:
+    """`--text-to-video`: drive the generic video guest and end with an mp4.
+
+    One exit, not two: a video row must declare a `vae.decode` reading, or
+    there is nothing here that can turn a latent volume into frames from
+    inside pie, and the guest refuses by name.
+
+    The prompt goes in as IDS.  Wan 2.2's text encoder is umT5, whose
+    tokenizer is a SentencePiece Unigram model and `crates/tokenizer`
+    compiles BPE pipelines alone (`models::wan_2::tokenizer`), so the
+    artifact carries somebody else's vocabulary and `--prompt` on this row
+    would condition the DiT on ids it has never seen.  The ids below are
+    `T5Tokenizer(Wan2.2-TI2V-5B/tokenizer)("a red bicycle leaning on a blue
+    wall")` -- the golden's own prompt, so the clip is comparable with
+    `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_golden.mp4`.
+    """
+    inferlet = os.path.join(REPO, "tests/inferlets/text-to-video")
+    workspace = os.path.dirname(inferlet)
+    if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
+        done = subprocess.run(["cargo", "build", "-p", "text-to-video", "--release",
+                               "--target", "wasm32-wasip2"],
+                              cwd=workspace, capture_output=True, text=True)
+        if done.returncode != 0:
+            sys.stderr.write(done.stderr)
+            return 1
+    candidates = [os.path.join(workspace, "target/wasm32-wasip2", flavour, "text_to_video.wasm")
+                  for flavour in ("release", "debug")]
+    present = [p for p in candidates if os.path.exists(p)]
+    if not present:
+        print(f"[gates] no text-to-video wasm; tried {candidates}")
+        return 1
+    wasm = max(present, key=os.path.getmtime)
+    cmd = [args.pie, "--config", args.config, "run", "--path", wasm,
+           "--manifest", os.path.join(inferlet, "Pie.toml"),
+           "-o", args.out, "--",
+           "--prompt-ids", args.prompt_ids, "--width", str(args.width),
+           "--height", str(args.height), "--frames", str(args.frames),
+           "--steps", str(args.steps), "--seed", str(args.seed), "--out", "clip"]
+    print("$ " + " ".join(cmd), flush=True)
+    done = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    if done.returncode != 0:
+        print(f"[gates] pie run failed ({done.returncode})")
+        return 1
+
+    mp4 = os.path.join(args.out, "clip.mp4")
+    if not os.path.exists(mp4):
+        print(f"[gates] {mp4} does not exist")
+        return 1
+    # A real mp4: the ISO-BMFF brand, a plausible size, and the frame count
+    # the guest reported.
+    with open(mp4, "rb") as f:
+        head = f.read(12)
+    if head[4:8] != b"ftyp":
+        print(f"[gates] {mp4} is not ISO base media")
+        return 1
+    size = os.path.getsize(mp4)
+    print(f"[gates] {args.width}x{args.height} mp4, {args.frames} frames, {size} bytes")
+    print(f"[gates] clip: {mp4}")
+    if size < 20_000:
+        print(f"[gates] suspiciously small for a {args.frames}-frame clip")
+        return 1
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # the run
 # ----------------------------------------------------------------------------
 
@@ -787,12 +915,15 @@ def main() -> int:
     ap.add_argument("--cargo", default="cargo")
     ap.add_argument("--json", default=None, help="also write the table here as JSON")
     ap.add_argument("--log", default=None, help="the full transcript (default: <out>/gates.log)")
-    # the text-to-image gate re-enters this file as a step of its own
+    # the text-to-image / text-to-video gates re-enter this file as a step
     ap.add_argument("--text-to-image", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--text-to-video", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--config", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--prompt", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--prompt-ids", default="", help=argparse.SUPPRESS)
     ap.add_argument("--width", type=int, default=1024, help=argparse.SUPPRESS)
     ap.add_argument("--height", type=int, default=1024, help=argparse.SUPPRESS)
+    ap.add_argument("--frames", type=int, default=17, help=argparse.SUPPRESS)
     ap.add_argument("--steps", type=int, default=4, help=argparse.SUPPRESS)
     ap.add_argument("--seed", type=int, default=0, help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -809,6 +940,9 @@ def main() -> int:
 
     if args.text_to_image:
         return text_to_image(args)
+
+    if args.text_to_video:
+        return text_to_video(args)
 
     if args.only:
         names = {gate.name for gate in gates}

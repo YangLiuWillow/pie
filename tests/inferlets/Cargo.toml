@@ -46,6 +46,7 @@ members = [
     "flux2-parity",
     "hy3-parity",
     "text-to-image",
+    "text-to-video",
     "zimage-parity",
     "zimage-vae-parity",
     "wan2-parity",

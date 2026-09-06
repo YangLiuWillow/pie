@@ -139,6 +139,7 @@ fn denoise_reading(tap: Option<&str>) -> ReadingFact {
         width,
         streams: streams.to_vec(),
         at: None,
+        rows: None,
     };
     ReadingFact {
         name: "denoise",

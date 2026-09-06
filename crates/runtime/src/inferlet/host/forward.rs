@@ -1314,6 +1314,22 @@ impl ProcessCtx {
                 Ok::<_, anyhow::Error>((name, cell.shape.clone(), cell.dtype))
             })
             .collect::<Result<_, _>>()?;
+            // How many ids the embed channel holds, read before the pass is
+            // borrowed. A CACHELESS ENCODER's lane is as tall as its ids
+            // (see the float-rows decision below); every other pass ignores
+            // this.
+            let embed_ids: Option<usize> = {
+                let rep = self.ctx().table.get(&this)?.bindings.embed.map(|e| e.tokens);
+                match rep {
+                    Some(rep) => {
+                        let resource: Resource<Channel> = Resource::new_borrow(rep);
+                        let cell = self.ctx().table.get(&resource)?.cell.clone();
+                        let ids = cell.lock().unwrap().numel();
+                        Some(ids)
+                    }
+                    None => None,
+                }
+            };
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -1410,17 +1426,23 @@ impl ProcessCtx {
                     stream_names(reading)
                 )));
             }
-            // This runtime fires a lane either through its KV working set
-            // (tokens, geometry ports) or as a float lane (rows from a
-            // port, no sequence); a reading with one but not the other has
-            // no fire path yet.
-            if wants_tokens != wants_kv {
+            // A lane fires through its KV working set (tokens plus geometry
+            // ports: a sequence) or as a FLOAT lane (no sequence). A float
+            // lane usually embeds no tokens either — its rows are a port's —
+            // but ONE shape does: a CACHELESS ENCODER, `takes_tokens` with
+            // no KV space, which is what a bidirectional text encoder is
+            // (Wan 2.2's umT5). Its rows attend each other inside the arm,
+            // over the lane's own indptr, and it holds nothing between
+            // fires, so a page table would be a table of nothing. It rides
+            // the float path with the ids in `Lane::tokens`.
+            //
+            // The other half is still refused: KV without tokens is a
+            // sequence with nothing to seat.
+            if wants_kv && !wants_tokens {
                 return Ok(Err(format!(
-                    "reading `{}` {} tokens but {} a KV space; this runtime fires a lane with \
-                     both (a sequence) or neither (a float lane), not one of the two",
-                    reading.map_or("", |reading| reading.name),
-                    if wants_tokens { "embeds" } else { "embeds no" },
-                    if wants_kv { "declares" } else { "declares no" }
+                    "reading `{}` embeds no tokens but declares a KV space; a sequence's rows \
+                     are its tokens, and this reading states none",
+                    reading.map_or("", |reading| reading.name)
                 )));
             }
             // Neither reading is a default the host may pick for the guest.
@@ -1477,9 +1499,26 @@ impl ProcessCtx {
             // A float lane's rows are its latents port's. A VAE reading binds
             // no `[rows, ·]` port at all — its rows are its clips' voxels, on
             // the third axis — and takes ONE dummy token row so that its lane
-            // exists in the fire's composition.
-            let float_rows = if wants_tokens {
+            // exists in the fire's composition. A CACHELESS ENCODER's rows
+            // are its IDS, read off the embed channel's cell.
+            let float_rows = if wants_tokens && wants_kv {
                 None
+            } else if wants_tokens {
+                let Some(ids) = embed_ids else {
+                    return Ok(Err(
+                        "a cacheless encoder pass binds `embed`; this one bound none".to_string(),
+                    ));
+                };
+                match u32::try_from(ids).ok().filter(|rows| *rows > 0) {
+                    Some(rows) => Some(rows),
+                    None => {
+                        return Ok(Err(format!(
+                            "reading `{}` embeds tokens and the channel bound to `embed` holds \
+                             {ids} of them",
+                            reading.map_or("", |reading| reading.name)
+                        )));
+                    }
+                }
             } else {
                 match port_rows(&port_bindings) {
                     Ok(Some(rows)) => Some(rows),
@@ -2060,6 +2099,9 @@ impl ProcessCtx {
                         .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
                         .filter_map(|binding| binding.clip)
                         .collect(),
+                    // A cacheless encoder's ids come off this channel at
+                    // every fire; every other float lane seats zeros.
+                    embed: embed.map(|embed| embed.tokens),
                 }),
                 closed: false,
             };
@@ -2659,6 +2701,7 @@ mod tests {
             width,
             streams: Vec::new(),
             at: None,
+            rows: None,
         }
     }
 

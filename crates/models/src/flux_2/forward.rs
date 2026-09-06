@@ -133,6 +133,7 @@ impl Model {
             width,
             streams: streams.to_vec(),
             at: None,
+            rows: None,
         };
         let mut readings = Vec::new();
         if let (Some(index), Some(_)) = (codes.text, &self.te) {
@@ -243,6 +244,7 @@ impl Model {
                     width: super::vae::RGB,
                     streams: vec![Stream::Image],
                     at: Some(port::PIXEL_VOXELS),
+                    rows: None,
                 }],
                 positions: None,
                 readout: ReadoutKind::Pixels,

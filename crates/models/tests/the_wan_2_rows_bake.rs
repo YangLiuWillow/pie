@@ -169,6 +169,7 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
             Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
                 ("AxisPositions", *port, u32::from(*axes))
             }
+            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
             _ => continue,
         };
         traced.insert((kind.to_string(), port, width));
@@ -244,8 +245,30 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, d.patch_out());
-        // The voxel port is the decoder arms' own and no fact's: one
-        // declaration, read under both arms.
+        // ONE voxel declaration, read under BOTH decoder arms: the two
+        // readings state the same `(kind, index)` at the same width, which
+        // is what lets the engine seat one rectangle for the whole plan.
+        for name in ["vae.decode.head", "vae.decode"] {
+            let Some(arm) = facts.readings.iter().find(|r| r.name == name) else {
+                assert!(!is_flagship(sku), "{sku}: a VAE row declares `{name}`");
+                continue;
+            };
+            assert_eq!(arm.streams, vec![Stream::Video]);
+            assert!(!arm.has_kv && !arm.takes_tokens);
+            assert_eq!(arm.readout, ReadoutKind::Pixels);
+            assert_eq!(arm.readout_width, model::VAE_RGB);
+            assert_eq!(arm.positions, None, "a VAE tile sits in no rotary space");
+            let (index, port) = arm.port("latent").expect("the voxel port");
+            assert_eq!(
+                (index, port.kind, port.width, port.streams.clone()),
+                (
+                    model::port::VOXELS,
+                    PortKind::Voxels,
+                    model::VAE_Z,
+                    vec![Stream::Video]
+                )
+            );
+        }
         let voxels = plan
             .values
             .iter()
@@ -288,7 +311,9 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             seen.len(),
             "{sku}: two lanes share a class: {seen:?}"
         );
-        let want = if is_flagship(sku) { 3 } else { 2 };
+        // text/Text, denoise/Video, denoise/Context, and one Video lane
+        // for each decoder arm.
+        let want = if is_flagship(sku) { 5 } else { 2 };
         assert_eq!(seen.len(), want, "{sku}: the lanes the facts list");
     }
 }
@@ -504,7 +529,10 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         }
         let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
         if is_flagship(sku) {
-            assert_eq!(names, vec!["text", "denoise"]);
+            assert_eq!(
+                names,
+                vec!["text", "denoise", "vae.decode.head", "vae.decode"]
+            );
             let text = &facts.readings[0];
             assert!(
                 text.takes_tokens && !text.has_kv,
@@ -555,11 +583,11 @@ fn validate(facts: &models::Generative) {
         assert!(reading.readout_width > 0);
         if !reading.takes_tokens {
             assert!(
-                reading
-                    .ports
-                    .iter()
-                    .any(|port| port.kind == PortKind::Latents),
-                "a token-less reading states its rows through a latents port"
+                reading.ports.iter().any(|port| matches!(
+                    port.kind,
+                    PortKind::Latents | PortKind::Voxels | PortKind::Context
+                )),
+                "a token-less reading states its rows through a row port"
             );
         }
     }

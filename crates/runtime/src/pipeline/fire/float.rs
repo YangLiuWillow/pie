@@ -58,7 +58,18 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         return Ok(Err(error));
     }
 
-    let (rows, clips, lane_facts, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
+    let (
+        rows,
+        clips,
+        embed_rep,
+        lane_facts,
+        ws_rep,
+        cells,
+        accesses,
+        instance_id,
+        scheduler,
+        fwd_rep,
+    ) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -78,6 +89,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         (
             float.rows,
             float.clips.clone(),
+            float.embed,
             pass.lane.clone(),
             pass.kv_ws,
             pass.cells.clone(),
@@ -113,12 +125,46 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         }
     };
 
+    // A CACHELESS ENCODER's rows ARE its ids, so its token rectangle is the
+    // ids themselves; every other float lane seats a rectangle of zeros
+    // whose only job is to give the lane `rows` rows. The ids are read off
+    // the embed channel's committed cell at every fire, not captured at
+    // bind: the same pass may be fired again with another prompt.
+    let tokens: Vec<u32> = match embed_rep {
+        Some(rep) => {
+            let resource: Resource<crate::pipeline::channel::Channel> = Resource::new_borrow(rep);
+            let cell = ctx.resources().get(&resource)?.cell.clone();
+            let ids = {
+                let cell = cell.lock().unwrap();
+                cell.peek_seed().or_else(|_| cell.clone().read())
+            };
+            match ids {
+                Ok(bytes) => bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect(),
+                Err(error) => {
+                    return Ok(Err(format!(
+                        "pipeline: the cacheless encoder's token channel: {error}"
+                    )));
+                }
+            }
+        }
+        None => vec![0; rows as usize],
+    };
+    if tokens.len() != rows as usize {
+        return Ok(Err(format!(
+            "pipeline: this lane was bound for {rows} row(s) and its token channel holds {}",
+            tokens.len()
+        )));
+    }
+
     // One lane, `rows` rows, every row read out. The word is stamped once
     // the lane facts are on it.
     let mut req = crate::engine::FireRequest {
         boundary_program: true,
         lanes: vec![::engine::Lane {
-            tokens: vec![0; rows as usize],
+            tokens,
             readout: ::engine::Readout::Rows((0..rows).collect()),
             // A float lane binds no kv space: the shell seats no tokens
             // for it and carries no count between fires.

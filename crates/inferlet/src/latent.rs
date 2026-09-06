@@ -42,7 +42,8 @@ use eta_dsl::Tensor;
 pub mod prelude {
     pub use super::{
         DenoiseLoop, FlowMatchEuler, LaneClock, LaneRows, apg, at, cfg_combine, dynamic_shift,
-        encode_text, euler_step, noise, positions_for, positions_grid, rng_state, seed_or_step,
+        encode_ids, encode_ids_rows, encode_text, euler_step, noise, positions_for,
+        positions_grid, rng_state, seed_or_step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -345,6 +346,19 @@ pub enum LaneRows {
     /// An image lane over an `h × w` latent-row grid, `h`-major (the packed
     /// order every family's `positions` port reads).
     Grid { h: u32, w: u32 },
+    /// **A VIDEO lane over a `t × h × w` latent-row volume**, `t`-major then
+    /// `h`-major — the order a video family's `latents` port packs its rows
+    /// in, and the reason this is a variant and not `Grid { h: t·h, w }`:
+    /// the temporal coordinate is its OWN axis of the rotary space (Wan's
+    /// `(t, h, w)`), so folding it into the height would place every frame
+    /// of a clip at a different height and none of them at a different
+    /// time.
+    ///
+    /// `Grid { h, w }` is `Volume { t: 1, h, w }` with the `Time` axis left
+    /// at 0 — an image is one frame — and is kept separate because an image
+    /// family may put something else on that axis (FLUX.2's reference
+    /// index).
+    Volume { t: u32, h: u32, w: u32 },
 }
 
 /// The `[rows, axes]` f32 grid one lane binds to a reading's
@@ -357,15 +371,22 @@ pub enum LaneRows {
 /// axis (`image_follows_text`); pass 0 for a lane set with no text lane.
 ///
 /// Rows come out in the port's own order: `Sequence` numbers row `j` at
-/// `text_origin + j` on `text_axis` and 0 elsewhere; `Grid` puts `a` on the
-/// `Height` axis, `b` on the `Width` axis, the image's caption offset on
-/// `text_axis`, and 0 on everything else.
+/// `text_origin + j` on `text_axis` and 0 elsewhere; `Grid`/`Volume` put
+/// `i` on the `Time` axis, `a` on the `Height` axis, `b` on the `Width`
+/// axis, the image's caption offset on `text_axis` WHEN the family stacks
+/// the image behind the caption, and 0 on everything else.
+///
+/// `text_axis` only overrides a role under `image_follows_text` — a video
+/// family numbers its frames on the `Time` axis and has no caption offset
+/// to put there (Wan's context lane binds no positions at all: its
+/// cross-attention has no rope), so a convention that says
+/// `image_follows_text: false` leaves every axis to its role.
 #[must_use]
 pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows: u32) -> Vec<f32> {
     let axes = convention.axes.len();
     let text_axis = convention.text_axis as usize;
     let origin = convention.text_origin as f32;
-    match lane {
+    let (t, h, w) = match lane {
         LaneRows::Sequence(rows) => {
             let mut grid = vec![0f32; rows as usize * axes];
             for j in 0..rows as usize {
@@ -373,33 +394,32 @@ pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows:
                     *cell = origin + j as f32;
                 }
             }
-            grid
+            return grid;
         }
-        LaneRows::Grid { h, w } => {
-            let follow = if convention.image_follows_text {
-                origin + text_rows as f32
-            } else {
-                0.0
-            };
-            let mut grid = Vec::with_capacity((h * w) as usize * axes);
-            for a in 0..h {
-                for b in 0..w {
-                    for (axis, role) in convention.axes.iter().enumerate() {
-                        grid.push(if axis == text_axis {
-                            follow
-                        } else {
-                            match role {
-                                AxisRole::Height => a as f32,
-                                AxisRole::Width => b as f32,
-                                AxisRole::Time | AxisRole::Index => 0.0,
-                            }
-                        });
-                    }
+        LaneRows::Grid { h, w } => (1, h, w),
+        LaneRows::Volume { t, h, w } => (t, h, w),
+    };
+    let follow = origin + text_rows as f32;
+    let mut grid = Vec::with_capacity((t * h * w) as usize * axes);
+    for i in 0..t {
+        for a in 0..h {
+            for b in 0..w {
+                for (axis, role) in convention.axes.iter().enumerate() {
+                    grid.push(if axis == text_axis && convention.image_follows_text {
+                        follow
+                    } else {
+                        match role {
+                            AxisRole::Time => i as f32,
+                            AxisRole::Height => a as f32,
+                            AxisRole::Width => b as f32,
+                            AxisRole::Index => 0.0,
+                        }
+                    });
                 }
             }
-            grid
         }
     }
+    grid
 }
 
 // ---------------------------------------------------------------------------
@@ -596,18 +616,11 @@ pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String>
     let Some(fact) = crate::model::reading(reading) else {
         return Err(format!("this model declares no reading `{reading}`"));
     };
-    if !(fact.has_kv && fact.takes_tokens) {
+    if !fact.takes_tokens {
         return Err(format!(
-            "reading `{reading}` is not a text encoder (it needs tokens and a KV space)"
+            "reading `{reading}` is not a text encoder (it embeds no tokens)"
         ));
     }
-    if fact.readout != ReadoutKind::Hidden {
-        return Err(format!(
-            "reading `{reading}` reads out {:?}, not the hidden rows an encoder hands over",
-            fact.readout
-        ));
-    }
-    let width = fact.readout_width;
     // THE TEMPLATE IS THE FAMILY'S, AND THE `chat` SURFACE IS WHERE IT
     // LIVES. Every text encoder in the generative zoo is an instruct model
     // whose reference pipeline renders one user turn plus the generation
@@ -618,32 +631,75 @@ pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String>
     // optional and it is not the guest's to spell: `first_user` + `cue` are
     // the bound model's own rendering. Padding stays the family's (the
     // encode arm's), so nothing is added here.
-    let mut ids_u32 = crate::chat::first_user(prompt);
-    ids_u32.extend(crate::chat::cue());
+    let mut ids = crate::chat::first_user(prompt);
+    ids.extend(crate::chat::cue());
+    if ids.is_empty() {
+        return Err("the prompt tokenizes to nothing".to_string());
+    }
+    encode_ids(&ids, reading).await
+}
+
+/// The other door into a text reading: the ids themselves.
+///
+/// [`encode_text`] renders the bound model's template and tokenizes with
+/// the bound model's tokenizer, which is the right thing whenever the
+/// artifact carries the encoder's own vocabulary. Some do not — Wan 2.2's
+/// umT5 is a SentencePiece **Unigram** model and `crates/tokenizer`
+/// compiles BPE pipelines alone (`models::wan_2::tokenizer`), so that row's
+/// artifact carries somebody else's vocabulary and `encode_text` on it
+/// would condition the DiT on ids it has never seen. A caller that HAS the
+/// right ids hands them over here instead, and the encoder still runs
+/// inside pie.
+///
+/// **A CACHELESS ENCODER BINDS NO ATTENTION.** `has_kv` is the fact that
+/// says which: a causal encoder (Qwen3 behind FLUX.2 and Z-Image) needs a
+/// working set and a `KvGeometry`; a bidirectional one (umT5) declares
+/// `has_kv: false`, which REFUSES `attention` on its pass by name, and its
+/// rows attend each other inside the arm over the lane's own indptr. Both
+/// land `hidden()` at every row.
+pub async fn encode_ids(ids: &[u32], reading: &str) -> Result<Channel, String> {
+    let (rows, width) = encode_ids_rows(ids, reading).await?;
+    let len = u32::try_from(rows.len() / width.max(1) as usize).unwrap_or(0);
+    Ok(Channel::from_shaped([len, width], rows))
+}
+
+/// [`encode_ids`] one step lower: the encoder's rows as host values plus
+/// their width, before they are put on a channel.
+///
+/// A guest that must RESHAPE the rows before the denoiser sees them needs
+/// this: a family whose context lane is a fixed height
+/// (`PortFact::rows` — Wan 2.2's 512) has the guest zero-pad the encoder's
+/// answer, and building a channel only to take it apart again would cross
+/// the host twice.
+pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u32), String> {
+    let Some(fact) = crate::model::reading(reading) else {
+        return Err(format!("this model declares no reading `{reading}`"));
+    };
+    if !fact.takes_tokens {
+        return Err(format!(
+            "reading `{reading}` embeds no tokens, so there is nothing to hand ids to"
+        ));
+    }
+    if fact.readout != ReadoutKind::Hidden {
+        return Err(format!(
+            "reading `{reading}` reads out {:?}, not the hidden rows an encoder hands over",
+            fact.readout
+        ));
+    }
+    let width = fact.readout_width;
     let cap = crate::eta::max_embed_length().max(1);
-    ids_u32.truncate(cap);
-    let ids: Vec<i32> = ids_u32
-        .into_iter()
-        .map(|id| i32::try_from(id).unwrap_or(0))
+    let ids: Vec<i32> = ids
+        .iter()
+        .take(cap)
+        .map(|id| i32::try_from(*id).unwrap_or(0))
         .collect();
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
     if len == 0 {
-        return Err("the prompt tokenizes to nothing".to_string());
+        return Err("no ids to encode".to_string());
     }
-    let page_size = crate::eta::kv_page_size().max(1);
-    let pages = len.div_ceil(page_size);
-    let ws = WorkingSet::new();
-    ws.reserve(pages)?;
     let pipe = Pipeline::new();
-
     let toks = Channel::from(ids);
     let embed_indptr = Channel::from([0u32, len]);
-    let positions = Channel::from_iter(0..len);
-    let page_ids = Channel::from_iter(0..pages);
-    let page_indptr = Channel::from([0u32, pages]);
-    let w_slot = Channel::from_iter((0..len).map(|p| p / page_size));
-    let w_off = Channel::from_iter((0..len).map(|p| p % page_size));
-    let kv_len = Channel::from([len]);
     let readout = Channel::from_iter(0..len);
     let out = Channel::new([len, width], crate::eta::Dtype::F32);
 
@@ -651,27 +707,43 @@ pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String>
     pass.reading(reading)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
-    pass.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &page_ids,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
-        },
-    )?;
+    // Held past the `if` so the working set outlives the submit on the
+    // cached path; a cacheless reading reserves no pages at all.
+    let ws = WorkingSet::new();
+    if fact.has_kv {
+        let page_size = crate::eta::kv_page_size().max(1);
+        let pages = len.div_ceil(page_size);
+        ws.reserve(pages)?;
+        let positions = Channel::from_iter(0..len);
+        let page_ids = Channel::from_iter(0..pages);
+        let page_indptr = Channel::from([0u32, pages]);
+        let w_slot = Channel::from_iter((0..len).map(|p| p / page_size));
+        let w_off = Channel::from_iter((0..len).map(|p| p % page_size));
+        let kv_len = Channel::from([len]);
+        pass.attention(
+            &ws,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len,
+                pages: &page_ids,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        )?;
+    }
+    let readback = out.clone();
     pass.epilogue(move || {
-        out.put(intrinsics::hidden(width));
+        readback.put(intrinsics::hidden(width));
     });
     pass.submit(&pipe)?;
     let rows: Vec<f32> = out.take_host().await?;
     pipe.close();
-    Ok(Channel::from_shaped([len, width], rows))
+    let _ = len;
+    Ok((rows, width))
 }
 
 #[cfg(test)]

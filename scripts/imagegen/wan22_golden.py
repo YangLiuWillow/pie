@@ -4,6 +4,7 @@ wan22_golden.py -- reference dump for Wan 2.2 TI2V-5B (M3).
 
     CUDA_VISIBLE_DEVICES=0 python wan22_golden.py --full     # ~30 GB VRAM, minutes
     python wan22_golden.py --mini                            # CPU, seconds
+    CUDA_VISIBLE_DEVICES=0 python wan22_golden.py --vae      # the VAE alone, fp32
 
 Outputs -> $PIE_IMAGEGEN_GOLDEN/wan22/
     wan22_golden.npz   umT5 prompt embeds (truncate-then-zero-pad to 512), initial noise,
@@ -14,6 +15,10 @@ Outputs -> $PIE_IMAGEGEN_GOLDEN/wan22/
     wan22_mini.npz     two random-init WanTransformer3DModel forwards:
                          `nano`  head_dim 24 -> rope split [8,8,8]   (catches d-4*(d//6))
                          `d128`  head_dim 128 -> rope split [44,42,42] (the real split)
+    wan22_vae/*.f32    --vae: the DiT-space latent and the fp32 decode of it, as raw
+                       little-endian f32 in the row-per-voxel `(t, h, w)` layout pie's
+                       voxel axis reads, PLUS the per-chunk boundaries the decoder's own
+                       frame-by-frame loop produces (`shapes.json`)
 
 TI2V-5B specifics: VAE stride (4,16,16), z=48, in/out channels 48, expand_timesteps=True,
 single backbone (boundary_ratio null), UniPCMultistepScheduler.
@@ -172,20 +177,89 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     npz_keys(tap)
 
 
+def run_vae(d: str, device="cuda"):
+    """`AutoencoderKLWan` alone, fp32, over the full run's final latent.
+
+    The DiT works in a NORMALISED latent space and the pipeline undoes that
+    before the decode (`latents * latents_std + latents_mean`); pie's
+    `vae.decode` arms undo it themselves, so what is dumped as `latent.f32`
+    is the DiT-space latent — exactly the rows the denoise reading answers —
+    and `denorm.f32` is the decoder's own input beside it, for a bisect.
+
+    `_decode` is a LOOP: it clears the per-conv frame caches, runs
+    `post_quant_conv` over the whole latent, and then calls the decoder once
+    per latent frame carrying the caches across. Latent frame 0 lands ONE
+    output frame, every later one lands FOUR, so `F = 4*T - 3`. Both halves
+    are dumped: the whole clip's pixels, and the frame boundary each chunk
+    ends at, so a port can be scored chunk by chunk and say WHICH fire drifted.
+    """
+    from diffusers import AutoencoderKLWan
+
+    vae = AutoencoderKLWan.from_pretrained(REPO, subfolder="vae",
+                                           torch_dtype=torch.float32).to(device).eval()
+    cfg = vae.config
+    full = os.path.join(d, "wan22_golden.npz")
+    if not os.path.exists(full):
+        raise SystemExit(f"{full} is missing; run `--full` first (the latent is a real one)")
+    z = np.load(full)["latent.final"]            # [1, 48, T, H, W], DiT space
+    z = torch.from_numpy(np.ascontiguousarray(z.reshape(z.shape[-4:]))).to(
+        device=device, dtype=torch.float32)[None]
+
+    mean = torch.tensor(cfg.latents_mean, device=device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+    std = torch.tensor(cfg.latents_std, device=device, dtype=torch.float32).view(1, -1, 1, 1, 1)
+    denorm = z * std + mean
+
+    with torch.no_grad():
+        x = vae.decode(denorm, return_dict=False)[0]          # [1, 3, 4T-3, 16H, 16W]
+
+    t_lat = int(z.shape[2])
+    frames = int(x.shape[2])
+    assert frames == 4 * t_lat - 3, f"{t_lat} latent frames should land {4 * t_lat - 3}, not {frames}"
+
+    raw = os.path.join(d, "wan22_vae")
+    os.makedirs(raw, exist_ok=True)
+    shapes = {}
+    for key, t in (("latent", z[0]), ("denorm", denorm[0]), ("pixels", x[0])):
+        cthw = t.detach().float().cpu().numpy()               # [C, T, H, W]
+        rows = np.ascontiguousarray(cthw.transpose(1, 2, 3, 0)).astype("<f4")
+        rows.tofile(os.path.join(raw, f"{key}.f32"))
+        shapes[key] = {"t": int(cthw.shape[1]), "h": int(cthw.shape[2]),
+                       "w": int(cthw.shape[3]), "channels": int(cthw.shape[0])}
+    # Chunk `k` of the decode loop is latent frame `k`; it lands output
+    # frames `[chunks[k], chunks[k+1])`.
+    shapes["chunks"] = [0] + [1 + 4 * k for k in range(t_lat)]
+    shapes["latents_mean"] = [float(v) for v in cfg.latents_mean]
+    shapes["latents_std"] = [float(v) for v in cfg.latents_std]
+    shapes["clip_output"] = bool(cfg.clip_output)
+    shapes["source"] = "latent.final of wan22_golden.npz"
+    with open(os.path.join(raw, "shapes.json"), "w") as f:
+        json.dump(shapes, f, indent=2)
+
+    from PIL import Image
+    for k in (0, frames // 2):
+        u8 = (np.clip(x[0, :, k].float().cpu().numpy().transpose(1, 2, 0) + 1, 0, 2) * 127.5)
+        Image.fromarray(u8.astype("uint8")).save(os.path.join(raw, f"frame{k:03d}.png"))
+    print(f"  vae: latent {tuple(z.shape)} -> pixels {tuple(x.shape)} "
+          f"[{float(x.min()):.3f}, {float(x.max()):.3f}]; chunks {shapes['chunks']}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
+    ap.add_argument("--vae", action="store_true")
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
-    if not (a.full or a.mini):
-        a.full = a.mini = True
+    if not (a.full or a.mini or a.vae):
+        a.full = a.mini = a.vae = True
     d = outdir(MODEL)
     torch.set_grad_enabled(False)
     if a.mini:
         print("== mini =="); run_mini(d, a.device)
     if a.full:
         print("== full =="); run_full(d)
+    if a.vae:
+        print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu")
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED, "steps": STEPS,
                  "height": HEIGHT, "width": WIDTH, "frames": FRAMES})
 

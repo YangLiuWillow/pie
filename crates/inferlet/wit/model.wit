@@ -135,6 +135,19 @@ interface model {
         // the reading. A pass on stream `s` binds exactly the ports that
         // list `s` (or list nothing).
         streams: list<lane-stream>,
+        // THE ROW COUNT THIS PORT'S CHANNEL MUST CARRY, when the family
+        // fixes it. `none` -- nearly always -- means the lane's own rows: a
+        // latents port is as tall as the picture's grid, a context port as
+        // tall as the prompt.
+        //
+        // A few families PAD instead. Wan 2.2 zero-pads its umT5 rows to
+        // 512 and the transformer attends every one of the 512 keys, so a
+        // context lane of the prompt's real length is a different model:
+        // the pad rows go through the text embedder into a nonzero constant
+        // that carries real attention mass. The IR cannot grow a lane, so
+        // the pad is the guest's, and this is the fact that lets a
+        // family-blind guest build it without spelling 512.
+        rows: option<u32>,
     }
 
     // What one axis of an `axis-positions` port means. The rotary space a

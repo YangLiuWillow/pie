@@ -151,6 +151,7 @@ impl Model {
             width,
             streams: streams.to_vec(),
             at,
+            rows: None,
         };
         // Both connectors read one rectangle of packed trunk rows, and both
         // hand a text lane one coordinate column.

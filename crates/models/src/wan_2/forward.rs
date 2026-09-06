@@ -5,7 +5,7 @@
 //! |---|---|---|---|
 //! | `text` | one, `Text` | `embed(ids)` — NO `attention`: umT5 is bidirectional and cacheless | `hidden` `[L, 4096]`: `last_hidden_state` after `final_layer_norm` |
 //! | `denoise` | one or two `Video` + one `Context`, one group | video: `latents` `[N, C·4]`, `positions` `[N, 3]`, `timestep`; context: `context` `[512, 4096]` | `velocity` `[N, C·4]` on every video lane |
-//! | `vae.decode.head`, `vae.decode` (arms only, see below) | one, `Video` | `voxels` `[V, 48]` + the grid | `pixels` `[64·V, 3]` (head: `16·V`) |
+//! | `vae.decode.head`, `vae.decode` (see the chunking contract below) | one, `Video` | `latent` `[h·w, 48]` + the clip's box | `pixels` `[16·h·16·w, 3]` (later frames: `4×` that) |
 //!
 //! **The timestep is per lane, and TI2V's per-token timestep is two
 //! lanes.** The reference's TI2V path (`expand_timesteps`) hands the
@@ -44,23 +44,57 @@
 //! rows are permuted at import (the checkpoint's `(ph, pw, c)`), so a
 //! guest's Euler step is elementwise over one layout.
 //!
-//! **The two `vae.decode` arms are traced, imported, and NOT declared in
-//! the facts.** `models::PortKind`/`ReadoutKind` have no `Voxels`/`Pixels`
-//! (the facts vocabulary stops at the engine, as for `flux_2`), and the
-//! mid block's single-head attention (`head_dim = 1024`, per frame) has
-//! neither a kernel arm (`attention.ragged` serves 64/128/256) nor a
-//! voxel-axis indptr to segment by, so the arms below are the decoder
-//! MINUS that attention and their pixels are not the reference's yet.
-//! Two arms because the reference decodes one latent frame at a time
-//! through per-conv frame caches and treats the FIRST frame apart: the
-//! `upsample3d` time conv is skipped (`"Rep"`) and `DupUp3D` emits frame
-//! 0 once. `vae.decode.head` takes exactly ONE latent frame per clip (its
-//! time convs are absent, its `(2, 2, 2)` shortcuts are `(1, 2, 2)`);
-//! `vae.decode` takes any later frame range with every causal conv
-//! reading its `CacheRow::State` slab, which `Shell::open` zeroes — the
-//! zero front padding the reference gives its first chunk. The encoder is
-//! not traced (its `AvgDown3D` mean over a `(2, 2, 2)` window has no
-//! `Spatial` member).
+//! # THE `vae.decode` CHUNKING CONTRACT
+//!
+//! **A decode fire is exactly ONE latent frame, and a clip is decoded by
+//! firing the arms in order down ONE slot.** That is not a simplification:
+//! it is the reference's own loop. `AutoencoderKLWan._decode` clears its
+//! per-conv caches, runs `post_quant_conv` over the whole latent (a
+//! `(1, 1, 1)` kernel — no temporal mixing, so per frame is the same
+//! numbers), and then calls the decoder once per latent frame, carrying
+//! every causal conv's last two input frames across the calls. Two arms,
+//! because the FIRST frame is treated apart: its `upsample3d` time conv is
+//! skipped entirely (`feat_cache[idx] = "Rep"`) and `DupUp3D` emits it
+//! once.
+//!
+//! | arm | takes | lands | time convs |
+//! |---|---|---|---|
+//! | `vae.decode.head` | latent frame 0, `[h·w, 48]` | `[1 × 16h × 16w, 3]` | absent; `(2, 2, 2)` shortcuts become `(1, 2, 2)` |
+//! | `vae.decode` | any later latent frame, `[h·w, 48]` | `[4 × 16h × 16w, 3]` | present, each reading its `CacheRow::State` slab |
+//!
+//! The slabs are what makes the fires a sequence: `Shell::open` zeroes
+//! them, which is the zero front padding the reference gives its first
+//! chunk, and each fire leaves its last frames behind for the next. So a
+//! guest that fires `vae.decode` before `vae.decode.head`, or that
+//! interleaves two clips in one slot, gets the wrong pixels and no
+//! diagnostic — the arms are ordered, and the order is the guest's to
+//! keep.
+//!
+//! **`F` output frames need `(F − 1) % 4 == 0`.** One latent frame lands 1
+//! output frame on the head arm and 4 on every later one, so a clip of `T`
+//! latent frames is `4·T − 3` output frames and nothing else: 1, 5, 9,
+//! ..., 17, ..., 33, ..., 49. Neither the model nor the engine rounds a
+//! frame count, so a guest that wants 48 frames is asking for a clip this
+//! family does not have and should be told so BY NAME rather than handed
+//! 49. `LatentSpace::temporal_compression` (4) states the same rule from
+//! the other side.
+//!
+//! **The denormalisation is the arm's, not the guest's.** The denoiser
+//! works in `(z_vae − mean)/std`; `vae_decode` undoes it
+//! (`model::VAE_LATENTS_MEAN`/`_STD` as a filled `standardize` pair)
+//! exactly as `z_image`'s decoder undoes its `scaling_factor`, so a
+//! family-blind guest hands the arm the rows the denoise reading answered
+//! and spells no family's numbers.
+//!
+//! The mid block's single-head attention rides `spatial::attention` — the
+//! conv VAE's own arm, one head as wide as the row, stamped at 256/512/1024
+//! and segmenting per CLIP — and per clip is per frame precisely because a
+//! decode fire is one latent frame. `attention.ragged` would not serve it
+//! (stamped at head widths 64/128/256, and its CSR is a token-axis table).
+//!
+//! The ENCODER is not traced: its `AvgDown3D` mean over a `(2, 2, 2)`
+//! window has no `Spatial` member, so `vae.encode` is refused by absence
+//! and an image-to-video row would need that op first.
 
 use model_dsl::ops::spatial;
 use model_dsl::{
@@ -70,16 +104,16 @@ use model_dsl::{
 use model_ir::TimePad;
 
 use crate::{
-    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
-    ScheduleKind,
+    AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
+    ReadoutKind, ScheduleFact, ScheduleKind,
 };
 
 use super::model::{
-    Block, CONTEXT_LEN, Conv, Dims, Dit, Linear, MOD_SLICES, Model, NORM_EPS, PATCH_H, PATCH_T,
-    PATCH_W, ROPE_AXES, ROPE_THETA, Resnet, Shortcut, T_FLIP_SIN_COS, T_MAX_PERIOD, T_SCALE,
-    TE_BUCKETS, TE_EPS, TE_HEAD_DIM, TE_HIDDEN, TE_MAX_DISTANCE, TE_MAX_TOKENS, TE_VOCAB,
-    TRAIN_STEPS, TextEncoder, VAE_EPS, VAE_PATCH, VAE_SPATIAL_COMPRESSION,
-    VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, port,
+    Block, CONTEXT_LEN, Conv, Dims, Dit, Linear, MOD_SLICES, MidAttention, Model, NORM_EPS,
+    PATCH_H, PATCH_T, PATCH_W, ROPE_AXES, ROPE_THETA, Resnet, Shortcut, T_FLIP_SIN_COS,
+    T_MAX_PERIOD, T_SCALE, TE_BUCKETS, TE_EPS, TE_HEAD_DIM, TE_HIDDEN, TE_MAX_DISTANCE,
+    TE_MAX_TOKENS, TE_VOCAB, TRAIN_STEPS, TextEncoder, VAE_EPS, VAE_PATCH, VAE_RGB,
+    VAE_SPATIAL_COMPRESSION, VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, port,
 };
 
 /// The bit the one-hot stream facts start at (D2): bits 0..6 are the six
@@ -138,7 +172,10 @@ impl Model {
             kind,
             width,
             streams: streams.to_vec(),
-                    at: None,
+            at: None,
+            // The context port states 512 of its own below; nothing else
+            // on this row fixes a row count.
+            rows: None,
         };
         let mut readings = Vec::new();
         if let (Some(index), Some(_)) = (codes.text, &self.te) {
@@ -163,7 +200,21 @@ impl Model {
             streams: vec![Stream::Video, Stream::Context],
             ports: vec![
                 port("latents", PortKind::Latents, d.patch_in(), &[Stream::Video]),
-                port("context", PortKind::Context, d.text_dim, &[Stream::Context]),
+                // 512 ROWS, ALWAYS. The reference truncates umT5's answer to
+                // the prompt's real length and zero-pads the EMBEDS back to
+                // 512, and the transformer attends every one of those keys
+                // — the pad rows go through `text_embedder` into a nonzero
+                // constant that carries real attention mass. So a context
+                // lane of the prompt's length is a different model, and the
+                // fact says so rather than leaving a guest to discover it.
+                PortFact {
+                    name: "context",
+                    kind: PortKind::Context,
+                    width: d.text_dim,
+                    streams: vec![Stream::Context],
+                    at: None,
+                    rows: Some(CONTEXT_LEN),
+                },
                 port("timestep", PortKind::LaneVector, 1, &[Stream::Video]),
                 port(
                     "positions",
@@ -172,17 +223,48 @@ impl Model {
                     &[Stream::Video],
                 ),
             ],
-            // NO CONVENTION STATED. `PositionConvention`'s image half is a
-            // 2-D `(h, w)` grid and a Wan token is `(t, h, w)` over a
-            // `T' x H/2 x W/2` volume; its text half does not apply either
-            // (the context lane binds no positions — cross-attention has no
-            // rope). A video family fits once the convention grows a
-            // temporal extent; until then this is `none` and a guest of
-            // this row builds its own grid, which is what `none` means.
-            positions: None,
+            // `(t, h, w)` over the `T' x H/2 x W/2` volume, in patch units,
+            // which `inferlet::latent::positions_for` fills from
+            // `LaneRows::Volume` — the temporal extent the convention grew
+            // for this family. `image_follows_text` is FALSE and the
+            // context lane binds no positions at all (cross-attention has
+            // no rope), so `text_axis` names an axis nothing numbers on
+            // this row: it is 0 because a convention must name one, and
+            // the video grid reads every axis by its ROLE.
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 0,
+                image_follows_text: false,
+            }),
             readout: ReadoutKind::Velocity,
             readout_width: d.patch_out(),
         });
+        // The two decoder arms, in the order `readings()` codes them. Both
+        // read ONE latent frame on the SAME voxel port — one width, one
+        // `(kind, index)` pair for the whole plan — so neither states a
+        // `PortFact::at` (z_image's `vae.encode` does, because its pixel
+        // clip is a second voxel width).
+        if let (Some(head), Some(rest), Some(_)) =
+            (codes.vae_decode_head, codes.vae_decode, &self.vae)
+        {
+            for (name, index) in [("vae.decode.head", head), ("vae.decode", rest)] {
+                readings.push(ReadingFact {
+                    name,
+                    index,
+                    has_kv: false,
+                    takes_tokens: false,
+                    streams: vec![Stream::Video],
+                    ports: vec![port("latent", PortKind::Voxels, VAE_Z, &[Stream::Video])],
+                    // A VAE tile is a box on the voxel axis, not rows in a
+                    // rotary space: it takes no positions and states no
+                    // convention.
+                    positions: None,
+                    readout: ReadoutKind::Pixels,
+                    readout_width: VAE_RGB,
+                });
+            }
+        }
         Generative {
             readings,
             latent: Some(LatentSpace {
@@ -297,8 +379,8 @@ impl ForwardHybrid for Model {
         if let (Some(head), Some(rest), Some(vae)) =
             (codes.vae_decode_head, codes.vae_decode, &self.vae)
         {
-            vae_decode(arm(head), vae, true);
-            vae_decode(arm(rest), vae, false);
+            let _ = vae_decode(arm(head), vae, true);
+            let _ = vae_decode(arm(rest), vae, false);
         }
         velocity
     }
@@ -587,19 +669,47 @@ fn resnet(x: &Value, g: &Value, r: &Resnet, arm: &Input<Facts>) -> Value {
     ops::elemwise::add(&skip, &h)
 }
 
-/// A `vae.decode` arm: `post_quant_conv` → `conv_in` → the mid block (its
-/// attention unserved, see the module doc) → four up blocks → `norm_out`,
-/// SiLU, `conv_out` → the 2×2 depth-to-space → `clamp(−1, 1)` → `pixels`.
-/// `first` is the first-frame arm.
-fn vae_decode(arm: &Input<Facts>, vae: &Vae, first: bool) {
+/// `WanAttentionBlock`: the mid block's single-head self-attention over
+/// every position of ONE FRAME, behind its own RMS norm, with `to_qkv` and
+/// `proj` as 1×1 convs (a matmul on the voxel axis) and a plain residual.
+///
+/// `spatial::attention` segments by CLIP — every query of a lane attends
+/// every voxel of that lane — and a decode arm's clip is one latent frame,
+/// so per clip is per frame and this is the reference's own attention.
+/// `sm_scale` is `1/√C` (`F.scaled_dot_product_attention`'s default over a
+/// `C`-wide single head), `C` = 1024 on this row, which is a width
+/// `spatial::attention` is stamped at.
+fn mid_attention(x: &Value, g: &Value, a: &MidAttention) -> Value {
+    let width = u32::try_from(a.proj.w.shape[0]).expect("a VAE row is narrower than 2^32");
+    let h = ops::elemwise::rmsnorm(x, &a.norm, VAE_EPS);
+    let (q, k, v) = ops::layout::split_qkv(&linear(&a.qkv, &h), width, width);
+    let o = spatial::attention(&q, &k, &v, g, (width as f32).sqrt().recip());
+    ops::elemwise::add(x, &linear(&a.proj, &o))
+}
+
+/// A `vae.decode` arm over ONE latent frame: the denormalisation, then
+/// `post_quant_conv` → `conv_in` → the mid block → four up blocks →
+/// `norm_out`, SiLU, `conv_out` → the 2×2 depth-to-space → `clamp(−1, 1)`
+/// → `pixels`. `first` is the first-frame arm.
+///
+/// Public so a host-fed parity harness can trace the two arms alone
+/// (`engine-cuda`'s `the_wan_2_vae_answers_the_reference`) instead of
+/// loading the whole row to exercise 1.4 GB of it.
+pub fn vae_decode(arm: &Input<Facts>, vae: &Vae, first: bool) -> Value {
     let g0 = arm.grid();
     let z = arm.voxels(port::VOXELS, VAE_Z, Dtype::Bf16);
+    // `z·std + mean`, the reference pipeline's step before `vae.decode`,
+    // as `(z − (−mean/std))·std`. `add` is the one fresh copy of a port
+    // rectangle this IR has (`2z`); the halving and the standardisation
+    // after it run in place on the copy, never on the port's own cell.
+    let z = ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(&z, &z));
+    let z = ops::elemwise::standardize(&z, &vae.denorm_bias, &vae.denorm_scale);
     let (z, g) = conv(&z, &g0, &vae.post_quant, arm);
     let (mut x, _) = conv(&z, &g, &vae.conv_in, arm);
     let mut g = g;
 
     x = resnet(&x, &g, &vae.mid_res0, arm);
-    // UNSERVED: `vae.mid_attn` — see the module doc.
+    x = mid_attention(&x, &g, &vae.mid_attn);
     x = resnet(&x, &g, &vae.mid_res1, arm);
 
     for up in &vae.up {
@@ -651,4 +761,5 @@ fn vae_decode(arm: &Input<Facts>, vae: &Vae, first: bool) {
     // diffusers clamps regardless of `clip_output`.
     let pixels = ops::elemwise::clamp(&pixels, -1.0, 1.0);
     seam::at(seam::PIXELS, &[&pixels, &gp]);
+    pixels
 }

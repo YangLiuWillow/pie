@@ -126,6 +126,26 @@ pub const VAE_TEMPORAL_UP: [bool; 4] = [true, true, false, false];
 /// `F.normalize` clamps the norm at 1e-12; the RMS form adds it to the mean
 /// square, which is the same number for any live activation.
 pub const VAE_EPS: f32 = 1e-12;
+/// `latents_mean` / `latents_std` (`vae/config.json`): the DiT works in a
+/// NORMALISED latent space, `(z_vae − mean)/std`, and the reference
+/// pipeline undoes that before `vae.decode` (`latents/(1/std) + mean`).
+/// The decoder arm owns it (`forward::vae_decode`), the way `z_image`'s
+/// owns its `scaling_factor`/`shift_factor`, so a guest hands the arm the
+/// denoiser's own latent and never spells a family's numbers.
+pub const VAE_LATENTS_MEAN: [f32; VAE_Z as usize] = [
+    -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813,
+    0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108,
+    -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.123, -0.0313,
+    -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.052, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944,
+    0.3573, -0.0548, -0.1681, -0.0667,
+];
+pub const VAE_LATENTS_STD: [f32; VAE_Z as usize] = [
+    0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901,
+    0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
+    0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944,
+    0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+];
+
 /// The widest latent plane (`h·w` at latent resolution) one clip may
 /// carry: 1280×704 at stride 16 is 44×80. The causal convs' frame caches
 /// are sized from it (`CacheRow::State` slabs of `[2·plane, C_in]` per
@@ -151,8 +171,10 @@ pub mod port {
     /// `denoise`: the three rotary coordinates `(t, h, w)` per video row,
     /// in patch units, `[rows, 3]`.
     pub const POSITIONS: u8 = 0;
-    /// `vae.decode`: the latent voxels, `[voxels, 48]` bf16, denormalised
-    /// (`z·std + mean`) by the guest.
+    /// `vae.decode.head` / `vae.decode`: ONE latent frame's voxels,
+    /// `[h·w, 48]` bf16, in the DENOISER's space — the arm denormalises
+    /// (`z·std + mean`, [`super::VAE_LATENTS_STD`]) itself, so the guest
+    /// hands over exactly the rows the denoise reading answered.
     pub const VOXELS: u8 = 0;
 }
 
@@ -543,12 +565,16 @@ impl Resnet {
 }
 
 /// `WanAttentionBlock`: a single-head (`head_dim = C`) self-attention over
-/// every position of one frame, `to_qkv` and `proj` as 1×1 convs.
+/// every position of ONE FRAME, `to_qkv` and `proj` as 1×1 convs.
 ///
-/// **Declared and imported, not traced** (`forward::vae_decode`): its head
-/// is 1024 wide, past what `attention.ragged` serves (64/128/256), and the
-/// voxel axis has no per-frame indptr for it to segment by. The weights
-/// are read so the artifact is whole when the arm lands.
+/// Traced (`forward::mid_attention`) through `spatial::attention` — the
+/// conv VAE's own attention arm, one head as wide as the row, per CLIP, at
+/// the stamped widths 256/512/1024 — and never `attention.ragged`, whose
+/// kernel is stamped at head widths 64/128/256 over a token-axis CSR.
+/// Per clip IS per frame here, because a decode arm takes exactly ONE
+/// latent frame ([`super::forward`]'s chunking contract): the reference
+/// decodes frame by frame through its per-conv caches and this arm is that
+/// loop's body.
 pub struct MidAttention {
     pub norm: Weight,
     pub qkv: Linear,
@@ -586,6 +612,13 @@ pub struct UpBlock {
 /// The Wan 2.2 VAE decoder: `post_quant_conv`, `conv_in`, the mid block,
 /// four up blocks, the head, and the 2×2 depth-to-space at the end.
 pub struct Vae {
+    /// `−mean/std` and `std` as `[48]` rows in the trunk's dtype: the
+    /// `(z − bias)·scale` form of `z·std + mean`, which is what
+    /// `elementwise.standardize` computes. Derived at import from
+    /// [`VAE_LATENTS_MEAN`]/[`VAE_LATENTS_STD`] — the IR has no constant
+    /// op, so a config number reaches a plan as a filled plane.
+    pub denorm_bias: Weight,
+    pub denorm_scale: Weight,
     pub post_quant: Conv,
     pub conv_in: Conv,
     pub mid_res0: Resnet,
@@ -659,6 +692,8 @@ impl Vae {
         }
         let last = dims[4];
         Vae {
+            denorm_bias: Weight::sym("vae.denorm_bias", [u64::from(VAE_Z)], dense),
+            denorm_scale: Weight::sym("vae.denorm_scale", [u64::from(VAE_Z)], dense),
             post_quant: Conv::at("vae.post_quant", VAE_Z, VAE_Z, [1, 1, 1], p0, banks),
             conv_in: Conv::at("vae.conv_in", top, VAE_Z, [3, 3, 3], p0, banks),
             mid_res0: Resnet::at("vae.mid.res.0", top, top, p0, banks),

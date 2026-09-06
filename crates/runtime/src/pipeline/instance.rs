@@ -329,6 +329,16 @@ pub struct FloatLane {
     /// The clips this lane submits on the voxel axis, in the order its
     /// `Voxels` ports were bound; empty for a lane with no VAE tile.
     pub clips: Vec<[u32; 3]>,
+    /// **A CACHELESS ENCODER'S TOKEN CHANNEL.** `Some` for the one float
+    /// shape that DOES embed tokens: a reading with `takes_tokens` and no
+    /// KV space (Wan 2.2's umT5, which is bidirectional and holds nothing
+    /// between fires — its rows attend each other inside the arm, over the
+    /// lane's own indptr, and never through a page table). Its rows are the
+    /// ids' own count and its `Lane::tokens` are the ids themselves, where
+    /// every other float lane seats a rectangle of zeros.
+    ///
+    /// `None` for a denoise step or a VAE tile, whose rows come from a port.
+    pub embed: Option<u32>,
 }
 
 /// One staged self-conditioning payload: `canvas * taps` ids and weights,

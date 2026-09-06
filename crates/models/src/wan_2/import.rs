@@ -49,8 +49,8 @@ use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
 use model_dsl::{Platform, Weight};
 
 use super::model::{
-    Block, Conv, Dims, Dit, HEAD_SLICES, Linear, MOD_SLICES, Model, Resnet, TextEncoder, VAE_PATCH,
-    VAE_RGB, Vae,
+    Block, Conv, Dims, Dit, HEAD_SLICES, Linear, MOD_SLICES, Model, Resnet, TextEncoder,
+    VAE_LATENTS_MEAN, VAE_LATENTS_STD, VAE_PATCH, VAE_RGB, Vae,
 };
 
 /// Where a checkpoint puts the components.
@@ -253,6 +253,18 @@ fn text_encoder(b: &mut Builder, te: &TextEncoder, layout: Layout) -> Result<(),
 fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Result<(), Error> {
     let at = |tail: &str| layout.component("vae.", tail);
 
+    // The two config rows the decoder arm denormalises with. They are in
+    // `vae/config.json` and in no tensor, so the contract STATES them:
+    // `Fill` is realized by zeroing and `Bias` adds the number, one
+    // element at a time, concatenated into the row (the same algebra
+    // `z_image`'s pad tables use).
+    row_of(b, src, &v.denorm_scale, &at("post_quant_conv.bias")?, |i| {
+        VAE_LATENTS_STD[i]
+    })?;
+    row_of(b, src, &v.denorm_bias, &at("post_quant_conv.bias")?, |i| {
+        -VAE_LATENTS_MEAN[i] / VAE_LATENTS_STD[i]
+    })?;
+
     conv(b, src, &v.post_quant, &at("post_quant_conv")?, None)?;
     conv(b, src, &v.conv_in, &at("decoder.conv_in")?, None)?;
 
@@ -412,6 +424,60 @@ fn conv(
         Some(rows) => b.read_over(&c.bias, bias, move |e| e.gather(0, rows)),
         None => b.read(&c.bias, bias),
     }
+}
+
+/// A `[n]` row of STATED numbers — a config vector the checkpoint holds no
+/// tensor for (`latents_mean`, `latents_std`).
+///
+/// The affine fragment of the contract algebra composes byte spans, and a
+/// `Bias` is a kernel, so a filled-and-biased element cannot sit inside the
+/// `Concat` directly: each element is its own internal one-element tensor
+/// and the row is their concatenation, exactly as `z_image`'s pad tables
+/// are built. `seed` names a stored plane whose raw dtype the constants are
+/// stated in, so every checkpoint of this family derives them the same way;
+/// the row is cast where it declares another dtype.
+fn row_of(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    w: &Weight,
+    seed: &str,
+    value: impl Fn(usize) -> f32,
+) -> Result<(), Error> {
+    let stored = stored_encoding(src, seed)?;
+    let checkpoint::types::Encoding::Raw(dtype) = stored.clone() else {
+        return Err(Error::Illegible {
+            name: w.name.clone(),
+            detail: format!("`{seed}` is stored {stored:?}; a stated row wants a raw dtype"),
+        });
+    };
+    let shape = extents(w);
+    let n = shape.iter().product::<i64>();
+    let mut parts = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let cell = format!("{}.{i}", w.name);
+        b.push(
+            checkpoint::contract::TensorContract::new(
+                cell.clone(),
+                Expr::fill(0.0, TensorType::raw(vec![1], dtype)).bias(value(i as usize)),
+                vec![1],
+                stored.clone(),
+            )
+            .internal(),
+        );
+        parts.push(Expr::out(cell));
+    }
+    // Pushed, not `read_expr`d: a row built from `Out` alone names no
+    // checkpoint tensor, and `read_expr` reads the stored encoding off one.
+    let want = checkpoint_dsl::encoding(w.dtype);
+    let row = Expr::concat(0, parts);
+    let row = if want == stored { row } else { row.cast(want.clone()) };
+    b.push(checkpoint::contract::TensorContract::new(
+        w.name.clone(),
+        row,
+        shape,
+        want,
+    ));
+    Ok(())
 }
 
 /// A `WanRMS_norm` gain `[C, 1, 1, 1]` (or `[C, 1, 1]`) as `[C]`.

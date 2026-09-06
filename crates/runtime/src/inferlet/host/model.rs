@@ -71,6 +71,7 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
                 // set has no bf16, and the engine marshals at the feed.
                 dtype: pie::inferlet::types::Dtype::F32,
                 streams: port.streams.iter().copied().map(lane_stream).collect(),
+                rows: port.rows,
             })
             .collect(),
         positions: reading.positions.as_ref().map(|convention| {

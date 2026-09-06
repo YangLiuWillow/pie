@@ -206,6 +206,20 @@ pub struct PortFact {
     /// `vae.decode`'s 16-wide latent keeps index 0. Stating an index also
     /// moves the positional counter past it.
     pub at: Option<u8>,
+    /// **THE ROW COUNT THIS PORT'S CHANNEL MUST CARRY, when the family
+    /// fixes it.** `None` — nearly always — means the lane's own rows: a
+    /// latents port is as tall as the picture's grid, a context port as
+    /// tall as the prompt.
+    ///
+    /// A few families PAD instead. Wan 2.2 zero-pads its umT5 rows to 512
+    /// and the transformer attends every one of the 512 keys, so a context
+    /// lane of the prompt's real length is a DIFFERENT model: the pad rows
+    /// go through `text_embedder` into a nonzero constant that carries real
+    /// attention mass. The IR cannot grow a lane, so the pad is the
+    /// GUEST's — and this is the fact that lets a family-blind guest build
+    /// it without spelling 512 (design D13, "text padding is a model
+    /// contract").
+    pub rows: Option<u32>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
