@@ -11,6 +11,30 @@ use crate::error::{Fault, Result};
 /// Whether a CUDA device is present. Must survive both a missing runtime
 /// library (cudarc's fallback-dynamic-loading panics on a missing
 /// `libcudart` rather than returning a code) and a library with no device.
+/// How many CUDA devices the runtime sees, `0` with none or no runtime — a
+/// gate's door for a test that needs a group's worth of them.
+#[must_use]
+pub fn count() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        if !present() {
+            return 0;
+        }
+        let mut count: i32 = 0;
+        // SAFETY: a live local; the runtime is loaded (`present` said so).
+        let status = unsafe { cudarc::runtime::sys::cudaGetDeviceCount(&raw mut count) };
+        if status == cudarc::runtime::sys::cudaError::cudaSuccess {
+            usize::try_from(count).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 #[must_use]
 pub fn present() -> bool {
     #[cfg(feature = "cuda")]

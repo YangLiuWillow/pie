@@ -21,5 +21,5 @@ pub use alloc::{
     zero_span_on,
 };
 pub use elastic::{Arena, PhysicalPool};
-pub use ctx::{Context, present};
+pub use ctx::{Context, count, present};
 pub use graph::{Graph, GraphExec};

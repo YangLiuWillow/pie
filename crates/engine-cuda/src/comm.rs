@@ -100,6 +100,26 @@ impl Comm {
         self.raw
     }
 
+    /// Abort the communicator: every collective pending or later issued on
+    /// it returns an error instead of waiting for peers that will never
+    /// arrive. The group's answer to a rank that refused before its
+    /// collective — its peers come back out of NCCL with an error rather
+    /// than sitting there forever. Idempotent; a closed handle is left
+    /// alone. The communicator is never destroyed after this (see `Drop`).
+    pub fn abort(&self) {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::nccl::sys as nccl;
+            if self.raw.is_null() {
+                return;
+            }
+            // SAFETY: a live communicator this group opened; NCCL allows an
+            // abort from any thread while other threads are inside calls on
+            // the same communicator — that is what it is for.
+            let _ = unsafe { nccl::ncclCommAbort(self.raw.cast()) };
+        }
+    }
+
     #[must_use]
     pub fn rank(&self) -> u32 {
         self.rank
