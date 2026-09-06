@@ -15,6 +15,7 @@ pub mod qwen_3;
 pub mod qwen_4;
 pub mod template;
 pub mod tokenizer;
+pub mod wan_2;
 pub mod z_image;
 
 use std::sync::LazyLock;
@@ -167,8 +168,8 @@ impl ReadingFact {
                 PortKind::AxisPositions => 3,
                 PortKind::Voxels => 4,
             };
-            let index = seen[slot];
-            seen[slot] = seen[slot].saturating_add(1);
+            let index = port.at.unwrap_or(seen[slot]);
+            seen[slot] = index.saturating_add(1);
             (index, port)
         })
     }
@@ -195,6 +196,16 @@ pub struct PortFact {
     /// reading. A pass on stream `s` must bind exactly the ports that list
     /// `s` (or list nothing).
     pub streams: Vec<Stream>,
+    /// The `RuntimeInput` index this port is read at, when it is not the
+    /// positional one. A port's index is normally its position among the
+    /// ports of its own kind IN THIS READING, which is what a family wants
+    /// when every reading reads the same rectangle. Two readings that read
+    /// one kind at DIFFERENT WIDTHS need different indices, because the
+    /// engine seats one rectangle per `(kind, index)` for the whole plan —
+    /// z_image's `vae.encode` takes its pixel clip at voxel index 1 so that
+    /// `vae.decode`'s 16-wide latent keeps index 0. Stating an index also
+    /// moves the positional counter past it.
+    pub at: Option<u8>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
@@ -402,6 +413,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row
         // spells, so the generative rows identify nothing above them.
         z_image::skus(),
+        wan_2::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

@@ -197,6 +197,29 @@ def run_vae(d: str, device="cuda"):
     print(f"  vae: latent {tuple(z.shape)} ({source}) -> pixels {tuple(x.shape)} "
           f"[{float(x.min()):.3f}, {float(x.max()):.3f}] -> mean {tuple(mean.shape)}; "
           f"round trip max |mean - decode input| {float(back):.4f}")
+
+def run_mini_pad(d: str, device="cpu", dtype=torch.float32):
+    """A second forward of the `--mini` weights whose rows NEED padding: a 12x16
+    latent (6x8 = 48 patches -> 64 rows, 16 image pads) and a 40-row caption
+    (-> 64 rows, 24 caption pads), at a pipeline-realistic `t = 0.5` (the
+    `--mini` case's `t = 500` is the raw transformer argument, x1000 inside).
+    Reads `zimage_mini.safetensors` back rather than re-drawing it, so the
+    fixture's weights stay the ones already on disk."""
+    from diffusers import ZImageTransformer2DModel
+    from safetensors.torch import load_file
+
+    m = ZImageTransformer2DModel(**MINI_CFG).to(device=device, dtype=dtype).eval()
+    m.load_state_dict(load_file(os.path.join(d, "zimage_mini.safetensors")))
+    tap = Tap()
+    gi = torch.Generator().manual_seed(4321)
+    x = [torch.randn(16, 1, 12, 16, generator=gi).to(device=device, dtype=dtype)]     # C,F,H,W
+    cap = [torch.randn(40, MINI_CFG["cap_feat_dim"], generator=gi).to(device=device, dtype=dtype)]
+    t = torch.tensor([0.5], device=device, dtype=dtype)
+    tap.put_tree("mini_pad.in.x", x); tap.put_tree("mini_pad.in.cap", cap); tap.put("mini_pad.in.t", t)
+    with torch.no_grad():
+        out = m(x, t, cap, return_dict=False)[0]
+    tap.put_tree("mini_pad.out", out)
+    tap.save(os.path.join(d, "zimage_mini_pad.npz"))
     npz_keys(tap)
 
 
@@ -205,14 +228,18 @@ def main():
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
     ap.add_argument("--vae", action="store_true")
+    ap.add_argument("--mini-pad", action="store_true",
+                    help="the padded-rows forward of the --mini weights (zimage_mini_pad.npz)")
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
-    if not (a.full or a.mini or a.vae):
-        a.full = a.mini = True
+    if not (a.full or a.mini or a.vae or a.mini_pad):
+        a.full = a.mini = a.vae = a.mini_pad = True
     d = outdir(MODEL)
     torch.set_grad_enabled(False)
     if a.mini:
         print("== mini =="); run_mini(d, a.device)
+    if a.mini_pad:
+        print("== mini-pad =="); run_mini_pad(d, a.device)
     if a.full:
         print("== full =="); run_full(d)
     if a.vae:

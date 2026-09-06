@@ -40,24 +40,28 @@ fn denoise() -> ReadingFact {
                 kind: PortKind::Latents,
                 width: 64,
                 streams: Vec::new(),
+            at: None,
             },
             PortFact {
                 name: "timestep",
                 kind: PortKind::LaneVector,
                 width: 1,
                 streams: Vec::new(),
+            at: None,
             },
             PortFact {
                 name: "positions",
                 kind: PortKind::AxisPositions,
                 width: 3,
                 streams: Vec::new(),
+            at: None,
             },
             PortFact {
                 name: "context",
                 kind: PortKind::Context,
                 width: 512,
                 streams: Vec::new(),
+            at: None,
             },
         ],
         positions: Some(convention()),
@@ -109,6 +113,7 @@ fn a_reading_resolves_its_ports_by_name_to_kind_relative_indices() {
         kind: PortKind::LaneVector,
         width: 1,
         streams: Vec::new(),
+            at: None,
     });
     let (index, _) = two.port("guidance").expect("declared");
     assert_eq!(index, 1, "the second lane vector is lane-vector port 1");
@@ -150,6 +155,7 @@ fn duplicate_names_are_refused() {
         kind: PortKind::Latents,
         width: 64,
         streams: Vec::new(),
+            at: None,
     });
     let why = validate_generative(&family(vec![text(), twice])).unwrap_err();
     assert!(why.contains("`latents`") && why.contains("twice"), "{why}");
