@@ -4992,9 +4992,16 @@ impl Shell {
     /// for a pass the command buffer would not open.
     /// **THE CHANNEL-FED TAPS, INTO THE SEAT**: one blit per lane and plane
     /// from the ring's committed cell into this fire's arm, at the head of
-    /// the command buffer so the forward reads them. Refused when a channel
-    /// is not a ring this plane registered or its cell is narrower than the
-    /// lane's rows.
+    /// the command buffer so the forward reads them. The cell is the one the
+    /// lane's epilogue takes this fire — the ring's head, which the harvest
+    /// of the last fire advanced before the guest could see that fire's
+    /// output and submit this one. Refused when a channel is not a ring this
+    /// plane registered or its cell is narrower than the lane's rows.
+    ///
+    /// Under `PIE_KERNEL_PROFILE` every dispatch commits in its own command
+    /// buffer ahead of this frame, so the feed lands AFTER the forward read
+    /// the seat: the profile's kernel times hold, its samples do not (a
+    /// denoiser runs unconditioned and does not converge).
     fn feed_self_cond(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         if p.self_cond_feeds.is_empty() {
             return Ok(());
