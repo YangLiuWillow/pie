@@ -228,18 +228,17 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     // this socket carries keep streaming, and the client may
                     // retry. Closing here lost every in-flight process's events
                     // to one transient "saturated".
-                    Ok(Incoming::Turn(req)) => match handle.turn(req).await {
-                        Ok(new_rx) => live.push(new_rx),
-                        Err(e) => {
-                            if tx
-                                .send(Message::Text(error_json(&e.to_string()).into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                    Ok(Incoming::Turn(req)) => {
+                        let corr = req.message.corr_id();
+                        match handle.turn(req).await {
+                            Ok(new_rx) => live.push(new_rx),
+                            Err(e) => {
+                                if tx.send(refusal(corr, &e.to_string())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                    },
+                    }
                     Ok(Incoming::Cancel) => handle.cancel().await,
                     Err(e) => {
                         // Bad frame is non-fatal: report and keep the session.
@@ -247,18 +246,17 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     }
                 },
                 Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
-                    Ok(Incoming::Turn(req)) => match handle.turn(req).await {
-                        Ok(new_rx) => live.push(new_rx),
-                        Err(e) => {
-                            if tx
-                                .send(Message::Text(error_json(&e.to_string()).into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                    Ok(Incoming::Turn(req)) => {
+                        let corr = req.message.corr_id();
+                        match handle.turn(req).await {
+                            Ok(new_rx) => live.push(new_rx),
+                            Err(e) => {
+                                if tx.send(refusal(corr, &e.to_string())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                    },
+                    }
                     Ok(Incoming::Cancel) => handle.cancel().await,
                     Err(e) => {
                         let _ = tx.send(Message::Text(error_json(&e).into())).await;
@@ -354,4 +352,72 @@ fn turn_done_json() -> String {
 
 fn error_json(msg: &str) -> String {
     serde_json::json!({ "type": "error", "message": msg }).to_string()
+}
+
+/// A turn the cluster would not take, answered to the call that asked. A
+/// frame that carried a correlation id gets a `response { ok: false }` under
+/// that id — the client's pending call fails by name, and the other calls
+/// this socket multiplexes are untouched. A frame with none (or one the
+/// encoder cannot serialise) gets the bare `error` text frame, which is all
+/// there is to say about it.
+fn refusal(corr_id: Option<u32>, why: &str) -> Message {
+    match corr_id.and_then(|corr_id| {
+        encode(&client_api::ServerMessage::Response {
+            corr_id,
+            ok: false,
+            result: why.to_string(),
+        })
+    }) {
+        Some(bytes) => Message::Binary(bytes.into()),
+        None => Message::Text(error_json(why).into()),
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_correlated_call_is_refused_under_its_own_id() {
+        let frame = refusal(Some(7), "cluster saturated");
+        let Message::Binary(bytes) = frame else {
+            panic!("a refusal of a correlated call is a binary response frame");
+        };
+        let decoded: client_api::ServerMessage =
+            rmp_serde::from_slice(&bytes).expect("the codec pie-client reads");
+        match decoded {
+            client_api::ServerMessage::Response {
+                corr_id,
+                ok,
+                result,
+            } => {
+                assert_eq!(corr_id, 7);
+                assert!(!ok);
+                assert_eq!(result, "cluster saturated");
+            }
+            other => panic!("expected a response frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_uncorrelated_frame_gets_the_bare_error() {
+        let Message::Text(text) = refusal(None, "no route") else {
+            panic!("a refusal with no id to answer under is the error text frame");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["message"], "no route");
+    }
+
+    #[test]
+    fn every_call_that_expects_a_response_carries_its_id() {
+        let ping: client_api::ClientMessage =
+            serde_json::from_str(r#"{"type":"ping","corr_id":3}"#).unwrap();
+        assert_eq!(ping.corr_id(), Some(3));
+        let signal: client_api::ClientMessage = serde_json::from_str(
+            r#"{"type":"signal_process","process_id":"p","message":"m"}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.corr_id(), None);
+    }
 }

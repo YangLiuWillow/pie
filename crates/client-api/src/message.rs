@@ -89,6 +89,28 @@ pub enum ClientMessage {
     Ping { corr_id: u32 },
 }
 
+impl ClientMessage {
+    /// The correlation id the client stamped on this frame, when it is a
+    /// call that expects a `response` — a refusal of such a frame must carry
+    /// the same id back, or the client cannot tell which call failed.
+    /// `signal_process` and `transfer_file` are fire-and-forget and have none.
+    pub fn corr_id(&self) -> Option<u32> {
+        match self {
+            ClientMessage::AuthIdentify { corr_id, .. }
+            | ClientMessage::AuthProve { corr_id, .. }
+            | ClientMessage::CheckProgram { corr_id, .. }
+            | ClientMessage::Query { corr_id, .. }
+            | ClientMessage::AddProgram { corr_id, .. }
+            | ClientMessage::LaunchProcess { corr_id, .. }
+            | ClientMessage::AttachProcess { corr_id, .. }
+            | ClientMessage::TerminateProcess { corr_id, .. }
+            | ClientMessage::ListProcesses { corr_id }
+            | ClientMessage::Ping { corr_id } => Some(*corr_id),
+            ClientMessage::SignalProcess { .. } | ClientMessage::TransferFile { .. } => None,
+        }
+    }
+}
+
 /// Messages from server -> client
 //
 // `Clone` so the gateway's `Tokens` chunk (which carries these) is cloneable on
