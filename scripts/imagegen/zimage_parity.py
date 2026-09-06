@@ -20,6 +20,10 @@ Two modes, one per row:
                        (`dit.step0.in.*` -> `dit.step0.out.0`; the prompt
                        embeds are the golden's own, so the `text` reading is
                        not exercised here)
+    --text             the flagship's `text` reading alone: the golden's prompt
+                       through the family template -> `prompt_embeds.0`
+    --chain            the flagship end to end, text -> refine -> denoise,
+                       against the same `dit.step0.out.0` (and the embeds)
 
     python zimage_parity.py case    --out /tmp/zimage-parity
     python zimage_parity.py run     --out /tmp/zimage-parity --config ~/.pie/config.zimage-mini.toml
@@ -79,19 +83,66 @@ TOLERANCES = {
     "mini": ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"],
     "mini_pad": ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"],
     "turbo": ["--tol", "1.0", "--rel-tol", "0.05", "--cos-tol", "0.999"],
+    # the encoder's rows are O(10..100) wide in value; the gate is the cosine
+    "text": ["--rel-tol", "0.05", "--cos-tol", "0.999"],
+    "chain": ["--rel-tol", "0.05", "--cos-tol", "0.999"],
 }
+PROMPT_KEY = "prompt_embeds.0"
 
+def keyed(file: str, prefix: str, out: str, sku: str, refined: str | None = None) -> dict:
+    """A mode: the golden file, its input keys (`<prefix>x.0`, `<prefix>cap.0`,
+    `<prefix>t`), the output key the velocity lands under, the row's SKU and —
+    for a tapped golden — the key the refined caption lands under."""
+    return dict(file=file, x=f"{prefix}x.0", cap=f"{prefix}cap.0", t=f"{prefix}t",
+                out=out, sku=sku, refined=refined)
+
+
+MINI_SKU = "z-image-mini-bf16-kv-bf16"
+TURBO_SKU = "z-image-turbo-bf16-kv-bf16"
 MODES = {
-    # mode: (golden file, latent key, caption key, t key, out key, sku)
-    "mini": ("zimage_mini.npz", "mini.in.x.0", "mini.in.cap.0", "mini.in.t",
-             "mini.out.0", "z-image-mini-bf16-kv-bf16"),
+    "mini": keyed("zimage_mini.npz", "mini.in.", "mini.out.0", MINI_SKU),
     # the same weights over rows that NEED padding (16 image pads, 24 caption
     # pads) at a pipeline-realistic t: `zimage_golden.py --mini-pad`
-    "mini_pad": ("zimage_mini_pad.npz", "mini_pad.in.x.0", "mini_pad.in.cap.0",
-                 "mini_pad.in.t", "mini_pad.out.0", "z-image-mini-bf16-kv-bf16"),
-    "turbo": ("zimage_golden.npz", "dit.step0.in.arg0.0", "dit.step0.in.arg2.0",
-              "dit.step0.in.arg1", "dit.step0.out.0", "z-image-turbo-bf16-kv-bf16"),
+    "mini_pad": keyed("zimage_mini_pad.npz", "mini_pad.in.", "mini_pad.out.0", MINI_SKU),
+    "turbo": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_SKU),
+    # the Turbo row's `text` reading alone (the golden's prompt through the
+    # family template -> `prompt_embeds.0`), and the whole chain text ->
+    # refine -> denoise against the same step-0 velocity
+    "text": keyed("zimage_golden.npz", "dit.step0.in.", PROMPT_KEY, TURBO_SKU),
+    "chain": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_SKU),
+    # the tapped goldens (`zimage_golden.py --taps`): the Turbo transformer
+    # alone over the step-0 inputs (`full`) and over their 256-row crop
+    # (`crop`), with the refined caption to diff first
+    "full": keyed("zimage_taps.npz", "taps.full.in.", "taps.full.out.0", TURBO_SKU,
+                  refined="taps.full.cap.refined"),
+    "crop": keyed("zimage_taps.npz", "taps.crop.in.", "taps.crop.out.0", TURBO_SKU,
+                  refined="taps.crop.cap.refined"),
+    "tiny": keyed("zimage_taps.npz", "taps.tiny.in.", "taps.tiny.out.0", TURBO_SKU,
+                  refined="taps.tiny.cap.refined"),
 }
+# the pipeline golden's step-0 keys are `arg0.0` / `arg2.0` / `arg1`, not `x` / `cap` / `t`
+for _mode in ("turbo", "text", "chain"):
+    MODES[_mode].update(x="dit.step0.in.arg0.0", cap="dit.step0.in.arg2.0", t="dit.step0.in.arg1")
+TOLERANCES.update(full=TOLERANCES["turbo"], crop=TOLERANCES["turbo"], tiny=TOLERANCES["turbo"])
+
+
+def floats(arr: np.ndarray) -> list[str]:
+    """Every value as the shortest decimal that reads back to the same f32:
+    a third of `json.dump`'s double repr, which is what keeps the Turbo case
+    inside a few dozen argv pieces."""
+    return [np.format_float_positional(v, unique=True, trim="-") for v in arr.astype(np.float32).ravel()]
+
+
+def dump_case(doc: dict, path: str) -> None:
+    """`json.dump` with the float lists written by `floats`."""
+    parts = []
+    for key, value in doc.items():
+        if isinstance(value, np.ndarray):
+            parts.append(f'"{key}":[{",".join(floats(value))}]')
+        else:
+            parts.append(f'"{key}":{json.dumps(value)}')
+    with open(path, "w") as f:
+        f.write("{" + ",".join(parts) + "}")
 
 
 # ----------------------------------------------------------------------------
@@ -124,22 +175,28 @@ def padded(n: int) -> int:
 # ----------------------------------------------------------------------------
 
 def mode_of(args) -> str:
+    if args.mode:
+        return args.mode
+    if args.text:
+        return "text"
+    if args.chain:
+        return "chain"
     if args.turbo:
         return "turbo"
     return "mini_pad" if args.pad else "mini"
 
 
 def golden_of(args) -> np.lib.npyio.NpzFile:
-    return np.load(os.path.join(args.golden, MODES[mode_of(args)][0]))
+    return np.load(os.path.join(args.golden, MODES[mode_of(args)]["file"]))
 
 
 def case(args) -> str:
     mode = mode_of(args)
-    _, k_x, k_cap, k_t, _, _ = MODES[mode]
+    keys = MODES[mode]
     dump = golden_of(args)
-    image = dump[k_x].astype(np.float32)          # [C, F, H, W]
-    caption = dump[k_cap].astype(np.float32)      # [L, cap_width]
-    t_model = float(np.asarray(dump[k_t]).reshape(-1)[0])
+    image = dump[keys["x"]].astype(np.float32)          # [C, F, H, W]
+    caption = dump[keys["cap"]].astype(np.float32)      # [L, cap_width]
+    t_model = float(np.asarray(dump[keys["t"]]).reshape(-1)[0])
 
     # the caption: padded rows (diffusers repeats the last row; the plan
     # overwrites them with `cap_pad_token` anyway), flags, positions
@@ -165,26 +222,31 @@ def case(args) -> str:
 
     timestep = T_FLIP - T_SCALE * t_model
     doc = {
-        "latents": img_rows.reshape(-1).tolist(),
+        "latents": img_rows,
         "image_rows": int(n32),
         "patch_features": int(img_rows.shape[1]),
-        "image_pad": img_pad.tolist(),
-        "image_positions": img_pos.reshape(-1).tolist(),
-        "caption": cap_rows.reshape(-1).tolist(),
+        "image_pad": img_pad,
+        "image_positions": img_pos,
+        "caption": cap_rows,
         "caption_rows": int(l32),
         "caption_width": int(cap_rows.shape[1]),
-        "caption_pad": cap_pad.tolist(),
-        "caption_positions": cap_pos.reshape(-1).tolist(),
+        "caption_pad": cap_pad,
+        "caption_positions": cap_pos,
         "timestep": float(timestep),
     }
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, f"case_{mode}.json")
-    with open(path, "w") as f:
-        json.dump(doc, f)
+    dump_case(doc, path)
     print(f"[case] {mode}: {n_real}->{n32} image rows x {img_rows.shape[1]}, "
           f"{l_real}->{l32} caption rows x {cap_rows.shape[1]}, t_model {t_model} -> "
           f"port {timestep} ({os.path.getsize(path)} bytes) -> {path}")
     return path
+
+
+def prompt_of(args) -> str:
+    """The prompt the full golden was rendered from (`MANIFEST.json`)."""
+    with open(os.path.join(args.golden, "MANIFEST.json")) as f:
+        return json.load(f)["prompt"]
 
 
 # ----------------------------------------------------------------------------
@@ -216,39 +278,64 @@ def wasm(inferlet: str) -> str:
     return max(present, key=os.path.getmtime)
 
 
-# eight argv pieces, each under the kernel's 128 KiB single-argument ceiling
-ARGV_LIMIT = 8 * 120 * 1024
+# The case travels as argv pieces `case_0..N`, each under the kernel's 128 KiB
+# single-argument ceiling, up to the count the guest's Pie.toml declares. The
+# total is past the default 2 MiB `ARG_MAX` for the Turbo case, so the child
+# runs under an unlimited stack rlimit (Linux sizes argv at a quarter of it).
+PIECE = 120 * 1024
+MAX_PIECES = 32
+
+
+def unlimited_stack() -> None:
+    import resource
+    resource.setrlimit(resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
 
 
 def run(args) -> None:
     mode = mode_of(args)
-    path = os.path.join(args.out, f"case_{mode}.json")
-    if not os.path.exists(path):
-        raise SystemExit(f"{path}: no case JSON; run `case` first")
     pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
     if not os.path.exists(pie):
         raise SystemExit(f"{pie}: no pie binary. Build one with `cargo build -p pie --features cuda`, or pass --pie.")
     binary = wasm(args.inferlet)
     manifest = os.path.join(args.inferlet, "Pie.toml")
-    text = open(path).read()
     cmd = [pie]
     if args.config:
         cmd += ["--config", args.config]
     cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
-    if args.case_file or len(text) > ARGV_LIMIT:
-        # the case as a file under the sandbox's scratch dir (`[sandbox]
-        # allow_fs = true`, `fs_scratch_dir = <--out>`)
-        cmd += ["--case_file", os.path.basename(path)]
+    if mode == "text":
+        cmd += ["--prompt", prompt_of(args), "--text_only", "true"]
     else:
-        n = 8
-        step = -(-len(text) // n)
-        for i in range(n):
-            cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
-    if args.refine_only:
-        cmd += ["--refine_only", "true"]
+        path = os.path.join(args.out, f"case_{mode}.json")
+        if not os.path.exists(path):
+            raise SystemExit(f"{path}: no case JSON; run `case` first")
+        text = open(path).read()
+        if args.case_file:
+            # the case as a file under the sandbox's PER-PROCESS scratch dir
+            # (`[sandbox] allow_fs = true`; the dir is created at process start
+            # and deleted at exit, so this needs a hand on the other side)
+            cmd += ["--case_file", os.path.basename(path)]
+        else:
+            # No piece may start with `-`: `pie run` would read it as the
+            # next flag and hand the guest `true`. A cut that lands before a
+            # minus sign slides past it (the concatenation is unchanged).
+            pieces, at = [], 0
+            while at < len(text):
+                cut = min(at + PIECE, len(text))
+                while cut < len(text) and text[cut] == "-":
+                    cut += 1
+                pieces.append(text[at:cut])
+                at = cut
+            if len(pieces) > MAX_PIECES:
+                raise SystemExit(f"{path}: {len(text)} bytes is more than {MAX_PIECES} pieces of {PIECE}")
+            for i, piece in enumerate(pieces):
+                cmd += [f"--case_{i}", piece]
+        if mode == "chain":
+            cmd += ["--prompt", prompt_of(args)]
+        if args.refine_only:
+            cmd += ["--refine_only", "true"]
     out = os.path.join(args.out, f"pie_{mode}.json")
     print(f"[run] {' '.join(c if len(c) < 80 else c[:40] + '...' for c in cmd)}")
-    done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+    done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, preexec_fn=unlimited_stack)
     if done.returncode != 0:
         sys.stderr.write(done.stdout)
         sys.stderr.write(done.stderr)
@@ -277,20 +364,27 @@ def document(path: str) -> dict:
 
 def collect(args) -> str:
     mode = mode_of(args)
-    _, k_x, _, _, k_out, _ = MODES[mode]
+    keys = MODES[mode]
     path = os.path.join(args.out, f"pie_{mode}.json")
     if not os.path.exists(path):
         raise SystemExit(f"{path}: no pie answer; run `run` first")
     doc = document(path)
-    image = golden_of(args)[k_x]
+    image = golden_of(args)[keys["x"]]
     c, f, h, w = image.shape
     out: dict[str, np.ndarray] = {}
-    out["refined"] = np.asarray(doc["refined"], np.float32).reshape(doc["caption_rows"], doc["dim"])
+    if doc.get("text"):
+        out[PROMPT_KEY] = np.asarray(doc["text"], np.float32).reshape(doc["text_rows"], doc["text_width"])
+    if doc["refined"]:
+        out["refined"] = np.asarray(doc["refined"], np.float32).reshape(doc["caption_rows"], doc["dim"])
+        if keys["refined"]:
+            out[keys["refined"]] = out["refined"]
     if doc["velocity"]:
         rows = np.asarray(doc["velocity"], np.float32).reshape(doc["image_rows"], doc["patch_features"])
         out["velocity.rows"] = rows
         # the family's velocity is `-model_out`; the golden is `model_out`
-        out[k_out] = unpatchify(-rows, c, f, h, w)
+        # (a tapped family reads back an intermediate instead: rows only)
+        if rows.shape[1] == c * PATCH * PATCH:
+            out[keys["out"]] = unpatchify(-rows, c, f, h, w)
     npz = os.path.join(args.out, f"zimage_pie_{mode}.npz")
     np.savez(npz, **out)
     print(f"[collect] {len(out)} tensors -> {npz}")
@@ -306,12 +400,18 @@ def compare(args) -> int:
     mine = os.path.join(args.out, f"zimage_pie_{mode}.npz")
     if not os.path.exists(mine):
         raise SystemExit(f"{mine}: no pie npz; run `collect` first")
-    theirs = os.path.join(args.golden, MODES[mode][0])
+    theirs = os.path.join(args.golden, MODES[mode]["file"])
     cmd = [
         sys.executable, os.path.join(HERE, "compare.py"), mine, theirs,
         "--allow-missing", "--sort-by", "rel", *TOLERANCES[mode],
     ]
-    for glob in args.keys or [MODES[mode][4]]:
+    keys = args.keys or [MODES[mode]["out"]]
+    if not args.keys:
+        if mode == "chain":
+            keys.append(PROMPT_KEY)
+        if MODES[mode]["refined"]:
+            keys.append(MODES[mode]["refined"])
+    for glob in keys:
         cmd += ["--keys", glob]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
@@ -322,10 +422,17 @@ def main() -> int:
     ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/zimage-parity")
+    ap.add_argument("--mode", choices=sorted(MODES), default=None,
+                    help="the case by name (the flags below are shortcuts; `full`/`crop` "
+                         "are the tapped Turbo goldens of `zimage_golden.py --taps`)")
     ap.add_argument("--mini", action="store_true", help="the miniature row (default)")
     ap.add_argument("--pad", action="store_true",
                     help="the miniature row over rows that need padding (zimage_mini_pad.npz)")
     ap.add_argument("--turbo", action="store_true", help="the Turbo row's step-0 denoise instead")
+    ap.add_argument("--text", action="store_true",
+                    help="the Turbo row's text reading alone, against prompt_embeds.0")
+    ap.add_argument("--chain", action="store_true",
+                    help="the Turbo row end to end: text -> refine -> denoise against dit.step0.out.0")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/zimage-parity"))
     ap.add_argument("--config", default=None,
                     help="the serving config; its `[model] model` must be the row's artifact")
