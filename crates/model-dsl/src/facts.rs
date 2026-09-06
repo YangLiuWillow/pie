@@ -5,6 +5,8 @@
 
 use std::ops::{BitAnd, Not};
 
+use model_ir::Stream;
+
 /// A formula over fact bits, stated at trace time. `Rest` is the n-way
 /// split's catch-all arm and legal nowhere else.
 ///
@@ -28,6 +30,15 @@ impl Predicate {
     #[must_use]
     pub fn rest() -> Predicate {
         Predicate::Rest
+    }
+
+    /// The stream fact, one-hot from `base`: lane is on `stream` ⇔ bit
+    /// `base + stream.code()`. The DSL side of [`Stream::word`], which a
+    /// family's `Classify::word` packs with; a family that spells its
+    /// stream bits this way carves one arm per stream it names.
+    #[must_use]
+    pub fn stream(base: u8, stream: Stream) -> Predicate {
+        Predicate::fact(base + stream.code())
     }
 }
 

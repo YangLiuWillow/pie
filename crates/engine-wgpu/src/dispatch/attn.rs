@@ -197,7 +197,10 @@ impl Run<'_> {
             // name rather than approximated.
             Attention::Masked { causal: false, .. }
             | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            | Attention::SelectorWalk { .. }
+            // M0: the ragged attention (D2) is CUDA-first; refused by name
+            // here in this phase.
+            | Attention::Ragged { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Attention::Masked {
                 q,
                 plan,

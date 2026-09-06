@@ -31,10 +31,10 @@ pub mod elemwise;
 pub mod layout;
 pub mod linear;
 
-pub use attn::Attention;
+pub use attn::{Attention, RaggedMask};
 pub use collective::Collective;
 pub use custom_cuda::CustomCuda;
-pub use elemwise::{Elementwise, GateActivation, MropeForm};
+pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, NormKind, RopeForm};
 pub use layout::Layout;
 pub use linear::Linear;
 

@@ -1,6 +1,6 @@
 use kernels_wgpu::layout;
 use model_exec::{DispatchLayout, KernelError};
-use model_ir::Layout;
+use model_ir::{Layout, Operands};
 
 use crate::run::Run;
 
@@ -151,6 +151,10 @@ impl Run<'_> {
 
             // The per-row top-k a candidate selector reads has no wgpu kernel yet.
             Layout::TopK { .. } => Err(kernels_wgpu::Error::Unsupported { op: "layout.topk" }),
+            // M0: the row packing (D2) is CUDA-first; refused by name here.
+            Layout::PackRows { .. } | Layout::UnpackRows { .. } => {
+                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+            }
             Layout::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
                     layout::argmax(

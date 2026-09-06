@@ -601,7 +601,13 @@ impl FireCtx<'_> {
             return Ok(None);
         }
         let slots = &staged.slots;
-        let out = self.exports.out;
+        // M0: a float readout (`velocity`, `hidden`) is read back by the
+        // runtime agent's path; this shell's readback is logits only.
+        let out = self.exports.out.ok_or_else(|| Fault::Unbound {
+            what: "a plan with no `out` seam: its readout is a float seam, which this shell \
+                   does not read back yet"
+                .to_string(),
+        })?;
         let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!(
                 "value {}, the out seam, which the carve gave no rectangle",

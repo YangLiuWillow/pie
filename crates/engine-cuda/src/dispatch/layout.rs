@@ -2,7 +2,7 @@
 
 use kernels_cuda::layout;
 use model_exec::{DispatchLayout, KernelError};
-use model_ir::Layout;
+use model_ir::{Layout, Operands};
 
 use crate::run::Run;
 
@@ -173,6 +173,11 @@ impl Run<'_> {
                 // Whole, for `scatter_live_rows`' reason one arm up.
                 &mut self.fire_wide(*y),
             ),
+            // M0: wired by the CUDA layout kernel agent (a row gather and
+            // its inverse scatter over `RuntimeInput::RowPermutation`).
+            Layout::PackRows { .. } | Layout::UnpackRows { .. } => {
+                return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+            }
             Layout::TopK { .. } => {
                 return Err(kernels_cuda::Error::Backend {
                     op: "layout.topk",

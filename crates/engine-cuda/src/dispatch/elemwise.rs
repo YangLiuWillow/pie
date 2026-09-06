@@ -2,7 +2,7 @@
 
 use kernels_cuda::{Tensor, elemwise};
 use model_exec::{DispatchElementwise, KernelError};
-use model_ir::{Elementwise, MropeForm};
+use model_ir::{Elementwise, MropeForm, Operands};
 
 use crate::run::Run;
 
@@ -453,6 +453,22 @@ impl Run<'_> {
                 *streams,
                 &mut self.tensor(*hyper),
             ),
+            // M0: wired by the CUDA modulation / activation / rope kernel
+            // agents (`IMAGEGEN_CONTRACT.md` states each entry). Refused by
+            // name until then; no catalog row names them yet.
+            Elementwise::Modulate { .. }
+            | Elementwise::GatedResidualAdd { .. }
+            | Elementwise::NormModulate { .. }
+            | Elementwise::GatedResidualNormModulate { .. }
+            | Elementwise::Sinusoid { .. }
+            | Elementwise::Silu { .. }
+            | Elementwise::Gelu { .. }
+            | Elementwise::Tanh { .. }
+            | Elementwise::Mul { .. }
+            | Elementwise::Add { .. }
+            | Elementwise::RopeAxes { .. } => {
+                Err(kernels_cuda::Error::Unsupported { op: op.name() })
+            }
             Elementwise::PleGate {
                 key,
                 query,

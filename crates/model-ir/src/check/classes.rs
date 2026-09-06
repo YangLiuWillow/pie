@@ -379,9 +379,12 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
             ins: &mut ins,
         };
 
-        // Roots: the effects this class owes the world.
+        // Roots: the effects this class owes the world — and the one op
+        // that reads across classes, which every class it is live in must
+        // run so that its operands are demanded in THEIR classes.
         for &j in &class.live {
-            if writes_cache(&trace.nodes[j as usize].op) {
+            let op = &trace.nodes[j as usize].op;
+            if writes_cache(op) || spans_classes(op) {
                 walk.demand(j as usize, &mut node_mask);
             }
         }
@@ -540,6 +543,23 @@ fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
         .map(|(_, input)| input)
 }
 
+/// Does this op read operands from MORE THAN ONE CLASS — the ragged
+/// attention (D2), whose queries come off one stream's arm and whose keys
+/// come off another's, under the `Or` of the two guards?
+///
+/// **WHY IT IS ROOTED.** The demand walk is per class: a class runs the
+/// nodes its own outputs need. A cross-attention's output is consumed on
+/// the queries' class alone, so per-class demand would run the key
+/// projections in no class at all — the keys' class produces nothing it
+/// reads itself. Rooting the node in every class its guard admits makes
+/// each class demand the operands that hold in it: the queries' class runs
+/// the query chain, the keys' class runs the key chain, and both run the
+/// attention, whose launch spans the two windows. A class with no query
+/// rows launches it as a no-op, which the kernel contract states.
+fn spans_classes(op: &Operation) -> bool {
+    matches!(op, Operation::Attention(Attention::Ragged { .. }))
+}
+
 /// Does this op write a cache — is it demanded for its effect, whatever a
 /// class does with what it returns? Hand-written and exhaustive: a new op
 /// variant must answer this question before it compiles, since getting it
@@ -577,8 +597,10 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::Decode { .. }
             | Attention::Prefill { .. }
             | Attention::Masked { .. }
-            // The tower's attention touches no sequence cache at all.
+            // The tower's attention touches no sequence cache at all, and
+            // neither does the generative families' ragged one.
             | Attention::Dense { .. }
+            | Attention::Ragged { .. }
             | Attention::DecodeLse { .. }
             | Attention::PrefillLse { .. }
             | Attention::Sink { .. }

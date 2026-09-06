@@ -405,6 +405,194 @@ pub enum Elementwise {
         streams: u32,
         y: ValueId,
     },
+
+    // The generative families' conditioning algebra (D6): adaptive
+    // modulation from a per-lane or per-token vector, the gated residual it
+    // pairs with, and the bare activations and binary ops a DiT's
+    // embedders and heads are written in.
+    /// Adaptive modulation: `y = form(x, m)` where `m` is a `[Lanes,
+    /// k·width]` vector broadcast over each lane's rows through
+    /// `lane_of_row` (`GeomKind::RequestOfToken`, `[Tokens]` i32), or a
+    /// `[Tokens, k·width]` per-token vector with `lane_of_row: None`. `k`
+    /// is the form's ([`ModulateForm`]); the halves of `m` are laid out
+    /// `[s | b]` — the first `width` columns scale, the next shift — and a
+    /// family reorders its modulation linear's rows at import to say so.
+    /// `x`, `y` share a type; `m` rides the activation dtype. Arithmetic in
+    /// fp32, rounded once at the store.
+    Modulate {
+        x: ValueId,
+        m: ValueId,
+        lane_of_row: Option<ValueId>,
+        form: ModulateForm,
+        y: ValueId,
+    },
+    /// The gated residual fold: `r += g · y`, in place on `r`, where `g` is
+    /// a `[Lanes, width]` gate broadcast through `lane_of_row`
+    /// (`GeomKind::RequestOfToken`) or a `[Tokens, width]` per-token gate
+    /// (`lane_of_row: None`). The adaLN-Zero `gate_msa * attn(...)` step.
+    /// fp32 product and sum, rounded once.
+    GatedResidualAdd {
+        r: ValueId,
+        g: ValueId,
+        y: ValueId,
+        lane_of_row: Option<ValueId>,
+        r_out: ValueId,
+    },
+    /// `normed = norm(x)` (a scale-free norm, [`NormKind`]) then `y =
+    /// form(normed, m)`: the adaLN pre-norm and its modulation, one launch
+    /// where the trace lands two. `normed` is still written as its own
+    /// launch would write it. Written by [`crate::fuse`], never traced.
+    NormModulate {
+        x: ValueId,
+        norm: NormKind,
+        normed: ValueId,
+        m: ValueId,
+        lane_of_row: Option<ValueId>,
+        form: ModulateForm,
+        y: ValueId,
+    },
+    /// `r += g · y` in place, then `normed = norm(r)`, then `out =
+    /// form(normed, m)`: the deferred-residual form the FLUX.2 / LTX
+    /// references run between a block's attention and its MLP — three
+    /// traced nodes, one launch, two outputs a reader wants (`r_out`, the
+    /// stream, and `out`, the modulated input of the next sub-block) plus
+    /// the `normed` intermediate written as traced. `lane_of_row` serves
+    /// both the gate and the modulation: either both are per lane or both
+    /// per token. Written by [`crate::fuse`], never traced.
+    GatedResidualNormModulate {
+        r: ValueId,
+        g: ValueId,
+        y: ValueId,
+        lane_of_row: Option<ValueId>,
+        r_out: ValueId,
+        norm: NormKind,
+        normed: ValueId,
+        m: ValueId,
+        form: ModulateForm,
+        out: ValueId,
+    },
+    /// The sinusoidal timestep embedding: `t` is `[rows, 1]` f32 (`rows`
+    /// being `Lanes` for a per-lane timestep, `Tokens` for a per-token
+    /// one), `y` is `[rows, dim]` f32 with `half = dim / 2`,
+    /// `freq_i = exp(-ln(max_period) · i / half)` for `i < half`,
+    /// `arg_i = scale · t · freq_i`, and `y = [sin(arg) | cos(arg)]`, or
+    /// `[cos | sin]` under `flip_sin_cos` — diffusers'
+    /// `get_timestep_embedding` at `downscale_freq_shift = 0`, which is what
+    /// every target family runs. `dim` is even. All fp32.
+    Sinusoid {
+        t: ValueId,
+        dim: u32,
+        max_period: f32,
+        flip_sin_cos: bool,
+        scale: f32,
+        y: ValueId,
+    },
+    /// `x = x · sigmoid(x)`, in place. [`SiluScaled`](Elementwise::SiluScaled)
+    /// at `s = 1`, named so a text does not spell a scale it does not have.
+    Silu {
+        x: ValueId,
+        x_out: ValueId,
+    },
+    /// `x = gelu(x)`, in place: the erf form, or the tanh approximation
+    /// when `tanh` is set (`0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`).
+    Gelu {
+        x: ValueId,
+        tanh: bool,
+        x_out: ValueId,
+    },
+    /// `x = tanh(x)`, in place.
+    Tanh {
+        x: ValueId,
+        x_out: ValueId,
+    },
+    /// `z = x · y`, two activations of one type, fresh output. fp32 product,
+    /// rounded once.
+    Mul {
+        x: ValueId,
+        y: ValueId,
+        z: ValueId,
+    },
+    /// `z = x + y`, two activations of one type, fresh output — unlike
+    /// [`ResidualAdd`](Elementwise::ResidualAdd), which folds in place.
+    Add {
+        x: ValueId,
+        y: ValueId,
+        z: ValueId,
+    },
+    /// Rotary embedding over up to four position axes with a theta per axis
+    /// (D7), in place on one `[rows, heads·head_dim]` rectangle — called
+    /// once for `q` and once for `k` (LTX's a2v rotates the two by
+    /// different positions). `positions` is `[rows, axes]` f32
+    /// (`RuntimeInput::AxisPositions`); `dims[a]` is axis `a`'s CHANNEL count
+    /// (`0` past the last axis; `Σ dims == rotary_dim <= head_dim`, the
+    /// tail `head_dim - rotary_dim` of every head passing through);
+    /// `thetas[a]` its base. Pair `i` of axis `a` turns by `positions[a] ·
+    /// thetas[a]^(-2i / dims[a])`, angles in fp32. Which channels pair `i`
+    /// joins is [`form`](RopeForm).
+    RopeAxes {
+        x: ValueId,
+        positions: ValueId,
+        dims: [u32; 4],
+        thetas: [f32; 4],
+        form: RopeForm,
+        rotary_dim: u32,
+        head_dim: u32,
+        x_out: ValueId,
+    },
+}
+
+/// Which arithmetic a [`Modulate`](Elementwise::Modulate) applies, and how
+/// many `width`-wide slices (`k`) its vector carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModulateForm {
+    /// `y = x · (1 + s) + b`, `m = [s | b]`, `k = 2` — adaLN's shift/scale.
+    ScaleShift,
+    /// `y = x · (1 + s)`, `k = 1`.
+    Scale,
+    /// `y = tanh(g) · x`, `k = 1` — Z-Image's gated form.
+    TanhGate,
+}
+
+impl ModulateForm {
+    /// How many `width`-wide slices the modulation vector carries.
+    #[must_use]
+    pub fn slices(self) -> u64 {
+        match self {
+            ModulateForm::ScaleShift => 2,
+            ModulateForm::Scale | ModulateForm::TanhGate => 1,
+        }
+    }
+}
+
+/// The scale-free norm a fused [`NormModulate`](Elementwise::NormModulate)
+/// runs before its modulation: the same arithmetic as the traced variant it
+/// replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum NormKind {
+    /// [`LayernormNoScale`](Elementwise::LayernormNoScale): centred, whole row.
+    Layernorm { eps: f32 },
+    /// [`RmsnormNoScale`](Elementwise::RmsnormNoScale): per `head_dim` group.
+    Rmsnorm { head_dim: u32, eps: f32 },
+}
+
+/// Which channels pair `i` of an axis block joins in a
+/// [`RopeAxes`](Elementwise::RopeAxes). Every form keeps each axis's
+/// `dims[a]` channels as one contiguous block `b_a..b_a + dims[a]` of the
+/// rotated prefix; they differ in the pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RopeForm {
+    /// Adjacent pairs within the block: `(b + 2i, b + 2i + 1)` — FLUX's and
+    /// Z-Image's complex-pair layout.
+    Interleaved,
+    /// `rotate_half` over the whole rotated prefix: pair `p` of
+    /// `[0, rotary_dim/2)` is `(p, p + rotary_dim/2)`, and the axis owning
+    /// pair `p` is the one whose block of `dims[a]/2` pairs contains it —
+    /// MiniMax's layout (96 of 128 channels rotated).
+    Neox,
+    /// `rotate_half` WITHIN each block: pair `i` of axis `a` is `(b + i,
+    /// b + dims[a]/2 + i)` — Wan's and LTX's layout, and
+    /// [`MropeForm::Split`]'s pairing.
+    Split,
 }
 
 /// Which activation gates a [`RmsnormGated`](Elementwise::RmsnormGated) —
@@ -505,6 +693,29 @@ impl Operands for Elementwise {
             Self::HcMix { gates, normed, .. } => sink.extend([*gates, *normed]),
             Self::HcInject { o, gates, hyper, .. } => sink.extend([*o, *gates, *hyper]),
             Self::PleGate { key, query, value, .. } => sink.extend([*key, *query, *value]),
+            Self::Modulate { x, m, lane_of_row, .. } => {
+                sink.extend([*x, *m]);
+                sink.extend(*lane_of_row);
+            }
+            Self::GatedResidualAdd { r, g, y, lane_of_row, .. } => {
+                sink.extend([*r, *g, *y]);
+                sink.extend(*lane_of_row);
+            }
+            Self::NormModulate { x, m, lane_of_row, .. } => {
+                sink.extend([*x, *m]);
+                sink.extend(*lane_of_row);
+            }
+            Self::GatedResidualNormModulate { r, g, y, m, lane_of_row, .. } => {
+                sink.extend([*r, *g, *y, *m]);
+                sink.extend(*lane_of_row);
+            }
+            Self::Sinusoid { t, .. } => sink.push(*t),
+            Self::Silu { x, .. } => sink.push(*x),
+            Self::Gelu { x, .. } => sink.push(*x),
+            Self::Tanh { x, .. } => sink.push(*x),
+            Self::Mul { x, y, .. } => sink.extend([*x, *y]),
+            Self::Add { x, y, .. } => sink.extend([*x, *y]),
+            Self::RopeAxes { x, positions, .. } => sink.extend([*x, *positions]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -567,6 +778,19 @@ impl Operands for Elementwise {
             Self::HcMix { y, .. } => sink.push(*y),
             Self::HcInject { hyper_out, .. } => sink.push(*hyper_out),
             Self::PleGate { y, .. } => sink.push(*y),
+            Self::Modulate { y, .. } => sink.push(*y),
+            Self::GatedResidualAdd { r_out, .. } => sink.push(*r_out),
+            Self::NormModulate { normed, y, .. } => sink.extend([*normed, *y]),
+            Self::GatedResidualNormModulate { r_out, normed, out, .. } => {
+                sink.extend([*r_out, *normed, *out]);
+            }
+            Self::Sinusoid { y, .. } => sink.push(*y),
+            Self::Silu { x_out, .. } => sink.push(*x_out),
+            Self::Gelu { x_out, .. } => sink.push(*x_out),
+            Self::Tanh { x_out, .. } => sink.push(*x_out),
+            Self::Mul { z, .. } => sink.push(*z),
+            Self::Add { z, .. } => sink.push(*z),
+            Self::RopeAxes { x_out, .. } => sink.push(*x_out),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -615,6 +839,19 @@ impl Operands for Elementwise {
             Self::HcMix { .. } => {}
             Self::HcInject { hyper_out, hyper, .. } => sink.push((*hyper_out, *hyper)),
             Self::PleGate { .. } => {}
+            Self::Modulate { .. } => {}
+            Self::GatedResidualAdd { r_out, r, .. } => sink.push((*r_out, *r)),
+            Self::NormModulate { .. } => {}
+            // Only the fold is in place; the normed row and the modulated
+            // output are fresh, since an alias may name only an input.
+            Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
+            Self::Sinusoid { .. } => {}
+            Self::Silu { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::Gelu { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::Tanh { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::Mul { .. } => {}
+            Self::Add { .. } => {}
+            Self::RopeAxes { x_out, x, .. } => sink.push((*x_out, *x)),
         }
     }
     fn name(&self) -> &'static str {
@@ -657,6 +894,17 @@ impl Operands for Elementwise {
             Self::HcMix { .. } => "elementwise.hc_mix",
             Self::HcInject { .. } => "elementwise.hc_inject",
             Self::PleGate { .. } => "elementwise.ple_gate",
+            Self::Modulate { .. } => "elementwise.modulate",
+            Self::GatedResidualAdd { .. } => "elementwise.gated_residual_add",
+            Self::NormModulate { .. } => "elementwise.norm_modulate",
+            Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
+            Self::Sinusoid { .. } => "elementwise.sinusoid",
+            Self::Silu { .. } => "elementwise.silu",
+            Self::Gelu { .. } => "elementwise.gelu",
+            Self::Tanh { .. } => "elementwise.tanh",
+            Self::Mul { .. } => "elementwise.mul",
+            Self::Add { .. } => "elementwise.add",
+            Self::RopeAxes { .. } => "elementwise.rope_axes",
         }
     }
 }

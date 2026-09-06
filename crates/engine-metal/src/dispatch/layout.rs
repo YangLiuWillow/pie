@@ -2,7 +2,7 @@
 
 use kernels_metal::layout;
 use model_exec::{DispatchLayout, KernelError};
-use model_ir::Layout;
+use model_ir::{Layout, Operands};
 
 use crate::run::Run;
 
@@ -182,6 +182,10 @@ impl Run<'_> {
             ),
             // One launch per operand: each writes its own column of the i32
             // plane, so the plane is whole once the last has run.
+            // M0: the row packing (D2) is CUDA-first; refused by name here.
+            Layout::PackRows { .. } | Layout::UnpackRows { .. } => {
+                return Err(kernels_metal::Error::Unsupported { op: op.name() });
+            }
             Layout::TopK { x, k, values, indices } => layout::topk(
                 self.ctx(),
                 self.tensor(*x),

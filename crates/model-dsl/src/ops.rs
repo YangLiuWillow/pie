@@ -12,7 +12,7 @@ use crate::declare::Weight;
 use crate::record::Value;
 use model_ir::{
     Attention, Collective, CustomCuda, Dim, Dtype, Elementwise, GateActivation, Layout, Linear,
-    MropeForm, StructKind, Ty, ValueId,
+    ModulateForm, MropeForm, RaggedMask, RopeForm, StructKind, Ty, ValueId,
 };
 
 pub mod attn;

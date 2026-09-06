@@ -43,6 +43,10 @@ use crate::error::{Fault, Result};
 pub(crate) const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
 pub(crate) const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
 pub(crate) const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
+/// The float readouts a plan may carry instead of `out` (`velocity`,
+/// `hidden`): a plan with one of these and no `out` still computes
+/// something a reader takes.
+pub(crate) const FLOAT_READOUT_SEAMS: [&str; 2] = model_compiler::FLOAT_READOUT_SEAMS;
 
 /// One declared export, resolved against this load's plan and bake.
 ///
@@ -67,9 +71,12 @@ pub struct Export {
 /// This load's declared exports (design §9), resolved once at boot.
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
-    /// The trunk's logits. Required: a plan with no `out` seam computes
-    /// nothing a reader can take.
-    pub(crate) out: ValueId,
+    /// The trunk's logits. `None` for a plan whose readout is a float seam
+    /// (`velocity`, `hidden`) — a denoiser has no logits — and a plan with
+    /// neither is refused at boot, since a fire would compute nothing a
+    /// reader can take. M0: reading the float seams back is the runtime
+    /// agent's; this shell reads logits only.
+    pub(crate) out: Option<ValueId>,
     /// The draft head's logits over the draft window, for a SKU whose model
     /// text declares one (palo C3).
     pub(crate) mtp: Option<Export>,
@@ -87,18 +94,27 @@ impl Exports {
     ///
     /// # Errors
     ///
-    /// [`Fault::Unbound`] for a plan with no `out` seam.
+    /// [`Fault::Unbound`] for a plan with no export at all: neither an
+    /// `out` seam nor a float readout.
     pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Exports> {
         let out = trace
             .seams
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-            .ok_or_else(|| Fault::Unbound {
+            .and_then(|seam| seam.values.first().copied());
+        let float_readout = trace
+            .seams
+            .iter()
+            .any(|seam| FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty());
+        if out.is_none() && !float_readout {
+            return Err(Fault::Unbound {
                 what: format!(
-                    "no `{OUT_SEAM}` seam, so a fire would compute nothing a reader can take"
+                    "no `{OUT_SEAM}` seam and no float readout ({}), so a fire would compute \
+                     nothing a reader can take",
+                    FLOAT_READOUT_SEAMS.join(", ")
                 ),
-            })?;
+            });
+        }
         let named = |name: &str| -> Vec<Export> {
             trace.seams
                 .iter()
