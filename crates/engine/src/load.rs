@@ -294,8 +294,10 @@ mod residency_tests {
         let said = format!("{refused}");
         assert!(said.contains("4000"), "the refusal names the bytes: {said}");
         assert!(
-            said.contains("third tier"),
-            "and which tier they wanted: {said}"
+            said.contains("spills"),
+            "and what the plan wanted of them — the tier the budgets cut out, \
+             which the refusal names by what it does rather than by a number: \
+             {said}"
         );
         assert!(
             said.contains("pie model import"),
@@ -303,10 +305,10 @@ mod residency_tests {
              differently-configured boot: {said}"
         );
         assert!(
-            said.contains("uncapped"),
-            "and the one case where a boot still comes into it, because a \
-             deployment that has never been held whole has nothing for a \
-             prepare to read its spilled planes out of: {said}"
+            said.contains("state `None`"),
+            "and the one case where a boot still comes into it — an uncapped \
+             budget — because a deployment that has never been held whole has \
+             nothing for a prepare to read its spilled planes out of: {said}"
         );
         assert!(
             matches!(refused, crate::Error::Impossible(_)),
