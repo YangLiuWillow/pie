@@ -269,17 +269,29 @@ clip table below carries the offsets.
   `dispatch/spatial.rs`. **M0 rules:** every spatial kernel takes the whole
   clip table and finds a row's lane itself (`seat::Reads::Nothing`), so a
   voxel launch runs over the fire's whole voxel rectangle and the shell
-  refuses a fire whose clips fall in two classes (`Fault::VoxelPayload`); a
-  voxel plan is served eagerly (`bodies` is downgraded at load, the arming
-  pass fires no clip). `Shell::fire_voxels(lanes, clips) -> Vec<Pixels>` is
-  the door; `Engine::submit` takes `Step.voxels: Vec<StepVoxels { lane, clips,
-  payload }>` (host-fed) and answers `LaneReadout { seam:
-  ReadoutSeam::Pixels, clips, values }`; `PortKind::Voxels` names the
-  channel-fed port (staging it is the port agent's, beside `Latents`).
+  refuses a fire whose clips fall in two classes (`Fault::VoxelPayload`).
+  **Arming is PER AXIS** (M1): `Windows::admit_axes` marks every region on
+  `RowAxis::Voxels` an `Admit::Island` — the arming pass fires no clip, so a
+  voxel window it sees has zero rows and would read as capturable, and a
+  spatial launch reads no seat that could retire a replay's padding — while
+  the TOKEN regions of the same plan are judged as ever, so a flagship
+  serves its DiT bodied with a VAE standing beside it in the artifact.
+  `Shell::fire_voxels(lanes, clips) -> Vec<Pixels>` is the door;
+  `Engine::submit` takes `Step.voxels: Vec<StepVoxels { lane, clips,
+  payload }>` and answers `LaneReadout { seam: ReadoutSeam::Pixels, clips,
+  values }`. **A voxel port has TWO feeds and a lane takes one**: the
+  `payload` beside its clips (host-fed, the shell's own door), or
+  `PortKind::Voxels` in `Lane::ports` (channel-fed) — the clips then carry
+  the box alone, and `enqueue` copies the committed cell into the voxel
+  payload at the lane's `voxel_offset`, device to device, casting an f32
+  cell into a bf16 port the way `Latents` does. A lane doing neither is
+  refused by name.
   Tests: `model-dsl/tests/a_conv_decoder_traces_on_the_voxel_axis`,
   `model-compiler/tests/the_third_row_axis_carves_its_own_arena`,
   `model-exec/tests/the_voxel_axis_seriates_its_own_clips`,
   `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU),
+  `engine-cuda/tests/a_channel_fed_voxel_port_lands_the_committed_cell` (GPU),
+  `engine-cuda/tests/a_two_axis_plan_arms_its_token_bodies` (GPU),
   `kernels-cuda/tests/the_spatial_attention_answers_the_cpu_reference` (GPU).
 - **The first real VAE (M1).** `models::z_image::vae` states the FLUX
   16-channel `AutoencoderKL` as the flagship's `vae.decode` (latent `[h·w, 16]`
@@ -289,10 +301,17 @@ clip table below carries the offsets.
   `pixels` seam; `models/tests/the_z_image_vae_bakes`, and the GPU parity gate
   `engine-cuda/tests/the_z_image_vae_answers_the_reference` against
   `scripts/imagegen/zimage_golden.py --vae` (decode cos 0.99998, mean |err|
-  0.0023; encode at the bf16 reference's own distance, cos 0.9997). Known
-  limit: `layout.split_rows` launches its rows on `grid.y` and refuses past
-  65 535 rows, so a voxel-axis text must not split a wide rectangle's
-  columns (the encoder declares the mean's 16 `conv_out` rows instead).
+  0.0023; encode at the bf16 reference's own distance, cos 0.9997).
+  **FROM A GUEST** the same reading is `tests/inferlets/zimage-vae-parity`
+  driven by `scripts/imagegen/zimage_vae_parity.py`: the latent bound as the
+  port's channel (whose declared shape IS the clip's box, `[h, w, C]` or
+  `[t, h, w, C]`, which is what `runtime::validate_port_channel` accepts),
+  the answer read off `intrinsics::pixels(rows, 3)`, and the picture out
+  through `frames.from-channel` + `session.send-frames` — measured at cos
+  0.999981, mean |err| 0.00225, the host-fed gate's own distance.
+  `layout.split_rows` launches its rows on `grid.x` now (`grid.y` is capped
+  at 65 535 by every compute capability, which bit a 64k-row fire and a wide
+  voxel rectangle alike).
 
 ## 7. How the CUDA engine serves §1–§2 (M0 round 2)
 
@@ -344,6 +363,13 @@ a runtime or another shell must agree with. Tests: `engine-cuda/tests/a_double_b
   attachment gets `IntrinsicId::Velocity` (the velocity plane) and `IntrinsicId::Hidden` (the last
   hidden plane) bound at the lane's first row, `width = plane.width`, storage raw-bf16 or f32 as
   the arena holds it; `Logits` is bound only when the readout seam is logits.
+  `IntrinsicId::Pixels` (D8, `[rows, C]` f32, gated by `ModelProfile { has_pixels, pixels_width }`
+  — `pixels_width` is `0` when a plan's plantings disagree, a VAE's decode RGB beside its
+  encode's 16-channel mean, and bind then checks rank and rows alone) is bound at the lane's
+  first OUTPUT VOXEL, not its token row: a VAE lane's rows are on the third axis. Every grid past
+  the port's is a device value, so the offset comes from `voxels::host_grid`, which replays the
+  plan's `Spatial::Grid` chain through `GridRule::apply`, the rules' own host twins. A program
+  reading an unbound `pixels` is refused at its mint by name.
 - **Lane-shaped values** (`[Lanes, ·]`: a lane vector's chain) are carved and computed at the
   fire's lane carve (the key's lane ceiling for a body) and launched without the staged seat
   (`Run::unseated`); an f32 lane activation's `linear.matmul` takes `linear::lane_gemm`.

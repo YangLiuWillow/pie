@@ -56,12 +56,11 @@ impl Shell {
             return (admits, true);
         }
         // Widened here and nowhere else: one call, one table, three readers.
-        let admits: std::sync::Arc<[crate::window::Admit]> =
-            record::widen(
-                &self.compiled,
-                &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
-            )
-            .into();
+        let admits: std::sync::Arc<[crate::window::Admit]> = record::widen(
+            &self.compiled,
+            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
+        )
+        .into();
         // Bounded: past the seat count, keep only keys still holding or
         // refused a body; the rest re-derive on next use.
         if self.segments.len() > record::MAX_BODIES * 4 {
@@ -69,11 +68,14 @@ impl Shell {
             self.segments
                 .retain(|key, _| cache.holds_body(key) || cache.body_refused(key));
         }
-        self.segments.insert(key.clone(), Segmented {
-            copies,
-            admits: std::sync::Arc::clone(&admits),
-            cuttable: None,
-        });
+        self.segments.insert(
+            key.clone(),
+            Segmented {
+                copies,
+                admits: std::sync::Arc::clone(&admits),
+                cuttable: None,
+            },
+        );
         // First fire of a key writes the world; later fires are measured against it.
         (admits, true)
     }

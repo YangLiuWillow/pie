@@ -14,8 +14,8 @@ use crate::error::{Fault, Result};
 use super::compile::Compiled;
 use super::endpoint::Endpoint;
 use super::launch::{ChannelShape, Cursor, Prepared, Rings, native_to_wire, wire_to_native};
-use super::wave::Wave;
 use super::ports::{self, Envelope};
+use super::wave::Wave;
 
 /// What one fire produced; mirrors [`eta_exec::StepOutcome`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,9 +422,7 @@ impl Session {
         let seat = self.intrinsics.get_mut(slot).ok_or_else(|| {
             Fault::program(
                 "program::session",
-                format!(
-                    "intrinsic {slot} is past the pitch the side tables are indexed with"
-                ),
+                format!("intrinsic {slot} is past the pitch the side tables are indexed with"),
             )
         })?;
         *seat = Some(Intrinsic {
@@ -474,8 +472,7 @@ impl Session {
         stages_and_plans_agree(compiled)?;
 
         // An unbound intrinsic is a null pointer the kernel dereferences.
-        if plan.needs_logits
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::Logits as u32)) == 0
+        if plan.needs_logits && self.bound & (1u64 << (eta_ir::op::IntrinsicId::Logits as u32)) == 0
         {
             return Err(Fault::program(
                 "program::session",
@@ -505,6 +502,24 @@ impl Session {
                 "this program reads the `attn_score` intrinsic and no buffer has been \
                  bound to it; a lane that did not ask to capture its attention has no \
                  block of the observability slab for it to point at",
+            ));
+        }
+
+        // The pixels plane (D8) needs the same guard, read off the program's
+        // own values rather than a plan flag: a lane whose arm plants no
+        // `seam::PIXELS` — a text pass, a denoise pass, any load with no VAE
+        // reading — binds none, and the emitted kernel would dereference the
+        // side table's zero.
+        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::Pixels as u32)) == 0
+            && plan
+                .package
+                .values
+                .iter()
+                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::Pixels))
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `pixels` intrinsic and no buffer has been                  bound to it; a lane whose reading plants no `pixels` seam — or a                  fire that submitted no clip — has no pixel plane for it to point at",
             ));
         }
 
@@ -590,11 +605,7 @@ impl Session {
 
     /// This fire's tickets, slot lists, and three lanes, staged; touches no
     /// device word. Mirrors `eta_exec::step`'s commit arithmetic.
-    fn mint(
-        &mut self,
-        plan: &ExecPlan,
-        wave: &mut Wave,
-    ) -> std::result::Result<Minted, String> {
+    fn mint(&mut self, plan: &ExecPlan, wave: &mut Wave) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
         let mut tickets: Vec<Ticket> = Vec::with_capacity(self.shapes.len());
@@ -710,9 +721,7 @@ impl Session {
             }
             // A shared ring's endpoint is native-width; packing bools would
             // write a cell an eighth the expected width.
-            if shape.dtype == eta_ir::Dtype::Bool
-                && endpoint.role() != HostRole::None
-            {
+            if shape.dtype == eta_ir::Dtype::Bool && endpoint.role() != HostRole::None {
                 flags |= Ticket::PACKED_BOOL;
             }
             if flags & Ticket::SHADOW != 0 {
@@ -735,7 +744,11 @@ impl Session {
                 } else {
                     channel::NO_TICKET
                 },
-                expected_tail: if puts { cursor.tail } else { channel::NO_TICKET },
+                expected_tail: if puts {
+                    cursor.tail
+                } else {
+                    channel::NO_TICKET
+                },
                 words: endpoint.words_device(),
                 mirror: endpoint.mirror_device(),
                 cells,
@@ -989,5 +1002,4 @@ mod tests {
             "and what would go wrong: {text}"
         );
     }
-
 }

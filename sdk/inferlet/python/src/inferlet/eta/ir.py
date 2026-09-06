@@ -184,6 +184,7 @@ class Intrinsic(IntEnum):
     MTP_DRAFTS = 6
     ATTN_SCORE = 7
     VELOCITY = 8
+    PIXELS = 9
 
 
 class SinkScope(IntEnum):

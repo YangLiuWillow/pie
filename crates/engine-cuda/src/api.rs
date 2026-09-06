@@ -18,8 +18,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
-    Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{
@@ -498,10 +497,7 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder>
     if !declares_voxels {
         return None;
     }
-    let max_voxels = budgets
-        .max_voxels
-        .unwrap_or(DERIVED_VOXEL_CEILING)
-        .max(1);
+    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
     Some(VoxelLadder {
         max_voxels,
         // Served eagerly this phase: one rung at the ceiling.
@@ -532,6 +528,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         Err(_) if shell.readout_seam().is_some() => 0,
         Err(why) => return Err(fault(why)),
     };
+    let (has_pixels, pixels_width) = shell.pixels_facts();
     Ok(ModelProfile {
         vocab,
         page_size: budgets.page_size,
@@ -564,6 +561,12 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // at bind rather than at its first fire.
         has_velocity: shell.velocity_width().is_some(),
         velocity_width: shell.velocity_width().unwrap_or(0),
+        // The pixels seam is the model text's too (design D8): a plan that
+        // plants `seam::PIXELS` binds the `pixels()` intrinsic, at the one
+        // width every planting agrees on or at none when a VAE's decode
+        // lands RGB beside its encode's 16-channel mean.
+        has_pixels,
+        pixels_width,
         kernels: Vec::new(),
     })
 }

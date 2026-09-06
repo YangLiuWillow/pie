@@ -92,6 +92,14 @@ declare_intrinsics! {
     /// [`ModelProfile::velocity_width`](crate::registry::ModelProfile::velocity_width)
     /// the way `logits` is against `vocab`.
     Velocity = 8, VELOCITY, "velocity";
+    /// `[n_out, C]` F32 — epilogue only; model-gated. The pixels a VAE
+    /// reading on the voxel axis lands (design D8): one row per OUTPUT
+    /// voxel of the lane's clip, in `(t, h, w)` order, `C` wide — RGB in
+    /// `[-1, 1]` for a decode, the posterior mean for an encode. Width is
+    /// cross-checked at bind against
+    /// [`ModelProfile::pixels_width`](crate::registry::ModelProfile::pixels_width)
+    /// when the model states one width for every pixels planting.
+    Pixels = 9, PIXELS, "pixels";
 }
 
 /// An ETA stage-body op. Docs here give meaning only; wire tags live on the

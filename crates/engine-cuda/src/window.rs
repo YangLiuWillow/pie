@@ -350,7 +350,9 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                     // The patch axis: a different row space than the token map `Gathered::rows_host` describes.
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                     // The voxel axis: its own row space too.
-                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
+                        false
+                    }
                 },
             },
         }
@@ -422,7 +424,10 @@ impl Windows {
                     segments_host = spans
                         .iter()
                         .flat_map(|span| {
-                            [(span.row_offset - union.row_offset) as i32, span.rows as i32]
+                            [
+                                (span.row_offset - union.row_offset) as i32,
+                                span.rows as i32,
+                            ]
                         })
                         .collect();
                     spans.clear();
@@ -528,7 +533,10 @@ impl Windows {
         // Each slot is opened by padding out to its own offset.
         let open = |out: &mut Vec<i32>, at: u64| {
             let at = at as usize;
-            assert!(out.len() <= at, "a window's vectors overran the stride they were carved at");
+            assert!(
+                out.len() <= at,
+                "a window's vectors overran the stride they were carved at"
+            );
             // Grow only: a truncation would turn a `Fault::Ceiling` into silently wrong bytes.
             if out.len() < at {
                 out.resize(at, 0);
@@ -725,15 +733,14 @@ impl Windows {
     /// The same question for a table whose regions can move their own base: [`covers_fire`](Windows::covers_fire) with offset and rows waived per region on [`crate::shifted`]; the shape clause is never waived.
     #[must_use]
     pub fn covers_fire_shifted(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> bool {
-        (0..self.of_region.len() as u32)
-            .all(|region| {
-                self.admit_axes(
-                    region,
-                    model_ir::PerAxis::new([rows, 0, 0]),
-                    shifted,
-                    lane_shifted,
-                ) == Admit::Captured
-            })
+        (0..self.of_region.len() as u32).all(|region| {
+            self.admit_axes(
+                region,
+                model_ir::PerAxis::new([rows, 0, 0]),
+                shifted,
+                lane_shifted,
+            ) == Admit::Captured
+        })
     }
 
     /// Which regions of this fire a body may hold, and which it must re-issue — per-region rather than collapsed to one `bool`. A function of the [`record::BodyKey`](crate::record::BodyKey), except the copy knob, which a differently-armed fire walks eagerly instead of re-deriving.
@@ -773,6 +780,18 @@ impl Windows {
         shifted: &[bool],
         lane_shifted: &[bool],
     ) -> Admit {
+        // ARMING IS PER AXIS (design D8, M0). A voxel region is never held:
+        // the arming pass fires synthetic lanes that carry no clip, so every
+        // voxel window it sees has zero rows and would read as `Captured` —
+        // a graph recorded over an empty rectangle, replayed against a real
+        // fire's clips. And a spatial launch reads no window seat
+        // (`seat::Reads::Nothing`), so nothing in a replay could retire its
+        // padded rows anyway. The region re-issues at this fire's own voxel
+        // geometry while the TOKEN regions of the same plan still replay,
+        // which is what lets a plan stating both axes serve its DiT bodied.
+        if self.axis_of(region) == model_ir::RowAxis::Voxels {
+            return Admit::Island;
+        }
         let moves = shifted.get(region as usize).copied().unwrap_or(false);
         // The same question one axis over; an unheld index reads `false` (refuses).
         let finds_its_lane = lane_shifted.get(region as usize).copied().unwrap_or(false);
@@ -1262,7 +1281,9 @@ impl Sink for Cursor<'_> {
         };
         let kind = match *lowering {
             Lowering::If => Kind::If,
-            Lowering::Switch { arms, .. } => Kind::Switch { arms: u32::from(arms) },
+            Lowering::Switch { arms, .. } => Kind::Switch {
+                arms: u32::from(arms),
+            },
             Lowering::AlwaysLaunch => {
                 self.fault = Some(unlowered(lowering));
                 return;
@@ -1371,7 +1392,7 @@ impl Sink for Cursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use model_ir::ClassSet;
 
     /// A windowed region in the capture phase, behind a conditional node.
@@ -1409,7 +1430,10 @@ mod tests {
         let fault = recording
             .settle()
             .expect_err("a capture may not record a body outside its node");
-        assert!(matches!(fault, Fault::Unlowered { region: 0, .. }), "{fault}");
+        assert!(
+            matches!(fault, Fault::Unlowered { region: 0, .. }),
+            "{fault}"
+        );
         assert!(fault.to_string().contains("nowhere"), "{fault}");
     }
 
@@ -1517,8 +1541,16 @@ mod tests {
             lane_offset,
             lanes,
         };
-        let first = if a.0 == 0 { MaskSpan::default() } else { one(a, 0, 0) };
-        let second = if b.0 == 0 { MaskSpan::default() } else { one(b, a.0, a.1) };
+        let first = if a.0 == 0 {
+            MaskSpan::default()
+        } else {
+            one(a, 0, 0)
+        };
+        let second = if b.0 == 0 {
+            MaskSpan::default()
+        } else {
+            one(b, a.0, a.1)
+        };
         let both = match (a.0 == 0, b.0 == 0) {
             (false, false) => one((a.0 + b.0, a.1 + b.1), 0, 0),
             (false, true) => first,
@@ -1543,7 +1575,11 @@ mod tests {
         };
 
         let wide = seated((10, 2), (3, 3));
-        assert_eq!(wide.0, vec![0, 1, 0, 2], "three distinct masks, three slots");
+        assert_eq!(
+            wide.0,
+            vec![0, 1, 0, 2],
+            "three distinct masks, three slots"
+        );
         assert_eq!(
             seated((4, 1), (6, 6)),
             wide,
@@ -1562,6 +1598,9 @@ mod tests {
             vec![0, 0, 0, 1],
             "the both-classes mask is the A mask when B has no rows",
         );
-        assert_ne!(absent.0, wide.0, "and that is a different key, so a different body");
+        assert_ne!(
+            absent.0, wide.0,
+            "and that is a different key, so a different body"
+        );
     }
 }

@@ -283,7 +283,9 @@ impl Shell {
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
         // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
-        self.compiled.classes.adapted_word(&self.corrected, bit, word)
+        self.compiled
+            .classes
+            .adapted_word(&self.corrected, bit, word)
     }
 
     /// The shared-adapter store.
@@ -618,6 +620,32 @@ pub(crate) struct PortFeedPlan {
     pub(crate) instance: u64,
 }
 
+/// One VOXEL port's feed for one lane (design D8): where in the fire's
+/// voxel payload the lane's rows land, and which channel cell they come
+/// from. Its own plan and not a [`PortFeedPlan`] because the rectangle is
+/// not in the inputs store — the payload lives in [`crate::voxels::Store`],
+/// below the fire's other inputs, and its row offset is the lane's
+/// `voxel_offset` on the third axis rather than its token row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VoxelFeedPlan {
+    /// Which submitted lane this feeds.
+    pub(crate) lane: u32,
+    /// The first voxel row of the payload the cell lands at.
+    pub(crate) first: u32,
+    /// How many voxel rows the cell fills — the lane's clips' `Σ t·h·w`.
+    pub(crate) rows: u32,
+    /// The port's channel count.
+    pub(crate) width: u32,
+    /// The cell is f32 and the port bf16: cast on the way rather than copied.
+    pub(crate) cast: bool,
+    /// The payload bytes those rows are, in the port's element.
+    pub(crate) bytes: u64,
+    /// The engine-registered channel id.
+    pub(crate) channel: u64,
+    /// The instance the channel is read through.
+    pub(crate) instance: u64,
+}
+
 /// One lane's rows of a port merged straight into a stream, to land in the
 /// merged column: from the port rectangle when the lane fed the port, zeros
 /// when it did not (an arming synthetic).
@@ -665,6 +693,9 @@ pub struct Prepared<'a> {
     packings: Vec<model_exec::fire::Packed>,
     /// The D3 port feeds: one copy per (lane, port) the lane's class reads.
     port_feeds: Vec<PortFeedPlan>,
+    /// The D8 voxel port feeds: one copy per (lane, voxel port), landing in
+    /// the voxel store's payload rather than the inputs store.
+    voxel_feeds: Vec<VoxelFeedPlan>,
     /// The rows of ports merged straight into a stream, landed in the merged
     /// column after the feeds: one entry per (merge, lane) the arm selects.
     merge_lands: Vec<MergeLand>,
