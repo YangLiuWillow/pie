@@ -1699,6 +1699,7 @@ mod tests {
             prefilling: Vec::new(),
             media: Vec::new(),
             fragmenting: Vec::new(),
+            joining: Vec::new(),
             decoding: model_ir::ClassSet::of(0..decoders),
             seats: point.lanes,
             context: 512,
