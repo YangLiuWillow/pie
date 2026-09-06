@@ -65,6 +65,9 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.masked", Reads::RowsAndLanes),
     entry("attention.prefill", Reads::RowsAndLanes),
     entry("attention.prefill_lse", Reads::RowsAndLanes),
+    // the unpaged arm: group tables handed whole, plane-absolute rows inside
+    // them, live groups off `win[2..4]`, schedule rebuilt on the device per fire
+    entry("attention.ragged", Reads::RowsAndLanes),
     // attention: planners
     entry("attention.plan_decode", Reads::Nothing),
     entry("attention.plan_prefill", Reads::Nothing),

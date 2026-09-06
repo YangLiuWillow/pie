@@ -127,6 +127,71 @@ pub struct PrefillPagedParams {
     pub maybe_max_item_len_ptr: DevicePtr,
 }
 
+/// `::flashinfer::BatchPrefillRaggedParams<bf16, bf16, bf16, i32>`, the
+/// unpaged prefill's block: k and v are row-major rectangles walked through
+/// `kv_indptr` instead of a `paged_kv_t`. 312 bytes, align 8, pinned by the
+/// `static_assert` beside `RaggedParams` in `attn/attention.cuh`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct PrefillRaggedParams {
+    pub q: DevicePtr,
+    pub k: DevicePtr,
+    pub v: DevicePtr,
+    pub maybe_custom_mask: DevicePtr,
+    pub q_indptr: DevicePtr,
+    pub kv_indptr: DevicePtr,
+    pub maybe_mask_indptr: DevicePtr,
+    pub maybe_q_rope_offset: DevicePtr,
+    pub maybe_k_rope_offset: DevicePtr,
+    pub o: DevicePtr,
+    pub lse: DevicePtr,
+    pub maybe_alibi_slopes: DevicePtr,
+    pub group_size: UintFastdiv,
+    pub num_qo_heads: u32,
+    pub num_kv_heads: u32,
+    pub q_stride_n: u32,
+    pub q_stride_h: u32,
+    pub k_stride_n: u32,
+    pub k_stride_h: u32,
+    pub v_stride_n: u32,
+    pub v_stride_h: u32,
+    pub k_sf_stride_page: u32,
+    pub k_sf_stride_n: u32,
+    pub k_sf_stride_h: u32,
+    pub v_sf_stride_page: u32,
+    pub v_sf_stride_n: u32,
+    pub v_sf_stride_h: u32,
+    pub window_left: i32,
+    pub logits_soft_cap: f32,
+    pub sm_scale: f32,
+    pub rope_rcp_scale: f32,
+    pub rope_rcp_theta: f32,
+    pub request_indices: DevicePtr,
+    pub qo_tile_indices: DevicePtr,
+    pub kv_tile_indices: DevicePtr,
+    pub merge_indptr: DevicePtr,
+    pub o_indptr: DevicePtr,
+    pub kv_chunk_size_ptr: DevicePtr,
+    pub block_valid_mask: DevicePtr,
+    pub max_total_num_rows: u32,
+    pub total_num_rows: DevicePtr,
+    pub padded_batch_size: u32,
+    pub partition_kv: bool,
+    pub maybe_prefix_len_ptr: DevicePtr,
+    pub maybe_token_pos_in_items_ptr: DevicePtr,
+    pub token_pos_in_items_len: u32,
+    pub maybe_max_item_len_ptr: DevicePtr,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<PrefillRaggedParams>() == 312,
+    "PrefillRaggedParams: sizeof disagrees with ::flashinfer::BatchPrefillRaggedParams",
+);
+const _: () = assert!(
+    core::mem::align_of::<PrefillRaggedParams>() == 8,
+    "PrefillRaggedParams: alignof disagrees with ::flashinfer::BatchPrefillRaggedParams",
+);
+
 /// Every device address a decode or prefill fire touches, gathered by the
 /// entry from `q`/`o`/the pool row/the plan's workspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

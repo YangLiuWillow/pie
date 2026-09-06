@@ -2,7 +2,7 @@
 
 use crate::error::Error;
 
-use crate::attn::fa2_abi::{DecodeParams, Partials, PrefillPagedParams};
+use crate::attn::fa2_abi::{DecodeParams, Partials, PrefillPagedParams, PrefillRaggedParams};
 use crate::attn::plan::Device;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
@@ -106,6 +106,44 @@ fn prefill_symbol(
     )))
 }
 
+/// The ragged prefill instantiation: the paged kernel's traits (the traits
+/// are storage-agnostic; the kernel picks `SharedStorage` itself) under
+/// `BatchPrefillWithRaggedKVCacheKernel` with the unpaged parameter block.
+fn prefill_ragged_symbol(
+    op: &'static str,
+    g: &PrefillGeometry,
+    arm: PrefillArm,
+) -> Result<&'static str, Error> {
+    instantiated(op, g.head_dim)?;
+    let (mask, variant) = match arm {
+        PrefillArm::NoneFull => ("kNone", "VariantFull"),
+        PrefillArm::NoneFullSoftcap => ("kNone", "VariantFullSoftcap"),
+        PrefillArm::CausalFull => ("kCausal", "VariantFull"),
+        PrefillArm::CausalFullSoftcap => ("kCausal", "VariantFullSoftcap"),
+        other => {
+            return Err(refuse(
+                op,
+                format!(
+                    "the ragged prefill is stamped for the full-attention arms only, not {other:?}"
+                ),
+            ));
+        }
+    };
+    Ok(symbol(&format!(
+        "::flashinfer::BatchPrefillWithRaggedKVCacheKernel<\
+         ::pie::attn::fa2::PagedTraits<::flashinfer::MaskMode::{mask}, \
+         {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
+         ::pie::attn::fa2::{variant}>, ::pie::attn::fa2::RaggedParams>",
+        q = g.cta_tile_q,
+        mmaq = g.num_mma_q,
+        kv = g.num_mma_kv,
+        dqk = g.num_mma_d_qk,
+        dvo = g.num_mma_d_vo,
+        wq = g.num_warps_q,
+        wkv = g.num_warps_kv,
+    )))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePoint {
     pub head_dim: u32,
@@ -175,6 +213,38 @@ pub(crate) fn prefill(
     ctx.fire(
         op,
         Fire::at(FILE, prefill_symbol(op, &geometry, at.arm)?).apply(
+            Launch::grid(
+                PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
+                geometry.block(),
+            )
+            .smem(geometry.smem_bytes),
+        ),
+        &[block(params)],
+    )
+}
+
+/// The ragged prefill launch: one block of [`PrefillRaggedParams`] at a
+/// [`PrefillPoint`], the grid being `[padded_batch_size, 1, num_kv_heads]`
+/// exactly as the paged kernel's. The shared storage is the paged formula's:
+/// `KernelTraits::SharedStorage` and `SharedStoragePaged` differ only past
+/// head width 256, which the ragged entry refuses.
+pub(crate) fn prefill_ragged(
+    ctx: &Ctx,
+    op: &'static str,
+    at: PrefillPoint,
+    params: &PrefillRaggedParams,
+) -> Result<(), Error> {
+    let geometry = PrefillGeometry::derive(
+        op,
+        at.head_dim,
+        at.cta_tile_q,
+        KvWidth::BF16,
+        false,
+        &at.device,
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, prefill_ragged_symbol(op, &geometry, at.arm)?).apply(
             Launch::grid(
                 PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),

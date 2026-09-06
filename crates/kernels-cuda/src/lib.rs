@@ -9,6 +9,12 @@ pub mod attn;
 #[path = "attn/dense.rs"]
 pub mod attn_dense;
 
+// Non-causal ragged attention over arena q/k/v in groups (`attention.ragged`);
+// the same `#[path]` detour as `attn_dense`. Retire via `pub mod ragged;`
+// inside `attn.rs`.
+#[path = "attn/ragged.rs"]
+pub mod attn_ragged;
+
 // Patch axis row folds; same `#[path]` detour as `attn_dense`, one family
 // over. Retire via `pub mod fold;` inside `layout.rs`.
 #[path = "layout/fold.rs"]
