@@ -535,15 +535,39 @@ pub fn rmsnorm_residual_add(
             "false",
         ),
     };
+    // The eight-wide form for bf16 rows that are whole vectors on aligned
+    // planes: one block a row still, `chunks` vectors a thread.
+    let mut aligned = vec![x.ptr, w0.ptr, t.ptr, y.ptr];
+    if let Some((_, scaled)) = &scale {
+        aligned.push(scaled.ptr);
+    }
+    if let Some(post) = &post {
+        aligned.extend([post.weight.ptr, post.out.ptr]);
+    }
+    let vectors = y.dtype == Dtype::Bf16
+        && y.width % VEC_WIDTH == 0
+        && aligned.iter().all(|&at| aligned16(at));
+    let (entrypoint, block) = if vectors {
+        let nvec = y.width / VEC_WIDTH;
+        let block = nvec.clamp(WARP, 512).next_power_of_two();
+        let chunks = nvec.div_ceil(block);
+        (
+            format!(
+                "::pie::elemwise::rmsnorm_residual_add_vec8<{block}, {chunks}, {has_scale}, {has_post}, {plus}>"
+            ),
+            block,
+        )
+    } else {
+        (
+            format!(
+                "::pie::elemwise::rmsnorm_residual_add<{ty}, {BLOCK}, {per_thread}, {has_scale}, {has_post}, {plus}>"
+            ),
+            BLOCK,
+        )
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::elemwise::rmsnorm_residual_add<{ty}, {BLOCK}, {per_thread}, {has_scale}, {has_post}, {plus}>"
-            )),
-        )
-        .apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
         &[
             x.arg(),
             w0.arg(),

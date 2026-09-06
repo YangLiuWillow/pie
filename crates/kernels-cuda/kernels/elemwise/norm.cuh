@@ -29,6 +29,40 @@ __device__ __forceinline__ float block_reduce_sum_exact(float local, float* buf)
     return buf[0];
 }
 
+/// The two-barrier form: warp shuffles, one partial per warp through
+/// `buf[0 .. BLOCK / 32)`, the first warp finishing into `buf[BLOCK / 32]`
+/// (so `buf` is `BLOCK / 32 + 1` floats at least; every caller hands a
+/// `BLOCK`-float buffer). The result slot is apart from the partials so a
+/// second reduction over the same buffer cannot overwrite what a straggler
+/// of the first is still reading. Its summation order differs from the
+/// tree's; nothing here needs a fixed order, only a sum.
+template <int BLOCK>
+__device__ __forceinline__ float block_reduce_sum_fast(float local, float* buf)
+{
+    static_assert(BLOCK >= 32 && BLOCK <= 1024 && (BLOCK & (BLOCK - 1)) == 0,
+                  "block_reduce_sum_fast needs a power-of-two BLOCK in [32, 1024]");
+    constexpr int kWarps = BLOCK / 32;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local += __shfl_xor_sync(0xffffffffu, local, off);
+    }
+    if (lane == 0) buf[warp] = local;
+    __syncthreads();
+    if (warp == 0) {
+        float v = tid < kWarps ? buf[tid] : 0.f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, off);
+        }
+        if (lane == 0) buf[kWarps] = v;
+    }
+    __syncthreads();
+    return buf[kWarps];
+}
+
 template <class T, int BLOCK, bool WEIGHT_PLUS_ONE>
 __device__ __forceinline__ void rmsnorm_row(
     const T* __restrict__ x,
@@ -70,7 +104,7 @@ __device__ __forceinline__ void rmsnorm_row(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
 
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
@@ -153,7 +187,7 @@ __global__ void rmsnorm_grouped_plus_one(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(group) + eps);
 
     for (int i = tid; i < group; i += BLOCK) {
@@ -197,7 +231,7 @@ __global__ void rmsnorm_vec8(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < nvec; i += BLOCK) {
@@ -259,7 +293,7 @@ __global__ void residual_add_rmsnorm(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -312,7 +346,7 @@ __global__ void residual_add_rmsnorm_vec8(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < nvec; i += BLOCK) {
@@ -372,7 +406,7 @@ __global__ void rmsnorm_no_scale(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -403,7 +437,7 @@ __global__ void rmsnorm_gated(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -455,7 +489,7 @@ __global__ void rmsnorm_gated_f32_in(
     }
 
     __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -519,7 +553,7 @@ __global__ void rmsnorm_residual_add(
             local += xv[k] * xv[k];
         }
     }
-    const float sum0 = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float sum0 = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv0 = rsqrtf(sum0 / static_cast<float>(hidden) + eps0);
     // `scale` reads its one-element plane where it is.
     const float sf = SCALE ? Elem<T>::to_f32(s[0]) : 1.f;
@@ -549,7 +583,7 @@ __global__ void rmsnorm_residual_add(
         }
     }
     if constexpr (POST) {
-        const float sum1 = block_reduce_sum_exact<BLOCK>(local2, buf2);
+        const float sum1 = block_reduce_sum_fast<BLOCK>(local2, buf2);
         const float inv1 = rsqrtf(sum1 / static_cast<float>(hidden) + eps1);
 #pragma unroll
         for (int k = 0; k < PER_THREAD; ++k) {
@@ -558,6 +592,144 @@ __global__ void rmsnorm_residual_add(
                 float wv = Elem<T>::to_f32(w1[i]);
                 if constexpr (POST_PLUS_ONE) wv += 1.f;
                 out[base + i] = Elem<T>::from_f32(last[k] * inv1 * wv);
+            }
+        }
+    }
+}
+
+// The eight-wide form of `rmsnorm_residual_add`: bf16 rows that are a whole
+// number of vectors on 16-byte aligned planes, `CHUNKS` vectors a thread.
+// Same phases and the same per-element rounding as the scalar form; the
+// moments are summed eight elements a thread then across warps by
+// `block_reduce_sum_fast`, so `inv_rms` can differ from the scalar form's in
+// its last bit. 16-byte loads and stores, two barriers a moment instead of
+// five: at 64 rows of 2560 this is the difference between a kernel bound by
+// its own instruction latency and one bound by the memory it moves.
+template <int BLOCK, int CHUNKS, bool SCALE, bool POST, bool POST_PLUS_ONE>
+__global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ w0,
+    bf16* __restrict__ t,
+    bf16* __restrict__ y,
+    const bf16* __restrict__ s,
+    bf16* __restrict__ scaled,
+    const bf16* __restrict__ w1,
+    bf16* __restrict__ out,
+    int hidden,
+    float eps0,
+    float eps1,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const int nvec = hidden / 8;
+    const long long base = static_cast<long long>(plane_row) * hidden;
+
+    const uint4* xr = reinterpret_cast<const uint4*>(x + base);
+    uint4* yr = reinterpret_cast<uint4*>(y + base);
+    uint4* tr = reinterpret_cast<uint4*>(t + base);
+    uint4* sr = SCALE ? reinterpret_cast<uint4*>(scaled + base) : nullptr;
+    uint4* outr = POST ? reinterpret_cast<uint4*>(out + base) : nullptr;
+    const uint4* w0r = reinterpret_cast<const uint4*>(w0);
+    const uint4* w1r = POST ? reinterpret_cast<const uint4*>(w1) : nullptr;
+
+    __shared__ float buf[BLOCK / 32 + 1];
+    __shared__ float buf2[BLOCK / 32 + 1];
+
+    // Phase one: the source row and its moment, the stream row alongside.
+    float xv[CHUNKS][8];
+    float yv[CHUNKS][8];
+    float local = 0.f;
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int i = tid + c * BLOCK;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            xv[c][j] = 0.f;
+            yv[c][j] = 0.f;
+        }
+        if (i < nvec) {
+            const uint4 xq = xr[i];
+            const uint4 yq = yr[i];
+            const bf16x2* xh = reinterpret_cast<const bf16x2*>(&xq);
+            const bf16x2* yh = reinterpret_cast<const bf16x2*>(&yq);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 a = bf16x2_to_f32(xh[j]);
+                const float2 b = bf16x2_to_f32(yh[j]);
+                xv[c][2 * j] = a.x;
+                xv[c][2 * j + 1] = a.y;
+                yv[c][2 * j] = b.x;
+                yv[c][2 * j + 1] = b.y;
+                local += a.x * a.x + a.y * a.y;
+            }
+        }
+    }
+    const float sum0 = block_reduce_sum_fast<BLOCK>(local, buf);
+    const float inv0 = rsqrtf(sum0 / static_cast<float>(hidden) + eps0);
+    const float sf = SCALE ? Elem<bf16>::to_f32(s[0]) : 1.f;
+
+    // Phase two: the normed row, the fold, the scale — each rounded as its
+    // own launch rounds it — and the second moment over what the chain made.
+    float last[CHUNKS][8];
+    float local2 = 0.f;
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int i = tid + c * BLOCK;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) last[c][j] = 0.f;
+        if (i < nvec) {
+            const uint4 wq = w0r[i];
+            const bf16x2* wh = reinterpret_cast<const bf16x2*>(&wq);
+            uint4 tq;
+            uint4 yq;
+            uint4 sq;
+            bf16x2* th = reinterpret_cast<bf16x2*>(&tq);
+            bf16x2* yh = reinterpret_cast<bf16x2*>(&yq);
+            bf16x2* sh = reinterpret_cast<bf16x2*>(&sq);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 w = bf16x2_to_f32(wh[j]);
+                th[j] = f32_to_bf16x2(xv[c][2 * j] * inv0 * w.x, xv[c][2 * j + 1] * inv0 * w.y);
+                const float2 tv = bf16x2_to_f32(th[j]);
+                yh[j] = f32_to_bf16x2(yv[c][2 * j] + tv.x, yv[c][2 * j + 1] + tv.y);
+                float2 fin = bf16x2_to_f32(yh[j]);
+                if constexpr (SCALE) {
+                    sh[j] = f32_to_bf16x2(fin.x * sf, fin.y * sf);
+                    fin = bf16x2_to_f32(sh[j]);
+                }
+                last[c][2 * j] = fin.x;
+                last[c][2 * j + 1] = fin.y;
+                local2 += fin.x * fin.x + fin.y * fin.y;
+            }
+            tr[i] = tq;
+            yr[i] = yq;
+            if constexpr (SCALE) sr[i] = sq;
+        }
+    }
+    if constexpr (POST) {
+        const float sum1 = block_reduce_sum_fast<BLOCK>(local2, buf2);
+        const float inv1 = rsqrtf(sum1 / static_cast<float>(hidden) + eps1);
+#pragma unroll
+        for (int c = 0; c < CHUNKS; ++c) {
+            const int i = tid + c * BLOCK;
+            if (i < nvec) {
+                const uint4 wq = w1r[i];
+                const bf16x2* wh = reinterpret_cast<const bf16x2*>(&wq);
+                uint4 oq;
+                bf16x2* oh = reinterpret_cast<bf16x2*>(&oq);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float2 w = bf16x2_to_f32(wh[j]);
+                    if constexpr (POST_PLUS_ONE) {
+                        w.x += 1.f;
+                        w.y += 1.f;
+                    }
+                    oh[j] = f32_to_bf16x2(last[c][2 * j] * inv1 * w.x, last[c][2 * j + 1] * inv1 * w.y);
+                }
+                outr[i] = oq;
             }
         }
     }

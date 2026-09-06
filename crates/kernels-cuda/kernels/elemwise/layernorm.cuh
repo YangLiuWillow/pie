@@ -60,7 +60,7 @@ __device__ __forceinline__ void layernorm_row(
     for (int i = tid; i < hidden; i += BLOCK) {
         local += Elem<T>::to_f32(xr[i]);
     }
-    const float mean = block_reduce_sum_exact<BLOCK>(local, buf) /
+    const float mean = block_reduce_sum_fast<BLOCK>(local, buf) /
                        static_cast<float>(hidden);
 
     __syncthreads();
@@ -70,7 +70,7 @@ __device__ __forceinline__ void layernorm_row(
         const float c = Elem<T>::to_f32(xr[i]) - mean;
         spread += c * c;
     }
-    const float inv = rsqrtf(block_reduce_sum_exact<BLOCK>(spread, buf) /
+    const float inv = rsqrtf(block_reduce_sum_fast<BLOCK>(spread, buf) /
                                  static_cast<float>(hidden) +
                              eps);
 

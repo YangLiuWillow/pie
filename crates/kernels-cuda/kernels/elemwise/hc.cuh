@@ -525,7 +525,7 @@ __global__ void ple_gate(
         local += Elem<T>::to_f32(kr[i]) * Elem<T>::to_f32(qr[i]);
     }
     __shared__ float buf[BLOCK];
-    const float dot = block_reduce_sum_exact<BLOCK>(local, buf) * rsqrtf((float)H);
+    const float dot = block_reduce_sum_fast<BLOCK>(local, buf) * rsqrtf((float)H);
     // The reference's own damping: sqrt of the clamped magnitude, times
     // the SIGN — and sign(0) is 0, not the clamp floor.
     float damped = sqrtf(fmaxf(fabsf(dot), 1e-6f));
