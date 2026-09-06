@@ -18,6 +18,8 @@ path = "src/lib.rs"
 chat-template = { path = "../chat-template" }
 # Forward-pass authoring DSL: Recorder/Value, kernel wrappers, Weight decl.
 model-dsl = { path = "../model-dsl" }
+# The IR enums a family states its convolutions with (`TimePad`).
+model-ir = { path = "../model-ir" }
 # Load-contract algebra (`contract::Expr`, `ModelContract`).
 checkpoint = { path = "../checkpoint" }
 # Vocabulary for stating a checkpoint's provenance in an import.
