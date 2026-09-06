@@ -63,10 +63,45 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, E
             .collect());
     }
 
+    // **A CHECKPOINT NEED NOT BE CALLED `model`.** A diffusers-style folder
+    // names each component after the component
+    // (`diffusion_pytorch_model*.safetensors`), and the synthetic `mini-dit`
+    // reference writes `mini_dit.safetensors`; neither carries an index,
+    // because neither is sharded. Where neither canonical name is present,
+    // the safetensors files beside them ARE the checkpoint, in sorted order.
+    //
+    // This only widens a case that was an outright error, so no directory
+    // that loaded before loads differently — the two canonical names are
+    // still preferred, and an index still wins over the scan.
+    let named = named_safetensors_files(snapshot_dir);
+    if !named.is_empty() {
+        return Ok(named);
+    }
+
     Err(Error::Checkpoint(format!(
         "no model.safetensors[.index.json] in {}",
         snapshot_dir.display()
     )))
+}
+
+/// Every `*.safetensors` in `snapshot_dir`, sorted. Read off the directory
+/// rather than an index, so it is the last thing discovery tries.
+fn named_safetensors_files(snapshot_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(snapshot_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// The GGUF checkpoint files for a snapshot directory, in shard order.

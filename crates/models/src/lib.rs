@@ -8,6 +8,7 @@ pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod kimi_k3;
 pub mod media;
+pub mod mini_dit;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
@@ -326,6 +327,9 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         kimi_k3::skus(),
         qwen_3::skus(),
         qwen_4::skus(),
+        // Last: the synthetic parity row identifies nothing an operator
+        // ships, and identification is catalog order.
+        mini_dit::skus(),
     ]
     .into_iter()
     .flatten()
