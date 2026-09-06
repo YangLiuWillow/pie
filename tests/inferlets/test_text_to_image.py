@@ -9,6 +9,11 @@ raw final latent. This gate drives it through the CLI a person actually types
 (`pie --config C run -o DIR`), because the latent leaves as a FILE and the file is
 half the claim.
 
+The half in FRONT of this -- that `pie model list` reports the row's
+generative facts, that `pie run text-to-image` resolves the guest by name with
+no `--path`, and that what arrives is a named file -- is
+`test_generating_images.py`. This suite is about the sampler.
+
 Two claims, one per row:
 
   * on a generative row with a text encoder (FLUX.2 klein-4B), four steps at 1024²
@@ -213,12 +218,18 @@ def a_prompt_becomes_a_latent_a_vae_can_decode(args) -> None:
     # exploded one is the loop having gone wrong in a way the shape hides.
     assert 0.05 < report["std"] < 20.0, f"the final latent's scale is {report['std']}"
 
-    # `send-file` carries no name, so `pie run -o` numbers what arrives; the
-    # report says what that one file is.
-    blobs = sorted(out_dir.glob("file-*.bin"))
-    assert len(blobs) == 1, f"expected one latent blob in {out_dir}, found {blobs}"
+    # The latent goes out through `session.send-file-as`, so it arrives NAMED
+    # and `pie run -o` writes it under that name -- no `file-0000.bin` to
+    # rename, and no need to read the report to find out which file is which.
     latent = out_dir / report["file"]
-    blobs[0].rename(latent)
+    assert latent.exists(), (
+        f"the report names {report['file']}, which is not in {out_dir}: "
+        f"{sorted(p.name for p in out_dir.iterdir())}"
+    )
+    assert not sorted(out_dir.glob("file-*.bin")), (
+        "a numbered blob arrived beside the named one: something is still "
+        "sending through the unnamed `session.send-file`"
+    )
     assert latent.stat().st_size == report["bytes"], (latent.stat().st_size, report["bytes"])
     sidecar = latent.with_suffix("").with_suffix(".json")
     sidecar.write_text(json.dumps(report, indent=2))
