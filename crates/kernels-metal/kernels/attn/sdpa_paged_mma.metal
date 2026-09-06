@@ -126,7 +126,11 @@ inline void sdpa_paged_mma_body(
 
   const int q_pos    = live ? position_ids[my_row] : 0;
   const int my_start = (window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0;
-  const bool masked  = live && attention_mask_enabled[my_row] != 0;
+  // Mask word 2: this row's mask is authoritative and the causal upper bound
+  // does not apply (a bidirectional lane); 1 is a mask under the bound.
+  const int mask_word = live ? int(attention_mask_enabled[my_row]) : 0;
+  const bool masked  = mask_word != 0;
+  const bool wide    = mask_word == 2;
   const int my_req   = live ? req_of_token[my_row] : -1;
 
   float Ov[DF * 2];
@@ -143,12 +147,19 @@ inline void sdpa_paged_mma_body(
 
     int kp_hi = 0;
     int kp_lo = 0x7fffffff;
+    bool wide_here = false;
     for (int i = sub; i < sub_hi; i++) {
       const int p = position_ids[row_lo + i];
       kp_hi = max(kp_hi, p);
       kp_lo = min(kp_lo, (window > 0 && p >= window) ? (p - window + 1) : 0);
+      wide_here = wide_here || attention_mask_enabled[row_lo + i] == 2;
     }
     const int page_base = int(kv_page_indptr[r]);
+    // A group with a bidirectional row walks every cell the request's pages
+    // hold; its mask does the bounding (a cell past the sequence reads 0).
+    if (wide_here) {
+      kp_hi = int(kv_page_indptr[r + 1] - uint(page_base)) * page_size - 1;
+    }
 
     const bool mine = live && my_req == r;
 
@@ -194,7 +205,7 @@ inline void sdpa_paged_mma_body(
           bool keep = mine && kk < cnt;
           if (keep) {
             const int kp = base + kk;
-            keep = kp <= q_pos && kp >= my_start;
+            keep = (wide || kp <= q_pos) && kp >= my_start;
             if (keep && masked) {
               keep = !(uint(kp) >= attention_mask_stride ||
                        attention_mask[size_t(my_row) * attention_mask_stride + uint(kp)] == 0);

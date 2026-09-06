@@ -8,9 +8,13 @@
 //!
 //! Causality is folded into the expansion even though the shaders also
 //! apply their own causal bound (redundant, but keeps the staged table
-//! meaning the same regardless of which sdpa arm runs). The sliding window
-//! is NOT folded in: `Attention::Masked` states it per node, so the shaders
-//! take it as their own scalar argument.
+//! meaning the same regardless of which sdpa arm runs) — except for a
+//! [`LaneMask::bidirectional`] lane, whose rows keep every key of the
+//! extent their mask keeps and whose `enabled` word is 2 instead of 1, which
+//! tells the shaders the mask is authoritative and the causal upper bound
+//! does not apply to that row. The sliding window is NOT folded in:
+//! `Attention::Masked` states it per node, so the shaders take it as their
+//! own scalar argument.
 //!
 //! `Masking::Extent` (one restriction re-applied to every row) and
 //! `Masking::Rows` (one restriction per row) both land in the same dense
@@ -67,6 +71,9 @@ pub struct LaneMask<'a> {
     pub have: u32,
     /// How many token rows this fire feeds it.
     pub rows: u32,
+    /// Every row reads every key of the extent (a denoiser's canvas): the
+    /// causal bound is not folded in and the row's `enabled` word is 2.
+    pub bidirectional: bool,
 }
 
 /// A fire's mask plane and the flags that gate it: one dense
@@ -76,7 +83,9 @@ pub struct Staged {
     /// `[rows * stride]`: 1 keeps the pair, 0 drops it. Row `r` of the fire
     /// starts at `r * stride`.
     pub bytes: Vec<u8>,
-    /// `[rows]`: whether that row's plane is consulted at all. Rows of a
+    /// `[rows]`: whether that row's plane is consulted at all — 0 no mask,
+    /// 1 a mask under the causal bound, 2 a mask that is authoritative (a
+    /// bidirectional lane, no causal upper bound). Rows of a
     /// lane that stated no mask are 0, and the shaders then read neither
     /// the plane nor the stride bound.
     pub enabled: Vec<u8>,
@@ -165,8 +174,9 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
             continue;
         };
         let kv = u64::from(lane.have) + u64::from(lane.rows);
+        let word = if lane.bidirectional { 2 } else { 1 };
         for q in 0..lane.rows as usize {
-            out.enabled[row + q] = 1;
+            out.enabled[row + q] = word;
         }
         let base = row as u64;
         match masking {
@@ -178,7 +188,11 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                         for key in at_position..end {
                             // Causal, read from the key's side: the first
                             // row that may see key `key` is `key - have`.
-                            let first = key.saturating_sub(u64::from(lane.have));
+                            let first = if lane.bidirectional {
+                                0
+                            } else {
+                                key.saturating_sub(u64::from(lane.have))
+                            };
                             for q in first..u64::from(lane.rows) {
                                 keep(&mut out.bytes, stride, base + q, key);
                             }
@@ -195,7 +209,11 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                     let q = q as u64;
                     // Same bound, read from the row's side, inclusive: row
                     // `q` stands at `have + q` and may reach its own key.
-                    let bound = u64::from(lane.have) + q;
+                    let bound = if lane.bidirectional {
+                        kv
+                    } else {
+                        u64::from(lane.have) + q
+                    };
                     let mut at_position = 0u64;
                     for (index, &run) in mask.runs.iter().enumerate() {
                         let end = at_position.saturating_add(u64::from(run)).min(kv);
@@ -233,6 +251,45 @@ mod tests {
     use super::*;
 
     /// A row count that is not the lane's is refused by name.
+    /// A bidirectional lane keeps the keys AFTER a row that its mask keeps,
+    /// and its rows say so with the word 2.
+    #[test]
+    fn a_bidirectional_lane_keeps_the_keys_after_the_row() {
+        // Two rows appended to one held key, an all-keeping extent mask.
+        let all = Masking::Extent(Mask::new(vec![0, 3], 3));
+        let causal = stage(&[LaneMask {
+            mask: Some(&all),
+            have: 1,
+            rows: 2,
+            bidirectional: false,
+        }])
+        .unwrap()
+        .unwrap();
+        assert_eq!(causal.enabled, vec![1, 1]);
+        assert_eq!(causal.bytes, vec![1, 1, 0, 1, 1, 1]);
+        let wide = stage(&[LaneMask {
+            mask: Some(&all),
+            have: 1,
+            rows: 2,
+            bidirectional: true,
+        }])
+        .unwrap()
+        .unwrap();
+        assert_eq!(wide.enabled, vec![2, 2]);
+        assert_eq!(wide.bytes, vec![1, 1, 1, 1, 1, 1]);
+        // Per-row masks may reach past the row too.
+        let rows = Masking::Rows(vec![Mask::new(vec![0, 3], 3), Mask::new(vec![1, 2], 3)]);
+        let wide = stage(&[LaneMask {
+            mask: Some(&rows),
+            have: 1,
+            rows: 2,
+            bidirectional: true,
+        }])
+        .unwrap()
+        .unwrap();
+        assert_eq!(wide.bytes, vec![1, 1, 1, 0, 1, 1]);
+    }
+
     #[test]
     fn a_per_row_mask_of_the_wrong_height_is_refused() {
         let short = Masking::Rows(vec![Mask::new(vec![0, 3], 3), Mask::new(vec![0, 3], 3)]);
@@ -240,6 +297,7 @@ mod tests {
             mask: Some(&short),
             have: 0,
             rows: 3,
+            bidirectional: false,
         }]);
         assert!(
             matches!(
@@ -273,6 +331,7 @@ mod tests {
             mask: Some(&short),
             have: 1,
             rows: 3,
+            bidirectional: false,
         }]);
         assert!(
             matches!(
@@ -295,6 +354,7 @@ mod tests {
             mask: None,
             have: 4,
             rows: 1,
+            bidirectional: false,
         }])
         .expect("no mask is no error");
         assert_eq!(staged, None);
@@ -308,6 +368,7 @@ mod tests {
             mask: Some(&mask),
             have: 7,
             rows: 1,
+            bidirectional: false,
         }]);
         assert!(
             matches!(

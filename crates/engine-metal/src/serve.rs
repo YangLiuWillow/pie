@@ -562,6 +562,17 @@ pub struct Seated<'a> {
     /// whose presence disagrees with the lane's own word
     /// ([`Fault::MaskWord`]).
     pub mask: Option<&'a Masking>,
+    /// Every row of this lane attends every key of its extent — a
+    /// denoiser's reading of a canvas. Lifted on the masked arm, so the lane
+    /// carries a mask (`engine::fire::Lane::validate_for` insists); the
+    /// expansion leaves the causal bound out and the rows' mask word says
+    /// so ([`crate::mask::LaneMask::bidirectional`]).
+    pub bidirectional: bool,
+    /// The denoiser's self-conditioning taps for this lane's rows, staged
+    /// into `RuntimeInput::SelfCondRows/Weights` when the plan reads them.
+    /// Channel-fed taps ([`engine::fire::SelfCondInput::channels`]) are
+    /// refused: this shell advances no channel on the device.
+    pub self_cond: Option<&'a engine::fire::SelfCondInput>,
     /// Which adapter bank row this lane's tokens route to (design §8), or
     /// `None` for the base model.
     ///
@@ -685,6 +696,8 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             mask: None,
+            bidirectional: false,
+            self_cond: None,
             adapter: None,
             positions: &[],
             readout: None,
@@ -899,6 +912,10 @@ pub struct Shell {
     /// triple-wide stream, which is staged for every fire of such a plan and
     /// for no fire of any other.
     states_mrope: bool,
+    /// The width of `RuntimeInput::SelfCondRows` the plan declares — a
+    /// denoiser's self-conditioning taps per row, staged for every fire of
+    /// such a plan (zeros for a lane carrying none) — or 0.
+    self_cond_taps: u32,
 
     // fallback.copy — the A/B switch and the one number it moves.
     /// **DOES THIS SHELL SERVE `Fallback::Copy`?** OFF at load, and that is
@@ -1358,17 +1375,15 @@ impl Shell {
         // alone: a plan declaring it stages one stream every fire, image or
         // no image, because `(p, p, p)` is what a text row rotates by.
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
-        // A block-diffusion text's denoiser input: this shell stages no seat
-        // for it (and lifts no causal bound), so the plan is refused here
-        // rather than at its first denoise fire.
-        if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
-            return Err(Fault::Program {
-                at: "serve::load",
-                why: "this plan reads a self-conditioning input (a block-diffusion text), \
-                      which this shell stages no seat for"
-                    .to_string(),
-            });
-        }
+        // A block-diffusion text's denoiser input: `[rows, taps]` ids and
+        // weights, a seat reserved when the plan declares the width.
+        let self_cond_taps =
+            u32::try_from(declared_width(&boot.trace, RuntimeInput::SelfCondRows)).map_err(|_| {
+                Fault::Program {
+                    at: "serve::load",
+                    why: "the self-conditioning tap width does not fit u32".to_string(),
+                }
+            })?;
         // **HOW MANY PATCH ROWS ONE OUTPUT ROW COSTS**, read off the folds the
         // plan states. `1` for a plan that folds nothing, which is every
         // pre-campaign plan and every tower whose pooler is the identity.
@@ -1390,6 +1405,7 @@ impl Shell {
                     gathers,
                     patch_seat,
                     states_mrope,
+                    self_cond_taps,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1588,6 +1604,7 @@ impl Shell {
             patch_fold,
             drops_patch_rows,
             states_mrope,
+            self_cond_taps,
             facts,
             spaces,
             // fallback.copy — off until a caller turns it on.
@@ -4168,6 +4185,7 @@ impl Shell {
                 mask: masking,
                 have,
                 rows: row.rows,
+                bidirectional: seated.bidirectional,
             });
             // THE ADAPTER AND THE WORD, CHECKED AGAINST EACH OTHER, ONCE —
             // the mask's rule one block up, restated for the axis beside it,
@@ -4694,6 +4712,53 @@ impl Shell {
             }
         }
 
+        // 4d'. **THE DENOISER'S SELF-CONDITIONING TAPS**, `taps` ids and
+        //      weights per TOKEN row — staged for every fire of a plan that
+        //      declares the input, zeros for a lane that carries none (an
+        //      encode lane, a lane arming a synthetic). Channel-fed taps
+        //      need the device to advance the rings; this shell does not.
+        let taps = self.self_cond_taps as usize;
+        let mut self_cond_rows = vec![0i32; rows as usize * taps];
+        let mut self_cond_weights = vec![0f32; rows as usize * taps];
+        if taps > 0 {
+            for row in composition.lanes() {
+                let Some(sc) = lanes[row.source as usize].self_cond else {
+                    continue;
+                };
+                if sc.channels.is_some() {
+                    return Err(Fault::Program {
+                        at: "serve::prepare",
+                        why: format!(
+                            "lane {} reads its self-conditioning taps off channels, which this \
+                             shell cannot advance on the device",
+                            row.source
+                        ),
+                    });
+                }
+                let cells = row.rows as usize * taps;
+                if sc.taps as usize != taps || sc.rows.len() != cells || sc.weight_bits.len() != cells {
+                    return Err(Fault::Program {
+                        at: "serve::prepare",
+                        why: format!(
+                            "lane {} states self-conditioning taps of width {} over {} ids, and \
+                             this plan reads {taps} taps over the lane's {} rows",
+                            row.source,
+                            sc.taps,
+                            sc.rows.len(),
+                            row.rows
+                        ),
+                    });
+                }
+                let at = row.row_offset as usize * taps;
+                for (i, &id) in sc.rows.iter().enumerate() {
+                    self_cond_rows[at + i] = id as i32;
+                }
+                for (i, &bits) in sc.weight_bits.iter().enumerate() {
+                    self_cond_weights[at + i] = f32::from_bits(bits);
+                }
+            }
+        }
+
         // 4d. **THE RECURRENT SEAT'S TABLES AND SCRATCH** (`crate::rs`). The
         //     two per-lane words go into the arm's plane with everything else;
         //     the extended rows need a scratch sized for THIS fire, grown when
@@ -4743,6 +4808,8 @@ impl Shell {
                     embed_weights: &patch_embed_weights,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
+                self_cond_rows: (taps > 0).then_some(self_cond_rows.as_slice()),
+                self_cond_weights: (taps > 0).then_some(self_cond_weights.as_slice()),
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
@@ -4821,6 +4888,8 @@ impl Shell {
             // And the trunk's, on the token axis: bound for every fire of a
             // plan that declares the rotation, image or no image.
             mrope_positions: bound.mrope_positions,
+            self_cond_rows: bound.self_cond_rows,
+            self_cond_weights: bound.self_cond_weights,
             geometry,
             tables: FireTables {
                 request_of_token: bound.request_of_token,

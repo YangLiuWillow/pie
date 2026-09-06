@@ -669,9 +669,12 @@ impl Engine for Metal {
             // scans that persist the bank only as far as the verb says, and the read path
             // that replays a buffered prefix ahead of a fire's rows.
             rs_verbs: shell.serves_rs_verbs(),
-            // The sdpa shaders apply their own causal bound beside the
-            // staged mask plane, so a bidirectional lane is refused by name.
-            bidirectional_attention: false,
+            // A bidirectional lane's rows carry mask word 2, which the sdpa
+            // shaders read as "the mask is authoritative, no causal upper
+            // bound" (`crate::mask`); its self-conditioning taps are staged
+            // when the plan reads them. Channel-fed taps stay refused with
+            // `device_channel_commit`.
+            bidirectional_attention: true,
         };
 
         self.shell = Some(shell);
@@ -721,7 +724,7 @@ impl Engine for Metal {
         frame.validate_for(engine::fire::Serves {
             device_channel_commit: false,
             rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
-            bidirectional: false,
+            bidirectional: true,
         })?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
@@ -1188,6 +1191,8 @@ impl Metal {
                     // Expanded into the dense sdpa plane (`crate::mask`) and
                     // cross-checked against the artifact at the fire.
                     mask: lane.mask.as_ref(),
+                    bidirectional: lane.bidirectional,
+                    self_cond: lane.self_cond.as_ref(),
                     // A guest sink's bound slot wins over `Lane::adapter`.
                     adapter: lane_adapters[at].or(lane.adapter),
                     positions: &lane.positions,

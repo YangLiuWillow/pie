@@ -158,6 +158,12 @@ pub struct FireBindings {
     /// scalar `(p, p, p)`.
     pub mrope_positions: Option<Tensor>,
 
+    /// `RuntimeInput::SelfCondRows` / `SelfCondWeights`: `i32` and `f32`, `[rows, taps]` — a
+    /// denoiser's self-conditioning taps, staged for every fire of a plan that declares them
+    /// (zeros for a lane carrying none).
+    pub self_cond_rows: Option<Tensor>,
+    pub self_cond_weights: Option<Tensor>,
+
     /// Per cache space, aligned with `Trace::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space.
     pub geometry: Vec<CacheGeometry>,
@@ -604,11 +610,21 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
-                panic!(
-                    "value {at} reads a self-conditioning input, which this shell stages none \
-                     of; the load refuses such a plan"
-                )
+            Def::Input(RuntimeInput::SelfCondRows) => {
+                self.fire.self_cond_rows.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's self-conditioning taps, which this load \
+                         reserved no seat for"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::SelfCondWeights) => {
+                self.fire.self_cond_weights.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's self-conditioning weights, which this \
+                         load reserved no seat for"
+                    )
+                })
             }
             Def::Input(RuntimeInput::PatchEmbedWeights) => {
                 self.fire.patch_embed_weights.unwrap_or_else(|| {
