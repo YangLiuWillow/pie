@@ -108,6 +108,18 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
               : (tag == 0x02u ? logf(value) : 1.0f / value));
       continue;
     }
+    if (tag >= 0x08u && tag <= 0x0bu) {
+      const float value = m1_load_f(a0, xindex, d0.dtype);
+      m1_store_f(
+          o0,
+          i,
+          tag == 0x08u
+              ? sinf(value)
+              : (tag == 0x09u
+                     ? cosf(value)
+                     : (tag == 0x0au ? sqrtf(value) : 1.0f / sqrtf(value))));
+      continue;
+    }
     if (tag == 0x03u || tag == 0x05u || tag == 0x06u) {
       if (d0.dtype == 0u) {
         const float value = m1_load_f(a0, xindex, d0.dtype);
@@ -319,6 +331,10 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
       // `imm3` is the element base: a row block of a row-parallel region
       // keys its elements by their position in the whole value, so the
       // noise is the one block per lane would have drawn.
+      if (p.kind == 2u) {
+        m1_store_f(o0, i, ptir_rng_hash_normal(seed, i + p.imm3));
+        continue;
+      }
       const float uniform = ptir_rng_hash_uniform(seed, i + p.imm3);
       m1_store_f(
           o0,

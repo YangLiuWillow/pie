@@ -802,6 +802,16 @@ inline void ptir_m1_execute_part(
     }
     return;
   }
+  if (p.tag >= 0x08 && p.tag <= 0x0B) {
+    for (uint i = tid; i < out0.len; i += nthreads) {
+      const float value = m1_load_f(a0, m1_pick(d0.len, i), d0.dtype);
+      if (p.tag == 0x08) m1_store_f(o0, i, precise::sin(value));
+      else if (p.tag == 0x09) m1_store_f(o0, i, precise::cos(value));
+      else if (p.tag == 0x0A) m1_store_f(o0, i, sqrt(value));
+      else m1_store_f(o0, i, 1.0f / sqrt(value));
+    }
+    return;
+  }
   if (p.tag == 0x03 || p.tag == 0x05 || p.tag == 0x06) {
     if (d0.dtype == 3) {
       if (tid == 0 && out0.len != 0) m1_fault(status, p.tag);
@@ -1303,6 +1313,10 @@ inline void ptir_m1_execute_part(
       seed = ptir_rng_keyed_seed(uint(key), uint(counter));
     }
     for (uint i = tid; i < out0.len; i += nthreads) {
+      if (p.kind == 2) {
+        m1_store_f(o0, i, ptir_rng_hash_normal(seed, i));
+        continue;
+      }
       const float uniform = ptir_rng_hash_uniform(seed, i);
       m1_store_f(
           o0, i,

@@ -288,6 +288,10 @@ pub struct PassInputs {
     /// The forward's final hidden states, `[n_out, d]` F32, read by
     /// [`IntrinsicId::Hidden`] in the epilogue.
     pub hidden: Option<Value>,
+    /// The denoise reading's flow-matching velocity, `[n_out, C]` F32, read
+    /// by [`IntrinsicId::Velocity`] in the epilogue; `None` unless the model
+    /// predicts one.
+    pub velocity: Option<Value>,
     /// The value head's per-token scalars, `[n_out]` F32, read by
     /// [`IntrinsicId::ValueHead`]; `None` unless the model has a value head.
     pub value_head: Option<Value>,

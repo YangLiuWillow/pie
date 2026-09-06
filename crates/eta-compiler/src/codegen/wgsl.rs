@@ -134,6 +134,10 @@ pub fn emits(tag: u8) -> bool {
             | tags::LOG
             | tags::NEG
             | tags::RECIP
+            | tags::SIN
+            | tags::COS
+            | tags::SQRT
+            | tags::RSQRT
             | tags::ABS
             | tags::SIGN
             | tags::CAST

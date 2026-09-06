@@ -249,7 +249,15 @@ impl<'a> Streams<'a> {
         };
         let tag = op.tag;
         match tag {
-            tags::EXP | tags::LOG | tags::RECIP | tags::CAST | tags::NOT => {
+            tags::EXP
+            | tags::LOG
+            | tags::RECIP
+            | tags::SIN
+            | tags::COS
+            | tags::SQRT
+            | tags::RSQRT
+            | tags::CAST
+            | tags::NOT => {
                 if op.args.len() != 1 || !scalar_dtypes(&op.args) {
                     return None;
                 }
@@ -744,11 +752,18 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
     let tag = op.tag;
     if tag == tags::BROADCAST {
         read(streams, op.args[0], out_dtype, pass)
-    } else if matches!(tag, tags::EXP | tags::LOG | tags::RECIP) {
+    } else if matches!(
+        tag,
+        tags::EXP | tags::LOG | tags::RECIP | tags::SIN | tags::COS | tags::SQRT | tags::RSQRT
+    ) {
         let x = read(streams, op.args[0], Dtype::F32, pass);
         match tag {
             tags::EXP => format!("expf({x})"),
             tags::LOG => format!("logf({x})"),
+            tags::SIN => format!("sinf({x})"),
+            tags::COS => format!("cosf({x})"),
+            tags::SQRT => format!("sqrtf({x})"),
+            tags::RSQRT => format!("(1.0f / sqrtf({x}))"),
             _ => format!("(1.0f / {x})"),
         }
     } else if tag == tags::CAST {
@@ -911,8 +926,15 @@ pub(super) fn emit_stream(
                         "    const m1_u64 seed{node} = ptir_rng_keyed_seed(m1_load_u({sp}, 0u, 2u), descriptors[{state}u].len > 1u ? m1_load_u({sp}, 1u, 2u) : 0u);"
                     );
                 }
-                pass.body.both(&format!("      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"));
-                pass.body.both(&format!("      const float r{out} = p{node}.kind == 0u ? u{node} : -logf(-logf(u{node}));"));
+                if op.kind == eta_ir::types::RngKind::Normal as u8 {
+                    // Box-Muller reads two uniform lanes an element, so the
+                    // draw is the runtime's own function rather than a
+                    // transform of one `u{node}`.
+                    pass.body.both(&format!("      const float r{out} = ptir_rng_hash_normal(seed{node}, i + p{node}.imm3);"));
+                } else {
+                    pass.body.both(&format!("      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"));
+                    pass.body.both(&format!("      const float r{out} = p{node}.kind == 0u ? u{node} : -logf(-logf(u{node}));"));
+                }
                 pass.registers.push((out, Dtype::F32));
                 if streams.escapes(out, &members) {
                     let ptr = (pass.pointer)(out);

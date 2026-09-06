@@ -332,6 +332,13 @@ pub enum RngKind {
     Uniform = 0,
     /// Standard Gumbel noise, for argmax-based categorical sampling.
     Gumbel = 1,
+    /// Standard normal noise `N(0, 1)`, for a diffusion sampler's latent.
+    ///
+    /// The transform is Box-Muller's cosine branch over the two uniform
+    /// lanes a normal draw consumes - see [`crate::rng::hash_normal`] for
+    /// the exact formula and why the pairing is by element index rather
+    /// than by a carried second variate.
+    Normal = 2,
 }
 
 /// A compile-time constant scalar (the payload of a `const` op).

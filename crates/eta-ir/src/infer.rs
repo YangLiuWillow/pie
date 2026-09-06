@@ -224,7 +224,13 @@ fn infer(
     match *op {
         Op::Const(lit) => push(&mut out, ValueType::scalar(lit.dtype())),
 
-        Op::Exp(a) | Op::Log(a) | Op::Recip(a) => {
+        Op::Exp(a)
+        | Op::Log(a)
+        | Op::Recip(a)
+        | Op::Sin(a)
+        | Op::Cos(a)
+        | Op::Sqrt(a)
+        | Op::Rsqrt(a) => {
             let t = g(a)?;
             if t.dtype != Dtype::F32 {
                 return Err(dtype_err());

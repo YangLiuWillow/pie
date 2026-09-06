@@ -222,6 +222,10 @@ pub(crate) fn symbolic_result_type(
         | Op::Log(..)
         | Op::Neg(..)
         | Op::Recip(..)
+        | Op::Sin(..)
+        | Op::Cos(..)
+        | Op::Sqrt(..)
+        | Op::Rsqrt(..)
         | Op::Abs(..)
         | Op::Sign(..)
         | Op::Cast { .. }
@@ -372,6 +376,7 @@ pub(crate) fn symbolic_intrinsic_type(
         IntrinsicId::MtpLogits
         | IntrinsicId::MtpDrafts
         | IntrinsicId::Hidden
+        | IntrinsicId::Velocity
         | IntrinsicId::Query
         | IntrinsicId::ValueHead
         | IntrinsicId::AttnScore

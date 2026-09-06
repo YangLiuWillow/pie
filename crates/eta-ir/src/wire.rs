@@ -46,7 +46,7 @@ pub struct OpWire {
     /// `broadcast` / `reshape` / `rng` / `intrinsic_val` / `kernel_call`
     /// target shape.
     pub shape: Vec<u32>,
-    /// `rng` kind — 0 uniform, 1 gumbel.
+    /// `rng` kind — 0 uniform, 1 gumbel, 2 normal.
     pub kind: u8,
 }
 
@@ -208,6 +208,7 @@ impl OpWire {
         match self.kind {
             0 => Some(RngKind::Uniform),
             1 => Some(RngKind::Gumbel),
+            2 => Some(RngKind::Normal),
             _ => None,
         }
     }
@@ -249,6 +250,10 @@ impl OpWire {
             tags::LOG => Op::Log(a0()?),
             tags::NEG => Op::Neg(a0()?),
             tags::RECIP => Op::Recip(a0()?),
+            tags::SIN => Op::Sin(a0()?),
+            tags::COS => Op::Cos(a0()?),
+            tags::SQRT => Op::Sqrt(a0()?),
+            tags::RSQRT => Op::Rsqrt(a0()?),
             tags::ABS => Op::Abs(a0()?),
             tags::SIGN => Op::Sign(a0()?),
             tags::CAST => Op::Cast {

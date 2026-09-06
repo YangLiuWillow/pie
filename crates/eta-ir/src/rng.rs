@@ -125,3 +125,48 @@ pub fn hash_uniform(seed_eff: u64, index: u32) -> f32 {
     let raw = (bits as f32 + RNG_FORMULA.uniform_midpoint) * (1.0 / denominator);
     if raw < UNIFORM_MAX { raw } else { UNIFORM_MAX }
 }
+
+/// How many uniform lanes one [`RngKind::Normal`](crate::types::RngKind::Normal)
+/// draw consumes.
+///
+/// Box-Muller turns a pair of uniforms into a pair of independent normals;
+/// ETA keeps only the cosine branch and spends the sine one, because the
+/// alternative - carrying the second variate to the next element - would make
+/// a draw depend on which lanes a backend happens to schedule together.
+/// Element `i` reads lanes `NORMAL_PAIR_STRIDE * i` and
+/// `NORMAL_PAIR_STRIDE * i + 1`, a pure function of `i` alone, so a row block,
+/// a whole plane and the host interpreter all write the same numbers.
+pub const NORMAL_PAIR_STRIDE: u32 = 2;
+
+/// The `2*pi` of the Box-Muller angle, as the `f32` every backend spells.
+///
+/// A number here, not a `core::f32::consts::TAU` reference, for the reason
+/// the rest of [`RngFormula`] is one: an emitter printing its own constant
+/// draws a different - still marginally correct - normal, and nothing would
+/// catch the drift. `6.2831855` is the nearest `f32` to `2*pi`.
+pub const NORMAL_TWO_PI: f32 = 6.283_185_5;
+
+/// The standard-normal draw for lane `index` under effective seed `seed_eff`.
+///
+/// `z = sqrt(-2*ln(u0)) * cos(2*pi*u1)` over `u0 = hash_uniform(seed, 2*index)`
+/// and `u1 = hash_uniform(seed, 2*index + 1)`. Finite for every input:
+/// [`hash_uniform`] never returns `0.0`, so the log is never `-inf`, and never
+/// returns `1.0`, so `-2*ln(u0)` is never negative.
+///
+/// The device projections in `eta-compiler`'s emitters spell this expression
+/// for expression, in this operand order; the only slack between host and
+/// device is the platform's own `logf`/`cosf` rounding, the same slack
+/// [`RngKind::Gumbel`](crate::types::RngKind::Gumbel) has always carried.
+///
+/// `std`-gated because the transform needs `ln`/`sqrt`/`cos`, which `core`
+/// does not have. The guest half of this crate builds the IR and never
+/// evaluates it, so the `no_std` surface loses nothing.
+#[cfg(feature = "std")]
+#[inline]
+pub fn hash_normal(seed_eff: u64, index: u32) -> f32 {
+    let lane = index.wrapping_mul(NORMAL_PAIR_STRIDE);
+    let u0 = hash_uniform(seed_eff, lane);
+    let u1 = hash_uniform(seed_eff, lane.wrapping_add(1));
+    let radius = (-2.0f32 * u0.ln()).sqrt();
+    radius * (NORMAL_TWO_PI * u1).cos()
+}

@@ -102,6 +102,7 @@ pub fn fold_stage(
         mtp_logits: None,
         mtp_drafts: None,
         hidden: None,
+        velocity: None,
         value_head: None,
         query: Vec::new(),
         attn_score: None,

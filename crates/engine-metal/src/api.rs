@@ -372,6 +372,11 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // The `lora` guest-sink gate; a model with no bank refuses by name
         // (`Fault::Adapterless`).
         has_lora: true,
+        // No denoise reading on this load yet: the velocity seam is bound
+        // by the model text, so a `velocity()` in a guest trace is refused
+        // at bind rather than at its first fire.
+        has_velocity: false,
+        velocity_width: 0,
         kernels: Vec::new(),
     })
 }

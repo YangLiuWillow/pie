@@ -785,6 +785,8 @@ fn dtype(byte: u8) -> Dtype {
 fn rng(byte: u8) -> RngKind {
     if byte == RngKind::Gumbel as u8 {
         RngKind::Gumbel
+    } else if byte == RngKind::Normal as u8 {
+        RngKind::Normal
     } else {
         RngKind::Uniform
     }
