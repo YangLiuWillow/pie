@@ -62,11 +62,13 @@
 //! not be the reference's) still takes the second exit, and the report says
 //! which reading it saw.
 //!
-//! The exit every model has today is the second: the final latent as raw
-//! little-endian f32 through `session::send_file`, with the geometry a
-//! decode needs returned as the JSON report — its sidecar.
-//! `scripts/imagegen/decode_latent.py` finishes the job with the diffusers
-//! VAE of the same checkpoint.
+//! That second exit is the final latent as raw little-endian f32 through
+//! `session::send_file_as`, under the name the report also states
+//! (`<out>.latent.f32`), with the geometry a decode needs returned as the
+//! JSON report — its sidecar. It is named for the same reason the picture
+//! is: `pie run -o DIR` writes a file whose name says what it is rather
+//! than a numbered `file-0000.bin`, and `scripts/imagegen/decode_latent.py`
+//! finishes the job with the diffusers VAE of the same checkpoint.
 //!
 //! # CFG
 //!
@@ -775,8 +777,14 @@ async fn main(input: Input) -> Result<Output> {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-            inferlet::session::send_file(&bytes);
-            (format!("{name}.latent.f32"), false, len)
+            // NAMED, like the decode arm above. `send_file` carries bytes and
+            // nothing else, so `pie run -o DIR` could only write
+            // `file-0000.bin` and the caller had to read the report to learn
+            // what it had -- a worse answer on the arm that already needs a
+            // second tool to finish the job.
+            let file = format!("{}.latent.f32", name.trim_end_matches(".png"));
+            inferlet::session::send_file_as(&bytes, &file);
+            (file, false, len)
         }
     };
 

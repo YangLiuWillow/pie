@@ -29,13 +29,19 @@ use client::client::{Client, ProcessEvent};
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// The inferlet to run, e.g. `chat-completion` or `chat-completion@0.1.0`.
-    /// A bare name resolves to the registry's latest, the same way `pie
-    /// inferlet download` resolves one. Omit when using `--path`.
+    /// The inferlet to run, e.g. `text-to-image` or `chat-completion@0.1.0`.
+    ///
+    /// A bare name is looked for in three places, in this order: the
+    /// inferlets this source tree ships (`tests/inferlets/<name>`, when the
+    /// working directory is inside a pie checkout or `PIE_INFERLETS` names
+    /// the directory), then the local cache, then the registry. A
+    /// `name@version` skips the first two -- pinning a version is asking
+    /// for a published one. Omit when using `--path`.
     pub inferlet: Option<String>,
 
     /// Run a local `.wasm` build instead of a published inferlet. Requires
-    /// `--manifest`, which is where its name and version come from.
+    /// `--manifest`, which is where its name and version come from:
+    /// `pie run -p ./target/wasm32-wasip2/release/my_guest.wasm -m ./Pie.toml`.
     #[arg(long, short = 'p')]
     pub path: Option<PathBuf>,
 
@@ -135,6 +141,117 @@ pub fn target(
             })
         }
     }
+}
+
+/// One inferlet the SOURCE TREE ships, found by the name a person types.
+///
+/// # Why this exists
+///
+/// `pie run <name>` used to mean exactly one thing: ask the registry. That is
+/// the right rule for a published program and the wrong one for the programs
+/// in this repository, which are the ones a new user is told to try first and
+/// are published nowhere. Before this, running the flagship image guest meant
+/// knowing that it lives in `tests/inferlets/text-to-image`, that its build
+/// lands in `tests/inferlets/target/wasm32-wasip2/release/text_to_image.wasm`,
+/// and that `--path` needs `--manifest` -- three facts about the layout of a
+/// checkout, to run a program whose name the docs print.
+///
+/// # What counts as curated
+///
+/// A directory `<root>/<name>/Pie.toml`, where `<root>` is either an entry of
+/// `PIE_INFERLETS` (`:`-separated) or the `tests/inferlets` of the checkout
+/// the working directory sits in. Nothing is registered and nothing is
+/// hardcoded: the set is whatever the tree holds, so a guest added to
+/// `tests/inferlets` is runnable by name the moment it is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Curated {
+    /// The directory the search found it under.
+    pub root: PathBuf,
+    /// `<root>/<name>/Pie.toml`.
+    pub manifest: PathBuf,
+    /// The built guest, when there is one. `None` is not a failure -- it is
+    /// the state a fresh checkout is in, and the reason [`Curated::build_hint`]
+    /// exists.
+    pub wasm: Option<PathBuf>,
+    /// The cargo package name, which is the directory name.
+    pub name: String,
+}
+
+impl Curated {
+    /// The line to type when the manifest is here and the `.wasm` is not.
+    pub fn build_hint(&self) -> String {
+        format!(
+            "cd {} && cargo build -p {} --release --target wasm32-wasip2",
+            crate::ui::short_path(&self.root),
+            self.name
+        )
+    }
+}
+
+/// Where to look for curated inferlets, in order.
+///
+/// `PIE_INFERLETS` first, because an explicit setting outranks a guess. Then
+/// the checkout: walk up from the working directory until a `tests/inferlets`
+/// with its own `Cargo.toml` appears. The walk is what makes `pie run
+/// text-to-image` work from anywhere inside the tree rather than only from
+/// its root, which is the same courtesy cargo extends.
+pub fn curated_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = std::env::var("PIE_INFERLETS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .filter(|root| root.is_dir())
+        .collect();
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            let candidate = ancestor.join("tests").join("inferlets");
+            if candidate.join("Cargo.toml").is_file() {
+                roots.push(candidate);
+                break;
+            }
+        }
+    }
+    roots
+}
+
+/// The curated inferlet called `name`, if any root has one.
+pub fn curated(name: &str) -> Option<Curated> {
+    curated_in(&curated_roots(), name)
+}
+
+/// [`curated`] over an explicit root list, which is what makes it testable.
+///
+/// The `.wasm` is looked for under `release` first and `debug` second: the
+/// release build is what every instruction in the tree tells a person to
+/// make, so preferring it means a stale debug artifact from months ago never
+/// shadows the build they just did. A cargo package name is spelled with
+/// hyphens and its artifact with underscores, which is the one translation
+/// here.
+pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
+    // A name with a path separator in it is not a curated name; refusing it
+    // here keeps `pie run ../../x` from reaching outside a root.
+    if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+        return None;
+    }
+    let artifact = format!("{}.wasm", name.replace('-', "_"));
+    roots.iter().find_map(|root| {
+        let manifest = root.join(name).join("Pie.toml");
+        if !manifest.is_file() {
+            return None;
+        }
+        let built = root.join("target").join("wasm32-wasip2");
+        let wasm = ["release", "debug"]
+            .iter()
+            .map(|profile| built.join(profile).join(&artifact))
+            .find(|path| path.is_file());
+        Some(Curated {
+            root: root.clone(),
+            manifest,
+            wasm,
+            name: name.to_string(),
+        })
+    })
 }
 
 /// `name@version` from a `Pie.toml`'s `[package]`.
@@ -246,6 +363,88 @@ fn typed(value: &str) -> serde_json::Value {
     }
 }
 
+/// Turn a target into the pair the rest of this command needs: what to launch
+/// and the `name@version` it launches as.
+///
+/// # The order, and why it is this one
+///
+/// A bare name is looked for in the source tree FIRST, ahead of the cache.
+/// That is not a preference, it is what makes iterating work: a curated run
+/// uploads the guest under its manifest's name, so a cache-first rule would
+/// find that upload on the next run and launch the build from before the last
+/// edit -- silently, with no line saying which one it ran. Preferring the tree
+/// means the `.wasm` on disk is always the one that runs, exactly as `--path`
+/// behaves, because it IS `--path` with the path filled in.
+///
+/// A curated directory whose guest is not built does NOT stop the search: a
+/// checkout can hold a directory for a program the person actually downloaded
+/// from the registry, and refusing that would be inventing a conflict. It is
+/// remembered, so that if nothing else resolves either, the refusal can say
+/// the one useful thing -- the build line.
+///
+/// `name@version` skips the tree and the cache both: pinning a version is
+/// asking for a published build, and the tree has no versions to pin.
+async fn resolve(target: Target, registry: &str) -> Result<(Target, String)> {
+    let spec = match target {
+        Target::Local { ref name, .. } => {
+            let name = name.clone();
+            return Ok((target, name));
+        }
+        Target::Registry(spec) => spec,
+    };
+
+    if spec.contains('@') {
+        let program = crate::ops::inferlet::resolve_inferlet_id(&spec, registry)
+            .await
+            .with_context(|| format!("resolving {spec:?}"))?
+            .to_string();
+        return Ok((Target::Registry(spec), program));
+    }
+
+    let curated = curated(&spec);
+    if let Some(found) = &curated
+        && let Some(wasm) = &found.wasm
+    {
+        let manifest = std::fs::read_to_string(&found.manifest)
+            .with_context(|| format!("reading {}", found.manifest.display()))?;
+        let name = manifest_program_name(&manifest)
+            .with_context(|| format!("reading {}", found.manifest.display()))?;
+        return Ok((
+            Target::Local {
+                wasm: wasm.clone(),
+                manifest: found.manifest.clone(),
+                name: name.clone(),
+            },
+            name,
+        ));
+    }
+
+    // Cache next. A bare name that is already on disk needs no network to
+    // resolve, and the registry does not serve everything `pie inferlet list`
+    // shows -- so asking it first turned `pie run <a local program>` into a
+    // 404 for something sitting right there.
+    if let Some(program) = crate::ops::inferlet::cached_version(&spec) {
+        let program = program.to_string();
+        return Ok((Target::Registry(spec), program));
+    }
+
+    match crate::ops::inferlet::resolve_inferlet_id(&spec, registry).await {
+        Ok(program) => Ok((Target::Registry(spec), program.to_string())),
+        // The one place the unbuilt curated directory pays off: the registry
+        // has never heard of this program, and the reason is sitting in the
+        // tree the person is standing in.
+        Err(error) => match curated {
+            Some(found) => Err(error.context(format!(
+                "{spec:?} is in this tree at {} but has not been built; \
+                 `{}` builds it",
+                crate::ui::short_path(&found.manifest),
+                found.build_hint()
+            ))),
+            None => Err(error.context(format!("resolving {spec:?}"))),
+        },
+    }
+}
+
 /// Boot, run, print, exit.
 pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate::ui::Answer> {
     let (cfg_path, origin) = bootstrap::cli_config_path(global);
@@ -270,30 +469,18 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate:
 
     // Resolved before the boot, so a name nobody can find fails in a second
     // rather than after the weights are on the device.
-    let program = match &target {
-        // Cache first. A bare name that is already on disk needs no network to
-        // resolve, and the registry does not serve everything `pie inferlet
-        // list` shows -- so asking it first turned `pie run <a local program>`
-        // into a 404 for something sitting right there.
-        Target::Registry(inferlet) if !inferlet.contains('@') => {
-            match crate::ops::inferlet::cached_version(inferlet) {
-                Some(program) => program.to_string(),
-                None => crate::ops::inferlet::resolve_inferlet_id(inferlet, &registry)
-                    .await
-                    .with_context(|| format!("resolving {inferlet:?}"))?
-                    .to_string(),
-            }
-        }
-        Target::Registry(inferlet) => {
-            crate::ops::inferlet::resolve_inferlet_id(inferlet, &registry)
-                .await
-                .with_context(|| format!("resolving {inferlet:?}"))?
-                .to_string()
-        }
-        Target::Local { name, .. } => name.clone(),
-    };
+    let (target, program) = resolve(target, &registry).await?;
 
-    println!("Running {program} on {model}");
+    // WHERE it came from, not only what it is called. Three sources answer
+    // to one bare name, and "the build I just made" and "the copy the cache
+    // has held since Tuesday" produce identical first lines otherwise.
+    match &target {
+        Target::Local { wasm, .. } => println!(
+            "Running {program} on {model}\n  from {}",
+            crate::ui::short_path(wasm)
+        ),
+        Target::Registry(_) => println!("Running {program} on {model}"),
+    }
     println!();
 
     // No guess in the context. The first version offered "is something already
@@ -464,14 +651,17 @@ async fn drive(
                     // run carries on.
                     Err(error) => eprintln!("[could not write a received file: {error:#}]"),
                 },
-                None => eprintln!(
-                    "[received a {} byte file{}; pass `-o DIR` to write it]",
-                    file.data.len(),
-                    match &file.name {
-                        Some(n) => format!(" named {n:?}"),
-                        None => String::new(),
-                    }
-                ),
+                // Named where the inferlet named it, and always with the
+                // way to keep it. A byte count alone tells a reader that
+                // something arrived and nothing about what to do next.
+                None => {
+                    eprintln!(
+                        "[received {} ({} bytes) and dropped it; `-o .` writes it here]",
+                        file.file_name(&format!("an unnamed file-{files_written:04}.bin")),
+                        file.data.len(),
+                    );
+                    files_written += 1;
+                }
             },
             // Printed unless it is a repeat of what the reader already saw.
             //
@@ -526,6 +716,71 @@ mod tests {
     fn input(arguments: &[&str]) -> serde_json::Value {
         let owned: Vec<String> = arguments.iter().map(|s| s.to_string()).collect();
         serde_json::from_str(&arguments_to_input(&owned)).unwrap()
+    }
+
+    /// A tree with `<root>/<name>/Pie.toml` and, optionally, a built guest.
+    fn tree(dir: &Path, name: &str, profile: Option<&str>) {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("Pie.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        if let Some(profile) = profile {
+            let built = dir.join("target").join("wasm32-wasip2").join(profile);
+            std::fs::create_dir_all(&built).unwrap();
+            std::fs::write(
+                built.join(format!("{}.wasm", name.replace('-', "_"))),
+                b"\0asm",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_curated_name_resolves_to_the_build_beside_its_manifest() {
+        // The whole point: `pie run text-to-image` in a checkout means the
+        // `.wasm` in that checkout, with no `--path` and no `--manifest`.
+        let dir = tempfile::tempdir().unwrap();
+        tree(dir.path(), "text-to-image", Some("release"));
+        let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();
+        assert_eq!(
+            found.wasm.unwrap(),
+            dir.path()
+                .join("target/wasm32-wasip2/release/text_to_image.wasm")
+        );
+    }
+
+    #[test]
+    fn an_unbuilt_curated_directory_is_found_without_a_wasm() {
+        // Found, so the refusal can print the build line; `wasm: None`, so
+        // the search carries on to the cache and the registry.
+        let dir = tempfile::tempdir().unwrap();
+        tree(dir.path(), "text-to-image", None);
+        let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();
+        assert!(found.wasm.is_none());
+        assert!(found.build_hint().contains("-p text-to-image"));
+    }
+
+    #[test]
+    fn release_outranks_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        tree(dir.path(), "frames-probe", Some("debug"));
+        tree(dir.path(), "frames-probe", Some("release"));
+        let found = curated_in(&[dir.path().to_path_buf()], "frames-probe").unwrap();
+        assert!(found.wasm.unwrap().to_string_lossy().contains("/release/"));
+    }
+
+    #[test]
+    fn a_name_that_is_a_path_is_not_a_curated_name() {
+        // `pie run ../../etc` must not become a filesystem walk out of the
+        // root, and a bare name is the only thing this door takes.
+        let dir = tempfile::tempdir().unwrap();
+        tree(dir.path(), "text-to-image", Some("release"));
+        let roots = [dir.path().to_path_buf()];
+        assert!(curated_in(&roots, "../text-to-image").is_none());
+        assert!(curated_in(&roots, ".hidden").is_none());
+        assert!(curated_in(&roots, "").is_none());
     }
 
     #[test]
