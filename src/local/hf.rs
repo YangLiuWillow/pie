@@ -38,6 +38,24 @@ pub fn resolve_cache_dir() -> std::path::PathBuf {
 /// `model.safetensors` / `model-*.safetensors` shards, not duplicate `.pt`,
 /// `.bin`, `.gguf`, or `consolidated.safetensors` artifacts. Used by
 /// `pie model pull` to restrict the HF snapshot download.
+///
+/// # A diffusers pipeline is a repo of subfolders
+///
+/// A generative repo keeps `model_index.json` at the top and its weights one
+/// level down: `transformer/diffusion_pytorch_model-00001-of-00003.safetensors`,
+/// `text_encoder/model-00001-of-00003.safetensors`, `vae/config.json`,
+/// `tokenizer/tokenizer.json`, `scheduler/scheduler_config.json`. The `**/`
+/// half of this list already reaches every JSON and every `model*` shard at
+/// any depth (`**` matches zero segments too, which is why the bare `*.json`
+/// row is redundant but kept for readability); what it did not reach is
+/// diffusers' own weight name, so `**/diffusion_pytorch_model*.safetensors`
+/// is here.
+///
+/// **THE BUNDLE IS STILL NOT FETCHED.** FLUX.2 ships a single-file
+/// `flux-2-klein-4b.safetensors` at the top of the snapshot holding the same
+/// weights again for ComfyUI; it matches no pattern here, and the discovery
+/// that reads a pipeline ignores it even when a hand-fetched snapshot has one
+/// (`checkpoint::file::diffusers`). Images and READMEs match nothing either.
 pub fn runtime_snapshot_allow_patterns() -> Vec<String> {
     [
         "*.json",
@@ -52,6 +70,7 @@ pub fn runtime_snapshot_allow_patterns() -> Vec<String> {
         "**/*.tiktoken",
         "**/*.jinja",
         "**/model*.safetensors",
+        "**/diffusion_pytorch_model*.safetensors",
     ]
     .into_iter()
     .map(str::to_string)

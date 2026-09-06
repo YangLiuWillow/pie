@@ -1,9 +1,11 @@
 //! A checkpoint's own files. [`read`] turns a snapshot directory into a
-//! [`Metadata`], [`zt`] a single container, [`write`] puts one back on disk,
-//! [`meta`] owns the reserved `__meta__/` names, and [`emit`]/[`serve`] are
-//! the `pie.serving/1` writer/reader pair. The only place in the crate where
-//! a path becomes a [`Metadata`].
+//! [`Metadata`], [`zt`] a single container, [`diffusers`] a multi-component
+//! pipeline folder, [`write`] puts one back on disk, [`meta`] owns the
+//! reserved `__meta__/` names, and [`emit`]/[`serve`] are the `pie.serving/1`
+//! writer/reader pair. The only place in the crate where a path becomes a
+//! [`Metadata`].
 
+pub mod diffusers;
 pub mod emit;
 pub mod meta;
 pub mod read;

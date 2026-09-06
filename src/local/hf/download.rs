@@ -603,4 +603,43 @@ mod tests {
         assert!(!matches("pytorch_model.bin"));
         assert!(!matches("model.gguf"));
     }
+
+    /// **A DIFFUSERS PIPELINE'S SUBFOLDERS COME DOWN, ITS BUNDLE AND ITS
+    /// PICTURES DO NOT.**
+    ///
+    /// The three real layouts this was written against: Z-Image
+    /// (`transformer/` sharded diffusers weights + a Qwen3 `text_encoder/`),
+    /// FLUX.2-klein (the same plus a top-level ComfyUI bundle), Wan 2.2
+    /// (five transformer shards). Every component's weights, config,
+    /// tokenizer and scheduler must be fetched; the bundle is the same
+    /// weights a second time and the JPEGs are documentation.
+    #[test]
+    fn a_pipelines_components_are_fetched_and_its_bundle_is_not() {
+        let allow = super::super::runtime_snapshot_allow_patterns();
+        let matches = |path: &str| allow.iter().any(|p| glob_match(p, path));
+
+        assert!(matches("model_index.json"));
+        assert!(matches("transformer/config.json"));
+        assert!(matches("transformer/diffusion_pytorch_model.safetensors"));
+        assert!(matches(
+            "transformer/diffusion_pytorch_model-00001-of-00003.safetensors"
+        ));
+        assert!(matches(
+            "transformer/diffusion_pytorch_model.safetensors.index.json"
+        ));
+        assert!(matches("text_encoder/model-00001-of-00003.safetensors"));
+        assert!(matches("text_encoder/model.safetensors.index.json"));
+        assert!(matches("vae/diffusion_pytorch_model.safetensors"));
+        assert!(matches("tokenizer/tokenizer.json"));
+        assert!(matches("tokenizer/merges.txt"));
+        assert!(matches("tokenizer/spiece.model"));
+        assert!(matches("scheduler/scheduler_config.json"));
+
+        // The ComfyUI bundle beside the components, and the repo's prose.
+        assert!(!matches("flux-2-klein-4b.safetensors"));
+        assert!(!matches("README.md"));
+        assert!(!matches("editing.jpg"));
+        assert!(!matches("assets/teaser.png"));
+        assert!(!matches("transformer/diffusion_pytorch_model.bin"));
+    }
 }

@@ -61,6 +61,17 @@ fn no_such_sku(sku: &str) -> String {
 /// object model the contract algebra speaks. A sharded checkpoint opens as
 /// the union of all its shards, not just the first.
 pub fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
+    // A diffusers pipeline is asked first and answered whole: its weights
+    // are under `transformer/`, `text_encoder/`, `vae/`, each set spelling
+    // its tensors from its own root, and they enter one name space under the
+    // component prefixes `dit.`, `te.`, `vae.`. A bundle beside them
+    // (FLUX.2's `flux-2-klein-4b.safetensors`) is the same weights again for
+    // another tool and is deliberately not read — see
+    // `checkpoint::file::diffusers`.
+    if checkpoint::file::diffusers::is_pipeline(checkpoint) {
+        return checkpoint::file::diffusers::open(checkpoint)
+            .with_context(|| format!("open the diffusers pipeline {checkpoint:?}"));
+    }
     let containers = containers(checkpoint)?;
     // A lone container stays out of `Source::merge`, which would drop its own manifest.
     if let [container] = containers.as_slice() {

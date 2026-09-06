@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::file::zt;
-use crate::file::{Attributes, Metadata, TokenizerTables};
+use crate::file::{Attributes, Metadata, TokenizerTables, diffusers};
 use crate::error::Error;
 
 /// Discover the safetensors shard files for a snapshot directory, matching
@@ -18,6 +18,12 @@ use crate::error::Error;
 /// Returns shard paths in C++ loader order: a lone `model.safetensors`,
 /// else sorted unique shard names from `model.safetensors.index.json`'s
 /// `weight_map`.
+///
+/// **FLAT, AND DELIBERATELY SO.** One directory, one name space, one set of
+/// weights — the shape a language checkpoint has. A directory whose weights
+/// are one level down under component folders is a different shape and a
+/// different question: [`crate::file::diffusers`] answers that one, and every
+/// door in this module asks it first.
 pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let single = snapshot_dir.join("model.safetensors");
     let index = snapshot_dir.join("model.safetensors.index.json");
@@ -329,6 +335,12 @@ fn one_or_set(mut files: Vec<PathBuf>) -> Discovered {
 }
 
 pub fn parse_metadata(snapshot_dir: &Path) -> Result<Metadata, Error> {
+    // A pipeline is asked FIRST, because its answer is the one that carries
+    // the component prefixes: describing the merged source is the only way
+    // this Metadata spells its tensors the way a contract will read them.
+    if diffusers::is_pipeline(snapshot_dir) {
+        return zt::describe(&diffusers::open(snapshot_dir)?);
+    }
     match discover(snapshot_dir)? {
         Discovered::One(path) => zt::parse(&path),
         Discovered::Set(paths) => zt::parse_files(&paths),
@@ -339,6 +351,9 @@ pub fn parse_metadata(snapshot_dir: &Path) -> Result<Metadata, Error> {
 /// names in canonical order)`. Empty for a source whose objects are all one
 /// plane, which is every format but `.zt`.
 pub fn parse_groups(snapshot_dir: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {
+    if diffusers::is_pipeline(snapshot_dir) {
+        return zt::describe_groups(&diffusers::open(snapshot_dir)?);
+    }
     let paths = match discover(snapshot_dir)? {
         Discovered::One(path) => vec![path],
         Discovered::Set(paths) => paths,
@@ -360,6 +375,12 @@ pub fn parse_groups(snapshot_dir: &Path) -> Result<Vec<(String, Vec<String>)>, E
 ///
 /// The snapshot holds no checkpoint this loader can open.
 pub fn parse_attributes(snapshot_dir: &Path) -> Result<Attributes, Error> {
+    // Safetensors carry none, and a pipeline is safetensors all the way
+    // down: what a pipeline says about itself is its JSON, carried by
+    // [`diffusers::configs`], not a key-value block.
+    if diffusers::is_pipeline(snapshot_dir) {
+        return Ok(Attributes::default());
+    }
     match discover(snapshot_dir)? {
         Discovered::One(path) => zt::parse_attributes(&path),
         Discovered::Set(paths) => zt::parse_attributes_files(&paths),
@@ -376,6 +397,11 @@ pub fn parse_attributes(snapshot_dir: &Path) -> Result<Attributes, Error> {
 ///
 /// The snapshot holds no checkpoint this loader can open.
 pub fn parse_tokenizer(snapshot_dir: &Path) -> Result<TokenizerTables, Error> {
+    // A pipeline keeps its tokenizer in `tokenizer/`, as files; only a GGUF
+    // keeps one inside the weights, which is what this door reads.
+    if diffusers::is_pipeline(snapshot_dir) {
+        return Ok(TokenizerTables::default());
+    }
     let path = match discover(snapshot_dir)? {
         Discovered::One(path) => path,
         Discovered::Set(mut paths) => {

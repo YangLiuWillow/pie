@@ -430,6 +430,40 @@ impl Source {
         Options::default().from_parts(stores, catalog)
     }
 
+    /// This source with `prefix` in front of every tensor name.
+    ///
+    /// The one operation a multi-component checkpoint needs and
+    /// [`merge`](Source::merge) cannot express: a diffusers pipeline is N
+    /// safetensors sets that each spell their tensors `norm.weight`, and
+    /// merging them raw is a wall of collisions. Prefixing each set first
+    /// (`dit.`, `te.`, `vae.`) makes one name space out of them, exactly as
+    /// `pie model import --aux` does for a drafter head — but by renaming a
+    /// catalog rather than by rewriting the bytes into a staging file.
+    ///
+    /// The manifest is dropped: a manifest is one FILE's own claim about the
+    /// names it holds, and those names are no longer the names this source
+    /// answers to. Addresses, stores and payloads are untouched, so a
+    /// prefixed source still maps and locates its bytes where they lie.
+    pub fn under(self, prefix: &str) -> Result<Source> {
+        if prefix.is_empty() {
+            return Ok(self);
+        }
+        let Source {
+            stores,
+            catalog,
+            data_shard,
+            vocab,
+            ..
+        } = self;
+        Ok(Source {
+            stores,
+            catalog: catalog.renamed(|name| format!("{prefix}{name}"))?,
+            manifest: None,
+            data_shard,
+            vocab,
+        })
+    }
+
     /// Reads several sources as one name space. Names must not collide.
     pub fn merge(sources: Vec<Source>) -> Result<Source> {
         let vocab = sources

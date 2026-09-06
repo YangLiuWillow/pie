@@ -31,7 +31,11 @@ pub fn parse_files(paths: &[PathBuf]) -> Result<Metadata, Error> {
 /// canonical order)`. A leaf, a named layout and a gguf block array are one
 /// plane and are not listed.
 pub fn parse_groups(path: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {
-    let source = ztensor_compat::index(path).map_err(Error::from)?;
+    describe_groups(&ztensor_compat::index(path).map_err(Error::from)?)
+}
+
+/// [`parse_groups`], over a source the caller already opened.
+pub fn describe_groups(source: &Source) -> Result<Vec<(String, Vec<String>)>, Error> {
     let mut groups = Vec::new();
     for tensor in source.tensors() {
         let planes = planes_of(&tensor)?;
@@ -190,7 +194,14 @@ pub fn read_attributes(path: &Path) -> Result<std::collections::BTreeMap<String,
         .collect())
 }
 
-fn describe(source: &Source) -> Result<Metadata, Error> {
+/// A [`Source`] as the loader's [`Metadata`] — files, tensors, planes.
+///
+/// Public because a source is not always a path: a diffusers pipeline is
+/// several safetensors sets renamed into one name space
+/// ([`crate::file::diffusers::open`]), and describing THAT source is the
+/// only way its Metadata carries the same prefixed names the contract algebra
+/// will read it by.
+pub fn describe(source: &Source) -> Result<Metadata, Error> {
     let mut files = Vec::with_capacity(source.stores().len());
     for (index, store) in source.stores().iter().enumerate() {
         files.push(File {
