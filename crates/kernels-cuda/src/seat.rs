@@ -101,6 +101,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elementwise.clamp", Reads::Rows),
     entry("elementwise.clamp_learned", Reads::Rows),
     entry("elementwise.gate_sigmoid_mul", Reads::Rows),
+    entry("elementwise.gate_sigmoid_mul_heads", Reads::Rows),
     // The modulation family (`modulate`, `gated_residual_add`,
     // `norm_modulate`, `gated_residual_norm_modulate`) reads the row words
     // alone: the lane a row takes its vector at is a VALUE the `[rows]` lane

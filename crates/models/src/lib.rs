@@ -9,6 +9,7 @@ pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod hunyuan_image_3;
 pub mod kimi_k3;
+pub mod ltx_2;
 pub mod media;
 pub mod mini_dit;
 pub mod minimax_h3;
@@ -148,6 +149,9 @@ impl ReadingFact {
     /// The port named `name`, with its index among ports of its kind —
     /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
     #[must_use]
+    /// The index is [`ports_indexed`](ReadingFact::ports_indexed)'s, so a
+    /// port that STATES its index (`PortFact::at`) resolves to that one and
+    /// not to its position among its kind.
     pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
         // Through `ports_indexed`, so a port that STATES its index
         // (`PortFact::at`) resolves to the index the trace reads it at and
@@ -421,6 +425,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         z_image::skus(),
         wan_2::skus(),
         minimax_h3::skus(),
+        ltx_2::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

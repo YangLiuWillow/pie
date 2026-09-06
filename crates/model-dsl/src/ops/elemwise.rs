@@ -511,6 +511,43 @@ pub fn gate_sigmoid_mul(x: &Value, gate: &Value) -> Value {
     x_out
 }
 
+/// The per-HEAD sigmoid gate: `x[:, h·head_dim + j] *= scale · sigmoid(
+/// gate[:, h])`, in place. LTX-2's gated attention multiplies its answer by
+/// `2σ(W·x_norm)` with one logit per head, which is this at `scale = 2`.
+/// `gate` is `[rows, heads]` at `x`'s dtype.
+pub fn gate_sigmoid_mul_heads(x: &Value, gate: &Value, head_dim: u32, scale: f32) -> Value {
+    assert!(head_dim > 0, "a head is at least one channel wide");
+    assert!(
+        x.width().is_multiple_of(u64::from(head_dim)),
+        "x is {} wide, not a whole number of {head_dim}-wide heads",
+        x.width()
+    );
+    assert_eq!(
+        gate.width(),
+        x.width() / u64::from(head_dim),
+        "one gate logit per head"
+    );
+    assert_eq!(gate.rows(), x.rows(), "the gate is per row");
+    assert_eq!(
+        gate.dtype(),
+        x.dtype(),
+        "the gate rides the rectangle's dtype"
+    );
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::GateSigmoidMulHeads {
+            x: x.id(),
+            gate: gate.id(),
+            head_dim,
+            scale,
+            x_out: x_out.id(),
+        },
+        &[x, gate],
+    );
+    x_out
+}
+
 pub fn hc_expand(x: &Value, streams: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(x.rows(), x.width() * u64::from(streams), x.dtype()));
@@ -1021,11 +1058,6 @@ pub fn rope_axes(
     );
     assert_eq!(positions.rows(), x.rows(), "positions are over the rows they turn");
     assert_eq!(positions.dtype(), Dtype::F32, "axis positions are fp32");
-    assert_eq!(
-        dims.iter().sum::<u32>(),
-        rotary_dim,
-        "the axes of {dims:?} do not sum to rotary_dim {rotary_dim}"
-    );
     assert!(
         rotary_dim <= head_dim && rotary_dim.is_multiple_of(2) && dims.iter().all(|d| d.is_multiple_of(2)),
         "rotary_dim {rotary_dim} within head_dim {head_dim}, every axis an even count"
@@ -1035,6 +1067,31 @@ pub fn rope_axes(
         "x is {} wide, not a whole number of {head_dim}-wide heads",
         x.width()
     );
+    if form == RopeForm::SplitLadder {
+        // One ladder across the row: `dims[a]` counts the ROW's channels,
+        // whatever is left over is the identity pad in front of it, and the
+        // pairing is rotate-half within a whole head.
+        assert_eq!(
+            rotary_dim, head_dim,
+            "the ladder pairs (i, i + head_dim/2), so it turns the whole head"
+        );
+        let span: u64 = dims.iter().map(|d| u64::from(*d)).sum();
+        assert!(
+            span <= x.width() && (x.width() - span).is_multiple_of(2),
+            "the ladder's {span} channels leave no whole pad in a {}-wide row",
+            x.width()
+        );
+        assert!(
+            dims[..axes].iter().all(|d| *d == dims[0]),
+            "one ladder hands its axes out round-robin, so {dims:?} must be flat"
+        );
+    } else {
+        assert_eq!(
+            dims.iter().sum::<u32>(),
+            rotary_dim,
+            "the axes of {dims:?} do not sum to rotary_dim {rotary_dim}"
+        );
+    }
     let x_out = r.fresh(x.ty().clone());
     r.push(
         Elementwise::RopeAxes {

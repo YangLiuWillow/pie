@@ -665,6 +665,25 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "wan_2",
     },
+    // LTX-2.5 (M4). `layers` is the DiT's dual-stream block count; `vocab`
+    // is zero because no reading of this family has logits — the denoise
+    // reading answers `seam::VELOCITY` and the two connector readings
+    // answer `seam::HIDDEN`, both sized off the plan. The Gemma-4 trunk
+    // that feeds the connectors is not a reading of this text yet
+    // (`models::ltx_2::model`), so nothing here embeds by a vocabulary.
+    Row {
+        id: "ltx25-bf16-kv-bf16",
+        layers: 48,
+        vocab: 0,
+        arch: "ltx_2",
+    },
+    // The miniature: two blocks a side, one connector layer.
+    Row {
+        id: "ltx25-mini-bf16-kv-bf16",
+        layers: 2,
+        vocab: 0,
+        arch: "ltx_2",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
