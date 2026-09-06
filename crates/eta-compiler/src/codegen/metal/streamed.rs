@@ -574,6 +574,14 @@ inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uin
 /// `widest × 16`.
 const MAX_SPLIT_REDUCTIONS: usize = 64;
 
+/// The `temporary` a pivot selection owns: the runtime's `M4_SEL_BYTES`.
+const SELECT_BYTES: usize = 16384;
+
+/// Rounds of up to 1024 candidates a pivot selection runs before the serial
+/// fallback: three cover 3072 kept tokens, past which the fallback's pick
+/// loop is the cost it always was.
+const SELECT_ROUNDS: usize = 3;
+
 /// What a node becomes, before scheduling.
 enum Plan {
     /// A direct element-independent op (see [`direct_wide`]); `scalar` when
@@ -611,6 +619,18 @@ enum Plan {
     },
     /// A stateful walk or a fused threadgroup pattern on one threadgroup.
     Single(String),
+    /// A pivot selection by rank or by mass (`pivot_threshold`, predicate
+    /// `rank_le` / `cummass_le`): rounds of a radix select over the grid,
+    /// each finished by one threadgroup walking the round's candidates in
+    /// the serial order, then a serial fallback for whatever is left.
+    Select {
+        node: u32,
+        mode: u32,
+        a0: String,
+        a1: String,
+        o0: String,
+        input: u32,
+    },
     /// A scatter: the base copied into the result as a grid pass, then the
     /// read-modify-write over the indices on one threadgroup.
     Scatter {
@@ -752,7 +772,7 @@ impl Scheduler<'_> {
             let r = format!("r_{}", f.result);
             let _ = writeln!(
                 text,
-                "    const uint {r} = m4_reduce_final({}u, {}u, {}, descriptors[{}].len, reinterpret_cast<const device uint*>(temporary + {}u * m4_plane_bytes), status, m3_threads, m4_simd_lane, m4_simd_id, m3_tgbuf);",
+                "    const uint {r} = m4_reduce_final({}u, {}u, {}, descriptors[{}].len, reinterpret_cast<const device uint*>(m4_planes + {}u * m4_plane_bytes), status, m3_threads, m4_simd_lane, m4_simd_id, m3_tgbuf);",
                 f.tag, f.dtype, f.input_ptr, f.input, f.plane
             );
             let _ = writeln!(
@@ -860,7 +880,7 @@ impl Scheduler<'_> {
 /// The streamed kernel's opening: runtime, preamble, signature and the
 /// per-dispatch derivations every case relies on — lane, status, tables,
 /// channels, `m4_gtid` / `m4_gthreads`. Shared with the streamed top-k.
-pub(super) fn kernel_head(function_name: &str, channel_count: usize) -> String {
+pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str) -> String {
     let mut source = String::new();
     source.push_str(RUNTIME_TEMPLATE);
     source.push('\n');
@@ -897,6 +917,7 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize) -> String {
         source,
         "  threadgroup M1ArgmaxCandidate m3_tgbuf[{METAL_M3_REGION_THREADS}];"
     );
+    source.push_str(extra);
     // The lane is the grid's second axis; the first is element blocks.
     source.push_str("  const uint dispatch_lane = m4_group.y;\n");
     source.push_str("  if (dispatch_lane >= layout->lane_count) return;\n");
@@ -998,7 +1019,17 @@ pub fn emit_streamed_region(
     let channel_count = used_channel_slots(&ops);
     let value_types = &stage.normalized.value_types;
 
-    let mut source = kernel_head(function_name, channel_count);
+    let has_select = ops.iter().zip(0u32..).any(|(op, node)| {
+        region.nodes.iter().any(|n| n.index() as u32 == node)
+            && op.tag == tags::PIVOT_THRESHOLD
+            && matches!(op.pred_tag, predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE)
+    });
+    let extra = if has_select {
+        "  threadgroup atomic_uint m4_sel_tg_hist[256];\n  threadgroup uint m4_sel_key[1024];\n  threadgroup uint m4_sel_idx[1024];\n  threadgroup uint m4_sel_scan[1024];\n"
+    } else {
+        ""
+    };
+    let mut source = kernel_head(function_name, channel_count, extra);
 
     // The same view/alias decisions as the grouped emitter, so the two forms
     // read the same values at the same offsets.
@@ -1165,6 +1196,19 @@ pub fn emit_streamed_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         let plan = match kind {
+            StepKind::Single
+                if op.tag == tags::PIVOT_THRESHOLD
+                    && matches!(op.pred_tag, predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE) =>
+            {
+                Plan::Select {
+                    node: node_u32,
+                    mode: u32::from(op.pred_tag == predicate_tags::CUMMASS_LE),
+                    a0: slots.a0.clone(),
+                    a1: slots.a1.clone(),
+                    o0: slots.o0.clone(),
+                    input: reads.first().copied().unwrap_or(base),
+                }
+            }
             StepKind::Single if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET) => {
                 Plan::Scatter {
                     copy: format!(
@@ -1277,7 +1321,13 @@ pub fn emit_streamed_region(
         planned.push((node_u32, plan));
     }
 
-    // How many reductions may split: each owns a plane of `temporary`.
+    // `temporary` is carved: a 16 KiB area per pivot selection first, then
+    // a plane per reduction that may split.
+    let select_count = planned
+        .iter()
+        .filter(|(_, plan)| matches!(plan, Plan::Select { .. }))
+        .count();
+    let select_bytes = select_count * SELECT_BYTES;
     let split_count = planned
         .iter()
         .filter(|(_, plan)| matches!(plan, Plan::Reduce { split: true, .. }))
@@ -1286,7 +1336,7 @@ pub fn emit_streamed_region(
     if split_count > 0 {
         let _ = writeln!(
             source,
-            "  const uint m4_plane_bytes = ((layout->scratch_stride - layout->temporary_offset) / {split_count}u) & ~15u;"
+            "  device uchar* m4_planes = temporary + {select_bytes}u;\n  const uint m4_plane_bytes = ((layout->scratch_stride - layout->temporary_offset - {select_bytes}u) / {split_count}u) & ~15u;"
         );
     }
 
@@ -1304,6 +1354,7 @@ pub fn emit_streamed_region(
         open: None,
     };
     let mut planes_used = 0usize;
+    let mut select_used = 0usize;
     for (node, plan) in &planned {
         let node = *node;
         match plan {
@@ -1455,7 +1506,7 @@ pub fn emit_streamed_region(
                     let o = sched.open.as_mut().expect("opened");
                     let _ = writeln!(
                         o.passes,
-                        "    m4_reduce_partial({tag}u, {dtype}u, {input_ptr}, reinterpret_cast<device uint*>(temporary + {plane}u * m4_plane_bytes), descriptors[{input}].len, m4_gtid, m4_gthreads, m4_simd_lane);"
+                        "    m4_reduce_partial({tag}u, {dtype}u, {input_ptr}, reinterpret_cast<device uint*>(m4_planes + {plane}u * m4_plane_bytes), descriptors[{input}].len, m4_gtid, m4_gthreads, m4_simd_lane);"
                     );
                     // The final belongs to the next dispatch's prologue, so
                     // this one is complete.
@@ -1476,6 +1527,55 @@ pub fn emit_streamed_region(
                     sched.cases.push_str("    return;\n  }\n");
                     sched.steps.push(streamed_step(*input, StepKind::Reduce));
                 }
+            }
+            Plan::Select {
+                node,
+                mode,
+                a0,
+                a1,
+                o0,
+                input,
+            } => {
+                sched.flush_pending();
+                let q = select_used;
+                select_used += 1;
+                let base = format!("temporary + {}u", q * SELECT_BYTES);
+                let d0 = format!("descriptors[lane_params[{node}].a0]");
+                let d1 = format!("descriptors[lane_params[{node}].a1]");
+                let mut case = |text: String, kind: StepKind| {
+                    let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
+                    sched.cases.push_str(&text);
+                    sched.cases.push_str("    return;\n  }\n");
+                    sched.steps.push(streamed_step(*input, kind));
+                };
+                case(
+                    format!("    m4_sel_init({base}, {o0}, {d0}, {d1}, {a1}, {mode}u, m4_gtid, m4_gthreads);\n"),
+                    StepKind::Wide,
+                );
+                for _ in 0..SELECT_ROUNDS {
+                    for pass in 0..4u32 {
+                        case(
+                            format!("    m4_sel_hist_pass({base}, {a0}, {d0}, {pass}u, m4_gtid, m4_gthreads, m3_tid, m3_threads, m4_sel_tg_hist);\n"),
+                            StepKind::Wide,
+                        );
+                        case(
+                            format!("    if (m4_group.x != 0) return;\n    m4_sel_pick({base}, {pass}u, m3_tid, m3_threads);\n"),
+                            StepKind::Single,
+                        );
+                    }
+                    case(
+                        format!("    m4_sel_compact({base}, {a0}, {d0}, m4_gtid, m4_gthreads);\n"),
+                        StepKind::Wide,
+                    );
+                    case(
+                        format!("    if (m4_group.x != 0) return;\n    m4_sel_finish({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m4_sel_key, m4_sel_idx, m4_sel_scan);\n"),
+                        StepKind::Single,
+                    );
+                }
+                case(
+                    format!("    if (m4_group.x != 0) return;\n    m4_sel_fallback({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m3_tgbuf);\n"),
+                    StepKind::Single,
+                );
             }
             Plan::Scatter {
                 copy,

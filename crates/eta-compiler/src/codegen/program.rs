@@ -275,10 +275,14 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             Some(LibraryOp::TopK) => {
                 crate::codegen::metal::emit_streamed_topk(&entry, stage, region)
             }
+            // The nucleus sampler's ops are ordinary generated ops; its pivot
+            // selection has a grid form of its own in the streamed emitter.
+            Some(LibraryOp::NucleusSample) | None => {
+                crate::codegen::metal::emit_streamed_region(&entry, stage, region)
+            }
             Some(_) => Err(crate::codegen::error::EmitError::LibraryRegionAbiInvalid(
                 crate::codegen::error::RegionForm::GroupedFused,
             )),
-            None => crate::codegen::metal::emit_streamed_region(&entry, stage, region),
         };
         let (emitted, steps) = match answer {
             Ok((source, steps)) => (Ok(source), steps),

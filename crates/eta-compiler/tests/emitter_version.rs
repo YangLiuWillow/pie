@@ -28,7 +28,7 @@ const PINNED: &[(&str, u16, u64)] = &[
     // its own `ptir_m4` kernels joined the table. 49 -> 50 (merged with 45):
     // the normalization fold reaches the metal output too. 50 -> 51: a
     // gather is a direct op, a scalar runs mid-dispatch, a scatter splits.
-    ("metal", 51, 0xb900_8286_1f80_c1b6),
+    ("metal", 51, 0x63b4_f718_bf13_f781),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the
