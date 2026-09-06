@@ -33,16 +33,19 @@ pub(crate) mod fixture;
 pub mod compose;
 pub mod descriptor;
 pub mod fallback;
+pub mod packing;
 pub mod sink;
 pub mod walk;
 
 pub use compose::{
-    AxisComposition, ClassWindow, Composition, Lane, LaneRow, MaskSpan, WindowTable, compose,
-    compose_axes, rung_of, chunk_spans, pass_spans};
+    AxisComposition, ClassWindow, Composition, Lane, LaneRow, MaskSpan, WindowTable, chunk_spans,
+    compose, compose_axes, pass_spans, rung_of,
+};
 pub use descriptor::{
     ABI_VERSION, CLASS_BYTES, FireDescriptor, HEADER_BYTES, LANE_BYTES, MAGIC, PATCH_LANE_BYTES,
 };
 pub use fallback::{Serve, answers as fallback_answers, fragmentable, max_runs};
+pub use packing::{LaneFacts, Packed, group_of_lane, groups_of, pack};
 pub use sink::{EagerSink, EventId, Sink};
 pub use walk::{Filter, Phases, Regions, Units, walk, walk_phases, walk_regions};
 
@@ -241,6 +244,22 @@ pub enum Fault {
         /// The token rows this fire carries.
         rows: u32,
     },
+    /// A row selection (`model_ir::Selection`) whose lanes' rows are not one
+    /// contiguous run of the fire: its classes were seriated apart, so the
+    /// packed rectangle `layout.pack_rows` writes over the selection's window
+    /// would land on rows another class owns. The bake's class order is what
+    /// decides adjacency; a plan whose joint attention spans classes the
+    /// order keeps apart is not served by this packing.
+    ScatteredSelection {
+        /// The selection's fact mask.
+        mask: u32,
+        /// The bits those facts must be.
+        value: u32,
+        /// The fire row a selected lane begins at.
+        at: u32,
+        /// The row the previous selected lane ended at.
+        expected: u32,
+    },
 }
 
 impl fmt::Display for Fault {
@@ -271,7 +290,10 @@ impl fmt::Display for Fault {
                 "this fire carries {rows} token rows and the largest bucket is \
                  {top} — there is no graph to launch it in"
             ),
-            Self::ClassTable { descriptor, compiled } => write!(
+            Self::ClassTable {
+                descriptor,
+                compiled,
+            } => write!(
                 f,
                 "the descriptor carries {descriptor} classes and the artifact \
                  has {compiled} — a region's mask would index the wrong window"
@@ -326,6 +348,18 @@ impl fmt::Display for Fault {
             Self::TooManyImages { images, max } => write!(
                 f,
                 "this fire assembles {images} images and the artifact was baked for {max}"
+            ),
+            Self::ScatteredSelection {
+                mask,
+                value,
+                at,
+                expected,
+            } => write!(
+                f,
+                "the lanes selected by fact mask {mask:#x} = {value:#x} do not stand in one \
+                 run of the fire: a selected lane begins at row {at} where the previous one \
+                 ended at {expected}, so their packed rectangle would overlap rows another \
+                 class owns"
             ),
             Self::NoPatchBucket { patches, top } => write!(
                 f,

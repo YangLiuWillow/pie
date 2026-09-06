@@ -531,5 +531,4 @@ mod tests {
         assert!(said.contains('1') && said.contains('2'), "{said}");
         assert!(said.contains("never negotiated"), "{said}");
     }
-
 }

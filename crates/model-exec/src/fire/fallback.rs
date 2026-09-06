@@ -192,8 +192,7 @@ pub fn promised(compiled: &CompiledModel, axis: RowAxis, region: &Region) -> boo
 pub fn fragmentable(compiled: &CompiledModel) -> usize {
     let mut seen: Vec<&ClassSet> = Vec::new();
     for (at, region) in compiled.template().iter().enumerate() {
-        if bound(compiled, compiled.axis_of(at), &region.mask) > 1
-            && !seen.contains(&&region.mask)
+        if bound(compiled, compiled.axis_of(at), &region.mask) > 1 && !seen.contains(&&region.mask)
         {
             seen.push(&region.mask);
         }
@@ -256,7 +255,8 @@ mod tests {
             buckets: vec![64, 4096],
             max_adapters: 0,
         };
-        let compiled = compile(&b.trace, &wide, &DeviceProfile::default()).expect("the fixture bakes");
+        let compiled =
+            compile(&b.trace, &wide, &DeviceProfile::default()).expect("the fixture bakes");
 
         // The two answers agree: `bound` derives the same `r` the layout counted.
         let mut checked = 0;
@@ -269,8 +269,16 @@ mod tests {
                     _ => None,
                 });
             if let Some(stated) = stated {
-                assert_eq!(bound(&compiled, axis, &region.mask), stated, "{:?}", region.nodes);
-                assert!(stated > 1, "a withdrawn consumer costs more than one launch");
+                assert_eq!(
+                    bound(&compiled, axis, &region.mask),
+                    stated,
+                    "{:?}",
+                    region.nodes
+                );
+                assert!(
+                    stated > 1,
+                    "a withdrawn consumer costs more than one launch"
+                );
                 checked += 1;
             }
         }
@@ -280,9 +288,13 @@ mod tests {
         for (at, region) in compiled.template().iter().enumerate() {
             let axis = compiled.axis_of(at);
             if promised(&compiled, axis, region) {
-                assert_eq!(bound(&compiled, axis, &region.mask), 1, "{:?}", region.nodes);
+                assert_eq!(
+                    bound(&compiled, axis, &region.mask),
+                    1,
+                    "{:?}",
+                    region.nodes
+                );
             }
         }
     }
-
 }

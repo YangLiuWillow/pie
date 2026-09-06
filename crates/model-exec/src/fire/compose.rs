@@ -390,7 +390,6 @@ impl Composition {
     pub fn patch_bucket(&self) -> u32 {
         self.axes[RowAxis::Patches].bucket
     }
-
 }
 
 /// Compose one fire on the token axis — the door every text-only deployment
@@ -419,12 +418,7 @@ pub fn compose_axes(
     budgets: &Budgets,
     lanes: &[Lane],
 ) -> Result<Composition> {
-    seriate(
-        compiled,
-        &budgets.tokens,
-        budgets.patches.as_ref(),
-        lanes,
-    )
+    seriate(compiled, &budgets.tokens, budgets.patches.as_ref(), lanes)
 }
 
 fn seriate(
@@ -810,5 +804,4 @@ mod tests {
         let fire = compose(&compiled, &open, &[Lane::new(0, 5)]).expect("composes");
         assert_eq!(fire.bucket(), 5);
     }
-
 }

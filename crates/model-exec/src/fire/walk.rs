@@ -394,8 +394,7 @@ mod tests {
     use crate::fire::compose::{Lane, compose};
     use crate::fire::fixture::{Build, MockDispatch, Recorder, fact};
     use crate::fire::sink::EagerSink;
-    
-    
+
     use model_compiler::{Budget, DeviceProfile, compile};
     use model_ir::Guard;
 
@@ -431,7 +430,15 @@ mod tests {
         let descriptor = fire(&compiled, &[Lane::new(0, 7), Lane::new(1, 1)]);
 
         let mut whole = MockDispatch::new(&b.trace);
-        walk(&b.trace, &compiled, &descriptor, &mut whole, &mut EagerSink, Filter::default()).expect("walks");
+        walk(
+            &b.trace,
+            &compiled,
+            &descriptor,
+            &mut whole,
+            &mut EagerSink,
+            Filter::default(),
+        )
+        .expect("walks");
 
         let mut split = MockDispatch::new(&b.trace);
         let mut structure = (Recorder::default(), Recorder::default());
@@ -465,5 +472,4 @@ mod tests {
             "every region is opened and closed under a filter that dispatches none of it"
         );
     }
-
 }
