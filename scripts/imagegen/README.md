@@ -13,6 +13,7 @@ scripts/imagegen/
   mini_dit_ref.py     M0  synthetic mini-DiT reference (no real model, no download)
   mini_dit_parity.py  M0  drives pie's `mini-dit` row against that reference
   zimage_golden.py    M1  Z-Image-Turbo golden + miniature forward
+  zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
   golden_common.py        shared tap/hook/manifest plumbing
@@ -354,6 +355,35 @@ n_heads=4, axes_dims=[16,24,24], axes_lens=[256,64,64], cap_feat_dim=64)` —
 | `zimage_mini.npz` | 35,856 | `d72d2751c83cafa3f266abf68049e0e0` |
 | `zimage_mini.safetensors` | 25,677,496 | `fd71e61a6955381aff902cf10612c850` |
 | `zimage_mini_config.json` | 7,278 | `3afce5520a90b635c009a890b866b64b` |
+
+#### The pie side, from a guest — `zimage_vae_parity.py`
+
+`zimage_golden.py --vae` dumps a 64x64x16 centre crop of `latent.final` beside
+the pixels the reference VAE decodes it to
+(`golden/z-image/zimage_vae/{latent,pixels,mean}.f32` + `shapes.json`).  The
+engine gate `engine-cuda/tests/the_z_image_vae_answers_the_reference` feeds
+that latent from the HOST; this script feeds it the way a guest can, through
+`tests/inferlets/zimage-vae-parity`: the latent bound as the reading's
+`Voxels` port CHANNEL (whose declared shape is the clip's box), the answer
+read off `intrinsics::pixels()`, and the picture out through
+`frames.from-channel` + `session.send-frames`.
+
+```bash
+cp ~/.pie/config.minidit.toml ~/.pie/config.zimage-vae.toml
+# then edit: [model] model = the imported z-image-turbo artifact,
+#            [engine] graphs = "on", max_model_len = 32768,
+#            [server] port = something nothing else is using
+python zimage_vae_parity.py all --out /tmp/zimage-vae \
+    --config ~/.pie/config.zimage-vae.toml
+```
+
+Measured: **cos 0.999981, mean |err| 0.00225, max |err| 0.1526** against
+`pixels.f32` — the same distance the host-fed gate reports (0.99998 / 0.0023),
+so the guest road costs nothing.  `/tmp/zimage-vae/zimage-vae.png` is the
+picture: the golden's red bicycle against its blue wall, 512x512.
+
+`--no-pixels` takes the zero-copy road only (the PNG, no rows lifted); the two
+roads produce a byte-identical PNG.
 
 ### `flux2_golden.py` → `/root/.cache/pie-imagegen/golden/flux2/`
 
