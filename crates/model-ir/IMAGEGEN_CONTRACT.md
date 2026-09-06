@@ -278,9 +278,13 @@ a runtime or another shell must agree with. Tests: `engine-cuda/tests/a_double_b
   selection whose lanes' rows are not one contiguous run of the fire (classes seriated apart) is
   refused (`model_exec::fire::Fault::ScatteredSelection`) rather than packed over another class's
   rows.
-- **`ReferenceSelfOnly`** is served with the kernel's one-tail-per-group mask (reference lanes pack
-  last in their group; `packing::Packed::reference_start`). A group with two reference lanes is
-  refused by name at submit.
+- **`ReferenceSelfOnly`** is served in the contract's tag form: the two `ReferenceTag` tables,
+  fire-wide and indexed by the packed rows the CSRs name, reach the kernel whole
+  (`kernels_cuda::attn_ragged::RaggedMask::ReferenceTags { q_tags, kv_tags }`, a
+  `REGISTER_LOGITS_MASK` variant), so a group may hold ANY number of reference lanes, each
+  attending itself alone while every other row of the group sees them all (FLUX.2's KV layout,
+  HunyuanImage 3). The kernel's one-tail form (`ReferenceSelfOnly { ref_start }`) stays as a fast
+  case no engine arm uses.
 - **Ports.** Every `(kind, port)` a lane's CLASS reads must be fed (`Lane::ports`) from a channel the
   instance ATTACHED to that lane carries (the `SelfCondInput::channels` precedent): the feed reads
   the channel's committed cell at the consumer head — what the instance's own `take` would read

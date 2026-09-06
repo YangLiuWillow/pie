@@ -413,27 +413,6 @@ impl FrameShell for Shell {
                     composition.rows(),
                 )
                 .map_err(model_exec::Error::Fire)?;
-                // The CUDA ragged kernel's reference mask is one tail per
-                // group: a group with two reference lanes would let them see
-                // each other, which the contract forbids, so it is refused
-                // here rather than computed wrong.
-                if self.feeds.reference_masked.contains(&select)
-                    && let Some((group, count)) = packed
-                        .references
-                        .iter()
-                        .enumerate()
-                        .find(|(_, count)| **count > 1)
-                {
-                    return Err(Fault::program(
-                        "serve::packing",
-                        format!(
-                            "attention group {group} carries {count} reference lanes, and \
-                             this shell's `attention.ragged` reference mask is one tail per \
-                             group (every reference row of a group would see every other's); \
-                             submit one reference lane per group"
-                        ),
-                    ));
-                }
                 packings.push(packed);
             }
             (groups, packings)

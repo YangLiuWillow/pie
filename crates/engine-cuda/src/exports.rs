@@ -648,10 +648,6 @@ pub(crate) struct Feeds {
     /// Every row selection a packing table is keyed by, in first-seen order
     /// (the order the inputs store carves them in).
     pub(crate) selections: Vec<model_ir::Selection>,
-    /// The selections whose `ReferenceTag` table a `RaggedMask::ReferenceSelfOnly`
-    /// reads on its query side — the ones whose groups may hold at most one
-    /// reference lane on this shell (the kernel has one tail per group).
-    pub(crate) reference_masked: Vec<model_ir::Selection>,
     /// Every float port merged STRAIGHT into a stream (`Value::merge` with
     /// the port as an arm): the merged column has no node writing that arm's
     /// rows, so the fire lands the port's rows in it before the walk — the
@@ -799,20 +795,6 @@ impl Feeds {
                     seat,
                     select,
                 });
-            }
-        }
-        for node in &trace.nodes {
-            if let model_ir::Operation::Attention(model_ir::Attention::Ragged {
-                mask: model_ir::RaggedMask::ReferenceSelfOnly { q_tags, .. },
-                ..
-            }) = &node.op
-                && let Def::Input(RuntimeInput::Geometry {
-                    kind: GeomKind::ReferenceTag { select },
-                    ..
-                }) = &trace.values[q_tags.0 as usize].def
-                && !feeds.reference_masked.contains(select)
-            {
-                feeds.reference_masked.push(*select);
             }
         }
         feeds

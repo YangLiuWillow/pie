@@ -1065,21 +1065,6 @@ impl<'c> Run<'c> {
             })
     }
 
-    /// The D2 reference tails (`[groups]` i32, the row of each group where its reference rows begin) of the selection a `ReferenceTag` input names — what the ragged kernel's reference mask reads.
-    pub(crate) fn reference_start_of(&self, tags: ValueId) -> Tensor {
-        let at = tags.0 as usize;
-        match &self.values[at].def {
-            Def::Input(RuntimeInput::Geometry {
-                kind: GeomKind::ReferenceTag { select },
-                ..
-            }) => self.packing(at, *select).reference_start,
-            other => panic!(
-                "value {at} is {other:?}, and a ragged reference mask names a `ReferenceTag` \
-                 table on its query side"
-            ),
-        }
-    }
-
     /// One float port's rectangle, carved at this fire's rows or lanes.
     fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
         self.fire
