@@ -156,6 +156,26 @@ def cases(args) -> list[str]:
 # ----------------------------------------------------------------------------
 
 
+def split(text: str, pieces: int) -> list[str]:
+    """`pieces` roughly equal cuts of `text`, none of them starting with `-`.
+
+    A case is a few hundred KB of floats and goes in as argv; an argv value
+    that starts with a minus is read as another FLAG, and the parameter
+    before it silently becomes a boolean (`invalid type: boolean true,
+    expected a string`). Every cut is therefore nudged forward off a minus
+    sign, which a JSON number list has one of every few characters.
+    """
+    step = -(-len(text) // pieces)
+    bounds = [0]
+    for i in range(1, pieces):
+        at = min(i * step, len(text))
+        while at < len(text) and text[at] == "-":
+            at += 1
+        bounds.append(max(at, bounds[-1]))
+    bounds.append(len(text))
+    return [text[bounds[i] : bounds[i + 1]] for i in range(pieces)]
+
+
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
     name = os.path.basename(os.path.normpath(inferlet))
@@ -204,9 +224,8 @@ def run(args) -> None:
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
-            step = -(-len(text) // PIECES)
-            for i in range(PIECES):
-                cmd += [f"--case_{i}", text[i * step : (i + 1) * step]]
+            for i, piece in enumerate(split(text, PIECES)):
+                cmd += [f"--case_{i}", piece]
         print(f"[run] {' '.join(cmd[:8])} ... ({len(text)} bytes of case)")
         done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
         with open(out[:-5] + ".stderr", "w") as f:
@@ -267,6 +286,89 @@ def collect(args) -> str:
 
 
 # ----------------------------------------------------------------------------
+# does the conditioning matter?
+# ----------------------------------------------------------------------------
+
+
+def one_run(args, case: dict) -> tuple[np.ndarray, np.ndarray]:
+    """One pie run of `case`, in memory — the video and audio answers."""
+    pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
+    binary = wasm(args.inferlet)
+    manifest = os.path.join(args.inferlet, "Pie.toml")
+    cmd = [pie]
+    if args.config:
+        cmd += ["--config", args.config]
+    cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+    for i, piece in enumerate(split(json.dumps(case), PIECES)):
+        cmd += [f"--case_{i}", piece]
+    done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+    if done.returncode != 0:
+        sys.stderr.write(done.stderr[-2000:])
+        raise SystemExit(f"pie run failed ({done.returncode})")
+    path = os.path.join(args.out, "matters.json")
+    with open(path, "w") as f:
+        f.write(done.stdout)
+    doc = document(path)
+    v = np.asarray(doc["video"], dtype=np.float32).reshape(doc["video_rows"], -1)
+    a = np.asarray(doc["audio"], dtype=np.float32).reshape(doc["audio_rows"], -1)
+    return v, a
+
+
+def matters(args) -> int:
+    """**EVERY CONDITIONING STREAM MOVES THE ANSWER.**
+
+    A parity gate can pass on a fixture whose cross-attentions read nothing:
+    a lane that never joined the fire's attention group contributes zero, and
+    on random-init weights zero is within tolerance. So perturb each
+    conditioning stream in turn and demand the velocity move by MORE than the
+    gate's own tolerance — the video by its text context and by the audio
+    stream (the a2v fold), the audio by its own text context and by the video
+    stream (the v2a fold).
+    """
+    paths = numbered(args.out, "case", "")
+    if not paths:
+        cases(args)
+        paths = numbered(args.out, "case", "")
+    base = json.load(open(paths[0]))
+    rng = np.random.default_rng(7)
+
+    def jolt(field: str) -> dict:
+        case = dict(base)
+        case[field] = (
+            np.asarray(base[field], dtype=np.float32)
+            + rng.normal(0, 1, len(base[field])).astype(np.float32)
+        ).tolist()
+        return case
+
+    v0, a0 = one_run(args, base)
+    floor = 1.0 - float(TOLERANCES[TOLERANCES.index("--cos-tol") + 1])
+    print(f"[matters] the gate's own slack is {floor:.1e} of cosine; a stream that matters "
+          f"must move its answer by more")
+    ok = True
+    for field, moves in [
+        ("context", ("video",)),
+        ("audio_context", ("audio",)),
+        ("audio_latents", ("audio", "video")),
+        ("latents", ("video", "audio")),
+    ]:
+        v, a = one_run(args, jolt(field))
+        for side, (mine, was) in {"video": (v, v0), "audio": (a, a0)}.items():
+            moved = 1.0 - float(
+                (mine.ravel() @ was.ravel())
+                / (np.linalg.norm(mine) * np.linalg.norm(was))
+            )
+            want = side in moves
+            good = moved > 10 * floor if want else True
+            ok = ok and good
+            print(
+                f"  {field:<14} -> {side:<5} 1 - cos = {moved:.2e}"
+                f"{'   MUST MOVE' if want else ''}{'' if good else '   FAILED'}"
+            )
+    print("PASS" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+# ----------------------------------------------------------------------------
 # compare
 # ----------------------------------------------------------------------------
 
@@ -294,7 +396,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
+    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all", "matters"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/ltx2-parity")
     ap.add_argument(
@@ -316,6 +418,8 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    if args.cmd == "matters":
+        return matters(args)
     if args.cmd == "case":
         cases(args)
     elif args.cmd == "run":

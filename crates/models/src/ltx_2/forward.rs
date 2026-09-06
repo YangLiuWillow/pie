@@ -158,7 +158,7 @@ impl Model {
             vec![
                 port(
                     "text",
-                    PortKind::Context,
+                    PortKind::Latents,
                     d.text_in(),
                     &[Stream::Text],
                     Some(port::TEXT),
@@ -313,13 +313,15 @@ impl Facts {
         Predicate::stream(STREAM_BASE, Stream::Audio)
     }
 
-    /// The VIDEO text context lane.
+    /// The VIDEO text context lane. `Stream::Text` and not `Context` for
+    /// the ORDER it puts the lane in: see the module doc.
     #[must_use]
     pub fn context() -> Predicate {
         Predicate::stream(STREAM_BASE, Stream::Context)
     }
 
-    /// The AUDIO text context lane.
+    /// The AUDIO text context lane, on `Stream::Context` for the same
+    /// reason.
     #[must_use]
     pub fn audio_context() -> Predicate {
         Predicate::stream(STREAM_BASE, Stream::Reference)
@@ -373,9 +375,19 @@ impl ForwardHybrid for Model {
         let arm = |code: u8| &arms[usize::from(code)];
 
         let velocity = denoise(arm(DENOISE), self);
-        let text_in = self.dims.text_in();
-        refine(arm(REFINE_VIDEO), &self.connectors.0, text_in);
-        refine(arm(REFINE_AUDIO), &self.connectors.1, text_in);
+        let (text_in, caption) = (self.dims.text_in(), self.dims.caption);
+        refine(
+            arm(REFINE_VIDEO),
+            &self.connectors.0,
+            text_in,
+            self.connectors.0.rescale(caption),
+        );
+        refine(
+            arm(REFINE_AUDIO),
+            &self.connectors.1,
+            text_in,
+            self.connectors.1.rescale(caption),
+        );
         velocity
     }
 }
@@ -612,12 +624,26 @@ struct BlockMods {
     prompt_ss: Value,
 }
 
+/// A fresh copy of a lane vector. `elementwise.add_bias` folds its bias IN
+/// PLACE (the IR aliases `out_out` onto `out`), and every table below is
+/// added to a vector the WHOLE STACK shares — one adaLN head serves all 48
+/// blocks — so each block must add its table to a copy or the second block
+/// reads the first block's table as well as its own.
+fn copy_of(v: &Value) -> Value {
+    ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(v, v))
+}
+
+/// `table + vector`, on a copy of the vector.
+fn table_add(table: &Weight, v: &Value) -> Value {
+    ops::elemwise::add_bias(table, &copy_of(v))
+}
+
 fn block_mods(side: &Side, s: &StreamMods, prompt: &Value, dim: u32) -> BlockMods {
     BlockMods {
-        m: adaln9(&ops::elemwise::add_bias(&side.table, &s.proj9), dim),
-        av: adaln_av(&ops::elemwise::add_bias(&side.av_ss_table, &s.av_ss), dim),
-        av_gate: ops::elemwise::add_bias(&side.av_gate_table, &s.av_gate),
-        prompt_ss: ops::elemwise::add_bias(&side.prompt_table, prompt),
+        m: adaln9(&table_add(&side.table, &s.proj9), dim),
+        av: adaln_av(&table_add(&side.av_ss_table, &s.av_ss), dim),
+        av_gate: table_add(&side.av_gate_table, &s.av_gate),
+        prompt_ss: table_add(&side.prompt_table, prompt),
     }
 }
 
@@ -801,15 +827,22 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
 
 /// A `refine.*` reading: one connector transformer over the packed trunk
 /// rows a text lane carries.
-fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32) {
+fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32, rescale: f32) {
     let g = Geom {
         lanes: arm.request_of_token(),
         positions: arm.axis_positions(port::TIME_POSITIONS, 1),
         perm: arm.row_permutation(),
         csr: arm.lane_indptr(),
     };
-    let x = arm.context(port::TEXT, text_in);
-    let mut h = linear(&conn.aggregate, &x);
+    // `W·(s·x) + b` with the reference's `sqrt(dim / caption_channels)`
+    // rescale moved to the far side of the projection, where it is one
+    // in-place scale of a fresh rectangle instead of a copy of the
+    // `caption·49`-wide port cell.
+    let x = arm.latents(port::TEXT, text_in, Dtype::Bf16);
+    let mut h = ops::elemwise::mul_scalar(rescale, &ops::linear::matmul(&x, &conn.aggregate.w));
+    if let Some(bias) = &conn.aggregate.bias {
+        h = ops::elemwise::add_bias(bias, &h);
+    }
     let dims = conn.rope_dims();
     for (_, b) in arm.walk_layers(&conn.blocks) {
         let n = rms(&h);

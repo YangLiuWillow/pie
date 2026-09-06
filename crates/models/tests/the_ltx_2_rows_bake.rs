@@ -38,6 +38,8 @@
 //! (i) the modulation is a per-lane f32 vector over a bf16 trunk — twelve
 //!     scale-shift sites a block and one per head — every gated fold aliases
 //!     its residual, and every attention ends in a per-head sigmoid gate
+//! (j) every per-block table is folded into a COPY of the vector its stream's
+//!     adaLN head hands the whole stack, never in place on the vector itself
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,8 +232,8 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             let (index, port) = refine.port("text").expect("the packed trunk rows");
             assert_eq!(
                 (index, port.kind, port.width),
-                (model::port::TEXT, PortKind::Context, d.text_in()),
-                "{sku} {name}"
+                (model::port::TEXT, PortKind::Latents, d.text_in()),
+                "{sku} {name}: a token-less reading states its rows through a latents port"
             );
             assert_eq!(refine.readout, ReadoutKind::Hidden);
         }
@@ -545,10 +547,64 @@ fn validate(facts: &models::Generative) {
                 reading
                     .ports
                     .iter()
-                    .any(|port| port.kind == PortKind::Latents || port.kind == PortKind::Context),
-                "a token-less reading states its rows through a row port"
+                    .any(|port| port.kind == PortKind::Latents),
+                "a token-less reading states its rows through a latents port"
             );
         }
+    }
+}
+
+/// (j)
+///
+/// `elementwise.add_bias` folds ITS BIAS IN PLACE (the IR aliases `out_out`
+/// onto `out`). One adaLN head serves all 48 blocks, so a block that added
+/// its own table straight onto that shared vector would hand block `n + 1`
+/// the sum of every table before it. The text copies first; this is the
+/// claim that it still does.
+#[test]
+fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
+    for sku in ROWS {
+        let plan = trace(sku, Platform::Cuda);
+        let lane_shaped = |id: ValueId| {
+            matches!(
+                &plan.values[id.0 as usize].ty,
+                Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Lanes)
+            )
+        };
+        let mut folded = 0usize;
+        for node in &plan.nodes {
+            let Operation::Elementwise(Elementwise::AddBias { out, .. }) = &node.op else {
+                continue;
+            };
+            if !lane_shaped(*out) {
+                continue;
+            }
+            // How many nodes read the rectangle this fold writes over?
+            let readers = plan
+                .nodes
+                .iter()
+                .filter(|other| {
+                    let mut ins = Vec::new();
+                    other.op.inputs(&mut ins);
+                    ins.contains(out)
+                })
+                .count();
+            assert_eq!(
+                readers,
+                1,
+                "{sku}: a bias folded in place on a lane vector {} other nodes also read",
+                readers - 1
+            );
+            folded += 1;
+        }
+        let d = dims(sku);
+        // Per block: four tables a stream. Outside them: the two heads' own
+        // `[temb | temb]` folds and the eight adaLN projections' biases.
+        assert!(
+            folded >= 8 * d.layers as usize,
+            "{sku}: {folded} lane-vector folds for {} blocks",
+            d.layers
+        );
     }
 }
 

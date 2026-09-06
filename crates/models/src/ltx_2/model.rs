@@ -193,8 +193,12 @@ pub mod port {
     pub const CONTEXT: u8 = 0;
     /// `denoise`: the audio text context, `[1024, 2048]` bf16.
     pub const AUDIO_CONTEXT: u8 = 1;
-    /// `refine.*`: the packed trunk stack, `[rows, caption·49]` bf16.
-    pub const TEXT: u8 = 2;
+    /// `refine.*`: the packed trunk stack, `[rows, caption·49]` bf16. A
+    /// LATENTS port and not a context one, at an index of its own: a
+    /// token-less reading states its lane's row count through its latents
+    /// port, and the runtime refuses one that does not
+    /// (`runtime::validate_generative`).
+    pub const TEXT: u8 = 1;
     /// The scheduler timestep `σ·1000`, `[lanes, 1]`, bound by EVERY lane
     /// of the `denoise` reading — the two context lanes modulate their own
     /// rows from the prompt timestep, so they carry a cell too.

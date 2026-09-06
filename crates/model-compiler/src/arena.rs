@@ -9,12 +9,12 @@
 //! row windows ([`ArenaMap::co_tenants`] and [`Concurrency`]).
 
 use model_ir::{
-    ClassSet, ClassTable, Def, Dim, Dtype, Operands, RowAxis, Trace, RuntimeInput, StructKind, Ty,
+    ClassSet, ClassTable, Def, Dim, Dtype, Operands, RowAxis, RuntimeInput, StructKind, Trace, Ty,
     ValueId,
 };
 
-use crate::compiled::Region;
 use crate::budget::Budgets;
+use crate::compiled::Region;
 use crate::error::{Error, Share, Unrectangled};
 
 /// Who reads an export after the graph has run — whose rows stay spoken for.
@@ -168,19 +168,29 @@ impl RowExpr {
 
     /// Does a windowed reader see only its own classes' rows? `Const` and
     /// `*Plus` variants reach past their own class, so cannot share.
+    ///
+    /// **`Lanes` does NOT cut.** A lane-shaped rectangle — a timestep
+    /// vector's chain — is computed at the fire's LANE carve and launched
+    /// WITHOUT the staged seat (`IMAGEGEN_CONTRACT.md` §7,
+    /// `engine_cuda::Run::unseated`), so its writer covers every lane of the
+    /// fire and not just its own class's. Two lane vectors of one shape in
+    /// two classes would otherwise be placed at one offset as "two row
+    /// windows of one column" and clobber each other — which is what a
+    /// dual-stream text with a modulation chain per stream (`models::ltx_2`)
+    /// hands the arena.
     #[must_use]
     pub fn cut_per_class(self) -> bool {
         match self {
             // `Patches` cuts for `Tokens`' reason, one axis over.
             RowExpr::Tokens
             | RowExpr::TokensTimes(_)
-            | RowExpr::Lanes
             | RowExpr::Patches
             | RowExpr::Images
             | RowExpr::Voxels
             | RowExpr::VoxelsTimes(_)
             | RowExpr::Clips => true,
-            RowExpr::Const(_)
+            RowExpr::Lanes
+            | RowExpr::Const(_)
             | RowExpr::LanesPlus(_)
             | RowExpr::ImagesPlus(_)
             | RowExpr::ClipsPlus(_) => false,
@@ -467,8 +477,10 @@ impl ArenaMap {
     /// offset/pitch, a cut window, and disjoint known classes.
     #[must_use]
     pub fn co_tenants(&self, a: ValueId, b: ValueId) -> bool {
-        let (Some(x), Some(y)) = (self.placements.get(a.0 as usize), self.placements.get(b.0 as usize))
-        else {
+        let (Some(x), Some(y)) = (
+            self.placements.get(a.0 as usize),
+            self.placements.get(b.0 as usize),
+        ) else {
             return false;
         };
         let (
@@ -627,7 +639,8 @@ pub(crate) fn carve(
 
 /// One slot per value, sized at the budget's ceiling, offset still zero.
 fn rectangles(trace: &Trace, budgets: &Budgets) -> Result<Vec<Placement>, Error> {
-    trace.values
+    trace
+        .values
         .iter()
         .enumerate()
         .map(|(id, decl)| {
@@ -705,12 +718,7 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
         Dtype::Bf16 | Dtype::F16 | Dtype::I16 | Dtype::U16 => Some(2),
         Dtype::F32 | Dtype::I32 | Dtype::U32 => Some(4),
         Dtype::I64 | Dtype::U64 => Some(8),
-        Dtype::U8
-        | Dtype::I8
-        | Dtype::E4m3
-        | Dtype::E5m2
-        | Dtype::E8m0
-        | Dtype::Bool => Some(1),
+        Dtype::U8 | Dtype::I8 | Dtype::E4m3 | Dtype::E5m2 | Dtype::E8m0 | Dtype::Bool => Some(1),
         // `U8g64` is byte-wide but still packed: it names a weight bank's
         // affine codes, meaningful only beside its group's scale and offset.
         Dtype::E2m1
@@ -763,7 +771,12 @@ fn fold_merges(trace: &Trace, placements: &mut [Placement]) -> Result<(), Error>
 }
 
 /// Put `shares` into `holds`'s column, or refuse if declared at two sizes.
-fn share(placements: &mut [Placement], kind: Share, holds: ValueId, shares: ValueId) -> Result<(), Error> {
+fn share(
+    placements: &mut [Placement],
+    kind: Share,
+    holds: ValueId,
+    shares: ValueId,
+) -> Result<(), Error> {
     let (h, s) = (root(placements, holds), root(placements, shares));
     if h == s {
         return Ok(());
@@ -875,7 +888,11 @@ fn outlive_the_region(trace: &Trace, conc: &Concurrency, spans: &mut [Option<Spa
 /// them in. Spans are the plan's, not a class's — a mixed fire runs every
 /// class's nodes at one wall clock, so a per-class span would call a value
 /// dead while a kernel is still reading it.
-fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<Option<Span>>, Vec<ClassSet>) {
+fn lives(
+    trace: &Trace,
+    placements: &[Placement],
+    classes: &ClassTable,
+) -> (Vec<Option<Span>>, Vec<ClassSet>) {
     let end = trace.nodes.len() as u32;
     // The reader with no class: the runtime, over every row.
     let everywhere = ClassSet::of(0..classes.classes.len());
@@ -901,7 +918,10 @@ fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<
         for seam in trace.seams.iter().filter(|s| s.seam == export.seam) {
             for value in &seam.values {
                 let root = root(placements, *value);
-                if !placements.get(root.0 as usize).is_some_and(Placement::is_arena) {
+                if !placements
+                    .get(root.0 as usize)
+                    .is_some_and(Placement::is_arena)
+                {
                     continue;
                 }
                 spans[root.0 as usize]
@@ -936,11 +956,17 @@ fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<
             continue;
         }
         let root = root(placements, ValueId(id as u32));
-        if !placements.get(root.0 as usize).is_some_and(Placement::is_arena) {
+        if !placements
+            .get(root.0 as usize)
+            .is_some_and(Placement::is_arena)
+        {
             continue;
         }
         spans[root.0 as usize]
-            .get_or_insert(Span { first: 0, last: end })
+            .get_or_insert(Span {
+                first: 0,
+                last: end,
+            })
             .first = 0;
     }
 
@@ -971,7 +997,10 @@ fn touch(
     // A merge is its column's life, not its own: reading a merged value
     // reads the column its arms wrote.
     let root = root(placements, value);
-    if !placements.get(root.0 as usize).is_some_and(Placement::is_arena) {
+    if !placements
+        .get(root.0 as usize)
+        .is_some_and(Placement::is_arena)
+    {
         return;
     }
     match &mut spans[root.0 as usize] {
@@ -1171,7 +1200,10 @@ mod tests {
         assert_eq!(RowExpr::of(Dim::Const(7)).max(&b), 7);
         // …and a fire smaller than the ceiling uses fewer.
         assert_eq!(RowExpr::of(Dim::Tokens).at(FireRows::text_only(3, 2)), 3);
-        assert_eq!(RowExpr::of(Dim::LanesPlus(1)).at(FireRows::text_only(3, 2)), 3);
+        assert_eq!(
+            RowExpr::of(Dim::LanesPlus(1)).at(FireRows::text_only(3, 2)),
+            3
+        );
     }
 
     #[test]
@@ -1234,5 +1266,4 @@ mod tests {
             }),
         );
     }
-
 }

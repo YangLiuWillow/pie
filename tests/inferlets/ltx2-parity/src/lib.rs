@@ -248,10 +248,10 @@ async fn denoise(case: &Case) -> Result<(Vec<f32>, Vec<f32>)> {
     // One pipeline per lane, submitted back to back.
     let (pv_pipe, pa_pipe) = (Pipeline::new(), Pipeline::new());
     let (pc_pipe, pac_pipe) = (Pipeline::new(), Pipeline::new());
-    ctx.submit(&pc_pipe).context("video context lane")?;
-    actx.submit(&pac_pipe).context("audio context lane")?;
     video.submit(&pv_pipe).context("video lane")?;
     audio.submit(&pa_pipe).context("audio lane")?;
+    ctx.submit(&pc_pipe).context("video context lane")?;
+    actx.submit(&pac_pipe).context("audio context lane")?;
 
     let v = out_v.take_host::<Vec<f32>>().await?;
     let a = out_a.take_host::<Vec<f32>>().await?;

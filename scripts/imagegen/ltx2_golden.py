@@ -93,9 +93,37 @@ AUDIO_SIGMA = 0.909375
 
 
 def seeded(module: torch.nn.Module, seed: int = 0) -> torch.nn.Module:
+    """A fixture initialisation that DISCRIMINATES, re-drawn from one seed.
+
+    Not `0.02 * randn` over every parameter, which is what the other goldens
+    do: LTX's modulation is `scale_shift_table + adaLN(t)` and its attention
+    answer is scaled by `2 sigmoid(W x)`, so flattening every parameter to a
+    tiny normal drives every gate to a half of a half and every scale and
+    shift to nothing — the fixture would then be nearly `proj_out(norm(
+    proj_in(x)))` and would not discriminate a modulation bug from a typo.
+    Torch's own `reset_parameters` (and the `randn / sqrt(dim)` tables the
+    reference states) keep the gates near one and the modulation alive."""
     g = torch.Generator().manual_seed(seed)
-    for _, p in sorted(module.named_parameters()):
-        p.data = (0.02 * torch.randn(p.shape, generator=g)).to(dtype=p.dtype)
+    for name, p in sorted(module.named_parameters()):
+        if p.dim() >= 2 and "scale_shift_table" not in name and "registers" not in name:
+            # `nn.Linear`'s own kaiming-uniform bound.
+            bound = math.sqrt(1.0 / p.shape[-1])
+            p.data = ((torch.rand(p.shape, generator=g) * 2 - 1) * bound).to(dtype=p.dtype)
+        elif "norm_q" in name or "norm_k" in name:
+            # An across-heads RMS gain sits at one; a gain of 0.06 would make
+            # every attention logit vanish and every softmax uniform, and the
+            # gate could then not tell a wrong rope from a right one.
+            p.data = (1.0 + 0.02 * torch.randn(p.shape, generator=g)).to(dtype=p.dtype)
+        elif "scale_shift_table" in name or "registers" in name:
+            # The modulation tables at unit scale, NOT the reference's
+            # `randn / sqrt(dim)`: every gate is then O(1) and a dropped or
+            # mis-sliced fold moves the answer instead of hiding under the
+            # tolerance. The trained tables are O(1) too.
+            p.data = torch.randn(p.shape, generator=g).to(dtype=p.dtype)
+        else:
+            p.data = (torch.randn(p.shape, generator=g) / math.sqrt(p.shape[-1])).to(
+                dtype=p.dtype
+            )
     return module
 
 

@@ -118,17 +118,13 @@ fn stream(
     biased(b, &s.patchify, proj_in)?;
     // The nine slices, `(shift, scale)` exchanged in each of the three sets.
     adaln(b, &s.adaln, time_embed, dim, &[1, 0, 2, 4, 3, 5, 7, 6, 8])?;
-    // `linear_2` twice over, for the head's `[temb | temb]`.
+    // `linear_2` twice over, for the head's `[temb | temb]`. Stated as ONE
+    // gather of its rows twice rather than a concatenation of the tensor
+    // with itself: a `Concat` whose two parts are the same whole `Src` does
+    // not lower (the executor walks it as a two-row run).
     let l2 = format!("{time_embed}.emb.timestep_embedder.linear_2");
-    let twice = |tail: &str| {
-        Expr::concat(
-            0,
-            vec![
-                Expr::src(format!("{l2}.{tail}")),
-                Expr::src(format!("{l2}.{tail}")),
-            ],
-        )
-    };
+    let rows: Vec<i64> = (0..i64::from(dim)).chain(0..i64::from(dim)).collect();
+    let twice = |tail: &str| Expr::src(format!("{l2}.{tail}")).gather(0, rows.clone());
     b.read_expr(&s.head_proj.w, twice("weight"))?;
     b.read_expr(
         s.head_proj
@@ -290,18 +286,15 @@ fn feed_forward(b: &mut Builder, ff: &Ffn, stem: &str) -> Result<(), Error> {
 /// One connector: its input projection (with the reference's input rescale
 /// folded in) and its blocks.
 fn connector(b: &mut Builder, conn: &Connector, stem: &str, caption: u32) -> Result<(), Error> {
-    let proj = format!("connectors.{stem}_text_proj_in");
-    // `W · (s · x) + b`: the scale rides the bank, never the bias.
-    b.read_expr(
-        &conn.aggregate.w,
-        Expr::src(format!("{proj}.weight")).scale(conn.rescale(caption)),
-    )?;
-    b.read(
-        conn.aggregate
-            .bias
-            .as_ref()
-            .expect("the aggregate projection is biased"),
-        format!("{proj}.bias"),
+    let _ = caption;
+    // A plain read: the reference's `sqrt(dim / caption_channels)` rescale of
+    // the INPUT is `s·(W·x) + b` on the other side of the projection, and
+    // the plan applies it there (`forward.rs`) — `Expr::scale` needs a
+    // kernel the import path cannot lower.
+    biased(
+        b,
+        &conn.aggregate,
+        &format!("connectors.{stem}_text_proj_in"),
     )?;
     for (l, block) in conn.blocks.iter().enumerate() {
         let at = format!("connectors.{stem}_connector.transformer_blocks.{l}");
@@ -369,8 +362,13 @@ fn banded(
 }
 
 /// The permutation itself: `order.len()` consecutive `width`-wide bands of
-/// `axis`, concatenated in the plan's order.
+/// `axis`, concatenated in the plan's order. An order that permutes nothing
+/// is the tensor (a one-slice "cut" would be a slice covering its whole
+/// axis, which the contract refuses as a way of saying its operand).
 fn reordered(from: &str, order: &[i64], width: i64, axis: u8) -> Expr {
+    if order.iter().enumerate().all(|(at, &i)| i as usize == at) {
+        return Expr::src(from.to_string());
+    }
     let take = |i: i64| Expr::src(from.to_string()).slice(axis, i * width, width);
     Expr::concat(axis, order.iter().map(|&i| take(i)).collect())
 }

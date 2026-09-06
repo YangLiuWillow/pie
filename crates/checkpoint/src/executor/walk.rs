@@ -12,7 +12,6 @@ use std::collections::HashSet;
 
 use super::iq_grid;
 use super::{Progress, Residency};
-use crate::consume::SourceLedger;
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
@@ -20,6 +19,7 @@ use crate::codec::mlx::decode_mlx_affine_codes;
 use crate::codec::mlx::mlx_affine_group_params_bits;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
 use crate::codec::rows::{EncodeOperand, encode_rows};
+use crate::consume::SourceLedger;
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
 use crate::executor::sink::TensorSink;
@@ -149,8 +149,9 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
             StorageInstr::Allocate { buffer, .. } | StorageInstr::Fill { buffer, .. } => {
                 touch(*buffer);
             }
-            StorageInstr::ExtentWrite { dest, .. }
-            | StorageInstr::GatherWrite { dest, .. } => touch(dest.buffer),
+            StorageInstr::ExtentWrite { dest, .. } | StorageInstr::GatherWrite { dest, .. } => {
+                touch(dest.buffer)
+            }
             StorageInstr::BulkExtentWrite { .. } => {}
             StorageInstr::TileMap {
                 inputs,
@@ -1118,7 +1119,16 @@ impl Walk<'_, '_> {
             // GGUF blocks); `Cast` preserves element count, not byte count.
             // Every other kind must move the same byte count it read.
             if kind == TileMapKind::Cast {
-                require_same_element_count(source_stride, &dest.stride)?;
+                // What a cast must fill is the DESTINATION's bytes, and the
+                // conversion above has already produced them. Comparing the
+                // two extents' dim products instead holds only while the
+                // SOURCE extent is element-shaped: a source the walk
+                // collapsed into RUNS — a gather or a concatenation that
+                // reads one contiguous block of its source more than once,
+                // which is how a family states `[x | x]` — carries its
+                // elements in `element_bytes` and not in `dims`.
+                let _ = source_stride;
+                require_cast_output_fits(output.len(), &dest.stride)?;
             } else if transform.scale_blocks.is_empty()
                 && kind != TileMapKind::Decode
                 && kind != TileMapKind::Repack
@@ -2305,20 +2315,20 @@ fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> 
     Ok(())
 }
 
-/// A cast is well-formed when the two sides hold the same number of
-/// *elements*; the widths differ by exactly the representations' ratio.
-fn require_same_element_count(source: &Extent, dest: &Extent) -> Result<(), Error> {
-    let count = |extent: &Extent| -> Option<i64> {
-        extent
-            .dims
-            .iter()
-            .try_fold(1i64, |acc, dim| acc.checked_mul(dim.count))
-    };
-    let (source_count, dest_count) = (count(source), count(dest));
-    if source_count.is_none() || source_count != dest_count {
+/// A cast is well-formed when what it produced fills the destination
+/// exactly: the element counts agree on both sides and the widths differ by
+/// the representations' ratio, which is the same statement in BYTES — and
+/// the only one that holds however the source extent was shaped.
+fn require_cast_output_fits(produced: usize, dest: &Extent) -> Result<(), Error> {
+    let wanted = dest
+        .dims
+        .iter()
+        .try_fold(i64::from(dest.element_bytes), |acc, dim| {
+            acc.checked_mul(dim.count)
+        });
+    if wanted != i64::try_from(produced).ok() {
         return Err(invalid(format!(
-            "cast source holds {source_count:?} elements but the destination holds \
-             {dest_count:?}"
+            "the cast produced {produced} bytes and the destination holds {wanted:?}"
         )));
     }
     Ok(())
