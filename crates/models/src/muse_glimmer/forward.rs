@@ -223,6 +223,13 @@ impl ForwardHybrid for Model {
         // the softcap is the head's own epilogue.
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps) * m.output_multiplier;
         let logits = ops::linear::lm_head(&x, &m.lm_head);
+        // This rank landed its COLUMNS of the logits; the plan wants all of
+        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
+        let logits = if m.lm_head.dim(0) < u64::from(m.vocab) {
+            ops::collective::all_gather(&logits, m.tp)
+        } else {
+            logits
+        };
         ops::attn::logit_softcap(&logits, m.softcap)
     }
 }
