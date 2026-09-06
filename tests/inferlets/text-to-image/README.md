@@ -22,20 +22,23 @@ The config must bind a generative row (`pie model list` marks one
 job is 4096 latent rows a lane and the frame carries two fires, so the 4096
 default refuses the second fire by name.
 
-What arrives in `./out` is the final latent under the name the guest gave it
-(`image.latent.f32`), plus the JSON report on stdout, which is its sidecar.
-`scripts/imagegen/decode_latent.py` finishes the job with the checkpoint's own
-diffusers VAE:
+Two exits, and which one a model gets is its own fact.
+
+A row that declares a drivable `vae.decode` reading gets `./out/image.png`:
+the guest fires the VAE on the voxel axis, reads the `pixels` seam with
+`intrinsics::pixels()`, and hands the channel's cell to `send_frames`, so the
+picture never enters WASM memory. The report says `"decoded": true`.
+
+A row whose VAE is traced but not declared as a reading (FLUX.2 today: its
+decoder's mid-block attention has no kernel arm) gets the final latent under
+the name the guest gave it, `./out/image.latent.f32`, plus the JSON report on
+stdout, which is its sidecar. `scripts/imagegen/decode_latent.py` finishes the
+job with the checkpoint's own diffusers VAE:
 
 ```bash
 python scripts/imagegen/decode_latent.py --latent ./out/image.latent.f32 \
     --sidecar ./out/image.json --model-dir <the diffusers folder> --out ./out/image.png
 ```
-
-The `vae.decode` reading FLUX.2 and Z-Image declare is the exit this is meant
-to take (`session.send-frames`, pixels never entering WASM memory); the two
-guest verbs that would drive it are not in the SDK yet, so the guest reports
-the reading it saw and takes the latent exit instead.
 
 ## How it finds its way around
 

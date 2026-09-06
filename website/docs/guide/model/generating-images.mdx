@@ -154,19 +154,23 @@ Running text-to-image@0.1.0 on default
 
 ## What comes back
 
-Pixels never enter the guest's memory. A decode stage writes into a host-held
-`frames` handle, and `session.send-frames` encodes it and streams the bytes to
-the client without materializing them in WebAssembly linear memory. The client
-receives a file with the name the inferlet suggested, and `pie run -o DIR`
-writes it there under that name.
+Pixels never enter the guest's memory. A `vae.decode` reading lands its output
+on the `pixels` seam; the pass's epilogue reads that seam with
+`intrinsics::pixels()` and puts it on a channel; `Channel::take_frames` turns
+that channel's cell into a host-held `frames` handle without lifting it into
+linear memory; and `session.send-frames` encodes it and streams the bytes to
+the client. The client receives a file with the name the inferlet suggested,
+and `pie run -o DIR` writes it there under that name. On a row that takes this
+exit the file is `image.png`, the report says `"decoded": true`, and there is
+nothing left to do.
 
-Today `text-to-image` takes the other exit. The `vae.decode` reading is in the
-catalog, as the `pie model info` output above shows, but the two guest verbs it
-needs (a channel-fed voxel port and a `pixels()` intrinsic) are not in the SDK
-yet. So the guest sends the final latent as raw little-endian f32 through
-`session.send-file-as`, under a name that says what it is, and returns the
-geometry a decoder needs as its JSON report. Write the report beside the latent
-and finish the job with the checkpoint's own VAE:
+Which exit a model gets is its own fact. A model whose VAE is traced but not
+declared as a reading takes the other one, and FLUX.2 is such a model today:
+its decoder's mid-block attention has no kernel arm, so its pixels would not be
+the reference implementation's. The guest then sends the final latent as raw
+little-endian f32 through `session.send-file-as`, under a name that says what
+it is, and returns the geometry a decoder needs as its JSON report. Write the
+report beside the latent and finish the job with the checkpoint's own VAE:
 
 ```bash
 python scripts/imagegen/decode_latent.py \
@@ -182,9 +186,10 @@ prompt  'a red bicycle leaning on a blue wall'  steps 4  seed 0
 wrote   ./out/image.png  1024x1024
 ```
 
-When the decode reading becomes drivable the guest reports `"decoded": true`
-and the file that arrives is `image.png`. The command above is the only step
-that changes.
+`decode_latent.py` is family-aware where the guest is not: the sidecar carries
+the geometry, and the VAE's own normalization is the decode arm's business, so
+the script reads `--family`. When FLUX.2's decoder gains its kernel arm the run
+sends `image.png` directly and this step goes away.
 
 ## Inside the inferlet
 
