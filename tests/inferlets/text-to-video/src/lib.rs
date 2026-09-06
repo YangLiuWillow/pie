@@ -63,6 +63,18 @@
 //! is 81 MB of f32 through the boundary and 20 MB of RGB8 back) and the fix
 //! is a seam that appends rather than replaces, not a change here.
 //!
+//! # CFG IS THE SHAPE OF A LOOP, NOT A VERIFIED ONE
+//!
+//! A model with no `guidance` port takes a negative prompt as a second lane
+//! PAIR whose velocity the HOST combines (an epilogue reads its own lane's
+//! `velocity()` only, so the device form would need one lane's epilogue to
+//! see another's within one fire, which the channel contract does not
+//! promise). That path is written here and DOES NOT RUN: four lanes on
+//! `wan22-ti2v-5b` refuse with "no cell available" at the first readback —
+//! the two branches' `out` channels are taken in the same turn and one of
+//! them has no committed cell yet. Measured 2026-09-06; the single-branch
+//! path at `guidance: 1.0` is what has produced a clip.
+//!
 //! # THE PROMPT, AND THE ROW WHOSE TOKENIZER PIE CANNOT SPELL
 //!
 //! `--prompt` renders the bound model's template and tokenizes with the

@@ -98,6 +98,16 @@ passes `None`. Bending by a 1950-row volume instead put nineteen of twenty
 steps above sigma 0.58 and left the last one to do the denoising: it still
 produced a recognisable clip, which is exactly why it is written down.
 
+### CFG does not run yet
+
+A model with no `guidance` port takes a negative prompt as a second lane pair
+whose velocity the host combines. That path is written and refuses: four lanes
+on `wan22-ti2v-5b` die with `no cell available` at the first readback, because
+the two branches' `out` channels are taken in the same turn and one has no
+committed cell yet. Measured 2026-09-06. The clip in the gate is the
+single-branch path at `guidance: 1.0`, which is why it is more saturated and
+less faithful than the reference's UniPC-8-at-CFG-5.
+
 ## Gate
 
 ```bash
