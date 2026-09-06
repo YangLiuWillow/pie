@@ -1224,6 +1224,27 @@ impl ProcessCtx {
             port_bindings,
             float_rows,
         ) = {
+            // The port channels' shapes, looked up before the pass is
+            // borrowed: `input` validated each against the reading it found
+            // the port in, which may not be the reading `program` resolves
+            // (a port bound before `reading` was named), so every port is
+            // re-checked against the resolved reading's fact below.
+            let port_cells: Vec<(String, Vec<u32>, Dtype)> = {
+                let pass = self.ctx().table.get(&this)?;
+                pass.bindings
+                    .ports
+                    .iter()
+                    .map(|port| (port.name.clone(), port.channel_rep))
+                    .collect::<Vec<_>>()
+            }
+            .into_iter()
+            .map(|(name, rep)| {
+                let resource: Resource<Channel> = Resource::new_borrow(rep);
+                let cell = self.ctx().table.get(&resource)?.cell.clone();
+                let cell = cell.lock().unwrap();
+                Ok::<_, anyhow::Error>((name, cell.shape.clone(), cell.dtype))
+            })
+            .collect::<Result<_, _>>()?;
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -1312,22 +1333,6 @@ impl ProcessCtx {
                     stream_names(reading)
                 )));
             }
-            // A float lane's rows are its latents port's.
-            let float_rows = if wants_tokens {
-                None
-            } else {
-                match port_rows(&pass.bindings.ports) {
-                    Ok(Some(rows)) => Some(rows),
-                    Ok(None) => {
-                        return Ok(Err(format!(
-                            "reading `{}` embeds no tokens and this pass bound no `[rows, ·]` \
-                             port; nothing states its lane's row count",
-                            reading.map_or("", |reading| reading.name)
-                        )));
-                    }
-                    Err(error) => return Ok(Err(error)),
-                }
-            };
             // This runtime fires a lane either through its KV working set
             // (tokens, geometry ports) or as a float lane (rows from a
             // port, no sequence); a reading with one but not the other has
@@ -1348,11 +1353,62 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
+            let mut port_bindings = pass.bindings.ports.clone();
+            if let Some(reading) = reading {
+                for binding in &mut port_bindings {
+                    let Some((index, fact)) = reading.port(&binding.name) else {
+                        continue; // refused above
+                    };
+                    let Some((_, shape, dtype)) =
+                        port_cells.iter().find(|(name, _, _)| *name == binding.name)
+                    else {
+                        continue;
+                    };
+                    match validate_port_channel(fact, shape, *dtype) {
+                        Ok(rows) => binding.rows = rows,
+                        Err(error) => {
+                            return Ok(Err(format!("reading `{}`: {error}", reading.name)));
+                        }
+                    }
+                    if fact.kind == models::PortKind::Latents
+                        && let Some(rows) = binding.rows
+                        && let Some(generative) = crate::model::model().generative()
+                        && rows > generative.max_rows
+                    {
+                        return Ok(Err(format!(
+                            "port `{}` binds {rows} latent rows; this model carries at most {} \
+                             (`model.max-latent-rows()`)",
+                            binding.name, generative.max_rows
+                        )));
+                    }
+                    binding.kind = engine_port_kind(fact.kind);
+                    binding.port = index;
+                }
+                if let Err(error) = port_rows(&port_bindings) {
+                    return Ok(Err(error));
+                }
+            }
+            // A float lane's rows are its latents port's.
+            let float_rows = if wants_tokens {
+                None
+            } else {
+                match port_rows(&port_bindings) {
+                    Ok(Some(rows)) => Some(rows),
+                    Ok(None) => {
+                        return Ok(Err(format!(
+                            "reading `{}` embeds no tokens and this pass bound no `[rows, ·]` \
+                             port; nothing states its lane's row count",
+                            reading.map_or("", |reading| reading.name)
+                        )));
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
             let lane_facts = LaneFacts {
                 reading: reading.map_or(0, |reading| reading.index),
                 stream: lane_stream_of(stream),
                 group: pass.bindings.group,
-                ports: pass.bindings.ports.iter().map(PortBinding::feed).collect(),
+                ports: port_bindings.iter().map(PortBinding::feed).collect(),
             };
             (
                 embed,
@@ -1369,7 +1425,7 @@ impl ProcessCtx {
                 pass.bindings.max_layers,
                 pass.bindings.block_draft,
                 lane_facts,
-                pass.bindings.ports.clone(),
+                port_bindings,
                 float_rows,
             )
         };
