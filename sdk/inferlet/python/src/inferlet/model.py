@@ -21,6 +21,10 @@ from dataclasses import dataclass
 from wit_world.imports import model as _model
 
 ForwardKind = _model.ForwardKind
+LaneStream = _model.LaneStream
+PortKind = _model.PortKind
+ReadoutKind = _model.ReadoutKind
+ScheduleKind = _model.ScheduleKind
 
 from .tokenizer import (  # noqa: F401 — re-exported, as the Rust `model` module does
     encode,
@@ -160,3 +164,32 @@ def rs_fold_granularity() -> int:
 def arena_block_size() -> int:
     """Bytes in one unified-arena accounting block."""
     return _model.arena_block_size()
+
+
+# -- generative facts (imagegen design D12) ----------------------------------
+
+
+def readings() -> list:
+    """Every reading the bound model declares (`model.ReadingFact`), in
+    index order; empty for a text row (one implicit reading)."""
+    return _model.readings()
+
+
+def reading(name: str):
+    """The declared reading named `name`, or ``None``."""
+    return next((r for r in _model.readings() if r.name == name), None)
+
+
+def latent():
+    """The latent space a denoiser works in (`model.LatentSpace`), or ``None``."""
+    return _model.latent()
+
+
+def schedule():
+    """The schedule the denoiser was trained under (`model.ScheduleFact`), or ``None``."""
+    return _model.schedule()
+
+
+def max_latent_rows() -> int:
+    """The most latent rows one pass carries; 0 without a float lane."""
+    return _model.max_latent_rows()

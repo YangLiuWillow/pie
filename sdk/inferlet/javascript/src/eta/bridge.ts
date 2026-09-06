@@ -635,6 +635,34 @@ export class ForwardPass {
     wit('attention', () => (this.wit as witAttention.ForwardPass).attention(kv.ws, this.kvGeometryWit(kv)));
   }
 
+  /** Which of the family's declared readings (`model.readings()`) this pass
+   * runs — `"text"`, `"denoise"`, `"vae.decode"`, ... (imagegen design D1).
+   * Optional when the model declares at most one; before the program. */
+  reading(name: string): void {
+    this.requireKind(['attention', 'diffusion'], 'reading');
+    wit('reading', () => (this.wit as witAttention.ForwardPass).reading(name));
+  }
+
+  /** Bind `ch` to the reading's float port `port`, read at every submit from
+   * its committed cell. The host validates the shape; the program must
+   * declare the channel (a stage of the author's must touch it). */
+  input(port: string, ch: Channel): void {
+    this.requireKind(['attention', 'diffusion'], 'input');
+    wit('input', () => (this.wit as witAttention.ForwardPass).input(port, ch.wit()));
+  }
+
+  /** Which lane stream this pass's rows are (design D2). Default `'text'`. */
+  stream(s: witModel.LaneStream): void {
+    this.requireKind(['attention', 'diffusion'], 'stream');
+    wit('stream', () => (this.wit as witAttention.ForwardPass).stream(s));
+  }
+
+  /** Put this pass's lanes in attention group `id` within a frame. */
+  group(id: number): void {
+    this.requireKind(['attention', 'diffusion'], 'group');
+    wit('group', () => (this.wit as witAttention.ForwardPass).group(id));
+  }
+
   /** Which reading this diffusion pass runs (`'encode'` or `'denoise'`).
    * REQUIRED, once, before the first submit. */
   canvas(mode: witDiffusion.Mode): void {

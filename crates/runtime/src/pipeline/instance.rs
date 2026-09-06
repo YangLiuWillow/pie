@@ -169,6 +169,112 @@ pub struct ForwardBindings {
     /// pass's NEXT submit, taken by it. `None` between submits and on every
     /// encode pass.
     pub self_cond: Option<SelfCondPayload>,
+    /// `forward-pass.reading`: which of the family's declared readings this
+    /// pass runs, resolved to its index against `Model::readings()`. `None`
+    /// until stated; `program` falls back to the family's sole reading, or
+    /// to the implicit reading 0 of a text row.
+    pub reading: Option<u8>,
+    /// `forward-pass.stream`: which lane stream this pass's rows are.
+    /// `None` is `Text`.
+    pub stream: Option<models::Stream>,
+    /// `forward-pass.group`: the attention group this pass's lanes join.
+    pub group: Option<u32>,
+    /// `forward-pass.input`: the reading's float ports, each bound to a
+    /// channel whose committed cell feeds it at every submit.
+    pub ports: Vec<PortBinding>,
+}
+
+/// One float port bound by `forward-pass.input`, validated against the
+/// reading's `PortFact` at the verb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortBinding {
+    /// The port's name, as the family states it.
+    pub name: String,
+    /// The engine's port kind.
+    pub kind: ::engine::fire::PortKind,
+    /// The family's index for a port of this kind.
+    pub port: u8,
+    /// The channel resource, so `program` can check it is bound into the
+    /// pass's program.
+    pub channel_rep: u32,
+    /// The channel's engine-registered id (`ChannelCell::global_id`).
+    pub channel_id: u64,
+    /// The channel's leading extent for a `[rows, width]` port; `None` for
+    /// a lane vector.
+    pub rows: Option<u32>,
+}
+
+impl PortBinding {
+    /// The feed the engine reads this port from.
+    #[must_use]
+    pub fn feed(&self) -> ::engine::fire::PortFeed {
+        ::engine::fire::PortFeed {
+            kind: self.kind,
+            port: self.port,
+            channel: self.channel_id,
+        }
+    }
+}
+
+/// What every lane of a bound pass is stamped with beyond its rows (design
+/// D1/D2): its reading, stream, group and port feeds. Copied from
+/// [`ForwardBindings`] at bind, resolved once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaneFacts {
+    pub reading: u8,
+    pub stream: ::engine::fire::LaneStream,
+    pub group: Option<u32>,
+    pub ports: Vec<::engine::fire::PortFeed>,
+}
+
+impl LaneFacts {
+    /// Stamp these facts onto every lane of `req`.
+    pub fn stamp(&self, req: &mut crate::engine::FireRequest) {
+        for lane in &mut req.lanes {
+            lane.reading = self.reading;
+            lane.stream = self.stream;
+            lane.group = self.group;
+            lane.ports = self.ports.clone();
+        }
+    }
+}
+
+/// A catalog stream as the engine's lane stream (codes agree).
+#[must_use]
+pub fn lane_stream_of(stream: models::Stream) -> ::engine::fire::LaneStream {
+    use ::engine::fire::LaneStream;
+    match stream {
+        models::Stream::Text => LaneStream::Text,
+        models::Stream::Image => LaneStream::Image,
+        models::Stream::Video => LaneStream::Video,
+        models::Stream::Audio => LaneStream::Audio,
+        models::Stream::Context => LaneStream::Context,
+        models::Stream::Reference => LaneStream::Reference,
+    }
+}
+
+/// The engine's lane stream as the catalog spells it.
+#[must_use]
+pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> models::Stream {
+    use ::engine::fire::LaneStream;
+    match stream {
+        LaneStream::Text => models::Stream::Text,
+        LaneStream::Image => models::Stream::Image,
+        LaneStream::Video => models::Stream::Video,
+        LaneStream::Audio => models::Stream::Audio,
+        LaneStream::Context => models::Stream::Context,
+        LaneStream::Reference => models::Stream::Reference,
+    }
+}
+
+/// A pass that fires a FLOAT LANE: a reading with no KV space and no token
+/// rows (a DiT's denoise step, a VAE tile), whose rows are its latents
+/// port's and whose only state is its channels. Such a pass takes the
+/// float fire path (`pipeline::fire::float`) rather than the KV one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatLane {
+    /// The lane's row count: the latents port's channel rows.
+    pub rows: u32,
 }
 
 /// One staged self-conditioning payload: `canvas * taps` ids and weights,
@@ -352,6 +458,15 @@ pub struct BoundForwardPass {
     /// Host mirror of the instance's committed channel state (seeds, then
     /// per-fire stage folds) — the value oracle for evaluated fire geometry.
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
+    /// What every lane of this pass is stamped with (reading, stream,
+    /// group, port feeds), resolved from the bindings at bind.
+    pub lane: LaneFacts,
+    /// `Some` iff this pass fires a float lane (no KV, no tokens). Then
+    /// [`BoundForwardPass::kv_ws`] is a SCRATCH working set the host
+    /// minted at bind to seat the lane and hold its fire lease — it
+    /// reserves no pages, the guest never sees it, and `close_native`
+    /// releases it.
+    pub float: Option<FloatLane>,
     /// Idempotency guard for [`ForwardPass::close_native`], set the first
     /// time native cleanup runs (explicit WIT drop, or this type's `Drop`
     /// fallback), guarding against double-closing.

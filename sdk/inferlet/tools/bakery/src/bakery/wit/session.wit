@@ -1,6 +1,7 @@
 interface session {
 
-    use types.{blob};
+    use types.{blob, error};
+    use frames.{frames, pcm, image-format, audio-format};
 
     // Sends a message to the remote user client
     send: func(message: string);
@@ -13,6 +14,28 @@ interface session {
 
     // Receives an incoming file from the remote user client
     receive-file: async func() -> option<blob>;
+
+    /// Encodes `f` and streams the bytes to the client under `name`, WITHOUT
+    /// the encoded file ever entering WASM linear memory.
+    ///
+    /// This is `send-file` for a handle rather than a buffer, and the
+    /// difference is the whole point: `send-file(f.encode(format))` produces
+    /// the same file having first copied every byte of it into the guest's
+    /// heap. A 121-frame clip is tens of megabytes; a guest that only wants
+    /// the client to have it should never hold it.
+    ///
+    /// `name` is a suggested file name, carried beside the bytes to the
+    /// client (`pie run -o DIR` writes it there under this name). It is a
+    /// suggestion, not a path: the client sanitises it.
+    send-frames: func(f: borrow<frames>,
+                      format: image-format,
+                      name: string) -> result<_, error>;
+
+    /// `send-frames` for audio. Same statute: the samples are encoded
+    /// host-side and streamed out, never materialized in linear memory.
+    send-pcm: func(p: borrow<pcm>,
+                   format: audio-format,
+                   name: string) -> result<_, error>;
 
     /// `receive` for a guest that cannot lower an `async func` (see
     /// `channel.take-blocking`): the guest's task blocks until a message

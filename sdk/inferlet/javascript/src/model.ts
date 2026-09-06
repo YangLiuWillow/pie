@@ -7,7 +7,7 @@
 // separated the two interfaces.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
-import type { BlockDrafter, CanvasShape } from 'pie:inferlet/model@0.3.0';
+import type { BlockDrafter, CanvasShape, LatentSpace, ReadingFact, ScheduleFact } from 'pie:inferlet/model@0.3.0';
 
 // The tokenizer surface lives in the sibling `tokenizer` module and is
 // re-exported here, so `model.encode`/`model.decode` read off `model` the way
@@ -124,4 +124,45 @@ export function arenaBlockSize(): number {
   return Number(_model.arenaBlockSize());
 }
 
-export type { BlockDrafter, CanvasShape, ForwardKind } from 'pie:inferlet/model@0.3.0';
+// -- generative facts (imagegen design D12) ---------------------------------
+
+/** Every reading the bound model declares, in index order; empty for a text
+ *  row (one implicit reading). */
+export function readings(): ReadingFact[] {
+  return _model.readings();
+}
+
+/** The declared reading named `name`, if any. */
+export function reading(name: string): ReadingFact | undefined {
+  return _model.readings().find((r) => r.name === name);
+}
+
+/** The latent space a denoiser works in; `undefined` without one. */
+export function latent(): LatentSpace | undefined {
+  return _model.latent();
+}
+
+/** The schedule the denoiser was trained under; `undefined` when nothing
+ *  denoises. */
+export function schedule(): ScheduleFact | undefined {
+  return _model.schedule();
+}
+
+/** The most latent rows one pass carries; 0 without a float lane. */
+export function maxLatentRows(): number {
+  return _model.maxLatentRows();
+}
+
+export type {
+  BlockDrafter,
+  CanvasShape,
+  ForwardKind,
+  LaneStream,
+  LatentSpace,
+  PortFact,
+  PortKind,
+  ReadingFact,
+  ReadoutKind,
+  ScheduleFact,
+  ScheduleKind,
+} from 'pie:inferlet/model@0.3.0';

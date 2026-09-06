@@ -7,6 +7,7 @@
 
 pub mod chat;
 pub mod forward;
+pub mod frames;
 pub mod grammar;
 pub mod kv_working_set;
 pub mod media;
@@ -82,6 +83,9 @@ wasmtime::component::bindgen!({
         "pie:inferlet/media.image": media::Image,
         "pie:inferlet/media.video": media::Video,
         "pie:inferlet/media.audio": media::Audio,
+        // pie:inferlet/frames — pixel / sample output
+        "pie:inferlet/frames.frames": frames::Frames,
+        "pie:inferlet/frames.pcm": frames::Pcm,
         // pie:inferlet/speech (ex audio-out)
         "pie:inferlet/speech.speech": speech::Speech,
         // pie:inferlet chat / tools / reasoning (ex pie:instruct)
@@ -113,6 +117,7 @@ pub fn add_to_linker(
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::speech::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::frames::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::system::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::chat::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::tools::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

@@ -1,4 +1,5 @@
 interface model {
+    use types.{dtype};
 
     // The engine serves exactly one model; these are global functions over
     // that single bound model (no `model` resource handle). Identity + memory-
@@ -82,6 +83,129 @@ interface model {
         self-cond-taps: u32,
     }
     canvas: func() -> option<canvas-shape>;
+
+    // ── Generative facts (imagegen design D12) ──────────────────────────
+    // What a guest sizes an image/video job from, so it never parses
+    // `architecture()`: the family's readings (the arms a pass can run),
+    // its latent space, the schedule it was trained under, and the widest
+    // float lane one pass carries. A text model answers an empty list,
+    // `none`, `none` and 0: it has one implicit reading and no latent.
+
+    // A lane's stream — which of the model's rectangles its rows belong to
+    // (design D2: a lane is one request's rows of ONE stream; a request
+    // with text and image rows submits one pass per stream, both in one
+    // attention group). Codes agree with `model_ir::Stream`.
+    enum lane-stream {
+        text,
+        image,
+        video,
+        audio,
+        context,
+        reference,
+    }
+
+    // Which runtime input a float port feeds, and so what shape its channel
+    // is (design D3). `latents`: `[rows, width]`, the lane's own rows, fed
+    // from the channel's COMMITTED cell at every submit. `lane-vector`: one
+    // `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
+    // scale. `context`: `[rows, width]`, an encoder's output, the rows of a
+    // `context` lane. `axis-positions`: `[rows, width]` with `width` the
+    // axis count (1..=4), the per-row RoPE coordinates.
+    enum port-kind {
+        latents,
+        lane-vector,
+        context,
+        axis-positions,
+    }
+
+    // One float input port a reading declares. `dtype` is the CHANNEL's
+    // element type the guest must declare (always `f32` today: the WIT
+    // dtype set has no bf16; the model's own element type is the engine's
+    // marshal). `width` is the trailing extent.
+    record port-fact {
+        name: string,
+        kind: port-kind,
+        width: u32,
+        dtype: dtype,
+    }
+
+    // Which export seam a reading's epilogue reads: `logits()` for a text
+    // head, `velocity()` for a denoiser, `hidden()` for an encoder.
+    enum readout-kind {
+        logits,
+        velocity,
+        hidden,
+    }
+
+    // One reading of the bound model: the arm a pass runs when it names
+    // this reading (`forward-pass.reading`). `index` is the fact value a
+    // lane is stamped with; `has-kv` says whether `attention` is required
+    // (else refused) on its pass, `takes-tokens` the same for `embed`;
+    // `streams` are the lane streams a request submits (one pass per
+    // stream, `forward-pass.stream`; empty means text only); `ports` are
+    // the float ports `forward-pass.input` binds; `readout`/`readout-width`
+    // say what the epilogue may read and how wide one row is (the
+    // `velocity(width)` / `hidden(width)` declaration to make).
+    record reading-fact {
+        name: string,
+        index: u8,
+        has-kv: bool,
+        takes-tokens: bool,
+        streams: list<lane-stream>,
+        ports: list<port-fact>,
+        readout: readout-kind,
+        readout-width: u32,
+    }
+    // Every reading the bound model declares, in index order. Empty for a
+    // model with one implicit reading (every text row), on which
+    // `forward-pass.reading` is refused. Static.
+    readings: func() -> list<reading-fact>;
+
+    // The latent space a denoiser works in: one latent row is
+    // `patch-t × patch-h × patch-w` cells of `channels` values, one cell
+    // is `spatial-compression²` pixels by `temporal-compression` frames.
+    // `none` for a model with no latent.
+    record latent-space {
+        channels: u32,
+        patch-t: u32,
+        patch-h: u32,
+        patch-w: u32,
+        spatial-compression: u32,
+        temporal-compression: u32,
+    }
+    latent: func() -> option<latent-space>;
+
+    // The prediction target a schedule's velocity is.
+    enum schedule-kind {
+        // Rectified flow: `x <- x + (sigma' - sigma) · v`.
+        flow,
+        // Epsilon prediction.
+        epsilon,
+        // v-prediction.
+        v,
+    }
+
+    // The noise schedule the denoiser was trained under: `shift` is the
+    // trained timestep shift (1.0 = none; a flow model's base `mu` when it
+    // shifts by token count), `train-steps` scales the timestep axis,
+    // `boundary` is the sigma a two-backbone family hands over at (`none`
+    // for one backbone), `pinned-sigmas` a distilled model's fixed sigma
+    // list, descending, without the final 0 (empty when the guest builds
+    // its own). The SDK's `latent::FlowMatchEuler` is built from this.
+    // `none` when no reading denoises.
+    record schedule-fact {
+        kind: schedule-kind,
+        shift: f32,
+        train-steps: u32,
+        boundary: option<f32>,
+        pinned-sigmas: list<f32>,
+    }
+    schedule: func() -> option<schedule-fact>;
+
+    // The most latent rows one pass may carry: the guest sizes its latent
+    // channels (`[rows, width]`) under this. 0 for a model with no float
+    // lane. Static, like `max-embed-length`.
+    max-latent-rows: func() -> u32;
 
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
     // tokenizer's vocabs() token count due to padding. Use THIS for
@@ -175,6 +299,17 @@ interface model {
     // Guests split a prompt of L tokens into ceil(L / C) chunk passes;
     // chunking is guest-side, against this static constant.
     max-embed-length: func() -> u32;
+
+    // The prefill chunk the scheduler would like to see right now, in
+    // tokens: the per-forward token budget shared evenly among the live
+    // processes, rounded down to whole KV pages, never below one page and
+    // never above `max-embed-length`. A prefill fire that fills the whole
+    // budget holds every other lane's decode for as long as it runs; a fire
+    // of this size leaves the step room for them. A hint, not a limit: the
+    // runtime never splits a fire, and a guest may chunk larger or smaller
+    // — the SDK's `prefill_chunks` takes it as its default cap. Not static:
+    // it moves with the number of live processes.
+    prefill-chunk-hint: func() -> u32;
 
     // ── Working-set / arena capabilities (global, over the bound model) ──
     // Memory-shaping parameters of the bound model's engine, so an inferlet

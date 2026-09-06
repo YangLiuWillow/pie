@@ -80,17 +80,29 @@ pub mod eta;
 
 pub mod chat;
 
+/// The sampler prelude for the generative families (imagegen design D4):
+/// a flow-matching schedule built from `model::schedule()`, the Euler step
+/// and guidance rules as epilogue math over `velocity()`, a seeded device
+/// noise draw, a positions-grid builder, and `encode_text`.
+pub mod latent;
+
 /// The runtime serves exactly one model; these are global functions over
 /// that single bound model. There is no `Model`/`Tokenizer` handle to pass
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        BlockDrafter, CanvasShape, ForwardKind, architecture, arena_block_size, canvas,
-        channel_capacity, default_system_speculation, draft_block, frame_size, kv_page_size,
-        max_embed_length, mtp_depth, name, output_vocab_size, pass_kind, prefill_chunk_hint,
-        rs_buffer_page_size,
-        rs_fold_granularity, rs_state_size, run_ahead_window, submit_deadline_us,
+        BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact, PortKind,
+        ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind, architecture, arena_block_size,
+        canvas, channel_capacity, default_system_speculation, draft_block, frame_size,
+        kv_page_size, latent, max_embed_length, max_latent_rows, mtp_depth, name,
+        output_vocab_size, pass_kind, prefill_chunk_hint, readings, rs_buffer_page_size,
+        rs_fold_granularity, rs_state_size, run_ahead_window, schedule, submit_deadline_us,
     };
+
+    /// The declared reading named `name`, if the bound model has one.
+    pub fn reading(name: &str) -> Option<ReadingFact> {
+        readings().into_iter().find(|reading| reading.name == name)
+    }
     // Tokenizer functions live in the `tokenizer` interface; re-exported here
     // so `model::encode`/`model::decode`/… read off `model` in inferlet source.
     pub use crate::pie::inferlet::tokenizer::{
@@ -121,8 +133,34 @@ pub fn monotonic_now_ns() -> u64 {
     crate::wasi::clocks::monotonic_clock::now()
 }
 
+/// User <-> process communication. `send`/`send_file` carry text and bytes the
+/// guest already holds; `send_frames` and `send_pcm` carry a HANDLE, so the
+/// encoded file is built host-side and streamed to the client without ever
+/// being a value in this module's address space.
 pub mod session {
     pub use crate::pie::inferlet::session::*;
+}
+
+/// Pixel and sample OUTPUT — the inverse of [`media`].
+///
+/// A [`Frames`](frames::Frames) handle holds decoded pixels host-side
+/// (`count` frames of `width` x `height` RGB8) and a [`Pcm`](frames::Pcm)
+/// handle holds interleaved f32 samples. The guest never sees either payload;
+/// it asks for facts, and picks one of two exits:
+///
+/// ```ignore
+/// let clip = frames::Frames::from_rgb8(&rgb, 512, 512, 16, 24.0)?;
+/// // The happy path: encoded host-side, streamed out, never in linear memory.
+/// session::send_frames(&clip, frames::ImageFormat::Mp4H264, "out.mp4")?;
+/// // The other door, when the guest itself needs the bytes:
+/// let png = still.encode(frames::ImageFormat::Png)?;
+/// ```
+///
+/// `png`/`jpeg`/`webp` are stills and refuse a multi-frame handle by name;
+/// `y4m` is the uncompressed clip; `mp4-h264` is NVENC plus the runtime's own
+/// ISO-BMFF muxer, and refuses by name on a machine without an encoder.
+pub mod frames {
+    pub use crate::pie::inferlet::frames::{AudioFormat, Frames, ImageFormat, Pcm};
 }
 
 /// Grammar compilation + incremental matching (the WIT `grammar` interface).

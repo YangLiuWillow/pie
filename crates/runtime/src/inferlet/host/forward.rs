@@ -13,7 +13,8 @@ use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
 use crate::pipeline::instance::{
-    AttentionBinding, BoundForwardPass, CanvasMode, EmbedBinding, PassKind, RsGeometryBinding,
+    AttentionBinding, BoundForwardPass, CanvasMode, EmbedBinding, FloatLane, LaneFacts, PassKind,
+    PortBinding, RsGeometryBinding, lane_stream_of,
 };
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
@@ -38,6 +39,131 @@ fn model_pass_kind() -> PassKind {
         (true, true) => PassKind::Hybrid,
         (false, true) => PassKind::Recurrent,
     }
+}
+
+/// The reading a pass runs: the one it named, else the family's sole
+/// reading, else `None` (a text row's implicit reading: tokens and KV,
+/// no ports). `Err` when the family declares several and the pass named
+/// none — neither is a default the host may pick.
+fn reading_of(pass: &ForwardPass) -> Result<Option<&'static models::ReadingFact>, String> {
+    let model = crate::model::model();
+    if let Some(index) = pass.bindings.reading {
+        return Ok(model.readings().get(usize::from(index)));
+    }
+    if let Some(only) = model.sole_reading() {
+        return Ok(Some(only));
+    }
+    if model.readings().is_empty() {
+        return Ok(None);
+    }
+    Err(format!(
+        "this model declares {} readings ({}) and the pass named none; call `reading(name)` \
+         before `program`",
+        model.readings().len(),
+        reading_names(model.readings())
+    ))
+}
+
+/// `` `a`, `b`, `c` `` for a refusal.
+fn reading_names(readings: &[models::ReadingFact]) -> String {
+    readings
+        .iter()
+        .map(|reading| format!("`{}`", reading.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Does `reading` submit lanes on `stream`? An empty list is `Text` only.
+fn reading_lists_stream(reading: &models::ReadingFact, stream: models::Stream) -> bool {
+    if reading.streams.is_empty() {
+        return stream == models::Stream::Text;
+    }
+    reading.streams.contains(&stream)
+}
+
+/// The streams a reading lists, for a refusal.
+fn stream_names(reading: &models::ReadingFact) -> String {
+    if reading.streams.is_empty() {
+        return "`text`".to_string();
+    }
+    reading
+        .streams
+        .iter()
+        .map(|stream| format!("`{}`", stream.name()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The engine's port kind for a catalog port.
+fn engine_port_kind(kind: models::PortKind) -> ::engine::fire::PortKind {
+    use ::engine::fire::PortKind;
+    match kind {
+        models::PortKind::Latents => PortKind::Latents,
+        models::PortKind::LaneVector => PortKind::LaneVector,
+        models::PortKind::Context => PortKind::Context,
+        models::PortKind::AxisPositions => PortKind::AxisPositions,
+    }
+}
+
+/// Is `shape`/`dtype` the channel a port of `kind` and `width` reads? The
+/// rows of a `[rows, width]` port come back; a lane vector is `[width]` or
+/// `[1, width]` and answers `None` rows. Pure, so the port rules are
+/// testable without a wasm store.
+pub(crate) fn validate_port_channel(
+    port: &models::PortFact,
+    shape: &[u32],
+    dtype: Dtype,
+) -> Result<Option<u32>, String> {
+    if dtype != Dtype::F32 {
+        return Err(format!(
+            "port `{}` reads an f32 channel; this one is {dtype:?}",
+            port.name
+        ));
+    }
+    match port.kind {
+        models::PortKind::LaneVector => match shape {
+            [width] | [1, width] if *width == port.width => Ok(None),
+            _ => Err(format!(
+                "port `{}` is a lane vector of width {}: its channel must be `[{}]` or `[1, {}]` \
+                 f32; this one is {shape:?}",
+                port.name, port.width, port.width, port.width
+            )),
+        },
+        models::PortKind::Latents | models::PortKind::Context | models::PortKind::AxisPositions => {
+            match shape {
+                [rows, width] if *width == port.width && *rows > 0 => Ok(Some(*rows)),
+                _ => Err(format!(
+                    "port `{}` reads `[rows, {}]` f32; this channel is {shape:?}",
+                    port.name, port.width
+                )),
+            }
+        }
+    }
+}
+
+/// The rows a pass's `[rows, ·]` ports agree on, or the first pair that
+/// disagree. Context ports are a context lane's own rows and need not
+/// match the latents'.
+pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
+    let mut rows: Option<(u32, &str)> = None;
+    for port in ports {
+        let Some(these) = port.rows else { continue };
+        if port.kind == ::engine::fire::PortKind::Context {
+            continue;
+        }
+        match rows {
+            None => rows = Some((these, &port.name)),
+            Some((agreed, name)) if agreed != these => {
+                return Err(format!(
+                    "port `{}` binds {these} rows but port `{name}` binds {agreed}; a pass's \
+                     latents and positions ports carry the same rows",
+                    port.name
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(rows.map(|(rows, _)| rows))
 }
 
 fn page_span(
@@ -517,6 +643,15 @@ impl ProcessCtx {
                 "forward pass embed binding is already attached".to_string()
             ));
         }
+        if let Ok(Some(reading)) = reading_of(pass)
+            && !reading.takes_tokens
+        {
+            return Ok(Err(format!(
+                "reading `{}` embeds no tokens; `embed` is refused on its pass (its rows are \
+                 the latents port's)",
+                reading.name
+            )));
+        }
         pass.bindings.embed = Some(EmbedBinding {
             tokens: tokens.rep(),
             indptr: indptr.rep(),
@@ -596,7 +731,242 @@ impl ProcessCtx {
                 "forward pass attention binding is already attached".to_string()
             ));
         }
+        if let Ok(Some(reading)) = reading_of(pass)
+            && !reading.has_kv
+        {
+            return Ok(Err(format!(
+                "reading `{}` declares no KV space; `attention` is refused on its pass (nothing \
+                 there is a sequence)",
+                reading.name
+            )));
+        }
         pass.bindings.attention = Some(binding);
+        Ok(Ok(()))
+    }
+
+    /// `forward-pass.reading`: which declared reading this pass runs.
+    /// Resolved against `model.readings()` here, so an unknown name is
+    /// refused at the call; set once, before `program`.
+    async fn core_reading(
+        &mut self,
+        this: Resource<ForwardPass>,
+        name: String,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let model = crate::model::model();
+        let Some(reading) = model.readings().iter().find(|reading| reading.name == name) else {
+            return Ok(Err(if model.readings().is_empty() {
+                format!(
+                    "this model declares no readings (one implicit reading); `reading(\"{name}\")` \
+                     has nothing to name"
+                )
+            } else {
+                format!(
+                    "this model declares no reading `{name}`; it declares {}",
+                    reading_names(model.readings())
+                )
+            }));
+        };
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.reading.is_some() {
+            return Ok(Err(
+                "forward pass reading is already set; a pass keeps one reading for its life"
+                    .to_string(),
+            ));
+        }
+        // A binding made before the reading was named is checked here
+        // instead, so the order of the two calls does not matter.
+        if !reading.takes_tokens && pass.bindings.embed.is_some() {
+            return Ok(Err(format!(
+                "reading `{}` embeds no tokens, but this pass already bound `embed`",
+                reading.name
+            )));
+        }
+        if !reading.has_kv && pass.bindings.attention.is_some() {
+            return Ok(Err(format!(
+                "reading `{}` declares no KV space, but this pass already bound `attention`",
+                reading.name
+            )));
+        }
+        if let Some(port) = pass
+            .bindings
+            .ports
+            .iter()
+            .find(|port| reading.port(&port.name).is_none())
+        {
+            return Ok(Err(format!(
+                "reading `{}` declares no port `{}`, but this pass already bound one",
+                reading.name, port.name
+            )));
+        }
+        if let Some(stream) = pass.bindings.stream
+            && !reading_lists_stream(reading, stream)
+        {
+            return Ok(Err(format!(
+                "reading `{}` lists no `{}` stream, but this pass already stated it",
+                reading.name,
+                stream.name()
+            )));
+        }
+        pass.bindings.reading = Some(reading.index);
+        Ok(Ok(()))
+    }
+
+    /// `forward-pass.input`: bind a channel to one of the reading's float
+    /// ports. The channel's shape is checked against the port's fact here;
+    /// `program` checks that it is bound into the pass's program.
+    async fn core_input(
+        &mut self,
+        this: Resource<ForwardPass>,
+        port: String,
+        channel: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let (shape, dtype, global_id) = {
+            let resource = self.ctx().table.get(&channel)?;
+            let cell = resource.cell.lock().unwrap();
+            (cell.shape.clone(), cell.dtype, cell.global_id)
+        };
+        let pass = self.ctx().table.get(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        // With no reading named yet, the port is looked up in every
+        // reading that declares it; `reading()` re-checks the binding when
+        // it is named, and `program` demands agreement.
+        let model = crate::model::model();
+        let candidates: Vec<&models::ReadingFact> = match reading_of(pass) {
+            Ok(Some(reading)) => vec![reading],
+            Ok(None) => Vec::new(),
+            Err(_) => model.readings().iter().collect(),
+        };
+        if candidates.is_empty() {
+            return Ok(Err(format!(
+                "this model declares no float ports; `input(\"{port}\")` has nothing to bind"
+            )));
+        }
+        let Some((reading, (index, fact))) = candidates
+            .iter()
+            .find_map(|reading| reading.port(&port).map(|found| (*reading, found)))
+        else {
+            return Ok(Err(format!(
+                "no reading of this model declares a port `{port}`; {}",
+                candidates
+                    .iter()
+                    .map(|reading| format!(
+                        "`{}` declares {}",
+                        reading.name,
+                        if reading.ports.is_empty() {
+                            "none".to_string()
+                        } else {
+                            reading
+                                .ports
+                                .iter()
+                                .map(|p| format!("`{}`", p.name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        };
+        let rows = match validate_port_channel(fact, &shape, dtype) {
+            Ok(rows) => rows,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Some(rows) = rows
+            && fact.kind == models::PortKind::Latents
+            && let Some(generative) = model.generative()
+            && rows > generative.max_rows
+        {
+            return Ok(Err(format!(
+                "port `{port}` binds {rows} latent rows; this model carries at most {} \
+                 (`model.max-latent-rows()`)",
+                generative.max_rows
+            )));
+        }
+        let binding = PortBinding {
+            name: port.clone(),
+            kind: engine_port_kind(fact.kind),
+            port: index,
+            channel_rep: channel.rep(),
+            channel_id: global_id,
+            rows,
+        };
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.bindings.ports.iter().any(|bound| bound.name == port) {
+            return Ok(Err(format!(
+                "port `{port}` is already bound on this pass (reading `{}`)",
+                reading.name
+            )));
+        }
+        let mut ports = pass.bindings.ports.clone();
+        ports.push(binding.clone());
+        if let Err(error) = port_rows(&ports) {
+            return Ok(Err(error));
+        }
+        pass.bindings.ports.push(binding);
+        Ok(Ok(()))
+    }
+
+    /// `forward-pass.stream`: which lane stream this pass's rows are.
+    async fn core_stream(
+        &mut self,
+        this: Resource<ForwardPass>,
+        stream: pie::inferlet::model::LaneStream,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let stream = super::model::catalog_stream(stream);
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.stream.is_some() {
+            return Ok(Err(
+                "forward pass stream is already set; a pass is one lane of one stream".to_string(),
+            ));
+        }
+        if let Ok(Some(reading)) = reading_of(pass)
+            && !reading_lists_stream(reading, stream)
+        {
+            return Ok(Err(format!(
+                "reading `{}` lists no `{}` stream; it lists {}",
+                reading.name,
+                stream.name(),
+                stream_names(reading)
+            )));
+        }
+        pass.bindings.stream = Some(stream);
+        Ok(Ok(()))
+    }
+
+    /// `forward-pass.group`: the attention group this pass's lanes join.
+    async fn core_group(
+        &mut self,
+        this: Resource<ForwardPass>,
+        id: u32,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.group.is_some() {
+            return Ok(Err("forward pass group is already set".to_string()));
+        }
+        pass.bindings.group = Some(id);
         Ok(Ok(()))
     }
 
@@ -730,7 +1100,8 @@ impl ProcessCtx {
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.bindings.canvas != Some(CanvasMode::Denoise) {
             return Ok(Err(
-                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first".to_string(),
+                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first"
+                    .to_string(),
             ));
         }
         if pass.bindings.self_cond.is_some() {
@@ -849,21 +1220,132 @@ impl ProcessCtx {
             rs_fold_len_rep,
             pass_max_layers,
             pass_block_draft,
+            lane_facts,
+            port_bindings,
+            float_rows,
         ) = {
+            // The port channels' shapes, looked up before the pass is
+            // borrowed: `input` validated each against the reading it found
+            // the port in, which may not be the reading `program` resolves
+            // (a port bound before `reading` was named), so every port is
+            // re-checked against the resolved reading's fact below.
+            let port_cells: Vec<(String, Vec<u32>, Dtype)> = {
+                let pass = self.ctx().table.get(&this)?;
+                pass.bindings
+                    .ports
+                    .iter()
+                    .map(|port| (port.name.clone(), port.channel_rep))
+                    .collect::<Vec<_>>()
+            }
+            .into_iter()
+            .map(|(name, rep)| {
+                let resource: Resource<Channel> = Resource::new_borrow(rep);
+                let cell = self.ctx().table.get(&resource)?.cell.clone();
+                let cell = cell.lock().unwrap();
+                Ok::<_, anyhow::Error>((name, cell.shape.clone(), cell.dtype))
+            })
+            .collect::<Result<_, _>>()?;
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
             }
-            let Some(embed) = pass.bindings.embed else {
-                return Ok(Err(
-                    "forward pass embed binding must be attached before program".to_string(),
-                ));
+            // The reading decides what the pass must bind (design D1): a
+            // text row's implicit reading takes tokens and KV; a declared
+            // reading states each. `embed`/`attention` are required where
+            // the reading declares them and refused where it does not.
+            let reading = match reading_of(pass) {
+                Ok(reading) => reading,
+                Err(error) => return Ok(Err(error)),
             };
-            let Some(attention) = pass.bindings.attention else {
-                return Ok(Err(
-                    "forward pass attention binding must be attached before program".to_string(),
-                ));
+            let wants_tokens = reading.is_none_or(|reading| reading.takes_tokens);
+            let wants_kv = reading.is_none_or(|reading| reading.has_kv);
+            let embed = match (pass.bindings.embed, wants_tokens) {
+                (Some(embed), true) => Some(embed),
+                (None, true) => {
+                    return Ok(Err(
+                        "forward pass embed binding must be attached before program".to_string(),
+                    ));
+                }
+                (Some(_), false) => {
+                    return Ok(Err(format!(
+                        "reading `{}` embeds no tokens, but this pass bound `embed`",
+                        reading.map_or("", |reading| reading.name)
+                    )));
+                }
+                (None, false) => None,
             };
+            let attention = match (pass.bindings.attention, wants_kv) {
+                (Some(attention), true) => Some(attention),
+                (None, true) => {
+                    return Ok(Err(
+                        "forward pass attention binding must be attached before program"
+                            .to_string(),
+                    ));
+                }
+                (Some(_), false) => {
+                    return Ok(Err(format!(
+                        "reading `{}` declares no KV space, but this pass bound `attention`",
+                        reading.map_or("", |reading| reading.name)
+                    )));
+                }
+                (None, false) => None,
+            };
+            // Every port the reading declares is bound, and nothing else is.
+            if let Some(reading) = reading {
+                if let Some((_, port)) = reading.ports_indexed().find(|(_, port)| {
+                    !pass
+                        .bindings
+                        .ports
+                        .iter()
+                        .any(|bound| bound.name == port.name)
+                }) {
+                    return Ok(Err(format!(
+                        "reading `{}` declares port `{}` and this pass bound no channel to it; \
+                         call `input(\"{}\", channel)` before `program`",
+                        reading.name, port.name, port.name
+                    )));
+                }
+                if let Some(bound) = pass
+                    .bindings
+                    .ports
+                    .iter()
+                    .find(|bound| reading.port(&bound.name).is_none())
+                {
+                    return Ok(Err(format!(
+                        "reading `{}` declares no port `{}`, but this pass bound one",
+                        reading.name, bound.name
+                    )));
+                }
+            } else if let Some(bound) = pass.bindings.ports.first() {
+                return Ok(Err(format!(
+                    "this model declares no float ports, but this pass bound `{}`",
+                    bound.name
+                )));
+            }
+            let stream = pass.bindings.stream.unwrap_or_default();
+            if let Some(reading) = reading
+                && !reading_lists_stream(reading, stream)
+            {
+                return Ok(Err(format!(
+                    "reading `{}` lists no `{}` stream; it lists {}",
+                    reading.name,
+                    stream.name(),
+                    stream_names(reading)
+                )));
+            }
+            // This runtime fires a lane either through its KV working set
+            // (tokens, geometry ports) or as a float lane (rows from a
+            // port, no sequence); a reading with one but not the other has
+            // no fire path yet.
+            if wants_tokens != wants_kv {
+                return Ok(Err(format!(
+                    "reading `{}` {} tokens but {} a KV space; this runtime fires a lane with \
+                     both (a sequence) or neither (a float lane), not one of the two",
+                    reading.map_or("", |reading| reading.name),
+                    if wants_tokens { "embeds" } else { "embeds no" },
+                    if wants_kv { "declares" } else { "declares no" }
+                )));
+            }
             // Neither reading is a default the host may pick for the guest.
             if pass.kind == PassKind::Diffusion && pass.bindings.canvas.is_none() {
                 return Ok(Err(
@@ -871,6 +1353,63 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
+            let mut port_bindings = pass.bindings.ports.clone();
+            if let Some(reading) = reading {
+                for binding in &mut port_bindings {
+                    let Some((index, fact)) = reading.port(&binding.name) else {
+                        continue; // refused above
+                    };
+                    let Some((_, shape, dtype)) =
+                        port_cells.iter().find(|(name, _, _)| *name == binding.name)
+                    else {
+                        continue;
+                    };
+                    match validate_port_channel(fact, shape, *dtype) {
+                        Ok(rows) => binding.rows = rows,
+                        Err(error) => {
+                            return Ok(Err(format!("reading `{}`: {error}", reading.name)));
+                        }
+                    }
+                    if fact.kind == models::PortKind::Latents
+                        && let Some(rows) = binding.rows
+                        && let Some(generative) = crate::model::model().generative()
+                        && rows > generative.max_rows
+                    {
+                        return Ok(Err(format!(
+                            "port `{}` binds {rows} latent rows; this model carries at most {} \
+                             (`model.max-latent-rows()`)",
+                            binding.name, generative.max_rows
+                        )));
+                    }
+                    binding.kind = engine_port_kind(fact.kind);
+                    binding.port = index;
+                }
+                if let Err(error) = port_rows(&port_bindings) {
+                    return Ok(Err(error));
+                }
+            }
+            // A float lane's rows are its latents port's.
+            let float_rows = if wants_tokens {
+                None
+            } else {
+                match port_rows(&port_bindings) {
+                    Ok(Some(rows)) => Some(rows),
+                    Ok(None) => {
+                        return Ok(Err(format!(
+                            "reading `{}` embeds no tokens and this pass bound no `[rows, ·]` \
+                             port; nothing states its lane's row count",
+                            reading.map_or("", |reading| reading.name)
+                        )));
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            let lane_facts = LaneFacts {
+                reading: reading.map_or(0, |reading| reading.index),
+                stream: lane_stream_of(stream),
+                group: pass.bindings.group,
+                ports: port_bindings.iter().map(PortBinding::feed).collect(),
+            };
             (
                 embed,
                 attention,
@@ -885,11 +1424,11 @@ impl ProcessCtx {
                 pass.bindings.rs_geom.map(|geom| geom.fold_len),
                 pass.bindings.max_layers,
                 pass.bindings.block_draft,
+                lane_facts,
+                port_bindings,
+                float_rows,
             )
         };
-        let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
-        let readable_pages = attention.readable;
-        let writable_pages = attention.writable;
         {
             // Hash-deduped compile/bind cache; a malformed trace fails here.
             let prog = match crate::pipeline::program::register(
@@ -931,22 +1470,46 @@ impl ProcessCtx {
                 )));
             }
             let channel_reps = channels.iter().map(Resource::rep).collect::<Vec<_>>();
+            // A port the pass did not bind must be absent from the trace
+            // too (`None` expected), so a float lane's program cannot
+            // smuggle in geometry the fire path would never read.
             let expected = [
-                (Port::EmbedTokens, Some(embed.tokens)),
-                (Port::EmbedIndptr, Some(embed.indptr)),
-                (Port::KvLen, Some(attention.kv_len)),
-                (Port::Pages, Some(attention.pages)),
-                (Port::PageIndptr, Some(attention.page_indptr)),
-                (Port::WSlot, Some(attention.w_slot)),
-                (Port::WOff, Some(attention.w_off)),
-                (Port::Positions, Some(attention.positions)),
-                (Port::AttnMask, attention.mask),
+                (Port::EmbedTokens, embed.map(|embed| embed.tokens)),
+                (Port::EmbedIndptr, embed.map(|embed| embed.indptr)),
+                (Port::KvLen, attention.map(|attention| attention.kv_len)),
+                (Port::Pages, attention.map(|attention| attention.pages)),
+                (
+                    Port::PageIndptr,
+                    attention.map(|attention| attention.page_indptr),
+                ),
+                (Port::WSlot, attention.map(|attention| attention.w_slot)),
+                (Port::WOff, attention.map(|attention| attention.w_off)),
+                (
+                    Port::Positions,
+                    attention.map(|attention| attention.positions),
+                ),
+                (
+                    Port::AttnMask,
+                    attention.and_then(|attention| attention.mask),
+                ),
                 (Port::Readout, readout),
             ];
             if let Err(error) =
                 validate_descriptor_bindings(&prog.bound.container, &channel_reps, &expected)
             {
                 return Ok(Err(error));
+            }
+            // A port-fed channel is read by the engine off the instance's
+            // channel arena, so it must be one of this program's channels.
+            if let Some(port) = port_bindings
+                .iter()
+                .find(|port| !channel_reps.contains(&port.channel_rep))
+            {
+                return Ok(Err(format!(
+                    "pipeline: port `{}`'s channel is not bound into this pass's program; \
+                     read it in a stage (the SDK's `input` does) so the program declares it",
+                    port.name
+                )));
             }
             // A pass that folds unconditionally claims no port, so the
             // program may legitimately lack this binding.
@@ -1007,107 +1570,113 @@ impl ProcessCtx {
                 cells.push(cell);
             }
 
-            let readable = readable_pages;
-            let writable = writable_pages;
-            let ws_rep = kv_working_set.rep();
-            let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-            let bound_ws = self.ctx().table.get(&ws_res)?.clone();
-            let stores = crate::store::registry::get(bound_ws.model, bound_ws.engine);
-            let page_len =
-                match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                    kv.page_len(bound_ws.id)
-                }) {
-                    Ok(page_len) => page_len,
-                    Err(error) => {
-                        return Ok(Err(format!("pipeline: KV page extent: {error}")));
+            let (ws_rep, readable, writable, devgeo, decode_envelope, geometry_class) =
+                if let Some(attention) = attention {
+                    let readable = attention.readable;
+                    let writable = attention.writable;
+                    let ws_rep = attention.kv_ws;
+                    let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
+                    let bound_ws = self.ctx().table.get(&ws_res)?.clone();
+                    let stores = crate::store::registry::get(bound_ws.model, bound_ws.engine);
+                    let page_len =
+                        match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                            kv.page_len(bound_ws.id)
+                        }) {
+                            Ok(page_len) => page_len,
+                            Err(error) => {
+                                return Ok(Err(format!("pipeline: KV page extent: {error}")));
+                            }
+                        };
+                    if let Err(error) = readable.resolve(page_len) {
+                        return Ok(Err(error));
                     }
-                };
-            if let Err(error) = readable.resolve(page_len) {
-                return Ok(Err(error));
-            }
-            if let Err(error) = writable.resolve(page_len) {
-                return Ok(Err(error));
-            }
-            // Derivability decides the geometry class, not op-pattern arity:
-            // host-derivable geometry is Host class on every engine; a
-            // device-dependent envelope classifies DecodeEnvelope only when
-            // the engine has the needed device geometry ports, else it falls
-            // back to Host and blocks loudly on the first undecidable value.
-            let device_port_mask =
-                crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
+                    if let Err(error) = writable.resolve(page_len) {
+                        return Ok(Err(error));
+                    }
+                    // Derivability decides the geometry class, not op-pattern arity:
+                    // host-derivable geometry is Host class on every engine; a
+                    // device-dependent envelope classifies DecodeEnvelope only when
+                    // the engine has the needed device geometry ports, else it falls
+                    // back to Host and blocks loudly on the first undecidable value.
+                    let device_port_mask =
+                        crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
 
-            // Device-geometry pass: the program traces its full explicit
-            // geometry in-graph; the runtime only leases physical pages. If
-            // AttnMask binds a channel, the engine must be able to resolve it
-            // per-step (CUDA today cannot); otherwise it falls back to Host.
-            let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
-                matches!(binding.port, eta_ir::registry::Port::AttnMask)
-                    && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
-            });
-            let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
-                && (!needs_mask_port || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
-            let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
-                &prog.bound.container,
-            ) {
-                Some(_) if !devgeo_capable => {
-                    tracing::info!(
-                        "device-geometry program on an engine without device geometry ports \
+                    // Device-geometry pass: the program traces its full explicit
+                    // geometry in-graph; the runtime only leases physical pages. If
+                    // AttnMask binds a channel, the engine must be able to resolve it
+                    // per-step (CUDA today cannot); otherwise it falls back to Host.
+                    let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
+                        matches!(binding.port, eta_ir::registry::Port::AttnMask)
+                            && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
+                    });
+                    let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
+                        && (!needs_mask_port
+                            || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
+                    let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
+                        &prog.bound.container,
+                    ) {
+                        Some(_) if !devgeo_capable => {
+                            tracing::info!(
+                                "device-geometry program on an engine without device geometry ports \
                          (mask {device_port_mask:?}): falling back to host-evaluated \
                          serialized execution"
-                    );
-                    None
-                }
-                Some((b, fresh_dense, w_cont_dense)) => {
-                    if readable.start != 0
-                        || readable.end.is_some()
-                        || writable.start != 0
-                        || writable.end.is_some()
-                    {
-                        return Ok(Err(
+                            );
+                            None
+                        }
+                        Some((b, fresh_dense, w_cont_dense)) => {
+                            if readable.start != 0
+                                || readable.end.is_some()
+                                || writable.start != 0
+                                || writable.end.is_some()
+                            {
+                                return Ok(Err(
                                 "pipeline: device-geometry passes require full open readable and writable page spans"
                                     .to_string(),
                             ));
-                    }
-                    // Seed the lease with `B` fire-0 pages, one per lane.
-                    let reserved =
-                        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                            kv.reserve(bound_ws.id, b as u64)
-                        });
-                    let seed_pages: Vec<u32> = match reserved {
-                        Ok(range) => (range.start as u32..range.end as u32).collect(),
-                        Err(e) => {
-                            return Ok(Err(format!("pipeline: device-geometry seed alloc: {e}")));
+                            }
+                            // Seed the lease with `B` fire-0 pages, one per lane.
+                            let reserved = crate::store::registry::with_kv_lock(
+                                &stores.kv,
+                                "host-other",
+                                |kv| kv.reserve(bound_ws.id, b as u64),
+                            );
+                            let seed_pages: Vec<u32> = match reserved {
+                                Ok(range) => (range.start as u32..range.end as u32).collect(),
+                                Err(e) => {
+                                    return Ok(Err(format!(
+                                        "pipeline: device-geometry seed alloc: {e}"
+                                    )));
+                                }
+                            };
+                            let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
+                            lease.seed(seed_pages);
+                            let has_mask = prog.bound.container.ports.iter().any(|p| {
+                                matches!(p.port, eta_ir::registry::Port::AttnMask)
+                                    && matches!(p.source, eta_ir::container::PortSource::Channel(_))
+                            });
+                            Some(DevGeo {
+                                lease,
+                                b,
+                                fresh_dense,
+                                w_cont_dense,
+                                has_mask,
+                                pooled: false,
+                                qo_indptr: None,
+                            })
                         }
+                        None => None,
                     };
-                    let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
-                    lease.seed(seed_pages);
-                    let has_mask = prog.bound.container.ports.iter().any(|p| {
-                        matches!(p.port, eta_ir::registry::Port::AttnMask)
-                            && matches!(p.source, eta_ir::container::PortSource::Channel(_))
-                    });
-                    Some(DevGeo {
-                        lease,
-                        b,
-                        fresh_dense,
-                        w_cont_dense,
-                        has_mask,
-                        pooled: false,
-                        qo_indptr: None,
-                    })
-                }
-                None => None,
-            };
 
-            let taint = prog.geometry_taint();
-            // A device-carried decode that re-publishes EVERY descriptor port
-            // — tokens, positions, pages, page bounds, kv length, write
-            // targets — states its whole geometry in-graph, so the engine
-            // resolves it there and the host only leases the pool. Asked
-            // before the envelope class: an envelope still folds every port
-            // but the token on the host, and a loop whose accepted count is
-            // device-decided (a speculative window) has nothing for the host
-            // to fold.
-            let devgeo = match devgeo {
+                    let taint = prog.geometry_taint();
+                    // A device-carried decode that re-publishes EVERY descriptor port
+                    // — tokens, positions, pages, page bounds, kv length, write
+                    // targets — states its whole geometry in-graph, so the engine
+                    // resolves it there and the host only leases the pool. Asked
+                    // before the envelope class: an envelope still folds every port
+                    // but the token on the host, and a loop whose accepted count is
+                    // device-decided (a speculative window) has nothing for the host
+                    // to fold.
+                    let devgeo = match devgeo {
                 Some(devgeo) => Some(devgeo),
                 None if devgeo_capable
                     && !taint.host_derivable()
@@ -1129,59 +1698,92 @@ impl ProcessCtx {
                 }
                 None => None,
             };
-            let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
-                None
-            } else {
-                let mut why = String::new();
-                match crate::pipeline::fire::geometry::classify_decode_envelope_why(
-                    &prog.bound.container,
-                    &mut why,
-                ) {
-                    Ok(Some(envelope)) => {
-                        let required =
-                            crate::pipeline::fire::geometry::envelope_required_ports(&envelope);
-                        if device_port_mask.covers(required) {
-                            Some(envelope)
-                        } else {
-                            tracing::info!(
-                                "decode envelope on an engine without device geometry ports \
+                    let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
+                        None
+                    } else {
+                        let mut why = String::new();
+                        match crate::pipeline::fire::geometry::classify_decode_envelope_why(
+                            &prog.bound.container,
+                            &mut why,
+                        ) {
+                            Ok(Some(envelope)) => {
+                                let required =
+                                    crate::pipeline::fire::geometry::envelope_required_ports(
+                                        &envelope,
+                                    );
+                                if device_port_mask.covers(required) {
+                                    Some(envelope)
+                                } else {
+                                    tracing::info!(
+                                        "decode envelope on an engine without device geometry ports \
                                  (mask {device_port_mask:?}, needs {required:?}): falling \
                                  back to host-evaluated serialized execution"
-                            );
-                            None
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::info!(
-                            "not a decode envelope: {why}; falling back to \
+                                    );
+                                    None
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::info!(
+                                    "not a decode envelope: {why}; falling back to \
                              host-evaluated execution"
-                        );
-                        None
-                    }
-                    Err(reason) => {
-                        tracing::warn!(
-                            "device-dependent geometry is not a decode envelope ({reason}); \
+                                );
+                                None
+                            }
+                            Err(reason) => {
+                                tracing::warn!(
+                                    "device-dependent geometry is not a decode envelope ({reason}); \
                              falling back to host-evaluated execution — fires block loudly \
                              on values the host cannot derive"
-                        );
-                        None
-                    }
-                }
-            };
-            if decode_envelope.is_some() && (readable.start != 0 || readable.end.is_some()) {
-                return Ok(Err(
+                                );
+                                None
+                            }
+                        }
+                    };
+                    if decode_envelope.is_some() && (readable.start != 0 || readable.end.is_some())
+                    {
+                        return Ok(Err(
                     "pipeline: device-resolved passes require a full open readable page span"
                         .to_string(),
                 ));
+                    }
+                    let geometry_class = if devgeo.is_some() {
+                        GeometryClass::DeviceGeometry
+                    } else if decode_envelope.is_some() {
+                        GeometryClass::DecodeEnvelope
+                    } else {
+                        GeometryClass::Host
+                    };
+                    (
+                        ws_rep,
+                        readable,
+                        writable,
+                        devgeo,
+                        decode_envelope,
+                        geometry_class,
+                    )
+                } else {
+                    // A float lane has no sequence, but the fire path seats
+                    // lanes and holds fire leases by working set, so the host
+                    // mints a SCRATCH one the guest never sees: no pages, no
+                    // geometry, released with the pass.
+                    let open = crate::pipeline::instance::KvPageSpan {
+                        start: 0,
+                        end: None,
+                    };
+                    (
+                        self.mint_scratch_working_set()?,
+                        open,
+                        open,
+                        None,
+                        None,
+                        GeometryClass::Host,
+                    )
+                };
+            let rs_reps: Vec<u32> = rs_working_sets.iter().map(Resource::rep).collect();
+            if float_rows.is_some() && !rs_reps.is_empty() {
+                self.release_scratch_working_set(ws_rep)?;
+                return Ok(Err("a float lane binds no recurrent state".to_string()));
             }
-            let geometry_class = if devgeo.is_some() {
-                GeometryClass::DeviceGeometry
-            } else if decode_envelope.is_some() {
-                GeometryClass::DecodeEnvelope
-            } else {
-                GeometryClass::Host
-            };
-            let rs_reps = rs_working_sets.iter().map(Resource::rep).collect();
 
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
@@ -1357,6 +1959,8 @@ impl ProcessCtx {
                 devgeo,
                 decode_envelope,
                 host_shadow,
+                lane: lane_facts,
+                float: float_rows.map(|rows| FloatLane { rows }),
                 closed: false,
             };
             if let Err(error) = self.ctx().table.get_mut(&this)?.attach_bound(bound) {
@@ -1364,6 +1968,30 @@ impl ProcessCtx {
             }
             Ok(Ok(()))
         }
+    }
+
+    /// A working set the host owns for a float lane's seats and fire
+    /// lease. Installed like the guest's (`kv-working-set` constructor),
+    /// registered with the process so residency accounting sees it, and
+    /// kept in the resource table under a rep the pass alone holds.
+    fn mint_scratch_working_set(&mut self) -> Anyhow<u32> {
+        let stores = crate::store::registry::get(0, 0);
+        let prepared = crate::store::kv::PreparedWorkingSet::new();
+        let id = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
+            kv.install_working_set(prepared)
+        });
+        let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
+        self.register_kv_working_set(&ws);
+        Ok(self.ctx().table.push(ws)?.rep())
+    }
+
+    /// Release a scratch working set a float pass held.
+    fn release_scratch_working_set(&mut self, rep: u32) -> Anyhow<()> {
+        let resource: Resource<KvWorkingSet> = Resource::new_own(rep);
+        let ws = self.ctx().table.delete(resource)?;
+        self.unregister_kv_working_set(ws.model, ws.engine, ws.id);
+        ws.release();
+        Ok(())
     }
 
     async fn core_set_rs_working_sets(
@@ -1543,8 +2171,17 @@ impl ProcessCtx {
 
         // close_native is idempotent, shared with the Drop fallback.
         let mut pass = self.ctx().table.delete(this)?;
+        let scratch = pass
+            .bound()
+            .ok()
+            .filter(|bound| bound.float.is_some())
+            .map(|bound| bound.kv_ws);
         if let Ok(bound) = pass.bound_mut() {
             bound.close_native();
+        }
+        drop(pass);
+        if let Some(rep) = scratch {
+            self.release_scratch_working_set(rep)?;
         }
         Ok(())
     }
@@ -1606,6 +2243,45 @@ macro_rules! forward_pass_common {
     };
 }
 
+/// The reading-and-ports verbs (`reading` / `input` / `stream` / `group`),
+/// shared by the interfaces that carry them (`forward`, `forward-diffusion`).
+macro_rules! forward_pass_readings {
+    () => {
+        async fn reading(
+            &mut self,
+            this: Resource<ForwardPass>,
+            name: String,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_reading(this, name).await
+        }
+
+        async fn input(
+            &mut self,
+            this: Resource<ForwardPass>,
+            port: String,
+            ch: Resource<Channel>,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_input(this, port, ch).await
+        }
+
+        async fn stream(
+            &mut self,
+            this: Resource<ForwardPass>,
+            s: pie::inferlet::model::LaneStream,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_stream(this, s).await
+        }
+
+        async fn group(
+            &mut self,
+            this: Resource<ForwardPass>,
+            id: u32,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_group(this, id).await
+        }
+    };
+}
+
 /// Converts an interface-local `rs-geometry` record into the host binding.
 /// A macro, not a trait, because each interface generates its own nominally
 /// distinct record type.
@@ -1644,6 +2320,7 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward, PassKind::Attention);
+    forward_pass_readings!();
 
     /// `media` rides the attention and hybrid interfaces (a hybrid tower
     /// family exists: qwen3.8-flash-next); recurrent-only gets it when one
@@ -1783,7 +2460,6 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // pie:inferlet/forward-diffusion — paged KV plus a canvas denoised in place.
 // ---------------------------------------------------------------------------
@@ -1804,6 +2480,7 @@ impl pie::inferlet::forward_diffusion::Host for ProcessCtx {
 
 impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward_diffusion, PassKind::Diffusion);
+    forward_pass_readings!();
 
     /// The attention interface's `media`, same host half and same span type.
     async fn media(
@@ -1871,14 +2548,97 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
 
 #[cfg(test)]
 mod tests {
-    use super::attention_rebind_diff;
-    use crate::pipeline::instance::{AttentionBinding, KvPageSpan};
+    use super::{attention_rebind_diff, port_rows, validate_port_channel};
+    use crate::pipeline::instance::{AttentionBinding, KvPageSpan, PortBinding};
+    use eta_ir::types::Dtype;
+
+    fn port(name: &'static str, kind: models::PortKind, width: u32) -> models::PortFact {
+        models::PortFact { name, kind, width }
+    }
+
+    fn bound(name: &str, kind: ::engine::fire::PortKind, rows: Option<u32>) -> PortBinding {
+        PortBinding {
+            name: name.to_string(),
+            kind,
+            port: 0,
+            channel_rep: 1,
+            channel_id: 1,
+            rows,
+        }
+    }
+
+    /// A `[rows, width]` port takes exactly that shape in f32 and answers
+    /// its rows; a lane vector takes `[width]` or `[1, width]` and answers
+    /// none; anything else is refused by the port's name.
+    #[test]
+    fn a_port_channel_is_validated_against_its_fact() {
+        let latents = port("latents", models::PortKind::Latents, 64);
+        assert_eq!(
+            validate_port_channel(&latents, &[256, 64], Dtype::F32),
+            Ok(Some(256))
+        );
+        assert!(
+            validate_port_channel(&latents, &[256, 32], Dtype::F32)
+                .unwrap_err()
+                .contains("`latents`")
+        );
+        assert!(validate_port_channel(&latents, &[256 * 64], Dtype::F32).is_err());
+        assert!(validate_port_channel(&latents, &[0, 64], Dtype::F32).is_err());
+        assert!(
+            validate_port_channel(&latents, &[256, 64], Dtype::I32)
+                .unwrap_err()
+                .contains("f32")
+        );
+
+        let timestep = port("timestep", models::PortKind::LaneVector, 1);
+        assert_eq!(validate_port_channel(&timestep, &[1], Dtype::F32), Ok(None));
+        assert_eq!(
+            validate_port_channel(&timestep, &[1, 1], Dtype::F32),
+            Ok(None)
+        );
+        assert!(validate_port_channel(&timestep, &[2], Dtype::F32).is_err());
+
+        let positions = port("positions", models::PortKind::AxisPositions, 3);
+        assert_eq!(
+            validate_port_channel(&positions, &[256, 3], Dtype::F32),
+            Ok(Some(256))
+        );
+    }
+
+    /// Every `[rows, ·]` port of one pass carries the same rows, except a
+    /// context port, which is another lane's.
+    #[test]
+    fn a_pass_s_row_ports_agree_on_their_rows() {
+        use ::engine::fire::PortKind;
+        let agree = [
+            bound("latents", PortKind::Latents, Some(256)),
+            bound("positions", PortKind::AxisPositions, Some(256)),
+            bound("timestep", PortKind::LaneVector, None),
+            bound("context", PortKind::Context, Some(77)),
+        ];
+        assert_eq!(port_rows(&agree), Ok(Some(256)));
+        let disagree = [
+            bound("latents", PortKind::Latents, Some(256)),
+            bound("positions", PortKind::AxisPositions, Some(128)),
+        ];
+        assert!(port_rows(&disagree).unwrap_err().contains("`positions`"));
+        assert_eq!(
+            port_rows(&[bound("timestep", PortKind::LaneVector, None)]),
+            Ok(None)
+        );
+    }
 
     fn binding() -> AttentionBinding {
         AttentionBinding {
             kv_ws: 1,
-            readable: KvPageSpan { start: 0, end: None },
-            writable: KvPageSpan { start: 0, end: None },
+            readable: KvPageSpan {
+                start: 0,
+                end: None,
+            },
+            writable: KvPageSpan {
+                start: 0,
+                end: None,
+            },
             kv_len: 2,
             pages: 3,
             page_indptr: 4,
@@ -1903,7 +2663,10 @@ mod tests {
             Some("kv-working-set")
         );
         let mut next = binding();
-        next.writable = KvPageSpan { start: 0, end: Some(4) };
+        next.writable = KvPageSpan {
+            start: 0,
+            end: Some(4),
+        };
         assert_eq!(
             attention_rebind_diff(&binding(), &next),
             Some("writable-pages")
