@@ -28,7 +28,9 @@ use checkpoint::contract::ModelContract;
 use common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_close, bf};
 use engine::Engine;
 use engine::channel::ChannelRegistration;
-use engine::fire::{Attachment, Boundary, FrameSubmission, Lane, PortFeed, PortKind, Readout, Step};
+use engine::fire::{
+    Attachment, Boundary, FrameSubmission, Lane, PortFeed, PortKind, Readout, Step,
+};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -39,8 +41,8 @@ use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 use model_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Trace,
-    Value, Weight, ops, seam, trace_hybrid,
+    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Trace, Value,
+    Weight, ops, seam, trace_hybrid,
 };
 
 /// Four heads of 64: the residual width.
@@ -357,7 +359,11 @@ fn four_ranks_land_what_one_rank_lands() {
             .expect("the instance binds on every rank")
             .id;
         let bytes: Vec<u8> = inputs[at].iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert!(group.publish_channel(instance, 0, &bytes).expect("the cell publishes"));
+        assert!(
+            group
+                .publish_channel(instance, 0, &bytes)
+                .expect("the cell publishes")
+        );
         lanes.push(Lane {
             slot: at as u32,
             word: 0,
@@ -390,7 +396,29 @@ fn four_ranks_land_what_one_rank_lands() {
     assert_eq!(readouts.len(), 2);
     for (at, readout) in readouts.iter().enumerate() {
         assert_eq!(readout.width, WIDTH);
-        assert_close(&readout.values, &want[at], &format!("lane {at} velocity, rank 0's readout"));
+        assert_close(
+            &readout.values,
+            &want[at],
+            &format!("lane {at} velocity, rank 0's readout"),
+        );
+        // How far the four-rank answer sits from the host's, said out loud:
+        // the reduction is one bf16 `ncclAllReduce` over four partials, so a
+        // sound one lands within a bf16 rounding or two of the host's own
+        // bf16 walk — well inside `assert_close`'s 4e-2. A number that
+        // creeps toward the assertion is the signal that the reduce, not
+        // the arithmetic, is what moved.
+        let worst = readout
+            .values
+            .iter()
+            .zip(&want[at])
+            .map(|(got, want)| (got - want).abs() / want.abs().max(1.0))
+            .fold(0f32, f32::max);
+        eprintln!("lane {at}: worst relative deviation from the host reference {worst:.2e}");
+        assert!(
+            worst <= 8.0e-3,
+            "lane {at}: the four-rank answer is {worst:.2e} off the host's bf16 walk; \
+             one bf16 all-reduce over four partials does not cost that much"
+        );
     }
     // The epilogue's road, off rank 0's ring: the same numbers.
     for (at, &instance) in instances.iter().enumerate() {
@@ -402,7 +430,11 @@ fn four_ranks_land_what_one_rank_lands() {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert_close(&got, &want[at], &format!("lane {at} velocity, the epilogue's intrinsic"));
+        assert_close(
+            &got,
+            &want[at],
+            &format!("lane {at} velocity, the epilogue's intrinsic"),
+        );
     }
     let _ = BTreeMap::<u64, u64>::new();
 }

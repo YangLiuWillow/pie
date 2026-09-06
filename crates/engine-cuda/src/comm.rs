@@ -27,6 +27,11 @@ impl Id {
         #[cfg(feature = "cuda")]
         {
             use cudarc::nccl::sys as nccl;
+            // Here rather than in `open`: this runs once, on the opener's
+            // own thread, before a rank thread exists — and `set_var` from
+            // the rank threads, which open concurrently, would be a data
+            // race on the environment.
+            transport_defaults();
             let mut id = nccl::ncclUniqueId { internal: [0; 128] };
             // SAFETY: a live out-parameter of the exact type NCCL writes.
             let code = unsafe { nccl::ncclGetUniqueId(&raw mut id) };
@@ -65,7 +70,6 @@ impl Comm {
         #[cfg(feature = "cuda")]
         {
             use cudarc::nccl::sys as nccl;
-            transport_defaults();
             let unique = nccl::ncclUniqueId {
                 internal: id.0.map(|byte| byte as core::ffi::c_char),
             };
@@ -159,9 +163,14 @@ impl PartialEq for Comm {
 }
 
 /// The ranks of one group are threads of one process. On PCIe boxes NCCL's
-/// P2P transport can wedge before it falls back (observed on a 2x L40S pair),
-/// so shared memory is the default transport; an operator who has stated a
-/// policy keeps it.
+/// P2P transport can wedge before it falls back (observed on a 2x L40S pair,
+/// and on a 4x RTX PRO 6000 one), so shared memory is the default transport;
+/// an operator who has stated a policy keeps it.
+///
+/// Called from [`Id::new`] alone, which is the group's first NCCL call and
+/// runs on the opener's thread before any rank thread starts: writing the
+/// environment from the rank threads, which open concurrently, would be a
+/// race.
 #[cfg(feature = "cuda")]
 fn transport_defaults() {
     if std::env::var_os("NCCL_P2P_DISABLE").is_none() {

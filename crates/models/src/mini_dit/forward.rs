@@ -136,8 +136,8 @@ fn denoise_reading(tap: Option<&str>) -> ReadingFact {
         kind,
         width,
         streams: streams.to_vec(),
-                at: None,
-        };
+        at: None,
+    };
     ReadingFact {
         name: "denoise",
         index: DENOISE_READING,
@@ -394,9 +394,13 @@ impl ForwardHybrid for Model {
         );
         tap!(m, "b1.joint_attn_heads", &o);
         let (o_txt, o_img) = o.split(&Facts::text());
-        let ta = linear(&m.double.txt.attn.out, &o_txt);
+        // Both sides' `o` are ROW-cut (`SelfAttn::at`), so each one reduces
+        // across the ranks before it lands in its stream's residual — this
+        // block spells its attention out by hand instead of going through
+        // `attn_sublayer`, and the reduction has to be spelled with it.
+        let ta = linear_reduced(m, &m.double.txt.attn.out, &o_txt);
         tap!(m, "b1.txt_attn_out", &ta);
-        let ia = linear(&m.double.img.attn.out, &o_img);
+        let ia = linear_reduced(m, &m.double.img.attn.out, &o_img);
         tap!(m, "b1.img_attn_out", &ia);
         let txt = ops::elemwise::gated_residual_add(&txt, &txt_mod.1, &ta, Some(&lanes));
         tap!(m, "b1.txt_after_attn", &txt);

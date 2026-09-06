@@ -69,6 +69,12 @@ pub struct Group {
     comms: Vec<Arc<Comm>>,
     /// Set by the first refusal or timeout; every later verb refuses by name.
     poisoned: Arc<Mutex<Option<String>>>,
+    /// Rank 0's device facts, read once at open. Kept beside the shells
+    /// rather than through them: [`Engine::device_facts`] borrows for the
+    /// group's life, and a shell held by a verb's rank thread cannot lend
+    /// one out. The facts are "what the machine is. Stable for the life of
+    /// the process", so one read is the whole answer.
+    facts: Option<DeviceFacts>,
 }
 
 /// Opens one CUDA shell per boot as a tensor-parallel group: rank `i` is
@@ -171,11 +177,16 @@ pub fn open_group(
             classify_for,
         )?)));
     }
+    let facts = ranks[0]
+        .lock()
+        .ok()
+        .and_then(|rank| rank.device_facts().cloned());
     Ok(Group {
         ranks,
         ordinals,
         comms: held,
         poisoned: Arc::new(Mutex::new(None)),
+        facts,
     })
 }
 
@@ -188,7 +199,10 @@ impl Group {
 
     /// The refusal that poisoned this group, if one did.
     fn poison(&self) -> Option<String> {
-        self.poisoned.lock().map(|held| held.clone()).unwrap_or(None)
+        self.poisoned
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or(None)
     }
 
     /// Poison the group with `why` and abort every communicator, so a rank
@@ -388,17 +402,9 @@ impl Engine for Group {
     }
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
-        // Rank 0's facts, read through its lock; a rank held by a verb that
-        // never came back answers nothing.
-        let shell = self.ranks[0].try_lock().ok()?;
-        // SAFETY of the lifetime: the facts live inside the shell, which the
-        // group owns for its life; the guard is released but the shell is
-        // not moved or dropped while the group holds it.
-        let facts: *const DeviceFacts = shell.device_facts()?;
-        drop(shell);
-        // SAFETY: see above — the shell is pinned in its `Arc<Mutex>` for
-        // the group's life and `device_facts` is a field read.
-        Some(unsafe { &*facts })
+        // Rank 0's, read once at open: a shell a verb's rank thread is
+        // holding could not lend one out, and the machine does not change.
+        self.facts.as_ref()
     }
 
     fn export_kv_handle(&self) -> Option<KvHandle> {
@@ -454,7 +460,9 @@ impl Engine for Group {
             let id = registration.id;
             for rank in 1..self.ranks.len() {
                 let endpoint = endpoint.clone();
-                self.on(rank, move |shell| shell.adopt_channel(id, endpoint).map(|_| ()))?;
+                self.on(rank, move |shell| {
+                    shell.adopt_channel(id, endpoint).map(|_| ())
+                })?;
             }
         }
         Ok(registered)
@@ -485,7 +493,11 @@ impl Engine for Group {
         self.on(0, |rank| rank.publish_channel(instance, channel, cell))
     }
 
-    fn take_channel(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+    fn take_channel(
+        &mut self,
+        instance: InstanceId,
+        channel: u32,
+    ) -> EngineResult<Option<Vec<u8>>> {
         self.on(0, |rank| rank.take_channel(instance, channel))
     }
 
@@ -522,7 +534,11 @@ impl Engine for Group {
         let silent: engine::CompletionSink = Arc::new(|_, _| {});
         for (rank, shell) in self.ranks.iter().enumerate() {
             if let Ok(mut shell) = shell.try_lock() {
-                shell.on_complete(if rank == 0 { sink.clone() } else { silent.clone() });
+                shell.on_complete(if rank == 0 {
+                    sink.clone()
+                } else {
+                    silent.clone()
+                });
             }
         }
     }

@@ -41,9 +41,23 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
         ),
-        // The same text four ranks wide (`mini-dit-bf16-kv-bf16-tp4`): one
-        // head per rank, the D14 bring-up row (`Model::mini` states the tp
-        // convention). An artifact imported at one rank serves it, each
+        // The same text two ranks wide (`mini-dit-bf16-kv-bf16-tp2`): two
+        // heads per rank. The rung between the one-rank row and the
+        // four-rank one, which is what makes the reduction noise a slope
+        // rather than a single number.
+        (
+            "mini-dit",
+            2,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::instruct,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
+        ),
+        // And four ranks wide (`mini-dit-bf16-kv-bf16-tp4`): one head per
+        // rank, the D14 bring-up row (`Model::mini` states the tp
+        // convention). An artifact imported at one rank serves either, each
         // rank reading its band.
         (
             "mini-dit",
