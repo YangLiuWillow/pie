@@ -87,6 +87,35 @@ impl Linear {
             ),
         }
     }
+
+    /// Cut along the OUTPUT axis: each rank lands a column block of the
+    /// weight and the matching block of the bias (the projection's answer
+    /// is that rank's heads / its slice of the intermediate).
+    fn columns(self) -> Linear {
+        Linear {
+            w: self.w.columns(),
+            bias: self.bias.columns(),
+        }
+    }
+
+    /// Cut along the REDUCTION axis: each rank lands a row block of the
+    /// weight; the partial products meet in an `all_reduce` and the bias —
+    /// replicated — is added once, after it (`forward::linear_reduced`).
+    fn rows(self) -> Linear {
+        Linear {
+            w: self.w.rows(),
+            bias: self.bias,
+        }
+    }
+
+    /// Cut axis 0 at the stated seams, weight and bias alike — a fused
+    /// projection (`qkv`, `kv`) whose halves must not straddle ranks.
+    fn packed(self, seams: impl IntoIterator<Item = u64> + Clone) -> Linear {
+        Linear {
+            w: self.w.packed(seams.clone()),
+            bias: self.bias.packed(seams),
+        }
+    }
 }
 
 /// A self-attention sublayer: one packed `q|k|v`, a per-head RMS gain on each
@@ -99,13 +128,20 @@ pub struct SelfAttn {
 }
 
 impl SelfAttn {
-    fn at(prefix: &str, banks: Dtype) -> SelfAttn {
+    /// A declared shape is the rank's OWN band (`tp` of them make the
+    /// checkpoint's plane along the cut axis): the fused projection is cut
+    /// at its three seams (each rank lands its `HIDDEN / tp` of q, k and v);
+    /// the QK-norm gains are per head width and stay whole; the output
+    /// projection reduces across ranks.
+    fn at(prefix: &str, banks: Dtype, tp: u32) -> SelfAttn {
         let dense = crate::dense(banks);
+        let mine = HIDDEN / tp;
+        let seams = [u64::from(mine); 3];
         SelfAttn {
-            qkv: Linear::at(&format!("{prefix}.qkv"), 3 * HIDDEN, HIDDEN, banks),
+            qkv: Linear::at(&format!("{prefix}.qkv"), 3 * mine, HIDDEN, banks).packed(seams),
             q_norm: Weight::sym(format!("{prefix}.q_norm"), [u64::from(HEAD_DIM)], dense),
             k_norm: Weight::sym(format!("{prefix}.k_norm"), [u64::from(HEAD_DIM)], dense),
-            out: Linear::at(&format!("{prefix}.o"), HIDDEN, HIDDEN, banks),
+            out: Linear::at(&format!("{prefix}.o"), HIDDEN, mine, banks).rows(),
         }
     }
 }
@@ -121,14 +157,16 @@ pub struct CrossAttn {
 }
 
 impl CrossAttn {
-    fn at(prefix: &str, banks: Dtype) -> CrossAttn {
+    fn at(prefix: &str, banks: Dtype, tp: u32) -> CrossAttn {
         let dense = crate::dense(banks);
+        let mine = HIDDEN / tp;
         CrossAttn {
-            q: Linear::at(&format!("{prefix}.q"), HIDDEN, HIDDEN, banks),
-            kv: Linear::at(&format!("{prefix}.kv"), 2 * HIDDEN, CONTEXT_WIDTH, banks),
+            q: Linear::at(&format!("{prefix}.q"), mine, HIDDEN, banks).columns(),
+            kv: Linear::at(&format!("{prefix}.kv"), 2 * mine, CONTEXT_WIDTH, banks)
+                .packed([u64::from(mine); 2]),
             q_norm: Weight::sym(format!("{prefix}.q_norm"), [u64::from(HEAD_DIM)], dense),
             k_norm: Weight::sym(format!("{prefix}.k_norm"), [u64::from(HEAD_DIM)], dense),
-            out: Linear::at(&format!("{prefix}.o"), HIDDEN, HIDDEN, banks),
+            out: Linear::at(&format!("{prefix}.o"), HIDDEN, mine, banks).rows(),
         }
     }
 }
@@ -141,25 +179,26 @@ pub struct Swiglu {
 }
 
 impl Swiglu {
-    fn at(prefix: &str, banks: Dtype) -> Swiglu {
+    fn at(prefix: &str, banks: Dtype, tp: u32) -> Swiglu {
         // `.packed` states the seam between the two halves: the checkpoint
         // ships them as two tensors and `Builder::read_concat` fuses them
         // along it. At one rank it cuts nothing; it is the seam that is the
         // fact, not the width.
         let name = format!("{prefix}.gate_up");
-        let seams = [u64::from(INTER), u64::from(INTER)];
+        let mine = INTER / tp;
+        let seams = [u64::from(mine), u64::from(mine)];
         Swiglu {
             gate_up: Linear {
-                w: Weight::sym(&name, [u64::from(2 * INTER), u64::from(HIDDEN)], banks)
+                w: Weight::sym(&name, [u64::from(2 * mine), u64::from(HIDDEN)], banks)
                     .packed(seams),
                 bias: Weight::sym(
                     format!("{name}.bias"),
-                    [u64::from(2 * INTER)],
+                    [u64::from(2 * mine)],
                     crate::dense(banks),
                 )
                 .packed(seams),
             },
-            down: Linear::at(&format!("{prefix}.down"), HIDDEN, INTER, banks),
+            down: Linear::at(&format!("{prefix}.down"), HIDDEN, mine, banks).rows(),
         }
     }
 }
@@ -180,11 +219,11 @@ pub struct Side {
 }
 
 impl Side {
-    fn at(prefix: &str, banks: Dtype) -> Side {
+    fn at(prefix: &str, banks: Dtype, tp: u32) -> Side {
         Side {
             ada: Linear::at(&format!("{prefix}.ada"), MOD_SLICES * HIDDEN, HIDDEN, banks),
-            attn: SelfAttn::at(&format!("{prefix}.attn"), banks),
-            mlp: Swiglu::at(&format!("{prefix}.mlp"), banks),
+            attn: SelfAttn::at(&format!("{prefix}.attn"), banks, tp),
+            mlp: Swiglu::at(&format!("{prefix}.mlp"), banks, tp),
         }
     }
 }
@@ -233,11 +272,35 @@ pub struct Model {
 }
 
 impl Model {
-    /// The one shape this family ships. `tp` is a column for the catalog's
-    /// sake: every rectangle here is 256 wide and nothing is worth cutting,
-    /// so this text ships one-rank rows only and every weight is replicated.
+    /// The one shape this family ships, at one rank or several.
+    ///
+    /// **The `tp` convention (design D14).** The plan is SPMD; a rank's
+    /// share is what its cut weights land, and the widths the forward
+    /// spells are per rank:
+    ///
+    /// - every self- and cross-attention projection is cut BY HEADS —
+    ///   `qkv` at its three seams, cross `q` by columns, cross `kv` at its
+    ///   two seams — so a rank holds `HEADS / tp` heads of each and its
+    ///   `attention.ragged` runs over them with no collective (the softmax
+    ///   is per head);
+    /// - every projection back into the residual (`attn.o`, `cross.x.o`,
+    ///   `mlp.down`) is cut BY ROWS: the partial products `all_reduce`, and
+    ///   the bias, replicated, is added once after the reduction;
+    /// - `mlp.gate_up` is cut at its gate/up seam (each rank its `INTER /
+    ///   tp` of both halves, so the SwiGLU is local);
+    /// - the adaLN linears, `x_embed`, the head (`final.*`), every norm gain
+    ///   and the QK-norm gains are replicated (per-lane vectors and `[HEAD_DIM]`
+    ///   gains are not worth cutting; `final.proj` reads the reduced residual).
+    ///
+    /// `tp` must divide `HEADS` (4) and `INTER` (512): 1, 2 and 4. An
+    /// artifact imported at one rank serves every width, each rank reading
+    /// its band at load.
     #[must_use]
     pub fn mini(banks: Dtype, tp: u32) -> Model {
+        assert!(
+            matches!(tp, 1 | 2 | 4),
+            "tp {tp} does not divide mini-dit's {HEADS} heads"
+        );
         let dense = crate::dense(banks);
         Model {
             tp,
@@ -245,21 +308,21 @@ impl Model {
             x_embed: Linear::at("x_embed", HIDDEN, PATCH_FEATURES, banks),
             single: Single {
                 ada: Linear::at("single.ada", MOD_SLICES * HIDDEN, HIDDEN, banks),
-                attn: SelfAttn::at("single.attn", banks),
-                mlp: Swiglu::at("single.mlp", banks),
+                attn: SelfAttn::at("single.attn", banks, tp),
+                mlp: Swiglu::at("single.mlp", banks, tp),
             },
             double: Double {
-                img: Side::at("double.img", banks),
-                txt: Side::at("double.txt", banks),
+                img: Side::at("double.img", banks, tp),
+                txt: Side::at("double.txt", banks, tp),
             },
             cross: Cross {
                 mod_table: Weight::sym("cross.mod_table", [u64::from(MOD_SLICES * HIDDEN)], dense),
                 ada: Linear::at("cross.ada", MOD_SLICES * HIDDEN, HIDDEN, banks),
-                self_attn: SelfAttn::at("cross.self", banks),
+                self_attn: SelfAttn::at("cross.self", banks, tp),
                 norm: Weight::sym("cross.norm", [u64::from(HIDDEN)], dense),
                 norm_bias: Weight::sym("cross.norm.bias", [u64::from(HIDDEN)], dense),
-                cross: CrossAttn::at("cross.x", banks),
-                mlp: Swiglu::at("cross.mlp", banks),
+                cross: CrossAttn::at("cross.x", banks, tp),
+                mlp: Swiglu::at("cross.mlp", banks, tp),
             },
             final_ada: Linear::at("final.ada", 2 * HIDDEN, HIDDEN, banks),
             final_proj: Linear::at("final.proj", PATCH_FEATURES, HIDDEN, banks),
