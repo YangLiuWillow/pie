@@ -771,38 +771,63 @@ python wan22_parity.py all --out /tmp/wan22-parity --config ~/.pie/config.wan22-
 python wan22_parity.py all --pertoken --out /tmp/wan22-parity --config ...
 ```
 
-`d128`, both forwards: max-abs 0.01887, rel 0.01223, **cos 0.999925** — under the
-gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`). The per-token forward (two
-video lanes of one group, the conditioning frame at timestep 0) lands the same
-number. `conditioning` passes at a move of 0.0065.
+`d128`, both forwards: max-abs 0.00949, rel 0.00605, **cos 0.999982** — under
+the gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`). The per-token forward
+(two video lanes of one group, the conditioning frame at timestep 0) lands the
+same number. `conditioning` passes at a move of 0.0065.
 
-**The real row does NOT yet pass.** `wan22-ti2v-5b` against `dit.step0.out`
-answers **cos 0.2740** (std 0.159 against the golden's 1.117), and the forward is
-well conditioned — diffusers in fp32 against diffusers in bf16 is cos 0.999942 —
-so this is a defect, not drift. Bisected by importing the real checkpoint with
-chosen planes zeroed:
+**The real row passes too.** `wan22-ti2v-5b` against `dit.step0.out` answers
+**cos 0.999959** (max-abs 0.0625, rel 0.00914) under its own `--cos-tol 0.999`,
+and `conditioning` moves the velocity by **0.3233** where the reference — the
+same diffusers forward with the 512-row context zeroed — moves **0.3254**.
+Four consecutive flagship runs answered the same cosine to every printed digit.
 
-| fixture | cos vs diffusers |
-|---|---|
-| all 30 blocks neutralised (`attn1/attn2/ffn` output projections zeroed) | **0.999998** |
-| one live self-attention block, modulation six distinct constants | **0.999991** |
-| 30 live self-attention blocks (cross-attn and FFN dead) | 0.098 |
-| 30 blocks, `condition_embedder.time_proj` zeroed | 0.233 |
+### The defect that used to hold it at cos 0.2740
 
-So `patch_embedding`, the whole timestep chain, the head's modulation,
-`norm_out`, `proj_out`, the velocity readback and the `(c, ph, pw)` row layout
-are EXACT, and so is a single block; the defect is in the blocks and grows with
-depth. Not the import: `dit.time_proj`, the block and head `scale_shift_table`s,
-`dit.head_proj` and `proj_out`'s row permutation all read back exactly as the
-plan states them, and the timestep chain recomputed from the artifact's own
-planes matches diffusers' `timestep_proj` at cos 0.9999986. Not the context
-lane either: dropping the prompt moves pie's velocity by 0.55 against the
-reference's 0.48.
+One vector, folded into thirty times. `elementwise.add_bias` folds its bias IN
+PLACE — the IR aliases `out_out` onto `out`, which is exactly what a biased
+projection wants of its own matmul output — and `denoise` computes
+`time_proj(silu(temb))` ONCE a fire and hands the same vector to every block.
+Each block added its `scale_shift_table` to it, so block `k` modulated by
+`timestep_proj + sum(table_0..table_k)` instead of `timestep_proj + table_k`.
+`wan_2::forward::copy_of` now hands each block a fresh copy (two elementwise
+ops on a `[lanes, 6·dim]` f32 vector), and `cargo test -p models --test
+every_wan_2_fold_owns_the_vector_it_folds_into` walks every wan_2 plan on every
+platform for another fold whose operand a later node still reads.
+
+The bisection that named it runs one 1×2×2 latent — ONE token, so the
+self-attention is the identity on V and DEPTH is the only variable — against
+diffusers with the same planes zeroed. "K blocks live" means every block from
+K on has its three output projections zeroed: all thirty still run, only the
+first K write to the residual.
+
+| live blocks K | before | after |
+|---:|---|---|
+| 0 (all neutralised) | 0.999998 | — |
+| 1 | 0.999991 | 0.999991 |
+| 2 | **0.98704** | 0.999991 |
+| 4 | 0.96408 | 0.999985 |
+| 8 | 0.86953 | 0.999985 |
+| 15 | 0.30741 | 0.999980 |
+| 30 | 0.16397 | 0.999970 |
+
+The break is at TWO blocks and deepens monotonically — the signature of
+something carried BETWEEN blocks, not inside one. It is also why the fixtures
+that came first all missed it: one live block has one table to fold, and
+"thirty blocks, one constant modulation" and "`time_proj` zeroed" both give
+every block the SAME table, which a cumulative sum cannot distinguish from a
+per-block one until the tables differ. On four whole-model cases (1, 1, 4 and
+390 tokens, context 0/0/11/11 rows) the same fix moves pie from cos
+0.16/0.23/0.30/0.30 to 0.99997/0.99996/0.99993/0.99978; repeat runs of those
+move the last digits by ~2e-5, and nothing worse was seen in ~20 runs.
 
 Two operational notes for the real row: `[engine] gpu_mem_utilization` must be
 0.95+ (every fire — a denoise step included — demands the VAE's whole
-causal-conv state watermark, ~6.4 GiB, and a co-tenanted card leaves the elastic
-pool less than that and refuses the pass by name), and the umT5 tokenizer is a
+causal-conv state watermark, ~6.4 GiB, because `state_slot_bytes` sums EVERY
+`Shape::State` row of the plan with no idea which reading's arms touch them:
+`crates/engine-cuda/src/store.rs`, consumed as `state_size` in
+`crates/runtime/src/bootstrap.rs`. Charging a reading only the state its own
+arms read is a real fix and still to be made), and the umT5 tokenizer is a
 SentencePiece Unigram model `pie model import` cannot compile, so the import
 needs a `tokenizer/` a BPE loader accepts (the row borrows `qwen_3`'s contract
 anyway — `models::wan_2::tokenizer`).

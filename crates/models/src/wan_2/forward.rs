@@ -357,6 +357,19 @@ fn linear(w: &Linear, x: &Value) -> Value {
     ops::elemwise::add_bias(&w.bias, &ops::linear::matmul(x, &w.w))
 }
 
+/// A fresh copy of a lane vector. `elementwise.add_bias` folds its bias IN
+/// PLACE (the IR aliases `out_out` onto `out`), and `timestep_proj` is one
+/// vector the WHOLE STACK shares — `time_proj(silu(temb))` is computed once
+/// per fire and read by all thirty blocks — so a block must add its
+/// `scale_shift_table` to a COPY. Folding into the shared vector instead
+/// leaves block `k` modulating by `timestep_proj + sum(table_0..table_k)`,
+/// which is exact at one block and drifts further with every one after
+/// (the real row read cos 0.274 against diffusers, a miniature two blocks
+/// deep still read 0.9999).
+fn copy_of(v: &Value) -> Value {
+    ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(v, v))
+}
+
 /// The tables the video side's attentions need: the token→lane map, the
 /// rotary coordinates, the video selection's permutation and group CSR.
 struct VideoGeom {
@@ -530,8 +543,9 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     );
 
     for (_, b) in arm.walk_layers(&dit.blocks) {
-        // `scale_shift_table + timestep_proj`, in fp32, per lane.
-        let e = ops::elemwise::add_bias(&b.table, &proj);
+        // `scale_shift_table + timestep_proj`, in fp32, per lane — on a
+        // COPY of the projection, see `copy_of`.
+        let e = ops::elemwise::add_bias(&b.table, &copy_of(&proj));
         x = block(&x, &c, b, &e, d, &vg, &cg);
     }
 
