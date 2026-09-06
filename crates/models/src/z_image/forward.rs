@@ -232,6 +232,10 @@ impl Model {
                 takes_tokens: false,
                 streams: vec![Stream::Image],
                 ports: vec![port("latent", PortKind::Voxels, CHANNELS, &[Stream::Image])],
+                // A VAE tile is a box on the voxel axis, not rows in a
+                // rotary space: it takes no positions and states no
+                // convention.
+                positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: super::vae::RGB,
             });
@@ -247,6 +251,7 @@ impl Model {
                     super::vae::RGB,
                     &[Stream::Image],
                 )],
+                positions: None,
                 readout: ReadoutKind::Pixels,
                 readout_width: CHANNELS,
             });

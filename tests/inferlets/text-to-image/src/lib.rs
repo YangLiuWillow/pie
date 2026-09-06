@@ -51,13 +51,13 @@
 //!
 //! The intended one is D11: a `vae.decode` reading, whose pixels land in a
 //! host-held `frames` handle that `session::send_frames` encodes and
-//! streams to the client without ever entering linear memory. **No family
-//! declares that reading on `dev`** — `flux_2` traces its decoder but keeps
-//! it out of the facts, because `PortKind`/`ReadoutKind` carry no
-//! voxel/pixel seam yet — so there is no honest way to drive it from here
-//! and this program says so by name rather than guessing at a shape that
-//! does not exist. The branch is written that way ON PURPOSE: the day the
-//! VAE arm lands, this is the one place that changes.
+//! streams to the client without ever entering linear memory. `z_image`
+//! declares that reading now — a `Voxels` port and a `Pixels` readout —
+//! but the two guest verbs it would take, a channel-fed voxel port and a
+//! `pixels()` intrinsic to read the seam back with, are not in the SDK
+//! yet. So this program NOTES the reading in its report and takes the
+//! other exit; the day those verbs land, the branch marked in `main` is
+//! the one place that changes.
 //!
 //! The exit every model has today is the second: the final latent as raw
 //! little-endian f32 through `session::send_file`, with the geometry a
@@ -136,6 +136,10 @@ struct Output {
     /// Whether the pixels went out as an encoded image (a `vae.decode`
     /// reading) or the latent went out raw.
     decoded: bool,
+    /// The decode reading this model declares, if any. Present with
+    /// `decoded: false` means the model HAS a decoder and this guest could
+    /// not drive it yet (see the branch's note).
+    decode_reading: Option<String>,
     /// The name the client should give what was sent.
     file: String,
     bytes: u32,
@@ -354,6 +358,17 @@ fn lane(
             }
             model::PortKind::LaneVector => {
                 Channel::from(vec![1.0f32; port.width as usize]).named(&name)
+            }
+            // A voxel port is a VAE tile's box on the third row axis
+            // (D8), not something a denoise lane carries. If a denoise
+            // reading ever declares one, this program is the wrong driver
+            // for it and says so rather than feeding it zeros.
+            model::PortKind::Voxels => {
+                return Err(format!(
+                    "reading `{}` declares a voxel port `{}`; this sampler drives latent rows,                      not a VAE tile",
+                    reading.name, port.name
+                )
+                .into());
             }
         };
         pass.input(&port.name, &ch)?;
@@ -596,29 +611,24 @@ async fn main(input: Input) -> Result<Output> {
     let mean = last.iter().sum::<f32>() / n;
     let var = last.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
     let name = input.out.unwrap_or_else(|| "image".to_string());
-    let (file, decoded, bytes) = match &roles.decode {
-        // The pixels never enter linear memory: the decode reading's frames
-        // handle is streamed out by the host (D11). No family declares this
-        // reading on `dev`; the arm is here so the exit exists the day one
-        // does, and it refuses loudly rather than pretending.
-        Some(decode) => {
-            return Err(format!(
-                "this model declares a `{}` reading, but its pixels seam is not in the facts \
-                 vocabulary yet (`ReadoutKind` has no `Pixels`), so this program cannot drive \
-                 it; re-run once the VAE arm lands",
-                decode.name
-            )
-            .into());
+    // THE DECODE BRANCH IS A BRANCH, NOT A REFUSAL. A model that declares a
+    // `vae.decode` reading with a voxel port and a pixels readout is one
+    // `frames` handle away from D11's exit — the pixels encoded host-side
+    // and streamed to the client without ever entering linear memory. What
+    // is not in the guest surface yet is the pair that would drive it: a
+    // channel-fed `Voxels` port and a `pixels()` intrinsic to read the seam
+    // back with. Until both land, this reports the reading it saw and takes
+    // the latent exit, so a row that grows a decoder keeps working and the
+    // report says exactly what is missing.
+    let decode_reading = roles.decode.as_ref().map(|r| r.name.clone());
+    let (file, decoded, bytes) = {
+        let mut bytes = Vec::with_capacity(last.len() * 4);
+        for value in &last {
+            bytes.extend_from_slice(&value.to_le_bytes());
         }
-        None => {
-            let mut bytes = Vec::with_capacity(last.len() * 4);
-            for value in &last {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-            inferlet::session::send_file(&bytes);
-            (format!("{name}.latent.f32"), false, len)
-        }
+        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        inferlet::session::send_file(&bytes);
+        (format!("{name}.latent.f32"), false, len)
     };
 
     Ok(Output {
@@ -643,6 +653,7 @@ async fn main(input: Input) -> Result<Output> {
         sigmas: sched.sigmas.clone(),
         context_rows,
         decoded,
+        decode_reading,
         file,
         bytes,
         non_finite: last.iter().filter(|v| !v.is_finite()).count() as u32,

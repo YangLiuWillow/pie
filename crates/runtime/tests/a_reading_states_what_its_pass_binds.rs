@@ -8,7 +8,9 @@
 //!
 //! `cargo test -p runtime --test a_reading_states_what_its_pass_binds`
 
-use models::{Generative, PortFact, PortKind, ReadingFact, ReadoutKind, Stream};
+use models::{
+    AxisRole, Generative, PortFact, PortKind, PositionConvention, ReadingFact, ReadoutKind, Stream,
+};
 use runtime::model::{validate_generative, velocity_facts};
 
 fn text() -> ReadingFact {
@@ -19,6 +21,7 @@ fn text() -> ReadingFact {
         takes_tokens: true,
         streams: Vec::new(),
         ports: Vec::new(),
+        positions: None,
         readout: ReadoutKind::Hidden,
         readout_width: 512,
     }
@@ -57,6 +60,12 @@ fn denoise() -> ReadingFact {
                 streams: Vec::new(),
             },
         ],
+        positions: Some(PositionConvention {
+            axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+            text_axis: 0,
+            text_origin: 0,
+            image_follows_text: false,
+        }),
         readout: ReadoutKind::Velocity,
         readout_width: 64,
     }

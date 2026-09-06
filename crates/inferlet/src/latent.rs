@@ -402,9 +402,9 @@ impl LaneClock {
     /// modulates (a text lane) passes a body that does nothing; the image
     /// lane's body is the Euler update.
     pub fn drive(&self, pass: &ForwardPass, body: impl Fn(&Tensor) + 'static) {
-        let step = self.step.clone();
-        let timestep = self.timestep.clone();
-        let ts = self.ts.clone();
+        // `Channel` is a Copy handle; these are the epilogue closure's own
+        // copies of the same three cells.
+        let (step, timestep, ts) = (self.step, self.timestep, self.ts);
         pass.epilogue(move || {
             let k = step.take();
             body(&k);
