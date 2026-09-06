@@ -25,15 +25,22 @@ script is the other half: it turns the golden's *inputs* into the case JSON the
 Nothing here imports torch: the reference numbers are already on disk, and
 patchify is a reshape.
 
-WHAT THIS CANNOT DO YET
------------------------
-The guest side is complete: the `reading` / `input` / `stream` / `group` verbs
-and the `velocity()` intrinsic have landed.  What `run` still needs is the
-CUDA dispatch arms for `attention.ragged`, `layout.{pack,unpack}_rows` and
-`elementwise.{modulate,gated_residual_add,sinusoid,silu,rope_axes}`, which
-`engine-cuda` refuses by name today.  `case`, `collect` and `compare` are
-useful on their own the moment a pie-side answer exists, however it was
-produced, and `run` says what failed rather than failing obscurely.
+THE GUEST'S SHAPE
+-----------------
+One step is three passes (caption, image, context) in one attention group,
+each on ITS OWN pipeline: the scheduler seals a frame from every live
+pipeline and never seats two passes of one pipeline in one step, so three
+passes down one pipeline would be three fires, each lane attending alone.
+The runtime holds a fresh group's first frame for its cohort (`FireRequest::
+cohort`), so the three seal together from the first step.
+
+BISECTION
+---------
+`--tap <dump key>` (e.g. `b0.attn_out`) re-imports nothing: the family reads
+`PIE_MINI_DIT_TAP` at IMPORT time and plants the velocity export on that
+intermediate, so re-import the artifact under the env first, then `run
+--tap KEY`, `collect --tap KEY`, `compare --tap KEY` diff that one tensor.
+`pie_<b>.stderr` is kept beside each answer.
 """
 
 from __future__ import annotations
@@ -240,6 +247,8 @@ def run(args) -> None:
             )
         with open(out, "w") as f:
             f.write(done.stdout)
+        with open(out[:-5] + ".stderr", "w") as f:
+            f.write(done.stderr)
         print(f"[run] batch {b} -> {out}")
 
 
@@ -287,6 +296,13 @@ def collect(args) -> str:
             out[f"euler.v{i}"] = stack("euler_v", i)
             out[f"euler.x{i + 1}"] = stack("euler_x", i)
         out["euler.latent"] = out[f"euler.x{steps}"]
+    elif args.tap:
+        # The tapped intermediate rides in the velocity's place at its own
+        # `[rows, width]`; no unpatchify — the golden's key is `[B, rows, width]`
+        # (a trunk tensor) or `[B, width]` (a lane vector, rows == 1).
+        planes = [np.asarray(doc["velocity"], dtype=np.float32) for doc in docs]
+        tw = docs[0].get("velocity_width", width)
+        out[args.tap] = np.stack([plane.reshape(-1, tw) for plane in planes]).squeeze()
     else:
         out["velocity"] = stack("velocity")
         # The head's own rectangle too, so a mismatch says whether it is the
@@ -320,6 +336,8 @@ def compare(args) -> int:
     if args.keys:
         for glob in args.keys:
             cmd += ["--keys", glob]
+    if args.tap:
+        cmd += ["--keys", args.tap]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
 
@@ -342,6 +360,8 @@ def main() -> int:
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")
     ap.add_argument("--keys", action="append", default=None)
+    ap.add_argument("--tap", default=None,
+                    help="the dump key the artifact was imported to export (PIE_MINI_DIT_TAP)")
     args = ap.parse_args()
 
     if args.cmd == "case":

@@ -20,6 +20,14 @@
 //! on any of them: a denoise reading declares no kv space and no tokens,
 //! and the image lane's row count comes from its latents channel.
 //!
+//! **ONE PIPELINE PER LANE.** A group is a fact about a FIRE: the three
+//! passes join one attention only when they are members of one step. The
+//! scheduler seals a frame when every live pipeline has submitted and never
+//! seats two passes of one pipeline in one step, so three passes down one
+//! pipeline are three fires — each lane attending alone, the context lane's
+//! keys never seen. Three pipelines, one pass each, submitted back to back,
+//! are what the wait-all seal composes into one fire.
+//!
 //! Only the image lane reads out — the caption stream ends after block 1,
 //! and the head is image-only — so only it carries an epilogue.
 //!
@@ -60,6 +68,14 @@ struct Input {
     case_7: Option<String>,
     #[serde(default)]
     euler: bool,
+    /// The family's `PIE_MINI_DIT_TAP` bisection knob is set: the readout
+    /// is an intermediate, at whatever width the model declares.
+    #[serde(default)]
+    tap: bool,
+    /// Under `tap`, a tap whose rectangle spans the caption rows too: read
+    /// the caption lane out as well, into `text_tap`.
+    #[serde(default)]
+    tap_text: bool,
 }
 
 /// One batch element of the reference's fixed inputs, flattened row-major.
@@ -109,6 +125,12 @@ struct Output {
     euler_v: Vec<Vec<f32>>,
     #[serde(default)]
     euler_x: Vec<Vec<f32>>,
+    /// `--tap_text`: the caption lane's rows of the tapped rectangle,
+    /// `[text_rows, width]`.
+    #[serde(default)]
+    text_tap: Vec<f32>,
+    #[serde(default)]
+    text_rows: u32,
 }
 
 /// The port names this family's `denoise` reading declares. Read off
@@ -143,19 +165,46 @@ fn ports(reading: &model::ReadingFact) -> Result<Ports> {
     })
 }
 
+/// The three lanes' pipelines, one each, so the three passes of a step seal
+/// into one fire.
+struct Pipes {
+    caption: Pipeline,
+    context: Pipeline,
+    image: Pipeline,
+}
+
+impl Pipes {
+    fn new() -> Pipes {
+        Pipes {
+            caption: Pipeline::new(),
+            context: Pipeline::new(),
+            image: Pipeline::new(),
+        }
+    }
+
+    fn close(&self) {
+        self.caption.close();
+        self.context.close();
+        self.image.close();
+    }
+}
+
 /// One denoise step: three lanes, one group, one fire, one velocity.
 async fn step(
     case: &Case,
     ports: &Ports,
     reading: &str,
-    pipe: &Pipeline,
+    pipes: &Pipes,
     group: u32,
     latents: &[f32],
     timestep: f32,
+    text_tap: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>> {
     let tag = |what: &str| format!("{what}_g{group}");
     let rows = case.image_rows;
-    let width = case.patch_features;
+    // The readout's width is the reading's, which is the patch features —
+    // or, under the family's tap knob, the tapped rectangle's.
+    let width = ports.velocity_width;
     // One timestep cell PER PASS: a seeded channel attaches to one pass
     // only (the runtime's channel-role rule), so the two modulating lanes
     // each carry their own copy of the same scalar.
@@ -177,6 +226,18 @@ async fn step(
     caption.input(&ports.text, &txt)?;
     caption.input(&ports.positions, &txt_pos)?;
     caption.input(&ports.timestep, &t_txt)?;
+    // The bisection knob's caption readout: the same intrinsic, off the
+    // caption lane's own rows of the tapped rectangle.
+    let text_out = text_tap.as_ref().map(|_| {
+        let out = Channel::new([case.text_rows, ports.velocity_width], dtype::f32)
+            .named(&tag("text_tap"));
+        let readback = out.clone();
+        let width = ports.velocity_width;
+        caption.epilogue(move || {
+            readback.put(intrinsics::velocity(width));
+        });
+        out
+    });
 
     // The context lane: block 2's cross-attention keys and values, and
     // nothing else. No positions — the Wan contract gives cross-attention
@@ -198,7 +259,7 @@ async fn step(
     image.reading(reading)?;
     image.stream(LaneStream::Image)?;
     image.group(group)?;
-    let x = Channel::from_shaped([rows, width], latents).named(&tag("latents"));
+    let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
     let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
         .named(&tag("img_pos"));
     image.input(&ports.latents, &x)?;
@@ -211,10 +272,14 @@ async fn step(
         readback.put(intrinsics::velocity(velocity_width));
     });
 
-    caption.submit(pipe).context("caption lane")?;
-    context.submit(pipe).context("context lane")?;
-    image.submit(pipe).context("image lane")?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    caption.submit(&pipes.caption).context("caption lane")?;
+    context.submit(&pipes.context).context("context lane")?;
+    image.submit(&pipes.image).context("image lane")?;
+    let velocity = out.take_host::<Vec<f32>>().await?;
+    if let (Some(sink), Some(text_out)) = (text_tap, text_out) {
+        *sink = text_out.take_host::<Vec<f32>>().await?;
+    }
+    Ok(velocity)
 }
 
 #[inferlet::main]
@@ -259,7 +324,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    if reading.readout_width != case.patch_features {
+    if !(input.tap || input.tap_text) && reading.readout_width != case.patch_features {
         return Err(format!(
             "the model reads a {}-wide velocity and the case carries {}-wide patch rows",
             reading.readout_width, case.patch_features
@@ -275,7 +340,7 @@ async fn main(input: Input) -> Result<Output> {
         .into());
     }
     let ports = ports(&reading)?;
-    let pipe = Pipeline::new();
+    let pipes = Pipes::new();
     let mut out = Output {
         velocity: Vec::new(),
         image_rows: case.image_rows,
@@ -283,20 +348,25 @@ async fn main(input: Input) -> Result<Output> {
         sigmas: Vec::new(),
         euler_v: Vec::new(),
         euler_x: Vec::new(),
+        text_tap: Vec::new(),
+        text_rows: case.text_rows,
     };
 
     if !input.euler {
+        let mut text_tap = Vec::new();
         out.velocity = step(
             &case,
             &ports,
             &reading.name,
-            &pipe,
+            &pipes,
             0,
             &case.latents,
             case.timestep,
+            input.tap_text.then_some(&mut text_tap),
         )
         .await?;
-        pipe.close();
+        out.text_tap = text_tap;
+        pipes.close();
         return Ok(out);
     }
 
@@ -331,10 +401,11 @@ async fn main(input: Input) -> Result<Output> {
             &case,
             &ports,
             &reading.name,
-            &pipe,
+            &pipes,
             i,
             &x,
             sched.timestep(i),
+            None,
         )
         .await?;
         let dt = sched.dt(i);
@@ -345,6 +416,6 @@ async fn main(input: Input) -> Result<Output> {
         out.euler_x.push(x.clone());
     }
     out.velocity = out.euler_v.last().cloned().unwrap_or_default();
-    pipe.close();
+    pipes.close();
     Ok(out)
 }
