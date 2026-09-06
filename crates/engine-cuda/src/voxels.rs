@@ -205,8 +205,7 @@ impl Tables {
                 grid[at..at + 4].copy_from_slice(&[*t as i32, *h as i32, *w as i32, row as i32]);
                 row += i64::from(*t) * i64::from(*h) * i64::from(*w);
                 if let Some(p) = seat.token_patch {
-                    if p.iter().any(|&n| n == 0) || t % p[0] != 0 || h % p[1] != 0 || w % p[2] != 0
-                    {
+                    if p.contains(&0) || t % p[0] != 0 || h % p[1] != 0 || w % p[2] != 0 {
                         return Err(Fault::VoxelPayload {
                             lane: lane.source,
                             what: "a clip's box does not divide by the plan's token patch",
@@ -250,7 +249,12 @@ impl Store {
         let align = |bytes: u64| bytes.next_multiple_of(256);
         let grid = 0u64;
         let token_grid = align(seat.clips * 16);
-        let slots = token_grid + if seat.token_patch.is_some() { align(seat.clips * 16) } else { 0 };
+        let slots = token_grid
+            + if seat.token_patch.is_some() {
+                align(seat.clips * 16)
+            } else {
+                0
+            };
         let payload = slots + align(seat.clips * 4);
         let total = payload + align(seat.rows * seat.row_bytes());
         Ok(Store {
@@ -291,12 +295,9 @@ impl Store {
                 have: self.seat.clips,
             });
         }
-        let row_bytes = self.seat.row_bytes();
-        let rows = if row_bytes == 0 {
-            0
-        } else {
-            tables.payload.len() as u64 / row_bytes
-        };
+        let rows = (tables.payload.len() as u64)
+            .checked_div(self.seat.row_bytes())
+            .unwrap_or(0);
         if rows > self.seat.rows {
             return Err(Fault::Ceiling {
                 what: "voxel rows",
@@ -305,12 +306,14 @@ impl Store {
             });
         }
         let base = self.buffer.ptr();
-        self.buffer.stage(stream, self.grid, i32_bytes(&tables.grid))?;
+        self.buffer
+            .stage(stream, self.grid, i32_bytes(&tables.grid))?;
         if !tables.token_grid.is_empty() {
             self.buffer
                 .stage(stream, self.token_grid, i32_bytes(&tables.token_grid))?;
         }
-        self.buffer.stage(stream, self.slots, i32_bytes(&tables.slots))?;
+        self.buffer
+            .stage(stream, self.slots, i32_bytes(&tables.slots))?;
         if !tables.payload.is_empty() {
             self.buffer.stage(stream, self.payload, &tables.payload)?;
         }
@@ -350,7 +353,9 @@ pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>
             .flat_map(|&v| crate::adapter::bf16_bits(v).to_le_bytes())
             .collect()),
         Dtype::F32 => Ok(values.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err("a voxel submission against a plan whose port element is neither `bf16` nor `f32`"),
+        _ => {
+            Err("a voxel submission against a plan whose port element is neither `bf16` nor `f32`")
+        }
     }
 }
 

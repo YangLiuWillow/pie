@@ -28,8 +28,8 @@ use model_compiler::{
 };
 use model_dsl::ops::spatial::{self, Conv};
 use model_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
-    seam, trace_hybrid,
+    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 use model_ir::{Operands, Trace};
 
@@ -47,7 +47,8 @@ impl Classify for NoFacts {
 const C: u32 = 8;
 
 fn conv(name: &str, c_in: u32, c_out: u32) -> Weight {
-    Weight::sym(name, [u64::from(c_out), u64::from(c_in) * 27], Dtype::Bf16).conv_taps_major(c_in, 27)
+    Weight::sym(name, [u64::from(c_out), u64::from(c_in) * 27], Dtype::Bf16)
+        .conv_taps_major(c_in, 27)
 }
 
 fn plane(name: &str, c: u32) -> Weight {
@@ -66,7 +67,15 @@ impl ForwardHybrid for Encoder {
         let g = inputs.grid();
         let x = inputs.voxels(0, C, Dtype::Bf16);
         let (h, g1) = spatial::conv3d(&x, &g, &conv("conv", C, C), None, Conv::same3(), None);
-        let h = spatial::group_norm(&h, &g1, 2, &plane("norm.w", C), &plane("norm.b", C), 1e-6, true);
+        let h = spatial::group_norm(
+            &h,
+            &g1,
+            2,
+            &plane("norm.w", C),
+            &plane("norm.b", C),
+            1e-6,
+            true,
+        );
         let tg = inputs.token_grid([1, 2, 2]);
         let tokens = spatial::patchify(&h, &g1, [1, 2, 2], &tg);
         let w = Weight::sym("proj", [64, u64::from(C) * 4], Dtype::Bf16);
@@ -128,7 +137,10 @@ fn an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one() {
     let compiled = compile_axes(&trace, &budgets(), &DeviceProfile::default()).expect("bakes");
     assert_eq!(compiled.units, vec![RowAxis::Voxels, RowAxis::Tokens]);
     assert!(compiled.fold_refused, "two units, no single graph to fold");
-    assert!(compiled.voxels.is_some(), "the voxel axis has its own seriation");
+    assert!(
+        compiled.voxels.is_some(),
+        "the voxel axis has its own seriation"
+    );
     assert!(compiled.order_for(RowAxis::Voxels).is_some());
     assert!(compiled.patches.is_none(), "and no patch axis was stated");
 
@@ -138,11 +150,15 @@ fn an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one() {
         .position(|(name, _)| name == "spatial.patchify")
         .expect("the patchify is a capture node");
     assert!(
-        placed[..boundary].iter().all(|(_, axis)| *axis == RowAxis::Voxels),
+        placed[..boundary]
+            .iter()
+            .all(|(_, axis)| *axis == RowAxis::Voxels),
         "everything before the patchify is the voxel unit's: {placed:?}"
     );
     assert!(
-        placed[boundary..].iter().all(|(_, axis)| *axis == RowAxis::Tokens),
+        placed[boundary..]
+            .iter()
+            .all(|(_, axis)| *axis == RowAxis::Tokens),
         "the patchify writes token rows and opens the token unit: {placed:?}"
     );
     assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
@@ -159,14 +175,24 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
         .iter()
         .position(|(name, _)| name == "spatial.unpatchify")
         .expect("the unpatchify is a capture node");
-    assert!(placed[..boundary].iter().all(|(_, axis)| *axis == RowAxis::Tokens));
     assert!(
-        placed[boundary..].iter().all(|(_, axis)| *axis == RowAxis::Voxels),
+        placed[..boundary]
+            .iter()
+            .all(|(_, axis)| *axis == RowAxis::Tokens)
+    );
+    assert!(
+        placed[boundary..]
+            .iter()
+            .all(|(_, axis)| *axis == RowAxis::Voxels),
         "the unpatchify writes voxel rows and opens the voxel unit: {placed:?}"
     );
 
     // The pixel plane and its grid, off the seam.
-    let pixels = trace.seams.iter().find(|s| s.seam == "pixels").expect("planted");
+    let pixels = trace
+        .seams
+        .iter()
+        .find(|s| s.seam == "pixels")
+        .expect("planted");
     let (plane, grid) = (pixels.values[0], pixels.values[1]);
     let Placement::Arena { rows, bytes, .. } = &compiled.arena.placements[plane.0 as usize] else {
         panic!("the pixel plane is a rectangle of the arena")

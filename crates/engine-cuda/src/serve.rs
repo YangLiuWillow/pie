@@ -463,7 +463,7 @@ impl Shell {
         &mut self,
         lanes: &[Seated<'_>],
         voxels: &[Clips<'_>],
-    ) -> Result<Vec<(Vec<f32>, Vec<[u32; 3]>)>> {
+    ) -> Result<Vec<Pixels>> {
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -556,6 +556,10 @@ impl Drop for Shell {
         let _ = self.device.synchronize();
     }
 }
+
+/// One lane's decoded pixels (D8): one `f32` row per output voxel of its
+/// clips in submission order, beside each clip's output box.
+pub type Pixels = (Vec<f32>, Vec<[u32; 3]>);
 
 /// One step's submission, as the shell reads it.
 #[derive(Clone, Copy)]

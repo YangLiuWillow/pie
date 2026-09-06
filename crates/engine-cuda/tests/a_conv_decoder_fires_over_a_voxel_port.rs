@@ -83,7 +83,14 @@ impl Decoder {
     }
 
     fn weights(&self) -> [&Weight; 6] {
-        [&self.conv1, &self.b1, &self.gn_w, &self.gn_b, &self.conv2, &self.b2]
+        [
+            &self.conv1,
+            &self.b1,
+            &self.gn_w,
+            &self.gn_b,
+            &self.conv2,
+            &self.b2,
+        ]
     }
 }
 
@@ -164,31 +171,69 @@ struct Planes {
 /// sorted name order as canonical `.zt` form requires.
 fn write_checkpoint(path: &Path) -> Planes {
     let mut lcg = Lcg(0xd8_c0de);
-    let (conv1, conv1_bytes) = drawn(&mut lcg, C_MID * C_IN * TAPS, 2.0 / ((C_IN * TAPS) as f32).sqrt());
+    let (conv1, conv1_bytes) = drawn(
+        &mut lcg,
+        C_MID * C_IN * TAPS,
+        2.0 / ((C_IN * TAPS) as f32).sqrt(),
+    );
     let b1: Vec<f32> = (0..C_MID).map(|_| lcg.unit() * 0.2).collect();
     let gn_w: Vec<f32> = (0..C_MID).map(|_| 1.0 + lcg.unit() * 0.5).collect();
     let gn_b: Vec<f32> = (0..C_MID).map(|_| lcg.unit() * 0.5).collect();
-    let (conv2, conv2_bytes) = drawn(&mut lcg, C_OUT * C_MID * TAPS, 2.0 / ((C_MID * TAPS) as f32).sqrt());
+    let (conv2, conv2_bytes) = drawn(
+        &mut lcg,
+        C_OUT * C_MID * TAPS,
+        2.0 / ((C_MID * TAPS) as f32).sqrt(),
+    );
     let b2: Vec<f32> = (0..C_OUT).map(|_| lcg.unit() * 0.2).collect();
 
     let mut writer = ztensor::Writer::create(path).expect("the container opens");
     writer
-        .add("conv1", vec![C_MID as u64, (C_IN * TAPS) as u64], ztensor::Leaf::BF16, &conv1_bytes)
+        .add(
+            "conv1",
+            vec![C_MID as u64, (C_IN * TAPS) as u64],
+            ztensor::Leaf::BF16,
+            &conv1_bytes,
+        )
         .expect("conv1");
     writer
-        .add("conv1.bias", vec![C_MID as u64], ztensor::Leaf::F32, &f32_bytes(&b1))
+        .add(
+            "conv1.bias",
+            vec![C_MID as u64],
+            ztensor::Leaf::F32,
+            &f32_bytes(&b1),
+        )
         .expect("conv1.bias");
     writer
-        .add("conv2", vec![C_OUT as u64, (C_MID * TAPS) as u64], ztensor::Leaf::BF16, &conv2_bytes)
+        .add(
+            "conv2",
+            vec![C_OUT as u64, (C_MID * TAPS) as u64],
+            ztensor::Leaf::BF16,
+            &conv2_bytes,
+        )
         .expect("conv2");
     writer
-        .add("conv2.bias", vec![C_OUT as u64], ztensor::Leaf::F32, &f32_bytes(&b2))
+        .add(
+            "conv2.bias",
+            vec![C_OUT as u64],
+            ztensor::Leaf::F32,
+            &f32_bytes(&b2),
+        )
         .expect("conv2.bias");
     writer
-        .add("norm.bias", vec![C_MID as u64], ztensor::Leaf::F32, &f32_bytes(&gn_b))
+        .add(
+            "norm.bias",
+            vec![C_MID as u64],
+            ztensor::Leaf::F32,
+            &f32_bytes(&gn_b),
+        )
         .expect("norm.bias");
     writer
-        .add("norm.weight", vec![C_MID as u64], ztensor::Leaf::F32, &f32_bytes(&gn_w))
+        .add(
+            "norm.weight",
+            vec![C_MID as u64],
+            ztensor::Leaf::F32,
+            &f32_bytes(&gn_w),
+        )
         .expect("norm.weight");
     writer.finish().expect("the container closes");
     Planes {
@@ -211,7 +256,14 @@ fn voxels(b: [usize; 3]) -> usize {
 
 /// `torch.nn.functional.conv3d`, k=3, stride 1, pad 1, over one clip's
 /// `[rows, c_in]`, weights natural `[c_out][c_in][kt][kh][kw]`.
-fn conv3d_ref(x: &[f32], b: [usize; 3], c_in: usize, w: &[f32], c_out: usize, bias: &[f32]) -> Vec<f32> {
+fn conv3d_ref(
+    x: &[f32],
+    b: [usize; 3],
+    c_in: usize,
+    w: &[f32],
+    c_out: usize,
+    bias: &[f32],
+) -> Vec<f32> {
     let [t, h, wd] = b;
     let mut o = vec![0f32; voxels(b) * c_out];
     for to in 0..t {
@@ -235,7 +287,8 @@ fn conv3d_ref(x: &[f32], b: [usize; 3], c_in: usize, w: &[f32], c_out: usize, bi
                                 if wi < 0 || wi as usize >= wd {
                                     continue;
                                 }
-                                let voxel = ((ti as usize * h + hi as usize) * wd + wi as usize) * c_in;
+                                let voxel =
+                                    ((ti as usize * h + hi as usize) * wd + wi as usize) * c_in;
                                 for c in 0..c_in {
                                     let wk = (((n * c_in + c) * 3 + it) * 3 + ih) * 3 + iw;
                                     acc += x[voxel + c] * w[wk];
@@ -251,7 +304,13 @@ fn conv3d_ref(x: &[f32], b: [usize; 3], c_in: usize, w: &[f32], c_out: usize, bi
     o
 }
 
-fn group_norm_silu_ref(x: &[f32], c: usize, groups: usize, weight: &[f32], bias: &[f32]) -> Vec<f32> {
+fn group_norm_silu_ref(
+    x: &[f32],
+    c: usize,
+    groups: usize,
+    weight: &[f32],
+    bias: &[f32],
+) -> Vec<f32> {
     let cg = c / groups;
     let n = x.len() / c;
     let mut y = vec![0f32; x.len()];
@@ -275,7 +334,8 @@ fn group_norm_silu_ref(x: &[f32], c: usize, groups: usize, weight: &[f32], bias:
         for v in 0..n {
             for ch in g * cg..(g + 1) * cg {
                 let e = v * c + ch;
-                let mut val = (f64::from(x[e]) - mean) * rstd * f64::from(weight[ch]) + f64::from(bias[ch]);
+                let mut val =
+                    (f64::from(x[e]) - mean) * rstd * f64::from(weight[ch]) + f64::from(bias[ch]);
                 val /= 1.0 + (-val).exp();
                 y[e] = val as f32;
             }
@@ -299,7 +359,12 @@ fn upsample_ref(x: &[f32], b: [usize; 3], c: usize, f: [usize; 3]) -> (Vec<f32>,
     (y, ob)
 }
 
-fn pixel_shuffle_ref(x: &[f32], b: [usize; 3], c_out: usize, r: [usize; 3]) -> (Vec<f32>, [usize; 3]) {
+fn pixel_shuffle_ref(
+    x: &[f32],
+    b: [usize; 3],
+    c_out: usize,
+    r: [usize; 3],
+) -> (Vec<f32>, [usize; 3]) {
     let vol = r[0] * r[1] * r[2];
     let c_in = c_out * vol;
     let ob = [b[0] * r[0], b[1] * r[1], b[2] * r[2]];
@@ -362,7 +427,8 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     let contract = {
         let mut b = checkpoint_dsl::Builder::new(&source, 1, Platform::Cuda);
         for w in decoder.weights() {
-            b.read_own(w).unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
+            b.read_own(w)
+                .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
         }
         b.build()
     };
@@ -430,7 +496,9 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
             payload: &inputs[1].1,
         },
     ];
-    let answered = shell.fire_voxels(&lanes, &clips).expect("the decoder fires");
+    let answered = shell
+        .fire_voxels(&lanes, &clips)
+        .expect("the decoder fires");
     assert_eq!(answered.len(), 2, "one answer per submitted lane");
 
     let mut worst = 0f32;
@@ -441,7 +509,11 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
             &vec![[want_box[0] as u32, want_box[1] as u32, want_box[2] as u32]],
             "lane {lane}'s clip comes back at the output resolution"
         );
-        assert_eq!(got.len(), want.len(), "lane {lane}: one pixel row per output voxel, 3 wide");
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "lane {lane}: one pixel row per output voxel, 3 wide"
+        );
         let mut sum = 0f32;
         let mut spread = 0f32;
         for (g, w) in got.iter().zip(&want) {
@@ -458,7 +530,11 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
              readout of the wrong rectangle, not a decode",
             got.len()
         );
-        eprintln!("lane {lane}: first pixels {:?} vs {:?}", &got[..6], &want[..6]);
+        eprintln!(
+            "lane {lane}: first pixels {:?} vs {:?}",
+            &got[..6],
+            &want[..6]
+        );
         eprintln!(
             "lane {lane}: box {:?} -> {:?}, {} pixel rows, max |err| {worst:.4}, mean {mean:.5}, spread {spread:.3}",
             BOXES[lane],
@@ -590,9 +666,17 @@ fn close(lane: &str, got: &[f32], want: &[f32]) {
         .zip(want)
         .map(|(g, w)| (g - w).abs())
         .fold(0f32, f32::max);
-    let mean = got.iter().zip(want).map(|(g, w)| (g - w).abs()).sum::<f32>() / want.len() as f32;
+    let mean = got
+        .iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .sum::<f32>()
+        / want.len() as f32;
     eprintln!("{lane}: max |err| {worst:.4}, mean {mean:.5}");
-    assert!(mean < 1e-2 && worst < 6e-2, "{lane} drifts: max {worst}, mean {mean}");
+    assert!(
+        mean < 1e-2 && worst < 6e-2,
+        "{lane} drifts: max {worst}, mean {mean}"
+    );
 }
 
 /// **A CHUNKED CAUSAL DECODE IS THE WHOLE ONE.** Slot 0 decodes a `[4, 4, 6]`
@@ -610,15 +694,29 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     let dir = scratch();
     let container = dir.join("causal.zt");
     let mut lcg = Lcg(0xca_5a1);
-    let (conv, conv_bytes) = drawn(&mut lcg, C_MID * C_IN * TAPS, 2.0 / ((C_IN * TAPS) as f32).sqrt());
+    let (conv, conv_bytes) = drawn(
+        &mut lcg,
+        C_MID * C_IN * TAPS,
+        2.0 / ((C_IN * TAPS) as f32).sqrt(),
+    );
     let bias: Vec<f32> = (0..C_MID).map(|_| lcg.unit() * 0.2).collect();
     {
         let mut writer = ztensor::Writer::create(&container).expect("the container opens");
         writer
-            .add("conv", vec![C_MID as u64, (C_IN * TAPS) as u64], ztensor::Leaf::BF16, &conv_bytes)
+            .add(
+                "conv",
+                vec![C_MID as u64, (C_IN * TAPS) as u64],
+                ztensor::Leaf::BF16,
+                &conv_bytes,
+            )
             .expect("conv");
         writer
-            .add("conv.bias", vec![C_MID as u64], ztensor::Leaf::F32, &f32_bytes(&bias))
+            .add(
+                "conv.bias",
+                vec![C_MID as u64],
+                ztensor::Leaf::F32,
+                &f32_bytes(&bias),
+            )
             .expect("conv.bias");
         writer.finish().expect("closes");
     }
@@ -629,7 +727,8 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     let contract = {
         let mut b = checkpoint_dsl::Builder::new(&source, 1, Platform::Cuda);
         for w in [&causal.conv, &causal.bias] {
-            b.read_own(w).unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
+            b.read_own(w)
+                .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
         }
         b.build()
     };
@@ -670,12 +769,26 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     let (whole, _) = drawn(&mut lcg, voxels(big) * C_IN, 1.0);
     let (other, other_bytes) = drawn(&mut lcg, voxels(small) * C_IN, 1.0);
     let half = voxels(tile) * C_IN;
-    let first_bytes: Vec<u8> = whole[..half].iter().flat_map(|&v| bf16_bits(v).to_le_bytes()).collect();
-    let second_bytes: Vec<u8> = whole[half..].iter().flat_map(|&v| bf16_bits(v).to_le_bytes()).collect();
+    let first_bytes: Vec<u8> = whole[..half]
+        .iter()
+        .flat_map(|&v| bf16_bits(v).to_le_bytes())
+        .collect();
+    let second_bytes: Vec<u8> = whole[half..]
+        .iter()
+        .flat_map(|&v| bf16_bits(v).to_le_bytes())
+        .collect();
     let zeros = vec![0f32; FRAMES * plane * C_IN];
     let want_first = causal_conv3d_ref(&whole[..half], &zeros, tile, C_IN, &conv, C_MID, &bias);
     // The second tile's front frames are the first tile's last two.
-    let want_second = causal_conv3d_ref(&whole[half..], &whole[..half], tile, C_IN, &conv, C_MID, &bias);
+    let want_second = causal_conv3d_ref(
+        &whole[half..],
+        &whole[..half],
+        tile,
+        C_IN,
+        &conv,
+        C_MID,
+        &bias,
+    );
     // And the cache matters: a second tile that saw zero front frames would
     // answer something else, so agreement below is agreement about the slot.
     let cold_second = causal_conv3d_ref(&whole[half..], &zeros, tile, C_IN, &conv, C_MID, &bias);

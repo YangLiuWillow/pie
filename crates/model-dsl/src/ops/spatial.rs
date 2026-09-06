@@ -183,7 +183,11 @@ pub fn conv3d(
     assert_eq!(x.dtype(), Dtype::Bf16, "`spatial::conv3d` reads bf16 rows");
     let taps = conv.taps();
     assert!(
-        w.layout == ParamLayout::ConvTapsMajor { c_in: x.width() as u32, taps },
+        w.layout
+            == ParamLayout::ConvTapsMajor {
+                c_in: x.width() as u32,
+                taps
+            },
         "`{}` must be declared `.conv_taps_major({}, {taps})` for this convolution; it is {:?}",
         w.name,
         x.width(),
@@ -292,7 +296,10 @@ pub fn upsample_nearest(
 ) -> (Value, Value) {
     expect_voxels("`spatial::upsample_nearest`'s input", x);
     expect_grid("`spatial::upsample_nearest`'s grid", grid);
-    assert!(volume(factor) > 0, "an upsample factor of {factor:?} is empty");
+    assert!(
+        volume(factor) > 0,
+        "an upsample factor of {factor:?} is empty"
+    );
     let rule = GridRule::Upsample {
         factor,
         keep_first_frame,

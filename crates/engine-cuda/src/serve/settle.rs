@@ -50,7 +50,7 @@ pub struct Settled {
     /// Each submitted lane's decoded pixels (D8): one `f32` row per output
     /// voxel of its clips in submission order, beside each clip's output
     /// box. Empty for a lane that submitted no clip.
-    pub pixels: Vec<(Vec<f32>, Vec<[u32; 3]>)>,
+    pub pixels: Vec<super::Pixels>,
     /// Where to read them from, or `None` for the arming pass.
     pub(super) readback: Option<Readback>,
 }
@@ -237,7 +237,7 @@ impl Shell {
 
         // The pixels (D8): the output grid comes back first, then each
         // lane's clips' rows out of the plane in clip order.
-        let mut pixels: Vec<(Vec<f32>, Vec<[u32; 3]>)> = vec![(Vec::new(), Vec::new()); lanes];
+        let mut pixels: Vec<super::Pixels> = vec![(Vec::new(), Vec::new()); lanes];
         if let Some(seat) = readback.pixels.as_ref() {
             let clips = seat.grid.rows as usize;
             let mut grid = vec![0u8; clips * 16];
@@ -249,7 +249,7 @@ impl Shell {
             let channels = seat.plane.width as usize;
             let element = model_compiler::arena::elem_bytes(seat.plane.dtype).unwrap_or(0) as usize;
             let mut raw: Vec<u8> = Vec::new();
-            for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
+            for (&(first, count), answer) in seat.lane_clips.iter().zip(pixels.iter_mut()) {
                 let mut values = Vec::new();
                 let mut boxes = Vec::with_capacity(count as usize);
                 for clip in first..first + count {
@@ -275,7 +275,7 @@ impl Shell {
                         ),
                     }
                 }
-                pixels[lane] = (values, boxes);
+                *answer = (values, boxes);
             }
         }
 

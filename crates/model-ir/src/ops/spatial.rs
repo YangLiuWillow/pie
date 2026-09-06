@@ -120,11 +120,7 @@ impl GridRule {
             }
             GridRule::Shuffle { r } => Some([t * r[0], h * r[1], w * r[2]]),
             GridRule::Unshuffle { r } => {
-                if r.iter().any(|&x| x == 0)
-                    || t % r[0] != 0
-                    || h % r[1] != 0
-                    || w % r[2] != 0
-                {
+                if r.iter().any(|&x| x == 0) || t % r[0] != 0 || h % r[1] != 0 || w % r[2] != 0 {
                     return None;
                 }
                 Some([t / r[0], h / r[1], w / r[2]])
@@ -289,9 +285,15 @@ impl Operands for Spatial {
                 bias,
                 ..
             } => sink.extend([*x, *grid, *weight, *bias]),
-            Self::UpsampleNearest { x, grid, y_grid, .. }
-            | Self::PixelShuffle { x, grid, y_grid, .. }
-            | Self::PixelUnshuffle { x, grid, y_grid, .. } => sink.extend([*x, *grid, *y_grid]),
+            Self::UpsampleNearest {
+                x, grid, y_grid, ..
+            }
+            | Self::PixelShuffle {
+                x, grid, y_grid, ..
+            }
+            | Self::PixelUnshuffle {
+                x, grid, y_grid, ..
+            } => sink.extend([*x, *grid, *y_grid]),
             Self::Patchify { x, grid, tgrid, .. } => sink.extend([*x, *grid, *tgrid]),
             Self::Unpatchify { x, tgrid, grid, .. } => sink.extend([*x, *tgrid, *grid]),
         }
@@ -369,9 +371,7 @@ mod tests {
             GridRule::Unshuffle { r: [1, 2, 2] }.out_extent([1, 3, 4]),
             None
         );
-        let table = up
-            .apply(&[1, 2, 2, 0, 3, 4, 4, 4])
-            .expect("both boxes map");
+        let table = up.apply(&[1, 2, 2, 0, 3, 4, 4, 4]).expect("both boxes map");
         assert_eq!(table, vec![1, 4, 4, 0, 5, 8, 8, 16]);
     }
 }

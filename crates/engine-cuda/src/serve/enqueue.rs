@@ -256,7 +256,7 @@ impl FireCtx<'_> {
         let voxels = if p.voxel_tables.grid.is_empty() {
             None
         } else {
-            let store = self.voxels.as_deref_mut().ok_or_else(|| Fault::Ceiling {
+            let store = self.voxels.as_deref_mut().ok_or(Fault::Ceiling {
                 what: "the voxel tables, which this load reserved none of",
                 need: 1,
                 have: 0,

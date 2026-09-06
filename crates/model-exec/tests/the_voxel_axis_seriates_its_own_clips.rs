@@ -20,7 +20,7 @@
 //!   descriptor round-trips whole, and its voxel windows must add up.
 
 use model_compiler::{Budget, Budgets, DeviceProfile, VoxelLadder, compile_axes};
-use model_exec::fire::{FireDescriptor, Fault, Lane, compose_axes};
+use model_exec::fire::{Fault, FireDescriptor, Lane, compose_axes};
 use model_ir::ops::Elementwise;
 use model_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RowAxis, RuntimeInput, Seam, Trace, Ty,
@@ -97,7 +97,10 @@ fn trunk_and_decoder() -> Trace {
     let mut b = Build::new();
     let tokens = b.value(Def::Input(RuntimeInput::Tokens), act());
     let port = b.value(
-        Def::Input(RuntimeInput::Voxels { port: 0, channels: WIDTH as u32 }),
+        Def::Input(RuntimeInput::Voxels {
+            port: 0,
+            channels: WIDTH as u32,
+        }),
         voxel(Dim::Voxels),
     );
     let seeded = b.op(tokens, act(), Guard::Always);
@@ -146,11 +149,20 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     assert_eq!(fire.rows(), 13);
     assert_eq!(fire.voxel_rows(), 264);
     assert_eq!(fire.clips(), 3);
-    assert_eq!(fire.voxel_bucket(), 512, "the voxel ladder rounds on its own rungs");
+    assert_eq!(
+        fire.voxel_bucket(),
+        512,
+        "the voxel ladder rounds on its own rungs"
+    );
     assert_eq!(fire.patch_rows(), 0, "no patch axis was stated");
 
     // The token half is the same fire without the clips.
-    let plain = [Lane::new(1, 5), Lane::new(0, 3), Lane::new(1, 4), Lane::new(0, 1)];
+    let plain = [
+        Lane::new(1, 5),
+        Lane::new(0, 3),
+        Lane::new(1, 4),
+        Lane::new(0, 1),
+    ];
     let bare = compose_axes(&compiled, &budgets, &plain).expect("composes");
     assert_eq!(fire.classes(), bare.classes());
     assert_eq!(fire.bucket(), bare.bucket());
@@ -171,7 +183,15 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     let placed: Vec<(u32, u32, u32, u32, u32)> = fire
         .lanes()
         .iter()
-        .map(|row| (row.source, row.voxel_offset, row.voxels, row.clip_offset, row.clips))
+        .map(|row| {
+            (
+                row.source,
+                row.voxel_offset,
+                row.voxels,
+                row.clip_offset,
+                row.clips,
+            )
+        })
         .collect();
     assert!(placed.contains(&(0, 0, 200, 0, 2)));
     assert!(placed.contains(&(2, 200, 64, 2, 1)));
@@ -187,10 +207,20 @@ fn a_fire_past_the_voxel_ceilings_is_refused_by_name() {
     let rows = compose_axes(
         &compiled,
         &budgets,
-        &[Lane::with_clips(1, 1, 1, 300), Lane::with_clips(1, 1, 1, 300)],
+        &[
+            Lane::with_clips(1, 1, 1, 300),
+            Lane::with_clips(1, 1, 1, 300),
+        ],
     )
     .expect_err("600 voxel rows past a 512 ceiling");
-    assert_eq!(rows, Fault::TooManyVoxels { voxels: 600, max: 512 }.into());
+    assert_eq!(
+        rows,
+        Fault::TooManyVoxels {
+            voxels: 600,
+            max: 512
+        }
+        .into()
+    );
     assert!(rows.to_string().contains("every VAE column was cut at 512"));
 
     let clips = compose_axes(
@@ -209,7 +239,14 @@ fn a_fire_past_the_voxel_ceilings_is_refused_by_name() {
     let compiled = compile_axes(&trace, &short, &DeviceProfile::default()).expect("bakes");
     let rung = compose_axes(&compiled, &short, &[Lane::with_clips(1, 1, 1, 128)])
         .expect_err("128 voxel rows over a ladder that stops at 64");
-    assert_eq!(rung, Fault::NoVoxelBucket { voxels: 128, top: 64 }.into());
+    assert_eq!(
+        rung,
+        Fault::NoVoxelBucket {
+            voxels: 128,
+            top: 64
+        }
+        .into()
+    );
 
     // A clip with no voxels, or voxels with no clip, is inconsistent.
     let geometry = compose_axes(&compiled, &short, &[Lane::with_clips(1, 1, 1, 0)])
@@ -231,7 +268,8 @@ fn abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips() {
     let budgets = budgets();
     let compiled = compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("bakes");
 
-    let bare = compose_axes(&compiled, &budgets, &[Lane::new(1, 2), Lane::new(0, 1)]).expect("composes");
+    let bare =
+        compose_axes(&compiled, &budgets, &[Lane::new(1, 2), Lane::new(0, 1)]).expect("composes");
     let bare = FireDescriptor::of(&bare);
     assert!(!bare.has_voxels());
     let bytes = bare.pack();
@@ -240,7 +278,9 @@ fn abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips() {
     assert_eq!(FireDescriptor::unpack(&bytes), Ok(bare.clone()));
     assert_eq!(
         bytes.len() as u64,
-        model_exec::fire::HEADER_BYTES + model_exec::fire::CLASS_BYTES * 2 + model_exec::fire::LANE_BYTES * 2
+        model_exec::fire::HEADER_BYTES
+            + model_exec::fire::CLASS_BYTES * 2
+            + model_exec::fire::LANE_BYTES * 2
     );
 
     let with = compose_axes(
@@ -259,16 +299,27 @@ fn abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips() {
         bare.bytes() + model_exec::fire::CLASS_BYTES * 2 + model_exec::fire::VOXEL_LANE_BYTES * 2,
         "the voxel trailer: one window per class, one record per lane"
     );
-    assert_eq!(&bytes[32..36], &100u32.to_le_bytes(), "voxel_rows at word 8");
+    assert_eq!(
+        &bytes[32..36],
+        &100u32.to_le_bytes(),
+        "voxel_rows at word 8"
+    );
     let back = FireDescriptor::unpack(&bytes).expect("round trips");
     assert_eq!(back, with);
-    assert_eq!(back.table(RowAxis::Voxels).rows_of(&compiled.classes.node_mask[2]), 100);
+    assert_eq!(
+        back.table(RowAxis::Voxels)
+            .rows_of(&compiled.classes.node_mask[2]),
+        100
+    );
 
     // Voxel windows that do not add up to the header are refused by name.
     let mut wrong = bytes;
     wrong[32..36].copy_from_slice(&99u32.to_le_bytes());
     assert!(matches!(
         FireDescriptor::unpack(&wrong),
-        Err(model_exec::Error::Fire(Fault::DescriptorVoxelRows { counted: 100, header: 99 }))
+        Err(model_exec::Error::Fire(Fault::DescriptorVoxelRows {
+            counted: 100,
+            header: 99
+        }))
     ));
 }

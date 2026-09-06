@@ -57,7 +57,12 @@ fn triple(op: &'static str, v: [u32; 3]) -> Result<[i32; 3], Error> {
 ///
 /// A refusal for a table that is not `[lanes, 4]` i32 or two tables of
 /// different lane counts.
-pub fn derive_grid(ctx: &Ctx, grid: Tensor, rule: GridRule, o_grid: &mut Tensor) -> Result<(), Error> {
+pub fn derive_grid(
+    ctx: &Ctx,
+    grid: Tensor,
+    rule: GridRule,
+    o_grid: &mut Tensor,
+) -> Result<(), Error> {
     let lanes = lane_pair(OP, grid, *o_grid)?;
     let geom = match rule {
         GridRule::Conv {

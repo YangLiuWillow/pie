@@ -55,9 +55,12 @@ impl Run<'_> {
     /// [`kernel`](crate::error::kernel) above the match.
     fn spatial(&mut self, op: &Spatial) -> Result<(), kernels_cuda::Error> {
         match op {
-            Spatial::Grid { grid, rule: how, y } => {
-                spatial::derive_grid(self.ctx(), self.tensor(*grid), rule(*how), &mut self.tensor(*y))
-            }
+            Spatial::Grid { grid, rule: how, y } => spatial::derive_grid(
+                self.ctx(),
+                self.tensor(*grid),
+                rule(*how),
+                &mut self.tensor(*y),
+            ),
             Spatial::Conv3d {
                 x,
                 grid,
@@ -101,12 +104,15 @@ impl Run<'_> {
                 // The frame cache: gather, convolve, store.
                 let frames = conv.pad[0];
                 let pool = self.recurrent(*state);
-                let slot_ids = self.clip_slots().ok_or_else(|| kernels_cuda::Error::Backend {
-                    op: "spatial.conv3d",
-                    detail: "a causal convolution with a frame cache needs the fire's clip slot \
+                let slot_ids = self
+                    .clip_slots()
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: "spatial.conv3d",
+                        detail:
+                            "a causal convolution with a frame cache needs the fire's clip slot \
                              table, which no lane of it staged"
-                        .to_string(),
-                })?;
+                                .to_string(),
+                    })?;
                 // Bounded above by `frames` copies of the input rectangle;
                 // the kernels read exactly `Σ frames·h·w` rows of it.
                 let rows = x.rows.saturating_mul(frames);
@@ -137,7 +143,15 @@ impl Run<'_> {
                     self.tensor(*y_grid),
                 )?;
                 let mut slab = pool.slab;
-                spatial::cache_store(self.ctx(), x, frame_cache, slot_ids, grid, frames, &mut slab)
+                spatial::cache_store(
+                    self.ctx(),
+                    x,
+                    frame_cache,
+                    slot_ids,
+                    grid,
+                    frames,
+                    &mut slab,
+                )
             }
             Spatial::GroupNorm {
                 x,

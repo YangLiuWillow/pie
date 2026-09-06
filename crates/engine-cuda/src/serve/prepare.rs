@@ -251,7 +251,7 @@ impl FrameShell for Shell {
                     what: "a lane's clips are one submission",
                 });
             }
-            if shot.clips.iter().any(|b| b.iter().any(|&n| n == 0)) {
+            if shot.clips.iter().any(|b| b.contains(&0)) {
                 return Err(Fault::VoxelPayload {
                     lane: shot.lane,
                     what: "a clip's box has a zero side",
