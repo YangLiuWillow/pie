@@ -10,7 +10,7 @@
 //! `c_in = c * r1*r2*r3 + (i1 * r2 + i2) * r3 + i3`.
 
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::spatial::{flat_elements, lane_pair};
 use crate::tensor::Tensor;
 
@@ -123,7 +123,7 @@ pub fn pixel_shuffle(
         ));
     }
     let c = count(OP, "the output channel count", o.width)?;
-    let trim = count(OP, "the anchor drop", trim_t)?;
+    let trim = stated(OP, trim_t)?;
     let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
     ctx.fire(
         OP,

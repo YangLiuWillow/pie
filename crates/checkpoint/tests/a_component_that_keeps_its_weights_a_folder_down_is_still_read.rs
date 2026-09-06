@@ -98,10 +98,14 @@ fn a_component_that_keeps_its_weights_a_folder_down_is_still_read() {
     let (_guard, root) = built();
 
     let components = diffusers::components(&root).unwrap();
-    let seen: Vec<(&str, &str, usize)> = components
+    // Sorted: the order `components` answers in follows `model_index.json`'s
+    // key order or its insertion order depending on whether the build turned
+    // on `serde_json/preserve_order`, and this claim is about the SET.
+    let mut seen: Vec<(&str, &str, usize)> = components
         .iter()
         .map(|c| (c.folder.as_str(), c.prefix.as_str(), c.weights.len()))
         .collect();
+    seen.sort_unstable();
     assert_eq!(
         seen,
         vec![("transformer", "dit.", 1), ("video_vae", "vae.", 1)],
@@ -111,7 +115,13 @@ fn a_component_that_keeps_its_weights_a_folder_down_is_still_read() {
     );
 
     // The video VAE's set is the one under `source/`, named from there.
-    let vae = &components[1];
+    let named = |folder: &str| {
+        components
+            .iter()
+            .find(|c| c.folder == folder)
+            .unwrap_or_else(|| panic!("{folder} is in the set"))
+    };
+    let vae = named("video_vae");
     assert_eq!(
         vae.weights,
         vec![root.join("video_vae/source/model.safetensors")]
@@ -123,7 +133,7 @@ fn a_component_that_keeps_its_weights_a_folder_down_is_still_read() {
 
     // The transformer never descended.
     assert_eq!(
-        components[0].weights,
+        named("transformer").weights,
         vec![root.join("transformer/diffusion_pytorch_model.safetensors")]
     );
 

@@ -42,12 +42,18 @@ fn snapshot() -> Option<PathBuf> {
         .find(|path| path.join("FL2VA/model_index.json").is_file())
 }
 
+/// The component set as `(folder, prefix, files)`, SORTED: whether
+/// `components` answers in `model_index.json`'s insertion order or in its
+/// keys' alphabetical order depends on whether something in the build turned
+/// on `serde_json/preserve_order`, and this claim is about the set.
 fn roster(dir: &Path) -> Vec<(String, String, usize)> {
-    diffusers::components(dir)
+    let mut seen: Vec<(String, String, usize)> = diffusers::components(dir)
         .unwrap()
         .into_iter()
         .map(|c| (c.folder, c.prefix, c.weights.len()))
-        .collect()
+        .collect();
+    seen.sort();
+    seen
 }
 
 #[test]
@@ -78,8 +84,11 @@ fn the_minimax_h3_snapshot_finds_its_video_vae_a_folder_down() {
 
         // Its one file is the one under `source/`, and the component still
         // points at the folder `model_index.json` named.
-        let vae = seen.iter().position(|(f, ..)| f == "video_vae").unwrap();
-        let vae = &diffusers::components(&dir).unwrap()[vae];
+        let components = diffusers::components(&dir).unwrap();
+        let vae = components
+            .iter()
+            .find(|c| c.folder == "video_vae")
+            .expect("the video VAE is in the set");
         assert_eq!(
             vae.weights,
             vec![dir.join("video_vae/source/model.safetensors")]
