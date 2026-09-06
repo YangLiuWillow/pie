@@ -221,7 +221,9 @@ impl FireCtx<'_> {
 
         // The first stream touch: commit the slot `prepare` wrote, in front of
         // the launches that read it.
-        let handles = self.inputs.commit(self.device.stream(), slot, &p.lengths)?;
+        let handles =
+            self.inputs
+                .commit(self.device.stream(), slot, &p.lengths, &p.token_injects)?;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);

@@ -370,6 +370,21 @@ impl Plane {
         self.instances.get(&id).map(|bound| bound.geometry)
     }
 
+    /// The device-side source of instance `id`'s [`Port::EmbedTokens`] cell,
+    /// when it can be injected device-to-device rather than round-tripped
+    /// through the host. See [`Session::token_device_source`].
+    #[must_use]
+    pub fn token_device_source(&self, id: u64) -> Option<(u64, u32)> {
+        let bound = self.instances.get(&id)?;
+        if bound.geometry == GeometryClass::Host {
+            return None;
+        }
+        let program = self.programs.get(&bound.program_id)?;
+        bound
+            .session
+            .token_device_source(&program.plan, bound.geometry)
+    }
+
     /// One instance's rings and cursors, for publishing into and taking out of.
     #[must_use]
     pub fn instance(&self, id: u64) -> Option<&Session> {

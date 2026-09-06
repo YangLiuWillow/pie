@@ -603,6 +603,9 @@ pub struct Prepared<'a> {
     slot: Option<crate::inputs::SlotGuard>,
     /// What went into that slot, as lengths.
     lengths: crate::inputs::Staged,
+    /// Device-to-device decode-token overwrites to apply after the slot's
+    /// H2D commit; empty on the (PIE_NO_RUNAHEAD) host round-trip path.
+    token_injects: Vec<crate::inputs::TokenInject>,
     /// Is this fire a body's? Decided here, because it decides the staging.
     bodied: bool,
     /// Which regions that body holds, per template region.

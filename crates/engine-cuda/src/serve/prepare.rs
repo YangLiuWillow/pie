@@ -92,11 +92,44 @@ impl FrameShell for Shell {
             }
         }
 
+        // Run-ahead (default; PIE_NO_RUNAHEAD opts out): a decode-envelope lane can be built from
+        // host state alone — the token is injected device-to-device (slice 1)
+        // and positions/kv_len are provably equal to what the host computes
+        // (`positions_for`'s natural check and `check_extent` enforce it). So
+        // its ports need no device read, the reap a read would force is
+        // skipped, and the host launches the next frame ahead of this
+        // epilogue. Only when EVERY attachment qualifies: a `DeviceGeometry`
+        // lane still derives its whole geometry on the device and must reap.
+        // (A decode-envelope instance is always single-lane — it never owns
+        // pages — so the per-lane injection needs no multi-lane handling.)
+        let can_runahead = std::env::var_os("PIE_NO_RUNAHEAD").is_none()
+            && attachments.iter().all(|attached| {
+                match self.programs.geometry_of(attached.instance) {
+                    None | Some(eta_ir::registry::GeometryClass::Host) => true,
+                    Some(eta_ir::registry::GeometryClass::DecodeEnvelope) => {
+                        // Only a genuinely 1-wide decode lane: one token per
+                        // step, so positions (have+0) and kv_len (have+1) are
+                        // deterministic and the skipped checks are provably
+                        // redundant. A multi-row fire is a speculative verify
+                        // whose accepted count is the device's to decide — its
+                        // positions/kv_len are NOT host-derivable, so it keeps
+                        // the device read (and the reap) until the async
+                        // settle-validation path lands.
+                        self.programs.token_device_source(attached.instance).is_some()
+                            && lanes
+                                .get(attached.lane as usize)
+                                .is_some_and(|seated| seated.lane.tokens.len() == 1)
+                    }
+                    Some(eta_ir::registry::GeometryClass::DeviceGeometry) => false,
+                }
+            });
+
         // 0b. Descriptor ports, read off the rings the gate just approved.
         // Read here, before the prologue, since a prologue's commit would
         // move the cursors under a later read. A `GeometryClass::Host` lane
         // resolves `None` and reads the submission unchanged.
-        if self.owed.is_some()
+        if !can_runahead
+            && self.owed.is_some()
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)
@@ -107,12 +140,31 @@ impl FrameShell for Shell {
         }
         super::btrace::mark("reap");
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
+        // Per submission lane: the device-side token source, when the token
+        // can be injected device-to-device instead of round-tripped through
+        // the host. Recorded whether the lane resolves its envelope (slice 1)
+        // or is built host-side under run-ahead.
+        let mut token_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         for attached in attachments {
+            let first = attached.lane as usize;
+            let src = self.programs.token_device_source(attached.instance);
+            // Run-ahead builds a decode-envelope lane from host state: skip
+            // the device read, leave `envelope_of` `None` so the assembly
+            // takes the host path (submission placeholder token, overwritten
+            // device-side by the injection; positions host-computed).
+            if can_runahead
+                && self.programs.geometry_of(attached.instance)
+                    == Some(eta_ir::registry::GeometryClass::DecodeEnvelope)
+            {
+                if first < lanes.len() {
+                    token_src_of[first] = src;
+                }
+                continue;
+            }
             let Some(envelope) = self.programs.envelope(attached.instance)? else {
                 continue;
             };
-            let first = attached.lane as usize;
             let carried = envelope.lanes();
             if first + carried > lanes.len() {
                 return Err(Fault::program(
@@ -139,6 +191,9 @@ impl FrameShell for Shell {
                     ));
                 }
                 envelope_of[first + lane] = Some((held, lane));
+            }
+            if first < lanes.len() {
+                token_src_of[first] = src;
             }
             resolved.push(envelope);
         }
@@ -457,6 +512,10 @@ impl FrameShell for Shell {
         // One mask entry per lane, seriated with the rest.
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Device-to-device token injections, one per
+        // single-lane device-resolved decode row: filled as `tokens` is
+        // assembled so `dst_off` is that row's byte offset in the slab.
+        let mut token_injects: Vec<crate::inputs::TokenInject> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         // `Some((page, offset))` for a row with its own resolved
         // `w_slot`/`w_off`; `None` where `store::kv::geometry_with` derives
@@ -736,6 +795,21 @@ impl FrameShell for Shell {
             match ports.as_ref() {
                 Some(ports) => {
                     ports.check_extent(have.saturating_add(row.rows))?;
+                    // The token is already on the device-only ring; inject it
+                    // device-to-device at this row's offset rather than lean
+                    // on the host having read it back. Single-lane instances
+                    // only (a multi-lane cell packs several lanes' tokens),
+                    // and only when the cell's width matches this row's.
+                    let dst_off = tokens.len() as u64 * 4;
+                    if let Some((src, native)) = token_src_of[source]
+                        && native as usize == rows_here * 4
+                    {
+                        token_injects.push(crate::inputs::TokenInject {
+                            dst_off,
+                            src,
+                            bytes: native as usize,
+                        });
+                    }
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
@@ -760,6 +834,21 @@ impl FrameShell for Shell {
                     }
                 }
                 None => {
+                    // Run-ahead: a decode-envelope lane arrives here (host
+                    // path) with a submission placeholder token whose VALUE
+                    // is overwritten device-side by the injection below; only
+                    // its count matters. Positions are the natural run the
+                    // device would have stated (`have + at`).
+                    let dst_off = tokens.len() as u64 * 4;
+                    if let Some((src, native)) = token_src_of[source]
+                        && native as usize == rows_here * 4
+                    {
+                        token_injects.push(crate::inputs::TokenInject {
+                            dst_off,
+                            src,
+                            bytes: native as usize,
+                        });
+                    }
                     for (at, token) in lane.tokens.iter().enumerate() {
                         tokens.push(*token as i32);
                         positions.push(narrow(u64::from(have) + at as u64));
@@ -1189,6 +1278,7 @@ impl FrameShell for Shell {
         Ok(Prepared {
             slot: Some(slot),
             lengths: staged_lens,
+            token_injects,
             bodied,
             admits,
             ladder,

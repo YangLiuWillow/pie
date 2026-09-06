@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Port};
 use eta_ir::validate::Direction;
 use kernels_cuda::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
@@ -371,6 +371,42 @@ impl Session {
     /// A port names a channel this instance lacks or a non-integer cell.
     pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
         ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
+    }
+
+    /// The device-side source of the [`Port::EmbedTokens`] cell this fire
+    /// will read, when the token lives on a device-only ring: `(cell
+    /// address, native bytes)`. The token is already on device — the host
+    /// round-trip only relocates it into the inputs slab — so this lets the
+    /// commit inject it device-to-device instead. `None` (keep the host
+    /// round-trip) when the port is const, host-facing, unresolved for the
+    /// class, or when `PIE_NO_RUNAHEAD` forces the old path. Read at `head`, the same
+    /// cell [`ports::resolve`] reads.
+    #[must_use]
+    pub fn token_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
+        // Run-ahead (device token injection + host-built decode envelope) is
+        // the default decode path; `PIE_NO_RUNAHEAD` forces the old
+        // read-the-shadow-and-reap path for debugging or fallback.
+        if std::env::var_os("PIE_NO_RUNAHEAD").is_some() {
+            return None;
+        }
+        if !ports::resolves(class, Port::EmbedTokens) {
+            return None;
+        }
+        let binding = plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
+        let channel = binding.channel as usize;
+        let endpoint = self.rings.endpoint(channel)?;
+        if endpoint.role() != HostRole::None {
+            return None;
+        }
+        let base = endpoint.device_cells()?;
+        let native = u32::try_from(self.shapes.get(channel)?.cell_bytes()).ok()?;
+        let head = self.cursors_now().get(channel)?.head;
+        let src = base + (head % u64::from(endpoint.cap1())) * u64::from(native);
+        Some((src, native))
     }
 
     /// Point one intrinsic at a device buffer, for every stage of this
