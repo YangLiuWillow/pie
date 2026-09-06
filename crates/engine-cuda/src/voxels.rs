@@ -157,12 +157,20 @@ pub struct Tables {
     /// `{t/pt, h/ph, w/pw, token_row_offset}` per clip, in fire order;
     /// empty for a plan that reads none.
     pub token_grid: Vec<i32>,
-    /// The port payload, clips in fire order.
+    /// The port payload, clips in fire order. EMPTY when every lane feeds
+    /// its port from a channel (`PortKind::Voxels` in `Lane::ports`): the
+    /// payload region is then filled device to device at `enqueue`, and
+    /// nothing crosses the host bus.
     pub payload: Vec<u8>,
     /// The port width the payload's rows are at — one of the seat's
     /// `widths`, the one this fire's reading takes; `0` for a fire that
-    /// fed no voxel port.
+    /// fed no voxel port. A channel-fed fire states it from the seat the
+    /// feed names, since it stages no bytes to read it off.
     pub channels: u32,
+    /// How many port voxel rows the payload region holds this fire —
+    /// `Σ t·h·w` over every lane's clips. Carried rather than derived from
+    /// `payload`, which a channel-fed fire leaves empty.
+    pub rows: u64,
     /// The recurrent slot of each clip's lane, in fire order.
     pub slots: Vec<i32>,
 }
@@ -179,11 +187,16 @@ impl Tables {
     /// port rows at a width the plan reads (or two lanes at two widths), a
     /// clip box that does not divide by the token patch, or a lane whose
     /// token rows are not its clips' token count.
+    /// `fed` is the width of the voxel port this fire's lanes feed from a
+    /// CHANNEL, or `0` when none does: a channel-fed lane submits its clips
+    /// with an empty payload, so its width cannot be read off bytes that
+    /// were never staged, and the seat the feed names states it instead.
     pub fn of(
         seat: &Seat,
         lanes: &[LaneRow],
         of_lane: &[Option<Clips<'_>>],
         slot_of: &[u32],
+        fed: u32,
     ) -> Result<Tables> {
         let clips_total: usize = lanes.iter().map(|lane| lane.clips as usize).sum();
         let voxels_total: usize = lanes.iter().map(|lane| lane.voxels as usize).sum();
@@ -191,7 +204,23 @@ impl Tables {
         // must be a width the plan reads; every other lane agrees with it.
         let elem = seat.elem_bytes() as usize;
         let mut channels = 0u32;
-        if seat.channels > 0 {
+        // Does any lane hand over bytes at all? A fire whose every voxel
+        // port is channel-fed stages none: the payload region is filled
+        // device to device instead.
+        let host_fed = of_lane
+            .iter()
+            .flatten()
+            .any(|shot| !shot.payload.is_empty());
+        if seat.channels > 0 && !host_fed {
+            if fed != 0 && !seat.widths.contains(&fed) {
+                return Err(Fault::VoxelPayload {
+                    lane: lanes.first().map_or(0, |lane| lane.source),
+                    what: "the channel-fed voxel port is not a width the plan reads",
+                });
+            }
+            channels = fed;
+        }
+        if seat.channels > 0 && host_fed {
             for lane in lanes {
                 let Some(shot) = of_lane.get(lane.source as usize).copied().flatten() else {
                     continue;
@@ -228,7 +257,11 @@ impl Tables {
         } else {
             Vec::new()
         };
-        let mut payload = vec![0u8; voxels_total * row_bytes];
+        let mut payload = if host_fed {
+            vec![0u8; voxels_total * row_bytes]
+        } else {
+            Vec::new()
+        };
         let mut slots = vec![0i32; clips_total];
         for lane in lanes {
             let Some(shot) = of_lane.get(lane.source as usize).copied().flatten() else {
@@ -241,7 +274,7 @@ impl Tables {
                 });
             }
             let need = shot.voxels() as usize * row_bytes;
-            if seat.channels > 0 {
+            if seat.channels > 0 && host_fed {
                 let at = lane.voxel_offset as usize * row_bytes;
                 payload[at..at + need].copy_from_slice(shot.payload);
             }
@@ -284,6 +317,7 @@ impl Tables {
             token_grid,
             payload,
             channels,
+            rows: voxels_total as u64,
             slots,
         })
     }
@@ -345,9 +379,7 @@ impl Store {
                 have: self.seat.clips,
             });
         }
-        let rows = (tables.payload.len() as u64)
-            .checked_div(u64::from(tables.channels) * self.seat.elem_bytes())
-            .unwrap_or(0);
+        let rows = tables.rows;
         if rows > self.seat.rows {
             return Err(Fault::Ceiling {
                 what: "voxel rows",

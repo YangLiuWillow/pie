@@ -58,7 +58,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         return Ok(Err(error));
     }
 
-    let (rows, lane_facts, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
+    let (rows, clips, lane_facts, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -77,6 +77,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         }
         (
             float.rows,
+            float.clips.clone(),
             pass.lane.clone(),
             pass.kv_ws,
             pass.cells.clone(),
@@ -121,6 +122,18 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             readout: ::engine::Readout::Rows((0..rows).collect()),
             ..::engine::Lane::default()
         }],
+        // The VAE clips (design D8): the boxes this lane's `Voxels` ports
+        // declared, with NO payload — the port itself is channel-fed, so
+        // what travels is the geometry a channel cell cannot carry.
+        voxels: if clips.is_empty() {
+            Vec::new()
+        } else {
+            vec![::engine::fire::StepVoxels {
+                lane: 0,
+                clips,
+                payload: Vec::new(),
+            }]
+        },
         ..crate::engine::FireRequest::default()
     };
     lane_facts.stamp(&mut req);

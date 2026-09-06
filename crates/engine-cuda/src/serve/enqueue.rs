@@ -271,6 +271,48 @@ impl FireCtx<'_> {
             })?;
             Some(store.stage(self.device.stream(), &p.voxel_tables)?)
         };
+        // The voxel port fed from a channel (D8): the tables above staged the
+        // grid and the slots and left the payload region as the load did, and
+        // each fed lane's rows land in it now — device to device from the
+        // cell the instance's own `take` would read this fire, at the lane's
+        // `voxel_offset`. Nothing crosses the host bus: a decode's latent and
+        // an encode's pixels are already on the card, on the ring the guest
+        // wrote them to.
+        if let Some(handles) = voxels {
+            for feed in &p.voxel_feeds {
+                let dest = handles.voxels.ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "lane {}'s voxel port payload, which this fire's tables reserved \
+                         no rectangle for",
+                        feed.lane
+                    ),
+                })?;
+                let row_bytes = feed.bytes / u64::from(feed.rows.max(1));
+                let at = dest.ptr + u64::from(feed.first) * row_bytes;
+                let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
+                if feed.cast {
+                    kernels_cuda::linear::quant::cast_fp32_to(
+                        self.device.ctx(),
+                        kernels_cuda::Tensor::new(source, feed.rows, feed.width, Dtype::F32),
+                        &mut kernels_cuda::Tensor::new(at, feed.rows, feed.width, Dtype::Bf16),
+                    )
+                    .map_err(Fault::from)?;
+                } else {
+                    crate::device::alloc::copy_any(
+                        self.device.stream(),
+                        at,
+                        source,
+                        usize::try_from(feed.bytes).unwrap_or(usize::MAX),
+                    )?;
+                }
+            }
+        } else if !p.voxel_feeds.is_empty() {
+            return Err(Fault::Unbound {
+                what: "a channel-fed voxel port on a fire that staged no voxel table; a \
+                       lane that feeds one submits its clips beside it (`Step::voxels`)"
+                    .to_string(),
+            });
+        }
         let self_cond = if p.self_cond_rows.is_empty() {
             None
         } else {
@@ -794,11 +836,11 @@ impl FireCtx<'_> {
         // `voxels::host_grid` replays the plan's `Spatial::Grid` chain with
         // the rules' own host twins over this fire's port grid. A chain the
         // twins cannot follow binds nothing rather than binding a wrong row.
-        let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> = vec![None; p.lanes.len()];
+        let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> =
+            vec![None; p.lanes.len()];
         if let (Some(seat), Some((_, grid))) =
             (pixels.as_ref(), self.exports.pixels_for(voxel_class))
-            && let Some(table) =
-                crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
+            && let Some(table) = crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
         {
             for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
                 if count == 0 {

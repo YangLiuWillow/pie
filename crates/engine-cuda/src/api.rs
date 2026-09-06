@@ -18,8 +18,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
-    Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{
@@ -498,10 +497,7 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder>
     if !declares_voxels {
         return None;
     }
-    let max_voxels = budgets
-        .max_voxels
-        .unwrap_or(DERIVED_VOXEL_CEILING)
-        .max(1);
+    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
     Some(VoxelLadder {
         max_voxels,
         // Served eagerly this phase: one rung at the ceiling.

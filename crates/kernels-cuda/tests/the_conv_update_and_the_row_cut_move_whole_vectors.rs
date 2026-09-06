@@ -70,7 +70,10 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
             }
             let silu = acc / (1.0 + (-acc).exp());
             let got = from_bf16(got_y[r * channels + c]);
-            assert!(close(got, silu), "row {r} channel {c}: {got} against {silu}");
+            assert!(
+                close(got, silu),
+                "row {r} channel {c}: {got} against {silu}"
+            );
             for t in 0..k as usize - 1 {
                 state[t * channels + c] = state[(t + 1) * channels + c];
             }
@@ -110,8 +113,14 @@ fn the_row_cut_lands_both_halves() {
     let got_l: Vec<u16> = gpu.down(l_at, rows as usize * left_w);
     let got_r: Vec<u16> = gpu.down(r_at, rows as usize * right_w);
     for r in 0..rows as usize {
-        assert_eq!(&got_l[r * left_w..(r + 1) * left_w], &x_raw[r * total..r * total + left_w]);
-        assert_eq!(&got_r[r * right_w..(r + 1) * right_w], &x_raw[r * total + left_w..(r + 1) * total]);
+        assert_eq!(
+            &got_l[r * left_w..(r + 1) * left_w],
+            &x_raw[r * total..r * total + left_w]
+        );
+        assert_eq!(
+            &got_r[r * right_w..(r + 1) * right_w],
+            &x_raw[r * total + left_w..(r + 1) * total]
+        );
     }
 }
 

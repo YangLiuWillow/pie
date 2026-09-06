@@ -133,10 +133,7 @@ impl Exports {
     /// `seam::PIXELS` the text plants. A planting whose width is symbolic
     /// is skipped rather than guessed, so a plan of only symbolic pixel
     /// widths reads as planting none.
-    pub(crate) fn pixels_widths<'a>(
-        &'a self,
-        trace: &'a Trace,
-    ) -> impl Iterator<Item = u32> + 'a {
+    pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
         self.pixels.iter().filter_map(move |(export, _)| {
             crate::store::kv::width_of(trace, export.value)
                 .ok()
@@ -747,6 +744,17 @@ impl Feeds {
                     width: u32::from(axes),
                     dtype,
                 }),
+                // The voxel port (D8). It is a seat like any other for the
+                // purpose of "which class must feed this", but its rectangle
+                // is NOT in the inputs store: the payload lives in
+                // `voxels::Store`, below the fire's other inputs, so
+                // `seats()` keeps it out of the token-axis carve.
+                RuntimeInput::Voxels { port, channels } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::Voxels,
+                    port,
+                    width: channels,
+                    dtype,
+                }),
                 RuntimeInput::RowPermutation { select }
                 | RuntimeInput::Geometry {
                     kind:
@@ -844,8 +852,15 @@ impl Feeds {
 
     /// The port seats alone, in the store's order.
     #[must_use]
+    /// The port rectangles the INPUTS store carves — every seat but the
+    /// voxel one, whose payload the voxel store reserves at the ladder's
+    /// ceilings instead (design D8).
     pub(crate) fn seats(&self) -> Vec<crate::inputs::PortSeat> {
-        self.ports.iter().map(|(seat, _)| *seat).collect()
+        self.ports
+            .iter()
+            .map(|(seat, _)| *seat)
+            .filter(|seat| seat.kind != engine::fire::PortKind::Voxels)
+            .collect()
     }
 }
 

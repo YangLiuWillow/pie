@@ -7,7 +7,6 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use lru::LruCache;
 use eta_compiler::codegen::cuda::region_analysis::RegionAnalysis;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
@@ -17,6 +16,7 @@ use eta_ir::container_hash;
 use eta_ir::op::Op;
 use eta_ir::registry::{ModelProfile, Port};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
+use lru::LruCache;
 
 /// Registration-time pricing: per-instance costs computed once per program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,7 +232,8 @@ impl Registry {
                 matches!(
                     op,
                     Op::IntrinsicVal {
-                        intr: eta_ir::op::IntrinsicId::MtpLogits | eta_ir::op::IntrinsicId::MtpDrafts,
+                        intr: eta_ir::op::IntrinsicId::MtpLogits
+                            | eta_ir::op::IntrinsicId::MtpDrafts,
                         ..
                     }
                 )
@@ -269,7 +270,6 @@ impl Registry {
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
-
 }
 
 /// Compute registration-time pricing from the decoded container.
@@ -476,7 +476,6 @@ fn profile_from(
         },
     }
 }
-
 
 #[cfg(test)]
 mod pricing_tests {
