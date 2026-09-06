@@ -715,11 +715,10 @@ __global__ void moe_matmul_select_mxfp4(
     // route ordinal that is the PLANE's and not the launch's — which is what
     // `engine_cuda::SHIFTED` promises for a name on its list.
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
-    // `order` (see `moe_route_order`) hands this block its plane route with
-    // the window offset folded in; without it the position is the route.
-    const int plane_route = order != nullptr
-        ? order[route]
-        : (win != nullptr ? route + static_cast<int>(win[1]) * top_k : route);
+    // This kernel walks routes in token order (no `moe_route_order` list is
+    // handed to it — the affine tensor-core select is the one that takes
+    // one): the position is the route, plus the window's offset.
+    const int plane_route = win != nullptr ? route + static_cast<int>(win[1]) * top_k : route;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
     const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
