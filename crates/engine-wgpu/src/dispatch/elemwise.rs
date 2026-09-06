@@ -102,7 +102,11 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
 
-            Elementwise::LayernormNoScale { .. } => {
+            Elementwise::LayernormNoScale { .. }
+            // CUDA's load-time chain fusions (`model_ir::fuse::residual_chains`);
+            // this engine never runs that pass, so it never sees these.
+            | Elementwise::RmsnormResidualAdd { .. }
+            | Elementwise::EmbedScaleAdd { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
 

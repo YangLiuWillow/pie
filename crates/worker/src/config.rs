@@ -468,7 +468,7 @@ pub struct ModelConfig {
     pub sku: Option<String>,
     /// Which published draft head to serve `model` with, by its short name
     /// (`dflash`, `dflash2`): `sku` looked up in the catalog's table of
-    /// published heads (`models::drafter::PUBLISHED`) for the target `model`
+    /// published heads (`models::published::PUBLISHED`) for the target `model`
     /// names, so a deployment says which drafter it wants rather than which
     /// row spells it. The artifact must already carry the head — `pie model
     /// import <target> --drafter <name>` is what puts it there. Refused when
@@ -648,8 +648,8 @@ impl ModelConfig {
              (as `pie model list` prints it), not an artifact path {target:?}; name the row \
              with model.sku instead"
         );
-        let Some(published) = models::drafter::published(target, drafter) else {
-            let known: Vec<&str> = models::drafter::published_for(target).map(|p| p.drafter).collect();
+        let Some(published) = models::published::lookup(target, drafter) else {
+            let known: Vec<&str> = models::published::for_target(target).map(|p| p.drafter).collect();
             bail!(
                 "model.drafter = {drafter:?}: no published head of that name for {target:?} in this \
                  build{}",

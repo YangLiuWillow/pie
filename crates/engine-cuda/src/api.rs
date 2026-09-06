@@ -618,6 +618,11 @@ impl Engine for Cuda {
             frames_in_flight,
         } = request;
         let trace = model_ir::fuse::residual_norm(trace);
+        let trace = if crate::serve::fuse_chains() {
+            model_ir::fuse::residual_chains(trace)
+        } else {
+            trace
+        };
 
         // Serving eagerly is a choice a deployment may make but never one
         // it should make silently: an uncaptured decode pays hundreds of

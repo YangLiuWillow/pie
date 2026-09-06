@@ -83,6 +83,58 @@ pub fn embed(
     )
 }
 
+/// `e = table[ids]`, `e_scaled = e * embed_scale`, `y += e_scaled` in place,
+/// `y_scaled = y * out_scale`: what [`embed`], `mul_scalar`, `residual_add`
+/// and `mul_scalar` land, one launch.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_scale_add(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    e: &mut Tensor,
+    embed_scale: f32,
+    e_scaled: &mut Tensor,
+    y: &mut Tensor,
+    out_scale: f32,
+    y_scaled: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.embed_scale_add";
+    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    debug_assert!(
+        ids.rows == y.rows && e.rows == y.rows && e.width == y.width,
+        "the token ids and every row plane share the fire's rows"
+    );
+    let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
+    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
+    let rows = stated(OP, nonzero(OP, "rows", y.rows)?)?;
+    let total = u64::from(y.rows) * u64::from(y.width);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
+        .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::embed_scale_add")
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ids.arg(),
+            table.arg(),
+            e.arg(),
+            embed_scale.arg(),
+            e_scaled.arg(),
+            y.arg(),
+            out_scale.arg(),
+            y_scaled.arg(),
+            hidden.arg(),
+            vocab.arg(),
+            rows.arg(),
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn split_qkv(
     ctx: &Ctx,
     packed: Tensor,

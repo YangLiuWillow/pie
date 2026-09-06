@@ -721,6 +721,28 @@ impl AxisCarve<'_> {
     }
 }
 
+/// How many leading execs of a body a replay launches; the rest walk. The
+/// golden probe's bisection knob (`Shell::golden` under `PIE_GOLDEN_PROBE`);
+/// `usize::MAX` — every fire outside that probe — launches them all.
+pub static REPLAY_UPTO: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+/// The first exec a replay launches (the ones before it walk); with
+/// [`REPLAY_UPTO`] this isolates one exec. `0` outside the probe.
+pub static REPLAY_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `PIE_PTR_TRACE=<substring of a key>`: which walk the per-node pointer
+/// trace ([`crate::dispatch::custom`]'s probe) is inside — `1` the capture
+/// of a matching body, `2` its golden's eager arm, `0` neither.
+pub static PTR_TAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether `PIE_PTR_TRACE` names this key.
+pub fn ptr_traced(key: &BodyKey) -> bool {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    match WANT.get_or_init(|| std::env::var("PIE_PTR_TRACE").ok()) {
+        Some(want) => key.to_string().contains(want.as_str()),
+        None => false,
+    }
+}
+
 /// One step of a body's replay script — a stretch the graph holds, or a
 /// stretch it re-issues eagerly. No second vector: the sequence itself is
 /// the representation.
@@ -949,6 +971,16 @@ impl Bodies {
         }
     }
 
+    /// Drop a captured body and refuse its key: the arming pass's verdict on
+    /// a body whose golden disagreed, when the load is told to keep going
+    /// without it rather than fail. The key then walks eagerly for the life
+    /// of the load, as a refused key does.
+    pub fn body_drop(&mut self, key: &BodyKey) -> bool {
+        let dropped = self.map.drop_body(key);
+        self.body_refuse(key.clone());
+        dropped
+    }
+
     /// One more body the load armed: pinned in the map and counted ([`BodyTally::armed_at_load`]).
     /// Answers whether the key held a body to arm.
     pub fn body_armed(&mut self, key: &BodyKey) -> bool {
@@ -957,6 +989,24 @@ impl Bodies {
             self.recorder.bstats.armed_at_load += 1;
         }
         armed
+    }
+
+    /// A body's script as `(island, from, upto)` per step, for the golden
+    /// probe to name the stretch a bisection lands on. Empty for no body.
+    pub fn body_script(&self, key: &BodyKey) -> Vec<(bool, u32, u32)> {
+        self.map
+            .bodies
+            .get(key)
+            .map(|body| {
+                body.script
+                    .iter()
+                    .map(|step| match step {
+                        Step::Exec { cut, .. } => (false, cut.from, cut.upto),
+                        Step::Island(cut) => (true, cut.from, cut.upto),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Close the map — `Shell::arm_bodies`'s last line. Idempotent and one-way.
@@ -1036,6 +1086,13 @@ impl Bodies {
             self.recorder.bstats.sealed_short += 1;
         }
         let replays = !short && !moved && !empty;
+        if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+            let held = self.map.bodies.get(&key).map(|body| body.shape);
+            eprintln!(
+                "[body-probe] {key} eager_twin={} replays={replays} short={short} moved={moved} empty={empty} shape={shape:#x} held={held:x?}",
+                at.eager_twin
+            );
+        }
         if replays && let Some(body) = self.map.bodies.get_mut(&key) {
             // The hit path: one host for-loop over one stream, captured
             // stretches submitted and islands re-issued eagerly between
@@ -1072,11 +1129,24 @@ impl Bodies {
                  the readout rectangle held from the last fire that ran",
             );
             // The golden's control arm ([`Fire::eager_twin`]) walks what it
-            // would have launched instead of launching the exec.
+            // would have launched instead of launching the exec. The probe's
+            // bisection (`REPLAY_UPTO`) launches only the first `k` execs
+            // and walks the rest, so a disagreement names its stretch.
+            let upto = REPLAY_UPTO.load(std::sync::atomic::Ordering::Relaxed);
+            let from = REPLAY_FROM.load(std::sync::atomic::Ordering::Relaxed);
+            let mut nth = 0usize;
             for step in body.script.iter() {
                 match step {
-                    Step::Exec { exec, .. } if !at.eager_twin => exec.launch(at.stream)?,
-                    Step::Exec { cut, .. } | Step::Island(cut) => {
+                    Step::Exec { exec, cut } => {
+                        let launch = !at.eager_twin && nth >= from && nth < upto;
+                        nth += 1;
+                        if launch {
+                            exec.launch(at.stream)?;
+                        } else {
+                            walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
+                        }
+                    }
+                    Step::Island(cut) => {
                         walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                     }
                 }
@@ -1145,8 +1215,33 @@ impl Bodies {
                 steps.push(Step::Island(cut));
                 continue;
             }
-            let graph =
-                Graph::capture(at.stream, || walk_capture_cut(at, run, place, Streams::Forked, cut))?;
+            let graph = {
+                if ptr_traced(&key) {
+                    PTR_TAG.store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let captured = Graph::capture(at.stream, || {
+                    walk_capture_cut(at, run, place, Streams::Forked, cut)
+                });
+                PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
+                captured?
+            };
+            // `PIE_GRAPH_DOT=<dir>`: every exec of the `PIE_PTR_TRACE` key as DOT.
+            if let Some(dir) = std::env::var_os("PIE_GRAPH_DOT")
+                && ptr_traced(&key)
+            {
+                let nth = steps
+                    .iter()
+                    .filter(|step| matches!(step, Step::Exec { .. }))
+                    .count();
+                let path = format!("{}/exec{nth}.dot", dir.to_string_lossy());
+                let wrote = graph.debug_dot(&path);
+                eprintln!(
+                    "[graph-dot] {key} exec {nth} regions {}..{} -> {path} ({})",
+                    cut.from,
+                    cut.upto,
+                    if wrote { "written" } else { "REFUSED" }
+                );
+            }
             // Prepare-only stretches that recorded nothing are dropped
             // (`Some(0)`, not `== 0` — a refused query is not empty).
             // Capture-phase ones become islands instead, re-issued eagerly.
@@ -1189,6 +1284,31 @@ impl Bodies {
             return Ok(());
         }
         let grids = launch_grids(at, run);
+        // `PIE_GRID_TRACE=<substring of a key>`: per launch of a matching
+        // body, the live span beside the ceiling grid it was captured at —
+        // the two numbers a replay disagreeing with its walk is read by.
+        if let Some(wanted) = std::env::var_os("PIE_GRID_TRACE")
+            && key.to_string().contains(wanted.to_string_lossy().as_ref())
+        {
+            let windows = run.windows();
+            let mut seen = 0usize;
+            for region in 0..at.compiled.template().len() as u32 {
+                if at.island(region) {
+                    continue;
+                }
+                let template = &at.compiled.template()[region as usize];
+                for at_run in 0..windows.runs(region) {
+                    let span = windows.at(region, at_run).span();
+                    let (rows, lanes) = grids.get(seen).copied().unwrap_or((0, 0));
+                    seen += 1;
+                    eprintln!(
+                        "[grid-trace] {key} r{region} run{at_run} nodes={:?} phase={:?} stream={} \
+                         live=({}, {}) grid=({rows}, {lanes})",
+                        template.nodes, template.phase, template.stream, span.rows, span.lanes
+                    );
+                }
+            }
+        }
         let _ = self.insert_body(key, Body {
             script: steps.into_boxed_slice(),
             grids,
@@ -1271,6 +1391,15 @@ impl BodyMap {
     /// key was newly refused, so the caller counts compositions not traffic.
     fn refuse(&mut self, key: BodyKey) -> bool {
         self.bodies_refused.insert(key)
+    }
+
+    /// Forget a captured body outright — the arming pass's own verdict on a
+    /// body its golden disagreed with, before the map is sealed and before
+    /// anything launched it. Answers whether a body was there to drop.
+    fn drop_body(&mut self, key: &BodyKey) -> bool {
+        self.body_order.retain(|held| held != key);
+        self.body_warm.remove(key);
+        self.bodies.remove(key).is_some()
     }
 
     /// Is the map closed?
@@ -1461,8 +1590,17 @@ fn walk_capture_units(
     units: Units,
     regions: Regions,
 ) -> Result<()> {
+    // `PIE_CAPTURE_SERIAL=1`: a diagnostic arm that captures on ONE stream
+    // — the fork/join event points the stream pass baked are not walked —
+    // while still writing the capture down. A body that agrees with its
+    // walk only under this flag names the stream plan as what it disagrees
+    // over.
+    let serial_capture = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_CAPTURE_SERIAL").is_some())
+    };
     let mut cursor = match (streams, at.lanes) {
-        (Streams::Forked, Some(lanes)) => Cursor::across(place, lanes),
+        (Streams::Forked, Some(lanes)) if !serial_capture => Cursor::across(place, lanes),
         _ => at.serial(place),
     };
     // Whether this walk is being written down is separate from whether it

@@ -278,6 +278,45 @@ pub(crate) fn wave_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
 }
 
+/// One `[wave-trace]` line out. `PIE_WAVE_TRACE=buffer` parks lines in
+/// memory and a thread flushes them once a second: a direct `eprintln!` per
+/// enqueue costs ~10 µs on the worker's path, and 64 of them per step is a
+/// delay of the same order as a guest's turnaround — enough to move what
+/// the trace is meant to show.
+pub(crate) fn wave_trace_emit(line: String) {
+    static BUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let buffered = *BUFFERED.get_or_init(|| {
+        let on = std::env::var_os("PIE_WAVE_TRACE").is_some_and(|v| v == "buffer");
+        if on {
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let drained: Vec<String> =
+                        std::mem::take(&mut *LINES.lock().unwrap_or_else(|e| e.into_inner()));
+                    for line in drained {
+                        eprintln!("{line}");
+                    }
+                }
+            });
+        }
+        on
+    });
+    if buffered {
+        LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// Microseconds since the first trace line — every `[wave-trace]` line
+/// carries one, so a dump reads as a timeline (ramp, steady state, collapse)
+/// and not just as a sequence.
+pub(crate) fn wave_trace_us() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros()
+}
+
 /// Whether this request lowered its mask to rows the host can see. A mask
 /// lives on its lane (`Lane::mask`), so this asks whether any lane carries one.
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
@@ -2998,15 +3037,16 @@ impl BatchScheduler {
                     // even while it sits in `pending` behind an
                     // in-flight-depth or seal hold.
                     if wave_trace() {
-                        eprintln!(
-                            "[wave-trace] enq fire={} framed={} mask={} masks={} stm={} pipe={}",
+                        wave_trace_emit(format!(
+                            "[wave-trace] t={}us enq fire={} framed={} mask={} masks={} stm={} pipe={}",
+                            wave_trace_us(),
                             launch.logical_fire_id,
                             launch.frame.is_some(),
                             launch.request.has_user_mask,
                             has_wire_masks(&launch.request),
                             launch.request.single_token_mode,
                             launch.pipeline_id.is_some()
-                        );
+                        ));
                     }
                     if let Some(stamp) = launch.frame {
                         frame_policy.on_fire_enqueued(
@@ -3695,6 +3735,13 @@ impl BatchScheduler {
             // it, a resize's pipe drain); a settling standalone copy holds
             // nothing, so frames keep posting while it settles.
             if in_flight_control.holds_launches() {
+                if wave_trace() {
+                    wave_trace_emit(format!(
+                        "[wave-trace] t={}us hold control in_flight={}",
+                        wave_trace_us(),
+                        in_flight_launches.len()
+                    ));
+                }
                 // Counted only when the device is idle: the frame policy
                 // isn't even consulted here. See `probe::QuorumProbes`.
                 if in_flight_launches.is_empty() {
@@ -3717,6 +3764,14 @@ impl BatchScheduler {
             // frees a slot; posting never waits on completion beyond this
             // backpressure.
             if in_flight_launches.len() >= frame::configured_dispatch_depth() {
+                if wave_trace() {
+                    wave_trace_emit(format!(
+                        "[wave-trace] t={}us hold depth in_flight={} depth={}",
+                        wave_trace_us(),
+                        in_flight_launches.len(),
+                        frame::configured_dispatch_depth()
+                    ));
+                }
                 if in_flight_launches.is_empty() {
                     stats
                         .fire
@@ -3728,6 +3783,13 @@ impl BatchScheduler {
             }
             let now = Instant::now();
             let scan = Self::scan_queue(scan_cache, pending, stopping);
+            if wave_trace() {
+                wave_trace_emit(format!(
+                    "[wave-trace] t={}us plan in_flight={}",
+                    wave_trace_us(),
+                    in_flight_launches.len()
+                ));
+            }
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
                 // Shutdown drain: the boundary gate waits for arrivals that
@@ -3743,7 +3805,7 @@ impl BatchScheduler {
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
                 if wave_trace() {
-                    eprintln!("[wave-trace] rider fire={untracked}");
+                    wave_trace_emit(format!("[wave-trace] t={}us rider fire={untracked}", wave_trace_us()));
                 }
                 vec![vec![untracked]]
             } else {
@@ -3755,10 +3817,11 @@ impl BatchScheduler {
                 ) {
                     FramePlan::Dispatch(waves) => {
                         if wave_trace() {
-                            eprintln!(
-                                "[wave-trace] dispatch waves={:?}",
+                            wave_trace_emit(format!(
+                                "[wave-trace] t={}us dispatch waves={:?}",
+                                wave_trace_us(),
                                 waves.iter().map(Vec::len).collect::<Vec<_>>()
-                            );
+                            ));
                         }
                         waves
                     }
@@ -3992,6 +4055,13 @@ impl BatchScheduler {
                 _ => None,
             };
             let mut retired = in_flight_launches.pop_front().expect("front batch exists");
+            if wave_trace() {
+                wave_trace_emit(format!(
+                    "[wave-trace] t={}us retire lanes={}",
+                    wave_trace_us(),
+                    retired.requests.len()
+                ));
+            }
             // The runtime has answered these lanes: re-arm their submit
             // deadline from here so the wave they waited on is not charged
             // to them (see `FramePolicy::on_frame_retired`).

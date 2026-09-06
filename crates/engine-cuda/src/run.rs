@@ -1025,6 +1025,20 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
+    /// Whether [`Run::tensor`] would answer for this id without panicking: an op
+    /// output or merge with an arena slot, or a dense weight. Diagnostics only.
+    pub(crate) fn resolvable(&self, id: ValueId) -> bool {
+        let at = id.0 as usize;
+        match self.values.get(at).map(|decl| &decl.def) {
+            Some(Def::Op(_) | Def::Merge(_)) => self.arena.0.get(at).copied().flatten().is_some(),
+            Some(Def::Weight(w)) => matches!(
+                self.weights.0.get(*w as usize).copied().flatten(),
+                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. })
+            ),
+            _ => false,
+        }
+    }
+
     /// The fire-wide rectangle, asked for by name — for a consumer whose own index vector is already absolute (the embed merge), so cutting at the window would double-count the offset.
     pub(crate) fn fire_wide(&self, id: ValueId) -> Tensor {
         self.whole(id)

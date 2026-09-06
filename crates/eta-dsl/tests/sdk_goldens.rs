@@ -1,4 +1,4 @@
-//! The SDK-port goldens: the canonical container bytes of five programs,
+//! The SDK-port goldens: the canonical container bytes of seven programs,
 //! pinned in `goldens/sdk_containers.txt` and rebuilt byte for byte by the
 //! Python (`sdk/inferlet/python/tests/test_eta_goldens.py`) and JavaScript
 //! (`sdk/inferlet/javascript/src/__tests__/eta_goldens.test.ts`) ports of
@@ -231,6 +231,186 @@ fn sinks() -> Traced {
 }
 
 
+/// diffusion-baseline's denoise pass (`tests/inferlets/diffusion-baseline`),
+/// with `inferlet::eta::diffusion::{entropy_bound_accept, stable_and_confident}`
+/// inlined — this crate cannot depend on `inferlet`, so keep the two bodies
+/// in step with `crates/inferlet/src/eta.rs`.
+fn diffusion_step() -> Traced {
+    let length = 8u32;
+    let taps = 4u32;
+    let base = 5u32;
+    let end = base + length;
+    let page_size = PAGE;
+    let max_pages = 2u32;
+    let bound = 0.5f32;
+    let confidence = 0.1f32;
+    let toks: &'static Channel = leak(Channel::from((0..length).map(|i| (i * 7919 % 1000) as i32).collect::<Vec<_>>()).named("canvas"));
+    let embed_indptr: &'static Channel = leak(Channel::from([0u32, length]).named("embed_indptr"));
+    let positions: &'static Channel = leak(Channel::from((base..end).collect::<Vec<_>>()).named("positions"));
+    let pages: &'static Channel = leak(Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages"));
+    let page_indptr: &'static Channel = leak(Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr"));
+    let w_slot: &'static Channel = leak(Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot"));
+    let w_off: &'static Channel = leak(Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off"));
+    let kv_len: &'static Channel = leak(Channel::from([end]).named("kv_len"));
+    let readout: &'static Channel = leak(Channel::from((0..length).collect::<Vec<_>>()).named("readout"));
+    let temp: &'static Channel = leak(Channel::from([1.0f32]).named("temperature"));
+    let rng_state: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
+    let history: &'static Channel = leak(Channel::from(vec![-1i32; length as usize]).named("argmax_history"));
+    let canvas_out: &'static Channel = leak(Channel::new([length], dtype::i32).named("canvas_out"));
+    let argmax_out: &'static Channel = leak(Channel::new([length], dtype::i32).named("argmax_out"));
+    let stop: &'static Channel = leak(Channel::new([1], dtype::bool).named("stop"));
+    let mean_out: &'static Channel = leak(Channel::new([1], dtype::f32).named("mean_entropy"));
+    let tap_ids_out: &'static Channel = leak(Channel::new([length, taps], dtype::u32).named("tap_ids"));
+    let tap_weights_out: &'static Channel = leak(Channel::new([length, taps], dtype::f32).named("tap_weights"));
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.bind_port(Port::EmbedTokens, toks);
+    b.bind_port(Port::EmbedIndptr, embed_indptr);
+    b.bind_port(Port::KvLen, kv_len);
+    b.bind_port(Port::Pages, pages);
+    b.bind_port(Port::PageIndptr, page_indptr);
+    b.bind_port(Port::WSlot, w_slot);
+    b.bind_port(Port::WOff, w_off);
+    b.bind_port(Port::Positions, positions);
+    b.bind_port(Port::Readout, readout);
+    b.stage(Stage::Epilogue, move || {
+        positions.put(positions.take());
+        w_slot.put(w_slot.take());
+        w_off.put(w_off.take());
+
+        let r = rng_state.take();
+        let t = reshape(temp.read(), []);
+        let logits = intrinsics::logits();
+        let scaled = div(&logits, &t);
+        let probs = softmax(&scaled);
+        let h = entropy(&probs);
+        let sampled = gumbel_max(&scaled, &r);
+        let argmax = reduce_argmax(&scaled);
+
+        // entropy_bound_accept(&h, bound)
+        let accept = {
+            let n = h.shape().dims()[0];
+            let (neg_sorted, order) = sort_desc(neg(&h));
+            let sorted = neg(&neg_sorted);
+            let below = le(sub(cumsum(&sorted), &sorted), bound);
+            let none = lt(iota(n), 0u32);
+            scatter_set(&none, &order, &below)
+        };
+        let r_noise = add(&r, iota(2));
+        let noise = cast(mul(rng(&r_noise, [length]), VOCAB as f32), dtype::i32);
+        let next = select(&accept, &sampled, &noise);
+
+        let previous = history.take();
+        history.put(&argmax);
+        // stable_and_confident(&argmax, &previous, &h, confidence)
+        let done = {
+            let n = argmax.shape().dims()[0];
+            let unchanged = reduce_sum(cast(eq(&argmax, &previous), dtype::i32));
+            let stable = eq(&unchanged, n as i32);
+            let mean = div(reduce_sum(&h), n as f32);
+            and(&stable, &lt(&mean, confidence))
+        };
+
+        let (tap_weights, tap_ids) = top_k(&probs, taps);
+        tap_ids_out.put(&tap_ids);
+        tap_weights_out.put(&tap_weights);
+
+        canvas_out.put(&next);
+        argmax_out.put(&argmax);
+        stop.put(reshape(done, [1]));
+        mean_out.put(reshape(div(reduce_sum(&h), length as f32), [1]));
+        rng_state.put(add(&r_noise, iota(2)));
+    });
+    for ch in [canvas_out, argmax_out, stop, mean_out, tap_ids_out, tap_weights_out] {
+        ch.note_host_take();
+    }
+    b.build().unwrap()
+}
+
+/// beam-search's step (`tests/inferlets/beam-search`): the `mask` port,
+/// `from_shaped`, `capacity`, `top_k` / `gather` / `or` over a `[B, V]` block.
+fn beam_step() -> Traced {
+    #[allow(non_snake_case)]
+    let B = 2u32;
+    let pool_pages = 8u32;
+    let page_t = PAGE;
+    let pool_len = pool_pages * page_t;
+    let v = VOCAB;
+    let pool_ids: Vec<u32> = (0..pool_pages).collect();
+    let tiled: Vec<u32> = (0..B * pool_pages).map(|_| pool_ids[0]).collect();
+    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
+    let mask: &'static Channel = leak(Channel::from_shaped([B, pool_len], init_mask).named("mask"));
+    let scores: &'static Channel = leak(Channel::from(vec![0.0f32, f32::NEG_INFINITY]).named("scores"));
+    let toks: &'static Channel = leak(Channel::from(vec![1i32; B as usize]).named("toks"));
+    let pos: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("pos"));
+    let fill: &'static Channel = leak(Channel::from([1u32]).named("fill"));
+    let klen: &'static Channel = leak(Channel::from(vec![1u32; B as usize]).named("klen"));
+    let w_slot: &'static Channel = leak(Channel::from(vec![pool_ids[0]; B as usize]).named("w_slot"));
+    let w_off: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("w_off"));
+    let pages: &'static Channel = leak(Channel::from(tiled).named("pages"));
+    let page_indptr: &'static Channel = leak(Channel::from_shaped([B + 1], (0..=B).collect::<Vec<_>>()).named("page_indptr"));
+    let lanes_b: &'static Channel = leak(Channel::from((0..=B).collect::<Vec<_>>()).named("embed_indptr"));
+    let pool_ids_ch: &'static Channel = leak(Channel::from(pool_ids).named("pool_ids"));
+    let out: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8).named("out"));
+    let out_par: &'static Channel = leak(Channel::new([B], dtype::u32).capacity(8).named("out_par"));
+    let out_scr: &'static Channel = leak(Channel::new([B], dtype::f32).capacity(8).named("out_scr"));
+    let out_greedy: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8).named("out_greedy"));
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.bind_port(Port::KvLen, klen);
+    b.bind_port(Port::Pages, pages);
+    b.bind_port(Port::PageIndptr, page_indptr);
+    b.bind_port(Port::WSlot, w_slot);
+    b.bind_port(Port::WOff, w_off);
+    b.bind_port(Port::Positions, pos);
+    b.bind_port(Port::AttnMask, mask);
+    b.bind_port(Port::EmbedTokens, toks);
+    b.bind_port(Port::EmbedIndptr, lanes_b);
+    b.stage(Stage::Epilogue, move || {
+        let logits = reshape(intrinsics::logits(), [B, v]);
+        let cand = add(broadcast(reshape(scores.take(), [B, 1]), [B, v]), log_softmax(&logits));
+        let (s, i) = top_k(reshape(cand, [B * v]), B);
+        let parent = div(&i, v);
+        let tok_i = cast(rem(&i, v), dtype::i32);
+
+        let base = fill.take();
+        let lane = iota(B);
+        let base_b = broadcast(reshape(&base, [1]), [B]);
+        let wpos = add(&base_b, &lane);
+
+        let inherited = gather(mask.take(), &parent);
+        let col = broadcast(reshape(iota(pool_len), [1, pool_len]), [B, pool_len]);
+        let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, pool_len]);
+        let newpos = eq(col, wpos_b);
+        let new_mask = or(inherited, &newpos);
+        mask.put(&new_mask);
+
+        let pids = pool_ids_ch.take();
+        let logical_slot = div(&wpos, page_t);
+        let w_slot_v = gather(&pids, &logical_slot);
+        let w_off_v = rem(&wpos, page_t);
+        w_slot.put(&w_slot_v);
+        w_off.put(&w_off_v);
+
+        let filled = add(&base, B);
+        klen.put(broadcast(reshape(&filled, [1]), [B]));
+
+        pos.put(add(pos.take(), 1u32));
+        fill.put(&filled);
+        scores.put(&s);
+        toks.put(&tok_i);
+        let page_count = filled.div_ceil(page_t);
+        let pages_ig = gather(&pids, rem(iota(B * pool_pages), broadcast(&page_count, [B * pool_pages])));
+        pages.put(&pages_ig);
+        page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
+
+        out.put(&tok_i);
+        out_par.put(&parent);
+        out_scr.put(&s);
+        out_greedy.put(&reshape(reduce_argmax(&logits), [B]));
+        pool_ids_ch.put(&pids);
+    });
+    b.build().unwrap()
+}
+
 fn programs() -> Vec<(&'static str, Traced)> {
     vec![
         ("s3", s3()),
@@ -238,6 +418,8 @@ fn programs() -> Vec<(&'static str, Traced)> {
         ("naive_decode", naive_decode()),
         ("coverage", coverage()),
         ("sinks", sinks()),
+        ("diffusion_step", diffusion_step()),
+        ("beam_step", beam_step()),
     ]
 }
 

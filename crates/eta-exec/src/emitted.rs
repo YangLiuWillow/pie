@@ -4,7 +4,13 @@ use eta_compiler::codegen::program::{EmittedKernel, KernelKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot<'a> {
-    Kernel { source: &'a str, entry: &'a str },
+    Kernel {
+        source: &'a str,
+        entry: &'a str,
+        /// The streamed form's dispatch table (`EmittedKernel::steps`);
+        /// empty for every other kind.
+        steps: &'a [u32],
+    },
 
     Refused(&'a str),
 
@@ -58,6 +64,7 @@ impl<'a> Emitted<'a> {
         Slot::Kernel {
             source: &kernel.source,
             entry: &kernel.entry_name,
+            steps: &kernel.steps,
         }
     }
 

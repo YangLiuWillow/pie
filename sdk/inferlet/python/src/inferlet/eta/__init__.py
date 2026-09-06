@@ -19,7 +19,7 @@ program, so a Python and a Rust inferlet share the host's program cache.
 
 from __future__ import annotations
 
-from . import intrinsics
+from . import diffusion, intrinsics
 from .bridge import (
     TOKEN_PAD,
     Channel,
@@ -38,10 +38,10 @@ from .bridge import (
     channel_capacity,
     frame_size,
     kv_page_size,
-    live_slots,
     max_embed_length,
     mm,
     pad_tokens,
+    prefill_chunk_hint,
     prefill_chunks,
     run_ahead,
     scale,
@@ -138,10 +138,10 @@ __all__ = [
     "channel_capacity",
     "frame_size",
     "kv_page_size",
-    "live_slots",
     "max_embed_length",
     "mm",
     "pad_tokens",
+    "prefill_chunk_hint",
     "prefill_chunks",
     "run_ahead",
     "scale",
@@ -154,6 +154,7 @@ __all__ = [
     "Stage",
     "dtype",
     "TraceError",
+    "diffusion",
     "intrinsics",
     # value
     "ConstData",

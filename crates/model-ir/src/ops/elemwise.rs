@@ -17,6 +17,16 @@ pub struct Yarn {
     pub original_max_position: u32,
 }
 
+/// The trailing norm of a fused [`RmsnormResidualAdd`](Elementwise::RmsnormResidualAdd):
+/// `out = rmsnorm(row) * (weight [+ 1])` over the row the chain produced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PostNorm {
+    pub weight: ValueId,
+    pub plus_one: bool,
+    pub eps: f32,
+    pub out: ValueId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Elementwise {
     Rmsnorm {
@@ -133,6 +143,42 @@ pub enum Elementwise {
         plus_one: bool,
         eps: f32,
         out: ValueId,
+    },
+    /// `t = rmsnorm(x) * weight`, then `y += t` in place, then — when the
+    /// chain carries them — `scaled = y * s` for a device-held scalar `s`
+    /// and `out = rmsnorm(scaled or y)` (`post`): the norm-add-scale-norm
+    /// run between a block's projection and the next block, one launch
+    /// where the trace lands three or four. Every intermediate (`t`, `y_out`,
+    /// `scaled`) is still written with the bf16 rounding its own launch
+    /// would give it, so every reader of the traced values survives.
+    /// Written by [`crate::fuse`], never traced.
+    RmsnormResidualAdd {
+        x: ValueId,
+        weight: ValueId,
+        eps: f32,
+        t: ValueId,
+        y: ValueId,
+        y_out: ValueId,
+        /// `(s, scaled)`: the scalar plane and the row it scales `y_out` into.
+        scale: Option<(ValueId, ValueId)>,
+        post: Option<PostNorm>,
+    },
+    /// `e = table[ids]`, `e_scaled = e * embed_scale`, `y += e_scaled` in
+    /// place, `y_scaled = y * out_scale`: a per-layer input embedding folded
+    /// into the stream it joins (gemma's per-layer inputs), one launch where
+    /// the trace lands four. Every intermediate is written as its own launch
+    /// would write it. Written by [`crate::fuse`], never traced.
+    EmbedScaleAdd {
+        ids: ValueId,
+        table: ValueId,
+        vocab: u32,
+        e: ValueId,
+        embed_scale: f32,
+        e_scaled: ValueId,
+        y: ValueId,
+        y_out: ValueId,
+        out_scale: f32,
+        y_scaled: ValueId,
     },
     AddBias {
         bias: ValueId,
@@ -409,6 +455,23 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
             Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
             Self::ResidualAddRmsnorm { x, y, weight, .. } => sink.extend([*x, *y, *weight]),
+            Self::RmsnormResidualAdd {
+                x,
+                weight,
+                y,
+                scale,
+                post,
+                ..
+            } => {
+                sink.extend([*x, *weight, *y]);
+                if let Some((s, _)) = scale {
+                    sink.push(*s);
+                }
+                if let Some(post) = post {
+                    sink.push(post.weight);
+                }
+            }
+            Self::EmbedScaleAdd { ids, table, y, .. } => sink.extend([*ids, *table, *y]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
             Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
             Self::MulScalar { x, .. } => sink.push(*x),
@@ -460,6 +523,28 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { y, .. } => sink.push(*y),
             Self::ResidualAdd { y_out, .. } => sink.push(*y_out),
             Self::ResidualAddRmsnorm { y_out, out, .. } => sink.extend([*y_out, *out]),
+            Self::RmsnormResidualAdd {
+                t,
+                y_out,
+                scale,
+                post,
+                ..
+            } => {
+                sink.extend([*t, *y_out]);
+                if let Some((_, scaled)) = scale {
+                    sink.push(*scaled);
+                }
+                if let Some(post) = post {
+                    sink.push(post.out);
+                }
+            }
+            Self::EmbedScaleAdd {
+                e,
+                e_scaled,
+                y_out,
+                y_scaled,
+                ..
+            } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
             Self::Standardize { x_out, .. } => sink.push(*x_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
@@ -500,6 +585,10 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { .. } => {}
             Self::ResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::ResidualAddRmsnorm { y_out, y, .. } => sink.push((*y_out, *y)),
+            // Only the fold is in place: the scaled row and the embed rows
+            // are fresh outputs, since an alias may name only an input.
+            Self::RmsnormResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
+            Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
             Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -544,6 +633,8 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { .. } => "elementwise.rmsnorm_gated_by",
             Self::ResidualAdd { .. } => "elementwise.residual_add",
             Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
+            Self::RmsnormResidualAdd { .. } => "elementwise.rmsnorm_residual_add",
+            Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
             Self::AddBias { .. } => "elementwise.add_bias",
             Self::Standardize { .. } => "elementwise.standardize",
             Self::MulScalar { .. } => "elementwise.mul_scalar",

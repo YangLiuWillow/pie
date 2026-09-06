@@ -16,16 +16,18 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// fingerprint change that doesn't move the version fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 31, 0xd7b3_1b9a_1111_4c43),
-    // The metal row's hash was mis-transcribed when 42 -> 43 was made
-    // (566667983, which bumped both backends and got cuda's right). The
-    // emitter has not changed a byte since that commit -- `crates/eta-compiler`
-    // and `crates/eta-ir` are identical between it and here -- so the pin was
-    // wrong when written rather than the output having moved under it, and the
-    // gate has been red ever since. Corrected to what the emitter emits,
-    // WITHOUT touching the version: 43 is what the engines have cached, and
-    // bumping it would discard every one of those caches for nothing.
-    ("metal", 45, 0x7ffd_0d92_f577_cf49),
+    // 28 -> 29: `fused_block0.cuh` (spliced into every emitted kernel) grew
+    // `ptir_fast_gumbel_argmax_intrinsic`, and a Gumbel-max head emits a call
+    // to it instead of its four launches. 29 -> 32 (merged with 30/31):
+    // row-parallel streams through registers, the reshaped-row-vector
+    // broadcast fold and the pooled `top_k` select.
+    ("cuda", 32, 0x27d8_d2fd_45f0_9ca1),
+    // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
+    // emitted kernel) grew the threadgroup-partitioned op walk, then the
+    // partitioned selections, then the streamed form's level reductions and
+    // its own `ptir_m4` kernels joined the table. 49 -> 50 (merged with 45):
+    // the normalization fold reaches the metal output too.
+    ("metal", 50, 0xafea_077e_140a_1a97),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

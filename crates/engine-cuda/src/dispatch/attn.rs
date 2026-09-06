@@ -108,6 +108,18 @@ impl Run<'_> {
                         seat.workspace,
                     )?
                 };
+                if std::env::var_os("PIE_PLAN_TRACE").is_some() {
+                    let seat = self.planning(*kv_indptr, *plan);
+                    eprintln!(
+                        "[plan-trace] decode capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
+                        self.bindings().capture,
+                        seat.rows,
+                        seat.live,
+                        seat.window,
+                        seat.workspace,
+                        built.info
+                    );
+                }
                 built.stage(self.ctx())?;
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
@@ -149,6 +161,33 @@ impl Run<'_> {
                                 &fire.device,
                                 seat.workspace,
                             )?;
+                            // `PIE_PLAN_TRACE=<rows>`: the plan this fire
+                            // built, for a fire of exactly that many rows —
+                            // both arms of a golden print theirs, which is
+                            // how a body's schedule is read beside its walk's.
+                            if let Some(wanted) = std::env::var_os("PIE_PLAN_TRACE")
+                                && (wanted == "all"
+                                    || wanted.to_string_lossy() == seat.rows.to_string())
+                            {
+                                let ints: Vec<i32> = built
+                                    .int_upload
+                                    .chunks_exact(4)
+                                    .take(96)
+                                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                    .collect();
+                                eprintln!(
+                                    "[plan-trace] capture={} rows={} live={:?} window={:?} grant={:?} info={:?} int_bytes={} float_bytes={} ints[..96]={:?}",
+                                    fire.capture,
+                                    seat.rows,
+                                    seat.live,
+                                    seat.window,
+                                    seat.workspace,
+                                    built.info,
+                                    built.int_bytes,
+                                    built.float_bytes,
+                                    ints
+                                );
+                            }
                             built.stage(self.ctx())?;
                             StructSlot::Prefill(built)
                         }
@@ -168,6 +207,17 @@ impl Run<'_> {
                                 &fire.device,
                                 seat.workspace,
                             )?;
+                            if std::env::var_os("PIE_PLAN_TRACE").is_some() {
+                                eprintln!(
+                                    "[plan-trace] sm90 capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
+                                    fire.capture,
+                                    seat.rows,
+                                    seat.live,
+                                    seat.window,
+                                    seat.workspace,
+                                    built.info
+                                );
+                            }
                             built.stage(self.ctx())?;
                             StructSlot::PrefillSm90(built)
                         }

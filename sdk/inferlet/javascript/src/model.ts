@@ -7,6 +7,7 @@
 // separated the two interfaces.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
+import type { BlockDrafter, CanvasShape } from 'pie:inferlet/model@0.3.0';
 
 // The tokenizer surface lives in the sibling `tokenizer` module and is
 // re-exported here, so `model.encode`/`model.decode` read off `model` the way
@@ -38,10 +39,26 @@ export function submitDeadlineUs(): number {
   return Number(_model.submitDeadlineUs());
 }
 
-/** Whether the bound model carries irreversibly-folded recurrent state —
- *  `passKind() !== 'attention'`, the WIT's documented invariant. */
+/** Whether the bound model carries irreversibly-folded recurrent state (a
+ *  `recurrent` or `hybrid` pass kind). */
 export function isLinear(): boolean {
-  return _model.passKind() !== 'attention';
+  const k = _model.passKind();
+  return k === 'recurrent' || k === 'hybrid';
+}
+
+/** The bound model's block drafter, if it carries one. */
+export function draftBlock(): BlockDrafter | undefined {
+  return _model.draftBlock();
+}
+
+/** The diffusion canvas; `undefined` for every other pass kind. */
+export function canvas(): CanvasShape | undefined {
+  return _model.canvas();
+}
+
+/** Fires one lane may have submitted and not yet taken. */
+export function runAheadWindow(): number {
+  return _model.runAheadWindow();
 }
 
 /**
@@ -80,6 +97,13 @@ export function maxEmbedLength(): number {
   return _model.maxEmbedLength();
 }
 
+/** The prefill chunk the scheduler would like right now: the forward token
+ * budget shared among live processes, in whole KV pages. A hint, read per
+ * call — it moves as processes come and go. */
+export function prefillChunkHint(): number {
+  return _model.prefillChunkHint();
+}
+
 /** Bytes in one folded recurrent-state object. 0 for pure attention. */
 export function rsStateSize(): number {
   return Number(_model.rsStateSize());
@@ -100,4 +124,4 @@ export function arenaBlockSize(): number {
   return Number(_model.arenaBlockSize());
 }
 
-export type { ForwardKind } from 'pie:inferlet/model@0.3.0';
+export type { BlockDrafter, CanvasShape, ForwardKind } from 'pie:inferlet/model@0.3.0';

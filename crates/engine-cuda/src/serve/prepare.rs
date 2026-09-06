@@ -90,7 +90,7 @@ impl FrameShell for Shell {
                     .is_some_and(|class| class != eta_ir::registry::GeometryClass::Host)
             })
         {
-            self.reap_guests()?;
+            self.reap_guests_at("prepare")?;
         }
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];

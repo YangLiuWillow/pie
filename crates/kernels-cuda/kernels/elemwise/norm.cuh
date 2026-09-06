@@ -469,6 +469,100 @@ __global__ void rmsnorm_gated_f32_in(
     }
 }
 
+// `t = rmsnorm(x) * w0`, `y += t`, then, as the template says, `scaled = y *
+// s[0]` and `out = rmsnorm(scaled or y) * (w1 [+ 1])`: the launches
+// `rmsnorm`, `residual_add`, `scale` and `rmsnorm` land, from one block per
+// row. Every intermediate is rounded to `T` where its own launch would round
+// it, and both moments are summed in `rmsnorm_row`'s element order, so the
+// chain lands what the separate launches land (a `residual_add_rmsnorm`
+// pair excepted, whose vectorised sum runs another order). The row rides in
+// registers between the phases — `PER_THREAD` elements a thread, `hidden`
+// no wider than `BLOCK * PER_THREAD` — so global memory is read once and
+// written once; the host falls back to the launches themselves past that.
+template <class T, int BLOCK, int PER_THREAD, bool SCALE, bool POST, bool POST_PLUS_ONE>
+__global__ void rmsnorm_residual_add(
+    const T* __restrict__ x,
+    const T* __restrict__ w0,
+    T* __restrict__ t,
+    T* __restrict__ y,
+    const T* __restrict__ s,
+    T* __restrict__ scaled,
+    const T* __restrict__ w1,
+    T* __restrict__ out,
+    int hidden,
+    float eps0,
+    float eps1,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+    // The staged-geometry seat, one block per row (`rmsnorm_row`'s idiom).
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const long long base = static_cast<long long>(plane_row) * hidden;
+
+    __shared__ float buf[BLOCK];
+    __shared__ float buf2[BLOCK];
+
+    // Phase one: the source row and its moment, the stream row alongside.
+    float xv[PER_THREAD];
+    float yv[PER_THREAD];
+    float local = 0.f;
+#pragma unroll
+    for (int k = 0; k < PER_THREAD; ++k) {
+        const int i = tid + k * BLOCK;
+        xv[k] = 0.f;
+        yv[k] = 0.f;
+        if (i < hidden) {
+            xv[k] = Elem<T>::to_f32(x[base + i]);
+            yv[k] = Elem<T>::to_f32(y[base + i]);
+            local += xv[k] * xv[k];
+        }
+    }
+    const float sum0 = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv0 = rsqrtf(sum0 / static_cast<float>(hidden) + eps0);
+    // `scale` reads its one-element plane where it is.
+    const float sf = SCALE ? Elem<T>::to_f32(s[0]) : 1.f;
+
+    // Phase two: the normed row, the fold, the scale — each rounded as its
+    // own launch rounds it — and the second moment over what the chain made.
+    float last[PER_THREAD];
+    float local2 = 0.f;
+#pragma unroll
+    for (int k = 0; k < PER_THREAD; ++k) {
+        const int i = tid + k * BLOCK;
+        if (i < hidden) {
+            const float wv = Elem<T>::to_f32(w0[i]);
+            const T tv = Elem<T>::from_f32(xv[k] * inv0 * wv);
+            t[base + i] = tv;
+            const T folded = Elem<T>::from_f32(yv[k] + Elem<T>::to_f32(tv));
+            y[base + i] = folded;
+            T final_v = folded;
+            if constexpr (SCALE) {
+                final_v = Elem<T>::from_f32(Elem<T>::to_f32(folded) * sf);
+                scaled[base + i] = final_v;
+            }
+            last[k] = Elem<T>::to_f32(final_v);
+            local2 += last[k] * last[k];
+        } else {
+            last[k] = 0.f;
+        }
+    }
+    if constexpr (POST) {
+        const float sum1 = block_reduce_sum_exact<BLOCK>(local2, buf2);
+        const float inv1 = rsqrtf(sum1 / static_cast<float>(hidden) + eps1);
+#pragma unroll
+        for (int k = 0; k < PER_THREAD; ++k) {
+            const int i = tid + k * BLOCK;
+            if (i < hidden) {
+                float wv = Elem<T>::to_f32(w1[i]);
+                if constexpr (POST_PLUS_ONE) wv += 1.f;
+                out[base + i] = Elem<T>::from_f32(last[k] * inv1 * wv);
+            }
+        }
+    }
+}
+
 template <class T>
 __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n,
                              int width, const u32* __restrict__ win) {

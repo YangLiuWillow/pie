@@ -33,6 +33,9 @@ struct Synthetic {
     captures: bool,
     /// Which real slot lends its page arithmetic.
     slot: u32,
+    /// This lane's kv pages, packed from the front of the pool (see
+    /// [`Shell::synthetic_lanes_with`]).
+    pages: Vec<u32>,
     /// [`Seated::held`]. `Some(0)` for every enumerated lane; only
     /// [`Shell::golden_real`] writes anything else.
     held: Option<u32>,
@@ -514,6 +517,16 @@ impl Shell {
         media: &[(u32, u32)],
     ) -> Vec<Synthetic> {
         let slots = self.held.len().max(1) as u32;
+        // Packed page tables, not the slots' own blocks. A slot's block sits
+        // at `slot × pages_per_slot`, so a synthetic of `n` lanes admitted by
+        // block would demand a watermark of `n × context` tokens — a decode
+        // body for 64 lanes needed the pool to hold 64 × 4096 tokens, and on
+        // a pool sized for what the deployment serves that refused every
+        // wide decode body and left those steps walking eagerly. A tabled
+        // lane demands one past its highest page, so the whole synthetic
+        // asks only for the pages its rows actually fill.
+        let page_size = u64::from(self.pools.paging().page_size).max(1);
+        let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let taps = self.patch_seat.map_or(0, |seat| seat.embed_taps) as usize;
         let weight_taps = self
@@ -539,6 +552,14 @@ impl Shell {
                 // Real slots, round-robin: the page arithmetic needs a slot
                 // that exists.
                 slot: (at as u32) % slots,
+                pages: {
+                    let pages = u64::from(rows).div_ceil(page_size).max(1);
+                    let table: Vec<u32> = (next_page..next_page + pages)
+                        .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
+                        .collect();
+                    next_page += pages;
+                    table
+                },
                 held: Some(0),
                 media: media
                     .get(at)
@@ -622,7 +643,7 @@ impl Shell {
                     word: lane.word,
                     tokens: &lane.tokens,
                 },
-                pages: &[],
+                pages: &lane.pages,
                 // A synthetic owns every row it reads: `Some(0)` for every
                 // enumerated lane, begins its slot's sequence.
                 // [`Shell::golden_real`] is the one caller that states
@@ -705,14 +726,193 @@ impl Shell {
             shell.device.synchronize()?;
             Ok(out)
         };
-        let walked = fire(self, Golden::Eager)
-            .map_err(|fault| refused(format!("the control arm would not fire: {fault}")))?;
+        if crate::record::ptr_traced(key) {
+            crate::record::PTR_TAG.store(2, std::sync::atomic::Ordering::Relaxed);
+        }
+        let walked = fire(self, Golden::Eager);
+        crate::record::PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
+        let walked =
+            walked.map_err(|fault| refused(format!("the control arm would not fire: {fault}")))?;
         let replayed = fire(self, Golden::Body)
             .map_err(|fault| refused(format!("the body arm would not fire: {fault}")))?;
         // Bit for bit, not `close`: no accumulation order to differ by.
         match evidence(&walked, &replayed) {
             None => Ok(()),
-            Some(why) => Err(refused(why)),
+            Some(why) => {
+                // `PIE_GOLDEN_PROBE=1`: on a disagreement, two more questions
+                // before the verdict — is each arm itself repeatable, and
+                // does the body's lane `i` answer some OTHER lane of the
+                // walk bit for bit (a lane order that moved, not a wrong
+                // number)?
+                if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+                    let walked_again = fire(self, Golden::Eager);
+                    let replayed_again = fire(self, Golden::Body);
+                    let same = |a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>| {
+                        evidence(a, b).map_or("identical".to_string(), |why| {
+                            why.split("  lanes=").next().unwrap_or(&why).to_string()
+                        })
+                    };
+                    if let Ok(w2) = &walked_again {
+                        eprintln!("[golden-probe] {key} walk vs walk: {}", same(&walked, w2));
+                    }
+                    if let Ok(b2) = &replayed_again {
+                        eprintln!("[golden-probe] {key} body vs body: {}", same(&replayed, b2));
+                    }
+                    // Bisect: launch the first `k` execs, walk the rest; the
+                    // first `k` that disagrees names the stretch.
+                    let script = self.cache.body_script(key);
+                    let execs = script.iter().filter(|(island, ..)| !island).count();
+                    let mut culprit = None;
+                    for k in 1..=execs {
+                        crate::record::REPLAY_UPTO.store(k, std::sync::atomic::Ordering::Relaxed);
+                        let partial = fire(self, Golden::Body);
+                        crate::record::REPLAY_UPTO
+                            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                        match partial {
+                            Ok(out) => {
+                                let agrees = evidence(&walked, &out).is_none();
+                                eprintln!(
+                                    "[golden-probe] {key} replay first {k} exec(s): {}",
+                                    if agrees {
+                                        "agrees with the walk"
+                                    } else {
+                                        "DIFFERS"
+                                    }
+                                );
+                                if !agrees {
+                                    culprit = Some(k);
+                                    break;
+                                }
+                            }
+                            Err(fault) => {
+                                eprintln!(
+                                    "[golden-probe] {key} replay first {k} exec(s): would not fire: {fault}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(k) = culprit {
+                        let mut seen = 0usize;
+                        for (at_step, (island, from, upto)) in script.iter().enumerate() {
+                            if *island {
+                                continue;
+                            }
+                            seen += 1;
+                            if seen == k {
+                                eprintln!(
+                                    "[golden-probe] {key} first disagreeing exec is step {at_step}: regions {from}..{upto}"
+                                );
+                                for region in *from..*upto {
+                                    if let Some(template) =
+                                        self.compiled.template().get(region as usize)
+                                    {
+                                        eprintln!(
+                                            "[golden-probe]   region {region}: nodes {:?} phase {:?} stream {} lowering {:?}",
+                                            template.nodes,
+                                            template.phase,
+                                            template.stream,
+                                            template.lowering
+                                        );
+                                        for node in template.nodes.clone() {
+                                            if let Some(held) = self.trace.nodes.get(node as usize)
+                                            {
+                                                let op = format!("{:?}", held.op);
+                                                let head: String = op.chars().take(90).collect();
+                                                eprintln!(
+                                                    "[golden-probe]     node {node} layer {:?}: {head}",
+                                                    held.layer
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Each exec alone: the ones before and after it walk.
+                    let mut nth = 0usize;
+                    for (at_step, (island, from, upto)) in script.iter().enumerate() {
+                        if *island {
+                            continue;
+                        }
+                        let j = nth;
+                        nth += 1;
+                        crate::record::REPLAY_FROM.store(j, std::sync::atomic::Ordering::Relaxed);
+                        crate::record::REPLAY_UPTO
+                            .store(j + 1, std::sync::atomic::Ordering::Relaxed);
+                        let alone = fire(self, Golden::Body);
+                        crate::record::REPLAY_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
+                        crate::record::REPLAY_UPTO
+                            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                        let verdict = match &alone {
+                            Ok(out) => match evidence(&walked, out) {
+                                None => "agrees".to_string(),
+                                Some(why) => format!(
+                                    "DIFFERS ({})",
+                                    why.chars().take(120).collect::<String>()
+                                ),
+                            },
+                            Err(fault) => format!("would not fire: {fault}"),
+                        };
+                        let nodes = self
+                            .compiled
+                            .template()
+                            .get(*from as usize)
+                            .map(|t| t.nodes.start)
+                            .unwrap_or(0);
+                        let nodes_end = self
+                            .compiled
+                            .template()
+                            .get((*upto as usize).saturating_sub(1))
+                            .map(|t| t.nodes.end)
+                            .unwrap_or(0);
+                        let layers: Vec<Option<u32>> = {
+                            let mut seen = Vec::new();
+                            for n in nodes..nodes_end {
+                                if let Some(h) = self.trace.nodes.get(n as usize) {
+                                    if seen.last() != Some(&h.layer) {
+                                        seen.push(h.layer);
+                                    }
+                                }
+                            }
+                            seen
+                        };
+                        eprintln!(
+                            "[golden-probe] {key} exec {j} alone (step {at_step}, regions {from}..{upto}, nodes {nodes}..{nodes_end}, layers {layers:?}): {verdict}"
+                        );
+                    }
+                    for (i, body_lane) in replayed.iter().enumerate() {
+                        let best = walked
+                            .iter()
+                            .enumerate()
+                            .map(|(j, walk_lane)| {
+                                let agree = body_lane
+                                    .iter()
+                                    .zip(walk_lane)
+                                    .filter(|(x, y)| x.to_bits() == y.to_bits())
+                                    .count();
+                                (agree, j)
+                            })
+                            .max()
+                            .unwrap_or((0, 0));
+                        eprintln!(
+                            "[golden-probe] {key} body lane {i} best matches walk lane {} ({} of {} cells bit-exact); head body={:?} walk[{}]={:?} walk[{i}]={:?}",
+                            best.1,
+                            best.0,
+                            body_lane.len(),
+                            &body_lane[..body_lane.len().min(4)],
+                            best.1,
+                            &walked[best.1][..walked[best.1].len().min(4)],
+                            &walked[i][..walked[i].len().min(4)],
+                        );
+                        if i >= 7 {
+                            break;
+                        }
+                    }
+                }
+                Err(refused(why))
+            }
         }
     }
 
@@ -820,6 +1020,13 @@ impl Shell {
         if ceiling == 0 {
             return Ok(());
         }
+        if std::env::var_os("PIE_ARM_TRACE").is_some() {
+            // What `c<n>` names in every line below: the requests that land
+            // in each class, the first being its representative.
+            for (class, requests) in self.landing.iter().enumerate() {
+                eprintln!("[arm-trace] class c{class}: {requests:?}");
+            }
+        }
         // No lattice: one key per row count. A lattice: each point at the
         // lane count a real fire of that rung can bring.
         let points: Vec<LatticePoint> = if self.budget.buckets.is_empty() {
@@ -891,14 +1098,26 @@ impl Shell {
             mut targets,
             mut unfireable,
         } = found;
-        // Ascending bucket, so the budget is spent on the smallest first.
-        targets.sort_by_key(|(bucket, _)| *bucket);
-        // Top rung first, then ascending: a scratch slab grow retires the
-        // old block, so firing the largest rung first forces that growth
-        // before anything is recorded.
-        if let Some(top) = targets.last().map(|(bucket, _)| *bucket) {
-            targets.sort_by_key(|(bucket, _)| (*bucket != top, *bucket));
-        }
+        // The order the budget is spent in, since a belt or the ceiling's
+        // spare can stop the pass before the end. Top rung first: a scratch
+        // slab grow retires the old block, so firing the largest rung first
+        // forces that growth before anything is recorded. Then by kind —
+        // decode bodies serve every steady step of a generation, at every
+        // width, so they go before the prefill, mixed and fragmented bodies
+        // a ramp or a tail runs through — and ascending bucket within a
+        // kind, so a budget buys the most bodies.
+        let top = targets.iter().map(|(bucket, _)| *bucket).max();
+        let rank = |kind: Kind| match kind {
+            Kind::Decode => 0u8,
+            Kind::Ensemble => 1,
+            Kind::Mixed => 2,
+            Kind::Prefill => 3,
+            Kind::Fragmented => 4,
+            Kind::Tower => 5,
+        };
+        targets.sort_by_key(|(bucket, target)| {
+            (Some(*bucket) != top, rank(target.kind()), *bucket)
+        });
         if targets.is_empty() {
             return Ok(());
         }
@@ -912,15 +1131,34 @@ impl Shell {
 
         let mut never = 0usize;
         let mut never_from = 0u32;
-        // Which of the two bounds stopped the pass.
+        // Which of the bounds stopped the pass.
         let mut belted = false;
+        let mut starved: Option<u64> = None;
+        // A body is driver memory outside the elastic pool, so every byte
+        // captured is a byte the pool's next recalibration no longer finds.
+        // The pass stops while the ceiling still holds the pool's declared
+        // growth plus a margin for what only traffic grows — scratch slabs
+        // for regions and streams the synthetics never touched, workspaces,
+        // the commit rounding of one wide fire — sixteen map units, or two
+        // bodies at the going price if that is more.
+        let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
         for (bucket, target) in targets {
             // Bytes, not seats: the live census reads device memory spent.
             let spent = self.cache.body_stats();
-            if spent.census.bodies >= record::MAX_BODIES || spent.census.bytes >= self.bodies_mem {
+            let spare = self.pools.spare_bytes().unwrap_or(u64::MAX);
+            let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
+            let margin = price.max(unit_margin);
+            let headroom = spare < margin;
+            if spent.census.bodies >= record::MAX_BODIES
+                || spent.census.bytes >= self.bodies_mem
+                || headroom
+            {
                 if never == 0 {
                     never_from = bucket;
                     belted = spent.census.bodies >= record::MAX_BODIES;
+                    if headroom && !belted && spent.census.bytes < self.bodies_mem {
+                        starved = Some(spare);
+                    }
                 }
                 never += 1;
                 continue;
@@ -954,6 +1192,11 @@ impl Shell {
                 // quiet device to read a refusal as final.
                 let landed = self.device.synchronize();
                 if let Err(why) = fired.and(landed) {
+                    // Every refusal, not just the last, so a boot log lists
+                    // which compositions this deployment cannot arm.
+                    if std::env::var_os("PIE_ARM_TRACE").is_some() {
+                        eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                    }
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
                     faulted = true;
                     break;
@@ -971,14 +1214,34 @@ impl Shell {
                 && let Some(key) = key.as_ref()
                 && self.cache.holds_body(key)
             {
-                self.golden(key, &owned)?;
-                // And the same verdict over a composition a caller could
-                // have brought, which the synthetic cannot state.
-                self.golden_real(key, &owned)?;
+                let verdict = self
+                    .golden(key, &owned)
+                    // And the same verdict over a composition a caller could
+                    // have brought, which the synthetic cannot state.
+                    .and_then(|()| self.golden_real(key, &owned));
+                if let Err(fault) = verdict {
+                    // `PIE_GOLDEN_SKIP=1`: a diagnostic arm. The body that
+                    // disagreed is dropped and its key refused — the key walks
+                    // eagerly, as an unarmed one does — and the load goes on,
+                    // so one boot lists EVERY body the golden disagrees with
+                    // instead of stopping at the first. Off, the first
+                    // disagreement fails the load, as it always has.
+                    if std::env::var_os("PIE_GOLDEN_SKIP").is_some() {
+                        eprintln!("[arm-trace] golden refused {key}: {fault}");
+                        self.cache.body_drop(key);
+                    } else {
+                        return Err(fault);
+                    }
+                }
             }
-            if key.is_some_and(|key| self.cache.body_armed(&key)) {
+            if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
+                if std::env::var_os("PIE_ARM_TRACE").is_some()
+                    && let Some(key) = key.as_ref()
+                {
+                    eprintln!("[arm-trace] armed {key}");
+                }
             } else if !admitted && !faulted && target.skips_on_present_set() {
                 // A tower target writes nothing here: its verdict is about a
                 // second rectangle token arms do not have.
@@ -997,7 +1260,17 @@ impl Shell {
         } else {
             Seal::Partial { never }
         };
+        // The pool beside the bodies: what the deployment declared, what is
+        // mapped, and what the card still has beyond the two.
+        let pool_line = format!(
+            "pool declared {} MiB, high water {} MiB, committed {} MiB, spare under the ceiling {} MiB",
+            self.pools.declared_bytes() >> 20,
+            self.pools.high_water_bytes() >> 20,
+            self.pools.committed_bytes() >> 20,
+            self.pools.spare_bytes().map_or(0, |bytes| bytes >> 20),
+        );
         let report = Armed {
+            pool_line,
             wanted,
             armed,
             kinds: tally,
@@ -1011,6 +1284,7 @@ impl Shell {
             never,
             never_from,
             belted,
+            starved,
             declines: stats.tally.declines,
             refusals: stats.tally.refusals,
             seal,
@@ -1212,7 +1486,19 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
     let mut differing = 0usize;
     let mut total = 0usize;
     let mut worst = 0u32;
+    // The same distance in bf16 steps (the readout's own grain: a value
+    // whose low 16 bits are zero is a bf16 the head rounded to), so a
+    // dump says whether a disagreement is a rounding or a wrong number.
+    let mut worst_bf16 = 0u32;
+    let mut worst_bf16_at: Option<(usize, usize, f32, f32)> = None;
+    let mut beyond_one_bf16 = 0usize;
+    let mut beyond_eight_bf16 = 0usize;
+    let mut non_finite = (0usize, 0usize);
+    // Per lane: how many of its cells differ, so a dump says WHICH lanes a
+    // body gets wrong (all of them, a leading run, a trailing run).
+    let mut per_lane: Vec<usize> = Vec::with_capacity(walked.len());
     for (lane, (a, b)) in walked.iter().zip(replayed).enumerate() {
+        per_lane.push(0);
         if a.len() != b.len() {
             return Some(format!(
                 "lane {lane} answered {} and {} elements  class=structural",
@@ -1226,7 +1512,17 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
                 continue;
             }
             differing += 1;
+            per_lane[lane] += 1;
+            non_finite.0 += usize::from(!x.is_finite());
+            non_finite.1 += usize::from(!y.is_finite());
             worst = worst.max(ordered(x.to_bits()).abs_diff(ordered(y.to_bits())));
+            let steps = ordered(x.to_bits() & 0xffff_0000).abs_diff(ordered(y.to_bits() & 0xffff_0000)) >> 16;
+            beyond_one_bf16 += usize::from(steps > 1);
+            beyond_eight_bf16 += usize::from(steps > 8);
+            if steps > worst_bf16 {
+                worst_bf16 = steps;
+                worst_bf16_at = Some((lane, at, *x, *y));
+            }
             if first.is_none() {
                 first = Some((at, *x, *y));
             }
@@ -1235,9 +1531,37 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
     let (at, x, y) = first?;
     // Two ulp: the width of one bf16 rounding either way.
     let class = if worst <= 2 { "numeric" } else { "structural" };
+    // Lanes as runs of "differs"/"agrees": `lanes=[0..64 differ]`,
+    // `lanes=[0..3 agree, 3..64 differ]`, and so on.
+    let lane_runs = {
+        let mut runs: Vec<String> = Vec::new();
+        let mut start = 0usize;
+        while start < per_lane.len() {
+            let differs = per_lane[start] > 0;
+            let mut end = start;
+            while end < per_lane.len() && (per_lane[end] > 0) == differs {
+                end += 1;
+            }
+            let width = walked[start].len().max(1);
+            let mean = per_lane[start..end].iter().sum::<usize>() as f64
+                / ((end - start) as f64 * width as f64);
+            runs.push(if differs {
+                format!("{start}..{end} differ ({:.0}% of cells)", mean * 100.0)
+            } else {
+                format!("{start}..{end} agree")
+            });
+            start = end;
+        }
+        runs.join(", ")
+    };
+    let worst_bf16_line = worst_bf16_at.map_or(String::new(), |(lane, at, x, y)| {
+        format!("  worst_bf16=lane {lane} #{at} (walk={x}, body={y}, {worst_bf16} bf16 step(s))")
+    });
     Some(format!(
         "differs at #{at} (walk={x} {:#010x}, body={y} {:#010x})  n_diff={differing}/{total}  \
-         max_ulp={worst}  class={class}",
+         max_ulp={worst}  class={class}  beyond_1_bf16={beyond_one_bf16}  \
+         beyond_8_bf16={beyond_eight_bf16}  non_finite(walk,body)={non_finite:?}  \
+         lanes=[{lane_runs}]{worst_bf16_line}",
         x.to_bits(),
         y.to_bits(),
     ))
@@ -1308,6 +1632,8 @@ mod tests {
 /// What the arming pass did, as the boot line says it.
 #[derive(Debug, Clone)]
 pub struct Armed {
+    /// The elastic pool beside the bodies, for the boot line.
+    pub pool_line: String,
     pub wanted: usize,
     pub armed: usize,
     /// Per [`Kind`], `(armed, wanted)`.
@@ -1322,6 +1648,9 @@ pub struct Armed {
     pub never: usize,
     pub never_from: u32,
     pub belted: bool,
+    /// `Some(bytes)` when the card's spare — beyond the elastic pool's own
+    /// growth — is what stopped the pass, with the spare it stopped at.
+    pub starved: Option<u64>,
     pub declines: u64,
     pub refusals: u64,
     /// What the seal stands for. See [`Seal`].
@@ -1369,6 +1698,7 @@ impl core::fmt::Display for Armed {
         if self.unweighed > 0 {
             write!(f, " ({} unweighed)", self.unweighed)?;
         }
+        write!(f, " ({})", self.pool_line)?;
         if let Some(why) = &self.last_refusal {
             write!(f, " (last refusal: {why})")?;
         }
@@ -1389,7 +1719,14 @@ impl core::fmt::Display for Armed {
                 f,
                 " [sealed partial: {never} key(s) never attempted, {} at bucket {}, and they \
                  walk eagerly for the life of this load]",
-                if self.belted { "record::MAX_BODIES" } else { "[engine] bodies_mem" },
+                match self.starved {
+                    Some(spare) => format!(
+                        "the ceiling's spare ran out ({} MiB left beyond the elastic pool's growth)",
+                        spare >> 20
+                    ),
+                    None if self.belted => "record::MAX_BODIES".to_string(),
+                    None => "[engine] bodies_mem".to_string(),
+                },
                 self.never_from,
             )?,
             Seal::Partial { .. } => write!(f, " [sealed partial: a key refused]")?,

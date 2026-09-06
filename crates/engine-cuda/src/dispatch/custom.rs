@@ -56,6 +56,62 @@ impl Run<'_> {
 impl model_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &model_ir::Node) {
         use model_ir::Operands;
+        let tag = crate::record::PTR_TAG.load(std::sync::atomic::Ordering::Relaxed);
+        if tag != 0 {
+            let mut ins = Vec::new();
+            let mut outs = Vec::new();
+            node.op.inputs(&mut ins);
+            node.op.outputs(&mut outs);
+            let show = |run: &Self, ids: &[model_ir::ValueId]| -> String {
+                ids.iter()
+                    .map(|id| {
+                        let Some(decl) = run.values().get(id.0 as usize) else {
+                            return format!("{}:?", id.0);
+                        };
+                        match &decl.def {
+                            model_ir::Def::Op(_)
+                            | model_ir::Def::Merge(_)
+                            | model_ir::Def::Weight(_)
+                                if run.resolvable(*id) =>
+                            {
+                                let t = run.tensor(*id);
+                                format!("{}:{:#x}/{}x{}", id.0, t.ptr, t.rows, t.width)
+                            }
+                            model_ir::Def::Op(_) | model_ir::Def::Merge(_) => {
+                                format!("{}:unslotted", id.0)
+                            }
+                            model_ir::Def::Weight(_) => format!("{}:planes", id.0),
+                            // Safe after the node dispatched: the kernel just resolved it.
+                            model_ir::Def::Input(kind) => {
+                                let t = run.tensor(*id);
+                                let short = format!("{kind:?}").replace(' ', "");
+                                format!(
+                                    "{}:{:#x}/{}x{}@{}",
+                                    id.0,
+                                    t.ptr,
+                                    t.rows,
+                                    t.width,
+                                    short.chars().take(28).collect::<String>()
+                                )
+                            }
+                            other => format!(
+                                "{}:{}",
+                                id.0,
+                                format!("{other:?}").chars().take(12).collect::<String>()
+                            ),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            eprintln!(
+                "[ptr-trace] tag={tag} {} layer={:?} in=[{}] out=[{}]",
+                node.op.name(),
+                node.layer,
+                show(self, &ins),
+                show(self, &outs)
+            );
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("PIE_CUDA_NAN_CHECK").is_some_and(|v| v == "1")) {
             return;

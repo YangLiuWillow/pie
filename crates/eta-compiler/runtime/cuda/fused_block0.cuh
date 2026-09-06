@@ -1182,4 +1182,84 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
   }
 }
 
+// `argmax((logits [/ divisor]) + gumbel(state))` straight off the logits
+// intrinsic: what `ptir_fast_argmax_intrinsic` is to a bare argmax, this is
+// to the Gumbel-max draw — the scaled logit, the keyed noise and the compare
+// happen per element in one scan, and nothing is written to scratch. Each
+// element's noise is the draw the `rng_keyed` node would have written for
+// it (`ptir_rng_keyed_seed` of the state cell, `ptir_rng_hash_uniform` at
+// the element's index in the whole value — `noise_base` is the row block's
+// element base, 0 for a whole-value block — then `-log(-log(u))`), the
+// divide and the add are the f32 ops the `div` and `add` arms land, so the
+// scan answers what the four launches answer. `divisor` is null when the
+// chain scales nothing.
+__device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
+    const m1_u8* input,
+    m1_u8* output,
+    const M1ValueDesc input_desc,
+    m1_u32 mode,
+    m1_u32 stride,
+    m1_u32 row_offset,
+    const m1_u8* state,
+    const M1ValueDesc state_desc,
+    const m1_u8* divisor,
+    const M1ValueDesc divisor_desc,
+    m1_u32 noise_base) {
+  __shared__ M1ArgmaxCandidate candidates[32];
+  int* result = reinterpret_cast<int*>(output);
+  const m1_u32 lane = threadIdx.x & 31u;
+  const m1_u32 warp = threadIdx.x >> 5u;
+  const m1_u32 warps = blockDim.x >> 5u;
+  const m1_u32 key = m1_load_u(state, 0u, state_desc.dtype);
+  const m1_u32 counter =
+      state_desc.len > 1u ? m1_load_u(state, 1u, state_desc.dtype) : 0u;
+  const m1_u64 seed = ptir_rng_keyed_seed(key, counter);
+  const bool scaled = divisor != nullptr;
+  const float divide_by =
+      scaled ? m1_load_f(divisor, 0u, divisor_desc.dtype) : 1.0f;
+  for (m1_u32 row = 0; row < input_desc.rows; ++row) {
+    const m1_u8* row_base = m1_intrinsic_row_base(
+        input, (m1_u64)row_offset + row, stride, mode);
+    const m1_u32 last = input_desc.last;
+    const m1_u32 element_base = noise_base + row * last;
+    M1ArgmaxCandidate candidate{m1_neg_inf(), 0u, 0u, 0u};
+    const m1_u32 vectors =
+        (mode != 0u && ((m1_u64)row_base & 15ull) == 0ull) ? (last >> 3) : 0u;
+    for (m1_u32 v = threadIdx.x; v < vectors; v += blockDim.x) {
+      const M1U32x4 packed = reinterpret_cast<const M1U32x4*>(row_base)[v];
+      const m1_u32 words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+      for (m1_u32 k = 0; k < 8u; ++k) {
+        const m1_u32 index = v * 8u + k;
+        float value = __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
+        if (scaled) value = value / divide_by;
+        const float uniform = ptir_rng_hash_uniform(seed, element_base + index);
+        value = value + (-logf(-logf(uniform)));
+        const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
+        candidate = m1_argmax_combine(candidate, next);
+      }
+    }
+    for (m1_u32 index = (vectors << 3) + threadIdx.x;
+         index < last;
+         index += blockDim.x) {
+      float value = m1_intrinsic_column_load(row_base, index, mode);
+      if (scaled) value = value / divide_by;
+      const float uniform = ptir_rng_hash_uniform(seed, element_base + index);
+      value = value + (-logf(-logf(uniform)));
+      const M1ArgmaxCandidate next{value, index, m1_isnan(value) ? 0u : 1u, 0u};
+      candidate = m1_argmax_combine(candidate, next);
+    }
+    candidate = m1_argmax_warp_reduce(candidate, lane);
+    if (lane == 0u) candidates[warp] = candidate;
+    __syncthreads();
+    if (warp == 0u) {
+      candidate =
+          lane < warps ? candidates[lane] : M1ArgmaxCandidate{m1_neg_inf(), 0u, 0u, 0u};
+      candidate = m1_argmax_warp_reduce(candidate, lane);
+      if (lane == 0u) result[row] = (int)candidate.index;
+    }
+    __syncthreads();
+  }
+}
+
 extern "C" __global__ void 

@@ -497,6 +497,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Elementwise::HcGates { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
             // The trunk collapse reads the f32 mix row and the f32 gate planes.
             Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
+            // The fused per-layer input gathers by i32 token ids, as `Embed` does.
+            Elementwise::EmbedScaleAdd { .. } => &[(In(0), I32)],
             // Per-token math with nothing pinned: the norms, the residual and
             // scaling arithmetic, and the gate take and return the activation
             // dtype they are given.
@@ -513,6 +515,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormGatedBy { .. }
             | Elementwise::ResidualAdd { .. }
             | Elementwise::ResidualAddRmsnorm { .. }
+            | Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::AddBias { .. }
             | Elementwise::Standardize { .. }
             | Elementwise::MulScalar { .. }

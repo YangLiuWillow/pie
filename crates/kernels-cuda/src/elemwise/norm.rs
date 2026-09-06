@@ -473,6 +473,95 @@ pub fn residual_add_rmsnorm(
     )
 }
 
+/// What a fused chain's trailing norm reads and writes.
+pub struct PostNorm<'a> {
+    pub weight: Tensor,
+    pub plus_one: bool,
+    pub eps: f32,
+    pub out: &'a mut Tensor,
+}
+
+/// `t = rmsnorm(x) * w0`, `y += t` in place, then optionally `scaled = y *
+/// s` (a device-held scalar) and `out = rmsnorm(scaled or y)`: what
+/// [`rmsnorm`], [`residual_add`], [`scale`] and [`rmsnorm`] land, one launch.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_residual_add(
+    ctx: &Ctx,
+    x: Tensor,
+    w0: Tensor,
+    eps0: f32,
+    t: &mut Tensor,
+    y: &mut Tensor,
+    scale: Option<(Tensor, &mut Tensor)>,
+    post: Option<PostNorm<'_>>,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_residual_add";
+    // Elements a thread keeps in registers between the phases: the narrowest
+    // of 8/16/32 that seats the row at `BLOCK` threads. Wider rows are
+    // refused; `model_ir::fuse::residual_chains` fuses nothing past that.
+    let per_thread = [8u32, 16, 32]
+        .into_iter()
+        .find(|per| y.width <= BLOCK * per)
+        .ok_or_else(|| {
+            refuse(
+                OP,
+                format!("a {}-wide row is wider than the fused chain seats ({})", y.width, BLOCK * 32),
+            )
+        })?;
+    let ty = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert!(
+        x.rows == y.rows && x.width == y.width && t.rows == y.rows && t.width == y.width,
+        "the normed row, its scaled copy and the stream share one shape"
+    );
+    let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let (s_arg, scaled_arg, has_scale) = match &scale {
+        Some((s, scaled)) => (s.arg(), scaled.arg(), "true"),
+        None => (crate::jit::ArgValue::ABSENT, crate::jit::ArgValue::ABSENT, "false"),
+    };
+    let (w1_arg, out_arg, eps1, has_post, plus) = match &post {
+        Some(post) => (
+            post.weight.arg(),
+            post.out.arg(),
+            post.eps,
+            "true",
+            if post.plus_one { "true" } else { "false" },
+        ),
+        None => (
+            crate::jit::ArgValue::ABSENT,
+            crate::jit::ArgValue::ABSENT,
+            0.0,
+            "false",
+            "false",
+        ),
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::rmsnorm_residual_add<{ty}, {BLOCK}, {per_thread}, {has_scale}, {has_post}, {plus}>"
+            )),
+        )
+        .apply(Launch::per_row(rows, BLOCK)),
+        &[
+            x.arg(),
+            w0.arg(),
+            t.arg(),
+            y.arg(),
+            s_arg,
+            scaled_arg,
+            w1_arg,
+            out_arg,
+            hidden.arg(),
+            eps0.arg(),
+            eps1.arg(),
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
+            ctx.stage(),
+        ],
+    )
+}
+
 /// `out += bias` per row, in place on `out`.
 pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";

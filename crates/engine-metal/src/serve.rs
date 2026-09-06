@@ -2752,7 +2752,15 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
-        fire_trace(|| format!("device-done seq={} rows={}", flight.seq, flight.lanes));
+        fire_trace(|| {
+            let (start, end) = flight.pending.gpu_span_us();
+            format!(
+                "device-done seq={} rows={} gpu_us={}",
+                flight.seq,
+                flight.lanes,
+                end.saturating_sub(start)
+            )
+        });
         if let Err(fault) = waited {
             // The seat goes back even on a refusal: the device is done with
             // it either way, and a seat held by a step that faulted would
@@ -2936,6 +2944,7 @@ impl Shell {
         fire_lane: &[u32],
         owed: &mut Vec<u64>,
     ) -> Result<()> {
+        let mut staged = Vec::with_capacity(prepared.attachments.len());
         for attached in prepared
             .attachments
             .iter()
@@ -3158,17 +3167,28 @@ impl Shell {
                 )?;
             }
 
-            match self.programs.stage_into(frame, attached.instance)? {
-                crate::program::Launched::Airborne => owed.push(attached.instance),
+            staged.push(attached.instance);
+        }
+        // Every attached epilogue of this step, staged together: instances of
+        // one program share a lane table and a scratch pool, and each of the
+        // program's regions is one dispatch for all of them, rather than one
+        // per instance in a row.
+        let mut refusal = None;
+        for (instance, launched) in self.programs.stage_batched(&self.device, frame, &staged)? {
+            match launched {
+                crate::program::Launched::Airborne => owed.push(instance),
                 // Nothing was encoded and the verdict is already final. The
                 // gate asked about readiness before the forward ran, so a
                 // refusal here is a poisoned instance or a race the fence was
                 // supposed to have closed — either way it is this fire's
                 // fault and not the next one's.
                 crate::program::Launched::Refused(fired) => {
-                    return Err(refused(&fired, attached.instance));
+                    refusal.get_or_insert((instance, fired));
                 }
             }
+        }
+        if let Some((instance, fired)) = refusal {
+            return Err(refused(&fired, instance));
         }
         Ok(())
     }
@@ -5536,6 +5556,7 @@ impl engine::frame::Shell for Shell {
         if let Some(keepalive) = &self.keepalive {
             keepalive.touch();
         }
+        fire_trace(|| "encode-begin".to_string());
         // **THE ONE BRANCH A STREAMED LOAD ADDS TO THE FIRE PATH**, and it is
         // here rather than inside the walk because the two are different call
         // orders: one command buffer, or `N + 1` of them cut after each
@@ -5576,6 +5597,7 @@ impl engine::frame::Shell for Shell {
         };
         // `PIE_KERNEL_PROFILE=1`: the device time of this fire by entrypoint,
         // top ten, then the tally starts over — resident or streamed alike.
+        fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
         if !profile.is_empty() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
@@ -5731,6 +5753,7 @@ impl engine::frame::Shell for Shell {
         }
         let attached =
             self.encode_epilogues(&mut frame, &prepared, base, width, draft, drafts)?;
+        fire_trace(|| "epilogues-encoded".to_string());
 
         // ── The fire is enqueued, so the sequences are longer.
         self.advance(&prepared);

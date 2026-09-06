@@ -143,7 +143,7 @@ impl FireCtx<'_> {
         // A session may hold one airborne fire, so the deferred batch is reaped
         // only when a prologue is about to stage.
         if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
-            reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed)?;
+            reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed, "enqueue.prologue")?;
         }
         for (at, attached) in p.attachments.iter().enumerate() {
             if attached.at != Boundary::Prologue {
@@ -668,7 +668,7 @@ impl FireCtx<'_> {
             None => None,
         };
         // The previous frame's epilogues are collected here, the latest point a lane must be free.
-        reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed)?;
+        reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed, "enqueue.epilogue")?;
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             // The guest's own rows, by index within the lane.
@@ -1097,6 +1097,7 @@ pub(super) fn reap_guest_fires(
     owed: &mut Option<GuestBatch>,
     airborne: &crate::settle::Airborne,
     landed: &crate::device::graph::Event,
+    site: &'static str,
 ) -> Result<()> {
     let Some(batch) = owed.take() else {
         return Ok(());
@@ -1105,7 +1106,20 @@ pub(super) fn reap_guest_fires(
     // reaped with no CUDA call at all, which is the steady state whenever the
     // host is not running ahead of the device.
     if !airborne.settled_past(batch.seq) {
+        // `PIE_REAP_TRACE=1`: which door waited, and how long, per reap.
+        let traced = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("PIE_REAP_TRACE").is_some())
+        };
+        let started = traced.then(std::time::Instant::now);
         landed.settle()?;
+        if let Some(started) = started {
+            eprintln!(
+                "[reap-trace] {site}: waited {} us for batch seq {}",
+                started.elapsed().as_micros(),
+                batch.seq
+            );
+        }
     }
     let mut first: Option<crate::error::Fault> = None;
     for (lane, instance) in batch.launched {

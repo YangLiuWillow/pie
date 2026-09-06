@@ -74,13 +74,17 @@ pub struct CudaNativeEngineOptions {
     /// Recurrent-state seats (KDA/GDN and conv state), one sequence in flight
     /// each; absent takes 256. A model with no state rows seats by pages alone.
     pub max_state_slots: Option<u32>,
-    /// The most tokens one sequence may hold; absent takes the contract's
-    /// 4096. The same knob Metal's table carries, and the one that sizes a
-    /// sequence's KV reservation: a frame's admission commits every lane's
-    /// pages at this ceiling, so a deployment of short contexts (a
-    /// diffusion canvas of 256 over a prompt) seats many more lanes at 1024
-    /// than at 4096 — eight canvases were refused at fire time on a 46 GB
-    /// card because each asked 1.76 GB of KV for a 300-token sequence.
+    /// The most tokens one sequence may hold; absent takes the engine's
+    /// contract default (4096). It is also what the arming pass sizes every
+    /// synthetic lane at: a decode body for `n` lanes is armed only if the
+    /// pool can hold `n × max_model_len` tokens, so a deployment whose
+    /// `max_total_pages` is small next to `max_forward_requests × 4096 /
+    /// kv_page_size` gets no wide decode bodies — and runs its wide steps
+    /// eagerly — until this is stated at what it actually serves.
+    /// It is also what sizes a sequence's KV reservation: a frame's
+    /// admission commits every lane's pages at this ceiling, so a deployment
+    /// of short contexts (a diffusion canvas of 256 over a prompt) seats many
+    /// more lanes at 1024 than at 4096.
     pub max_model_len: Option<u32>,
     /// HARD pin on the prefill token budget the forward step is built for.
     ///

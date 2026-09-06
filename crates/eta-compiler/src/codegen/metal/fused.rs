@@ -395,12 +395,12 @@ pub fn emit_grouped_fused_region(
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
-            emit_mtp_drafts(&mut source, base, &slots.o0);
+            emit_mtp_drafts(&mut source, base, &slots.o0, "m3_tid", "m3_threads");
             source.push_str(BARRIER);
             continue;
         }
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::ATTN_SCORE {
-            emit_score_gather(&mut source, base, &slots.o0);
+            emit_score_gather(&mut source, base, &slots.o0, "m3_tid", "m3_threads");
             source.push_str(BARRIER);
             continue;
         }
@@ -412,6 +412,8 @@ pub fn emit_grouped_fused_region(
                 base,
                 op.intr == intrinsic_tags::MTP_LOGITS,
                 &slots.o0,
+                "m3_tid",
+                "m3_threads",
             );
             source.push_str(BARRIER);
             continue;
@@ -459,10 +461,10 @@ pub fn emit_grouped_fused_region(
 /// `lane.mtp_drafts_depth`). The plane holds the argmax the model text
 /// chained on, so what a guest reads here is the token the head actually
 /// conditioned its next draft on — not a second argmax taken over logits.
-fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
+pub(super) fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str, begin: &str, step: &str) {
     source.push_str("  {\n");
-    source.push_str("    const uint draft_begin = m3_tid;\n");
-    source.push_str("    const uint draft_step = m3_threads;\n");
+    let _ = writeln!(source, "    const uint draft_begin = {begin};");
+    let _ = writeln!(source, "    const uint draft_step = {step};");
     let _ = writeln!(
         source,
         "    const M1ValueDesc draft_desc = descriptors[{base}];"
@@ -497,7 +499,7 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
 /// `argmax(logits)` without materializing the logits. bf16 -> f32 is exact,
 /// so the argmax over the stored halves has the same value and index as over
 /// the widened row; fusing removes a vocabulary-wide f32 write and read-back.
-fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
+pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("  {\n");
     let _ = writeln!(
         source,
@@ -574,11 +576,11 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
 /// `row_indices` indirection (rows are `0..n` within the lane's own block);
 /// and a zero base faults rather than reading (a lane that did not capture
 /// has no block).
-fn emit_score_gather(source: &mut String, base: u32, o0: &str) {
+pub(super) fn emit_score_gather(source: &mut String, base: u32, o0: &str, begin: &str, step: &str) {
     source.push_str("  {\n");
     // A plane is ATTN_SCORE_KV_MAX wide; split across threads like the logits gather.
-    source.push_str("    const uint score_begin = m3_tid;\n");
-    source.push_str("    const uint score_step = m3_threads;\n");
+    let _ = writeln!(source, "    const uint score_begin = {begin};");
+    let _ = writeln!(source, "    const uint score_step = {step};");
     let _ = writeln!(
         source,
         "    const M1ValueDesc score_desc = descriptors[{base}];"
@@ -626,12 +628,20 @@ fn emit_score_gather(source: &mut String, base: u32, o0: &str) {
 
 /// The `logits` / `mtp_logits` intrinsics: a strided gather out of the lane's
 /// logits buffer, rebased for MTP rows.
-fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
+pub(super) fn emit_logits_gather(
+    source: &mut String,
+    base: u32,
+    mtp: bool,
+    o0: &str,
+    begin: &str,
+    step: &str,
+) {
     source.push_str("  {\n");
-    // Walks the whole vocabulary; every thread of the lane's threadgroup
-    // reaches this, so it must be split, not repeated.
-    source.push_str("    const uint gather_begin = m3_tid;\n");
-    source.push_str("    const uint gather_step = m3_threads;\n");
+    // Walks the whole vocabulary; every thread that reaches this splits it
+    // by `begin`/`step` — the threadgroup in the grouped form, the whole grid
+    // in the streamed one.
+    let _ = writeln!(source, "    const uint gather_begin = {begin};");
+    let _ = writeln!(source, "    const uint gather_step = {step};");
     let _ = writeln!(
         source,
         "    const M1ValueDesc intrinsic_desc = descriptors[{base}];"

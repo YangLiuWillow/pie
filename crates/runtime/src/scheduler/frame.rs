@@ -31,10 +31,9 @@ pub(crate) fn set_dispatch_depth(depth: usize) {
 /// `0` = never installed; see `crate::scheduler::reconfigure`.
 static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-/// `PIE_SEAL_MODE=ready` (default): when idle, open the boundary with
-/// whichever lanes are arrival-complete instead of holding for all; late
-/// lanes join later partitions. `PIE_SEAL_MODE=strict` restores holding for
-/// every awaited lane.
+/// `PIE_SEAL_MODE=strict` (default): hold the boundary for every awaited
+/// lane. `PIE_SEAL_MODE=ready`: when idle, open it with whichever lanes are
+/// arrival-complete instead; late lanes join later partitions.
 /// Threshold for the `[idle-gap]` dump, in microseconds. `u64::MAX` (never)
 /// unless `PIE_IDLE_DUMP_US` names one.
 /// Seat floor for the `[device-idle]` dump. `0` unless
@@ -59,18 +58,22 @@ pub(super) fn idle_dump_threshold_us() -> u64 {
     })
 }
 
-/// **THE SEAL MODE'S DEFAULT IS THE PLATFORM'S.** Ready-mode sealing was
-/// measured on CUDA at ~240 lanes, where it opens the boundary earlier
-/// without narrowing the batch (+1-2%). On Metal at eight lanes it does the
-/// opposite: a fire is 12-66 ms and a lane's host round trip is a visible
-/// fraction of that, so the "arrival-complete subset" is one or two lanes —
-/// 2048 fires landed in ~920 batches of 2.2 lanes, and holding the seal for
-/// every lane (`strict`) read 26.7 -> 60.7 tok/s on Qwen3.8-27B, 107 -> 180
-/// on gemma-4-26B-A4B, 129 -> 221 on Qwen3.6-35B-A3B at eight lanes, 17.4 ->
-/// 32.2 at four (with per-request latency halved), and the same at one; a
-/// prefill-heavy mix read within 2%. Bootstrap installs the default for the
-/// engine it boots (`set_seal_default_ready`); `PIE_SEAL_MODE` still wins.
-static SEAL_DEFAULT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// **THE SEAL MODE'S DEFAULT IS STRICT — WAIT-ALL — ON EVERY PLATFORM.**
+/// Ready mode was measured on CUDA at ~240 run-ahead lanes, where it opened
+/// the boundary earlier without narrowing the batch (+1-2%), and taken as
+/// the CUDA default on that. Metal at eight lanes showed the opposite (a
+/// fire is 12-66 ms and a lane's host round trip is a visible fraction of
+/// that, so the arrival-complete subset was two or three lanes; strict read
+/// 1.7-2.3x). Then CUDA at 64 HOST-DRIVEN lanes (text-completion: one host
+/// round trip per token, no submit-ahead) showed the same failure in a
+/// steadier form: ready mode opens the boundary the instant the device is
+/// free, 50-300 µs before the lanes it just answered have re-submitted, so
+/// the population settles into two cohorts (41/23, 45/19) that fire
+/// ALTERNATELY — every fire half-width, every lane a token per two device
+/// steps. Strict wait-all read 1690 -> 3000 tok/s there, and the run-ahead
+/// program 2690 -> 2990, at the same 19.5 ms per 64-wide fire. Strict is
+/// the principle and now the default; `PIE_SEAL_MODE=ready` opts back in.
+static SEAL_DEFAULT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_seal_default_ready(ready: bool) {
     SEAL_DEFAULT_READY.store(ready, Ordering::Relaxed);
@@ -127,14 +130,18 @@ fn seal_mode_ready() -> bool {
     })
 }
 
-/// Default ON; `PIE_GATE_CONTRIBUTED=0` restores the strict wait-all rule.
-/// While a frame executes, doesn't count a lane as missing if the runtime
-/// owes it a result and nothing else is queued — see
-/// [`LaneState::gate_verdict`].
+/// Default OFF — the strict wait-all rule; `PIE_GATE_CONTRIBUTED=1` turns
+/// the relaxation on. On, while a frame executes a lane the runtime owes a
+/// result with nothing else queued is not counted missing (see
+/// [`LaneState::gate_verdict`]), so the gate "holds" the moment every
+/// OTHER lane has re-submitted. For host-driven lanes that is a permanent
+/// split into two alternating half-width cohorts (see
+/// [`SEAL_DEFAULT_READY`]); a run-ahead lane in flight has already
+/// submitted its next frame and never needed the relaxation.
 fn gate_contributed() -> bool {
     static CONFIGURED: OnceLock<bool> = OnceLock::new();
     *CONFIGURED
-        .get_or_init(|| !std::env::var("PIE_GATE_CONTRIBUTED").is_ok_and(|value| value == "0"))
+        .get_or_init(|| std::env::var("PIE_GATE_CONTRIBUTED").is_ok_and(|value| value == "1"))
 }
 
 /// The frame identity one fire carries from `forward.submit`: which lane
@@ -1049,6 +1056,26 @@ impl FramePolicy {
                     .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
                 return None;
             }
+            if super::worker::wave_trace() {
+                let complete = self
+                    .lanes
+                    .values()
+                    .filter(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
+                    .count();
+                let awaited = self.lanes.values().filter(|lane| lane.awaited).count();
+                super::worker::wave_trace_emit(format!(
+                    "[wave-trace] t={}us seal partition={} fresh={} continuing={} complete_left={} awaited={} lanes={} in_flight={} mid_boundary={mid_boundary} executing={}",
+                    super::worker::wave_trace_us(),
+                    members.len(),
+                    fresh.len(),
+                    continuing.len(),
+                    complete,
+                    awaited,
+                    self.lanes.len(),
+                    self.in_flight_lanes.len(),
+                    self.executing_now
+                ));
+            }
             if !mid_boundary {
                 self.open_boundary();
             }
@@ -1385,6 +1412,16 @@ ready_age_newest={}us",
                 expired.dedup();
                 return FramePlan::Terminate(expired);
             }
+            if super::worker::wave_trace() {
+                super::worker::wave_trace_emit(format!(
+                    "[wave-trace] t={}us gate missing={missing} executing={executing} candidate={} in_flight={} awaited={} lanes={}",
+                    super::worker::wave_trace_us(),
+                    self.have_seal_candidate(),
+                    self.in_flight_lanes.len(),
+                    self.lanes.values().filter(|lane| lane.awaited).count(),
+                    self.lanes.len()
+                ));
+            }
             // A joiner never holds the seal: it is not a wait-set member
             // yet, so sealing without it excludes nobody.
             if missing > 0 {
@@ -1577,9 +1614,8 @@ mod tests {
     /// watchdog reports, never evicts); once it completes, the epoch seals dense.
     #[test]
     fn incomplete_lane_holds_the_seal_until_it_completes() {
-        // Pins the strict rule (no longer the default). Ready mode's own
-        // behaviour is covered by
-        // `ready_mode_opens_the_boundary_only_after_arrivals_quiesce`.
+        // Pins the strict rule (the default; stated so the test does not
+        // depend on it).
         let mut policy = FramePolicy::new(2, 64, 4096, None)
             .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_secs(86_400));

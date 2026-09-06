@@ -265,11 +265,24 @@ pub(crate) fn build_frame_submission(
 
         let build = build_batch_request(&group, page_size, stats);
         if super::worker::wave_trace() {
-            eprintln!(
-                "[step-lanes] members={} lanes={}",
+            let (mut tokens, mut page_refs) = (0usize, 0usize);
+            for req in &group {
+                let usage = request_capacity_usage(req, page_size);
+                tokens += usage.forward_tokens;
+                page_refs += usage.page_refs;
+            }
+            super::worker::wave_trace_emit(format!(
+                "[step-lanes] members={} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={}",
                 group.len(),
-                build.lanes.len()
-            );
+                build.lanes.len(),
+                limits.max_forward_tokens,
+                limits.max_page_refs,
+                group
+                    .iter()
+                    .flat_map(|req| req.request.lanes.iter().map(|lane| lane.kv.pages.len()))
+                    .max()
+                    .unwrap_or(0)
+            ));
         }
         // One instance id per lane, not per member.
         let mut instances = Vec::with_capacity(build.lanes.len());

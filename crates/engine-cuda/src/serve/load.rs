@@ -59,6 +59,17 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // the compile and every node index taken off `boot.trace` below share
     // one numbering; see the Metal shell's `load` for the argument.
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
+    // The chain fusions behind it; `PIE_FUSE_CHAINS=0` is the A/B arm that
+    // lands the traced launches instead.
+    if fuse_chains() {
+        boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
+    }
+    // `PTIR_GUMBEL_DIRECT=0`: keep a program's Gumbel-max head as the
+    // launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
+    if std::env::var("PTIR_GUMBEL_DIRECT").is_ok_and(|value| value == "0") {
+        eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     Ok(Baked {
         device,
@@ -405,6 +416,13 @@ impl Shell {
         }
         // The arming pass is the last thing the load does; only the golden can fail it.
         shell.arm_bodies()?;
+        // A tensor-parallel follower runs the guest as a shadow of rank 0's:
+        // it fires the same boundaries (so its device-only `tok_in` handoff
+        // feeds its own pipelined decode step), but its host-ended rings are
+        // rank 0's, read and never written. See `program::Session`.
+        if boot.world.rank != 0 {
+            shell.programs.set_shadow(true);
+        }
         Ok(shell)
     }
 }
@@ -465,4 +483,11 @@ pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
+}
+
+/// Whether the load folds the norm-add-scale-norm and per-layer-input chains
+/// (`model_ir::fuse::residual_chains`). On unless `PIE_FUSE_CHAINS=0`.
+pub(crate) fn fuse_chains() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("PIE_FUSE_CHAINS").is_ok_and(|value| value == "0"))
 }

@@ -129,6 +129,7 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
     // one device. `worker::serve` refuses `tensor_parallel_size > 1` for every
     // flavor but CUDA, so these rows are unreachable from the CLI as well.
     ("dsv4-base-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
+    ("gemma4-e4b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     ("gemma4-31b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     ("glm5-a12b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     (

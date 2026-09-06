@@ -7,6 +7,42 @@ namespace pie::layout {
 template <class T>
 using Elem = ::pie::Elem<T>;
 
+// `e = table[ids]`, `e_scaled = e * a`, `y += e_scaled`, `y_scaled = y * b`:
+// the launches `embed`, `mul_scalar`, `residual_add` and `mul_scalar` land,
+// one element per thread, each intermediate rounded where its own launch
+// would round it (`mul_scalar` rounds its scalar to `T` first).
+__global__ void embed_scale_add(
+    const i32* __restrict__ token_ids,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ e,
+    float a,
+    bf16* __restrict__ e_scaled,
+    bf16* __restrict__ y,
+    float b,
+    bf16* __restrict__ y_scaled,
+    int hidden, int vocab, int num_tokens,
+    const u32* __restrict__ win)
+{
+    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= num_tokens * hidden) return;
+    const int n = idx / hidden;
+    const int h = idx % hidden;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const i32 tid_raw = token_ids[plane_row];
+    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
+    const long long at = static_cast<long long>(plane_row) * hidden + h;
+    const bf16 ev = weight[static_cast<long long>(tid) * hidden + h];
+    e[at] = ev;
+    const float a_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(a));
+    const bf16 es = Elem<bf16>::from_f32(Elem<bf16>::to_f32(ev) * a_rounded);
+    e_scaled[at] = es;
+    const bf16 yv = Elem<bf16>::from_f32(Elem<bf16>::to_f32(y[at]) + Elem<bf16>::to_f32(es));
+    y[at] = yv;
+    const float b_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(b));
+    y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
+}
+
 template <bool VEC>
 __global__ void embed(
     const i32* __restrict__ token_ids,

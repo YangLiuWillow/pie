@@ -57,6 +57,10 @@ pub struct Plane {
     /// names channels by dense slot, which differs per instance). Only
     /// `HostRole::None` channels are here.
     channels: BTreeMap<u64, Arc<SharedRing>>,
+    /// One [`launch::Batch`] per (program, stage, key): the shared lane
+    /// table and scratch pool the program's instances launch a stage through
+    /// together. Grown on demand, kept for the program's life.
+    batches: BTreeMap<(u64, usize, launch::BatchKey), launch::Batch>,
     next_program: u64,
     next_instance: u64,
 }
@@ -81,6 +85,7 @@ impl Plane {
             by_hash: BTreeMap::new(),
             instances: BTreeMap::new(),
             channels: BTreeMap::new(),
+            batches: BTreeMap::new(),
             next_program: 1,
             next_instance: 1,
         }
@@ -448,6 +453,130 @@ impl Plane {
     ///
     /// [`Fault::Program`] for an unknown instance or one whose program is
     /// gone, and whatever the status reads said.
+    /// Stage every instance in `ids` into `frame` — the batched twin of
+    /// [`Plane::stage_into`]. Each instance is gated and its cells resolved
+    /// alone; then, per program and per stage, the instances that share a
+    /// [`launch::BatchKey`] are laid into one [`launch::Batch`] and each
+    /// region is encoded once for all of them. Answers one [`Launched`] per
+    /// id, in order. If any instance is refused, nothing is encoded and the
+    /// airborne ones are left marked for the caller to abandon, exactly as
+    /// a refusal mid-loop left them before.
+    ///
+    /// # Errors
+    ///
+    /// As [`Plane::stage_into`], plus a batch whose members disagree.
+    pub fn stage_batched(
+        &mut self,
+        device: &Context,
+        frame: &Frame,
+        ids: &[u64],
+    ) -> Result<Vec<(u64, Launched)>> {
+        let mut results = Vec::with_capacity(ids.len());
+        let mut by_program: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        let mut refused = false;
+        for &id in ids {
+            let bound = self
+                .instances
+                .get_mut(&id)
+                .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+            let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!(
+                        "instance {id} names program {}, which is gone",
+                        bound.program_id
+                    ),
+                )
+            })?;
+            match bound
+                .session
+                .prepare_airborne(&program.compiled, &program.plan)?
+            {
+                Some(fired) => {
+                    refused = true;
+                    results.push((id, Launched::Refused(fired)));
+                }
+                None => {
+                    by_program.entry(bound.program_id).or_default().push(id);
+                    results.push((id, Launched::Airborne));
+                }
+            }
+        }
+        if refused {
+            return Ok(results);
+        }
+        for (program_id, members) in by_program {
+            let program = self.programs.get(&program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("program {program_id} vanished between staging and encoding"),
+                )
+            })?;
+            for (stage_index, stage) in program.compiled.stages.iter().enumerate() {
+                if stage.regions.is_empty() {
+                    continue;
+                }
+                // Each member's tables for this stage, grouped by what the
+                // grouped kernel strides by. `iter_mut` hands out disjoint
+                // borrows; the member order inside a group is the id order.
+                let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
+                    BTreeMap::new();
+                for (id, bound) in self.instances.iter_mut() {
+                    if !members.contains(id) {
+                        continue;
+                    }
+                    // An instance on a shared ring is ordered against the
+                    // ring's other attachments by the FIFO they fire in, and a
+                    // batch would run it beside them in one dispatch: it
+                    // launches alone, as every instance did before batches.
+                    let shares = bound
+                        .shared
+                        .iter()
+                        .flatten()
+                        .any(|ring| ring.attachments() > 1);
+                    let Some(prepared) = bound.session.prepared_mut(stage_index) else {
+                        continue;
+                    };
+                    let key = if shares { None } else { prepared.batch_key() };
+                    groups.entry(key).or_default().push(prepared);
+                }
+                for (key, mut group) in groups {
+                    let Some(key) = key else {
+                        // No grouped seat, or a shared ring: this stage runs on
+                        // the instance's own tables, one at a time, as it always did.
+                        for prepared in group {
+                            prepared.zero_scratch()?;
+                            for region in stage.regions.iter() {
+                                prepared.encode_into(frame, region)?;
+                            }
+                        }
+                        continue;
+                    };
+                    let needed = u32::try_from(group.len()).unwrap_or(u32::MAX);
+                    let slot = (program_id, stage_index, key);
+                    let rebuild = self
+                        .batches
+                        .get(&slot)
+                        .is_none_or(|batch| batch.lanes() < needed);
+                    if rebuild {
+                        let batch = launch::Batch::build(
+                            device,
+                            group[0],
+                            needed.next_power_of_two(),
+                        )?;
+                        self.batches.insert(slot, batch);
+                    }
+                    let batch = self
+                        .batches
+                        .get_mut(&slot)
+                        .expect("inserted or present one statement ago");
+                    batch.encode(frame, &stage.regions, &mut group)?;
+                }
+            }
+        }
+        Ok(results)
+    }
+
     pub fn settle_launched(&mut self, id: u64) -> Result<Fired> {
         let bound = self
             .instances

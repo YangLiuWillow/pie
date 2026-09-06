@@ -8,7 +8,7 @@ the KV length by device arithmetic in the epilogue. The traced container is
 byte-identical to the Rust inferlet's, so both share one program-cache entry.
 """
 
-from inferlet import model
+from inferlet import chat, model
 from inferlet.eta import (
     Channel,
     ForwardKind,
@@ -47,7 +47,9 @@ async def main(input: dict) -> dict:
     if max_tokens == 0:
         return {"text": "", "count": 0, "tokens": []}
 
-    prompt = model.encode(prompt_text)
+    # The model's opening (`<bos>` where it has one) before the raw text: a
+    # gemma without it answers noise.
+    prompt = chat.prefix() + model.encode(prompt_text)
     if not prompt:
         prompt = [0]
     n = len(prompt)

@@ -48,7 +48,7 @@ pub struct ImportArgs {
     pub aux: Option<String>,
     /// Overlay the published draft head of this name for this checkpoint:
     /// `--aux` and `--sku` filled in from the catalog's table of published
-    /// heads (`models::drafter::PUBLISHED`), so `pie model import
+    /// heads (`models::published::PUBLISHED`), so `pie model import
     /// mlx-community/Qwen3.8-27B-4bit --drafter dflash2` is the whole recipe.
     /// A name or a target the table does not know is refused with what it
     /// does know.
@@ -126,8 +126,8 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
     // source, and it is resolved before anything is fetched: a name the table
     // lacks must not cost a download to find out about.
     if let Some(name) = args.drafter.take() {
-        let Some(published) = models::drafter::published(&args.source, &name) else {
-            let known: Vec<String> = models::drafter::published_for(&args.source)
+        let Some(published) = models::published::lookup(&args.source, &name) else {
+            let known: Vec<String> = models::published::for_target(&args.source)
                 .map(|p| format!("`{}` ({})", p.drafter, p.head))
                 .collect();
             bail!(

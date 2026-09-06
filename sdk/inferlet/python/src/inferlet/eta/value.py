@@ -930,14 +930,16 @@ def gumbel_max(logits, state) -> Tensor:
     return Tensor.node(result, result_type)
 
 
+F32_MIN_POSITIVE = 2.0**-126  # `f32::MIN_POSITIVE`, the smallest normal
+
+
 def entropy(probabilities) -> Tensor:
+    """Shannon entropy `-sum(p * log(p))`. A softmax tail underflows to
+    exactly 0 in f32 and `0 * log 0` is NaN, so the log sees the
+    probabilities floored at the smallest normal: a zero term contributes 0."""
     pid, pty = _materialize(_to_arg(probabilities))
     result_type = ValueType(drop_last(pty.shape), Dtype.F32)
-    # The log is taken over the probabilities floored at the smallest
-    # positive f32, so a zero probability contributes 0 * log(min) = 0
-    # rather than 0 * -inf = NaN (the Rust DSL's rule).
-    floored = max_elem(Tensor.node(pid, pty), 1.1754944e-38)
-    fid, _ = _materialize(_to_arg(floored))
+    fid, _ = _materialize(max_elem(Tensor.node(pid, pty), F32_MIN_POSITIVE))
     lp = emit(Op.unary(tags.LOG, fid), (pty,))
     terms = emit(Op.binary(tags.MUL, pid, lp), (pty,))
     s = emit(Op.unary(tags.REDUCE_SUM, terms), (result_type,))

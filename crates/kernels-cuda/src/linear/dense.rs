@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::error::Error;
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetVersion_v2,
-    cublasHandle_t, cublasOperation_t, cublasSetStream_v2, cublasStatus_t, cudaDataType,
+    cublasHandle_t, cublasOperation_t, cublasSetStream_v2, cublasSetWorkspace_v2, cublasStatus_t,
+    cudaDataType,
 };
 use cudarc::cublaslt::sys as lt;
 use cudarc::runtime::sys::{
@@ -123,6 +124,19 @@ pub(crate) fn act_x_wt(
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
+    // The same slab is cuBLAS's workspace too. Left to its own, cuBLAS takes
+    // one from its pool eagerly but under stream capture allocates a graph
+    // node — and once that is refused, falls back to a 16 KiB entry — and its
+    // heuristic follows the bytes it has: the eager walk and the capture of
+    // ONE GEMM could land on different kernels (split-K vs not), whose sums
+    // round differently. The golden reads a replay bit for bit against its
+    // walk, so both arms must see the same workspace. A null slab binds a
+    // zero-byte workspace, which is the same answer both ways.
+    // SAFETY: `handle` is this context's live cuBLAS handle, bound to
+    // `stream`; `ws` is a device slab of `ws_bytes` the context owns.
+    unsafe {
+        cublasSetWorkspace_v2(handle, ws, ws_bytes);
+    }
     if let Some(tactic) = tactic
         && run_tactic(
             handle,

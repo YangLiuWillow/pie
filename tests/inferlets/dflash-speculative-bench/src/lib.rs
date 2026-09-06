@@ -281,17 +281,20 @@
 //! warm-up rounds at eight rows on a prose that closes at once cost 5%).
 //!
 //! **THE DEFAULTS FOLLOW THE CROWD** (`batch_concurrency`, which
-//! `benches/pie_bench.py` passes): alone, the prices gate and no floor; in a
-//! crowd, no prices and a floor of five with four narrow probes to reopen and
-//! a probe cadence that backs off per probe. Measured at four lanes under
-//! strict sealing on qwen38 (aggregate tok/s, plain 40 on every prompt):
-//! counting 68, code 39, prose 28 — and prose is the honest number: with the
-//! floor at 2.5 it read 31, with probes every sixteen fires 24-28, with the
-//! cadence backing off 37 once and 28 the next time. Four lanes of a
-//! low-yield prompt lose 25-30% to the warm-up rounds and the probes falling
-//! out of the batch, whatever this gate does, and the plain loop is the
-//! right one for them; the crowd default keeps the counting gain (1.6x) and
-//! pays that. `min_tokens_per_round = 1000` closes the gate for good.
+//! `benches/pie_bench.py` passes to every launched inferlet since
+//! `911f9d177` — before that every harness run took the lone-lane defaults
+//! under load): alone, the prices gate and no floor; in a crowd, no prices
+//! and a floor of five with four narrow probes to reopen and a probe cadence
+//! that backs off per probe. Measured with the crowd stated, qwen38, strict
+//! sealing, aggregate tok/s against plain: four lanes counting 60.9 / 40.7,
+//! prose 39.9 / 41.5, code 40.2 / 42.3; eight lanes 63.6 / 57.0, 47.6 / 60.2,
+//! 46.2 / 60.4. The structured prompt pays; the others cost 4-5% at four
+//! lanes and a fifth at eight — and at eight even a floor that never drafts
+//! after the warm-up reads 48-53, the warm-up rounds and the probes being
+//! the cost. So **eight lanes and up open no round at all** (`default_floor`:
+//! an infinite floor; measured 61.2 / 57.0 against plain 60.2 / 57.0), four
+//! and under take the floor of five. `min_tokens_per_round` states any of
+//! this explicitly; 1000 closes the gate for good at any crowd.
 //!
 //! **UNDER CONCURRENT LOAD THE PRICES LIE, SO `priced` IS OFF IN A CROWD.**
 //! Eight lanes held open (`pie_bench.py tput --num-requests 8 --concurrency
@@ -515,7 +518,62 @@ struct Input {
     /// closes when that rung loses. Off, the loop is the header's.
     #[serde(default)]
     priced: Option<bool>,
+    /// **WHICH DRAFTER**: `head` (the load's block drafter, the default) or
+    /// `ngram` — prompt-lookup decoding, no model at all: the last `ngram_n`
+    /// tokens are looked up in the context (prompt and everything committed)
+    /// and the tokens that followed their most recent earlier occurrence are
+    /// the proposals, up to `ngram_max`. No draft fire, so a round costs the
+    /// verify alone; a round with no match is a plain fire. The arm
+    /// llama.cpp's `ngram-mod` is compared against, in the loop pie prices
+    /// its verify fires with.
+    #[serde(default = "default_drafter")]
+    drafter: String,
+    #[serde(default = "default_ngram_n")]
+    ngram_n: u32,
+    #[serde(default = "default_ngram_max")]
+    ngram_max: u32,
 }
+
+fn default_drafter() -> String {
+    "head".into()
+}
+
+fn default_ngram_n() -> u32 {
+    3
+}
+
+fn default_ngram_max() -> u32 {
+    7
+}
+
+/// Prompt-lookup: the tokens that followed the most recent earlier occurrence
+/// of the context's last `n` tokens (falling back to shorter keys), at most
+/// `max` of them. Empty when nothing repeats.
+fn ngram_lookup(context: &[i32], n: u32, max: u32) -> Vec<i32> {
+    let len = context.len();
+    for k in (1..=n as usize).rev() {
+        if len <= k {
+            continue;
+        }
+        let key = &context[len - k..];
+        // Most recent earlier occurrence: scan back from the end, skipping
+        // the key's own position.
+        let mut start = len - k;
+        while start > 0 {
+            start -= 1;
+            if &context[start..start + k] == key {
+                let from = start + k;
+                let to = (from + max as usize).min(len);
+                if to > from {
+                    return context[from..to].to_vec();
+                }
+                break;
+            }
+        }
+    }
+    Vec::new()
+}
+
 
 /// The floor this file ships when none is stated. **Alone, none**: the
 /// prices gate the lone lane (`priced`), and a yield floor beside them
@@ -529,7 +587,20 @@ struct Input {
 /// than the one-lane three. The crowd is what the caller says it is; the
 /// guest has no other way to know it is one of several.
 fn default_floor(concurrency: u32) -> f64 {
-    if concurrency > 1 { 5.0 } else { 0.0 }
+    match concurrency {
+        // **EIGHT LANES AND UP DO NOT DRAFT AT ALL.** Measured on qwen38 at
+        // eight lanes against plain 57-60 tok/s: the crowd floor of five read
+        // 47.6 / 46.2 / 63.6 (prose / code / counting), a floor of eight 49.6
+        // / 46.7 / 49.5, and a floor of 1000 — which never drafts after the
+        // warm-up — 48.2 / 49.5 / 52.7. The loss is not the drafting
+        // decision: it is the eight warm-up rounds and the probes, each a
+        // lane stepping out of the batch its seven neighbours are in. An
+        // infinite floor opens no round, warms nothing up, probes nothing,
+        // and fires the plain geometry — the batch is the lever there.
+        c if c >= 8 => f64::INFINITY,
+        c if c > 1 => 5.0,
+        _ => 0.0,
+    }
 }
 
 fn default_concurrency() -> u32 {
@@ -1107,7 +1178,7 @@ const MASK_TOKEN: i32 = 248_070;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::mtp_depth() == 0 {
+    if model::mtp_depth() == 0 && input.drafter != "ngram" {
         return Err("this SKU ships no draft head".into());
     }
     // **THE HEAD'S FACTS COME OFF THE LOAD.** The block the head was trained
@@ -1316,7 +1387,20 @@ async fn main(input: Input) -> Result<Output> {
         // first compiles and is dropped, `Prices::keep`), and cost the two
         // tokens they emit. Then the rung — or no round — is the prices'
         // choice; without prices, the stated gate's and ladder's.
-        let planned = if priced {
+        let ngram = input.drafter == "ngram";
+        let ngram_props: Vec<i32> = if ngram {
+            let mut context: Vec<i32> = prompt_i32.clone();
+            context.extend(generated.iter().map(|&t| t as i32));
+            ngram_lookup(&context, input.ngram_n, input.ngram_max)
+        } else {
+            Vec::new()
+        };
+        let planned = if floor.is_infinite() {
+            None
+        } else if ngram {
+            // A match drafts as many rows as it found; none is a plain fire.
+            (!ngram_props.is_empty()).then(|| (ngram_props.len() as u32 + 1).min(block))
+        } else if priced {
             if since_priced >= REPRICE {
                 since_priced = 0;
                 owed_plain = 2;
@@ -1374,6 +1458,9 @@ async fn main(input: Input) -> Result<Output> {
         if !drafting {
             verify = 1;
             plain_fires += 1;
+        } else if ngram {
+            // No draft fire: the proposals are the lookup's.
+            proposals_owned = ngram_props[..verify as usize - 1].to_vec();
         } else {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]` ──────────
         let mut ids = vec![mask_token; block as usize];

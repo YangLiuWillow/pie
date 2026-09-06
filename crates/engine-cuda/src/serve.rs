@@ -20,6 +20,7 @@ mod boot;
 mod enqueue;
 mod lanes;
 mod load;
+pub(crate) use load::fuse_chains;
 mod prepare;
 mod segments;
 mod settle;
@@ -366,11 +367,17 @@ impl Shell {
     ///
     /// As [`reap_guest_fires`].
     pub fn reap_guests(&mut self) -> Result<()> {
+        self.reap_guests_at("shell.reap_guests")
+    }
+
+    /// [`Shell::reap_guests`], naming the door for `PIE_REAP_TRACE`.
+    pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
         reap_guest_fires(
             &mut self.programs,
             &mut self.owed,
             &self.airborne,
             &self.guest_landed,
+            site,
         )
     }
 
@@ -380,7 +387,7 @@ impl Shell {
     ///
     /// As [`Shell::reap_guests`].
     pub fn program_instance(&mut self, instance_id: u64) -> Result<Option<&mut ProgramSession>> {
-        self.reap_guests()?;
+        self.reap_guests_at("shell.program_instance")?;
         Ok(self.programs.instance_mut(instance_id))
     }
 
@@ -397,7 +404,7 @@ impl Shell {
     ///
     /// [`Fault::Program`] for an instance that is already gone, and whatever the reap said.
     pub fn close_program_instance(&mut self, instance_id: u64) -> Result<()> {
-        self.reap_guests()?;
+        self.reap_guests_at("shell.close_program_instance")?;
         self.programs.close_instance(instance_id)
     }
 
