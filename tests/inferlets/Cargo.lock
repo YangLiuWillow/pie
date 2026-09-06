@@ -424,6 +424,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ltx2-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "macro-string"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
