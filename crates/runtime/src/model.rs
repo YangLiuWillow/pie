@@ -856,6 +856,23 @@ pub fn velocity_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
         .map_or((false, 0), |reading| (true, reading.readout_width))
 }
 
+/// The `pixels()` intrinsic's gate and width, read off the family's
+/// readings (design D8): available iff some reading reads back pixels, and
+/// as wide as that readout row when every such reading agrees — `0` when
+/// they do not (a VAE's decode lands RGB and its encode a 16-channel mean),
+/// which tells bind to check rank and rows alone. The engine fills its
+/// side of the same profile from the plan's `seam::PIXELS` plantings.
+pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
+    let mut widths = readings
+        .iter()
+        .filter(|reading| reading.readout == models::ReadoutKind::Pixels)
+        .map(|reading| reading.readout_width);
+    let Some(first) = widths.next() else {
+        return (false, 0);
+    };
+    (true, if widths.all(|width| width == first) { first } else { 0 })
+}
+
 /// Returns the single registered model. Panics if called before bootstrap
 /// registers the model.
 pub fn model() -> &'static Arc<Model> {

@@ -641,6 +641,7 @@ pub(crate) fn eval_op(
                 IntrinsicId::MtpLogits => inputs.mtp_logits.clone(),
                 IntrinsicId::Hidden => inputs.hidden.clone(),
                 IntrinsicId::Velocity => inputs.velocity.clone(),
+                IntrinsicId::Pixels => inputs.pixels.clone(),
                 IntrinsicId::ValueHead => inputs.value_head.clone(),
                 IntrinsicId::Query => inputs.query.get(layer as usize).cloned(),
                 IntrinsicId::Layer => Some(Value::U32(vec![layer])),

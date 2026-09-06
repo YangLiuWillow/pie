@@ -90,6 +90,23 @@ pub fn velocity(width: u32) -> Tensor {
         activation_type,
     )
 }
+/// `intrinsics::pixels(width)` — the pixels a VAE reading lands (design
+/// D8), `[rows, width]` F32 at the epilogue: one row per OUTPUT voxel of
+/// the lane's clip in `(t, h, w)` order — `8h·8w` rows of RGB in `[-1, 1]`
+/// for a decode of an `[h, w]` latent, the posterior mean's rows for an
+/// encode. `rows` is declared, not derived: the guest knows its clip's box
+/// and the family's compression, and a lane's `current_rows()` is its
+/// token-axis count, which a VAE lane has none of. `width` is checked at
+/// bind against `ModelProfile::pixels_width` when the model states one
+/// width for every pixels planting, and for rank alone otherwise.
+/// Model-gated on `has_pixels`.
+pub fn pixels(rows: u32, width: u32) -> Tensor {
+    intrinsic_val(
+        IntrinsicId::Pixels,
+        Shape::matrix(rows.max(1), width.max(1)),
+        activation_type,
+    )
+}
 /// `intrinsics::query(width)` — this layer's projected query (attn taps),
 /// `[width]`. Declared, not derived, for the same reason as [`hidden`].
 pub fn query(width: u32) -> Tensor {

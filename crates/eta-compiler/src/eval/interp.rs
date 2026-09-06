@@ -292,6 +292,10 @@ pub struct PassInputs {
     /// by [`IntrinsicId::Velocity`] in the epilogue; `None` unless the model
     /// predicts one.
     pub velocity: Option<Value>,
+    /// A VAE reading's pixels, `[n_out, C]` F32, read by
+    /// [`IntrinsicId::Pixels`] in the epilogue; `None` unless the model
+    /// lands some.
+    pub pixels: Option<Value>,
     /// The value head's per-token scalars, `[n_out]` F32, read by
     /// [`IntrinsicId::ValueHead`]; `None` unless the model has a value head.
     pub value_head: Option<Value>,
