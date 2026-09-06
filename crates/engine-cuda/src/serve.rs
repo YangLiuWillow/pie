@@ -97,6 +97,9 @@ pub struct Shell {
     pools: Pools,
     /// The buffered-activation pool, or `None` for a plan with nothing to buffer.
     buffers: Option<Buffers>,
+    /// The read path's extended-run scratch (`crate::run::RsScratch`), grown
+    /// to the largest extended fire so far; `None` until a lane replays.
+    rs_scratch: Option<crate::device::Buffer>,
     /// The fold predicate and the accepted lengths, resident at the lane ceiling.
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
@@ -554,6 +557,12 @@ struct RsFire<'a> {
     splits: bool,
     /// Does any lane move buffered bytes? Such a fire cannot graph-replay.
     buffered: bool,
+    /// Buffered tokens each fire lane replays ahead of its rows (the read
+    /// path), in fire order; all zero for a fire without one.
+    replays: Vec<u32>,
+    /// The fire's rows plus every lane's replay — what the extended-run
+    /// scratch is sized by. Zero for a fire with no read path.
+    rows_ext: u32,
 }
 
 /// Every host decision one step needs, made — and not one stream touched.

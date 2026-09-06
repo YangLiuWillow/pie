@@ -349,6 +349,7 @@ impl Shell {
             arena,
             pools,
             buffers,
+            rs_scratch: None,
             predicate,
             inputs,
             facts,

@@ -422,6 +422,26 @@ impl Plane {
             .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
     }
 
+    /// Whether instance `id`'s program reads the `mtp_drafts` intrinsic —
+    /// the token plane, bound at its own rectangle beside the logits.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unknown instance or a program that is gone.
+    pub fn needs_mtp_drafts(&self, id: u64) -> Result<bool> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("instance {id} names program {}, which is gone", bound.program_id),
+            )
+        })?;
+        Ok(program.plan.needs_mtp_drafts)
+    }
+
     /// How many score planes instance `id` declared, or `None` for one that
     /// reads no score rectangle. A rectangle read for more rows than a
     /// lane's block holds would walk silently into the next lane's memory,

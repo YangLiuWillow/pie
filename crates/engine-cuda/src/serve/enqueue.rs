@@ -12,9 +12,9 @@ use engine::fire::Boundary;
 use crate::arena::Arena;
 use crate::device::{Buffer, Context, graph::Event};
 use crate::error::{Fault, Result};
-use crate::exports::{Exports, MTP_SEAM, SCORES_SEAM};
+use crate::exports::{DRAFTS_SEAM, Exports, MTP_SEAM, SCORES_SEAM};
 use crate::inputs::{Handles, Inputs, PatchHandles, SlotGuard};
-use crate::program::launch::INTRINSIC_STORAGE_RAW_BF16;
+use crate::program::launch::{INTRINSIC_STORAGE_RAW_BF16, INTRINSIC_STORAGE_RAW_I32};
 use crate::program::{Fired, Plane as ProgramPlane};
 use crate::record::{self, Bodies as GraphCache};
 use crate::run::{
@@ -54,6 +54,20 @@ impl Shell {
         // The step this fire settles at, stamped onto the cache before anything launches.
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
+        // The read path's scratch, grown to this fire's extended rows before
+        // the frame is cut — after a drain, since a step still on the stream
+        // may be reading the old one.
+        if p.rs.rows_ext > 0 {
+            let need = crate::run::RsScratch::need(
+                p.rs.rows_ext,
+                self.buffers.as_ref().map_or(0, Buffers::ext_row_bytes),
+            );
+            if self.rs_scratch.as_ref().is_none_or(|have| (have.bytes() as u64) < need) {
+                self.drain()?;
+                self.rs_scratch = Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
+            }
+        }
+        let rs_scratch = self.rs_scratch.as_ref().map(|have| (have.ptr(), have.bytes() as u64));
         let mut fire = FireCtx {
             device: &self.device,
             trace: &self.trace,
@@ -72,6 +86,7 @@ impl Shell {
             exports: &self.exports,
             held: &mut self.held,
             buffers: self.buffers.as_ref(),
+            rs_scratch,
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
             budget: &self.budget,
@@ -116,6 +131,8 @@ struct FireCtx<'a> {
     exports: &'a Exports,
     held: &'a mut [u32],
     buffers: Option<&'a Buffers>,
+    /// The read path's scratch span `(ptr, bytes)`, grown before this frame was cut.
+    rs_scratch: Option<(u64, u64)>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     budget: &'a Budget,
@@ -500,12 +517,17 @@ impl FireCtx<'_> {
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
+        let rs_scratch = (p.rs.rows_ext > 0)
+            .then(|| self.rs_scratch.map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes)))
+            .flatten();
         if p.rs.buffered
             && let Some(pool) = self.buffers
         {
             run = run.buffered(RsSeat {
                 buffers: pool,
                 lanes: &p.rs.moves,
+                replays: &p.rs.replays,
+                scratch: rs_scratch.as_ref(),
             });
         }
         super::btrace::mark("run_new");
@@ -750,6 +772,58 @@ impl FireCtx<'_> {
                     column.width,
                     column.width,
                     first_row[attached.lane as usize],
+                )?;
+            }
+            // The token plane: the emitted gather copies `depth` ints off the
+            // base it is handed and applies no row arithmetic of its own, so
+            // the base is the lane's readout row of the plane (Metal's
+            // `plane + at * depth * 4`). Which row is the readout's is what
+            // `wanted` already resolved for the logits.
+            if self.programs.needs_mtp_drafts(attached.instance)? {
+                let export = self.exports.drafts.as_ref().ok_or_else(|| {
+                    Fault::program(
+                        "serve::enqueue",
+                        format!(
+                            "instance {} reads the `mtp_drafts` intrinsic and this load \
+                             declares no `{DRAFTS_SEAM}` export; the attachment gate was \
+                             supposed to have refused it",
+                            attached.instance
+                        ),
+                    )
+                })?;
+                let plane = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no rectangle",
+                        export.value.0
+                    ),
+                })?;
+                if plane.dtype != Dtype::I32 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "a `{DRAFTS_SEAM}` export landed as {:?}, and the draft ids are \
+                             read as i32",
+                            plane.dtype
+                        ),
+                    });
+                }
+                let depth = self.exports.drafts_depth;
+                if plane.width != depth {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "the `{DRAFTS_SEAM}` export landed {} wide and the text declared \
+                             {depth}",
+                            plane.width
+                        ),
+                    });
+                }
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::MtpDrafts,
+                    plane.ptr + u64::from(wanted[0]) * u64::from(depth) * 4,
+                    INTRINSIC_STORAGE_RAW_I32,
+                    depth,
+                    depth,
+                    0,
                 )?;
             }
             // The observability door: the stride is the slab's, the rows the program's.

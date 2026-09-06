@@ -173,20 +173,28 @@ impl Run<'_> {
                 // Whole, for `scatter_live_rows`' reason one arm up.
                 &mut self.fire_wide(*y),
             ),
-            Layout::TopK { .. } => {
-                return Err(kernels_cuda::Error::Backend {
-                    op: "layout.topk",
-                    detail: "the per-row top-k a candidate selector reads is not yet read on the CUDA arm"
-                        .to_string(),
-                });
-            }
-            Layout::Argmax { .. } => {
-                return Err(kernels_cuda::Error::Backend {
-                    op: "layout.argmax",
-                    detail: "the per-row argmax a draft chain feeds itself is not yet read on \
-                             the CUDA arm"
-                        .to_string(),
-                });
+            Layout::TopK {
+                x,
+                k,
+                values,
+                indices,
+            } => layout::topk(
+                self.ctx(),
+                self.tensor(*x),
+                *k,
+                &mut self.tensor(*values),
+                &mut self.tensor(*indices),
+            ),
+            Layout::Argmax { xs, y } => {
+                for (column, x) in xs.iter().enumerate() {
+                    layout::argmax(
+                        self.ctx(),
+                        self.tensor(*x),
+                        u32::try_from(column).expect("a draft depth inside u32"),
+                        &mut self.tensor(*y),
+                    )?;
+                }
+                Ok(())
             }
             Layout::Select {
                 table,

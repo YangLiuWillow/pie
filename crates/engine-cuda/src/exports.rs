@@ -9,7 +9,8 @@
 //! WHICH NODE, which is a fact about the artifact and is true before a device
 //! is bound.
 //!
-//! * [`Exports::of`] — the declared seams (`out`, `mtp`, `attn.scores`)
+//! * [`Exports::of`] — the declared seams (`out`, `mtp`, `attn.scores`,
+//!   `mtp.drafts`)
 //!   resolved to values, layers and the class sets that fill them.
 //! * [`masked_classes`] / [`corrected_classes`] — the same reading taken from
 //!   the OP VOCABULARY rather than from a seam: which classes' windows run an
@@ -43,6 +44,7 @@ use crate::error::{Fault, Result};
 pub(crate) const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
 pub(crate) const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
 pub(crate) const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
+pub(crate) const DRAFTS_SEAM: &str = model_compiler::EXPORT_SEAMS[3];
 
 /// One declared export, resolved against this load's plan and bake.
 ///
@@ -73,6 +75,12 @@ pub(crate) struct Exports {
     /// The draft head's logits over the draft window, for a SKU whose model
     /// text declares one (palo C3).
     pub(crate) mtp: Option<Export>,
+    /// The draft head's token plane — the block drafter's picks, `[rows,
+    /// depth]` i32 — for a SKU whose readout plants one (`mtp.drafts`).
+    pub(crate) drafts: Option<Export>,
+    /// The token plane's declared width: the depth a guest sizes its
+    /// `mtp_drafts` read by, fixed by the model text. Zero without a plane.
+    pub(crate) drafts_depth: u32,
     /// The attention's per-query mass, one entry per attention layer that
     /// exports it, in the plan's own order (palo C4).
     pub(crate) scores: Vec<Export>,
@@ -117,6 +125,25 @@ impl Exports {
                 .collect()
         };
         let scores = named(SCORES_SEAM);
+        let drafts = named(DRAFTS_SEAM).into_iter().next();
+        let drafts_depth = match &drafts {
+            Some(export) => {
+                let width = model_exec::store::kv::width_of(trace, export.value).map_err(|why| {
+                    Fault::Unbound {
+                        what: format!("the `{DRAFTS_SEAM}` export's width: {why}"),
+                    }
+                })?;
+                match u32::try_from(width) {
+                    Ok(depth) if depth > 0 => depth,
+                    _ => {
+                        return Err(Fault::Unbound {
+                            what: format!("a `{DRAFTS_SEAM}` export {width} wide drafts nothing"),
+                        });
+                    }
+                }
+            }
+            None => 0,
+        };
         let mut capturing = model_ir::ClassSet::default();
         for export in &scores {
             for class in export.classes.iter() {
@@ -126,6 +153,8 @@ impl Exports {
         Ok(Exports {
             out,
             mtp: named(MTP_SEAM).into_iter().next(),
+            drafts,
+            drafts_depth,
             scores,
             capturing,
         })

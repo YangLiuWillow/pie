@@ -504,6 +504,18 @@ impl Session {
             ));
         }
 
+        // And the token plane beside it.
+        if plan.needs_mtp_drafts
+            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpDrafts as u32)) == 0
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `mtp_drafts` intrinsic and no buffer has \
+                 been bound to it; a model whose text plants no `mtp.drafts` export \
+                 has no token plane for it to point at",
+            ));
+        }
+
         // The attention-score capture buffer needs the same guard.
         if plan.needs_attn_scores
             && self.bound & (1u64 << (eta_ir::op::IntrinsicId::AttnScore as u32)) == 0

@@ -740,6 +740,40 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
 }
 
 /// One device-to-device copy, on `stream`. A free function since callers hold only resolved device addresses, not an owned [`Buffer`]; always async since synchronous would order against every stream in the process. # Errors: [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime selected.
+/// Copy host `bytes` to device address `dst` on `stream` — [`Buffer::stage`] for a span the caller addresses itself. Async on the stream; a pageable source is staged before the call returns.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for a refused copy.
+pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: `bytes` is a live host slice for the call; the destination span is the caller's own scratch.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
+                    dst as *mut core::ffi::c_void,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream.cast(),
+                ),
+            )
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (stream, dst);
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn copy_d2d(
     stream: *mut core::ffi::c_void,
     dst: u64,

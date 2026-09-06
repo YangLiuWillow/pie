@@ -66,6 +66,11 @@ pub struct Buffers {
     per_page: u64,
     /// How many recurrent layers the plan declares.
     layers: u32,
+    /// Bytes one EXTENDED row costs the read path (`crate::run::RsScratch`):
+    /// the widest layer's six rectangles — the two buffered planes, the
+    /// conv's output, the prepared gates, the scan's gate projection and its
+    /// output — summed.
+    ext_row_bytes: u64,
 }
 
 impl Buffers {
@@ -81,6 +86,7 @@ impl Buffers {
             return Ok(None);
         };
         let per_page = u64::from(paging.page_size) * per_token;
+        let ext_row_bytes = ext_row_bytes(trace)?;
         let bytes = per_page
             .saturating_mul(u64::from(paging.slots))
             .saturating_mul(u64::from(layers))
@@ -92,8 +98,56 @@ impl Buffers {
             slots: paging.slots,
             per_page,
             layers,
+            ext_row_bytes,
         }))
     }
+}
+
+/// Bytes one extended row of the read path costs, over the widest chunked
+/// recurrent layer: the conv's input and output, the gate prep's input and
+/// output, the scan's gate projection and output.
+fn ext_row_bytes(trace: &Trace) -> Result<u64> {
+    let mut defined: HashMap<u32, usize> = HashMap::new();
+    for (at, node) in trace.nodes.iter().enumerate() {
+        let mut outs = Vec::new();
+        node.op.outputs(&mut outs);
+        for out in outs {
+            defined.insert(out.0, at);
+        }
+    }
+    let row_bytes = |id: ValueId| -> Result<u64> {
+        let decl = trace.values.get(id.0 as usize);
+        let Some(Ty::Tensor { shape, dtype }) = decl.map(|d| &d.ty) else {
+            return Err(unsized_plane("an extended-run operand", id));
+        };
+        let Some(Dim::Const(width)) = shape.last() else {
+            return Err(unsized_plane("an extended-run operand", id));
+        };
+        let elem = model_compiler::arena::elem_bytes(*dtype).ok_or_else(|| Fault::Unbound {
+            what: format!("value {} has a dtype with no element size", id.0),
+        })?;
+        Ok(*width * elem)
+    };
+    let mut widest = 0u64;
+    for node in &trace.nodes {
+        let Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, z, gates, y, .. }) = &node.op
+        else {
+            continue;
+        };
+        let mut total = row_bytes(*qkv)? + row_bytes(*z)? + row_bytes(*gates)? + row_bytes(*y)?;
+        if let Some(Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. })) =
+            defined.get(&qkv.0).map(|n| &trace.nodes[*n].op)
+        {
+            total += row_bytes(*x)?;
+        }
+        if let Some(Operation::Attention(Attention::SsmGdnPrep { ba, .. })) =
+            defined.get(&gates.0).map(|n| &trace.nodes[*n].op)
+        {
+            total += row_bytes(*ba)?;
+        }
+        widest = widest.max(total);
+    }
+    Ok(widest)
 }
 
 /// Reads the plan's chunked recurrent layers with no allocation and no
@@ -118,14 +172,29 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
         let mut planes: HashMap<u32, Plane> = HashMap::new();
         let mut per_token: Option<u64> = None;
         let mut layers = 0u32;
+        // The decode class's chain — the step scan over the step conv and
+        // the same gate prep — buffers the SAME planes as its layer's
+        // chunked chain: a one-row `RsVerb::Buffer` lane scatters its row
+        // there, and a one-row lane replaying buffered tokens ahead of it
+        // (the read path) gathers from there. Layers are numbered in node
+        // order on each chain, which is the model's layer order on both.
+        let mut decode_layers = 0u32;
         for (at, node) in trace.nodes.iter().enumerate() {
-            let Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, gates, .. }) = &node.op
-            else {
-                continue;
+            let (qkv, gates, chunked) = match &node.op {
+                Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, gates, .. }) => {
+                    (*qkv, *gates, true)
+                }
+                Operation::Attention(Attention::SsmGatedDelta { qkv, gates, .. }) => {
+                    (*qkv, *gates, false)
+                }
+                _ => continue,
             };
             let conv = defined.get(&qkv.0).copied().and_then(|n| {
                 match &trace.nodes[n].op {
-                    Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. }) => {
+                    Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. }) if chunked => {
+                        Some((n, *x))
+                    }
+                    Operation::Attention(Attention::SsmCausalConv1d { x, .. }) if !chunked => {
                         Some((n, *x))
                     }
                     _ => None,
@@ -138,6 +207,12 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                 }
             });
             let (Some((conv_at, x)), Some((prep_at, ba))) = (conv, prep) else {
+                if !chunked {
+                    // A step scan fed some other way buffers nothing; only
+                    // the chunked chain is a refusal, since it is what the
+                    // verbs are defined against.
+                    continue;
+                }
                 return Err(Fault::Unbound {
                     what: format!(
                         "the chunked recurrence at node {at}, whose `qkv` and `gates` are not \
@@ -150,18 +225,19 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
             if conv_at >= at || prep_at >= at {
                 return Err(Fault::Unbound {
                     what: format!(
-                        "the chunked recurrence at node {at} reads planes written at nodes \
+                        "the recurrence at node {at} reads planes written at nodes \
                          {conv_at} and {prep_at}, which do not both stand before it"
                     ),
                 });
             }
-            let qkv_width = width_of(trace, x).ok_or_else(|| unsized_plane("the chunked conv's rows", x))?;
+            let qkv_width = width_of(trace, x).ok_or_else(|| unsized_plane("the conv's rows", x))?;
             let ba_width = width_of(trace, ba).ok_or_else(|| unsized_plane("the gate prep's `[b | a]`", ba))?;
             let page = u64::from(paging);
+            let layer = if chunked { layers } else { decode_layers };
             planes.insert(
                 x.0,
                 Plane {
-                    layer: layers,
+                    layer,
                     at: 0,
                     width: qkv_width,
                 },
@@ -169,7 +245,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
             planes.insert(
                 ba.0,
                 Plane {
-                    layer: layers,
+                    layer,
                     at: page * qkv_width,
                     width: ba_width,
                 },
@@ -183,14 +259,26 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                 Some(first) => {
                     return Err(Fault::Unbound {
                         what: format!(
-                            "recurrent layer {layers} buffers {here} elements a token where \
+                            "recurrent layer {layer} buffers {here} elements a token where \
                              layer 0 buffers {first} — this pool cuts one page-slot stride \
                              for every layer"
                         ),
                     });
                 }
             }
-            layers += 1;
+            if chunked {
+                layers += 1;
+            } else {
+                decode_layers += 1;
+            }
+        }
+        if decode_layers != 0 && decode_layers != layers {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "the plan runs {decode_layers} step recurrence(s) and {layers} chunked \
+                     one(s); the buffered planes pair the two chains layer by layer"
+                ),
+            });
         }
         let Some(per_token) = per_token else {
             return Ok(None);
@@ -228,6 +316,12 @@ impl Buffers {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.slab.bytes() as u64
+    }
+
+    /// Bytes one extended row of the read path costs (`crate::run::RsScratch::need`).
+    #[must_use]
+    pub fn ext_row_bytes(&self) -> u64 {
+        self.ext_row_bytes
     }
 
     /// The device address of `plane`'s row `row` inside page slot

@@ -75,6 +75,20 @@ impl FrameShell for Shell {
                     ),
                 ));
             }
+            // A program reading the token plane needs a text that plants
+            // one; refused here, where nothing has launched, rather than at
+            // `Session::fire`'s unbound guard after the forward has run.
+            if self.exports.drafts.is_none() && self.programs.needs_mtp_drafts(attached.instance)? {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "instance {} reads the `mtp_drafts` intrinsic and this load's model \
+                         text plants no `{}` export, so there is no token plane to point it at",
+                        attached.instance,
+                        crate::exports::DRAFTS_SEAM
+                    ),
+                ));
+            }
             if attachments[..index]
                 .iter()
                 .any(|earlier| earlier.instance == attached.instance)
@@ -657,33 +671,37 @@ impl FrameShell for Shell {
                     fold,
                     replay,
                 } => {
-                    // The buffer read path — buffered tokens replayed ahead
-                    // of this lane's rows — has no device half on this plane
-                    // yet: its recurrences initialize from the folded state
-                    // alone. Refused by name rather than run from the wrong
-                    // state.
-                    if *replay > 0 {
+                    // **The buffer read path**: `replay` buffered tokens at
+                    // `[at - replay, at)` are replayed through the recurrence
+                    // ahead of this lane's rows, so the rows start from
+                    // `folded (+) replay(buffer)`. The recurrent arms run over
+                    // the EXTENDED run `[replay | rows]` (`Run::rs_extend`),
+                    // and every count below — the fold, the split, the
+                    // truncation — is taken in that layout, as the verb
+                    // states it.
+                    if *replay > *at {
                         return Err(Fault::program(
                             "serve::rs",
                             format!(
-                                "lane {} replays {replay} buffered token(s) ahead of its rows \
-                                 (the buffer read path), which this plane does not serve; \
-                                 fold the buffer before appending to it",
+                                "lane {} replays {replay} buffered token(s) below buffer \
+                                 position {at}, which has only {at}",
                                 row.source
                             ),
                         ));
                     }
+                    let extended = replay.saturating_add(row.rows);
                     let fold = match fold {
                         FoldLen::Host(0) => 0,
-                        stated => resolve_fold_len(*stated, row.rows, fire_lane, port)?,
+                        stated => resolve_fold_len(*stated, extended, fire_lane, port)?,
                     };
                     (
                         RsMove::Scatter {
                             pages: pages.as_slice(),
                             at: *at,
                             fold,
+                            replay: *replay,
                         },
-                        if fold == 0 { row.rows } else { fold },
+                        if fold == 0 { extended } else { fold },
                     )
                 }
                 RsVerb::Window { .. } => {
@@ -764,7 +782,14 @@ impl FrameShell for Shell {
             if seated.drafts && self.exports.mtp.is_none() {
                 return Err(Fault::Draftless { lane: row.source });
             }
-            if seated.drafts != runs_draft_arm {
+            // A BLOCK DRAFTER's column is not a class's: its `mtp` seam is the
+            // shared head's output split by the `block_draft` fact, so the
+            // writing region runs in every class and the arm costs a lane
+            // nothing unless its word carries the fact. The word already
+            // says which rows are the block's; there is no second axis to
+            // cross-check against.
+            let block_drafter = self.trace.drafter.is_some();
+            if seated.drafts != runs_draft_arm && !block_drafter {
                 return Err(Fault::DraftWord {
                     lane: row.source,
                     word: lane.word,
@@ -1265,16 +1290,30 @@ impl FrameShell for Shell {
         )?;
 
         // Bound only when it would truncate something — see `RsFire::truncates`.
+        // Both counted in the lane's extended layout `[replay | rows]`.
+        let rs_replays: Vec<u32> = rs_moves
+            .iter()
+            .map(|verb| match verb {
+                RsMove::Scatter { replay, .. } => *replay,
+                _ => 0,
+            })
+            .collect();
         let rs_truncates = rs_lens
             .iter()
             .zip(&seats)
-            .any(|(len, seat)| *len < narrow(u64::from(seat.rows)));
+            .zip(&rs_replays)
+            .any(|((len, seat), replay)| *len < narrow(u64::from(seat.rows) + u64::from(*replay)));
         // Split only when a boundary is strictly inside a row — see
         // `RsFire::splits`. `fold == rows` or `fold == 0` are both
         // single-call; only an interior boundary costs a second launch.
         let rs_splits = rs_moves.iter().zip(&seats).any(|(verb, seat)| {
-            matches!(verb, RsMove::Scatter { fold, .. } if *fold > 0 && *fold < seat.rows)
+            matches!(verb, RsMove::Scatter { fold, replay, .. } if *fold > 0 && *fold < seat.rows + *replay)
         });
+        let rs_rows_ext = if rs_replays.iter().any(|replay| *replay > 0) {
+            rows.saturating_add(rs_replays.iter().sum::<u32>())
+        } else {
+            0
+        };
         Ok(Prepared {
             slot: Some(slot),
             lengths: staged_lens,
@@ -1331,6 +1370,8 @@ impl FrameShell for Shell {
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
+                replays: rs_replays,
+                rows_ext: rs_rows_ext,
             },
         })
     }
