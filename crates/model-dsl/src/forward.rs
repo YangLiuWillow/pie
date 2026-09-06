@@ -321,6 +321,23 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
+    /// Which token row each readout row gathers: `[Dim::Readouts]` `i32`,
+    /// one entry per row a reader takes (its lane's last row by default).
+    /// Read by [`ops::layout::gather_rows`](crate::ops::layout::gather_rows),
+    /// which is what puts the trunk head on those rows alone.
+    #[must_use]
+    pub fn readout_rows(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::ReadoutRows,
+                Ty::Tensor {
+                    shape: vec![Dim::Readouts],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
     /// The fire's patch rows, pre-unfolded: `[Dim::Patches, width]`. `width`
     /// is `C * T * P^2` (channels x temporal/spatial patch extents).
     #[must_use]

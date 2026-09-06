@@ -684,6 +684,15 @@ pub struct Prepared<'a> {
     attachments: &'a [Attached],
     /// Words to classes, classes to an order, counts to prefix sums.
     composition: Composition,
+    /// Which token row each readout row gathers, in fire order — the rows
+    /// the trunk head runs over. Padded to the key's ceiling for a bodied
+    /// fire (`Prepared::readout_ceiling`).
+    readout_rows: Vec<i32>,
+    /// Per submitted lane: where its readouts start in `readout_rows`, and
+    /// how many it takes. What the readback turns a lane into a row of the
+    /// gathered logits rectangle with.
+    readout_first: Vec<u32>,
+    readout_count: Vec<u32>,
     /// What the walk reads to know which nodes have rows.
     descriptor: FireDescriptor,
     /// The patch payload, in fire order; empty for a fire with no image.

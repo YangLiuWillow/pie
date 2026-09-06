@@ -518,6 +518,7 @@ impl FireCtx<'_> {
                 images: u64::from(p.composition.images()),
                 voxels: u64::from(p.composition.voxel_rows()),
                 clips: u64::from(p.composition.clips()),
+                readouts: p.readout_rows.len() as u64,
             },
         );
         // The ports merged straight into a stream land in their merged
@@ -661,6 +662,7 @@ impl FireCtx<'_> {
             tokens: handles.tokens,
             positions: handles.positions,
             adapter_routes: handles.adapter_routes,
+            readout_rows: handles.readout_rows,
             patches: staged.patches.as_ref().map(|seats| seats.patches),
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
             patch_routes: staged.patches.as_ref().map(|seats| seats.routes),
@@ -954,19 +956,28 @@ impl FireCtx<'_> {
                 ));
             }
         }
-        // Which rows of the arena's readout rectangles each submitted lane
-        // reads and owns, and the class its word landed in.
+        // **THE READOUT RECTANGLE IS THE GATHERED ONE, NOT THE FIRE'S ROWS.**
+        // The head runs over `layout.gather_rows`' output, so a lane's rows
+        // here are its run of THAT rectangle — the readouts `prepare` laid
+        // out — and every reader below (the host readback, the guest's
+        // `Logits` intrinsic) indexes it the same way. For a decode lane the
+        // two coincide; for a prefill lane the run is one row where the fire
+        // carries hundreds. The class its word landed in still comes off the
+        // composition.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
         let mut first_row = vec![0u32; lane_count];
         let mut lane_rows = vec![0u32; lane_count];
         let mut lane_class = vec![0usize; lane_count];
         for row in p.composition.lanes() {
-            let at = row.source as usize;
-            last_row[at] = row.row_offset + row.rows - 1;
-            first_row[at] = row.row_offset;
-            lane_rows[at] = row.rows;
-            lane_class[at] = row.class as usize;
+            lane_class[row.source as usize] = row.class as usize;
+        }
+        for lane in 0..lane_count {
+            let first = p.readout_first.get(lane).copied().unwrap_or(0);
+            let count = p.readout_count.get(lane).copied().unwrap_or(0);
+            first_row[lane] = first;
+            lane_rows[lane] = count;
+            last_row[lane] = first + count.saturating_sub(1);
         }
         // One export rectangle, as the carve placed it, checked for an
         // element this shell can read back or point an intrinsic at.
@@ -1089,25 +1100,24 @@ impl FireCtx<'_> {
             let lane = attached.lane as usize;
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
+            // The gather laid this lane's readouts out in the order it
+            // stated them, so the rows it wants are its run, in order — a
+            // consecutive one, which is why no pointer table is minted for
+            // a multi-row readout any more.
             let wanted: Vec<u32> = match stated {
                 None => vec![last_row[lane]],
+                Some(rows) if rows.is_empty() => vec![last_row[lane]],
                 Some(rows) => {
-                    let mut arena_rows = Vec::with_capacity(rows.len());
-                    for &row in rows {
-                        if row >= owned {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: u64::from(row) + 1,
-                                have: u64::from(owned),
-                            });
-                        }
-                        arena_rows.push(first_row[lane] + row);
+                    if rows.len() as u32 > owned {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: rows.len() as u64,
+                            have: u64::from(owned),
+                        });
                     }
-                    // A stated-but-empty list still reads the row it always had.
-                    if arena_rows.is_empty() {
-                        arena_rows.push(last_row[lane]);
-                    }
-                    arena_rows
+                    (0..rows.len() as u32)
+                        .map(|i| first_row[lane] + i)
+                        .collect()
                 }
             };
             // A consecutive run is a base and an offset; only a list a stride

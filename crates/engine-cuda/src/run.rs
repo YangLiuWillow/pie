@@ -370,6 +370,9 @@ pub struct FireBindings {
     /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row, `-1` for a row whose lane registered none. `None` for a fire no lane carried an adapter into.
     pub adapter_routes: Option<Tensor>,
 
+    /// `RuntimeInput::ReadoutRows`: `i32`, the token row each readout row gathers.
+    pub readout_rows: Tensor,
+
     /// The second row axis's three seats, all `None` for a fire no lane submitted an image into. `patches` is pre-unfolded patch rows; `patch_segments` its indptr; `patch_routes` the scatter target per patch row.
     pub patches: Option<Tensor>,
     /// The patch axis's indptr — see [`patches`](FireBindings::patches).
@@ -1306,6 +1309,9 @@ impl<'c> Run<'c> {
             Dim::Tokens => row(1),
             Dim::TokensTimes(k) => row(k),
             Dim::Patches => row(1),
+            // Gathered across every lane, so a class window names the wrong
+            // rows: handed over whole, like a `Const`.
+            Dim::Readouts => return handle,
             // A lane-shaped ACTIVATION (a lane vector's chain: the timestep embedding, the adaLN modulation) is handed whole at the fire's lane carve: its launches grid over every lane the carve admits and read no seat (`Run::unseated`), so one body serves every lane count. The lane-shaped INPUTS (the group table, a lane vector port) are the same rectangle, whole.
             Dim::Lanes => return handle,
             Dim::LanesPlus(k) => lane(k),
@@ -1481,6 +1487,7 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
+            Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
             Def::Input(RuntimeInput::Mask { space }) => {
                 let seat = self.geometry(at, *space);

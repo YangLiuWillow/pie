@@ -347,6 +347,9 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                     // Window-free: handed over whole, gathered or not.
                     Some(Dim::Const(_)) | None => true,
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                    // Gathered across every lane already: a second gather
+                    // over a window's rows would name the wrong ones.
+                    Some(Dim::Readouts) => false,
                     // The patch axis: a different row space than the token map `Gathered::rows_host` describes.
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                     // The voxel axis: its own row space too.

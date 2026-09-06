@@ -197,19 +197,21 @@ impl Shell {
             let chosen: Vec<u32> = match want.get(lane) {
                 None | Some(Readout::Last) => vec![readback.last_row[lane]],
                 Some(Readout::None) => Vec::new(),
+                // The head ran over the gathered readout rectangle, and a
+                // lane's run of it holds the rows it stated, in the order it
+                // stated them — so a caller asking for its own list again
+                // reads position by position, not by fire row.
                 Some(Readout::Rows(rows)) => {
-                    let mut arena_rows = Vec::with_capacity(rows.len());
-                    for &row in rows {
-                        if row >= owned {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: u64::from(row) + 1,
-                                have: u64::from(owned),
-                            });
-                        }
-                        arena_rows.push(readback.first_row[lane] + row);
+                    if rows.len() as u32 > owned {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: rows.len() as u64,
+                            have: u64::from(owned),
+                        });
                     }
-                    arena_rows
+                    (0..rows.len() as u32)
+                        .map(|i| readback.first_row[lane] + i)
+                        .collect()
                 }
             };
             let mut values = Vec::with_capacity(chosen.len() * width);

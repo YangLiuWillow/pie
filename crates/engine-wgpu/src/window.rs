@@ -156,6 +156,7 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
 
                     Some(Dim::Const(_)) | None => true,
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                    Some(Dim::Readouts) => false,
 
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                     // The voxel axis: its own row space too.

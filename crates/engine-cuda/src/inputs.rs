@@ -109,6 +109,10 @@ pub struct Handles {
     pub row_valid: Tensor,
     /// One adapter id per token row. `None` when no lane carried one.
     pub adapter_routes: Option<Tensor>,
+    /// `[readouts]` `i32`: which token row each readout row gathers, in
+    /// fire order — what puts the trunk head on the rows a reader takes
+    /// (`RuntimeInput::ReadoutRows`).
+    pub readout_rows: Tensor,
     /// Packed `u8` (query, key) bits, fire-wide. `None` when no lane carried a mask, so a masked consumer answers `attn::masked`'s own refusal rather than reading zeros.
     pub mask: Option<Tensor>,
     /// Each lane's ABSOLUTE byte offset into [`mask`](Handles::mask).
@@ -265,6 +269,10 @@ pub struct Fire<'a> {
     pub slot_ids: &'a [i32],
     /// Which adapter each token row routes to, or `None` if none carried one. Tail value `-1` means the base model.
     pub adapter_routes: Option<&'a [i32]>,
+    /// The token row each readout row gathers, in fire order. A bodied
+    /// fire pads to the key's readout ceiling with zeros, so a replay's
+    /// carved grid reads a live row rather than off the plane.
+    pub readout_rows: &'a [i32],
     /// One geometry per kv space. A bodied fire pads page CSR and per-lane vectors to the key's ladder reach so lanes past live ones read empty.
     pub spaces: &'a [Geometry],
     /// This fire's expanded lane masks, or `None` when no lane carried one.
@@ -370,6 +378,9 @@ pub struct Staged {
     /// `None` until a caller fills [`Fire::live`].
     live: Option<usize>,
     adapter_rows: Option<u32>,
+    /// Readout rows written — the fire's own count, or the key's ceiling
+    /// for a bodied fire.
+    readouts: u32,
     mask_bytes: Option<u32>,
     /// Per kv space, how many page ids its `indices` vector carries.
     space_indices: Vec<u32>,
@@ -417,6 +428,9 @@ pub struct Inputs {
     row_valid: u64,
     slot_ids: u64,
     adapter_routes: u64,
+    /// `[readouts]` `i32`, carved at the token ceiling: a readout names a
+    /// row the lane has, so a fire may read every row it carries.
+    readout_rows: u64,
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
@@ -503,6 +517,9 @@ impl Inputs {
         let slot_ids = take(lanes * 4);
         // Reserved unconditionally: a conditional carve would make the store's layout depend on the plan.
         let adapter_routes = take(rows * 4);
+        // Same reason as the adapter routes: carved unconditionally so the
+        // store's layout does not follow the plan.
+        let readout_rows = take(rows * 4);
         // Masked axis's two vectors. `context` is what a slot can hold, so `rows * context` bounds every (query, key) cell a fire can present; `+ lanes` is one byte-alignment pad per lane. A plan with no `attention.masked` arm carves none: at 65536 rows the slab (and its nine pinned mirrors) would be gigabytes nobody reads.
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_bytes = if masked {
@@ -631,6 +648,7 @@ impl Inputs {
             row_valid,
             slot_ids,
             adapter_routes,
+            readout_rows,
             mask_bits,
             mask_bytes,
             mask_indptr,
@@ -867,6 +885,12 @@ impl Inputs {
             }
         };
 
+        put(
+            self.readout_rows,
+            bytes_of(fire.readout_rows),
+            "staged readout rows",
+        )?;
+
         // A fire no lane masked writes nothing and binds no seat, so a masked consumer sees `attn::masked`'s refusal rather than reading a zeroed (all-masked-out) slab.
         let mask_bytes = match fire.mask {
             None => None,
@@ -940,6 +964,7 @@ impl Inputs {
             qo_absolute,
             live,
             adapter_rows,
+            readouts: fire.readout_rows.len() as u32,
             mask_bytes,
             space_indices,
             space_lanes,
@@ -1150,11 +1175,13 @@ impl Inputs {
             qo_absolute,
             live,
             adapter_rows,
+            readouts,
             mask_bytes,
             space_indices,
             space_lanes,
             packed,
         } = staged;
+        let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
         let packed = *packed;
         // What the lane tables were written at (see `Staged::space_lanes`).
@@ -1167,6 +1194,7 @@ impl Inputs {
         let (at_row_valid, at_slot_ids) = (self.row_valid, self.slot_ids);
         let (at_routes, at_mask, at_mask_indptr) =
             (self.adapter_routes, self.mask_bits, self.mask_indptr);
+        let at_readouts = self.readout_rows;
         let places: Vec<SpaceAt> = self.spaces.clone();
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
@@ -1196,6 +1224,7 @@ impl Inputs {
         }
         copy(at_row_valid, rows as usize)?;
         copy(at_lane_of_row, rows as usize * 4)?;
+        copy(at_readouts, readouts as usize * 4)?;
         // Copied at `space_lanes`, with every other per-lane table: the host vector was `-1`-padded to that reach (see `write_host`).
         copy(at_slot_ids, space_lanes as usize * 4)?;
         if let Some(routes) = adapter_rows {
@@ -1271,6 +1300,7 @@ impl Inputs {
             // The handle says what was written, at `space_lanes`.
             slot_ids: i32s(base + at_slot_ids, space_lanes),
             adapter_routes: adapter_rows.map(|rows| i32s(base + at_routes, rows)),
+            readout_rows: i32s(base + at_readouts, readouts),
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
             // Handed over whole: entries are bits, not fire rows, so `Run::cut` excludes it, like the page-id list.
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),

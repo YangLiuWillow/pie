@@ -204,6 +204,9 @@ impl Run<'_> {
                 }
                 Ok(())
             }
+            // The readout gather is the CUDA head's; this shell runs the
+            // trunk head over every row, as it always has.
+            Layout::GatherRows { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Layout::Select {
                 table,
                 layer,

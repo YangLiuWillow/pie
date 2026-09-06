@@ -363,6 +363,8 @@ impl<'c> Run<'c> {
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
+            // Gathered across every lane: handed over whole.
+            Some(Dim::Readouts) => return handle,
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
@@ -435,6 +437,8 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
+            // This shell dispatches no `layout.gather_rows`, so nothing reads it.
+            Def::Input(RuntimeInput::ReadoutRows) => self.fire.tokens,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
 
             Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,

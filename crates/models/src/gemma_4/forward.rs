@@ -576,6 +576,12 @@ impl ForwardHybrid for Model {
             }
             _ => (x, None),
         };
+        // **THE HEAD RUNS OVER THE ROWS A READER TAKES.** Everything above
+        // is per token; the logits are not — one row per lane by default,
+        // and only more where a lane states a multi-row readout. Gathering
+        // first turns a prefill's head from a `[prompt, vocab]` GEMM into a
+        // `[readouts, vocab]` one, which is the size a decode's already was.
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.embed);
         let logits = if embed_banded(m) {
             ops::collective::all_gather(&logits, m.tp)

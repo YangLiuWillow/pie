@@ -118,6 +118,22 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     (left, right)
 }
 
+/// `y[i] = x[rows[i]]`: the rows a reader takes, compacted out of the token
+/// rectangle so the head that follows runs over them alone.
+pub fn gather_rows(x: &Value, rows: &Value) -> Value {
+    let r = x.rec();
+    let y = r.fresh(tensor(Dim::Readouts, x.width(), x.dtype()));
+    r.push(
+        Layout::GatherRows {
+            x: x.id(),
+            rows: rows.id(),
+            y: y.id(),
+        },
+        &[x, rows],
+    );
+    y
+}
+
 pub fn select(table: &Value, layer: u32, width: u32) -> Value {
     let r = table.rec();
     let y = r.fresh(tensor(table.rows(), width, table.dtype()));

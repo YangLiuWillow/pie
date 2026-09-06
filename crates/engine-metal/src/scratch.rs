@@ -188,6 +188,7 @@ impl Scratch {
             images: u64::from(budgets.max_images()),
             voxels: u64::from(budgets.max_voxels()),
             clips: u64::from(budgets.max_clips()),
+            readouts: u64::from(budget.max_tokens),
         };
         let of = |id: ValueId| rect(map, id, ceiling);
         let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
