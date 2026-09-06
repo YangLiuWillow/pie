@@ -20,6 +20,7 @@ mod boot;
 mod enqueue;
 mod lanes;
 mod load;
+pub(crate) use load::fuse_chains;
 mod prepare;
 mod segments;
 mod settle;

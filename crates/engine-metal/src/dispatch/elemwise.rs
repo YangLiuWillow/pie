@@ -90,7 +90,11 @@ impl Run<'_> {
             // No shipped shader for these; refuse by name.
             Elementwise::LayernormNoScale { .. }
             | Elementwise::Clamp { .. }
-            | Elementwise::ClampLearned { .. } => {
+            | Elementwise::ClampLearned { .. }
+            // CUDA's load-time chain fusions (`model_ir::fuse::residual_chains`);
+            // this engine never runs that pass, so it never sees these.
+            | Elementwise::RmsnormResidualAdd { .. }
+            | Elementwise::EmbedScaleAdd { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             // qwen4's gated-residual family.

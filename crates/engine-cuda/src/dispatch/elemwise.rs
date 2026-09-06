@@ -181,6 +181,63 @@ impl Run<'_> {
                 self.tensor(*scale),
                 &mut self.tensor(*x),
             ),
+            Elementwise::RmsnormResidualAdd {
+                x,
+                weight,
+                eps,
+                t,
+                y,
+                y_out: _,
+                scale,
+                post,
+            } => {
+                let mut scaled = scale.map(|(_, scaled)| self.tensor(scaled));
+                let mut out = post.as_ref().map(|post| self.tensor(post.out));
+                elemwise::norm::rmsnorm_residual_add(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*weight),
+                    *eps,
+                    &mut self.tensor(*t),
+                    &mut self.tensor(*y),
+                    match (scale, scaled.as_mut()) {
+                        (Some((s, _)), Some(scaled)) => Some((self.tensor(*s), scaled)),
+                        _ => None,
+                    },
+                    match (post, out.as_mut()) {
+                        (Some(post), Some(out)) => Some(elemwise::norm::PostNorm {
+                            weight: self.tensor(post.weight),
+                            plus_one: post.plus_one,
+                            eps: post.eps,
+                            out,
+                        }),
+                        _ => None,
+                    },
+                )
+            }
+            Elementwise::EmbedScaleAdd {
+                ids,
+                table,
+                vocab,
+                e,
+                embed_scale,
+                e_scaled,
+                y,
+                y_out: _,
+                out_scale,
+                y_scaled,
+            } => kernels_cuda::layout::embed_scale_add(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*table),
+                *vocab,
+                &mut self.tensor(*e),
+                *embed_scale,
+                &mut self.tensor(*e_scaled),
+                &mut self.tensor(*y),
+                *out_scale,
+                &mut self.tensor(*y_scaled),
+            ),
             Elementwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
             }

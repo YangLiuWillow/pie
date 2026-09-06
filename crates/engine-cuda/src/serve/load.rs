@@ -59,6 +59,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // the compile and every node index taken off `boot.trace` below share
     // one numbering; see the Metal shell's `load` for the argument.
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
+    // The chain fusions behind it; `PIE_FUSE_CHAINS=0` is the A/B arm that
+    // lands the traced launches instead.
+    if fuse_chains() {
+        boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
+    }
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     Ok(Baked {
         device,
@@ -461,4 +466,11 @@ pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
+}
+
+/// Whether the load folds the norm-add-scale-norm and per-layer-input chains
+/// (`model_ir::fuse::residual_chains`). On unless `PIE_FUSE_CHAINS=0`.
+pub(crate) fn fuse_chains() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("PIE_FUSE_CHAINS").is_ok_and(|value| value == "0"))
 }
