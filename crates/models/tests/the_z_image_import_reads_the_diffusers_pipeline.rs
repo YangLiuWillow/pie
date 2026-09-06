@@ -496,7 +496,7 @@ fn the_flagship_reads_the_real_snapshot() {
 }
 
 /// The derived planes are stated through internal steps that reach the
-/// checkpoint: a pad table reads its token by `Src` and its `−1` row by
+/// checkpoint: a pad bank reads its token by `Src` and its `−1` block by
 /// `Out`; the constant is a fill plus a bias and nothing else.
 #[test]
 fn the_derived_planes_are_stated_through_internal_steps() {
@@ -512,15 +512,15 @@ fn the_derived_planes_are_stated_through_internal_steps() {
             .find(|t| t.name == name)
             .unwrap_or_else(|| panic!("no `{name}` in the contract"))
     };
-    for table in ["dit.x_pad_mod", "dit.cap_pad_mod"] {
-        let neg = named(&format!("{table}.neg"));
+    for bank in ["dit.x_pad_mod", "dit.cap_pad_mod"] {
+        let neg = named(&format!("{bank}.neg"));
         assert!(
             matches!(&neg.expr, Expr::Bias { .. }),
-            "`{table}.neg` is a biased fill"
+            "`{bank}.neg` is a biased fill"
         );
-        let table = named(table);
-        assert_eq!(table.expr.outputs(), vec![format!("{}.neg", table.name)]);
-        assert_eq!(table.expr.sources().len(), 1, "the token itself, once");
+        let bank = named(bank);
+        assert_eq!(bank.expr.outputs(), vec![format!("{}.neg", bank.name)]);
+        assert_eq!(bank.expr.sources().len(), 1, "the token itself, once");
     }
     let flip = named("dit.t_flip");
     assert_eq!(flip.expr.outputs(), vec!["dit.t_flip.raw".to_string()]);

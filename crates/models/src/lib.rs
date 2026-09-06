@@ -8,6 +8,7 @@ pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod kimi_k3;
 pub mod media;
+pub mod mini_dit;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
@@ -181,6 +182,12 @@ pub struct PortFact {
     /// count for axis positions. Latents and context channels are
     /// `[rows, width]`; a lane vector is `[width]` or `[1, width]`.
     pub width: u32,
+    /// Which streams' lanes carry this port. A row port belongs to the one
+    /// stream whose rows it fills; a lane vector (a timestep) is read once
+    /// per lane by every class that modulates. EMPTY means every lane of the
+    /// reading. A pass on stream `s` must bind exactly the ports that list
+    /// `s` (or list nothing).
+    pub streams: Vec<Stream>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
@@ -330,6 +337,9 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row
         // spells, so the generative rows identify nothing above them.
         z_image::skus(),
+        // Last: the synthetic parity row identifies nothing an operator
+        // ships, and identification is catalog order.
+        mini_dit::skus(),
     ]
     .into_iter()
     .flatten()

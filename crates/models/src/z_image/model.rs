@@ -119,6 +119,12 @@ pub const TE_MAX_TOKENS: u32 = 512;
 pub mod port {
     /// `denoise`: the image lane's patch rows, `[rows, PATCH_FEATURES]` bf16.
     pub const LATENTS: u8 = 0;
+    /// `denoise`: the image lane's pad flags, `[rows, 1]` (`0` real, `1`
+    /// pad), the second latents port of the reading.
+    pub const PAD_IMAGE: u8 = 1;
+    /// `refine`: the caption lane's pad flags, `[rows, 1]`, its only
+    /// latents port.
+    pub const PAD_CAPTION: u8 = 0;
     /// `refine`: the raw caption rows, `[rows, cap_width]` (Qwen3 layer −2);
     /// `denoise`: the refined caption rows, `[rows, dim]`. Both the first
     /// context port of their reading.
@@ -266,11 +272,12 @@ impl Block {
 pub struct Dit {
     /// `all_x_embedder["2-1"]`: `Linear(64 → dim)`.
     pub x_embed: Linear,
-    /// The image pad rows as a per-row scale-shift table, `[2, 2·dim]`:
-    /// row 0 is `[0 | 0]` (a real row is `x·(1+0)+0`), row 1 is
-    /// `[−1 | x_pad_token]` (a pad row is `x·0 + x_pad_token`). Gathered by
-    /// the lane's pad flags and applied with one `elementwise.modulate`;
-    /// `import.rs` derives it from the stored `x_pad_token`.
+    /// The image pad rows as a scale-shift projection of the pad flag: a
+    /// `[2·dim, 1]` bank `[−1 × dim | x_pad_token]ᵀ`, so a flag row `f`
+    /// projects to `[−f | f·x_pad_token]` and one `elementwise.modulate`
+    /// lands `x·(1−f) + f·x_pad_token` — the row itself at `f = 0`, the
+    /// learned token at `f = 1`. `import.rs` states it from the stored
+    /// `x_pad_token`.
     pub x_pad_mod: Weight,
     /// `cap_embedder.0`: `RMSNorm(cap_width)`.
     pub cap_norm: Weight,
@@ -441,10 +448,10 @@ impl Model {
         };
         let dit = Dit {
             x_embed: Linear::at("dit.x_embed", dim, PATCH_FEATURES, banks),
-            x_pad_mod: Weight::sym("dit.x_pad_mod", [2, u64::from(2 * dim)], dense),
+            x_pad_mod: Weight::sym("dit.x_pad_mod", [u64::from(2 * dim), 1], banks),
             cap_norm: Weight::sym("dit.cap_norm", [u64::from(d.cap_width)], dense),
             cap_embed: Linear::at("dit.cap_embed", dim, d.cap_width, banks),
-            cap_pad_mod: Weight::sym("dit.cap_pad_mod", [2, u64::from(2 * dim)], dense),
+            cap_pad_mod: Weight::sym("dit.cap_pad_mod", [u64::from(2 * dim), 1], banks),
             t_mlp0: Linear::at("dit.t_mlp0", T_MID, T_FREQ_DIM, banks),
             t_mlp1: Linear::at("dit.t_mlp1", ADALN_DIM, T_MID, banks),
             t_flip: Weight::sym("dit.t_flip", [1], Dtype::F32),

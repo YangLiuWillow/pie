@@ -14,8 +14,8 @@
 //! checked where the contract does more than copy:
 //!
 //! ```text
-//! (a) `dit.x_pad_mod` / `dit.cap_pad_mod`: row 0 is all zero, row 1 is
-//!     `[−1 × dim | pad_token]` with the token's fp32 values rounded to bf16
+//! (a) `dit.x_pad_mod` / `dit.cap_pad_mod`: `[−1 × dim | pad_token]` down
+//!     the column, the token's fp32 values rounded to bf16
 //! (b) `dit.t_flip` is the one f32 `1000`
 //! (c) a packed `qkv` bank is `to_q` over `to_k` over `to_v`, rounded
 //! (d) every bank landed bf16, half the bytes it was stored in
@@ -106,27 +106,22 @@ fn the_miniature_lands_its_derived_planes() {
     };
 
     // (a)
-    for (table, token) in [
+    for (bank, token) in [
         ("dit.x_pad_mod", "x_pad_token"),
         ("dit.cap_pad_mod", "cap_pad_token"),
     ] {
-        let got = bf16(landed(table));
-        assert_eq!(got.len(), 2 * 2 * dim, "{table} is [2, 2·dim]");
-        let (real, pad) = got.split_at(2 * dim);
-        assert!(
-            real.iter().all(|&v| v == 0.0),
-            "{table} row 0 is the identity scale-shift"
-        );
-        let (scale, shift) = pad.split_at(dim);
+        let got = bf16(landed(bank));
+        assert_eq!(got.len(), 2 * dim, "{bank} is [2·dim, 1]");
+        let (scale, shift) = got.split_at(dim);
         assert!(
             scale.iter().all(|&v| v == -1.0),
-            "{table} row 1 scales by −1"
+            "{bank}: a pad row scales by −1"
         );
         let want: Vec<f32> = f32s(&stored(token)).into_iter().map(round_bf16).collect();
         assert_eq!(
             shift,
             want.as_slice(),
-            "{table} row 1 shifts by the learned token"
+            "{bank}: a pad row shifts by the learned token"
         );
     }
 

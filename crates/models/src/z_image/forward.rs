@@ -4,21 +4,22 @@
 //! | reading | lanes (stream) | binds | reads back |
 //! |---|---|---|---|
 //! | `text` | one, `Text` | `embed(ids)`, `attention(kv)` | `hidden` `[L, 2560]`: Qwen3 layer −2 |
-//! | `refine` | one, `Context` | `embed(pad flags)`, `caption` `[L32, 2560]`, `positions` `[L32, 3]` | `hidden` `[L32, 3840]`: the refined caption |
-//! | `denoise` | `Image` + `Context`, one group | image: `embed(pad flags)`, `latents` `[N32, 64]`, `positions`, `timestep`; context: `embed(zeros)`, `context` `[L32, 3840]`, `positions` | `velocity` `[N32, 64]` on the image lane |
+//! | `refine` | one, `Context` | `caption` `[L32, 2560]`, `pad` `[L32, 1]`, `positions` `[L32, 3]` | `hidden` `[L32, 3840]`: the refined caption |
+//! | `denoise` | `Image` + `Context`, one group | image: `latents` `[N32, 64]`, `pad` `[N32, 1]`, `positions`, `timestep`; context: `context` `[L32, 3840]`, `positions`, `timestep` | `velocity` `[N32, 64]` on the image lane |
 //!
 //! `L32`/`N32` are the caption / image row counts padded up to a multiple of
-//! [`super::model::SEQ_MULTIPLE`]. **The pad rows are the guest's to allocate and this
-//! text's to fill**: the IR cannot grow a lane, so a lane arrives already
-//! padded, its `embed` ids are per-row pad flags (`0` real, `1` pad), and
-//! the plan overwrites every flagged row with the learned `x_pad_token` /
-//! `cap_pad_token` after its embedder (the reference's `torch.where(mask,
-//! pad_token, feats)`), at rotary position `(0, 0, 0)` — which the guest's
-//! positions must state. The pad rows are attended (study §C.3); the
-//! velocity rows they produce are discarded by the guest. A lane that binds
-//! no `embed` is handed zero ids (`IMAGEGEN_CONTRACT.md` §7), i.e. no pad
-//! rows: the `denoise` context lane needs none, because its rows are the
-//! `refine` readout, pads included.
+//! [`super::model::SEQ_MULTIPLE`]. **The pad rows are the guest's to
+//! allocate and this text's to fill**: the IR cannot grow a lane, so a lane
+//! arrives already padded, its `pad` port flags each row (`0.0` real, `1.0`
+//! pad), and the plan overwrites every flagged row with the learned
+//! `x_pad_token` / `cap_pad_token` after its embedder (the reference's
+//! `torch.where(mask, pad_token, feats)`), at rotary position `(0, 0, 0)` —
+//! which the guest's positions must state. The pad rows are attended (study
+//! §C.3); the velocity rows they produce are discarded by the guest. The
+//! `denoise` context lane binds no `pad`: its rows are the `refine`
+//! readout, pads included. The `timestep` is bound by BOTH denoise lanes
+//! (the same cell): the joint trunk modulates every row by its own lane's
+//! vector, caption rows included.
 //!
 //! Positions (`AxisPositions`, `[rows, 3]` f32, `(t, h, w)`): caption row
 //! `j` is `(1 + j, 0, 0)`; image patch `(a, b)` is `(L32 + 1, a, b)` — the
@@ -110,7 +111,12 @@ impl Model {
     pub fn generative(&self) -> Generative {
         let d = &self.dims;
         let codes = self.readings();
-        let port = |name, kind, width| PortFact { name, kind, width };
+        let port = |name, kind, width, streams: &[Stream]| PortFact {
+            name,
+            kind,
+            width,
+            streams: streams.to_vec(),
+        };
         let mut readings = Vec::new();
         if let (Some(index), Some(te)) = (codes.text, &self.te) {
             readings.push(ReadingFact {
@@ -119,21 +125,35 @@ impl Model {
                 has_kv: true,
                 takes_tokens: true,
                 streams: vec![Stream::Text],
+                // A sequence lane: ids and kv, no float port.
                 ports: vec![],
                 readout: ReadoutKind::Hidden,
                 readout_width: te.hidden,
             });
         }
+        let axes = u32::from(ROPE_AXES);
+        // Port ORDER is load-bearing: a port's index is its position among
+        // its kind, and `model::port` numbers them so.
         readings.push(ReadingFact {
             name: "refine",
             index: codes.refine,
             has_kv: false,
-            // The ids are the pad flags; they also state the lane's rows.
-            takes_tokens: true,
+            takes_tokens: false,
             streams: vec![Stream::Context],
             ports: vec![
-                port("caption", PortKind::Context, d.cap_width),
-                port("positions", PortKind::AxisPositions, u32::from(ROPE_AXES)),
+                port("pad", PortKind::Latents, 1, &[Stream::Context]),
+                port(
+                    "caption",
+                    PortKind::Context,
+                    d.cap_width,
+                    &[Stream::Context],
+                ),
+                port(
+                    "positions",
+                    PortKind::AxisPositions,
+                    axes,
+                    &[Stream::Context],
+                ),
             ],
             readout: ReadoutKind::Hidden,
             readout_width: d.dim,
@@ -142,15 +162,29 @@ impl Model {
             name: "denoise",
             index: codes.denoise,
             has_kv: false,
-            takes_tokens: true,
+            takes_tokens: false,
             streams: vec![Stream::Image, Stream::Context],
-            // Port ORDER is load-bearing: a port's index is its position
-            // among its kind, and `model::port` numbers them so.
             ports: vec![
-                port("latents", PortKind::Latents, PATCH_FEATURES),
-                port("context", PortKind::Context, d.dim),
-                port("timestep", PortKind::LaneVector, 1),
-                port("positions", PortKind::AxisPositions, u32::from(ROPE_AXES)),
+                port(
+                    "latents",
+                    PortKind::Latents,
+                    PATCH_FEATURES,
+                    &[Stream::Image],
+                ),
+                port("pad", PortKind::Latents, 1, &[Stream::Image]),
+                port("context", PortKind::Context, d.dim, &[Stream::Context]),
+                port(
+                    "timestep",
+                    PortKind::LaneVector,
+                    1,
+                    &[Stream::Image, Stream::Context],
+                ),
+                port(
+                    "positions",
+                    PortKind::AxisPositions,
+                    axes,
+                    &[Stream::Image, Stream::Context],
+                ),
             ],
             readout: ReadoutKind::Velocity,
             readout_width: PATCH_FEATURES,
@@ -341,7 +375,11 @@ fn refine(arm: &Input<Facts>, d: &Dims, m: &Dit) {
     let c = arm.context(port::CONTEXT, d.cap_width);
     let c = ops::elemwise::rmsnorm(&c, &m.cap_norm, NORM_EPS);
     let c = linear(&m.cap_embed, &c);
-    let c = pad_rows(&c, &arm.tokens(), &m.cap_pad_mod);
+    let c = pad_rows(
+        &c,
+        &arm.latents(port::PAD_CAPTION, 1, Dtype::Bf16),
+        &m.cap_pad_mod,
+    );
     let geom = Geom {
         positions: arm.axis_positions(port::POSITIONS, ROPE_AXES),
         perm: arm.row_permutation(),
@@ -397,7 +435,11 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     };
     let x = img.latents(port::LATENTS, PATCH_FEATURES, Dtype::Bf16);
     let x = linear(&m.x_embed, &x);
-    let mut x = pad_rows(&x, &img.tokens(), &m.x_pad_mod);
+    let mut x = pad_rows(
+        &x,
+        &img.latents(port::PAD_IMAGE, 1, Dtype::Bf16),
+        &m.x_pad_mod,
+    );
     for (_, block) in img.walk_layers(&m.noise_refiner) {
         let mods = adaln4(
             &linear(
@@ -467,11 +509,12 @@ fn linear(w: &Linear, x: &Value) -> Value {
     ops::elemwise::add_bias(&w.bias, &ops::linear::matmul(x, &w.w))
 }
 
-/// Overwrite the flagged rows with the learned pad token: one gather of the
-/// `[2, 2·dim]` scale-shift table by the pad flags, one per-row modulate.
-/// A real row (flag 0) is `x·(1+0)+0`; a pad row (flag 1) is `x·(1−1)+pad`.
-fn pad_rows(x: &Value, flags: &Value, table: &Weight) -> Value {
-    let m = ops::layout::embed(flags, table, 2);
+/// Overwrite the flagged rows with the learned pad token: the `[rows, 1]`
+/// flag projected through the `[2·dim, 1]` bank to a per-row `[−f | f·pad]`
+/// scale-shift, applied with one modulate. A real row (`f = 0`) is
+/// `x·(1+0)+0`; a pad row (`f = 1`) is `x·(1−1)+pad`.
+fn pad_rows(x: &Value, flag: &Value, bank: &Weight) -> Value {
+    let m = ops::linear::matmul(flag, bank);
     ops::elemwise::modulate(x, &m, None, ModulateForm::ScaleShift)
 }
 

@@ -213,6 +213,10 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             )
         );
         assert_eq!(
+            at(denoise, "pad"),
+            (model::port::PAD_IMAGE, PortKind::Latents, 1)
+        );
+        assert_eq!(
             at(denoise, "context"),
             (model::port::CONTEXT, PortKind::Context, d.dim)
         );
@@ -226,6 +230,10 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         let refine = reading("refine");
         assert_eq!(
+            at(refine, "pad"),
+            (model::port::PAD_CAPTION, PortKind::Latents, 1)
+        );
+        assert_eq!(
             at(refine, "caption"),
             (model::port::CONTEXT, PortKind::Context, d.cap_width)
         );
@@ -233,6 +241,26 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             at(refine, "positions"),
             (model::port::POSITIONS, PortKind::AxisPositions, axes)
         );
+        // Which lanes bind what: the pad and the latents are the image
+        // lane's, the context the caption lane's, the timestep and the
+        // positions both lanes' (the joint trunk modulates every row by its
+        // own lane's vector).
+        let streams = |reading: &models::ReadingFact, name: &str| {
+            reading.port(name).unwrap().1.streams.clone()
+        };
+        assert_eq!(streams(denoise, "latents"), vec![Stream::Image]);
+        assert_eq!(streams(denoise, "pad"), vec![Stream::Image]);
+        assert_eq!(streams(denoise, "context"), vec![Stream::Context]);
+        assert_eq!(
+            streams(denoise, "timestep"),
+            vec![Stream::Image, Stream::Context]
+        );
+        assert_eq!(
+            streams(denoise, "positions"),
+            vec![Stream::Image, Stream::Context]
+        );
+        assert!(!refine.has_kv && !refine.takes_tokens, "a float lane");
+        assert!(!denoise.has_kv && !denoise.takes_tokens, "float lanes");
         assert_eq!(refine.readout, ReadoutKind::Hidden);
         assert_eq!(refine.readout_width, d.dim);
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
@@ -450,8 +478,8 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
 }
 
 /// The modulation is a per-lane f32 scale over a bf16 trunk, the pad
-/// overwrite a per-row bf16 scale-shift, and every gated fold aliases the
-/// stream it folds into.
+/// overwrite a per-row bf16 scale-shift projected off the flag, and every
+/// gated fold aliases the stream it folds into.
 #[test]
 fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
     for sku in ROWS {
@@ -505,7 +533,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                             shape: vec![Dim::Tokens, Dim::Const(u64::from(2 * d.dim))],
                             dtype: Dtype::Bf16,
                         },
-                        "{sku}: the pad table is gathered per row in the trunk's dtype"
+                        "{sku}: the pad flag projects per row in the trunk's dtype"
                     );
                 }
             }

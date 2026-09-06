@@ -564,6 +564,16 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "z_image",
     },
+    // The synthetic generative row (M0). `layers` is its three blocks;
+    // `vocab` is zero because a denoise pass has no logits and nothing sizes
+    // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
+    // off the plan.
+    Row {
+        id: "mini-dit-bf16-kv-bf16",
+        layers: 3,
+        vocab: 0,
+        arch: "mini_dit",
+    },
 ];
 
 /// The row with this id, or `None` if this build ships no such model.

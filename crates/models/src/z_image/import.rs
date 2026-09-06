@@ -21,7 +21,7 @@
 //!   import. The modulation projections are cast too: the reference runs
 //!   them in bf16 under `torch_dtype=bf16`, and their activations stay f32
 //!   on this side regardless (a lane-vector chain lands f32);
-//! * the two learned pad tokens become `[2, 2·dim]` scale-shift tables (see
+//! * the two learned pad tokens become `[2·dim, 1]` flag projections (see
 //!   `model::Dit::x_pad_mod`), and the `1000` of the time reversal becomes
 //!   a `[1]` f32 weight: both stated by the contract algebra (`Fill`,
 //!   `Bias`, `Concat`) in the checkpoint's own dtype, since the IR has no
@@ -223,12 +223,14 @@ fn biased(b: &mut Builder, w: &Linear, stem: &str) -> Result<(), Error> {
     b.read(&w.bias, format!("{stem}.bias"))
 }
 
-/// The learned pad token `[1, dim]` as the `[2, 2·dim]` scale-shift table
-/// `model::Dit::x_pad_mod` describes: row 0 `[0 | 0]`, row 1 `[−1 | token]`.
+/// The learned pad token `[1, dim]` as the `[2·dim, 1]` flag projection
+/// `model::Dit::x_pad_mod` describes: `−1` down the first `dim` rows, the
+/// token down the next `dim`.
 ///
-/// `Bias` is a root-only kernel in the contract algebra, so the `−1` row is
-/// its own internal step (a zero fill plus `−1`) and the table is one affine
-/// concatenation over it and the stored token, cast to the declared dtype.
+/// `Bias` is a root-only kernel in the contract algebra, so the `−1` block
+/// is its own internal step (a zero fill plus `−1`) and the bank is one
+/// affine concatenation over it and the stored token, cast to the declared
+/// dtype. The token's `[1, dim]` bytes ARE its `[dim, 1]` bytes.
 fn pad_table(b: &mut Builder, src: &ztensor::Source, w: &Weight, token: &str) -> Result<(), Error> {
     let stored = stored_encoding(src, token)?;
     let Encoding::Raw(dtype) = stored.clone() else {
@@ -238,13 +240,13 @@ fn pad_table(b: &mut Builder, src: &ztensor::Source, w: &Weight, token: &str) ->
         });
     };
     let shape = extents(w);
-    let width = shape[1] / 2;
+    let dim = shape[0] / 2;
     let neg = format!("{}.neg", w.name);
     b.push(
         TensorContract::new(
             neg.clone(),
-            Expr::fill(0.0, TensorType::raw(vec![1, width], dtype)).bias(-1.0),
-            vec![1, width],
+            Expr::fill(0.0, TensorType::raw(vec![dim, 1], dtype)).bias(-1.0),
+            vec![dim, 1],
             stored,
         )
         .internal(),
@@ -254,8 +256,8 @@ fn pad_table(b: &mut Builder, src: &ztensor::Source, w: &Weight, token: &str) ->
         Expr::concat(
             0,
             vec![
-                Expr::fill(0.0, TensorType::raw(vec![1, 2 * width], dtype)),
-                Expr::concat(1, vec![Expr::out(neg), Expr::src(token)]),
+                Expr::out(neg),
+                Expr::src(token).transmute(TensorType::raw(vec![dim, 1], dtype)),
             ],
         ),
     )
