@@ -66,59 +66,6 @@ const REFUSED: &[Refusal] = &[
         file: "src/dispatch/attn.rs",
         needle: "op: \"attention.pool_lse_selected\"",
     },
-    // M0 (`crates/model-ir/IMAGEGEN_CONTRACT.md`): the image/video substrate's
-    // ops. Their kernels exist in `kernels-cuda`; the dispatch arms that reach
-    // them are the R2-ENGINE agent's, and until they land every arm below
-    // refuses by name in one `M0: wired by ...` block per file. Every other
-    // shell refuses them too, this phase.
-    Refusal {
-        op: "attention.ragged",
-        why: "the M0 ragged-attention dispatch arm is not wired yet",
-        file: "src/dispatch/attn.rs",
-        needle: "op: \"attention.ragged\"",
-    },
-    Refusal {
-        op: "layout.pack_rows",
-        why: "the M0 row-gather dispatch arm is not wired yet",
-        file: "src/dispatch/layout.rs",
-        needle: "Layout::PackRows { .. } | Layout::UnpackRows { .. }",
-    },
-    Refusal {
-        op: "layout.unpack_rows",
-        why: "the M0 row-scatter dispatch arm is not wired yet",
-        file: "src/dispatch/layout.rs",
-        needle: "Layout::PackRows { .. } | Layout::UnpackRows { .. }",
-    },
-    Refusal {
-        op: "elementwise.modulate",
-        why: "the M0 modulation dispatch arm is not wired yet",
-        file: "src/dispatch/elemwise.rs",
-        needle: "Elementwise::Modulate { .. }",
-    },
-    Refusal {
-        op: "elementwise.gated_residual_add",
-        why: "the M0 gated-fold dispatch arm is not wired yet",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::GatedResidualAdd { .. }",
-    },
-    Refusal {
-        op: "elementwise.sinusoid",
-        why: "the M0 timestep-embedding dispatch arm is not wired yet",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::Sinusoid { .. }",
-    },
-    Refusal {
-        op: "elementwise.silu",
-        why: "the M0 bare-activation dispatch arm is not wired yet",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::Silu { .. }",
-    },
-    Refusal {
-        op: "elementwise.rope_axes",
-        why: "the M0 axis-rope dispatch arm is not wired yet",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::RopeAxes { .. }",
-    },
 ];
 
 /// The one refusal a name cannot express: `elementwise.rope_mrope` is covered
@@ -163,23 +110,6 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
     ("gemma4-26b-a4b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
     ("gemma4-31b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
     ("gemma4-e4b-vision-bf16-kv-bf16", &[SPLIT_MROPE]),
-    // TODO(R2-ENGINE): the synthetic generative row names every M0 op at
-    // once, which is what it is for. Drop this entry — the whole of it — when
-    // the CUDA dispatch arms above are wired; nothing else in the catalog
-    // reaches them.
-    (
-        "mini-dit-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
 ];
 
 /// The ops one row names. A split M-RoPE is reported under its own synthetic
