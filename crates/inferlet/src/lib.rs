@@ -121,8 +121,34 @@ pub fn monotonic_now_ns() -> u64 {
     crate::wasi::clocks::monotonic_clock::now()
 }
 
+/// User <-> process communication. `send`/`send_file` carry text and bytes the
+/// guest already holds; `send_frames` and `send_pcm` carry a HANDLE, so the
+/// encoded file is built host-side and streamed to the client without ever
+/// being a value in this module's address space.
 pub mod session {
     pub use crate::pie::inferlet::session::*;
+}
+
+/// Pixel and sample OUTPUT — the inverse of [`media`].
+///
+/// A [`Frames`](frames::Frames) handle holds decoded pixels host-side
+/// (`count` frames of `width` x `height` RGB8) and a [`Pcm`](frames::Pcm)
+/// handle holds interleaved f32 samples. The guest never sees either payload;
+/// it asks for facts, and picks one of two exits:
+///
+/// ```ignore
+/// let clip = frames::Frames::from_rgb8(&rgb, 512, 512, 16, 24.0)?;
+/// // The happy path: encoded host-side, streamed out, never in linear memory.
+/// session::send_frames(&clip, frames::ImageFormat::Mp4H264, "out.mp4")?;
+/// // The other door, when the guest itself needs the bytes:
+/// let png = still.encode(frames::ImageFormat::Png)?;
+/// ```
+///
+/// `png`/`jpeg`/`webp` are stills and refuse a multi-frame handle by name;
+/// `y4m` is the uncompressed clip; `mp4-h264` is NVENC plus the runtime's own
+/// ISO-BMFF muxer, and refuses by name on a machine without an encoder.
+pub mod frames {
+    pub use crate::pie::inferlet::frames::{AudioFormat, Frames, ImageFormat, Pcm};
 }
 
 /// Grammar compilation + incremental matching (the WIT `grammar` interface).

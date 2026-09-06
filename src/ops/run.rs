@@ -43,6 +43,13 @@ pub struct RunArgs {
     #[arg(long, short = 'm')]
     pub manifest: Option<PathBuf>,
 
+    /// Write every file the inferlet sends into this directory, creating it
+    /// if it does not exist. Without it a file is announced and dropped,
+    /// which is all this command could do before `session.send-frames` gave
+    /// files a name.
+    #[arg(long = "out", short = 'o', value_name = "DIR")]
+    pub out: Option<PathBuf>,
+
     /// Arguments for the inferlet itself, after `--`. `--prompt hi` arrives as
     /// `{"prompt": "hi"}`; a bare `--stream` arrives as `{"stream": true}`.
     // `last` rather than `trailing_var_arg`: the separator is then required, so
@@ -302,6 +309,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate:
         &target,
         &program,
         &args.arguments,
+        args.out.as_deref(),
     )
     .await;
     fire_probes().await;
@@ -365,12 +373,37 @@ async fn fire_probes() {
 #[cfg(not(feature = "profile-fire"))]
 async fn fire_probes() {}
 
+/// Write one received file into `dir`, under the name the inferlet suggested.
+///
+/// The name is sanitised by [`ReceivedFile::file_name`] and then joined, and
+/// the join is checked: a name that escapes `dir` is refused rather than
+/// written, because `pie run -o` points at a directory a person chose and an
+/// inferlet does not get to pick a different one.
+fn write_received(
+    dir: &Path,
+    file: &client::client::ReceivedFile,
+    index: usize,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let name = file.file_name(&format!("file-{index:04}.bin"));
+    let path = dir.join(&name);
+    if path.parent() != Some(dir) {
+        bail!(
+            "the inferlet asked for {name:?}, which is not a name in {}",
+            dir.display()
+        );
+    }
+    std::fs::write(&path, &file.data).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 /// Connect, upload if local, launch, and mirror everything the process says.
 async fn drive(
     addr: &str,
     target: &Target,
     program: &str,
     arguments: &[String],
+    out_dir: Option<&Path>,
 ) -> Result<std::process::ExitCode> {
     let client = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "pie-run")
         .await
@@ -400,6 +433,9 @@ async fn drive(
     // What the inferlet has already shown, kept so the return value can be
     // recognised as a repeat of it rather than assumed to be one.
     let mut shown = String::new();
+    // Numbers the fallback names, so an inferlet that sends three unnamed
+    // files does not write one file three times.
+    let mut files_written = 0usize;
     let code = loop {
         match process.recv().await.context("reading process output")? {
             ProcessEvent::Stdout(text) => {
@@ -417,9 +453,26 @@ async fn drive(
                 shown.push_str(&text);
                 println!("{text}");
             }
-            ProcessEvent::File(bytes) => {
-                eprintln!("[received a {} byte file]", bytes.len());
-            }
+            ProcessEvent::File(file) => match out_dir {
+                Some(dir) => match write_received(dir, &file, files_written) {
+                    Ok(path) => {
+                        files_written += 1;
+                        eprintln!("[wrote {} ({} bytes)]", path.display(), file.data.len());
+                    }
+                    // Not fatal: the inferlet is still running and its output
+                    // is still worth having. The reason goes to stderr and the
+                    // run carries on.
+                    Err(error) => eprintln!("[could not write a received file: {error:#}]"),
+                },
+                None => eprintln!(
+                    "[received a {} byte file{}; pass `-o DIR` to write it]",
+                    file.data.len(),
+                    match &file.name {
+                        Some(n) => format!(" named {n:?}"),
+                        None => String::new(),
+                    }
+                ),
+            },
             // Printed unless it is a repeat of what the reader already saw.
             //
             // `chat-completion` returns the completion it just streamed token

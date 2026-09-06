@@ -33,11 +33,47 @@ pub enum ProcessEvent {
     /// An inferlet text message (via session::send).
     Message(String),
     /// A binary file sent from the inferlet.
-    File(Vec<u8>),
+    File(ReceivedFile),
     /// Process completed successfully with a return value.
     Return(String),
     /// Process terminated with an error.
     Error(String),
+}
+
+/// One complete file the inferlet sent, reassembled and hash-checked.
+///
+/// The name is the one the inferlet suggested (`session.send-frames` /
+/// `send-pcm` name their output; plain `send-file` does not), UNSANITISED —
+/// it came off the wire. [`ReceivedFile::file_name`] is the accessor that
+/// makes it safe to join onto a directory, and it is the one a writer should
+/// use.
+#[derive(Debug, Clone)]
+pub struct ReceivedFile {
+    /// The name the inferlet suggested, verbatim, or `None`.
+    pub name: Option<String>,
+    /// The file's bytes.
+    pub data: Vec<u8>,
+}
+
+impl ReceivedFile {
+    /// A file name safe to join onto a directory: the suggested name with any
+    /// directory part, `..`, and NUL stripped, falling back to `fallback`
+    /// when nothing usable is left.
+    ///
+    /// The runtime sanitises on the way out too; this is the check that
+    /// counts, because a client does not get to assume the server it is
+    /// talking to is the one that wrote that code.
+    pub fn file_name(&self, fallback: &str) -> String {
+        let raw = self.name.as_deref().unwrap_or("");
+        let tail = raw.rsplit(['/', '\\']).next().unwrap_or("");
+        let stripped = tail.replace('\0', "");
+        let base = stripped.trim();
+        if base.is_empty() || base == "." || base == ".." {
+            fallback.to_string()
+        } else {
+            base.to_string()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -62,6 +98,8 @@ const BUFFERED_PROCESS_TTL: Duration = Duration::from_secs(60);
 struct DownloadState {
     process_id: String,
     buffer: Vec<u8>,
+    /// The name the first chunk carried, if any.
+    name: Option<String>,
 }
 
 /// A client that interacts with the server.
@@ -609,12 +647,14 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
             chunk_index,
             total_chunks,
             chunk_data,
+            name,
         } => {
             // Initialize download state on first chunk
             if !inner.pending_downloads.contains_key(&file_hash) {
                 let state = DownloadState {
                     process_id: process_id.clone(),
                     buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
+                    name: name.clone(),
                 };
                 inner
                     .pending_downloads
@@ -638,7 +678,10 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                     route_process_event(
                         inner,
                         final_state.process_id,
-                        ProcessEvent::File(final_state.buffer),
+                        ProcessEvent::File(ReceivedFile {
+                            name: final_state.name,
+                            data: final_state.buffer,
+                        }),
                     )
                     .await;
                 }

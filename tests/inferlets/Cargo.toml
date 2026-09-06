@@ -34,6 +34,7 @@ members = [
     "dflash-speculative-bench",
     "rs-window-decode",
     "dry-repetition-penalty",
+    "frames-probe",
     "gumbel-watermark",
     "synthid-tournament-sampling",
     "classifier-free-guidance",
