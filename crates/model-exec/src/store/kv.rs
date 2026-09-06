@@ -65,6 +65,14 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             head_dim,
             ..
         }
+        | Attention::DecodeRel {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            ..
+        }
         => Some(Reader {
             q: *q,
             plan: *plan,
@@ -101,6 +109,15 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             ..
         }
         | Attention::PrefillLse {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            kv_heads,
+            ..
+        }
+        | Attention::PrefillRel {
             q,
             plan,
             cache,

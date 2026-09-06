@@ -379,6 +379,19 @@ pub struct Staged {
     packed: bool,
 }
 
+/// One decode token to lift off a device-only ring instead of the host
+/// round-trip: overwrite the staged token slab, on the stream after the H2D
+/// stage, with the value the previous fire's epilogue wrote to the ring's
+/// device cells. `dst_off` is the byte offset into the token slab; `src` the
+/// device cell address; `bytes` the cell's native width. Empty unless
+/// run-ahead is on, the default (see [`crate::program::Session::token_device_source`]).
+#[derive(Clone, Copy, Debug)]
+pub struct TokenInject {
+    pub dst_off: u64,
+    pub src: u64,
+    pub bytes: usize,
+}
+
 /// The resident inputs, carved once.
 #[derive(Debug)]
 pub struct Inputs {
@@ -1128,6 +1141,7 @@ impl Inputs {
         stream: *mut core::ffi::c_void,
         slot: &SlotGuard,
         staged: &Staged,
+        token_injects: &[TokenInject],
     ) -> Result<Handles> {
         let Staged {
             rows,
@@ -1230,6 +1244,22 @@ impl Inputs {
 
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
+
+        // Device-injected decode tokens: overwrite the token cell with the
+        // value the previous fire's epilogue left on the device-only ring.
+        // MUST run after the batched H2D above (which staged the placeholder
+        // into the same slab) so the injection is the last write to the cell.
+        // The token is already on-device; this drops the round-trip's
+        // dependence on the host having read it, and is byte-identical to the
+        // host path when the sources agree.
+        for inject in token_injects {
+            crate::device::copy_d2d(
+                stream,
+                base + at_tokens + inject.dst_off,
+                inject.src,
+                inject.bytes,
+            )?;
+        }
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),

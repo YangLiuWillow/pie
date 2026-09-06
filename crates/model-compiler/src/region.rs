@@ -129,6 +129,7 @@ pub(crate) fn is_router(node: &model_ir::Node) -> bool {
             Linear::MoeTopkSoftmax { .. }
                 | Linear::MoeTopkSoftmaxScaled { .. }
                 | Linear::MoeTopkSigmoid { .. }
+                | Linear::MoeTopkSigmoidSink { .. }
                 | Linear::MoeTopkSqrtSoftplus { .. }
                 | Linear::MoeHashRoute { .. }
         )

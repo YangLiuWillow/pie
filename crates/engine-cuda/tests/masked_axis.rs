@@ -133,10 +133,14 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     // joined to a canvas whose rows all see each other — so the arm it takes
     // is `attention.masked{causal: false}`, the reading the diffusion axis
     // was built for.
-    const DECLARE: [&str; 6] = [
+    // Muse Glimmer states the mask predicate its qwen siblings do — it is a
+    // text decoder with the same rel-bias attention, and it arrived on `dev`
+    // while the image families were landing.
+    const DECLARE: [&str; 7] = [
         "gemma4-",
         "diffusiongemma-",
         "hunyuanimage3-",
+        "muse-glimmer-",
         "qwen35-",
         "qwen36-",
         "qwen38-",

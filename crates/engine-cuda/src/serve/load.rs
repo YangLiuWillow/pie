@@ -73,6 +73,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         // The adaLN peepholes (design D6): a scale-free norm into its
         // modulation, and the gated fold into both.
         boot.trace = model_ir::fuse::modulation(boot.trace.clone());
+        boot.trace = model_ir::fuse::q_norm_rope(boot.trace.clone());
+        boot.trace = model_ir::fuse::embed_select(boot.trace.clone());
     }
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
@@ -384,11 +386,13 @@ impl Shell {
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,
+            runahead: boot.runahead,
             voxels,
             weights,
             arena,
             pools,
             buffers,
+            rs_scratch: None,
             predicate,
             inputs,
             facts,

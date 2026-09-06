@@ -2,7 +2,7 @@
 
 use crate::error::Error;
 
-use crate::attn::fa2_abi::{DecodeParams, Partials, PrefillPagedParams};
+use crate::attn::fa2_abi::Partials;
 use crate::attn::plan::Device;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
@@ -16,6 +16,10 @@ pub enum DecodeArm {
     Window,
     CaptureFull,
     CaptureWindow,
+    /// The learned relative-position bias, over the whole sequence.
+    RelBiasFull,
+    /// The same bias inside a sliding window.
+    RelBiasWindow,
 }
 
 /// The prefill variants, same bargain as [`DecodeArm`].
@@ -31,6 +35,8 @@ pub enum PrefillArm {
     NoneCapture,
     CustomSoftcap,
     Custom,
+    CausalRelBiasFull,
+    CausalRelBiasWindow,
 }
 
 /// One fa2 head width outside the stamped lattice, refused before NVRTC ever sees a name for it.
@@ -59,6 +65,8 @@ fn decode_symbol(
         DecodeArm::Window => ("VariantWindow", "DecodeParams"),
         DecodeArm::CaptureFull => ("CaptureFull", "DecodeCaptureParams"),
         DecodeArm::CaptureWindow => ("CaptureWindow", "DecodeCaptureParams"),
+        DecodeArm::RelBiasFull => ("VariantRelBiasFull", "DecodeRelParams"),
+        DecodeArm::RelBiasWindow => ("VariantRelBiasWindow", "DecodeRelParams"),
     };
     Ok(symbol(&format!(
         "::flashinfer::BatchDecodeWithPagedKVCacheKernel<\
@@ -92,6 +100,8 @@ fn prefill_symbol(
         PrefillArm::NoneCapture => ("kNone", "CapturePrefill", "PrefillCaptureParams"),
         PrefillArm::CustomSoftcap => ("kCustom", "VariantCustomSoftcap", "PrefillParams"),
         PrefillArm::Custom => ("kCustom", "VariantCustom", "PrefillParams"),
+        PrefillArm::CausalRelBiasFull => ("kCausal", "VariantRelBiasFull", "PrefillRelParams"),
+        PrefillArm::CausalRelBiasWindow => ("kCausal", "VariantRelBiasWindow", "PrefillRelParams"),
     };
     Ok(symbol(&format!(
         "::flashinfer::BatchPrefillWithPagedKVCacheKernel<\
@@ -190,11 +200,11 @@ pub(crate) fn block<P>(params: &P) -> ArgValue {
     }
 }
 
-pub(crate) fn decode(
+pub(crate) fn decode<P>(
     ctx: &Ctx,
     op: &'static str,
     at: DecodePoint,
-    params: &DecodeParams,
+    params: &P,
 ) -> Result<(), Error> {
     let geometry =
         DecodeGeometry::derive(op, at.head_dim, at.group_size, KvWidth::BF16, &at.device)?;
@@ -212,11 +222,11 @@ pub(crate) fn decode(
     )
 }
 
-pub(crate) fn prefill(
+pub(crate) fn prefill<P>(
     ctx: &Ctx,
     op: &'static str,
     at: PrefillPoint,
-    params: &PrefillPagedParams,
+    params: &P,
 ) -> Result<(), Error> {
     let geometry = PrefillGeometry::derive(
         op,
@@ -311,6 +321,26 @@ pub fn prefill_arm(full_attention_variant: bool, causal: bool, logits_soft_cap: 
         PrefillArm::CausalSoftcap
     } else {
         PrefillArm::CausalWindow
+    }
+}
+
+/// The relative-bias arms carry no softcap and no custom mask: the one
+/// choice left is whether the schedule windows.
+#[must_use]
+pub fn decode_rel_arm(full_attention_variant: bool, window_left: i32) -> DecodeArm {
+    if full_attention_variant && window_left < 0 {
+        DecodeArm::RelBiasFull
+    } else {
+        DecodeArm::RelBiasWindow
+    }
+}
+
+#[must_use]
+pub fn prefill_rel_arm(full_attention_variant: bool, window_left: i32) -> PrefillArm {
+    if full_attention_variant && window_left < 0 {
+        PrefillArm::CausalRelBiasFull
+    } else {
+        PrefillArm::CausalRelBiasWindow
     }
 }
 
@@ -587,13 +617,17 @@ impl DecodeGeometry {
                 format!("fa2 decode head_dim {head_dim} needs bdx > 32 (decode.cuh:765)"),
             ));
         }
-        // GQA group values the lattice is stamped for.
-        if !matches!(group_size, 1 | 2 | 3 | 4 | 8 | 12) {
+        // GQA group values the lattice is stamped for. 16 is Muse Glimmer's
+        // (32 query heads over 2 kv heads): `bdy` 16 by `bdx` 16 is a
+        // 256-thread block with `bdz` 1, inside what `decode.cuh` admits. 6
+        // is Qwen3.8-27B's (24 over 4 at head width 256): `bdy` 6 by `bdx`
+        // 32, a 192-thread block with `bdz` 1.
+        if !matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16) {
             return Err(refuse(
                 op,
                 format!(
-                    "fa2 decode GQA group {group_size} is outside DISPATCH_GQA_GROUP_SIZE \
-                     (utils.cuh:164)"
+                    "fa2 decode GQA group {group_size} is outside the stamped lattice \
+                     (1, 2, 3, 4, 6, 8, 12, 16)"
                 ),
             ));
         }

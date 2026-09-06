@@ -834,6 +834,13 @@ impl Run<'_> {
                 *dilation,
                 self.tensor(*y),
             ),
+            // Inkling's relative-bias attention and short convolution: CUDA only.
+            Attention::DecodeRel { .. }
+            | Attention::PrefillRel { .. }
+            | Attention::ShortConv { .. }
+            | Attention::ShortConvChunked { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
             Attention::BlockDynConv {
                 x,
                 coeff,

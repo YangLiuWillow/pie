@@ -900,6 +900,16 @@ instantiate_mxfp4_qmm_t_routed_plain(64, 64)
       const device bfloat*, device bfloat*, const constant int&,              \
       const constant int&, const device int*, uint3, uint, uint);
 
+// The 8-row rung: a verify block routes a few rows to each expert it
+// touches (a DFlash block of 8-16 rows on gemma-4-26B-A4B lands ~5 rows an
+// expert), so a 16-row tile would spend most of its MMA on padding while
+// the matvec arm dequantizes the same expert once per pair. Measured through
+// `DeviceTuning::moe_batch_min_pairs` and it LOSES to the matvec by 2.4x at
+// eight rows (too few threadgroups, each a serial k walk); kept stamped so
+// the measurement can be repeated, not because it is served.
+instantiate_qmm_t_routed_fp16(8, 16)
+instantiate_qmm_t_routed_fp16(8, 32)
+instantiate_qmm_t_routed_fp16(8, 64)
 instantiate_qmm_t_routed_fp16(16, 16)
 instantiate_qmm_t_routed_fp16(16, 32)
 instantiate_qmm_t_routed_fp16(16, 64)

@@ -119,7 +119,10 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
             // Fused by the CUDA load only (`model_ir::fuse::gemm_epilogues`).
-            Linear::MatmulGeglu { .. } | Linear::LmHeadSoftcap { .. } => {
+            Linear::MatmulGeglu { .. }
+            | Linear::LmHeadSoftcap { .. }
+            | Linear::RelBias { .. }
+            | Linear::MoeTopkSigmoidSink { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Linear::MlpGegluTanhPacked {

@@ -113,6 +113,14 @@ impl Shell {
         self.exports.mtp.is_some()
     }
 
+    /// The width of the `mtp.drafts` token plane — what a guest sizes its
+    /// `IntrinsicId::MtpDrafts` read by — or zero for a text with no block
+    /// drafter.
+    #[must_use]
+    pub fn mtp_depth(&self) -> u32 {
+        self.exports.drafts_depth
+    }
+
     /// Does this load's model text declare a capture arm for attention scores?
     #[must_use]
     pub fn captures_scores(&self) -> bool {

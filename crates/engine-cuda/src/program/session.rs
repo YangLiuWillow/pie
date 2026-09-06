@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Port};
 use eta_ir::validate::Direction;
 use kernels_cuda::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
@@ -401,6 +401,39 @@ impl Session {
         ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
+    /// The device-side source of the [`Port::EmbedTokens`] cell this fire
+    /// will read, when the token lives on a device-only ring: `(cell
+    /// address, native bytes)`. The token is already on device — the host
+    /// round-trip only relocates it into the inputs slab — so this lets the
+    /// commit inject it device-to-device instead. `None` (keep the host
+    /// round-trip) when the port is const, host-facing, or unresolved for
+    /// the class. Read at `head`, the same cell [`ports::resolve`] reads.
+    ///
+    /// This states WHERE the token is, not whether run-ahead wants it there.
+    /// That policy is [`engine::runahead::Runahead::runs_ahead`] and is asked
+    /// at one site, in `serve::prepare`.
+    #[must_use]
+    pub fn token_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
+        if !ports::resolves(class, Port::EmbedTokens) {
+            return None;
+        }
+        let binding = plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
+        let channel = binding.channel as usize;
+        let endpoint = self.rings.endpoint(channel)?;
+        if endpoint.role() != HostRole::None {
+            return None;
+        }
+        let base = endpoint.device_cells()?;
+        let native = u32::try_from(self.shapes.get(channel)?.cell_bytes()).ok()?;
+        let head = self.cursors_now().get(channel)?.head;
+        let src = base + (head % u64::from(endpoint.cap1())) * u64::from(native);
+        Some((src, native))
+    }
+
     /// Point one intrinsic at a device buffer, for every stage of this
     /// instance; survives a fire. `width` is the row width, `row_stride` the
     /// elements between rows, `row_offset` the row this instance reads.
@@ -490,6 +523,18 @@ impl Session {
                 "this program reads the `mtp_logits` intrinsic and no buffer has \
                  been bound to it; a model whose text declares no `mtp` export has \
                  no draft column for it to point at",
+            ));
+        }
+
+        // And the token plane beside it.
+        if plan.needs_mtp_drafts
+            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpDrafts as u32)) == 0
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `mtp_drafts` intrinsic and no buffer has \
+                 been bound to it; a model whose text plants no `mtp.drafts` export \
+                 has no token plane for it to point at",
             ));
         }
 

@@ -320,6 +320,11 @@ impl ForwardHybrid for Model {
         };
 
         let logits = ops::linear::lm_head(&x, head);
+        let logits = if head_banded(m, head) {
+            ops::collective::all_gather(&logits, m.tp)
+        } else {
+            logits
+        };
 
         // The block's proposals: one draft a block row, the same
         // `[rows, depth]` seam shape the chained heads plant at depth one.
@@ -413,6 +418,11 @@ impl ForwardHybrid for Model {
                     None => dy.clone(),
                 };
                 let draft = ops::linear::lm_head(&read, head);
+                let draft = if head_banded(m, head) {
+                    ops::collective::all_gather(&draft, m.tp)
+                } else {
+                    draft
+                };
                 if step == 0 {
                     seam::at(seam::MTP, &[&draft]);
                 }
@@ -659,4 +669,14 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let o =
         ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps, GateActivation::Silu);
     ops::linear::matmul(&o, &g.out_proj)
+}
+
+/// Whether the readout head is vocab-BANDED across ranks: its declared rows are
+/// this rank's share, not the whole vocabulary, so the `lm_head` above landed
+/// this rank's COLUMNS of the logits and the plan wants all of them.
+///
+/// Only ever true of a `Head::Bank`: a tied head is the embedding table, which
+/// is left whole because its gather would need banding too.
+fn head_banded(m: &Model, head: &Weight) -> bool {
+    head.dim(0) < u64::from(m.vocab)
 }

@@ -5,9 +5,11 @@
 use kernels_cuda::attn::{self, fa2, index, mla, plan, pool};
 use kernels_cuda::attn_dense;
 use model_exec::{DispatchAttention, KernelError};
-use model_ir::{Attention, StructKind};
+use model_ir::{Attention, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
+use kernels_cuda::RaggedTensor;
+use model_ir::ValueId;
 
 impl DispatchAttention for Run<'_> {
     fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
@@ -247,6 +249,71 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
+            Attention::DecodeRel {
+                q,
+                plan,
+                cache,
+                bias,
+                window,
+                head_dim,
+                extent,
+                sm_scale,
+                log_floor,
+                log_alpha,
+                o,
+            } => attn::decode_rel(
+                self.ctx(),
+                self.ragged_q(*q),
+                self.decode_plan(*plan),
+                &self.pool_absolute(*cache),
+                attn::RelBias {
+                    bias: self.tensor(*bias),
+                    extent: *extent,
+                    log_floor: *log_floor,
+                    log_alpha: *log_alpha,
+                },
+                *window,
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+            ),
+            // The relative-bias arm is FA2's; an sm90 schedule has no
+            // launcher for it yet.
+            Attention::PrefillRel {
+                q,
+                plan,
+                cache,
+                bias,
+                window,
+                head_dim,
+                kv_heads,
+                extent,
+                sm_scale,
+                log_floor,
+                log_alpha,
+                o,
+            } => match self.slot(*plan) {
+                StructSlot::PrefillSm90(_) => {
+                    Err(kernels_cuda::Error::Unsupported { op: op.name() })
+                }
+                _ => attn::prefill_rel(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    &self.pool_absolute(*cache),
+                    attn::RelBias {
+                        bias: self.tensor(*bias),
+                        extent: *extent,
+                        log_floor: *log_floor,
+                        log_alpha: *log_alpha,
+                    },
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                ),
+            },
             // A prefill plan holds either kind the trace declared. Uses
             // `ragged_q` (FA2's by-value params block CSR must match q's raw
             // pointer), so cache/schedule state goes absolute with it too.
@@ -690,20 +757,76 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
-            } => attn::ssm::causal_conv1d(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                &self.recurrent(*state),
-                *conv_width,
-                *dilation,
-                &mut self.tensor(*y),
-            ),
+            } => {
+                if self.rs_extended() {
+                    return self.conv1d_extended(
+                        "attention.ssm_causal_conv1d",
+                        *x,
+                        *weight,
+                        *state,
+                        *conv_width,
+                        *dilation,
+                        *y,
+                    );
+                }
+                attn::ssm::causal_conv1d(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*weight),
+                    &self.recurrent(*state),
+                    *conv_width,
+                    *dilation,
+                    &mut self.tensor(*y),
+                )
+            }
             // `x` is the conv's in-projection rows: a `RsVerb::Buffer` lane
             // scatters them into a slab and `RsVerb::FoldBuffered` gathers
             // them back over the GEMM output. 2R split: the head runs
             // `[0, n)` and folds, the tail runs `[n, rows)` from the head's
             // rolling state (a row folding a prefix can't be one call).
+            Attention::ShortConv {
+                x,
+                weight,
+                state,
+                conv_width,
+                y,
+            } => attn::ssm::short_conv(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                &self.recurrent(*state),
+                *conv_width,
+                &mut self.tensor(*y),
+            ),
+            // The short conv's prefill arm keeps the recurrent conv's state
+            // discipline (the absolute lane door, the committed tail).
+            Attention::ShortConvChunked {
+                x,
+                weight,
+                state,
+                conv_width,
+                y,
+            } => {
+                self.rs_move("attention.short_conv_chunked", *x, self.tensor(*x))?;
+                let tail = self.recurrent_tail_absolute(*state);
+                attn::ssm::short_conv_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*x),
+                    self.tensor(*weight),
+                    &self.recurrent_absolute(*state),
+                    *conv_width,
+                    &mut self.tensor(*y),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                attn::ssm::short_conv_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*x),
+                    self.tensor(*weight),
+                    &tail,
+                    *conv_width,
+                    &mut self.tensor(*y),
+                )
+            }
             Attention::SsmCausalConv1dChunked {
                 x,
                 weight,
@@ -712,6 +835,17 @@ impl Run<'_> {
                 dilation,
                 y,
             } => {
+                if self.rs_extended() {
+                    return self.conv1d_extended(
+                        "attention.ssm_causal_conv1d_chunked",
+                        *x,
+                        *weight,
+                        *state,
+                        *conv_width,
+                        *dilation,
+                        *y,
+                    );
+                }
                 self.rs_move("attention.ssm_causal_conv1d_chunked", *x, self.tensor(*x))?;
                 // Only the chunked arms take the absolute lane door: a body
                 // bakes its slot map, so `lane_offset` isn't a function of
@@ -803,6 +937,19 @@ impl Run<'_> {
                 a_log,
                 gates,
             } => {
+                if self.rs_extended() {
+                    const OP: &str = "attention.ssm_gdn_prep";
+                    let ba_ext = self.rs_extend(OP, *ba, true)?;
+                    let mut gates_ext = self.rs_out(OP, *gates)?;
+                    attn::ssm::gdn_prep(
+                        self.ctx(),
+                        ba_ext,
+                        self.tensor(*dt_bias),
+                        self.tensor(*a_log),
+                        &mut gates_ext,
+                    )?;
+                    return self.rs_land(OP, gates_ext, *gates);
+                }
                 self.rs_move("attention.ssm_gdn_prep", *ba, self.tensor(*ba))?;
                 attn::ssm::gdn_prep(
                     self.ctx(),
@@ -822,18 +969,34 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta(
-                self.ctx(),
-                self.tensor(*qkv),
-                self.tensor(*z),
-                self.tensor(*gates),
-                &self.recurrent(*state),
-                *k_heads,
-                *v_heads,
-                *k_dim,
-                *v_dim,
-                &mut self.tensor(*y),
-            ),
+            } => {
+                if self.rs_extended() {
+                    return self.gated_delta_extended(
+                        "attention.ssm_gated_delta",
+                        *qkv,
+                        *z,
+                        *gates,
+                        *state,
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                        *y,
+                    );
+                }
+                attn::ssm::gated_delta(
+                    self.ctx(),
+                    self.tensor(*qkv),
+                    self.tensor(*z),
+                    self.tensor(*gates),
+                    &self.recurrent(*state),
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    &mut self.tensor(*y),
+                )
+            }
             // Same 2R split as the chunked conv above: the head folds the
             // boundary into the bank, the tail continues from what the head
             // wrote.
@@ -848,6 +1011,20 @@ impl Run<'_> {
                 v_dim,
                 y,
             } => {
+                if self.rs_extended() {
+                    return self.gated_delta_extended(
+                        "attention.ssm_gated_delta_chunked",
+                        *qkv,
+                        *z,
+                        *gates,
+                        *state,
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                        *y,
+                    );
+                }
                 let tail = self.recurrent_tail_absolute(*state);
                 attn::ssm::gated_delta_chunked(
                     self.ctx(),
@@ -1190,12 +1367,44 @@ impl Run<'_> {
             }
             // DFlash2's dynamic block convolution has a Metal kernel and no
             // CUDA one yet; refused by name rather than approximated.
-            Attention::BlockDynConv { .. } => Err(kernels_cuda::Error::Unsupported {
-                op: "attention.block_dyn_conv",
-            }),
-            Attention::SelectorWalk { .. } => Err(kernels_cuda::Error::Unsupported {
-                op: "attention.selector_walk",
-            }),
+            Attention::BlockDynConv {
+                x,
+                coeff,
+                base,
+                side,
+                taps,
+                group,
+                y,
+            } => kernels_cuda::attn::dynconv::block_dyn_conv(
+                self.ctx(),
+                self.ragged(*x),
+                self.tensor(*coeff),
+                self.tensor(*base),
+                *side,
+                *taps,
+                *group,
+                &mut self.tensor(*y),
+            ),
+            Attention::SelectorWalk {
+                cand,
+                unary,
+                hp,
+                tokens,
+                pred,
+                succ,
+                first,
+                picks,
+            } => kernels_cuda::attn::selector::walk(
+                self.ctx(),
+                self.ragged(*cand),
+                self.tensor(*unary),
+                hp.map(|hp| self.tensor(hp)),
+                self.tensor(*tokens),
+                self.tensor(*pred),
+                self.tensor(*succ),
+                *first,
+                &mut self.tensor(*picks),
+            ),
         }
     }
 }
@@ -1225,5 +1434,105 @@ impl Run<'_> {
             ),
             None => Ok(self.tensor(w)),
         }
+    }
+}
+
+/// **THE READ PATH'S RECURRENT ARMS** (`crate::run::RsScratch`): a lane that
+/// replays buffered tokens ahead of its rows runs the conv and the delta scan
+/// over the extended run `[replay | rows]` through the chunked kernels — the
+/// multi-row forms, whatever the lane's class — with the fire's own per-lane
+/// commit tables, which the host already counted in that layout. Only the
+/// lane's own rows land in the op's rectangle; the extended conv output and
+/// gates are kept for the scan by value.
+impl Run<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_extended(
+        &self,
+        op: &'static str,
+        x: ValueId,
+        weight: ValueId,
+        state: ValueId,
+        conv_width: u32,
+        dilation: u32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        let x_ext = self.rs_extend(op, x, true)?;
+        let csr = self.rs_ext_csr(op)?;
+        let mut y_ext = self.rs_out(op, y)?;
+        let tail = self.recurrent_tail_absolute(state);
+        attn::ssm::causal_conv1d_chunked(
+            self.ctx(),
+            RaggedTensor { data: x_ext, indptr: csr },
+            self.tensor(weight),
+            &self.recurrent_absolute(state),
+            conv_width,
+            dilation,
+            &mut y_ext,
+        )?;
+        if let Some(tail) = tail {
+            attn::ssm::causal_conv1d_chunked(
+                self.ctx(),
+                RaggedTensor { data: x_ext, indptr: csr },
+                self.tensor(weight),
+                &tail,
+                conv_width,
+                dilation,
+                &mut y_ext,
+            )?;
+        }
+        self.rs_land(op, y_ext, y)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_extended(
+        &self,
+        op: &'static str,
+        qkv: ValueId,
+        z: ValueId,
+        gates: ValueId,
+        state: ValueId,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        let qkv_ext = self.rs_ext_of(op, qkv)?;
+        let gates_ext = self.rs_ext_of(op, gates)?;
+        // The gate projection is no buffered plane: the replay rows' slots
+        // stay as they lie, since those rows' outputs are never read.
+        let z_ext = self.rs_extend(op, z, false)?;
+        let csr = self.rs_ext_csr(op)?;
+        let mut y_ext = self.rs_out(op, y)?;
+        let tail = self.recurrent_tail_absolute(state);
+        attn::ssm::gated_delta_chunked(
+            self.ctx(),
+            RaggedTensor { data: qkv_ext, indptr: csr },
+            z_ext,
+            gates_ext,
+            &self.recurrent_absolute(state),
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            &mut y_ext,
+        )?;
+        if let Some(tail) = tail {
+            attn::ssm::gated_delta_chunked(
+                self.ctx(),
+                RaggedTensor { data: qkv_ext, indptr: csr },
+                z_ext,
+                gates_ext,
+                &tail,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                &mut y_ext,
+            )?;
+        }
+        self.rs_land(op, y_ext, y)?;
+        self.rs_layer_done();
+        Ok(())
     }
 }

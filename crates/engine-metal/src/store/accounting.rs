@@ -31,9 +31,13 @@ pub struct Accounting {
     /// The resident weight tier's bytes: the slab plus every dense plane
     /// ([`Plan::device_demand`](crate::experts::Plan::device_demand)).
     pub weights: u64,
+    /// The arena scratch the compiled axes reserve — wired like the
+    /// weights, sized by `max_forward_tokens`. Zero at planning time, when
+    /// the axes are not compiled yet; the load re-admits with it.
+    pub scratch: u64,
     /// `min(128 MiB, working_set / 10)`, held back for the driver.
     pub floor: u64,
-    /// `ceiling - weights - floor`: what is left for the kv pool.
+    /// `ceiling - weights - scratch - floor`: what is left for the kv pool.
     pub pool: u64,
     /// The kv pool this load reserves at the declared context, across every
     /// cache row ([`pool_demand`](crate::store::pool_demand)).
@@ -45,6 +49,18 @@ impl Accounting {
     /// demands.
     #[must_use]
     pub fn of(working_set: u64, utilization: f64, weights: u64, minimum: u64) -> Accounting {
+        Accounting::with_scratch(working_set, utilization, weights, 0, minimum)
+    }
+
+    /// [`Accounting::of`] with the arena scratch counted beside the weights.
+    #[must_use]
+    pub fn with_scratch(
+        working_set: u64,
+        utilization: f64,
+        weights: u64,
+        scratch: u64,
+        minimum: u64,
+    ) -> Accounting {
         let fraction = if utilization.is_finite() {
             utilization.clamp(0.0, 1.0)
         } else {
@@ -63,8 +79,12 @@ impl Accounting {
             working_set,
             ceiling,
             weights,
+            scratch,
             floor,
-            pool: ceiling.saturating_sub(weights).saturating_sub(floor),
+            pool: ceiling
+                .saturating_sub(weights)
+                .saturating_sub(scratch)
+                .saturating_sub(floor),
             minimum,
         }
     }
@@ -93,17 +113,27 @@ impl Accounting {
             Some(bytes) => format!("{bytes} bytes"),
             None => "uncapped (the whole table resident)".to_string(),
         };
+        let scratch = if self.scratch > 0 {
+            format!(
+                ", the arena scratch the compiled axes reserve takes {} (sized by `[engine] \
+                 max_forward_tokens`)",
+                self.scratch
+            )
+        } else {
+            String::new()
+        };
         Err(Fault::Residency(format!(
             "the device does not hold this deployment: recommendedMaxWorkingSetSize is \
              {working_set} bytes, of which `[metal] gpu_mem_utilization` = {utilization} \
              allows pie {ceiling}; this load's resident weight tier takes {weights} \
-             (`device_weight_budget` {budget}) and the driver's safety floor holds back \
-             {floor}, leaving {pool} bytes for the kv pool — and this model's pool at the \
-             declared context needs {minimum} resident. On Apple Silicon a GPU-touched \
+             (`device_weight_budget` {budget}){scratch} and the driver's safety floor holds \
+             back {floor}, leaving {pool} bytes for the kv pool — and this model's pool at \
+             the declared context needs {minimum} resident. On Apple Silicon a GPU-touched \
              Shared page is WIRED and the pager never evicts it (.wiki/alto/streaming.md), \
              so this is a hard bound and not a hint: lower `[model] max_context` or `[model] \
-             slots`, raise `[metal] gpu_mem_utilization`, or state a smaller `[model] \
-             device_weight_budget` to stream the weight tier down.",
+             slots`, lower `[engine] max_forward_tokens`, raise `[metal] \
+             gpu_mem_utilization`, or state a smaller `[model] device_weight_budget` to \
+             stream the weight tier down.",
             working_set = self.working_set,
             ceiling = self.ceiling,
             weights = self.weights,
@@ -119,6 +149,24 @@ mod tests {
     use super::{Accounting, DEFAULT_GPU_MEM_UTILIZATION};
 
     const GIB: u64 = 1 << 30;
+
+    /// The arena scratch is wired like the weights: a load that fits without
+    /// it and crosses the ceiling with it is refused, and the refusal names
+    /// the knob that sizes it.
+    #[test]
+    fn the_arena_scratch_counts_against_the_ceiling() {
+        let ws = 21_800 * (GIB / 1000);
+        let util = DEFAULT_GPU_MEM_UTILIZATION;
+        let without = Accounting::of(ws, util, 11 * GIB, 4 * GIB);
+        assert!(without.admit(Some(11 * GIB), util).is_ok());
+        let with = Accounting::with_scratch(ws, util, 11 * GIB, 6 * GIB, 4 * GIB);
+        let why = with
+            .admit(Some(11 * GIB), util)
+            .expect_err("11 + 6 + 4 GiB is over ~19.6");
+        let said = format!("{why}");
+        assert!(said.contains("max_forward_tokens"), "the refusal names the scratch's knob: {said}");
+        assert_eq!(with.pool, without.pool - 6 * GIB);
+    }
 
     #[test]
     fn a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses() {

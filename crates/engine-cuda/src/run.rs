@@ -178,8 +178,10 @@ pub enum RsMove<'a> {
         pages: &'a [u32],
         /// Which buffer token this fire's first row lands at.
         at: u32,
-        /// How many of this fire's rows this lane also folds. `0` is a pure scatter; otherwise the fire also lands durable state on row `fold`, so speculation can restart without a second fire.
+        /// How many rows of the lane's EXTENDED run `[replay | rows]` this lane also folds. `0` is a pure scatter; otherwise the fire also lands durable state on row `fold`, so speculation can restart without a second fire.
         fold: u32,
+        /// **The buffer read path**: how many already-buffered tokens, at `[at - replay, at)`, are replayed through the recurrence AHEAD of this lane's rows. The recurrent arms then run over the extended run (`Run::rs_extend`), landing only the lane's own rows.
+        replay: u32,
     },
     /// Gather this lane's buffer over its rows: buffer token `t` becomes row `t`, for as many rows as the lane has.
     Gather {
@@ -190,6 +192,52 @@ pub enum RsMove<'a> {
     },
 }
 
+/// **The extended run's scratch** — one fire's bump allocator over a device span the shell grew for it, and the extended rectangles the recurrent arms landed so far, by value. A lane that replays buffered tokens ahead of its rows runs its conv, gate prep and delta scan over `[replay | rows]`; the inputs are assembled here, the outputs land here, and the lane's own rows are copied back to the op's rectangle. Reset when a layer's scan lands (`Run::rs_layer_done`), so the span only has to hold one layer's rectangles.
+#[derive(Debug)]
+pub struct RsScratch {
+    ptr: u64,
+    bytes: u64,
+    cursor: Cell<u64>,
+    ext: std::cell::RefCell<std::collections::HashMap<u32, Tensor>>,
+}
+
+impl RsScratch {
+    #[must_use]
+    pub fn new(ptr: u64, bytes: u64) -> Self {
+        Self {
+            ptr,
+            bytes,
+            cursor: Cell::new(0),
+            ext: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Bytes of scratch a fire of `rows_ext` extended rows needs: one layer's six rectangles at `ext_row_bytes` a row, each 256-aligned, plus the CSRs.
+    #[must_use]
+    pub fn need(rows_ext: u32, ext_row_bytes: u64) -> u64 {
+        u64::from(rows_ext.max(1)) * ext_row_bytes + 8 * 256 + 64 * 1024
+    }
+
+    fn take(&self, bytes: u64) -> crate::error::Result<u64> {
+        let at = self.cursor.get();
+        let end = at + bytes.max(4).next_multiple_of(256);
+        if end > self.bytes {
+            return Err(crate::error::Fault::Ceiling {
+                what: "recurrent extended-run scratch bytes",
+                need: end,
+                have: self.bytes,
+            });
+        }
+        self.cursor.set(end);
+        Ok(self.ptr + at)
+    }
+
+    fn reset(&self) {
+        self.cursor.set(0);
+        self.ext.borrow_mut().clear();
+    }
+}
+
 /// The buffered-activation plane, seated for one fire.
 #[derive(Debug, Clone, Copy)]
 pub struct RsSeat<'a> {
@@ -197,6 +245,10 @@ pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
     /// One verb per lane, in FIRE (seriated) order.
     pub lanes: &'a [RsMove<'a>],
+    /// Buffered tokens replayed ahead of each lane's rows, in FIRE order; zero for every lane of a fire with no read path.
+    pub replays: &'a [u32],
+    /// The extended run's scratch, for a fire some lane of which replays.
+    pub scratch: Option<&'a RsScratch>,
 }
 
 impl RsSeat<'_> {
@@ -268,6 +320,39 @@ impl RsSeat<'_> {
                 crate::device::copy_d2d(stream, dst, src, bytes)?;
                 done += take;
             }
+        }
+        Ok(())
+    }
+
+    /// Copy buffer tokens `[from, from + count)` of `plane` over `pages` into consecutive rows at `dst`, page piece by page piece (the read path's gather).
+    fn pages_to_rows(
+        &self,
+        stream: *mut core::ffi::c_void,
+        plane: crate::store::rs::Plane,
+        pages: &[u32],
+        from: u32,
+        count: u32,
+        dst: u64,
+    ) -> crate::error::Result<()> {
+        let page_tokens = self.buffers.page_tokens();
+        let elem = model_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
+            .expect("the buffered planes are bf16, which has an element size");
+        let row_bytes = plane.width * elem;
+        let mut done = 0u32;
+        while done < count {
+            let token = from + done;
+            let page = token / page_tokens;
+            let in_page = token % page_tokens;
+            let take = (page_tokens - in_page).min(count - done);
+            let page_slot = *pages.get(page as usize).ok_or(crate::error::Fault::Ceiling {
+                what: "rs buffer pages",
+                need: u64::from(page) + 1,
+                have: pages.len() as u64,
+            })?;
+            let slab = self.buffers.row(plane, page_slot, in_page)?;
+            let bytes = usize::try_from(u64::from(take) * row_bytes).unwrap_or(usize::MAX);
+            crate::device::copy_d2d(stream, dst + u64::from(done) * row_bytes, slab, bytes)?;
+            done += take;
         }
         Ok(())
     }
@@ -766,6 +851,191 @@ impl<'c> Run<'c> {
                 op,
                 detail: fault.to_string(),
             })
+    }
+
+    /// **Does some lane of this window replay buffered tokens ahead of its rows?** Then the recurrent arms run extended (`rs_extend`).
+    pub(crate) fn rs_extended(&self) -> bool {
+        let Some(seat) = self.rs.as_ref() else {
+            return false;
+        };
+        if seat.scratch.is_none() {
+            return false;
+        }
+        let lane0 = self.window().span().lane_offset as usize;
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        seat.replays.iter().skip(lane0).take(lanes).any(|&replay| replay > 0)
+    }
+
+    /// The extended run's layout for this window: per lane `(begin, replay, rows)` in extended rows, and the extended CSR.
+    fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
+        let lane0 = self.window().span().lane_offset as usize;
+        let bounds = self.qo_indptr_host();
+        let mut lanes = Vec::with_capacity(bounds.len().saturating_sub(1));
+        let mut csr = Vec::with_capacity(bounds.len());
+        let mut begin = 0u32;
+        csr.push(0i32);
+        for (r, pair) in bounds.windows(2).enumerate() {
+            let rows = (pair[1] - pair[0]).max(0) as u32;
+            let replay = seat.replays.get(lane0 + r).copied().unwrap_or(0);
+            lanes.push((begin, replay, rows));
+            begin += replay + rows;
+            csr.push(i32::try_from(begin).unwrap_or(i32::MAX));
+        }
+        (lanes, csr)
+    }
+
+    fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
+        kernels_cuda::Error::Backend {
+            op,
+            detail: fault.to_string(),
+        }
+    }
+
+    fn rs_seat_and_scratch(&self, op: &'static str) -> Result<(&RsSeat<'c>, &'c RsScratch), kernels_cuda::Error> {
+        let seat = self.rs.as_ref().ok_or_else(|| kernels_cuda::Error::Backend {
+            op,
+            detail: "the extended recurrent run of a fire with no buffered plane".to_string(),
+        })?;
+        let scratch = seat.scratch.ok_or_else(|| kernels_cuda::Error::Backend {
+            op,
+            detail: "the extended recurrent run of a fire the shell grew no scratch for".to_string(),
+        })?;
+        Ok((seat, scratch))
+    }
+
+    /// The extended CSR of this window, staged: lane `r` spans `replay_r + rows_r` rows.
+    pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let (_, csr) = self.rs_ext_layout(seat);
+        let bytes: Vec<u8> = csr.iter().flat_map(|n| n.to_le_bytes()).collect();
+        let at = scratch.take(bytes.len() as u64).map_err(|f| Self::rs_fault(op, f))?;
+        crate::device::stage_raw(self.ctx.stream(), at, &bytes).map_err(|f| Self::rs_fault(op, f))?;
+        Ok(Tensor::new(at, csr.len() as u32, 1, model_ir::Dtype::I32))
+    }
+
+    /// **Assemble the extended input for `id`**: the lane's buffered replay tokens gathered ahead of its own rows (a buffered plane), or its own rows behind a gap left as it lies (any other row operand — the replay rows' outputs are never read). The own rows are first moved by the lane's verb (`rs_move`), so a gathering lane's rows are already what the buffer holds. Answers the extended rectangle, `rows_ext` tall.
+    pub(crate) fn rs_extend(
+        &self,
+        op: &'static str,
+        id: ValueId,
+        buffered: bool,
+    ) -> Result<Tensor, kernels_cuda::Error> {
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let own = self.tensor(id);
+        self.rs_move(op, id, own)?;
+        let own = self.windowed(own);
+        let plane = seat.buffers.planes().of(id);
+        if buffered && plane.is_none() {
+            return Err(kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no plane this load buffers, so a lane's replay has nowhere to \
+                     read its tokens from; the read path serves the chunked recurrence's class",
+                    id.0
+                ),
+            });
+        }
+        let (lanes, csr) = self.rs_ext_layout(seat);
+        let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
+        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| kernels_cuda::Error::Backend {
+            op,
+            detail: format!("{:?} has no element size", own.dtype),
+        })?;
+        let row_bytes = u64::from(own.width) * elem;
+        let at = scratch
+            .take(u64::from(rows_ext) * row_bytes)
+            .map_err(|f| Self::rs_fault(op, f))?;
+        let ext = Tensor::new(at, rows_ext, own.width, own.dtype);
+        let lane0 = self.window().span().lane_offset as usize;
+        let bounds = self.qo_indptr_host();
+        let stream = self.ctx.stream();
+        for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
+            if replay > 0
+                && let Some(plane) = plane
+                && let Some(RsMove::Scatter { pages, at: token, .. }) = seat.lanes.get(lane0 + r)
+            {
+                if u64::from(plane.width) != u64::from(own.width) {
+                    return Err(kernels_cuda::Error::Backend {
+                        op,
+                        detail: format!(
+                            "a buffered plane reserved at {} elements a token is bound {} wide this fire",
+                            plane.width, own.width
+                        ),
+                    });
+                }
+                let from = token.checked_sub(replay).ok_or_else(|| kernels_cuda::Error::Backend {
+                    op,
+                    detail: format!("lane replays {replay} buffered token(s) below buffer position {token}"),
+                })?;
+                seat.pages_to_rows(stream, plane, pages, from, replay, at + u64::from(begin) * row_bytes)
+                    .map_err(|f| Self::rs_fault(op, f))?;
+            }
+            if rows > 0 {
+                let src = own.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
+                let dst = at + u64::from(begin + replay) * row_bytes;
+                crate::device::copy_d2d(stream, dst, src, usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX))
+                    .map_err(|f| Self::rs_fault(op, f))?;
+            }
+        }
+        Ok(ext)
+    }
+
+    /// The extended rectangle an op lands `id` into, remembered under `id` for the ops downstream (`rs_ext_of`).
+    pub(crate) fn rs_out(&self, op: &'static str, id: ValueId) -> Result<Tensor, kernels_cuda::Error> {
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let own = self.windowed(self.tensor(id));
+        let (_, csr) = self.rs_ext_layout(seat);
+        let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
+        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| kernels_cuda::Error::Backend {
+            op,
+            detail: format!("{:?} has no element size", own.dtype),
+        })?;
+        let at = scratch
+            .take(u64::from(rows_ext) * u64::from(own.width) * elem)
+            .map_err(|f| Self::rs_fault(op, f))?;
+        let ext = Tensor::new(at, rows_ext, own.width, own.dtype);
+        scratch.ext.borrow_mut().insert(id.0, ext);
+        Ok(ext)
+    }
+
+    /// The extended version of `id` an earlier recurrent op of this fire landed.
+    pub(crate) fn rs_ext_of(&self, op: &'static str, id: ValueId) -> Result<Tensor, kernels_cuda::Error> {
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        scratch.ext.borrow().get(&id.0).copied().ok_or_else(|| kernels_cuda::Error::Backend {
+            op,
+            detail: format!("value {} was not landed extended by an earlier recurrent op of this fire", id.0),
+        })
+    }
+
+    /// **Land the lanes' own rows** of extended output `ext` into `id`'s rectangle — the rows the rest of the plan reads.
+    pub(crate) fn rs_land(&self, op: &'static str, ext: Tensor, id: ValueId) -> Result<(), kernels_cuda::Error> {
+        let (seat, _) = self.rs_seat_and_scratch(op)?;
+        let target = self.windowed(self.tensor(id));
+        let elem = model_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| kernels_cuda::Error::Backend {
+            op,
+            detail: format!("{:?} has no element size", ext.dtype),
+        })?;
+        let row_bytes = u64::from(ext.width) * elem;
+        let (lanes, _) = self.rs_ext_layout(seat);
+        let bounds = self.qo_indptr_host();
+        let stream = self.ctx.stream();
+        for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
+            if rows == 0 {
+                continue;
+            }
+            let src = ext.ptr + u64::from(begin + replay) * row_bytes;
+            let dst = target.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
+            crate::device::copy_d2d(stream, dst, src, usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX))
+                .map_err(|f| Self::rs_fault(op, f))?;
+        }
+        Ok(())
+    }
+
+    /// A layer's recurrent chain has landed: its extended rectangles are dead, so the scratch starts over.
+    pub(crate) fn rs_layer_done(&self) {
+        if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
+            scratch.reset();
+        }
     }
 
     /// `Trace::values`, for the copy plan's own shape reading.

@@ -15,7 +15,13 @@ pub fn all_reduce(buf: &Value) -> Value {
     buf_out
 }
 
-/// Concatenates each rank's `width`-shard into the full tensor.
+/// Concatenates each rank's `width`-shard into the full tensor:
+/// `[rows, width]` on every rank becomes `[rows, width * world]`.
+///
+/// The collective underneath (`ncclAllGather`) joins whole buffers rank-major,
+/// which is this layout only at one row; above one row the CUDA entry gathers
+/// into scratch and permutes, so the declared shape holds either way. Other
+/// backends serve the same declaration and were not audited for it.
 pub fn all_gather(x: &Value, world: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(x.rows(), x.width() * u64::from(world), x.dtype()));
@@ -29,7 +35,12 @@ pub fn all_gather(x: &Value, world: u32) -> Value {
     y
 }
 
-/// Sums across ranks, leaving each rank its `width`-shard of the result.
+/// Sums across ranks, leaving each rank its `width`-shard of the result:
+/// `[rows, width]` becomes `[rows, width / world]`.
+///
+/// **ONE ROW ONLY**, mirroring [`all_gather`]: `ncclReduceScatter` hands each
+/// rank a contiguous block of the flat buffer, which is a width shard only at
+/// one row. Refused at the fire for a wider value.
 pub fn reduce_scatter(x: &Value, world: u32) -> Value {
     let world = u64::from(world);
     assert!(

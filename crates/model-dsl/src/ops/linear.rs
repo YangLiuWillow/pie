@@ -219,6 +219,59 @@ pub fn moe_topk_sigmoid(
     (routes, weights)
 }
 
+/// Inkling's relative-position profile (`Linear::RelBias`): `x` is the
+/// `[rows, heads · d_rel]` projection, `w` the `[d_rel, extent]` bank; lands
+/// `[rows, heads · extent]` f32.
+pub fn rel_bias(x: &Value, w: &Weight, heads: u32, d_rel: u32, extent: u32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(tensor(x.rows(), u64::from(heads) * u64::from(extent), Dtype::F32));
+    r.push(
+        Linear::RelBias {
+            x: x.id(),
+            w: r.weight(w),
+            heads,
+            d_rel,
+            extent,
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
+/// Sigmoid routing with `sink` shared experts after the routed `experts`
+/// on the logit row (`Linear::MoeTopkSigmoidSink`); routes and weights are
+/// `top_k + sink` wide, the sinks at `experts + i`.
+pub fn moe_topk_sigmoid_sink(
+    logits: &Value,
+    bias: &Weight,
+    scale: Option<&Weight>,
+    experts: u32,
+    top_k: u32,
+    sink: u32,
+    scaling: f32,
+) -> (Value, Value) {
+    let r = logits.rec();
+    let fan = top_k + sink;
+    let routes = r.fresh(tensor(Dim::Tokens, fan, Dtype::I32));
+    let weights = r.fresh(tensor(Dim::Tokens, fan, Dtype::F32));
+    r.push(
+        Linear::MoeTopkSigmoidSink {
+            logits: logits.id(),
+            bias: Some(r.weight(bias)),
+            scale: scale.map(|s| r.weight(s)),
+            experts,
+            top_k,
+            sink,
+            scaling,
+            routes: routes.id(),
+            weights: weights.id(),
+        },
+        &[logits],
+    );
+    (routes, weights)
+}
+
 /// Sigmoid routing where a per-expert bias steers the choice only: the
 /// picked weights are the sigmoid scores, renormalized and scaled.
 pub fn moe_topk_sigmoid_biased(

@@ -137,7 +137,14 @@ impl ForwardHybrid for Model {
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
-        ops::linear::lm_head(&x, &m.head)
+        let logits = ops::linear::lm_head(&x, &m.head);
+        // This rank landed its COLUMNS of the logits; the plan wants all of
+        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
+        if m.head.dim(0) < u64::from(m.vocab) {
+            ops::collective::all_gather(&logits, m.tp)
+        } else {
+            logits
+        }
     }
 }
 

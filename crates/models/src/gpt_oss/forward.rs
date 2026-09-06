@@ -220,6 +220,13 @@ impl ForwardHybrid for Model {
             _ => (x, None),
         };
         let logits = ops::linear::lm_head(&x, &m.head);
+        // This rank landed its COLUMNS of the logits; the plan wants all of
+        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
+        let logits = if m.head.dim(0) < u64::from(m.vocab) {
+            ops::collective::all_gather(&logits, m.tp)
+        } else {
+            logits
+        };
         if let Some(dr) = &m.dflash {
             dr.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
         }

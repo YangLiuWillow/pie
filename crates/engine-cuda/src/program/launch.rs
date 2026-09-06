@@ -53,6 +53,12 @@ pub const INTRINSIC_STORAGE_RAW_BF16: u32 = 1;
 /// ignored.
 pub const INTRINSIC_STORAGE_ROW_POINTERS: u32 = 2;
 
+/// The bound buffer holds raw `i32` elements — the `mtp_drafts` token plane.
+/// The emitted gather for that intrinsic copies ints straight off the base
+/// (`ptir_m1_runtime_body.cuh`, `p.intr == 6u`) and never consults the
+/// mode; the value is here so the side table says what it points at.
+pub const INTRINSIC_STORAGE_RAW_I32: u32 = 3;
+
 /// `BoolStorageMode::NativeBytes` — one byte per lane, which is what every
 /// device-side bool cell is.
 pub const BOOL_STORAGE_NATIVE_BYTES: u32 = 0;

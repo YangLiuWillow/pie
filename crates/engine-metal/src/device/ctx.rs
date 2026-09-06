@@ -173,6 +173,34 @@ impl Context {
         self.working_set
     }
 
+    /// The box's physical memory (`hw.memsize`), or 0 where it cannot be
+    /// asked. On unified memory this is the one pool the wired tier AND the
+    /// page cache a streamed load reads its seats out of both come from.
+    #[must_use]
+    pub fn physical_memory() -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut size: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            // SAFETY: `hw.memsize` is a u64 sysctl; `len` states the out
+            // buffer's size and the call writes at most that many bytes.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"hw.memsize".as_ptr(),
+                    (&raw mut size).cast(),
+                    &raw mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 { size } else { 0 }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
     /// One reservation's ceiling.
     #[must_use]
     pub fn max_buffer(&self) -> u64 {

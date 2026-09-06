@@ -129,6 +129,79 @@ using CapturePrefill = PieScoreCaptureWindow<VariantFull>;
 using DecodeCaptureParams = PieScoreParams<DecodeParams, IdType>;
 using PrefillCaptureParams = PieScoreWindowParams<PrefillParams, IdType>;
 
+// ── A learned relative-position bias on every score (Inkling) ────────────
+// `rel_bias` is one f32 profile per (query row, head) over backward distance
+// `d = key position - query position`, negated: `bias[(row * heads + h) *
+// extent + d]` for `0 <= d < extent`, nothing added outside. Rows are the
+// fire's q rows, so a request's block starts at `q_indptr[batch_idx]` like
+// its queries do. The score arrives unscaled; the scale is applied here (the
+// alibi convention) and the closure's `sm_scale_log2` is a bare log2e.
+// `log_floor`/`log_alpha`: Inkling's log attention scaling past the floor —
+// query position `n` (one-based) scales its scores and bias by
+// `1 + alpha · ln(max(1, n / floor))`; alpha 0 (or floor 0) is none.
+template <typename Base>
+struct RelBiasParams : Base {
+    const float* rel_bias = nullptr;
+    std::uint32_t rel_extent = 0;
+    std::uint32_t rel_heads = 0;
+    std::uint32_t log_floor = 0;
+    float log_alpha = 0.f;
+};
+
+template <bool use_sliding_window>
+struct VariantRelBias
+    : ::flashinfer::DefaultAttention<false, use_sliding_window, false, false> {
+    using Base = ::flashinfer::DefaultAttention<false, use_sliding_window, false, false>;
+
+    const float* bias_rows = nullptr;
+    std::uint32_t extent = 0;
+    std::uint32_t heads = 0;
+    float scale = 1.f;
+    std::uint32_t log_floor = 0;
+    float log_alpha = 0.f;
+
+    template <typename Params>
+    __device__ __host__ VariantRelBias(
+        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : Base(params, batch_idx, smem_ptr) {
+        this->sm_scale_log2 = ::flashinfer::math::log2e;
+        scale = params.sm_scale;
+        extent = params.rel_extent;
+        heads = params.rel_heads;
+        log_floor = params.log_floor;
+        log_alpha = params.log_alpha;
+        bias_rows = params.rel_bias +
+                    static_cast<std::size_t>(params.q_indptr[batch_idx]) * heads * extent;
+    }
+
+    REGISTER_LOGITS_TRANSFORM(
+        params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+            float out = static_cast<float>(logits) * scale;
+            if (qo_idx < this->qo_len && kv_idx < this->kv_len) {
+                const int d = static_cast<int>(this->kv_len) - static_cast<int>(this->qo_len) +
+                              static_cast<int>(qo_idx) - static_cast<int>(kv_idx);
+                if (d >= 0 && d < static_cast<int>(extent)) {
+                    out += bias_rows[(static_cast<std::size_t>(qo_idx) * heads + qo_head_idx) *
+                                         extent +
+                                     static_cast<std::size_t>(d)];
+                }
+                if (log_alpha != 0.f && log_floor != 0) {
+                    // The query's one-based position; the reference scales q
+                    // and the bias alike, which is the sum scaled once.
+                    const float n = static_cast<float>(this->kv_len - this->qo_len + qo_idx + 1);
+                    const float ratio = n / static_cast<float>(log_floor);
+                    if (ratio > 1.f) out *= 1.f + log_alpha * __logf(ratio);
+                }
+            }
+            return static_cast<T>(out);
+        })
+};
+
+using VariantRelBiasFull = VariantRelBias<false>;
+using VariantRelBiasWindow = VariantRelBias<true>;
+using DecodeRelParams = RelBiasParams<DecodeParams>;
+using PrefillRelParams = RelBiasParams<PrefillParams>;
+
 template <::flashinfer::MaskMode MASK, std::uint32_t CTA_TILE_Q, std::uint32_t NUM_MMA_Q,
           std::uint32_t NUM_MMA_KV, std::uint32_t NUM_MMA_D_QK, std::uint32_t NUM_MMA_D_VO,
           std::uint32_t NUM_WARPS_Q, std::uint32_t NUM_WARPS_KV, class Variant,

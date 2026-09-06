@@ -355,7 +355,15 @@ impl DFlash {
         for b in &d.blocks {
             let a = &b.attn;
             let hd = a.head_dim;
-            let plan = ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, None);
+            // **THE SCHEDULE IS CARVED FOR THIS BLOCK'S OWN WINDOW.** A
+            // schedule is carved for ONE reading — the window sizes its kv
+            // chunking — so a plan built with `None` and launched with
+            // `Some(w)` is a restated reading its schedule never covered.
+            // v1's windowed layers and every v2 layer state one; the full
+            // -attention layer (v1's last, and every dspark block) states
+            // `None`, which is what the masked arm below reads.
+            let plan =
+                ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, b.window);
             let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mixer_norm, b.mixer_norm_eps);
             let (x, attn_coeff) = conv_prepare(&x, b.attn_conv.as_ref());
             let q = biased(ops::linear::matmul(&x, &a.q_proj), a.q_bias.as_ref());

@@ -43,6 +43,45 @@ __global__ void embed_scale_add(
     y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
 }
 
+// `embed_scale_add` whose residual row is layer `col / width`'s slice of a
+// stacked `[rows][stacked_width]` table, read in place (the `select` that
+// copied the slice out folded away), and whose folded row lands in `y_out`.
+__global__ void embed_scale_add_select(
+    const i32* __restrict__ token_ids,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ e,
+    float a,
+    bf16* __restrict__ e_scaled,
+    const bf16* __restrict__ stacked,
+    int stacked_width,
+    int col,
+    bf16* __restrict__ y_out,
+    float b,
+    bf16* __restrict__ y_scaled,
+    int hidden, int vocab, int num_tokens,
+    const u32* __restrict__ win)
+{
+    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= num_tokens * hidden) return;
+    const int n = idx / hidden;
+    const int h = idx % hidden;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const i32 tid_raw = token_ids[plane_row];
+    const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
+    const long long at = static_cast<long long>(plane_row) * hidden + h;
+    const bf16 ev = weight[static_cast<long long>(tid) * hidden + h];
+    e[at] = ev;
+    const float a_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(a));
+    const bf16 es = Elem<bf16>::from_f32(Elem<bf16>::to_f32(ev) * a_rounded);
+    e_scaled[at] = es;
+    const bf16 y0 = stacked[static_cast<long long>(plane_row) * stacked_width + col + h];
+    const bf16 yv = Elem<bf16>::from_f32(Elem<bf16>::to_f32(y0) + Elem<bf16>::to_f32(es));
+    y_out[at] = yv;
+    const float b_rounded = Elem<bf16>::to_f32(Elem<bf16>::from_f32(b));
+    y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
+}
+
 template <bool VEC>
 __global__ void embed(
     const i32* __restrict__ token_ids,
@@ -78,24 +117,63 @@ __global__ void embed(
     }
 }
 
+// `embed` over a VOCAB-BANDED table: this rank holds rows
+// `[vocab_offset, vocab_offset + local_vocab)`, so an id outside the band
+// reads nothing and lands zeros. Summing every rank's answer rebuilds the
+// whole row — Megatron's vocab-parallel embedding, and the reason the caller
+// must `collective.all_reduce` after this.
+//
+// Carries `embed`'s staged-geometry seat: a replay whose grid was carved at a
+// bucket ceiling retires its padded rows off `win[0]` and finds the live ones
+// at `win[1]`. Without it a graph replay would embed the padding.
 template <class T>
 __global__ void embed_vocab_shard(
     const i32* __restrict__ token_ids,
     const T* __restrict__ weight,
     T* __restrict__ y,
-    int hidden, int local_vocab, int vocab_offset)
+    int hidden, int local_vocab, int vocab_offset,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    const i32 tid_raw = token_ids[n];
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const i32 tid_raw = token_ids[plane_row];
     const int local_tid = tid_raw - vocab_offset;
     const bool in_shard = local_tid >= 0 && local_tid < local_vocab;
     const T* row =
         weight + static_cast<long long>(in_shard ? local_tid : 0) * hidden;
-    T* out = y + static_cast<long long>(n) * hidden;
+    T* out = y + static_cast<long long>(plane_row) * hidden;
 
     for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
         out[h] = in_shard ? row[h] : Elem<T>::from_f32(0.0f);
     }
+}
+
+// The permute that turns what `ncclAllGather` lands into what the IR asked
+// for: `[world][rows][width]` (each rank's whole rectangle, one after the
+// other) into `[rows][world * width]` (each rank's columns joined into every
+// row). One thread per destination element, so the write is coalesced and the
+// read is the strided side.
+//
+// At one row the two layouts are the same and the caller skips this entirely.
+template <class T>
+__global__ void gather_width_concat(
+    const T* __restrict__ src,
+    T* __restrict__ dst,
+    int rows, int width, int world)
+{
+    const long long wide = static_cast<long long>(width) * world;
+    const long long total = static_cast<long long>(rows) * wide;
+    const long long idx =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    const long long r = idx / wide;
+    const long long c = idx - r * wide;
+    const long long k = c / width;          // which rank's shard
+    const long long w = c - k * width;      // column inside it
+    dst[idx] = src[(k * rows + r) * width + w];
 }
 
 template <class T>

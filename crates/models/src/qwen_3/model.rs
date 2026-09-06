@@ -1196,10 +1196,26 @@ impl Model {
             adapters: ADAPTERS,
             kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
+            // An UNTIED head is `vocab x hidden` of its own and every rank
+            // streamed all of it. Band it on the vocab axis: each rank lands
+            // its slice and `forward` all-gathers the logits shard. Exact —
+            // partitioning a GEMM's output changes no reduction.
+            //
+            // A TIED head IS the embedding table, whose lookup would then need
+            // banding (and an all-reduce) too, so it is left whole here; see
+            // `gemma_4` for that shape. `PIE_NO_VOCAB_SHARD` restores the
+            // replicated head for bisecting.
             head: if d.tied {
                 Head::Tied
             } else {
-                Head::Bank(Weight::sym("lm_head", [d.vocab as u64, hidden], w))
+                let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+                let rows = if banded {
+                    (d.vocab / tp) as u64
+                } else {
+                    d.vocab as u64
+                };
+                let bank = Weight::sym("lm_head", [rows, hidden], w);
+                Head::Bank(if banded { bank.packed([rows]) } else { bank })
             },
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),

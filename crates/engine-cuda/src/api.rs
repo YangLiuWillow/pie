@@ -544,13 +544,14 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         activation: Dtype::F32,
         // Does this load's model text declare a draft head.
         has_mtp_logits: shell.drafts(),
-        // `MtpDrafts` is `[k]` i32 token ids, an argmax the guest can take
-        // for itself off `MtpLogits`; no device path here produces it.
-        mtp_depth: 0,
-        draft_block: 0,
-        draft_mask_token: 0,
-        draft_bidirectional: false,
-        draft_proposals_from: 1,
+        // `MtpDrafts` is the block drafter's token plane, `[depth]` i32 a
+        // lane, bound where the `mtp.drafts` export landed.
+        mtp_depth: shell.mtp_depth(),
+        // The block drafter's facts, stated by the text on its trace.
+        draft_block: trace.drafter.map_or(0, |d| d.rows),
+        draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
+        draft_bidirectional: trace.drafter.is_some_and(|d| d.bidirectional),
+        draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
         has_value_head: false,
         // Does this load export a capture column, and did the slab that
         // observes it get carved.

@@ -15,6 +15,20 @@ __device__ __forceinline__ float silu_f(float z) {
     return z / (1.f + __expf(-z));
 }
 
+// What a conv tap lands: the recurrent mixers' `silu(acc)`; Inkling's short
+// convolution the raw sum with the token's own input added back
+// (`x + conv(x)`, in fp32 before the one rounding).
+template <bool SILU, bool RESIDUAL>
+__device__ __forceinline__ float conv_out(float acc, float x_t) {
+    if constexpr (RESIDUAL) {
+        return acc + x_t;
+    } else if constexpr (SILU) {
+        return silu_f(acc);
+    } else {
+        return acc;
+    }
+}
+
 template <class T, bool SILU>
 __global__ void ssm_causal_conv1d_chunked(
     const T* __restrict__ x,
@@ -103,7 +117,7 @@ __global__ void ssm_causal_conv1d_update(
     state[(K - 1) * C + c] = Elem<T>::from_f32(new_x);
 }
 
-template <class T>
+template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_chunked_batched(
     const T* __restrict__ x,
     const T* __restrict__ weight,
@@ -195,7 +209,8 @@ __global__ void ssm_causal_conv1d_chunked_batched(
             const float wv = Elem<T>::to_f32(weight[c * K + k]);
             acc += wv * xv;
         }
-        y_r[t * C + c] = Elem<T>::from_f32(silu_f(acc));
+        y_r[t * C + c] = Elem<T>::from_f32(
+            conv_out<SILU, RESIDUAL>(acc, Elem<T>::to_f32(x_r[t * C + c])));
     }
 
     __syncthreads();
@@ -214,7 +229,7 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     }
 }
 
-template <class T>
+template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     const T* __restrict__ x,
     const T* __restrict__ weight,
@@ -286,7 +301,8 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
             }
             acc += wv[k] * xv;
         }
-        y_r[static_cast<long long>(t) * C + c] = Elem<T>::from_f32(silu_f(acc));
+        y_r[static_cast<long long>(t) * C + c] = Elem<T>::from_f32(
+            conv_out<SILU, RESIDUAL>(acc, Elem<T>::to_f32(x_r[static_cast<long long>(t) * C + c])));
     }
 
     if (state_out_base && write_state &&
@@ -302,7 +318,7 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     }
 }
 
-template <class T>
+template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_update_batched(
     const T* __restrict__ x,
     const T* __restrict__ weight,
@@ -349,7 +365,7 @@ __global__ void ssm_causal_conv1d_update_batched(
         const float wv = Elem<T>::to_f32(weight[c * K + k]);
         acc += wv * xv;
     }
-    y_r[c] = Elem<T>::from_f32(silu_f(acc));
+    y_r[c] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, new_x));
 
     const int span = (K - 1) * dil;
     for (int k = 0; k < span; ++k) {
@@ -361,7 +377,7 @@ __global__ void ssm_causal_conv1d_update_batched(
 // Eight channels per thread, dilation 1: the row, the window and the
 // weights move as 16-byte vectors, every read issued before any arithmetic,
 // and the shift is written back from the window already in registers.
-template <class T>
+template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_update_batched_vec8(
     const T* __restrict__ x,
     const T* __restrict__ weight,
@@ -430,7 +446,9 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     }
     Vec yv;
     #pragma unroll
-    for (int u = 0; u < VEC; ++u) yv.e[u] = Elem<T>::from_f32(silu_f(acc[u]));
+    for (int u = 0; u < VEC; ++u) {
+        yv.e[u] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc[u], Elem<T>::to_f32(xv.e[u])));
+    }
     *reinterpret_cast<uint4*>(y + (long long)r_row * C + c0) = yv.raw;
 
     #pragma unroll
@@ -2357,11 +2375,27 @@ __global__ void ssm_kda_qkv_prep(
     constexpr int kMaxHeads = 256;
     __shared__ float sums[kMaxHeads];
     const int heads = head_dim > 0 ? width / head_dim : 1;
-    for (int h = tid; h < heads && h < kMaxHeads; h += BLOCK) sums[h] = 0.f;
-    __syncthreads();
-    for (int i = tid; i < width; i += BLOCK) {
-        const float x = Elem<ElemT>::to_f32(src[i]);
-        atomicAdd(&sums[(i / head_dim) % kMaxHeads], x * x);
+    // One warp per head, lanes striding the head, a shuffle tree in a fixed
+    // order: the sum is the same every fire. (A float `atomicAdd` over the
+    // head's elements landed in whatever order the threads arrived, and the
+    // rounding of a 46-layer stack's q/k norms moved from boot to boot —
+    // measured as run-to-run divergence of glm53's greedy tokens.)
+    {
+        constexpr int kWarps = BLOCK / 32;
+        const int warp = tid / 32;
+        const int lane = tid % 32;
+        for (int h = warp; h < heads && h < kMaxHeads; h += kWarps) {
+            float acc = 0.f;
+            for (int d = lane; d < head_dim; d += 32) {
+                const float x = Elem<ElemT>::to_f32(src[h * head_dim + d]);
+                acc += x * x;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_xor_sync(0xffffffffu, acc, off);
+            }
+            if (lane == 0) sums[h] = acc;
+        }
     }
     __syncthreads();
     const float q_scale = (plane == 0) ? rsqrtf(static_cast<float>(head_dim)) : 1.f;

@@ -242,6 +242,39 @@ const _: () = assert!(
     "PrefillRaggedBiasParams: sizeof disagrees with ::pie::attn::fa2::RaggedBiasParams",
 );
 
+/// `RelBiasParams<DecodeParams>` (`attn/attention.cuh`): the base block, then
+/// the learned relative-bias table and its extents. Both bases end on a
+/// pointer, so the derived fields start at `size_of::<Base>()` here as they
+/// do there (no tail padding for the Itanium ABI to reuse).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct DecodeRelParams {
+    pub base: DecodeParams,
+    pub rel_bias: DevicePtr,
+    pub rel_extent: u32,
+    pub rel_heads: u32,
+    pub log_floor: u32,
+    pub log_alpha: f32,
+}
+
+/// `RelBiasParams<PrefillParams>`, see [`DecodeRelParams`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct PrefillRelParams {
+    pub base: PrefillPagedParams,
+    pub rel_bias: DevicePtr,
+    pub rel_extent: u32,
+    pub rel_heads: u32,
+    pub log_floor: u32,
+    pub log_alpha: f32,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<DecodeParams>().is_multiple_of(8)
+        && core::mem::size_of::<PrefillPagedParams>().is_multiple_of(8),
+    "a params base must end on its alignment for the derived block to start where C++ puts it",
+);
+
 /// Every device address a decode or prefill fire touches, gathered by the
 /// entry from `q`/`o`/the pool row/the plan's workspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

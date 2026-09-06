@@ -446,6 +446,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
+            Attention::DecodeRel { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (In(3), F32)],
+            Attention::PrefillRel { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
             Attention::MergeLse { .. } => &[(In(1), F32), (In(3), F32), (Out(1), F32)],
             Attention::LogitSoftcap { .. } => &[],
@@ -464,7 +466,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
             }
-            Attention::SsmCausalConv1d { .. } | Attention::SsmCausalConv1dChunked { .. } => {
+            Attention::SsmCausalConv1d { .. }
+            | Attention::SsmCausalConv1dChunked { .. }
+            | Attention::ShortConv { .. }
+            | Attention::ShortConvChunked { .. } => {
                 &[(In(2), CACHE)]
             }
             Attention::BlockDynConv { .. } => &[],
@@ -523,8 +528,11 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::MoeTopkSoftmax { .. }
             | Linear::MoeTopkSoftmaxScaled { .. }
             | Linear::MoeTopkSigmoid { .. }
+            | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MoeTopkSqrtSoftplus { .. }
             | Linear::MoePredictRoute { .. } => &[(Out(0), I32), (Out(1), F32)],
+            // The relative-position profile lands f32 for the score to add.
+            Linear::RelBias { .. } => &[(Out(0), F32)],
             // The lookup router lands the same pair off a token-id column and
             // an I64 table: the ids are the fire's own `RuntimeInput::Tokens`
             // stream, i32 like every other id column in this table.
@@ -588,6 +596,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The bucket embedding rides the checkpoint's dtype; the table
             // it lands is f32, what the ragged arm's bias reads.
             Elementwise::RelativeBucketBias { .. } => &[(Out(0), F32)],
+            Elementwise::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
             // The mix projection is f32 end to end — the operand the norm
             // widened, the dynamic plane, and the row the sinkhorn splits.
@@ -596,7 +605,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The trunk collapse reads the f32 mix row and the f32 gate planes.
             Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
             // The fused per-layer input gathers by i32 token ids, as `Embed` does.
-            Elementwise::EmbedScaleAdd { .. } => &[(In(0), I32)],
+            Elementwise::EmbedScaleAdd { .. } | Elementwise::EmbedScaleAddSelect { .. } => {
+                &[(In(0), I32)]
+            }
             // Per-token math with nothing pinned: the norms, the residual and
             // scaling arithmetic, and the gate take and return the activation
             // dtype they are given.

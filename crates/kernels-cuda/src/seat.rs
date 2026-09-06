@@ -62,12 +62,14 @@ pub const ENTRIES: &[EntryInfo] = &[
     // attention: FA2 arms
     entry("attention.decode", Reads::RowsAndLanes),
     entry("attention.decode_lse", Reads::RowsAndLanes),
+    entry("attention.decode_rel", Reads::RowsAndLanes),
     entry("attention.masked", Reads::RowsAndLanes),
     entry("attention.prefill", Reads::RowsAndLanes),
     entry("attention.prefill_lse", Reads::RowsAndLanes),
     // the unpaged arm: group tables handed whole, plane-absolute rows inside
     // them, live groups off `win[2..4]`, schedule rebuilt on the device per fire
     entry("attention.ragged", Reads::RowsAndLanes),
+    entry("attention.prefill_rel", Reads::RowsAndLanes),
     // attention: planners
     entry("attention.plan_decode", Reads::Nothing),
     entry("attention.plan_prefill", Reads::Nothing),
@@ -85,6 +87,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.mla_split_q_b", Reads::Rows),
     entry("attention.ple_ngram_ids", Reads::Rows),
     entry("attention.pool_lse", Reads::Rows),
+    entry("attention.short_conv", Reads::Rows),
     entry("attention.sink", Reads::Rows),
     entry("attention.ssm_causal_conv1d", Reads::Rows),
     entry("attention.ssm_gated_delta", Reads::Rows),
@@ -92,6 +95,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.ssm_kda_step", Reads::Rows),
     // attention: chunked recurrent arms
     entry("attention.ple_ngram_ids_chunked", Reads::RowsAndLanes),
+    entry("attention.short_conv_chunked", Reads::RowsAndLanes),
     entry("attention.ssm_causal_conv1d_chunked", Reads::RowsAndLanes),
     entry("attention.ssm_gated_delta_chunked", Reads::RowsAndLanes),
     entry("attention.ssm_kda_chunked", Reads::RowsAndLanes),
@@ -154,7 +158,9 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("layout.embed_weighted", Reads::Rows),
     entry("layout.pack_rows", Reads::Rows),
     entry("layout.scatter_live_rows", Reads::Rows),
+    entry("layout.argmax", Reads::Rows),
     entry("layout.select", Reads::Rows),
+    entry("layout.topk", Reads::Rows),
     entry("layout.split_q_gate", Reads::Rows),
     entry("layout.split_qkv", Reads::Rows),
     entry("layout.split_rows", Reads::Rows),
@@ -174,10 +180,12 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("linear.moe_matmul_select_quant", Reads::Rows),
     entry("linear.moe_sigmoid_gate_add", Reads::Rows),
     entry("linear.moe_topk_sigmoid", Reads::Rows),
+    entry("linear.moe_topk_sigmoid_sink", Reads::Rows),
     entry("linear.moe_topk_softmax", Reads::Rows),
     entry("linear.moe_topk_softmax_scaled", Reads::Rows),
     entry("linear.moe_topk_sqrt_softplus", Reads::Rows),
     entry("linear.moe_weighted_sum", Reads::Rows),
+    entry("linear.rel_bias", Reads::Rows),
 ];
 
 /// What the entry named `op` reads off the seat; [`Reads::Nothing`] for a

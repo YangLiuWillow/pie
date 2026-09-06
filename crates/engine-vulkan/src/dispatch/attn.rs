@@ -201,6 +201,10 @@ impl Run<'_> {
             // M0: the ragged attention (D2) is CUDA-first; refused by name
             // here in this phase.
             | Attention::Ragged { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+            | Attention::DecodeRel { .. }
+            | Attention::PrefillRel { .. }
+            | Attention::ShortConv { .. }
+            | Attention::ShortConvChunked { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Attention::Masked {
                 q,
                 plan,

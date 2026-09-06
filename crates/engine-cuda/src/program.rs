@@ -422,6 +422,21 @@ impl Plane {
         self.instances.get(&id).map(|bound| bound.geometry)
     }
 
+    /// The device-side source of instance `id`'s [`Port::EmbedTokens`] cell,
+    /// when it can be injected device-to-device rather than round-tripped
+    /// through the host. See [`Session::token_device_source`].
+    #[must_use]
+    pub fn token_device_source(&self, id: u64) -> Option<(u64, u32)> {
+        let bound = self.instances.get(&id)?;
+        if bound.geometry == GeometryClass::Host {
+            return None;
+        }
+        let program = self.programs.get(&bound.program_id)?;
+        bound
+            .session
+            .token_device_source(&program.plan, bound.geometry)
+    }
+
     /// One instance's rings and cursors, for publishing into and taking out of.
     #[must_use]
     pub fn instance(&self, id: u64) -> Option<&Session> {
@@ -457,6 +472,26 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
             .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
+    }
+
+    /// Whether instance `id`'s program reads the `mtp_drafts` intrinsic —
+    /// the token plane, bound at its own rectangle beside the logits.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unknown instance or a program that is gone.
+    pub fn needs_mtp_drafts(&self, id: u64) -> Result<bool> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("instance {id} names program {}, which is gone", bound.program_id),
+            )
+        })?;
+        Ok(program.plan.needs_mtp_drafts)
     }
 
     /// How many score planes instance `id` declared, or `None` for one that

@@ -26,10 +26,10 @@ pub use forward::*;
 /// for the class sweep every merge must survive), and removed when nothing
 /// does.
 pub use model_ir::{
-    Attention, BlockDrafter, CacheRow, Def, Dim, Dtype, Elementwise, GateActivation, GeomKind,
-    Guard, Layout, Linear, ModulateForm, MropeForm, Operands, Operation, Param, ParamSource,
-    Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard, Stream, Trace, Ty, ValueId,
-    VoxelSegment, resolve_classes,
+    Attention, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elementwise, GateActivation,
+    GeomKind, Guard, Layout, Linear, ModulateForm, MropeForm, Operands, Operation, Param,
+    ParamSource, Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard, Stream, Trace, Ty,
+    ValueId, VoxelSegment, resolve_classes,
 };
 pub use record::{Recorder, Refine, SplitSpec, Value};
 

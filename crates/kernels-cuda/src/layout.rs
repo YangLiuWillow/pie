@@ -6,7 +6,8 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
+    symbol,
 };
 use crate::tensor::Tensor;
 
@@ -83,6 +84,121 @@ pub fn embed(
     )
 }
 
+/// [`embed`] over a VOCAB-BANDED table: `y[r] = table[ids[r] - offset]` where
+/// the id falls in this rank's band, zeros where it does not.
+///
+/// **THE CALLER MUST `collective::all_reduce` THE RESULT.** Each rank lands
+/// only its band, so the sum across ranks is the whole embedded row, and the
+/// zeros are what make that sum exact rather than an average.
+///
+/// The band is read off the COMMUNICATOR, not the trace: traces are SPMD and
+/// carry no rank, while the loader has already landed rows
+/// `[rank * table.rows, (rank + 1) * table.rows)`. So the rank the collectives
+/// agree on is the rank the gather bands by, and the two cannot drift.
+///
+/// # Errors
+///
+/// [`Error::Refused`] on a context with no communicator (a single rank has
+/// nothing to band), a dtype outside the lattice, or a refused launch.
+pub fn embed_vocab_shard(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.embed_vocab_shard";
+    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    debug_assert_eq!(ids.rows, y.rows, "the ids handed over are the rows landed");
+    let comm = ctx.comm(OP)?;
+    let local = nonzero(OP, "this rank's band of the embedding table", table.rows)?;
+    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
+    let rows = nonzero(OP, "rows", y.rows)?;
+
+    #[cfg(feature = "cuda")]
+    {
+        let rank = {
+            use cudarc::nccl::sys as nccl;
+            let mut rank: i32 = 0;
+            // SAFETY: `comm` is the live communicator this context fires its
+            // collectives on; the out-parameter is a stack i32.
+            let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
+            crate::collective::answered(OP, "ncclCommUserRank", code)?;
+            u32::try_from(rank).unwrap_or(0)
+        };
+        ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
+                .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
+            &[
+                ids.arg(),
+                table.arg(),
+                y.arg(),
+                hidden.arg(),
+                stated(OP, local)?.arg(),
+                stated(OP, rank.saturating_mul(local))?.arg(),
+                // The staged-geometry seat, as `embed` passes it.
+                ctx.stage(),
+            ],
+        )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (comm, local, hidden, rows, ids, table, y);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// The permute a width-concatenating gather needs: `src` holds
+/// `[world][rows][shard]` — each rank's whole rectangle, one after the other,
+/// which is what `ncclAllGather` lands — and `y` takes `[rows, world * shard]`,
+/// each rank's columns joined into every row, which is what the IR declares.
+///
+/// Only `collective::all_gather` calls this, and only above one row: at one
+/// row the two layouts are already the same buffer.
+///
+/// # Errors
+///
+/// [`Error::Refused`] for a `y` that is not `world` shards wide, or a launch
+/// the runtime refused.
+pub(crate) fn gather_width_concat(
+    ctx: &Ctx,
+    src: u64,
+    y: &mut Tensor,
+    shard_width: u32,
+    world: u32,
+) -> Result<(), Error> {
+    const OP: &str = "layout.gather_width_concat";
+    dtype_dispatch!(OP, y.dtype, { Bf16 => () });
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let shard = nonzero(OP, "the shard width", shard_width)?;
+    let world = nonzero(OP, "the rank count", world)?;
+    if shard.checked_mul(world) != Some(y.width) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {}-wide destination is not {world} shards of {shard}",
+                y.width
+            ),
+        ));
+    }
+    let total = u64::from(rows) * u64::from(y.width);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
+        .map_err(|_| refuse(OP, format!("{total} lanes do not fit a 32-bit grid")))?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::gather_width_concat<::pie::bf16>")
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(src),
+            y.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, shard)?.arg(),
+            stated(OP, world)?.arg(),
+        ],
+    )
+}
+
 /// `e = table[ids]`, `e_scaled = e * embed_scale`, `y += e_scaled` in place,
 /// `y_scaled = y * out_scale`: what [`embed`], `mul_scalar`, `residual_add`
 /// and `mul_scalar` land, one launch.
@@ -123,6 +239,87 @@ pub fn embed_scale_add(
             embed_scale.arg(),
             e_scaled.arg(),
             y.arg(),
+            out_scale.arg(),
+            y_scaled.arg(),
+            hidden.arg(),
+            vocab.arg(),
+            rows.arg(),
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
+            ctx.stage(),
+        ],
+    )
+}
+
+/// [`embed_scale_add`] whose residual is layer `layer`'s `width`-wide slice
+/// of the stacked table `stacked` (the `select` folded away), landing the
+/// folded row in `y_out`.
+///
+/// # Errors
+///
+/// [`Error::Refused`] for a slice past the stacked table or a width other
+/// than the embedded row's, or a launch the runtime refused.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_scale_add_select(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    e: &mut Tensor,
+    embed_scale: f32,
+    e_scaled: &mut Tensor,
+    stacked: Tensor,
+    layer: u32,
+    width: u32,
+    y_out: &mut Tensor,
+    out_scale: f32,
+    y_scaled: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.embed_scale_add_select";
+    dtype_dispatch!(OP, table.dtype, { Bf16 => () });
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    debug_assert!(
+        ids.rows == y_out.rows && e.rows == y_out.rows && e.width == y_out.width,
+        "the token ids and every row plane share the fire's rows"
+    );
+    let col = layer.checked_mul(width).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("layer {layer}'s slice starts beyond any column: {layer} x {width}"),
+        )
+    })?;
+    if width != y_out.width || col.checked_add(width).is_none_or(|end| end > stacked.width) {
+        return Err(refuse(
+            OP,
+            format!(
+                "layer {layer}'s {width}-wide slice does not sit in a {}-wide stacked row landing a \
+                 {}-wide row",
+                stacked.width, y_out.width
+            ),
+        ));
+    }
+    let vocab = stated(OP, nonzero(OP, "the embedding table's row count", vocab)?)?;
+    let hidden = stated(OP, nonzero(OP, "the embedded row's width", y_out.width)?)?;
+    let rows = stated(OP, nonzero(OP, "rows", y_out.rows)?)?;
+    let stacked_width = stated(OP, stacked.width)?;
+    let col = stated(OP, col)?;
+    let total = u64::from(y_out.rows) * u64::from(y_out.width);
+    let blocks = u32::try_from(total.div_ceil(u64::from(BLOCK)))
+        .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::embed_scale_add_select")
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ids.arg(),
+            table.arg(),
+            e.arg(),
+            embed_scale.arg(),
+            e_scaled.arg(),
+            stacked.arg(),
+            stacked_width.arg(),
+            col.arg(),
+            y_out.arg(),
             out_scale.arg(),
             y_scaled.arg(),
             hidden.arg(),
@@ -534,6 +731,42 @@ fn permute_rows(
     )
 }
 
+const TOPK_FILE: &str = "layout/topk.cuh";
+
+const TOPK_THREADS: u32 = 128;
+
+/// `y[row, column] = argmax_c x[row, c]` — one column of an i32 plane, ties
+/// to the LOWEST column and a NaN never chosen (the epilogue's rule). What a
+/// draft chain feeds itself between its steps.
+pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.argmax";
+    const THREADS: u32 = 1024;
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
+    debug_assert_eq!(y.dtype, Dtype::I32, "`{OP}` writes i32 column indices");
+    let rows = nonzero(OP, "rows", x.rows)?;
+    nonzero(OP, "width", x.width)?;
+    if column >= y.width {
+        return Err(refuse(
+            OP,
+            format!("column {column} is outside the {}-wide plane it writes", y.width),
+        ));
+    }
+    debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
+    ctx.fire(
+        OP,
+        Fire::at(TOPK_FILE, symbol(&format!("::pie::layout::argmax_rows<{t}>")))
+            .apply(Launch::per_row(rows, THREADS)),
+        &[
+            x.arg(),
+            y.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, column)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// Pack: `o[i] = x[perm[i]]`. The joint sequence a DiT attends over, laid
 /// down out of the streams it is built from.
 ///
@@ -564,4 +797,44 @@ pub fn pack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(
 /// As [`pack_rows`].
 pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
     permute_rows(ctx, "layout.unpack_rows", "unpack_rows", x, perm, o)
+}
+
+/// The `k` largest entries of every row of `x`, sorted descending, ties to
+/// the LOWER column and a NaN never chosen: `values` `[rows, k]` f32 and
+/// `indices` `[rows, k]` i32. Stamped for bf16 and f32 rows at k = 8 and 16.
+pub fn topk(
+    ctx: &Ctx,
+    x: Tensor,
+    k: u32,
+    values: &mut Tensor,
+    indices: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.topk";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
+    if k != 8 && k != 16 {
+        return Err(refuse(
+            OP,
+            format!("no point is stamped at k = {k}; the plane stamps bf16 and f32 at 8 and 16"),
+        ));
+    }
+    let rows = nonzero(OP, "rows", x.rows)?;
+    nonzero(OP, "width", x.width)?;
+    if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
+        return Err(refuse(OP, format!("the values plane is not [{rows}, {k}] f32")));
+    }
+    if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
+        return Err(refuse(OP, format!("the indices plane is not [{rows}, {k}] i32")));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(TOPK_FILE, symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")))
+            .apply(Launch::per_row(rows, TOPK_THREADS)),
+        &[
+            x.arg(),
+            values.arg(),
+            indices.arg(),
+            stated(OP, x.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
 }

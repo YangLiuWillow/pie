@@ -8,11 +8,13 @@ pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod hunyuan_image_3;
+pub mod inkling;
 pub mod kimi_k3;
 pub mod ltx_2;
 pub mod media;
 pub mod mini_dit;
 pub mod minimax_h3;
+pub mod muse_glimmer;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
@@ -428,7 +430,9 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         glm_5_next::skus(),
         gpt_oss::skus(),
         hunyuan_image_3::skus(),
+        inkling::skus(),
         kimi_k3::skus(),
+        muse_glimmer::skus(),
         qwen_3::skus(),
         qwen_4::skus(),
         // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row

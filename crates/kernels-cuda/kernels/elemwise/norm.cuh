@@ -1012,14 +1012,22 @@ __global__ void rmsnorm_gated_by(
         const float x = o[base + d];
         acc += x * x;
     }
+    // The warps' partials meet in a fixed order (not a float `atomicAdd`,
+    // whose arrival order moved the rounding from fire to fire).
+    __shared__ float warp_sums[32];
     __shared__ float ssum;
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, offset);
     }
-    if (threadIdx.x == 0) ssum = 0.f;
+    if ((threadIdx.x & (warpSize - 1)) == 0) warp_sums[threadIdx.x / warpSize] = acc;
     __syncthreads();
-    if ((threadIdx.x & (warpSize - 1)) == 0) atomicAdd(&ssum, acc);
+    if (threadIdx.x == 0) {
+        float total = 0.f;
+        const int warps = (blockDim.x + warpSize - 1) / warpSize;
+        for (int w = 0; w < warps; ++w) total += warp_sums[w];
+        ssum = total;
+    }
     __syncthreads();
 
     const float scale = rsqrtf(ssum / static_cast<float>(D) + eps);

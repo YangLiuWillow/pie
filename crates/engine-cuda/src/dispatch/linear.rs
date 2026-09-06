@@ -153,22 +153,26 @@ impl Run<'_> {
                 y,
                 y_out: _,
             } => {
-                let a = self.tensor(*act);
-                let weight = self.tensor(*w);
-                let out = self.tensor(*y);
-                let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
-                let epilogue = linear::skinny::Epilogue::Softcap(*cap);
-                if self.dense_weight(*w) && linear::skinny::covers(m, n, k, epilogue) {
-                    return linear::skinny::skinny_bf16(
-                        self.ctx(),
-                        weight.ptr,
-                        a.ptr,
-                        out.ptr,
-                        m,
-                        n,
-                        k,
-                        epilogue,
-                    );
+                // A quantized head is a split-plane bank with no dense handle
+                // to take: it goes straight to the head's own arms below.
+                if self.dense_weight(*w) {
+                    let a = self.tensor(*act);
+                    let weight = self.tensor(*w);
+                    let out = self.tensor(*y);
+                    let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
+                    let epilogue = linear::skinny::Epilogue::Softcap(*cap);
+                    if linear::skinny::covers(m, n, k, epilogue) {
+                        return linear::skinny::skinny_bf16(
+                            self.ctx(),
+                            weight.ptr,
+                            a.ptr,
+                            out.ptr,
+                            m,
+                            n,
+                            k,
+                            epilogue,
+                        );
+                    }
                 }
                 self.linear(&Linear::LmHead {
                     act: *act,
@@ -353,6 +357,44 @@ impl Run<'_> {
                 *scaling,
                 &mut self.tensor(*routes),
                 &mut self.tensor(*weights),
+            ),
+            Linear::MoeTopkSigmoidSink {
+                logits,
+                bias,
+                scale,
+                experts,
+                top_k,
+                sink,
+                scaling,
+                routes,
+                weights,
+            } => linear::moe::topk_sigmoid_sink(
+                self.ctx(),
+                self.tensor(*logits),
+                bias.map(|bias| self.tensor(bias)),
+                scale.map(|scale| self.tensor(scale)),
+                *experts,
+                *top_k,
+                *sink,
+                *scaling,
+                &mut self.tensor(*routes),
+                &mut self.tensor(*weights),
+            ),
+            Linear::RelBias {
+                x,
+                w,
+                heads,
+                d_rel,
+                extent,
+                y,
+            } => linear::rel_bias::rel_bias(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*w),
+                *heads,
+                *d_rel,
+                *extent,
+                &mut self.tensor(*y),
             ),
             // The prediction ranks like the router and cuts nothing on this
             // arm either (its op is not one `exports::writer_classes` names).

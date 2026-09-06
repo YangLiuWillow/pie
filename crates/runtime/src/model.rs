@@ -709,6 +709,49 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "mini_dit",
     },
+    // Muse Glimmer: the 30B text (`models::muse_glimmer`), 52 layers, its
+    // logits the head's 202 048 rows. No vision front-end reads the arch.
+    Row {
+        id: "muse-glimmer-30b-bf16-kv-bf16",
+        layers: 52,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    Row {
+        id: "muse-glimmer-30b-bf16-kv-bf16-tp2",
+        layers: 52,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    Row {
+        id: "muse-glimmer-30b-u4g64-kv-bf16",
+        layers: 52,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    // The parity miniature: layers 0-3 and 48-51 of the 30B.
+    Row {
+        id: "muse-glimmer-30b-mini-l8-bf16-kv-bf16",
+        layers: 8,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    // Inkling: the text (`models::inkling`), 66 layers; the logits are the
+    // UNPADDED head (200 058 of the 201 024 stored rows), which is what the
+    // sampler sees.
+    Row {
+        id: "inkling-bf16-kv-bf16",
+        layers: 66,
+        vocab: 200_058,
+        arch: "inkling",
+    },
+    // The parity miniature: layers 0-6, eight routed experts.
+    Row {
+        id: "inkling-mini-l7-e8-bf16-kv-bf16",
+        layers: 7,
+        vocab: 200_058,
+        arch: "inkling",
+    },
 ];
 
 /// The row with this id, or `None` if this build ships no such model.

@@ -3,18 +3,20 @@
 //! trained to see around them, and the reading half watches generated tokens
 //! go by and says when a reply began, a reasoning block closed, or a tool
 //! was called. This crate ships the formats — [`chatml`], [`harmony`],
-//! [`gemma`], [`deepseek`], [`kimi`] — knowing nothing about model SKUs.
+//! [`gemma`], [`deepseek`], [`kimi`], [`atem`] — knowing nothing about model SKUs.
 
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
 
+pub mod atem;
 pub mod chatml;
 pub mod decode;
 pub mod deepseek;
 pub mod gemma;
 pub mod glm;
 pub mod harmony;
+pub mod inkling;
 pub mod kimi;
 
 pub use decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};

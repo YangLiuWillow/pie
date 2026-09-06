@@ -123,6 +123,10 @@ impl Run<'_> {
             | Elementwise::RopeAxes { .. }
             | Elementwise::GateSigmoidMulHeads { .. }
             => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            | Elementwise::EmbedScaleAddSelect { .. }
+            | Elementwise::RmsnormRopePartialQ { .. } => {
+                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+            }
 
             Elementwise::RmsnormGroupedPlusOne {
                 x,

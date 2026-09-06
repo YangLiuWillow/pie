@@ -3,6 +3,8 @@
 //! IR variant; kernel selection lives below the entries so a dispatch arm
 //! stays destructure → resolve → call.
 
+pub mod dynconv;
+
 pub mod fa2;
 
 pub mod fa2_abi;
@@ -27,12 +29,16 @@ pub mod sched_prefill;
 
 pub mod sched_sm90;
 
+pub mod selector;
+
 pub mod ssm;
 
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::attn::fa2_abi::{Buffers, make_decode_params, make_prefill_params};
+use crate::attn::fa2_abi::{
+    Buffers, DecodeRelParams, PrefillRelParams, make_decode_params, make_prefill_params,
+};
 use crate::attn::plan::{DecodePlan, PrefillPlan, PrefillPlanSm90};
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
@@ -148,6 +154,7 @@ fn fa2_decode(
     sm_scale: f32,
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
+    rel: Option<RelBias>,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
@@ -179,22 +186,35 @@ fn fa2_decode(
         lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
         bufs.lse = lse.ptr;
     }
-    let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
     let (params, split) =
         make_decode_params(plan, &bufs, window_left, NO_SOFT_CAP, sm_scale, false);
-    fa2::decode(
-        ctx,
-        op,
-        fa2::DecodePoint {
-            head_dim: plan.shape.head_dim,
-            group_size: plan.shape.group_size(),
-            arm,
-            padded_batch_size: params.padded_batch_size,
-            num_kv_heads: plan.shape.num_kv_heads,
-            device: plan.device,
-        },
-        &params,
-    )?;
+    let point = |arm| fa2::DecodePoint {
+        head_dim: plan.shape.head_dim,
+        group_size: plan.shape.group_size(),
+        arm,
+        padded_batch_size: params.padded_batch_size,
+        num_kv_heads: plan.shape.num_kv_heads,
+        device: plan.device,
+    };
+    match rel {
+        None => {
+            let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
+            fa2::decode(ctx, op, point(arm), &params)?;
+        }
+        Some(rel) => {
+            rel_table(op, &rel.bias, q.data.rows, plan.shape.num_q_heads, rel.extent)?;
+            let arm = fa2::decode_rel_arm(plan.full_attention_variant(), window_left);
+            let params = DecodeRelParams {
+                base: params,
+                rel_bias: rel.bias.ptr,
+                rel_extent: rel.extent,
+                rel_heads: plan.shape.num_q_heads,
+                log_floor: rel.log_floor,
+                log_alpha: rel.log_alpha,
+            };
+            fa2::decode(ctx, op, point(arm), &params)?;
+        }
+    }
     if plan.info.split_kv {
         fa2::fold(ctx, op, &split)
     } else {
@@ -220,6 +240,7 @@ fn fa2_prefill(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
     mask: Option<(Tensor, Tensor)>,
+    rel: Option<RelBias>,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
@@ -240,28 +261,47 @@ fn fa2_prefill(
         lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
         bufs.lse = lse.ptr;
     }
-    let arm = match mask {
-        Some(_) => fa2::prefill_custom_arm(NO_SOFT_CAP),
-        None => fa2::prefill_arm(plan.full_attention_variant(), plan.causal, NO_SOFT_CAP),
-    };
     let (mut params, split) = make_prefill_params(plan, &bufs, window_left, NO_SOFT_CAP, sm_scale);
-    if let Some((bits, indptr)) = mask {
+    if let Some((bits, indptr)) = &mask {
         params.maybe_custom_mask = bits.ptr;
         params.maybe_mask_indptr = indptr.ptr;
     }
-    fa2::prefill(
-        ctx,
-        op,
-        fa2::PrefillPoint {
-            head_dim: plan.shape.head_dim,
-            cta_tile_q: plan.cta_tile_q(),
-            arm,
-            padded_batch_size: params.padded_batch_size,
-            num_kv_heads: plan.shape.num_kv_heads,
-            device: plan.device,
-        },
-        &params,
-    )?;
+    let point = |arm| fa2::PrefillPoint {
+        head_dim: plan.shape.head_dim,
+        cta_tile_q: plan.cta_tile_q(),
+        arm,
+        padded_batch_size: params.padded_batch_size,
+        num_kv_heads: plan.shape.num_kv_heads,
+        device: plan.device,
+    };
+    match rel {
+        None => {
+            let arm = match mask {
+                Some(_) => fa2::prefill_custom_arm(NO_SOFT_CAP),
+                None => fa2::prefill_arm(plan.full_attention_variant(), plan.causal, NO_SOFT_CAP),
+            };
+            fa2::prefill(ctx, op, point(arm), &params)?;
+        }
+        Some(rel) => {
+            if mask.is_some() || !plan.causal {
+                return Err(refuse(
+                    op,
+                    "the relative-bias arm is causal and takes no custom mask",
+                ));
+            }
+            rel_table(op, &rel.bias, q.data.rows, plan.shape.num_q_heads, rel.extent)?;
+            let arm = fa2::prefill_rel_arm(plan.full_attention_variant(), window_left);
+            let params = PrefillRelParams {
+                base: params,
+                rel_bias: rel.bias.ptr,
+                rel_extent: rel.extent,
+                rel_heads: plan.shape.num_q_heads,
+                log_floor: rel.log_floor,
+                log_alpha: rel.log_alpha,
+            };
+            fa2::prefill(ctx, op, point(arm), &params)?;
+        }
+    }
     if plan.info.split_kv {
         fa2::fold(ctx, op, &split)
     } else {
@@ -282,7 +322,7 @@ pub fn decode(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None)
+    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,7 +339,7 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode_lse";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, Some(lse))
+    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, Some(lse), None)
 }
 
 /// The stated kv head count must be the one the plan was carved at; the
@@ -318,7 +358,7 @@ pub fn prefill(
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
-    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None)
+    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,6 +387,7 @@ pub fn prefill_lse(
         sm_scale,
         o,
         Some(lse),
+        None,
         None,
     )
 }
@@ -398,7 +439,76 @@ pub fn masked(
         o,
         None,
         Some((mask, mask_indptr)),
+        None,
     )
+}
+
+/// What an `attention.*_rel` fire adds to its scores: the bias table (f32,
+/// one row per query row, `heads · extent` wide) and the log scaling past a
+/// position floor (`log_alpha` 0 is none).
+#[derive(Clone, Copy, Debug)]
+pub struct RelBias {
+    pub bias: Tensor,
+    pub extent: u32,
+    pub log_floor: u32,
+    pub log_alpha: f32,
+}
+
+/// The relative-bias table an `attention.*_rel` fire reads beside its
+/// queries: f32, one row per query row, `heads · extent` wide.
+fn rel_table(op: &'static str, bias: &Tensor, rows: u32, heads: u32, extent: u32) -> Result<(), Error> {
+    if bias.dtype != Dtype::F32 {
+        return Err(refuse(op, format!("the relative-bias table is {:?}, and the score adds f32", bias.dtype)));
+    }
+    let width = u64::from(heads) * u64::from(extent);
+    if bias.rows != rows || u64::from(bias.width) != width {
+        return Err(refuse(
+            op,
+            format!(
+                "the relative-bias table is [{}, {}] and the fire's queries want [{rows}, {heads} x {extent}]",
+                bias.rows, bias.width
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode with a learned relative-position bias on every score
+/// (`Attention::DecodeRel`); see [`RelBias`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rel(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &DecodePlan,
+    pool: &KvPool,
+    rel: RelBias,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.decode_rel";
+    plan.accepts(OP, head_dim, window)?;
+    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, Some(rel))
+}
+
+/// Prefill with the same bias (`Attention::PrefillRel`); causal, no custom mask.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_rel(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    rel: RelBias,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.prefill_rel";
+    plan.accepts(OP, head_dim, Some(kv_heads), window)?;
+    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, Some(rel))
 }
 
 /// The sm90 plan's consumer seat. The schedule builder is real

@@ -140,6 +140,10 @@ def run(args: argparse.Namespace):
         llm_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    if os.environ.get("VLLM_DISABLE_CUSTOM_AR"):
+        # This box's GPU-to-GPU P2P DMA is broken; vLLM's custom all-reduce
+        # uses it and returns zeros, so tp>1 needs the NCCL fallback.
+        llm_kwargs["disable_custom_all_reduce"] = True
     if getattr(args, "num_gpu_blocks_override", 0):
         llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     if getattr(args, "block_size", 0):

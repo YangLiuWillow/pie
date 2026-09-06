@@ -53,6 +53,42 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
+    /// Decode with a learned relative-position bias on every score
+    /// (Inkling's `rel_logits_proj`): `bias` is `[rows, heads · extent]`
+    /// f32, one profile over backward distance per (query row, head) —
+    /// [`Linear::RelBias`](crate::ops::Linear::RelBias)'s output — added
+    /// after the scale and zero past `extent`.
+    DecodeRel {
+        q: ValueId,
+        plan: ValueId,
+        cache: ValueId,
+        bias: ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        extent: u32,
+        sm_scale: f32,
+        /// Log attention scaling past a position floor: a query at one-based
+        /// position `n` has its scores and bias scaled by
+        /// `1 + log_alpha · ln(max(1, n / log_floor))`. `log_alpha` 0 is none.
+        log_floor: u32,
+        log_alpha: f32,
+        o: ValueId,
+    },
+    /// Prefill with the same bias; causal, no custom mask.
+    PrefillRel {
+        q: ValueId,
+        plan: ValueId,
+        cache: ValueId,
+        bias: ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        extent: u32,
+        sm_scale: f32,
+        log_floor: u32,
+        log_alpha: f32,
+        o: ValueId,
+    },
     /// Prefill against a query-provided mask instead of the causal one;
     /// the op names the `mask` it applies, not the engine.
     Masked {
@@ -310,6 +346,25 @@ pub enum Attention {
         state: ValueId,
         conv_width: u32,
         dilation: u32,
+        y: ValueId,
+    },
+    /// Inkling's short convolution: the depthwise causal conv with no
+    /// activation and the token's own input added back, `y = x + conv(x)`,
+    /// summed in f32 before the one rounding. Decode form; the state slab
+    /// is the recurrent conv's (`[conv_width, channels]` per slot).
+    ShortConv {
+        x: ValueId,
+        weight: ValueId,
+        state: ValueId,
+        conv_width: u32,
+        y: ValueId,
+    },
+    /// Prefill form: walks the fire's ambient request boundaries.
+    ShortConvChunked {
+        x: ValueId,
+        weight: ValueId,
+        state: ValueId,
+        conv_width: u32,
         y: ValueId,
     },
     /// Prefill form: walks the fire's ambient request boundaries.
@@ -657,6 +712,12 @@ impl Operands for Attention {
             }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
+            Self::DecodeRel { q, plan, cache, bias, .. } => {
+                sink.extend([*q, *plan, *cache, *bias]);
+            }
+            Self::PrefillRel { q, plan, cache, bias, .. } => {
+                sink.extend([*q, *plan, *cache, *bias]);
+            }
             // Bound as `sink_id`: the field name collides with the `sink` param.
             Self::Sink { o, lse, sink: sink_id, .. } => sink.extend([*o, *lse, *sink_id]),
             Self::MergeLse { o1, lse1, o2, lse2, .. } => sink.extend([*o1, *lse1, *o2, *lse2]),
@@ -693,6 +754,8 @@ impl Operands for Attention {
                 sink.extend([*q, *plan, *q_pe, *selection, *cache]);
             }
             Self::SsmCausalConv1d { x, weight, state, .. } => sink.extend([*x, *weight, *state]),
+            Self::ShortConv { x, weight, state, .. } => sink.extend([*x, *weight, *state]),
+            Self::ShortConvChunked { x, weight, state, .. } => sink.extend([*x, *weight, *state]),
             Self::SsmCausalConv1dChunked { x, weight, state, .. } => {
                 sink.extend([*x, *weight, *state]);
             }
@@ -781,6 +844,8 @@ impl Operands for Attention {
             Self::Ragged { o, .. } => sink.push(*o),
             Self::DecodeLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PrefillLse { o, lse, .. } => sink.extend([*o, *lse]),
+            Self::DecodeRel { o, .. } => sink.push(*o),
+            Self::PrefillRel { o, .. } => sink.push(*o),
             Self::Sink { o_out, .. } => sink.push(*o_out),
             Self::MergeLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::LogitSoftcap { x_out, .. } => sink.push(*x_out),
@@ -798,6 +863,8 @@ impl Operands for Attention {
             Self::MlaDecodeSelected { o, .. } => sink.push(*o),
             Self::MlaPrefillSelected { o, .. } => sink.push(*o),
             Self::SsmCausalConv1d { y, .. } => sink.push(*y),
+            Self::ShortConv { y, .. } => sink.push(*y),
+            Self::ShortConvChunked { y, .. } => sink.push(*y),
             Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
             Self::BlockDynConv { y, .. } => sink.push(*y),
             Self::SelectorWalk { picks, .. } => sink.push(*picks),
@@ -846,6 +913,8 @@ impl Operands for Attention {
             Self::Ragged { .. } => {}
             Self::DecodeLse { .. } => {}
             Self::PrefillLse { .. } => {}
+            Self::DecodeRel { .. } => {}
+            Self::PrefillRel { .. } => {}
             Self::Sink { o_out, o, .. } => sink.push((*o_out, *o)),
             Self::MergeLse { .. } => {}
             Self::LogitSoftcap { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -864,6 +933,8 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { .. } => {}
             Self::SsmCausalConv1d { .. } => {}
             Self::SsmCausalConv1dChunked { .. } => {}
+            Self::ShortConv { .. } => {}
+            Self::ShortConvChunked { .. } => {}
             Self::BlockDynConv { .. } => {}
             Self::SelectorWalk { .. } => {}
             Self::SsmGdnPrep { .. } => {}
@@ -897,6 +968,8 @@ impl Operands for Attention {
             Self::Ragged { .. } => "attention.ragged",
             Self::DecodeLse { .. } => "attention.decode_lse",
             Self::PrefillLse { .. } => "attention.prefill_lse",
+            Self::DecodeRel { .. } => "attention.decode_rel",
+            Self::PrefillRel { .. } => "attention.prefill_rel",
             Self::Sink { .. } => "attention.sink",
             Self::MergeLse { .. } => "attention.merge_lse",
             Self::LogitSoftcap { .. } => "attention.logit_softcap",
@@ -915,6 +988,8 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { .. } => "attention.mla_prefill_selected",
             Self::SsmCausalConv1d { .. } => "attention.ssm_causal_conv1d",
             Self::SsmCausalConv1dChunked { .. } => "attention.ssm_causal_conv1d_chunked",
+            Self::ShortConv { .. } => "attention.short_conv",
+            Self::ShortConvChunked { .. } => "attention.short_conv_chunked",
             Self::BlockDynConv { .. } => "attention.block_dyn_conv",
             Self::SelectorWalk { .. } => "attention.selector_walk",
             Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",

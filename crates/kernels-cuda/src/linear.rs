@@ -29,6 +29,9 @@ pub mod moe;
 /// device text is its own unit, for the reason that file states.
 pub mod moe_route;
 
+/// The learned relative-position profile (`Linear::RelBias`).
+pub mod rel_bias;
+
 pub mod fp8;
 
 pub mod kquant;

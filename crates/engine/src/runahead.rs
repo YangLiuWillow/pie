@@ -12,6 +12,16 @@ impl Runahead {
     /// Largest frame the runtime's policy will seal: `k` in `submit(frame)`'s `1..=k` steps.
     pub const STEPS_MAX: u8 = 4;
 
+    /// Is the host allowed to be ahead of the device at all? With one frame
+    /// in flight there is no next frame to launch ahead of this epilogue, so
+    /// every optimisation that spends host work to get there — the
+    /// host-built decode envelope, the device-to-device token injection —
+    /// buys nothing, and the plain read-the-shadow-and-reap path is taken.
+    #[must_use]
+    pub const fn runs_ahead(&self) -> bool {
+        self.frames_in_flight > 1
+    }
+
     /// Most frames one load's staging can carry. The free set is one `u64` bitmask, giving a 64-slot ceiling (`frames * 4 + 1 <= 64` = 15).
     pub const MAX_FRAMES: u8 = 15;
 

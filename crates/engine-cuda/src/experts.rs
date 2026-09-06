@@ -1187,6 +1187,18 @@ impl Tier {
         }
         if !mapped.is_empty() {
             bump(Stat::Loads);
+            // Logged once per load: the T2 seat is otherwise invisible from
+            // outside (no copy, no pin), and an operator reading a decode
+            // rate needs to know which bytes came off the disk.
+            let bytes: u64 = mapped.iter().map(|plane| plane.bytes).sum();
+            let groups = plan.groups().iter().filter(|group| group.held == Held::Mapped).count();
+            eprintln!(
+                "engine-cuda: the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
+                 byte(s) read where they lie in {} — neither budget held them; a GPU touch \
+                 faults the page in over HMM",
+                mapped.len(),
+                source.as_ref().map_or_else(|| "<no artifact>".to_string(), |artifact| artifact.path().display().to_string()),
+            );
         }
         // The ladder's roster: every routed packed group, seated or not, in param order, so two boots number cells the same.
         let mut roster: Vec<&GroupPlan> = plan

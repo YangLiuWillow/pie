@@ -37,6 +37,17 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )
                 }
+                // A table the loader banded holds fewer rows than the
+                // vocabulary the op names: this rank owns a slice, so the
+                // gather bands and the model's `all_reduce` sums the ranks
+                // back into a whole row. Nothing here needs the rank — the
+                // banded entry reads it off the communicator.
+                None if self.tensor(*table).rows < *vocab => layout::embed_vocab_shard(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    &mut self.tensor(*y),
+                ),
                 None => layout::embed(
                     self.ctx(),
                     self.tensor(*ids),
@@ -195,20 +206,30 @@ impl Run<'_> {
                     &mut kernels_cuda::Tensor::new(whole.ptr, packed.rows, whole.width, whole.dtype),
                 )
             }
-            Layout::TopK { .. } => {
-                return Err(kernels_cuda::Error::Backend {
-                    op: "layout.topk",
-                    detail: "the per-row top-k a candidate selector reads is not yet read on the CUDA arm"
-                        .to_string(),
-                });
-            }
-            Layout::Argmax { .. } => {
-                return Err(kernels_cuda::Error::Backend {
-                    op: "layout.argmax",
-                    detail: "the per-row argmax a draft chain feeds itself is not yet read on \
-                             the CUDA arm"
-                        .to_string(),
-                });
+            // TopK and Argmax were refusals on the imagegen branch and are
+            // served upstream; the kernels landed with the block drafters.
+            Layout::TopK {
+                x,
+                k,
+                values,
+                indices,
+            } => layout::topk(
+                self.ctx(),
+                self.tensor(*x),
+                *k,
+                &mut self.tensor(*values),
+                &mut self.tensor(*indices),
+            ),
+            Layout::Argmax { xs, y } => {
+                for (column, x) in xs.iter().enumerate() {
+                    layout::argmax(
+                        self.ctx(),
+                        self.tensor(*x),
+                        u32::try_from(column).expect("a draft depth inside u32"),
+                        &mut self.tensor(*y),
+                    )?;
+                }
+                Ok(())
             }
             Layout::Select {
                 table,

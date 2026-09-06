@@ -90,6 +90,19 @@ pub enum Linear {
         up_cap: Option<f32>,
         y: ValueId,
     },
+    /// Inkling's relative-position profile: `x` is `[rows, heads · d_rel]`
+    /// (the `r_proj` output), `w` the `[d_rel, extent]` bank, and `y` lands
+    /// `[rows, heads · extent]` f32 — one bias per (row, head, backward
+    /// distance), what [`Attention::DecodeRel`](crate::ops::Attention::DecodeRel)
+    /// and its prefill twin add to every score.
+    RelBias {
+        x: ValueId,
+        w: ValueId,
+        heads: u32,
+        d_rel: u32,
+        extent: u32,
+        y: ValueId,
+    },
     MoeTopkSoftmax {
         logits: ValueId,
         experts: u32,
@@ -123,6 +136,25 @@ pub enum Linear {
         /// A prediction of the next layer's routes, read by nobody but the
         /// streamed tier at this router's cut — see `MoeTopkSqrtSoftplus`.
         hint: Option<ValueId>,
+    },
+    /// Sigmoid routing with `sink` shared experts riding the logit row after
+    /// the `experts` routed ones (Inkling): the choice is top-k over the
+    /// routed sigmoid scores plus `bias`; the weights are every chosen score
+    /// and every sink score over their common sum, times `scaling` and the
+    /// `[1]` f32 `scale` when one is bound. `routes`/`weights` are
+    /// `top_k + sink` wide, the sinks at `experts + i`, so a select over a
+    /// bank that stacks the shared experts after the routed ones serves them
+    /// as fixed routes.
+    MoeTopkSigmoidSink {
+        logits: ValueId,
+        bias: Option<ValueId>,
+        scale: Option<ValueId>,
+        experts: u32,
+        top_k: u32,
+        sink: u32,
+        scaling: f32,
+        routes: ValueId,
+        weights: ValueId,
     },
     /// Sigmoid routing with a per-expert bias; weights pass through sqrt-softplus.
     ///
@@ -292,6 +324,12 @@ impl Operands for Linear {
                 sink.extend([*logits, *bias]);
                 sink.extend(*hint);
             }
+            Self::MoeTopkSigmoidSink { logits, bias, scale, .. } => {
+                sink.push(*logits);
+                sink.extend(*bias);
+                sink.extend(*scale);
+            }
+            Self::RelBias { x, w, .. } => sink.extend([*x, *w]),
             Self::MoePredictRoute { logits, bias, .. } => sink.extend([*logits, *bias]),
             Self::MoeHashRoute { ids, tid2eid, logits, .. } => sink.extend([*ids, *tid2eid, *logits]),
             Self::GroupRoutes { .. } => {}
@@ -331,6 +369,8 @@ impl Operands for Linear {
             Self::MoeTopkSoftmaxScaled { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSigmoid { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSqrtSoftplus { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSigmoidSink { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::RelBias { y, .. } => sink.push(*y),
             Self::MoePredictRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeHashRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::GroupRoutes { routes, .. } => sink.push(*routes),
@@ -364,6 +404,8 @@ impl Operands for Linear {
             | Self::MoeTopkSoftmax { .. }
             | Self::MoeTopkSoftmaxScaled { .. }
             | Self::MoeTopkSigmoid { .. }
+            | Self::MoeTopkSigmoidSink { .. }
+            | Self::RelBias { .. }
             | Self::MoeTopkSqrtSoftplus { .. }
             | Self::MoePredictRoute { .. }
             | Self::MoeHashRoute { .. }
@@ -394,6 +436,8 @@ impl Operands for Linear {
             Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",
             Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",
             Self::MoeTopkSigmoid { .. } => "linear.moe_topk_sigmoid",
+            Self::MoeTopkSigmoidSink { .. } => "linear.moe_topk_sigmoid_sink",
+            Self::RelBias { .. } => "linear.rel_bias",
             Self::MoeTopkSqrtSoftplus { .. } => "linear.moe_topk_sqrt_softplus",
             Self::MoePredictRoute { .. } => "linear.moe_predict_route",
             Self::MoeHashRoute { .. } => "linear.moe_hash_route",

@@ -100,6 +100,9 @@ pub struct Shell {
     pools: Pools,
     /// The buffered-activation pool, or `None` for a plan with nothing to buffer.
     buffers: Option<Buffers>,
+    /// The read path's extended-run scratch (`crate::run::RsScratch`), grown
+    /// to the largest extended fire so far; `None` until a lane replays.
+    rs_scratch: Option<crate::device::Buffer>,
     /// The fold predicate and the accepted lengths, resident at the lane ceiling.
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
@@ -166,6 +169,10 @@ pub struct Shell {
     last: FireCost,
     cache: GraphCache,
     /// The guest-program plane.
+    /// How far the host may run ahead of the device, from the boot document.
+    /// `serve::prepare` asks it once per fire — the single home of the
+    /// run-ahead decision, which used to be an environment read.
+    runahead: engine::runahead::Runahead,
     programs: ProgramPlane,
     /// One event per in-flight step.
     settlement: crate::settle::Settlement,
@@ -602,6 +609,12 @@ struct RsFire<'a> {
     splits: bool,
     /// Does any lane move buffered bytes? Such a fire cannot graph-replay.
     buffered: bool,
+    /// Buffered tokens each fire lane replays ahead of its rows (the read
+    /// path), in fire order; all zero for a fire without one.
+    replays: Vec<u32>,
+    /// The fire's rows plus every lane's replay — what the extended-run
+    /// scratch is sized by. Zero for a fire with no read path.
+    rows_ext: u32,
 }
 
 /// One float port's feed for one lane: which port rectangle, which row (or
@@ -729,6 +742,9 @@ pub struct Prepared<'a> {
     slot: Option<crate::inputs::SlotGuard>,
     /// What went into that slot, as lengths.
     lengths: crate::inputs::Staged,
+    /// Device-to-device decode-token overwrites to apply after the slot's
+    /// H2D commit; empty on the (PIE_NO_RUNAHEAD) host round-trip path.
+    token_injects: Vec<crate::inputs::TokenInject>,
     /// Is this fire a body's? Decided here, because it decides the staging.
     bodied: bool,
     /// Which regions that body holds, per template region.

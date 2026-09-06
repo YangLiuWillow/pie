@@ -314,7 +314,17 @@ impl Model {
             window: d.window,
             kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
-            head: Weight::sym("lm_head", [d.vocab as u64, hidden], weights),
+            // The untied head is `vocab x hidden` of its own and every rank
+            // streamed all of it. Band it on the vocab axis: each rank lands
+            // its slice and `forward` all-gathers the logits shard. Exact —
+            // partitioning a GEMM's output changes no reduction.
+            // `PIE_NO_VOCAB_SHARD` restores the replicated head.
+            head: {
+                let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+                let rows = if banded { u64::from(d.vocab / tp) } else { u64::from(d.vocab) };
+                let bank = Weight::sym("lm_head", [rows, hidden], weights);
+                if banded { bank.packed([rows]) } else { bank }
+            },
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
