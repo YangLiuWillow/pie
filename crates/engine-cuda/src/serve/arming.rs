@@ -18,6 +18,76 @@ use crate::record;
 
 use super::{Lane, MROPE_COORDS, Media, PATCH_ROUTE_DROP, Seated, Shell};
 
+/// **THE ARMING PASS'S STOP IS A GROUP DECISION.**
+///
+/// A rank arms a rung by FIRING it, and a sharded plan's fire carries the
+/// plan's collectives. The bound that stops the pass — the card's spare
+/// beyond the elastic pool's growth — is read off the local device, so two
+/// ranks of one group whose cards hold different amounts of other work stop
+/// at different rungs. The rank that walks on then sits in `ncclAllReduce`
+/// waiting for a peer that has already finished its load: a hang until
+/// `group::LOAD_WAIT`, an hour later. (Seen on a 4x RTX PRO 6000 box where
+/// another job held 22 GiB of one card: gemma-4-E4B at two ranks armed 34
+/// bodies on one rank and never came back on the other.)
+///
+/// So every rung is voted on: each rank puts its own "I would stop" on the
+/// wire, the votes are summed, and any rank's stop stops them all. One
+/// `f32` all-reduce per rung — tens of microseconds over SHM, against a
+/// rung that costs milliseconds to fire.
+///
+/// A shell with no communicator (one rank) has nothing to agree with and
+/// votes its own bound, allocating nothing.
+struct Ballot {
+    /// The one-element f32 the vote rides on, or `None` at one rank (or if
+    /// the device would not lend four bytes, in which case the local bound
+    /// stands and a group is no worse off than before this existed).
+    slip: Option<crate::device::Buffer>,
+}
+
+impl Ballot {
+    /// Opens a ballot on `device`, or a local-only one where there is no
+    /// group to agree with.
+    fn open(device: &crate::device::Context) -> Ballot {
+        let grouped = device.ctx().comm("arming ballot").is_ok();
+        Ballot {
+            slip: grouped
+                .then(|| crate::device::Buffer::zeroed(4).ok())
+                .flatten(),
+        }
+    }
+
+    /// `true` when ANY rank of the group would stop here. At one rank, or
+    /// when the vote could not be put on the wire, this rank's own answer.
+    fn any(&mut self, device: &crate::device::Context, mine: bool) -> bool {
+        let Some(slip) = self.slip.as_mut() else {
+            return mine;
+        };
+        let vote: f32 = if mine { 1.0 } else { 0.0 };
+        let sum = (|| -> Result<f32> {
+            slip.write(0, &vote.to_le_bytes())?;
+            let mut wire = kernels_cuda::Tensor::new(slip.ptr(), 1, 1, model_ir::Dtype::F32);
+            kernels_cuda::collective::all_reduce(device.ctx(), &mut wire)
+                .map_err(crate::error::kernel)?;
+            device.synchronize()?;
+            let mut back = [0u8; 4];
+            slip.read(0, &mut back)?;
+            Ok(f32::from_le_bytes(back))
+        })();
+        match sum {
+            // Half a vote is nobody's: the sum is a count of ranks.
+            Ok(total) => total >= 0.5,
+            // The wire refused. Every rank's `all_reduce` refuses the same
+            // way (a communicator is a group-wide fact), so falling back to
+            // the local bound keeps the ranks together rather than parting
+            // them.
+            Err(_) => {
+                self.slip = None;
+                mine
+            }
+        }
+    }
+}
+
 /// One lane of a synthetic composition — the owned side of a [`Seated`] an
 /// arming pass borrows. Its launches are real even though it computes and
 /// reads back nothing.
@@ -156,7 +226,11 @@ impl BodySynth {
                 Vec::new(),
             ),
             // Decode lane first: submission order does not affect the ladder.
-            BodySynth::Mixed { decode, class, rows } => (
+            BodySynth::Mixed {
+                decode,
+                class,
+                rows,
+            } => (
                 core::iter::once((*decode, 1u32))
                     .chain(rows.iter().map(|rows| (*class, *rows)))
                     .collect(),
@@ -355,11 +429,14 @@ fn mixed_keys(deployment: &Deployment, into: &mut Targets) {
                     })
                     .flatten();
                 match rows {
-                    Some(rows) => into.targets.push((point, BodySynth::Mixed {
-                        decode,
-                        class,
-                        rows,
-                    })),
+                    Some(rows) => into.targets.push((
+                        point,
+                        BodySynth::Mixed {
+                            decode,
+                            class,
+                            rows,
+                        },
+                    )),
                     None => into.unfireable.push(unfireable_line(
                         deployment,
                         &format!("mixed c{decode}+c{class}"),
@@ -411,12 +488,15 @@ fn tower_keys(deployment: &Deployment, into: &mut Targets) {
                     ));
                     continue;
                 }
-                into.targets.push((point, BodySynth::Tower {
-                    class,
-                    rows: point,
-                    images: 1,
-                    patches,
-                }));
+                into.targets.push((
+                    point,
+                    BodySynth::Tower {
+                        class,
+                        rows: point,
+                        images: 1,
+                        patches,
+                    },
+                ));
             }
         }
     }
@@ -507,7 +587,11 @@ impl core::fmt::Display for BodySynth {
             BodySynth::Prefill { class, rows } => {
                 write!(f, "prefill c{class} {rows:?}")
             }
-            BodySynth::Mixed { decode, class, rows } => {
+            BodySynth::Mixed {
+                decode,
+                class,
+                rows,
+            } => {
                 write!(f, "mixed c{decode}+c{class} {rows:?}")
             }
             BodySynth::Tower {
@@ -564,11 +648,7 @@ impl Shell {
     /// images, remainder on the first: an even split is always plausible,
     /// where an empty second image is a submission `Fault::PatchGeometry`
     /// refuses.
-    fn synthetic_lanes_with(
-        &self,
-        lanes: &[(usize, u32)],
-        media: &[(u32, u32)],
-    ) -> Vec<Synthetic> {
+    fn synthetic_lanes_with(&self, lanes: &[(usize, u32)], media: &[(u32, u32)]) -> Vec<Synthetic> {
         let slots = self.held.len().max(1) as u32;
         // Packed page tables, not the slots' own blocks. A slot's block sits
         // at `slot × pages_per_slot`, so a synthetic of `n` lanes admitted by
@@ -582,10 +662,13 @@ impl Shell {
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let taps = self.patch_seat.map_or(0, |seat| seat.embed_taps) as usize;
-        let weight_taps = self
-            .patch_seat
-            .map_or(0, |seat| if seat.embed_weights { seat.embed_taps } else { 0 })
-            as usize;
+        let weight_taps = self.patch_seat.map_or(0, |seat| {
+            if seat.embed_weights {
+                seat.embed_taps
+            } else {
+                0
+            }
+        }) as usize;
         let fold = (self.patch_fold as usize).max(1);
         lanes
             .iter()
@@ -594,60 +677,64 @@ impl Shell {
                 let wants_media = media.get(at).is_some_and(|(images, _)| *images > 0);
                 let request = self.representative(class, rows, wants_media);
                 Synthetic {
-                stream: request.stream().code(),
-                word: (self.classify)(&request),
-                tokens: vec![0u32; rows as usize],
-                mask: request.has_custom_mask().then(|| {
-                    Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))
-                }),
-                adapter: request.has_adapter().then_some(0),
-                drafts: request.drafts(),
-                captures: request.captures_scores(),
-                // Real slots, round-robin: the page arithmetic needs a slot
-                // that exists.
-                slot: (at as u32) % slots,
-                pages: {
-                    let pages = u64::from(rows).div_ceil(page_size).max(1);
-                    let table: Vec<u32> = (next_page..next_page + pages)
-                        .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
-                        .collect();
-                    next_page += pages;
-                    table
-                },
-                held: Some(0),
-                media: media
-                    .get(at)
-                    .copied()
-                    .filter(|(images, patches)| *images > 0 && *patches > 0)
-                    .map(|(images, patches)| {
-                        let patches = patches as usize;
-                        let per = patches / images as usize;
-                        let mut per_image: Vec<u32> = vec![per as u32; images as usize];
-                        per_image[0] += (patches - per * images as usize) as u32;
-                        // The tower's live output; rows past it are the dead tail.
-                        let live = patches / fold;
-                        let mut routes = vec![
-                            if self.drops_patch_rows { PATCH_ROUTE_DROP } else { 0 };
-                            patches
-                        ];
-                        for (j, route) in routes.iter_mut().take(live).enumerate() {
-                            *route = (j % rows.max(1) as usize) as i32;
-                        }
-                        let mut embed_weights = vec![0f32; patches * weight_taps];
-                        for row in embed_weights.chunks_mut(weight_taps.max(1)) {
-                            if let Some(first) = row.first_mut() {
-                                *first = 1.0;
+                    stream: request.stream().code(),
+                    word: (self.classify)(&request),
+                    tokens: vec![0u32; rows as usize],
+                    mask: request
+                        .has_custom_mask()
+                        .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
+                    adapter: request.has_adapter().then_some(0),
+                    drafts: request.drafts(),
+                    captures: request.captures_scores(),
+                    // Real slots, round-robin: the page arithmetic needs a slot
+                    // that exists.
+                    slot: (at as u32) % slots,
+                    pages: {
+                        let pages = u64::from(rows).div_ceil(page_size).max(1);
+                        let table: Vec<u32> = (next_page..next_page + pages)
+                            .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
+                            .collect();
+                        next_page += pages;
+                        table
+                    },
+                    held: Some(0),
+                    media: media
+                        .get(at)
+                        .copied()
+                        .filter(|(images, patches)| *images > 0 && *patches > 0)
+                        .map(|(images, patches)| {
+                            let patches = patches as usize;
+                            let per = patches / images as usize;
+                            let mut per_image: Vec<u32> = vec![per as u32; images as usize];
+                            per_image[0] += (patches - per * images as usize) as u32;
+                            // The tower's live output; rows past it are the dead tail.
+                            let live = patches / fold;
+                            let mut routes = vec![
+                                if self.drops_patch_rows {
+                                    PATCH_ROUTE_DROP
+                                } else {
+                                    0
+                                };
+                                patches
+                            ];
+                            for (j, route) in routes.iter_mut().take(live).enumerate() {
+                                *route = (j % rows.max(1) as usize) as i32;
                             }
-                        }
-                        SyntheticMedia {
-                            rows: per_image,
-                            patches: vec![0u8; patches * row_bytes],
-                            routes,
-                            positions: vec![0i32; patches * MROPE_COORDS],
-                            embed_rows: vec![0i32; patches * taps],
-                            embed_weights,
-                        }
-                    }),
+                            let mut embed_weights = vec![0f32; patches * weight_taps];
+                            for row in embed_weights.chunks_mut(weight_taps.max(1)) {
+                                if let Some(first) = row.first_mut() {
+                                    *first = 1.0;
+                                }
+                            }
+                            SyntheticMedia {
+                                rows: per_image,
+                                patches: vec![0u8; patches * row_bytes],
+                                routes,
+                                positions: vec![0i32; patches * MROPE_COORDS],
+                                embed_rows: vec![0i32; patches * taps],
+                                embed_weights,
+                            }
+                        }),
                 }
             })
             .collect()
@@ -662,10 +749,16 @@ impl Shell {
             .find(|request| {
                 request.has_media() == wants_media && (request.query_len() == 1) == (rows == 1)
             })
-            .or_else(|| landing.iter().find(|request| request.has_media() == wants_media))
+            .or_else(|| {
+                landing
+                    .iter()
+                    .find(|request| request.has_media() == wants_media)
+            })
             .or_else(|| landing.first())
             .copied()
-            .unwrap_or_else(|| panic!("the arming pass enumerated class {class}, which no request lands in"))
+            .unwrap_or_else(|| {
+                panic!("the arming pass enumerated class {class}, which no request lands in")
+            })
     }
 
     /// Fire one synthetic composition, with [`Shell::arming`] set, landing
@@ -677,7 +770,8 @@ impl Shell {
     /// capture, the instantiate. The caller tallies the sentence; nothing is
     /// retried.
     fn fire_synthetic(&mut self, owned: &[Synthetic]) -> Result<()> {
-        self.fire_synthetic_as(owned, crate::serve::Golden::Off).map(|_| ())
+        self.fire_synthetic_as(owned, crate::serve::Golden::Off)
+            .map(|_| ())
     }
 
     /// [`fire_synthetic`](Shell::fire_synthetic), told which half of the
@@ -1093,17 +1187,26 @@ impl Shell {
         // lane count a real fire of that rung can bring.
         let points: Vec<LatticePoint> = if self.budget.buckets.is_empty() {
             (1..=ceiling)
-                .map(|n| LatticePoint { bucket: n, lanes: n })
+                .map(|n| LatticePoint {
+                    bucket: n,
+                    lanes: n,
+                })
                 .collect()
         } else {
             let mut points = Vec::new();
             for point in self.budget.buckets.iter().copied() {
                 if point <= ceiling {
-                    points.push(LatticePoint { bucket: point, lanes: point });
+                    points.push(LatticePoint {
+                        bucket: point,
+                        lanes: point,
+                    });
                 } else {
                     // First rung past the seats, only if there is one.
                     if ceiling > points.last().map_or(0, |point| point.bucket) {
-                        points.push(LatticePoint { bucket: point, lanes: ceiling });
+                        points.push(LatticePoint {
+                            bucket: point,
+                            lanes: ceiling,
+                        });
                     }
                     break;
                 }
@@ -1186,9 +1289,8 @@ impl Shell {
             Kind::Fragmented => 5,
             Kind::Tower => 6,
         };
-        targets.sort_by_key(|(bucket, target)| {
-            (Some(*bucket) != top, rank(target.kind()), *bucket)
-        });
+        targets
+            .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
         if targets.is_empty() {
             return Ok(());
         }
@@ -1205,6 +1307,8 @@ impl Shell {
         // Which of the bounds stopped the pass.
         let mut belted = false;
         let mut starved: Option<u64> = None;
+        // Whether it was a PEER's bound rather than this rank's own.
+        let mut peer_stopped = false;
         // A body is driver memory outside the elastic pool, so every byte
         // captured is a byte the pool's next recalibration no longer finds.
         // The pass stops while the ceiling still holds the pool's declared
@@ -1213,6 +1317,10 @@ impl Shell {
         // the commit rounding of one wide fire — sixteen map units, or two
         // bodies at the going price if that is more.
         let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
+        // The vote a tensor-parallel rank casts on every rung (see
+        // [`Shell::agreed`]): the pass's stop is a GROUP decision, because
+        // every arming fire of a sharded plan is a collective.
+        let mut ballot = Ballot::open(&self.device);
         for (bucket, target) in targets {
             // Bytes, not seats: the live census reads device memory spent.
             let spent = self.cache.body_stats();
@@ -1220,16 +1328,20 @@ impl Shell {
             let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
             let margin = price.max(unit_margin);
             let headroom = spare < margin;
-            if spent.census.bodies >= record::MAX_BODIES
+            let mine = spent.census.bodies >= record::MAX_BODIES
                 || spent.census.bytes >= self.bodies_mem
-                || headroom
-            {
+                || headroom;
+            // A rank stops when ANY rank would: the rung it skips is a fire
+            // whose collectives its peers are already inside.
+            if ballot.any(&self.device, mine) {
                 if never == 0 {
                     never_from = bucket;
                     belted = spent.census.bodies >= record::MAX_BODIES;
                     if headroom && !belted && spent.census.bytes < self.bodies_mem {
                         starved = Some(spare);
                     }
+                    // Nothing of this rank's own stopped it: a peer's did.
+                    peer_stopped = !mine;
                 }
                 never += 1;
                 continue;
@@ -1239,7 +1351,9 @@ impl Shell {
             // different second (patch) rectangle.
             if target.skips_on_present_set() && unadmitted.contains(&present) {
                 // Named, not fired: already known inadmissible.
-                unfireable.push(format!("bucket {bucket}, {target}: inadmissible present set"));
+                unfireable.push(format!(
+                    "bucket {bucket}, {target}: inadmissible present set"
+                ));
                 continue;
             }
             wanted += 1;
@@ -1356,6 +1470,7 @@ impl Shell {
             never_from,
             belted,
             starved,
+            peer_stopped,
             declines: stats.tally.declines,
             refusals: stats.tally.refusals,
             seal,
@@ -1386,8 +1501,7 @@ impl Shell {
                 if region.mask.contains(separator) {
                     continue;
                 }
-                let Some(present) = Self::witness(&self.compiled, &region.mask, separator)
-                else {
+                let Some(present) = Self::witness(&self.compiled, &region.mask, separator) else {
                     continue;
                 };
                 // No witness may name a media class: every lane this arm
@@ -1396,8 +1510,7 @@ impl Shell {
                 if present.iter().any(|class| self.media.contains(*class)) {
                     continue;
                 }
-                if Self::breaks(&self.compiled, &region.mask, &present)
-                    && !found.contains(&present)
+                if Self::breaks(&self.compiled, &region.mask, &present) && !found.contains(&present)
                 {
                     found.push(present);
                 }
@@ -1497,11 +1610,7 @@ impl Shell {
         }
         let base = rows / lanes;
         let over = rows % lanes;
-        Some(
-            (0..lanes)
-                .map(|at| base + u32::from(at < over))
-                .collect(),
-        )
+        Some((0..lanes).map(|at| base + u32::from(at < over)).collect())
     }
 }
 
@@ -1541,11 +1650,7 @@ fn fragment_rows(
     bucket: u32,
 ) -> Option<Vec<(usize, u32)>> {
     let width = present.len() as u32;
-    if width < 2
-        || deployment.seats < width
-        || deployment.max_lanes < width
-        || bucket < width
-    {
+    if width < 2 || deployment.seats < width || deployment.max_lanes < width || bucket < width {
         return None;
     }
     let decodes = present
@@ -1638,7 +1743,9 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
             non_finite.0 += usize::from(!x.is_finite());
             non_finite.1 += usize::from(!y.is_finite());
             worst = worst.max(ordered(x.to_bits()).abs_diff(ordered(y.to_bits())));
-            let steps = ordered(x.to_bits() & 0xffff_0000).abs_diff(ordered(y.to_bits() & 0xffff_0000)) >> 16;
+            let steps = ordered(x.to_bits() & 0xffff_0000)
+                .abs_diff(ordered(y.to_bits() & 0xffff_0000))
+                >> 16;
             beyond_one_bf16 += usize::from(steps > 1);
             beyond_eight_bf16 += usize::from(steps > 8);
             if steps > worst_bf16 {
@@ -1730,10 +1837,20 @@ mod tests {
     fn two_decode_words_arm_the_pair_at_the_rungs_lane_count() {
         let mut found = Targets::default();
         ensemble_keys(
-            &deployment(2, LatticePoint { bucket: 256, lanes: 256 }),
+            &deployment(
+                2,
+                LatticePoint {
+                    bucket: 256,
+                    lanes: 256,
+                },
+            ),
             &mut found,
         );
-        assert_eq!(found.targets.len(), 1, "one key per rung, and there is one rung");
+        assert_eq!(
+            found.targets.len(),
+            1,
+            "one key per rung, and there is one rung"
+        );
         let (bucket, target) = &found.targets[0];
         assert_eq!(*bucket, 256);
         assert_eq!(
@@ -1746,10 +1863,12 @@ mod tests {
         let (rows, media) = target.lanes();
         assert!(media.is_empty(), "an ensemble lane submits no image");
         assert_eq!(rows.len(), 256, "one lane per row");
-        assert!(rows.iter().all(|(_, rows)| *rows == 1), "a decode lane is one row");
+        assert!(
+            rows.iter().all(|(_, rows)| *rows == 1),
+            "a decode lane is one row"
+        );
         assert_eq!(rows.iter().map(|(_, rows)| *rows).sum::<u32>(), 256);
     }
-
 }
 
 /// What the arming pass did, as the boot line says it.
@@ -1774,6 +1893,11 @@ pub struct Armed {
     /// `Some(bytes)` when the card's spare — beyond the elastic pool's own
     /// growth — is what stopped the pass, with the spare it stopped at.
     pub starved: Option<u64>,
+    /// Whether a PEER RANK's bound stopped this rank's pass rather than its
+    /// own: under tensor parallelism the stop is agreed, because every
+    /// arming fire of a sharded plan is a collective and a rank that walked
+    /// on alone would sit in NCCL waiting for one that had stopped.
+    pub peer_stopped: bool,
     pub declines: u64,
     pub refusals: u64,
     /// What the seal stands for. See [`Seal`].
@@ -1803,7 +1927,13 @@ impl core::fmt::Display for Armed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let columns = Kind::ALL
             .iter()
-            .map(|kind| format!("{kind} {}/{}", self.kinds[kind.at()].0, self.kinds[kind.at()].1))
+            .map(|kind| {
+                format!(
+                    "{kind} {}/{}",
+                    self.kinds[kind.at()].0,
+                    self.kinds[kind.at()].1
+                )
+            })
             .collect::<Vec<String>>()
             .join(", ");
         write!(
@@ -1843,6 +1973,8 @@ impl core::fmt::Display for Armed {
                 " [sealed partial: {never} key(s) never attempted, {} at bucket {}, and they \
                  walk eagerly for the life of this load]",
                 match self.starved {
+                    _ if self.peer_stopped =>
+                        "a peer rank's bound (the stop is agreed across the group)".to_string(),
                     Some(spare) => format!(
                         "the ceiling's spare ran out ({} MiB left beyond the elastic pool's growth)",
                         spare >> 20
