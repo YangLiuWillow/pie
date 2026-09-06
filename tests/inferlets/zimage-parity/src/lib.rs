@@ -15,10 +15,24 @@
 //!    `positions`, `timestep`) in one group; the image lane's epilogue
 //!    reads `velocity(64)`.
 //!
+//! **THE TWO DENOISE LANES GO DOWN TWO PIPELINES.** A pipeline is serial —
+//! the scheduler never seats two of its passes in one step — so a group
+//! whose lanes share a pipeline is two fires of one lane each, the joint
+//! trunk attends the image rows alone, and the caption is silently
+//! invisible: the velocity does not move at all when the caption changes,
+//! and the step-0 answer lands at cos 0.56 instead of 0.9997. One pipeline
+//! per lane, as `latent::DenoiseLoop` owns for a sampler and `Pipes` does
+//! in `mini-dit-parity`.
+//!
 //! The refine readout goes through the host between the two: a parity
 //! harness wants both numbers on disk anyway (the refined caption is the
 //! first thing to diff when the velocity disagrees), and a seeded channel
 //! attaches to one pass only, so the second fire seeds its own.
+//!
+//! Under `steps` the second fire becomes the whole TRAJECTORY: `steps`
+//! denoise fires over the family's pinned sigmas with the latent carried on
+//! the device by the image lane's Euler epilogue, started from the case's
+//! own latent (the golden's recorded `randn`, not a device draw).
 //!
 //! Row counts, pad flags and positions are the CASE's: the family cannot
 //! grow a lane, so the harness pads to the 32-row multiple and states the
@@ -53,6 +67,15 @@ struct Input {
     /// the family tapped on a joint-trunk value, this is its caption rows).
     #[serde(default)]
     ctx_tap: bool,
+    /// Run the whole Euler trajectory instead of one step: the case's
+    /// `latents` are then the INITIAL noise, and this is the schedule's
+    /// step count (the family pins eight for Turbo). 0 keeps one step.
+    #[serde(default)]
+    steps: u32,
+    /// Stop the trajectory after this many steps (a bisect against the
+    /// golden's `sched.x{n}`); all of them by default.
+    #[serde(default)]
+    stop: Option<u32>,
 }
 
 /// The reference's fixed inputs, flattened row-major and already padded.
@@ -98,6 +121,12 @@ struct Output {
     /// `[caption_rows, ·]`: the same readout off the context lane, under
     /// `ctx_tap`; empty otherwise.
     ctx: Vec<f32>,
+    /// `[image_rows, patch_features]`: the trajectory's latent after its
+    /// last fire, under `steps`; empty otherwise. The sigmas it walked and
+    /// the timesteps it read, so the report says what schedule ran.
+    latent: Vec<f32>,
+    sigmas: Vec<f32>,
+    timesteps: Vec<f32>,
 }
 
 struct Reading {
@@ -234,7 +263,8 @@ async fn denoise(
     image.reading(&r.name)?;
     image.stream(LaneStream::Image)?;
     image.group(group)?;
-    let x = Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("latents");
+    let x =
+        Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("latents");
     let pad = Channel::from_shaped([rows, 1], case.image_pad.as_slice()).named("img_pad");
     let img_pos =
         Channel::from_shaped([rows, r.axes], case.image_positions.as_slice()).named("img_pos");
@@ -256,6 +286,96 @@ async fn denoise(
         None => Vec::new(),
     };
     Ok((velocity, ctx_rows))
+}
+
+/// The whole Euler trajectory in one job: `steps` denoise fires over the
+/// family's own pinned sigmas ([`FlowMatchEuler::from_model`] — Turbo's
+/// eight), the latent carried on the DEVICE between them by the image
+/// lane's epilogue (`x <- x + (sigma' - sigma) . velocity`, design D4) and
+/// read back once per fire so a partial run can be diffed against the
+/// reference's own `sched.x{n}`.
+///
+/// The initial latent is the CASE's, not a device draw: this is a parity
+/// harness, and the reference's trajectory starts from a `randn` the golden
+/// recorded. `DenoiseLoop` puts a seed fire ahead of the steps whose `dt`
+/// is 0, so fire 0 leaves that latent alone and fire `k` integrates step
+/// `k - 1`.
+async fn trajectory(
+    case: &Case,
+    refined: &[f32],
+    dim: u32,
+    steps: u32,
+    stop: Option<u32>,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let r = reading(
+        model::ReadoutKind::Velocity,
+        &["latents", "pad", "context", "timestep", "positions"],
+    )?;
+    let width = r.readout_width;
+    let (p_latents, p_pad, p_context, p_timestep, p_positions) = (
+        &r.ports[0],
+        &r.ports[1],
+        &r.ports[2],
+        &r.ports[3],
+        &r.ports[4],
+    );
+    let group = 0;
+    let rows = case.image_rows;
+    let sched = FlowMatchEuler::from_model(steps, None)?;
+    let mut loops = DenoiseLoop::new(&sched);
+    let ctx_clock = loops.lane("traj_ctx");
+    let img_clock = loops.lane("traj_img");
+
+    let context = ForwardPass::new();
+    context.reading(&r.name)?;
+    context.stream(LaneStream::Context)?;
+    context.group(group)?;
+    let ctx = Channel::from_shaped([case.caption_rows, dim], refined).named("traj_context");
+    let ctx_pos = Channel::from_shaped(
+        [case.caption_rows, r.axes],
+        case.caption_positions.as_slice(),
+    )
+    .named("traj_ctx_pos");
+    context.input(p_context, &ctx)?;
+    context.input(p_positions, &ctx_pos)?;
+    context.input(p_timestep, &ctx_clock.timestep)?;
+
+    let image = ForwardPass::new();
+    image.reading(&r.name)?;
+    image.stream(LaneStream::Image)?;
+    image.group(group)?;
+    let latent =
+        Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("traj_x");
+    let pad = Channel::from_shaped([rows, 1], case.image_pad.as_slice()).named("traj_pad");
+    let img_pos =
+        Channel::from_shaped([rows, r.axes], case.image_positions.as_slice()).named("traj_pos");
+    image.input(p_latents, &latent)?;
+    image.input(p_pad, &pad)?;
+    image.input(p_positions, &img_pos)?;
+    image.input(p_timestep, &img_clock.timestep)?;
+
+    let out = Channel::new([rows, width], dtype::f32).named("traj_out");
+    // The caption lane only modulates: its clock advances and nothing else.
+    ctx_clock.drive(&context, |_| {});
+    let dts = loops.dts("traj_img");
+    let x = latent.clone();
+    let readback = out.clone();
+    img_clock.drive(&image, move |k| {
+        let next = euler_step(&x.take(), &intrinsics::velocity(width), &at(&dts.read(), k));
+        x.put(&next);
+        readback.put(&next);
+    });
+
+    let fires = stop.map_or(loops.fires(), |n| n.min(sched.steps()) + 1);
+    let mut last = Vec::new();
+    for fire in 0..fires {
+        loops
+            .fire(&[&context, &image])
+            .map_err(|why| format!("fire {fire}: {why}"))?;
+        last = out.take_host::<Vec<f32>>().await?;
+    }
+    loops.close();
+    Ok((last, sched.sigmas.clone(), sched.timesteps()))
 }
 
 /// The `text` reading: the prompt through the family's template
@@ -350,6 +470,9 @@ async fn main(input: Input) -> Result<Output> {
             image_rows: 0,
             patch_features: 0,
             ctx: Vec::new(),
+            latent: Vec::new(),
+            sigmas: Vec::new(),
+            timesteps: Vec::new(),
         });
     }
     let mut pieces = String::new();
@@ -440,7 +563,14 @@ async fn main(input: Input) -> Result<Output> {
         None => (Vec::new(), 0, 0),
     };
     let (refined, dim) = refine(&case, &pipe).await?;
+    let (mut latent, mut sigmas, mut timesteps) = (Vec::new(), Vec::new(), Vec::new());
     let (velocity, ctx_rows) = if input.refine_only {
+        (Vec::new(), Vec::new())
+    } else if input.steps > 0 {
+        let (rows, s, t) = trajectory(&case, &refined, dim, input.steps, input.stop).await?;
+        latent = rows;
+        sigmas = s;
+        timesteps = t;
         (Vec::new(), Vec::new())
     } else {
         denoise(&case, &refined, dim, input.ctx_tap, &ctx_pipe, &pipe).await?
@@ -465,5 +595,8 @@ async fn main(input: Input) -> Result<Output> {
         image_rows: case.image_rows,
         patch_features,
         ctx: ctx_rows,
+        latent,
+        sigmas,
+        timesteps,
     })
 }
