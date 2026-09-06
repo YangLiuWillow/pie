@@ -34,6 +34,12 @@ where the config's `[model] model` is the imported `.zt` (`pie model import
 curated suites this one does not use the embedded `pie.server` wheel: what is
 under test includes `pie run -o`, so it runs the binary.
 
+**GIVE THIS RUN ITS OWN CONFIG FILE.** `~/.pie/config.flux2.toml` is shared,
+and a config another agent repoints at a different artifact (or a different
+port) is indistinguishable from a numerics regression: the run still succeeds
+and hands back a plausible latent that decodes to the wrong picture. Copy one
+to a name only this suite uses.
+
 **TWO CONFIG KEYS THIS RUN NEEDS, AND WHY.** `[engine] max_model_len` is the
 per-slot token ceiling, and a 1024² job is 4096 latent rows a lane; at the
 default 4096 the engine refuses the second fire by name ("this fire wants 8192
