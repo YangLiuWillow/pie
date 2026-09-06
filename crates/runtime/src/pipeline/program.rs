@@ -298,6 +298,27 @@ fn price(c: &TraceContainer) -> Pricing {
                     .map(|decl| decl.shape.numel() as u32),
             })
     };
+    // A float lane's program (design D1) binds neither port: its read-out
+    // rows are the leading extent of the `velocity()` / `hidden()` /
+    // `logits()` value it materializes, sized by the SDK from the latents
+    // port's rows.
+    let intrinsic_rows = || {
+        c.stages
+            .iter()
+            .flat_map(|stage| stage.ops.iter())
+            .filter_map(|op| match op {
+                Op::IntrinsicVal {
+                    intr:
+                        eta_ir::op::IntrinsicId::Velocity
+                        | eta_ir::op::IntrinsicId::Hidden
+                        | eta_ir::op::IntrinsicId::Logits,
+                    shape,
+                    ..
+                } => shape.dims().first().copied(),
+                _ => None,
+            })
+            .max()
+    };
     let rows = port_len(eta_ir::registry::Port::Readout)
         .map(|readout| readout.max(1))
         .or_else(|| {
@@ -305,6 +326,7 @@ fn price(c: &TraceContainer) -> Pricing {
             port_len(eta_ir::registry::Port::EmbedIndptr)
                 .map(|indptr| indptr.saturating_sub(1).max(1))
         })
+        .or_else(intrinsic_rows)
         .unwrap_or(1);
     Pricing {
         channel_bytes,
@@ -449,3 +471,32 @@ fn profile_from(
     }
 }
 
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::price;
+    use eta_ir::container::{StageProgram, TraceContainer};
+    use eta_ir::op::{IntrinsicId, Op};
+    use eta_ir::registry::Stage;
+    use eta_ir::types::{Dtype, Shape};
+
+    /// A float lane's program binds no readout or embed port; its read-out
+    /// rows are the `velocity()` value's, so the engine's sampled-rows
+    /// extent is sized to the latent rows rather than to one.
+    #[test]
+    fn a_float_lane_is_priced_by_its_velocity_rows() {
+        let container = TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::IntrinsicVal {
+                    intr: IntrinsicId::Velocity,
+                    shape: Shape::matrix(256, 64),
+                    dtype: Dtype::F32,
+                }],
+            }],
+            ..TraceContainer::default()
+        };
+        assert_eq!(price(&container).rows, 256);
+        assert_eq!(price(&TraceContainer::default()).rows, 1);
+    }
+}
