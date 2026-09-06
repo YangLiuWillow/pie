@@ -35,7 +35,7 @@ struct Export {
 
 /// The export set: names `model_dsl::seam` states for values materializing
 /// outside the graph. Republished as [`crate::EXPORT_SEAMS`].
-const EXPORTS: [Export; 6] = [
+const EXPORTS: [Export; 7] = [
     // Trunk logits, into the runtime's sampler.
     Export {
         seam: "out",
@@ -68,23 +68,30 @@ const EXPORTS: [Export; 6] = [
         seam: "hidden",
         read_by: Readers::ItsOwnClasses,
     },
+    // A VAE decode arm's pixels, `[Voxels·k, C]` float on the voxel axis
+    // beside its `[Clips, 4]` grid, read back per clip.
+    Export {
+        seam: "pixels",
+        read_by: Readers::ItsOwnClasses,
+    },
 ];
 
 /// The export seam names, in the order [`EXPORTS`] states them: `out`,
-/// `mtp`, `attn.scores`, `mtp.drafts`, `velocity`, `hidden`.
-pub const EXPORT_SEAMS: [&str; 6] = [
+/// `mtp`, `attn.scores`, `mtp.drafts`, `velocity`, `hidden`, `pixels`.
+pub const EXPORT_SEAMS: [&str; 7] = [
     EXPORTS[0].seam,
     EXPORTS[1].seam,
     EXPORTS[2].seam,
     EXPORTS[3].seam,
     EXPORTS[4].seam,
     EXPORTS[5].seam,
+    EXPORTS[6].seam,
 ];
 
 /// The float readouts among [`EXPORT_SEAMS`]: the seams a forward may
 /// return its value under INSTEAD of `out`, so a plan carrying one of them
 /// and no `out` still has something a reader takes.
-pub const FLOAT_READOUT_SEAMS: [&str; 2] = [EXPORTS[4].seam, EXPORTS[5].seam];
+pub const FLOAT_READOUT_SEAMS: [&str; 3] = [EXPORTS[4].seam, EXPORTS[5].seam, EXPORTS[6].seam];
 
 /// How many rows a value has, in the terms the carve evaluates rather than
 /// `model_ir::Dim`'s serializable form.
@@ -107,6 +114,15 @@ pub enum RowExpr {
     Images,
     /// `images + k` — the patch axis's indptr shape.
     ImagesPlus(u32),
+    /// One row per port voxel this fire carries — the third row axis
+    /// (`RowAxis::Voxels`).
+    Voxels,
+    /// `voxels * k` — a rectangle grown by a fixed factor.
+    VoxelsTimes(u32),
+    /// One row per clip — [`Lanes`](RowExpr::Lanes) for the voxel axis.
+    Clips,
+    /// `clips + k`.
+    ClipsPlus(u32),
 }
 
 impl RowExpr {
@@ -122,6 +138,10 @@ impl RowExpr {
             Dim::Patches => RowExpr::Patches,
             Dim::Images => RowExpr::Images,
             Dim::ImagesPlus(k) => RowExpr::ImagesPlus(k),
+            Dim::Voxels => RowExpr::Voxels,
+            Dim::VoxelsTimes(k) => RowExpr::VoxelsTimes(k),
+            Dim::Clips => RowExpr::Clips,
+            Dim::ClipsPlus(k) => RowExpr::ClipsPlus(k),
         }
     }
 
@@ -134,6 +154,9 @@ impl RowExpr {
                 Some(RowAxis::Tokens)
             }
             RowExpr::Patches | RowExpr::Images | RowExpr::ImagesPlus(_) => Some(RowAxis::Patches),
+            RowExpr::Voxels | RowExpr::VoxelsTimes(_) | RowExpr::Clips | RowExpr::ClipsPlus(_) => {
+                Some(RowAxis::Voxels)
+            }
         }
     }
 
@@ -153,8 +176,14 @@ impl RowExpr {
             | RowExpr::TokensTimes(_)
             | RowExpr::Lanes
             | RowExpr::Patches
-            | RowExpr::Images => true,
-            RowExpr::Const(_) | RowExpr::LanesPlus(_) | RowExpr::ImagesPlus(_) => false,
+            | RowExpr::Images
+            | RowExpr::Voxels
+            | RowExpr::VoxelsTimes(_)
+            | RowExpr::Clips => true,
+            RowExpr::Const(_)
+            | RowExpr::LanesPlus(_)
+            | RowExpr::ImagesPlus(_)
+            | RowExpr::ClipsPlus(_) => false,
         }
     }
 
@@ -170,6 +199,10 @@ impl RowExpr {
             RowExpr::Patches => fire.patches,
             RowExpr::Images => fire.images,
             RowExpr::ImagesPlus(k) => fire.images.saturating_add(u64::from(k)),
+            RowExpr::Voxels => fire.voxels,
+            RowExpr::VoxelsTimes(k) => fire.voxels.saturating_mul(u64::from(k)),
+            RowExpr::Clips => fire.clips,
+            RowExpr::ClipsPlus(k) => fire.clips.saturating_add(u64::from(k)),
         }
     }
 }
@@ -186,10 +219,14 @@ pub struct FireRows {
     pub patches: u64,
     /// Images this fire carries.
     pub images: u64,
+    /// Port voxel rows this fire carries.
+    pub voxels: u64,
+    /// Clips this fire carries.
+    pub clips: u64,
 }
 
 impl FireRows {
-    /// A fire on the token axis alone: no images, no patch rows.
+    /// A fire on the token axis alone: no images, no patch rows, no clips.
     #[must_use]
     pub fn text_only(tokens: u64, lanes: u64) -> FireRows {
         FireRows {
@@ -197,6 +234,8 @@ impl FireRows {
             lanes,
             patches: 0,
             images: 0,
+            voxels: 0,
+            clips: 0,
         }
     }
 
@@ -208,6 +247,8 @@ impl FireRows {
             lanes: u64::from(budgets.tokens.max_lanes),
             patches: u64::from(budgets.max_patches()),
             images: u64::from(budgets.max_images()),
+            voxels: u64::from(budgets.max_voxels()),
+            clips: u64::from(budgets.max_clips()),
         }
     }
 }
@@ -644,7 +685,11 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
             | Dim::LanesPlus(_)
             | Dim::Patches
             | Dim::Images
-            | Dim::ImagesPlus(_) => {
+            | Dim::ImagesPlus(_)
+            | Dim::Voxels
+            | Dim::VoxelsTimes(_)
+            | Dim::Clips
+            | Dim::ClipsPlus(_) => {
                 return Err(Unrectangled::SymbolicWidth);
             }
         }

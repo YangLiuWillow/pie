@@ -416,6 +416,7 @@ mod tests {
                     shard: model_ir::Shard::Replicated,
                     dtype: model_ir::Dtype::U8,
                     source: model_ir::ParamSource::default(),
+                    layout: model_ir::ParamLayout::default(),
                 })
                 .collect(),
             caches: Vec::new(),

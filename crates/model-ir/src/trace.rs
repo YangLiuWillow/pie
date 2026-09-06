@@ -98,6 +98,29 @@ pub enum ParamSource {
     Registered,
 }
 
+/// How a landed plane's elements are ordered on the device, when that is
+/// not the checkpoint's own order. The checkpoint contract lands the
+/// natural rectangle; a shell relabels it once at load, in place, before
+/// the first fire. A layout is a property of the PARAM, not of the op that
+/// reads it, so the same weight bound twice is relabelled once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ParamLayout {
+    /// Row-major as declared — every weight before the spatial family.
+    #[default]
+    Natural,
+    /// A convolution weight: the checkpoint's `[C_out, C_in·kt·kh·kw]`
+    /// (`weight.reshape(C_out, -1)`, `kw` fastest) relabelled to the
+    /// tap-major channel-fastest `[C_out, kt·kh·kw·C_in]` the
+    /// `spatial.conv3d` kernel reads (`kernels_cuda::spatial::
+    /// conv_weight_taps_major`). The rectangle's shape is unchanged.
+    ConvTapsMajor {
+        /// Input channels — the fastest index after the relabelling.
+        c_in: u32,
+        /// `kt·kh·kw`.
+        taps: u32,
+    },
+}
+
 /// One loader-resolved weight. `Def::Weight(i)` values point here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Param {
@@ -109,6 +132,9 @@ pub struct Param {
     /// Where the bytes come from — the checkpoint, or the serving door.
     #[serde(default)]
     pub source: ParamSource,
+    /// The on-device element order, when it is not the checkpoint's.
+    #[serde(default)]
+    pub layout: ParamLayout,
 }
 
 /// One cache space — storage only; its geometry enters the graph as

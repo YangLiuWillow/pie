@@ -23,10 +23,12 @@ pub use guard::Guard;
 pub use operands::Operands;
 pub use request::{ClassifyFn, Request, Stream};
 pub use ops::{
-    Attention, Collective, CustomCuda, Elementwise, GateActivation, Layout, Linear, ModulateForm,
-    MropeForm, NormKind, Operation, RaggedMask, RopeForm,
+    Attention, Collective, CustomCuda, Elementwise, GateActivation, GridRule, Layout, Linear,
+    ModulateForm, MropeForm, NormKind, Operation, RaggedMask, RopeForm, Spatial, TimePad,
 };
-pub use trace::{BlockDrafter, CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
+pub use trace::{
+    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamSource, Platform, Seam, Shard, Trace,
+};
 pub use value::{
     BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, Selection,
     StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,

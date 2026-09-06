@@ -316,6 +316,7 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
             Operation::Layout(op) => collect!(op),
             Operation::Collective(op) => collect!(op),
             Operation::CustomCuda(op) => collect!(op),
+            Operation::Spatial(op) => collect!(op),
         }
     }
     operands.iter().all(|id| {
@@ -348,6 +349,8 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
                     // The patch axis: a different row space than the token map `Gathered::rows_host` describes.
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
+                    // The voxel axis: its own row space too.
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
                 },
             },
         }

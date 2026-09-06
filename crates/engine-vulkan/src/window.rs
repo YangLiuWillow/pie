@@ -121,6 +121,7 @@ pub(crate) fn operands(
             Operation::Layout(op) => collect!(op),
             Operation::Collective(op) => collect!(op),
             Operation::CustomCuda(op) => collect!(op),
+            Operation::Spatial(op) => collect!(op),
         }
     }
     Some((ins, outs))
@@ -157,6 +158,8 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
 
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
+                    // The voxel axis: its own row space too.
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
                 },
             },
         }
@@ -316,6 +319,8 @@ impl Windows {
             match axis {
                 model_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
                 model_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
+                // M0: no voxel table on this shell; a voxel region is the zero window.
+                model_ir::RowAxis::Voxels => spans.clear(),
             }
 
             let patch = match patches.span(&region.mask) {
@@ -378,7 +383,7 @@ impl Windows {
                     indptr_host: match axis {
                         model_ir::RowAxis::Tokens if capped => vec![0, span.rows as i32],
                         model_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
-                        model_ir::RowAxis::Patches => Vec::new(),
+                        model_ir::RowAxis::Patches | model_ir::RowAxis::Voxels => Vec::new(),
                     },
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
                     gathered: None,

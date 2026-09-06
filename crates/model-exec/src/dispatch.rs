@@ -13,7 +13,9 @@
 //! Nothing in this file names `model_compiler`; the walk that selects which
 //! nodes get dispatched lives in the engine substrate, not here.
 
-use model_ir::{Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Node, Operation};
+use model_ir::{
+    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Node, Operation, Spatial,
+};
 
 use crate::error::KernelError;
 
@@ -47,6 +49,13 @@ pub trait DispatchCustomCuda {
     fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError>;
 }
 
+/// Enqueue one [`Spatial`] op — the voxel axis's family. [`Dispatch`]
+/// states the standing rules; a shell with no spatial kernels answers
+/// [`KernelError::Unsupported`] by name.
+pub trait DispatchSpatial {
+    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError>;
+}
+
 /// The whole contract, one bound. Two standing rules:
 ///
 /// - `dispatch` means enqueue/encode only, never sync — CUDA graph capture
@@ -69,6 +78,7 @@ pub trait Dispatch:
     + DispatchLayout
     + DispatchCollective
     + DispatchCustomCuda
+    + DispatchSpatial
     + DispatchProbe
 {
     /// Enqueue one node's op. UFCS throughout — a method call would
@@ -82,6 +92,7 @@ pub trait Dispatch:
             Operation::Layout(op) => DispatchLayout::dispatch(self, op),
             Operation::Collective(op) => DispatchCollective::dispatch(self, op),
             Operation::CustomCuda(op) => DispatchCustomCuda::dispatch(self, op),
+            Operation::Spatial(op) => DispatchSpatial::dispatch(self, op),
         };
         if outcome.is_ok() {
             self.probe(node);
@@ -97,6 +108,7 @@ impl<T> Dispatch for T where
         + DispatchLayout
         + DispatchCollective
         + DispatchCustomCuda
+        + DispatchSpatial
         + DispatchProbe
 {
 }

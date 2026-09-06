@@ -66,6 +66,9 @@ pub struct CompiledModel {
     /// gets its own class order over its own lane space (images) and its
     /// own fallback rows, indexed into `PatchLadder::buckets`.
     pub patches: Option<AxisPlan>,
+    /// The voxel axis's own answers, or `None` for a plan with no voxel
+    /// row — the third row axis, seriated over clips.
+    pub voxels: Option<AxisPlan>,
     /// `true` exactly when this artifact has more than one capture unit. A
     /// fire launching two execs has two bucket numbers and no single graph
     /// to fold, so the engine serves the keyed path for the life of the load
@@ -127,6 +130,7 @@ impl CompiledModel {
         match axis {
             RowAxis::Tokens => Some(&self.order),
             RowAxis::Patches => self.patches.as_ref().map(|plan| &plan.order),
+            RowAxis::Voxels => self.voxels.as_ref().map(|plan| &plan.order),
         }
     }
 
@@ -137,6 +141,7 @@ impl CompiledModel {
         match axis {
             RowAxis::Tokens => Some(&self.fallback),
             RowAxis::Patches => self.patches.as_ref().map(|plan| &plan.fallback),
+            RowAxis::Voxels => self.voxels.as_ref().map(|plan| &plan.fallback),
         }
     }
 
