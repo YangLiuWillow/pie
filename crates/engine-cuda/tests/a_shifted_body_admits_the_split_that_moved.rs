@@ -167,7 +167,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, fire: &Composition) -> Windo
     Windows::of(
         trace,
         compiled,
-        model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
+        model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &boundaries(fire),
         Copies::off(),
         test_slots(),

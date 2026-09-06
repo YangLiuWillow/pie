@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, CustomCuda};
+use crate::ops::{Attention, CustomCuda, Spatial};
 use crate::{Guard, Def, Operands, Operation, Trace, ValueId};
 
 /// One deduplicated behavior: the fact words that run the same nodes and
@@ -566,7 +566,8 @@ fn spans_classes(op: &Operation) -> bool {
 /// wrong by default is a kv append a class silently drops. Reading a cache is
 /// not writing one — rooting a mere reader would make every attention node
 /// live-and-demanded everywhere. Only `Attention` and `CustomCuda` can touch
-/// a cache at all; the other families answer `false` wholesale.
+/// a cache at all — and a `Spatial` causal conv with a frame cache; the
+/// other families answer `false` wholesale.
 fn writes_cache(op: &Operation) -> bool {
     match op {
         Operation::Attention(op) => match op {
@@ -631,6 +632,19 @@ fn writes_cache(op: &Operation) -> bool {
         // Lands k and v in the pages on its way to returning q.
         Operation::CustomCuda(op) => match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => true,
+        },
+        // A causal convolution with a frame cache stores this tile's last
+        // frames into the lane's slot after its launch — an effect a class
+        // must keep whatever it does with `y`.
+        Operation::Spatial(op) => match op {
+            Spatial::Conv3d { cache, .. } => cache.is_some(),
+            Spatial::Grid { .. }
+            | Spatial::GroupNorm { .. }
+            | Spatial::UpsampleNearest { .. }
+            | Spatial::PixelShuffle { .. }
+            | Spatial::PixelUnshuffle { .. }
+            | Spatial::Patchify { .. }
+            | Spatial::Unpatchify { .. } => false,
         },
         Operation::Linear(_)
         | Operation::Elementwise(_)

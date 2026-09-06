@@ -5,8 +5,8 @@ use std::ops::Mul;
 use std::rc::Rc;
 
 use model_ir::{
-    CacheRow, Guard, Def, Dim, Dtype, Node, Operands, Operation, Param, ParamSource, Trace, Platform,
-    RuntimeInput, Seam, Shard, Ty, ValueDecl, ValueId,
+    CacheRow, Guard, Def, Dim, Dtype, Node, Operands, Operation, Param, ParamLayout, ParamSource,
+    Trace, Platform, RuntimeInput, Seam, Shard, Ty, ValueDecl, ValueId,
 };
 
 use crate::declare::Weight;
@@ -117,7 +117,15 @@ impl Recorder {
         for plane in w.planes() {
             let name = format!("{}{}", w.name, plane.suffix);
             let shard = restated(&w.shard, &w.shape, &plane.shape, &name);
-            let index = intern(&mut p, name, plane.shape, shard, plane.dtype, w.source);
+            let index = intern(
+                &mut p,
+                name,
+                plane.shape,
+                shard,
+                plane.dtype,
+                w.source,
+                w.layout,
+            );
             first.get_or_insert(index);
         }
         let first = first.expect("a weight stores at least one plane");
@@ -271,6 +279,7 @@ fn intern(
     shard: Shard,
     dtype: Dtype,
     source: ParamSource,
+    layout: ParamLayout,
 ) -> u32 {
     if let Some(i) = p.params.iter().position(|q| q.name == name) {
         let seen = &p.params[i];
@@ -286,6 +295,10 @@ fn intern(
             "`{name}` is declared twice, once from the checkpoint and once as \
              a registered bank"
         );
+        assert!(
+            seen.layout == layout,
+            "`{name}` is declared twice with two device layouts"
+        );
         return i as u32;
     }
     p.params.push(Param {
@@ -294,6 +307,7 @@ fn intern(
         shard,
         dtype,
         source,
+        layout,
     });
     (p.params.len() - 1) as u32
 }

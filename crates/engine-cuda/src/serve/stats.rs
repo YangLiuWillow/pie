@@ -99,6 +99,13 @@ impl Shell {
         self.patch_seat.map(|seat| seat.dtype)
     }
 
+    /// The element the voxel port computes in (D8), or `None` for a load
+    /// whose plan states no voxel row.
+    #[must_use]
+    pub fn voxel_element(&self) -> Option<model_ir::Dtype> {
+        self.voxels.as_ref().map(|store| store.seat().dtype)
+    }
+
     /// Can this load serve `IntrinsicId::AttnScore`? Only if the artifact declares a capture column AND the slab was carved.
     #[must_use]
     pub fn observes_scores(&self) -> bool {

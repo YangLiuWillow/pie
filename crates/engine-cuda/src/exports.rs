@@ -46,7 +46,9 @@ pub(crate) const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
 /// The float readouts a plan may carry instead of `out` (`velocity`,
 /// `hidden`): a plan with one of these and no `out` still computes
 /// something a reader takes.
-pub(crate) const FLOAT_READOUT_SEAMS: [&str; 2] = model_compiler::FLOAT_READOUT_SEAMS;
+pub(crate) const FLOAT_READOUT_SEAMS: [&str; 3] = model_compiler::FLOAT_READOUT_SEAMS;
+/// The VAE decode readout (D8): the pixel plane and its grid.
+pub(crate) const PIXELS_SEAM: &str = model_compiler::EXPORT_SEAMS[6];
 
 /// One declared export, resolved against this load's plan and bake.
 ///
@@ -95,6 +97,9 @@ pub(crate) struct Exports {
     /// planted in, in plan order. The LAST one is what a `hidden()`
     /// intrinsic and a `ReadoutSeam::Hidden` readback read.
     pub(crate) hidden: Vec<Export>,
+    /// The pixel plane and its `[Clips, 4]` grid (D8), for a plan whose
+    /// text plants `seam::PIXELS` on both; `None` otherwise.
+    pub(crate) pixels: Option<(ValueId, ValueId)>,
 }
 
 /// Which seam a fire's host readback mirrors, and the value it reads.
@@ -180,6 +185,14 @@ impl Exports {
                 capturing.insert(class);
             }
         }
+        let pixels = trace
+            .seams
+            .iter()
+            .find(|seam| seam.seam == PIXELS_SEAM)
+            .and_then(|seam| match seam.values.as_slice() {
+                [plane, grid, ..] => Some((*plane, *grid)),
+                _ => None,
+            });
         Ok(Exports {
             out,
             mtp: named(MTP_SEAM).into_iter().next(),
@@ -187,6 +200,7 @@ impl Exports {
             capturing,
             velocity: named(FLOAT_READOUT_SEAMS[0]).into_iter().next(),
             hidden: named(FLOAT_READOUT_SEAMS[1]),
+            pixels,
         })
     }
 }

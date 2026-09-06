@@ -13,6 +13,11 @@ pub struct Lane<'a> {
     pub tokens: &'a [u32],
 }
 
+/// One lane's VAE clips (D8): the boxes and the voxel port's rows, in the
+/// port's element. Re-exported from [`crate::voxels`], where the layout
+/// rules live.
+pub type Clips<'a> = crate::voxels::Clips<'a>;
+
 /// One request inside a fire, with the page table its caller owns.
 #[derive(Debug, Clone)]
 pub struct Seated<'a> {

@@ -38,6 +38,15 @@ pub struct Budgets {
     /// contributes at least one patch row.
     #[serde(default)]
     pub max_images: Option<u32>,
+    /// The most port voxel rows one fire may carry on the voxel axis (D8).
+    /// `None` (default): the shell derives a ceiling for a loaded text that
+    /// states the axis.
+    #[serde(default)]
+    pub max_voxels: Option<u32>,
+    /// The most clips one fire may carry, over every lane. `None` derives
+    /// one from `max_lanes`.
+    #[serde(default)]
+    pub max_clips: Option<u32>,
 }
 
 impl Default for Budgets {
@@ -54,6 +63,8 @@ impl Default for Budgets {
             pages: 65536,
             max_patches: None,
             max_images: None,
+            max_voxels: None,
+            max_clips: None,
         }
     }
 }

@@ -186,6 +186,8 @@ impl Scratch {
             lanes: u64::from(budget.max_lanes),
             patches: u64::from(budgets.max_patches()),
             images: u64::from(budgets.max_images()),
+            voxels: u64::from(budgets.max_voxels()),
+            clips: u64::from(budgets.max_clips()),
         };
         let of = |id: ValueId| rect(map, id, ceiling);
         let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {

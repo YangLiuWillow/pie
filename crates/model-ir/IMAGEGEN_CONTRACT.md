@@ -131,7 +131,115 @@ both. `lane_of_row` is `request_of_token()` (`[Tokens] i32`) for a `[Lanes, ·]`
 `the_axis_rope_states_its_axes_once`; `model-compiler/tests/a_ragged_attention_over_two_arms_bakes_into_one_region`;
 `model-ir` unit tests in `fuse.rs`, `value.rs`, `request.rs`.
 
-## 6. How the CUDA engine serves §1–§2 (M0 round 2)
+## 6. The voxel axis and the `Spatial` family (D8)
+
+A VAE runs inside the model layer on a THIRD row axis. `RowAxis::Voxels`
+(`RowAxis::ALL = [Tokens, Patches, Voxels]`, `COUNT = 3`, `PerAxis` three
+wide); dims `Dim::Voxels` (the fire's PORT voxel count — `Σ t·h·w` over the
+clips the lanes submitted), `Dim::VoxelsTimes(k)` (a rectangle an upsample /
+shuffle / unpatchify grew by a fixed factor `k`; an op that shrinks rows keeps
+its input's dim and over-allocates — the grid says which rows are live),
+`Dim::Clips` (the axis's lane space: images or videos), `Dim::ClipsPlus(k)`.
+`VoxelsPlus(k)` was not added: no table on this axis is indptr-shaped; the
+clip table below carries the offsets.
+
+- **Layout.** An activation is `[rows, channels]`, one row per voxel in
+  `(t, h, w)` order (`w` fastest), one clip's voxels contiguous. The per-clip
+  box is `RuntimeInput::Grid` `[Clips, 4] i32 = {t, h, w, row_offset}`,
+  host-built in fire order with prefix-summed offsets. Every later
+  resolution's grid is a VALUE computed on the device by `Spatial::Grid { grid,
+  rule: GridRule, y }` (one single-block launch, `kernels/spatial/rule.cuh`) —
+  chosen over a prepare-phase host node because a device rule is capturable
+  and stateless, while a host derivation would need a per-fire host copy of
+  every intermediate grid. `GridRule::{Conv{k,stride,pad,causal_t},
+  Upsample{factor,keep_first_frame}, Shuffle{r}, Unshuffle{r}}`;
+  `GridRule::out_extent`/`apply`/`growth` are the host twins.
+- **Ports and readouts.** `RuntimeInput::Voxels { port, channels }`
+  `[Voxels, channels]` f32/bf16 (DSL `Input::voxels(port, channels, dtype)`);
+  `Input::grid()`; `RuntimeInput::TokenGrid { p }` `[Clips, 4] i32`
+  `{t/pt, h/ph, w/pw, token_row_offset}` (`Input::token_grid(p)`), the token
+  side of the patchify pair — a clip's tokens are its lane's token rows, clips
+  of one lane consecutive; the shell checks a lane's token count is the sum
+  of its clips'. `seam::PIXELS = "pixels"` is a float readout (`FLOAT_READOUTS`
+  now `[velocity, hidden, pixels]`, compiler `EXPORT_SEAMS[6]`), planted on
+  TWO values — `seam::at(seam::PIXELS, &[&y, &y_grid])` — so the reader
+  slices the plane per clip through the output grid.
+- **Ops** (`model-ir/src/ops/spatial.rs`, DSL `ops::spatial`): `Conv3d { x,
+  grid, w, bias?, k, stride, pad, causal_t, time_pad: TimePad, cache?,
+  y_grid, y }` (bf16 in, fp32 accumulate, one rounding; `w` `[C_out,
+  taps·C_in]` tap-major channel-fastest); `GroupNorm { x, grid, groups,
+  weight, bias, eps, silu, y }` (fp32 Welford per clip per group);
+  `UpsampleNearest { x, grid, factor, keep_first_frame, y_grid, y }`;
+  `PixelShuffle`/`PixelUnshuffle { x, grid, r, y_grid, y }` (einops
+  `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'`); `Patchify { x, grid, p,
+  tgrid, y }` → `[Tokens, C·p³]`; `Unpatchify { x, tgrid, p, grid, y }` →
+  `[Voxels, C]`. Every member lands a fresh rectangle (a conv reads its
+  neighbours). DSL: `spatial::conv3d(x, grid, w, bias, Conv, cache) -> (y,
+  y_grid)`, `group_norm(..) -> y`, `upsample_nearest(..) -> (y, y_grid)`,
+  `pixel_shuffle/pixel_unshuffle(..) -> (y, y_grid)`, `patchify(x, grid, p,
+  tgrid) -> y`, `unpatchify(x, tgrid, p, grid) -> y`, `Conv::{conv2d, conv3d,
+  same3, causal(TimePad)}`. Shape rules: conv/norm keep rows; upsample and
+  shuffle grow `Voxels → VoxelsTimes(vol)`; unshuffle divides a carried
+  factor out or keeps the dim.
+- **Conv weights.** Declared as the checkpoint stores them (`[C_out,
+  C_in·kt·kh·kw]`, `weight.reshape(C_out, -1)`) with
+  `Weight::conv_taps_major(c_in, taps)`, interned as
+  `Param { layout: ParamLayout::ConvTapsMajor { c_in, taps } }`; the CUDA
+  shell relabels each such plane once at load (`voxels::relabel_conv_weights`
+  → `kernels_cuda::spatial::conv_weight_taps_major`). `spatial::conv3d`
+  refuses a weight declared natural.
+- **Causal time and the frame cache.** `Conv::same3().causal(TimePad::Zero)`
+  pads `kt-1` frames in front only. With `cache: Some(Input::state(name))` —
+  a `CacheRow::State` slab the text declares per causal conv, `[(kt-1)·
+  max_plane, C_in]` per slot — the CUDA arm gathers each clip's slot into a
+  `[Σ frames·h·w, C_in]` scratch rectangle (`spatial::cache_gather`,
+  `kernels/spatial/cache.cuh`), convolves, and stores this tile's last `kt-1`
+  input frames back (`spatial::cache_store`), keyed by the fire's `[Clips]`
+  slot table. `Shell::open(slot)` (the `RsReset` path) zeroes every state row
+  of the slot, which is the zero-padded first tile; `TimePad::Replicate` is
+  for the cacheless single-tile case. `check::classes::writes_cache` roots a
+  conv with a cache.
+- **Compiler.** `Budgets.voxels: Option<VoxelLadder { max_voxels, buckets,
+  max_clips }>` (`Budgets::with_voxels`, `ladder(RowAxis::Voxels)`,
+  `max_voxels()`, `max_clips()`); `Error::Unsized { axis: Voxels }` for a
+  voxel plan against no ladder; `RowExpr::{Voxels, VoxelsTimes(k), Clips,
+  ClipsPlus(k)}`, `FireRows { voxels, clips }`; `CompiledModel.voxels:
+  Option<AxisPlan>`; `FamilyCosts.spatial` (40 µs, GEMM-class). Units: a
+  voxel-axis region is its own capture unit, ordered by first appearance like
+  every unit (`unit::partition`); the patchify pair is placed on the unit of
+  the axis it WRITES (outputs decide), so an encoder is `[Voxels, Tokens]` and
+  a decoder from tokens `[Tokens, Voxels]`; a voxel-only plan is `[Voxels]`.
+- **Exec.** `Lane::with_clips(word, rows, clips, voxels)`, `LaneRow
+  { voxel_offset, voxels, clip_offset, clips }`, `Composition::{voxel_rows,
+  clips, voxel_classes, voxel_bucket}`; faults `TooManyVoxels`, `TooManyClips`,
+  `NoVoxelBucket`, `Vaeless`, `NoVoxelLadder`, `ClipGeometry`,
+  `DescriptorVoxelRows`. **Descriptor ABI 3**: a 40-byte header (`voxel_rows`
+  at word 8, `voxel_bucket` at word 9) and a voxel trailer (one `[row_offset,
+  rows, lane_offset, lanes]` window per class, one `[voxel_offset, voxels,
+  clip_offset, clips]` record per lane) present iff `voxel_rows > 0`; ABI 1
+  and 2 bytes are refused by name. `model_exec::DispatchSpatial` is the
+  seventh dispatch trait; Metal/Vulkan/wgpu refuse every member by name.
+- **CUDA shell.** `Boot.voxels: Option<VoxelLadder>` (`api::voxel_ladder`
+  derives one from `LoadBudgets.max_voxels/max_clips`, default 65 536 port
+  voxels and `max_lanes` clips); `engine_cuda::voxels::{Seat, Store, Tables,
+  Clips, Handles}` stage the grid, token grid, clip slots and payload below
+  the fire's inputs; `FireBindings.{grid, token_grid, voxels, clip_slots}`;
+  `dispatch/spatial.rs`. **M0 rules:** every spatial kernel takes the whole
+  clip table and finds a row's lane itself (`seat::Reads::Nothing`), so a
+  voxel launch runs over the fire's whole voxel rectangle and the shell
+  refuses a fire whose clips fall in two classes (`Fault::VoxelPayload`); a
+  voxel plan is served eagerly (`bodies` is downgraded at load, the arming
+  pass fires no clip). `Shell::fire_voxels(lanes, clips) -> Vec<Pixels>` is
+  the door; `Engine::submit` takes `Step.voxels: Vec<StepVoxels { lane, clips,
+  payload }>` (host-fed) and answers `LaneReadout { seam:
+  ReadoutSeam::Pixels, clips, values }`; `PortKind::Voxels` names the
+  channel-fed port (staging it is the port agent's, beside `Latents`).
+  Tests: `model-dsl/tests/a_conv_decoder_traces_on_the_voxel_axis`,
+  `model-compiler/tests/the_third_row_axis_carves_its_own_arena`,
+  `model-exec/tests/the_voxel_axis_seriates_its_own_clips`,
+  `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU).
+
+## 7. How the CUDA engine serves §1–§2 (M0 round 2)
 
 What `engine-cuda` (with `model-exec`) does with the tables and ports above — the refinements
 a runtime or another shell must agree with. Tests: `engine-cuda/tests/a_double_block_fires_two_streams_through_the_engine`,

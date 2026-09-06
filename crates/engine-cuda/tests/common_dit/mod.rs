@@ -520,6 +520,8 @@ impl Rig {
                     pages: 64,
                     max_patches: None,
                     max_images: None,
+                    max_voxels: None,
+                    max_clips: None,
                 },
                 residency: Residency::default(),
                 ordinal: 0,
@@ -687,6 +689,7 @@ pub fn frame(lanes: Vec<Lane>, attachments: Vec<Attachment>) -> FrameSubmission 
         lanes,
         attachments,
         media: Vec::new(),
+        voxels: Vec::new(),
     })
 }
 

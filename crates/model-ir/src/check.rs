@@ -20,7 +20,7 @@ pub use classes::{fact_width, resolve_classes};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
-use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear, RaggedMask};
+use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear, RaggedMask, Spatial};
 use crate::{Def, Dim, Dtype, Operands, Operation, Trace, StructKind, Ty, ValueId};
 
 /// Where an out-of-range `ValueId` was found.
@@ -599,6 +599,20 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             }
         },
         Operation::Collective(_) => &[],
+        // Every grid is an i32 lane table; the norm's affine planes and the
+        // conv's bias are f32 like every other per-channel plane here.
+        Operation::Spatial(op) => match op {
+            Spatial::Grid { .. } => &[(In(0), I32), (Out(0), I32)],
+            // `bias` and `cache` are optional, so the ports past `w` are
+            // not fixed; the output grid is the last input.
+            Spatial::Conv3d { .. } => &[(In(1), I32)],
+            Spatial::GroupNorm { .. } => &[(In(1), I32), (In(2), F32), (In(3), F32)],
+            Spatial::UpsampleNearest { .. }
+            | Spatial::PixelShuffle { .. }
+            | Spatial::PixelUnshuffle { .. }
+            | Spatial::Patchify { .. }
+            | Spatial::Unpatchify { .. } => &[(In(1), I32), (In(2), I32)],
+        },
     }
 }
 
@@ -665,6 +679,10 @@ impl Display for D {
             Dim::Patches => f.write_str("patches"),
             Dim::Images => f.write_str("images"),
             Dim::ImagesPlus(k) => write!(f, "images+{k}"),
+            Dim::Voxels => f.write_str("voxels"),
+            Dim::VoxelsTimes(k) => write!(f, "voxels*{k}"),
+            Dim::Clips => f.write_str("clips"),
+            Dim::ClipsPlus(k) => write!(f, "clips+{k}"),
         }
     }
 }

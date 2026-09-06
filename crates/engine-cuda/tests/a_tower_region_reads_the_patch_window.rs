@@ -156,7 +156,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
     let windows = Windows::of(
         &trace,
         &compiled,
-        model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
+        model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &indptr(&[5, 3, 4]),
         Copies::off(),
         test_slots(),
@@ -201,6 +201,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                 merge_saw_the_tower |= window.on(RowAxis::Patches).rows == fire.patch_rows()
                     && window.span().rows == fire.rows();
             }
+            RowAxis::Voxels => panic!("this plan states no voxel row"),
         }
     }
     assert!(towers > 0 && trunks > 0, "{towers} tower, {trunks} trunk");
@@ -244,7 +245,7 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
         Windows::of(
             &trace,
             &compiled,
-            model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
+            model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
             &boundaries,
             Copies::off(),
             test_slots(),

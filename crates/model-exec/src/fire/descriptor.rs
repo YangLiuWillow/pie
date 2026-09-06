@@ -17,10 +17,10 @@ pub const MAGIC: u32 = 0x4649_5245;
 /// unpack, never negotiated. A descriptor carrying an older version is
 /// refused by name ([`Fault::DescriptorAbi`]) and never regenerated, since
 /// nothing persists a descriptor across builds.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Bytes before the class table.
-pub const HEADER_BYTES: u64 = 32;
+pub const HEADER_BYTES: u64 = 40;
 
 /// Bytes per class record: `row_offset, rows, lane_offset, lanes`.
 pub const CLASS_BYTES: u64 = 16;
@@ -32,6 +32,9 @@ pub const LANE_BYTES: u64 = 24;
 /// Not a second copy of the token record — word/source/class are lane
 /// properties, already on the wire once.
 pub const PATCH_LANE_BYTES: u64 = 16;
+
+/// Bytes per VOXEL lane record: `voxel_offset, voxels, clip_offset, clips`.
+pub const VOXEL_LANE_BYTES: u64 = 16;
 
 /// One fire's window table, as the walk and the shells read it: a
 /// [`Composition`] minus the provenance — counts, offsets, words, with no
@@ -51,7 +54,9 @@ pub const PATCH_LANE_BYTES: u64 = 16;
 ///     20      4  classes       how many class records follow the header
 ///     24      4  patch_rows    total PATCH rows this fire carries
 ///     28      4  patch_bucket  the patch rung, i.e. which tower graph
-///     32     16  class[0]      row_offset, rows, lane_offset, lanes
+///     32      4  voxel_rows    total VOXEL rows this fire carries
+///     36      4  voxel_bucket  the voxel rung, i.e. which VAE graph
+///     40     16  class[0]      row_offset, rows, lane_offset, lanes
 ///    ...     16  class[n-1]
 ///    ...     24  lane[0]       word (8), source, class, row_offset, rows
 ///    ...     24  lane[m-1]
@@ -60,10 +65,17 @@ pub const PATCH_LANE_BYTES: u64 = 16;
 ///    ...     16  patch_class[n-1]
 ///    ...     16  patch_lane[0]   patch_offset, patches, image_offset, images
 ///    ...     16  patch_lane[m-1]
+///  --- the voxel trailer, present iff voxel_rows > 0 ---
+///    ...     16  voxel_class[0]  voxel_offset, voxels, clip_offset, clips
+///    ...     16  voxel_class[n-1]
+///    ...     16  voxel_lane[0]   voxel_offset, voxels, clip_offset, clips
+///    ...     16  voxel_lane[m-1]
 /// ```
 ///
-/// A fire with `patch_rows == 0` packs no trailer, byte-for-byte the same as
-/// ABI 1 wrote (which had no patch fields at all).
+/// A fire with `patch_rows == 0` packs no patch trailer and one with
+/// `voxel_rows == 0` no voxel trailer; ABI 3 grew the header by the two
+/// voxel words (ABI 2's 32-byte header had none), so ABI 2 bytes are
+/// refused by name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FireDescriptor {
     /// Total token rows.
@@ -99,6 +111,16 @@ pub struct FireDescriptor {
     /// don't break at the same places. All-zero, and packed as nothing at
     /// all, for a fire with no patch rows.
     pub patch_classes: WindowTable,
+    /// Total VOXEL rows (port voxels). Zero for every fire with no clip.
+    pub voxel_rows: u32,
+    /// How many CLIPS this fire carries — the voxel axis's lane count.
+    pub clips: u32,
+    /// The voxel rung these voxel rows round up to — which VAE graph runs.
+    pub voxel_bucket: u32,
+    /// One VOXEL window per class of the artifact — the third table over
+    /// the same classes. All-zero, and packed as nothing at all, for a fire
+    /// with no voxel rows.
+    pub voxel_classes: WindowTable,
 }
 
 impl FireDescriptor {
@@ -114,9 +136,21 @@ impl FireDescriptor {
             images: composition.images(),
             patch_bucket: composition.patch_bucket(),
             patch_classes: composition.patch_classes().clone(),
+            voxel_rows: composition.voxel_rows(),
+            clips: composition.clips(),
+            voxel_bucket: composition.voxel_bucket(),
+            voxel_classes: composition.voxel_classes().clone(),
             run_caps: Vec::new(),
             run_passes: Vec::new(),
         }
+    }
+
+    /// Does this fire carry the third row axis at all? The predicate the
+    /// voxel trailer is keyed on, and the one a shell asks before launching
+    /// a VAE exec.
+    #[must_use]
+    pub fn has_voxels(&self) -> bool {
+        self.voxel_rows > 0
     }
 
     /// Does this fire carry the second row axis at all? The predicate the
@@ -136,6 +170,7 @@ impl FireDescriptor {
         match axis {
             model_ir::RowAxis::Tokens => &self.classes,
             model_ir::RowAxis::Patches => &self.patch_classes,
+            model_ir::RowAxis::Voxels => &self.voxel_classes,
         }
     }
 
@@ -198,6 +233,12 @@ impl FireDescriptor {
             } else {
                 0
             }
+            + if self.has_voxels() {
+                CLASS_BYTES * self.voxel_classes.len() as u64
+                    + VOXEL_LANE_BYTES * self.lanes.len() as u64
+            } else {
+                0
+            }
     }
 
     /// The descriptor, flat.
@@ -212,6 +253,8 @@ impl FireDescriptor {
         put32(&mut out, self.classes.len() as u32);
         put32(&mut out, self.patch_rows);
         put32(&mut out, self.patch_bucket);
+        put32(&mut out, self.voxel_rows);
+        put32(&mut out, self.voxel_bucket);
 
         for window in self.classes.as_slice() {
             put32(&mut out, window.row_offset);
@@ -239,6 +282,21 @@ impl FireDescriptor {
                 put32(&mut out, lane.patches);
                 put32(&mut out, lane.image_offset);
                 put32(&mut out, lane.images);
+            }
+        }
+        // The voxel trailer, the same way.
+        if self.has_voxels() {
+            for window in self.voxel_classes.as_slice() {
+                put32(&mut out, window.row_offset);
+                put32(&mut out, window.rows);
+                put32(&mut out, window.lane_offset);
+                put32(&mut out, window.lanes);
+            }
+            for lane in &self.lanes {
+                put32(&mut out, lane.voxel_offset);
+                put32(&mut out, lane.voxels);
+                put32(&mut out, lane.clip_offset);
+                put32(&mut out, lane.clips);
             }
         }
         out
@@ -277,13 +335,21 @@ impl FireDescriptor {
         let classes = u64::from(take32(bytes, 20));
         let patch_rows = take32(bytes, 24);
         let patch_bucket = take32(bytes, 28);
+        let voxel_rows = take32(bytes, 32);
+        let voxel_bucket = take32(bytes, 36);
 
         let trailer = if patch_rows > 0 {
             CLASS_BYTES * classes + PATCH_LANE_BYTES * lanes
         } else {
             0
         };
-        let want = HEADER_BYTES + CLASS_BYTES * classes + LANE_BYTES * lanes + trailer;
+        let voxel_trailer = if voxel_rows > 0 {
+            CLASS_BYTES * classes + VOXEL_LANE_BYTES * lanes
+        } else {
+            0
+        };
+        let want =
+            HEADER_BYTES + CLASS_BYTES * classes + LANE_BYTES * lanes + trailer + voxel_trailer;
         if bytes.len() as u64 != want {
             return Err(Error::Fire(Fault::DescriptorLength {
                 bytes: bytes.len(),
@@ -360,6 +426,39 @@ impl FireDescriptor {
         }
         let images = placed.iter().map(|lane| lane.images).sum();
 
+        // And the voxel trailer, checked the same way.
+        let mut voxel_table = vec![ClassWindow::default(); classes as usize];
+        if voxel_rows > 0 {
+            let at_classes = base + LANE_BYTES * lanes + trailer;
+            let mut counted: u64 = 0;
+            for c in 0..classes {
+                let at = (at_classes + CLASS_BYTES * c) as usize;
+                let window = ClassWindow {
+                    row_offset: take32(bytes, at),
+                    rows: take32(bytes, at + 4),
+                    lane_offset: take32(bytes, at + 8),
+                    lanes: take32(bytes, at + 12),
+                };
+                counted += u64::from(window.rows);
+                voxel_table[c as usize] = window;
+            }
+            if counted != u64::from(voxel_rows) {
+                return Err(Error::Fire(Fault::DescriptorVoxelRows {
+                    counted,
+                    header: voxel_rows,
+                }));
+            }
+            let at_lanes = at_classes + CLASS_BYTES * classes;
+            for (l, lane) in placed.iter_mut().enumerate() {
+                let at = (at_lanes + VOXEL_LANE_BYTES * l as u64) as usize;
+                lane.voxel_offset = take32(bytes, at);
+                lane.voxels = take32(bytes, at + 4);
+                lane.clip_offset = take32(bytes, at + 8);
+                lane.clips = take32(bytes, at + 12);
+            }
+        }
+        let clips = placed.iter().map(|lane| lane.clips).sum();
+
         Ok(FireDescriptor {
             rows,
             bucket,
@@ -369,6 +468,10 @@ impl FireDescriptor {
             images,
             patch_bucket,
             patch_classes: WindowTable::new(patch_table),
+            voxel_rows,
+            clips,
+            voxel_bucket,
+            voxel_classes: WindowTable::new(voxel_table),
             run_caps: Vec::new(),
             run_passes: Vec::new(),
         })
@@ -461,9 +564,13 @@ mod tests {
         assert_eq!(&bytes[16..20], &13u32.to_le_bytes());
         assert_eq!(&bytes[20..24], &2u32.to_le_bytes());
         // Words 6/7 were one reserved `u64` under ABI 1; ABI 2 spends them as
-        // `patch_rows`/`patch_bucket`. No image here, so both read zero.
+        // `patch_rows`/`patch_bucket`, and ABI 3 adds `voxel_rows`/
+        // `voxel_bucket` as words 8/9. No image and no clip here, so all four
+        // read zero.
         assert_eq!(&bytes[24..28], &0u32.to_le_bytes());
         assert_eq!(&bytes[28..32], &0u32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &0u32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &0u32.to_le_bytes());
     }
 
     #[test]
@@ -512,23 +619,25 @@ mod tests {
         ));
     }
 
-    // Version 1 bytes are refused by name, never regenerated into version 2.
+    // Older bytes are refused by name, never regenerated into version 3.
     #[test]
-    fn a_version_one_descriptor_is_refused_by_name_and_not_regenerated() {
+    fn an_older_descriptor_is_refused_by_name_and_not_regenerated() {
         let before = descriptor();
-        let mut v1 = before.pack();
-        v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+        for older in [1u32, 2] {
+            let mut bytes = before.pack();
+            bytes[4..8].copy_from_slice(&older.to_le_bytes());
 
-        let refusal = FireDescriptor::unpack(&v1).expect_err("v1 is not v2");
-        assert_eq!(
-            refusal,
-            Error::Fire(Fault::DescriptorAbi {
-                saw: 1,
-                speaks: ABI_VERSION,
-            }),
-        );
-        let said = refusal.to_string();
-        assert!(said.contains('1') && said.contains('2'), "{said}");
-        assert!(said.contains("never negotiated"), "{said}");
+            let refusal = FireDescriptor::unpack(&bytes).expect_err("an old ABI is not v3");
+            assert_eq!(
+                refusal,
+                Error::Fire(Fault::DescriptorAbi {
+                    saw: older,
+                    speaks: ABI_VERSION,
+                }),
+            );
+            let said = refusal.to_string();
+            assert!(said.contains(&older.to_string()) && said.contains('3'), "{said}");
+            assert!(said.contains("never negotiated"), "{said}");
+        }
     }
 }

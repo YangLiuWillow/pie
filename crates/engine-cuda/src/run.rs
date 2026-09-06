@@ -297,6 +297,14 @@ pub struct FireBindings {
     pub patch_embed_weights: Option<Tensor>,
     /// The trunk's rotation stream: `[token rows, 3]`. On the first row axis, not the second, since the trunk is one region over the whole token rectangle. `None` for a plan that does not declare it.
     pub mrope_positions: Option<Tensor>,
+    /// `RuntimeInput::Grid` (D8): `[clips, 4]` i32, the voxel axis's lane table. `None` for a fire with no clip.
+    pub grid: Option<Tensor>,
+    /// `RuntimeInput::TokenGrid`: `[clips, 4]` i32, the same clips at token resolution. `None` for a plan that reads none or a fire with no clip.
+    pub token_grid: Option<Tensor>,
+    /// `RuntimeInput::Voxels`: `[voxel rows, channels]`, the VAE's port. `None` for a plan that reads none or a fire with no clip.
+    pub voxels: Option<Tensor>,
+    /// `[clips]` i32: which recurrent slot each clip's lane owns, for a causal convolution's frame cache. `None` for a fire with no clip.
+    pub clip_slots: Option<Tensor>,
     /// `RuntimeInput::SelfCondRows`: `i32`, `[token rows, taps]` — the denoiser's self-conditioning taps, staged on every fire of a plan that declares them (zeros for lanes carrying none). `None` for a plan that does not.
     pub self_cond_rows: Option<Tensor>,
     /// `RuntimeInput::SelfCondWeights`: `f32`, `[token rows, taps]`, beside the rows.
@@ -973,6 +981,10 @@ impl<'c> Run<'c> {
             Dim::LanesPlus(k) => lane(k),
             Dim::Images => lane(0),
             Dim::ImagesPlus(k) => lane(k),
+            Dim::Voxels => row(1),
+            Dim::VoxelsTimes(k) => row(k),
+            Dim::Clips => lane(0),
+            Dim::ClipsPlus(k) => lane(k),
         };
         if skip == 0 && keep >= handle.rows {
             return handle;
@@ -1239,6 +1251,21 @@ impl<'c> Run<'c> {
                     )
                 })
             }
+            // The voxel axis's three seats (D8), staged by `crate::voxels`.
+            Def::Input(RuntimeInput::Grid) => self.fire.grid.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's clip grid, which no lane of it submitted")
+            }),
+            Def::Input(RuntimeInput::TokenGrid { .. }) => {
+                self.fire.token_grid.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's token-side clip grid, which no lane of \
+                         it submitted"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::Voxels { .. }) => self.fire.voxels.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's voxel port, which no lane of it fed")
+            }),
             // The D2 row permutation of one selection: `[Tokens]` i32, fire-wide, staged per fire.
             Def::Input(RuntimeInput::RowPermutation { select }) => self.packing(at, *select).permutation,
             // The D3 float ports: rectangles the fire path filled from channel cells.
@@ -1532,6 +1559,11 @@ impl<'c> Run<'c> {
         }
         let window = self.window().span();
         skip(handle, window.row_offset, window.rows)
+    }
+
+    /// The fire's clip slot table (D8), whole: one i32 per clip in fire order.
+    pub(crate) fn clip_slots(&self) -> Option<Tensor> {
+        self.fire.clip_slots
     }
 
     /// The recurrent state pool a cache id names, with its slot map cut to the asking node's window; the slabs themselves are the model's state, whole.

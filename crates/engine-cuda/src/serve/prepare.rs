@@ -27,7 +27,7 @@ const WINDOWS_MEMO: usize = 8;
 
 /// One resolved window table and what it was resolved from.
 pub(super) struct WindowsMemo {
-    tables: [model_exec::fire::WindowTable; 2],
+    tables: [model_exec::fire::WindowTable; 3],
     indptr_host: Vec<i32>,
     bucket: u32,
     copies: bool,
@@ -57,6 +57,7 @@ impl FrameShell for Shell {
             lanes,
             attachments,
             media,
+            ..
         } = step;
         let arming = self.arming;
         let copies = self.copies;
@@ -232,6 +233,33 @@ impl FrameShell for Shell {
             }
         }
 
+        // The voxel-axis submission (D8): one entry per lane at most, only
+        // against a load that seats the axis, the payload one port row per
+        // voxel. Laid out in fire order once the composition has placed it.
+        let mut clips_of: Vec<Option<crate::voxels::Clips<'_>>> = vec![None; lanes.len()];
+        for shot in step.voxels {
+            let at = shot.lane as usize;
+            if at >= lanes.len() {
+                return Err(Fault::VoxelPayload {
+                    lane: shot.lane,
+                    what: "the lane index is past the submission",
+                });
+            }
+            if clips_of[at].is_some() {
+                return Err(Fault::VoxelPayload {
+                    lane: shot.lane,
+                    what: "a lane's clips are one submission",
+                });
+            }
+            if shot.clips.iter().any(|b| b.contains(&0)) {
+                return Err(Fault::VoxelPayload {
+                    lane: shot.lane,
+                    what: "a clip's box has a zero side",
+                });
+            }
+            clips_of[at] = Some(*shot);
+        }
+
         // The patch-axis submission is checked here, before anything
         // launches: past this, `layout.scatter_rows` is an unchecked
         // indexed write.
@@ -341,13 +369,19 @@ impl FrameShell for Shell {
             .iter()
             .zip(&lane_rows)
             .enumerate()
-            .map(|(at, (seated, &rows))| match media_of[at] {
-                None => FireLane::new(seated.lane.word, rows),
-                Some(shot) => FireLane::with_images(
+            .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
+                (None, None) => FireLane::new(seated.lane.word, rows),
+                (Some(shot), _) => FireLane::with_images(
                     seated.lane.word,
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().sum(),
+                ),
+                (None, Some(clips)) => FireLane::with_clips(
+                    seated.lane.word,
+                    rows,
+                    clips.clips.len() as u32,
+                    u32::try_from(clips.voxels()).unwrap_or(u32::MAX),
                 ),
             })
             .collect();
@@ -505,6 +539,28 @@ impl FrameShell for Shell {
                 });
             }
         }
+        // The voxel tables, in fire order. M0: every spatial launch runs over
+        // the whole voxel rectangle (`crate::voxels`), so the clips of one
+        // fire must fall in one class.
+        let voxel_tables = if composition.voxel_rows() == 0 {
+            crate::voxels::Tables::default()
+        } else {
+            let Some(store) = self.voxels.as_ref() else {
+                return Err(Fault::VoxelPayload {
+                    lane: clips_of.iter().position(Option::is_some).unwrap_or(0) as u32,
+                    what: "this load seats no voxel axis",
+                });
+            };
+            if composition.voxel_classes().present_in_order().count() > 1 {
+                return Err(Fault::VoxelPayload {
+                    lane: clips_of.iter().position(Option::is_some).unwrap_or(0) as u32,
+                    what: "the clips of one fire fall in two classes, and a spatial launch \
+                           runs over the whole voxel rectangle (M0: one voxel class per fire)",
+                });
+            }
+            let slot_of: Vec<u32> = lanes.iter().map(|seated| seated.lane.slot).collect();
+            crate::voxels::Tables::of(&store.seat(), composition.lanes(), &clips_of, &slot_of)?
+        };
 
         // The composition places each lane's images independently of token
         // order: `patch_offset` is where its rows begin in the fire's patch
@@ -1141,6 +1197,7 @@ impl FrameShell for Shell {
         let class_tables = [
             composition.table(model_ir::RowAxis::Tokens),
             composition.table(model_ir::RowAxis::Patches),
+            composition.table(model_ir::RowAxis::Voxels),
         ];
         let held = self.windows_memo.iter().position(|memo| {
             memo.bucket == bucket
@@ -1148,6 +1205,7 @@ impl FrameShell for Shell {
                 && memo.indptr_host == indptr_host
                 && memo.tables[0] == *class_tables[0]
                 && memo.tables[1] == *class_tables[1]
+                && memo.tables[2] == *class_tables[2]
         });
         let (mut windows, boundaries) = match held {
             Some(at) => {
@@ -1159,7 +1217,7 @@ impl FrameShell for Shell {
                     &self.trace,
                     &self.compiled,
                     // One table per row axis, addressed by the axis.
-                    model_ir::PerAxis::new([class_tables[0], class_tables[1]]),
+                    model_ir::PerAxis::new([class_tables[0], class_tables[1], class_tables[2]]),
                     &indptr_host,
                     crate::window::Copies {
                         bucket,
@@ -1176,7 +1234,11 @@ impl FrameShell for Shell {
                         self.windows_memo.remove(0);
                     }
                     self.windows_memo.push(WindowsMemo {
-                        tables: [class_tables[0].clone(), class_tables[1].clone()],
+                        tables: [
+                            class_tables[0].clone(),
+                            class_tables[1].clone(),
+                            class_tables[2].clone(),
+                        ],
                         indptr_host: indptr_host.clone(),
                         bucket,
                         copies: copies_here,
@@ -1379,6 +1441,7 @@ impl FrameShell for Shell {
             composition,
             descriptor,
             patch_payload,
+            voxel_tables,
             patch_segments,
             patch_routes,
             patch_positions,

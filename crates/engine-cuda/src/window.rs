@@ -316,6 +316,7 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
             Operation::Layout(op) => collect!(op),
             Operation::Collective(op) => collect!(op),
             Operation::CustomCuda(op) => collect!(op),
+            Operation::Spatial(op) => collect!(op),
         }
     }
     operands.iter().all(|id| {
@@ -348,6 +349,8 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
                     // The patch axis: a different row space than the token map `Gathered::rows_host` describes.
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
+                    // The voxel axis: its own row space too.
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
                 },
             },
         }
@@ -382,6 +385,17 @@ impl Windows {
             tables[axis].spans_into(&region.mask, &mut spans);
             // The patch axis's interval, for a token region whose embed merge reads a patch rectangle — resolved before this region's own window, bounding the patch axis to exactly one span.
             let patch = match tables[model_ir::RowAxis::Patches].span(&region.mask) {
+                Ok(span) => span.unwrap_or_default(),
+                Err(runs) => {
+                    return Err(Fault::Fragmented {
+                        region: at as u32,
+                        runs,
+                        promised: None,
+                    });
+                }
+            };
+            // The voxel axis's interval, the same way: a token region whose patchify pair reads a voxel rectangle, or a voxel region's own window.
+            let voxel = match tables[model_ir::RowAxis::Voxels].span(&region.mask) {
                 Ok(span) => span.unwrap_or_default(),
                 Err(runs) => {
                     return Err(Fault::Fragmented {
@@ -428,6 +442,7 @@ impl Windows {
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies.spaces);
                 gathered.spans[model_ir::RowAxis::Patches] = patch;
+                gathered.spans[model_ir::RowAxis::Voxels] = voxel;
                 seats(slots, &gathered)?;
                 of_region.push((runs.len() as u32, 1));
                 runs.push(insert(&mut windows, gathered));
@@ -437,12 +452,12 @@ impl Windows {
             of_region.push((runs.len() as u32, spans.len() as u32));
             for &span in &spans {
                 let window = Window {
-                    // The region's own interval at the primary entry, the patch table's at the patch entry.
-                    spans: model_ir::PerAxis::new([span, patch]),
-                    // A patch region has no rebased qo boundaries; it has its own bounds vector (`RuntimeInput::PatchSegments`).
+                    // The region's own interval at the primary entry, the patch table's at the patch entry, the voxel table's at the voxel entry.
+                    spans: model_ir::PerAxis::new([span, patch, voxel]),
+                    // A patch or voxel region has no rebased qo boundaries; each has its own lane table (`RuntimeInput::PatchSegments`, `RuntimeInput::Grid`).
                     indptr_host: match axis {
                         model_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
-                        model_ir::RowAxis::Patches => Vec::new(),
+                        model_ir::RowAxis::Patches | model_ir::RowAxis::Voxels => Vec::new(),
                     },
                     indptr: Tensor::new(0, 0, 1, Dtype::I32),
                     gathered: None,
@@ -714,7 +729,7 @@ impl Windows {
             .all(|region| {
                 self.admit_axes(
                     region,
-                    model_ir::PerAxis::new([rows, 0]),
+                    model_ir::PerAxis::new([rows, 0, 0]),
                     shifted,
                     lane_shifted,
                 ) == Admit::Captured
@@ -724,7 +739,7 @@ impl Windows {
     /// Which regions of this fire a body may hold, and which it must re-issue — per-region rather than collapsed to one `bool`. A function of the [`record::BodyKey`](crate::record::BodyKey), except the copy knob, which a differently-armed fire walks eagerly instead of re-deriving.
     #[must_use]
     pub fn admits(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> Vec<Admit> {
-        self.admits_axes(model_ir::PerAxis::new([rows, 0]), shifted, lane_shifted)
+        self.admits_axes(model_ir::PerAxis::new([rows, 0, 0]), shifted, lane_shifted)
     }
 
     /// The same table for an artifact with two row axes: every region is judged against its own axis's total ([`axis_of`](Windows::axis_of)), since judging a tower region against the token total would misclassify it. A patch region is never gathered, grouped, or in pieces.
@@ -908,7 +923,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
         .collect();
 
     Window {
-        // The compacted rectangle at the primary entry; the caller fills the patch entry from the patch table.
+        // The compacted rectangle at the primary entry; the caller fills the patch and voxel entries from their tables.
         spans: model_ir::PerAxis::new([
             MaskSpan {
                 row_offset: 0,
@@ -916,6 +931,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
                 lane_offset: 0,
                 lanes: lanes.len() as u32,
             },
+            MaskSpan::default(),
             MaskSpan::default(),
         ]),
         indptr_host: bounds,
@@ -1410,6 +1426,7 @@ mod tests {
                     lanes: 1,
                 },
                 MaskSpan::default(),
+                MaskSpan::default(),
             ]),
             indptr_host: Vec::new(),
             indptr: Tensor::new(0, 0, 1, Dtype::I32),
@@ -1486,7 +1503,7 @@ mod tests {
     /// A plain window carrying the one vector the packed blob is made of: a rebased `[lanes + 1]` boundary list, whose length moves between fires of one key.
     fn bounded(span: MaskSpan) -> Window {
         Window {
-            spans: model_ir::PerAxis::new([span, MaskSpan::default()]),
+            spans: model_ir::PerAxis::new([span, MaskSpan::default(), MaskSpan::default()]),
             indptr_host: (0..=span.lanes as i32).collect(),
             ..plain(0, 0)
         }

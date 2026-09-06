@@ -31,7 +31,7 @@ pub use arming::{Armed, Kind, Seal};
 pub use boot::{
     Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, Golden, Graphs, Knobs, Recording,
 };
-pub use lanes::{Attached, Lane, Media, Seated};
+pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
 pub(crate) use settle::Readback;
 pub use settle::{Done, Settled};
@@ -90,6 +90,8 @@ pub struct Shell {
     towered: bool,
     /// How many patch rows the plan folds into one (`1` for none).
     patch_fold: u32,
+    /// The voxel axis's tables (D8), or `None` for a plan with no voxel row.
+    voxels: Option<crate::voxels::Store>,
     /// Both axes' ceilings; `budgets.tokens == budget`.
     budgets: Budgets,
     weights: Weights,
@@ -450,6 +452,36 @@ impl Shell {
         self.fire_media(&seated, &[], &[], &mut Vec::new())
     }
 
+    /// [`Shell::fire_media`] with VAE clips on the voxel axis (D8): the
+    /// lanes' clips in, every lane's pixels (its `pixels` seam rows, one
+    /// `f32` row per output voxel, clips in submission order) out, beside
+    /// each clip's output box — empty for a lane that submitted no clip.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::fire_media`], plus [`Fault::VoxelPayload`] for clips the
+    /// fire cannot seat.
+    pub fn fire_voxels(
+        &mut self,
+        lanes: &[Seated<'_>],
+        voxels: &[Clips<'_>],
+    ) -> Result<Vec<Pixels>> {
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes,
+                attachments: &[],
+                media: &[],
+                voxels,
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        Shell::read_out(self, &mut settled)?;
+        Ok(std::mem::take(&mut settled.pixels))
+    }
+
     /// The one fire door: seated lanes, guest attachments, images, and the
     /// capture columns read back into `scores` (one entry per submitted lane).
     ///
@@ -477,6 +509,7 @@ impl Shell {
                 lanes,
                 attachments,
                 media,
+                voxels: &[],
             },
             None,
         )?;
@@ -526,6 +559,10 @@ impl Drop for Shell {
     }
 }
 
+/// One lane's decoded pixels (D8): one `f32` row per output voxel of its
+/// clips in submission order, beside each clip's output box.
+pub type Pixels = (Vec<f32>, Vec<[u32; 3]>);
+
 /// One step's submission, as the shell reads it.
 #[derive(Clone, Copy)]
 pub struct StepView<'a> {
@@ -535,6 +572,9 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     /// The images this step's lanes submitted; empty for a text-only fire.
     pub media: &'a [Media<'a>],
+    /// The clips this step's lanes submitted on the voxel axis (D8); empty
+    /// for a fire with no VAE tile.
+    pub voxels: &'a [Clips<'a>],
 }
 
 /// One fire's recurrent-state plan, resolved on the host; the default is the plain path.
@@ -590,6 +630,8 @@ pub struct Prepared<'a> {
     descriptor: FireDescriptor,
     /// The patch payload, in fire order; empty for a fire with no image.
     patch_payload: Vec<u8>,
+    /// The voxel axis's host tables, in fire order; empty for a fire with no clip.
+    voxel_tables: crate::voxels::Tables,
     patch_segments: Vec<i32>,
     patch_routes: Vec<i32>,
     patch_positions: Vec<i32>,

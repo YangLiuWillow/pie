@@ -36,6 +36,7 @@ pub mod settle;
 /// multiple lanes overlap host memcpy with DMA in flight.
 pub mod staged_h2d;
 pub mod store;
+pub mod voxels;
 pub mod weights;
 pub mod window;
 

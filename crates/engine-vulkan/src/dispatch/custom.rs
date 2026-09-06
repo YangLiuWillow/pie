@@ -9,6 +9,14 @@ impl DispatchCustomCuda for Run<'_> {
     }
 }
 
+/// M0 (design D8): the voxel axis's family is CUDA-only this phase; this
+/// shell refuses every member by name rather than folding.
+impl model_exec::DispatchSpatial for Run<'_> {
+    fn dispatch(&mut self, op: &model_ir::Spatial) -> Result<(), KernelError> {
+        Err(KernelError::Unsupported { op: op.name() })
+    }
+}
+
 impl model_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &model_ir::Node) {
         use std::io::Write;

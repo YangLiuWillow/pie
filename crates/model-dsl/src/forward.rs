@@ -614,6 +614,60 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
+    /// The voxel axis's lane table: `[Dim::Clips, 4]` `i32`
+    /// `{t, h, w, row_offset}` per clip at the voxel port's resolution
+    /// (`RuntimeInput::Grid`). What every `ops::spatial` wrapper reads
+    /// beside its rows; later resolutions' grids are computed from it.
+    #[must_use]
+    pub fn grid(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::Grid,
+                Ty::Tensor {
+                    shape: vec![Dim::Clips, Dim::Const(4)],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// A voxel float port: `[Dim::Voxels, channels]` of `dtype` (`F32` or
+    /// `Bf16`) — a VAE's input tile, one row per voxel of
+    /// [`grid`](Input::grid). `port` as for [`latents`](Input::latents).
+    #[must_use]
+    pub fn voxels(&self, port: u8, channels: u32, dtype: Dtype) -> Value {
+        assert!(
+            matches!(dtype, Dtype::F32 | Dtype::Bf16),
+            "a voxel port is f32 or bf16, not {dtype:?}"
+        );
+        self.rec
+            .input(
+                RuntimeInput::Voxels { port, channels },
+                Ty::Tensor {
+                    shape: vec![Dim::Voxels, Dim::Const(u64::from(channels))],
+                    dtype,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// The clip table at TOKEN resolution for the patch `p`: `[Dim::Clips,
+    /// 4]` `i32` `{t/pt, h/ph, w/pw, token_row_offset}` — the token side of
+    /// `ops::spatial::{patchify, unpatchify}` (`RuntimeInput::TokenGrid`).
+    #[must_use]
+    pub fn token_grid(&self, p: [u32; 3]) -> Value {
+        assert!(p.iter().all(|&n| n > 0), "a patch of {p:?} is empty");
+        self.rec
+            .input(
+                RuntimeInput::TokenGrid { p },
+                Ty::Tensor {
+                    shape: vec![Dim::Clips, Dim::Const(4)],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
     /// This arm's lanes as the host sees them: its guard as a mask/value
     /// pair over the fact word. An `Input` arm always has one — split arms
     /// are conjunctions of fact literals — so the `expect` never fires.

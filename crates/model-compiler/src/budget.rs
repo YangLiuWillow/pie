@@ -45,6 +45,11 @@ pub struct Budgets {
     /// carving a rectangle at zero rows, so a text-only SKU's artifact is
     /// bit-identical whether or not this field exists.
     pub patches: Option<PatchLadder>,
+    /// The third row axis's seat — the voxel rectangle a VAE runs over
+    /// (design D8) — or `None` for a deployment that admits no clip. The
+    /// same rule as [`patches`](Budgets::patches): `None` refuses a plan
+    /// stating `Dim::Voxels` at the door.
+    pub voxels: Option<VoxelLadder>,
 }
 
 impl Budgets {
@@ -55,7 +60,16 @@ impl Budgets {
         Budgets {
             tokens,
             patches: None,
+            voxels: None,
         }
+    }
+
+    /// The same, with a voxel axis admitted — what a deployment serving a
+    /// VAE passes.
+    #[must_use]
+    pub fn with_voxels(mut self, voxels: VoxelLadder) -> Budgets {
+        self.voxels = Some(voxels);
+        self
     }
 
     /// The same, with a patch axis admitted — what a deployment serving a
@@ -74,7 +88,21 @@ impl Budgets {
         match axis {
             crate::RowAxis::Tokens => Some(self.tokens.ladder()),
             crate::RowAxis::Patches => self.patches.as_ref().map(PatchLadder::ladder),
+            crate::RowAxis::Voxels => self.voxels.as_ref().map(VoxelLadder::ladder),
         }
+    }
+
+    /// The ceiling `Dim::Voxels` is sized at, `0` for a deployment with no
+    /// voxel axis.
+    #[must_use]
+    pub fn max_voxels(&self) -> u32 {
+        self.voxels.as_ref().map_or(0, |ladder| ladder.max_voxels)
+    }
+
+    /// Same, for `Dim::Clips` (the voxel rectangle's lane count).
+    #[must_use]
+    pub fn max_clips(&self) -> u32 {
+        self.voxels.as_ref().map_or(0, |ladder| ladder.max_clips)
     }
 
     /// The ceiling `Dim::Patches` is sized at, `0` for a deployment with no
@@ -147,6 +175,47 @@ impl PatchLadder {
         Ladder {
             max_rows: self.max_patches,
             max_lanes: self.max_images,
+            buckets: &self.buckets,
+        }
+    }
+}
+
+/// What a fire is allowed to be on the voxel axis: the most voxels one fire
+/// may carry AT THE PORT (`Dim::Voxels`; a `Dim::VoxelsTimes(k)` rectangle
+/// is carved at `k` times this), the lattice its port voxel count rounds up
+/// to, and the most clips. A VAE tile is a fire, so this is the tile
+/// ceiling: a decode of a `[16, 32, 32]`-voxel latent tile at `max_voxels =
+/// 16384` lands `8·8·4 = 256` times that many pixel rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoxelLadder {
+    /// The most port voxels one fire may carry, across every clip of every
+    /// lane. `Dim::Voxels` is this number.
+    pub max_voxels: u32,
+    /// The shape lattice a fire's port voxel count is rounded up to — one
+    /// immutable graph per entry, in the VAE's own capture unit. Ascending,
+    /// each entry at most [`max_voxels`](VoxelLadder::max_voxels).
+    pub buckets: Vec<u32>,
+    /// The most clips one fire may carry. `Dim::Clips` is this number.
+    pub max_clips: u32,
+}
+
+impl VoxelLadder {
+    /// A ceiling with no ladder — one implicit rung at the ceiling.
+    #[must_use]
+    pub fn new(max_voxels: u32, max_clips: u32) -> VoxelLadder {
+        VoxelLadder {
+            max_voxels,
+            buckets: Vec::new(),
+            max_clips,
+        }
+    }
+
+    /// This axis's ceilings and lattice as a [`Ladder`].
+    #[must_use]
+    pub fn ladder(&self) -> Ladder<'_> {
+        Ladder {
+            max_rows: self.max_voxels,
+            max_lanes: self.max_clips,
             buckets: &self.buckets,
         }
     }
@@ -293,6 +362,9 @@ pub struct FamilyCosts {
     pub collective: f32,
     /// `Operation::CustomCuda` — the fused per-family entries.
     pub custom: f32,
+    /// `Operation::Spatial` — the VAE's convolutions and norms, fat like a
+    /// GEMM (a conv IS an implicit GEMM).
+    pub spatial: f32,
 }
 
 impl FamilyCosts {
@@ -306,6 +378,7 @@ impl FamilyCosts {
             model_ir::Operation::Layout(_) => self.layout,
             model_ir::Operation::Collective(_) => self.collective,
             model_ir::Operation::CustomCuda(_) => self.custom,
+            model_ir::Operation::Spatial(_) => self.spatial,
         }
     }
 }
@@ -319,6 +392,7 @@ impl Default for FamilyCosts {
             layout: 4.0,
             collective: 50.0,
             custom: 20.0,
+            spatial: 40.0,
         }
     }
 }

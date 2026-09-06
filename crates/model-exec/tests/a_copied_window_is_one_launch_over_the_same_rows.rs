@@ -49,14 +49,14 @@ use std::collections::HashMap;
 use model_exec::KernelError;
 use model_exec::dispatch::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
-    DispatchLinear,
+    DispatchLinear, DispatchSpatial,
 };
 use model_compiler::{CompiledModel, Budget, DeviceProfile, Lowering, Region, compile};
 use model_dsl::Platform;
 use model_exec::fire::{EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk};
 use model_ir::{
     Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
-    Trace,
+    Trace, Spatial,
 };
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -141,6 +141,7 @@ fn payload(op: &Operation) -> usize {
         Operation::Layout(op) => address(op),
         Operation::Collective(op) => address(op),
         Operation::CustomCuda(op) => address(op),
+        Operation::Spatial(op) => address(op),
     }
 }
 
@@ -171,6 +172,12 @@ impl DispatchCollective for MockDispatch {
 }
 impl DispatchCustomCuda for MockDispatch {
     fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+        self.note(op)
+    }
+}
+
+impl DispatchSpatial for MockDispatch {
+    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
         self.note(op)
     }
 }

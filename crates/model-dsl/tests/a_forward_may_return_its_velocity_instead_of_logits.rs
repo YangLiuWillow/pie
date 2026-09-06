@@ -127,6 +127,6 @@ fn hidden_beside_logits_keeps_both_and_names_its_layer() {
     );
     assert_eq!(
         seam::FLOAT_READOUTS,
-        [seam::VELOCITY.name, seam::HIDDEN.name]
+        [seam::VELOCITY.name, seam::HIDDEN.name, seam::PIXELS.name]
     );
 }
