@@ -11,6 +11,7 @@ Large artifacts live **outside the repo**, under
 ```
 scripts/imagegen/
   mini_dit_ref.py     M0  synthetic mini-DiT reference (no real model, no download)
+  mini_dit_parity.py  M0  drives pie's `mini-dit` row against that reference
   zimage_golden.py    M1  Z-Image-Turbo golden + miniature forward
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
@@ -262,6 +263,38 @@ relative 9.7e-3, worst cosine 0.99995 — a usable gate at
 | `mini_dit_dump_bf16.npz` | 6,640,440 | `8ddf3e5b244c0bf9cad3d9266dd1152a` |
 | `mini_dit_euler_fp32.npz` | 26,900,586 | `67e5976b6eadf30f78255de0725b6475` |
 | `mini_dit_euler_bf16.npz` | 26,900,586 | `b53374ab535517f03d7b98eb25ac15db` |
+
+### The pie side — `mini_dit_parity.py`
+
+The other half of the M0 loop: it turns the golden's *inputs* into the case
+JSON the `mini-dit-parity` inferlet takes, runs it, turns its JSON answer back
+into an `.npz` under the golden's own key names, and diffs the two with
+`compare.py` at the bf16 gate above.
+
+```bash
+# the artifact the row serves (the SKU name is `<text>-<weights>-kv-<kv>`)
+cargo build -p pie --features cuda
+pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" --sku mini-dit-bf16-kv-bf16 \
+    --out ~/.cache/pie-imagegen/mini-dit.zt
+
+# one step, then the four-step Euler schedule
+python mini_dit_parity.py all --out /tmp/mini-dit-parity
+python mini_dit_parity.py all --out /tmp/mini-dit-parity --euler
+```
+
+`case`, `collect` and `compare` are separate subcommands so a pie-side answer
+produced any other way can be diffed too; `all` is the four in order.  One
+batch element is one run (the golden's batch of 2 carries two timesteps), and
+the harness stacks them back into the golden's `[2, ...]` shapes.  Patchify is
+checked against the reference's own `patches` tensor on every invocation.
+
+**It cannot run end to end yet.**  `run` needs the `reading` / `input` /
+`stream` / `group` verbs design D1/D2 adds to `pie:inferlet/forward`, the
+engine's staging of the float ports and the `velocity` readback (D3), and the
+CUDA dispatch arms for `attention.ragged`, `layout.{pack,unpack}_rows` and
+`elementwise.{modulate,gated_residual_add,sinusoid,silu,rope_axes}`.  The
+inferlet's body is behind its `imagegen-wit` feature until the first of those
+lands, so the fixture workspace still builds.
 
 ---
 

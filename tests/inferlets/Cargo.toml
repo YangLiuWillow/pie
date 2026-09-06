@@ -40,6 +40,7 @@ members = [
     "diffusion-baseline",
     "diffusion-lab",
     "diffusion-parity",
+    "mini-dit-parity",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",

@@ -1,0 +1,20 @@
+[package]
+name = "mini-dit-parity"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+# **THE BODY IS BEHIND A FEATURE ON PURPOSE.** This program is written against
+# the `reading` / `input` / `stream` / `group` verbs design D1 adds to
+# `pie:inferlet/forward`, which have not landed on `dev`. With the feature off
+# the crate is empty and the fixture workspace still builds; with it on, this
+# is the pie half of `scripts/imagegen/mini_dit_parity.py`.
+[features]
+default = []
+imagegen-wit = []
+
+[dependencies]
+inferlet = { path = "../../../crates/inferlet" }
+serde = { version = "1.0", features = ["derive"] }
