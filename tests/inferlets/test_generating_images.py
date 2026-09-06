@@ -19,6 +19,15 @@ Three claims, in the order the guide teaches them:
     and `scripts/imagegen/decode_latent.py` turns it into a PNG that is the
     right size and is a picture rather than a flat field.
 
+**WHAT THE PICTURE CHECK DOES NOT PROVE.** It proves the file decodes, that it
+is the size that was asked for, and that the decode was not a flat field. It
+does NOT prove the trajectory was right, and that limit was measured rather
+than assumed: a run whose denoise loop went wrong decodes to a textured field
+whose colour count, local gradient and contrast are indistinguishable from a
+photograph's (11.9 vs 11.9 mean horizontal gradient over the two observed on
+2026-09-06). Separating those needs a reference, which this suite does not
+carry. A person looking at the PNG is still the check on fidelity.
+
 **WANTS A GENERATIVE MODEL.** A config bound to a text row has nothing to
 drive here and is reported as a skip, not a failure:
 
@@ -159,8 +168,24 @@ def the_store_says_what_the_row_can_do(args) -> dict:
     text = [r for r in facts["readings"] if r["tokens"] and r["readout"] == "hidden"]
     denoise = [r for r in facts["readings"]
                if not r["tokens"] and r["readout"] == "velocity"]
-    assert text, f"no text reading among {names}: the guest will refuse by name"
-    assert denoise, f"no denoise reading among {names}"
+    # A row with no text reading (the `mini-dit` fixture, whose caption rows
+    # are random embeddings) cannot be told what to draw. That is a skip and
+    # not a failure -- and it is also the claim the `--expect-refusal` half of
+    # `test_text_to_image.py` makes, so there is nothing left for this suite
+    # to say about it.
+    if not text or not denoise:
+        raise FileNotFoundError(
+            f"{entry['address']} declares {names}, which is not a text-to-image path: "
+            f"the listing agrees with the guest's refusal"
+        )
+    # The human listing must agree with the document, or the marker it prints
+    # is decoration.
+    human = subprocess.run([cli, "model", "list"], env=env,
+                           capture_output=True, text=True, check=True)
+    assert "generative" in human.stdout and "text-to-image" in human.stdout, (
+        f"the readings are a text-to-image pair but `pie model list` did not say so:\n"
+        f"{human.stdout}"
+    )
     latent = facts["latent"]
     assert latent and latent["channels"] > 0, facts
     schedule = facts["schedule"]
