@@ -205,3 +205,6 @@ pub const TOLERANCE: f32 = 3.0e-2;
 pub fn close(got: f32, want: f32) -> bool {
     (got - want).abs() <= TOLERANCE * want.abs().max(1.0)
 }
+
+/// The spatial goldens' host half: lane tables and f32 references.
+pub mod spatial;
