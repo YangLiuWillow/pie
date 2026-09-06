@@ -662,6 +662,10 @@ def roster() -> list[Gate]:
                              832, 480, 17, 20, 0))],
             readout=wan_video_readout,
             timeout=5400,
+            note=("the prompt goes in as IDS: umT5's SentencePiece Unigram tokenizer does not "
+                  "compile in pie, and the artifact was imported from a staged snapshot "
+                  "(/root/.cache/pie-imagegen/wan22-stage) whose tokenizer/ is one pie CAN "
+                  "compile, because `pie model import` refuses the real one"),
         ),
         Gate(
             name="text-to-image",
