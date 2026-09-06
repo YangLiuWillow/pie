@@ -244,9 +244,34 @@ impl LaneFacts {
 
 /// The size of attention group `group`'s cohort in this process: every
 /// `ForwardPass` in the table that names it, bound or not (a sibling still
-/// to bind will submit; the gate's leash bounds the wait for one that never
-/// does). `None` for a pass in no group. Stamped on a request at submit —
-/// not at bind, when the siblings may not have named the group yet.
+/// to bind will submit). `None` for a pass in no group. Stamped on a
+/// request at submit — not at bind, when the siblings may not have named
+/// the group yet.
+///
+/// **THE HOST COUNTS THE GROUP; THE GUEST DOES NOT STATE ITS SIZE.** The
+/// guest owns the algorithm and the host answers facts, and it is tempting
+/// to read that as "the size is the guest's to state" — a `group(id, size)`
+/// verb the guest fills in. It is the wrong way round here, because of what
+/// the two mistakes cost. This number has an asymmetric failure: state it
+/// too LARGE and the group never composes, which the runtime catches and
+/// names (`Doom::CohortNeverComplete`); state it too SMALL and the group
+/// seals short, the joint trunk attends the image rows without the caption,
+/// and the guest gets a plausible picture and a green gate — the exact
+/// silent wrong answer the whole cohort machinery exists to make
+/// impossible. A guest-stated size hands the one number whose understatement
+/// is silent to sixteen hand-written call sites, each of which must be kept
+/// in step with how many passes the guest actually built. Counting the live
+/// handles cannot understate it: a pass that is going to submit is a pass
+/// that exists. Counting distinct PIPELINES instead of passes — which is
+/// what the error message used to claim — would be worse still: two of a
+/// group's passes submitted down one pipeline (a pipeline is serial, so
+/// they arrive as two fires of one lane and the group cannot form) would
+/// count as one and fire short, silently, instead of dying by name.
+///
+/// The count is taken at SUBMIT, so the contract it puts on the guest is:
+/// **build every pass of a group before submitting any of them**, and let
+/// every one of them submit into the group's frame. `latent::DenoiseLoop`
+/// does both by construction (`fire(&[..])` takes the whole group).
 #[must_use]
 pub fn cohort_of(
     table: &mut wasmtime::component::ResourceTable,
