@@ -73,6 +73,27 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_experts(Dtype::U4g64, Dtype::U8g64, Dtype::Bf16, tp),
         ),
+        // The plan `mlx-community/diffusiongemma-26B-A4B-it-4bit` ships:
+        // attention, dense MLP, router and embedding at 8 bits, experts
+        // AND the self-conditioning block at the 4-bit default (the
+        // converter's override list names the dense stack only). The
+        // dense-U8 row above would read the block at 8 bits and refuse.
+        (
+            "diffusiongemma-26b-a4b",
+            1,
+            [Dtype::U8g64, Dtype::U4g64, Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::gemma4,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::a4b_experts_self_cond(
+                Dtype::U8g64,
+                Dtype::U4g64,
+                Dtype::U4g64,
+                Dtype::Bf16,
+                tp,
+            ),
+        ),
         // The dense weights as they came (bf16, ≈3 GiB) over 4-bit experts:
         // no dense dequant on the step at all, the same convergence as
         // 8-bit dense, a gigabyte and a half more than the mixed row.

@@ -490,6 +490,10 @@ struct Dims {
     /// Whether this text is DiffusionGemma's: the self-conditioning block
     /// beside the trunk, and a denoise reading of its rows.
     self_cond: bool,
+    /// The self-conditioning block's element type when it is not the dense
+    /// weights' (`None`): a published quantization may leave it at the
+    /// default bits while the dense stack sits at another.
+    self_cond_w: Option<Dtype>,
     /// Whether this SKU's artifact carries an `aux.*` overlay head.
     draft: bool,
     /// Whether it carries Google's assistant instead (see [`Assistant`]).
@@ -549,6 +553,7 @@ impl Model {
         Dims {
                 tower: None,
                 self_cond: false,
+                self_cond_w: None,
                 draft: false,
                 assistant: false,
                 dflash: None,
@@ -619,6 +624,7 @@ impl Model {
             Dims {
                 tower: None,
                 self_cond: false,
+                self_cond_w: None,
                 draft: false,
                 assistant: false,
                 dflash: None,
@@ -670,6 +676,23 @@ impl Model {
         Model::new_with_experts(w, xw, kv, tp, d)
     }
 
+    /// The diffusion text with the dense weights in `w`, the routed experts
+    /// in `xw` and the self-conditioning block in `sw` — the plan
+    /// `mlx-community/diffusiongemma-26B-A4B-it-4bit` ships (dense at 8
+    /// bits, experts and the block at the 4-bit default).
+    pub fn a4b_diffusion_experts_self_cond(
+        w: Dtype,
+        xw: Dtype,
+        sw: Dtype,
+        kv: Dtype,
+        tp: u32,
+    ) -> Model {
+        let mut d = Model::a4b_dims();
+        d.self_cond = true;
+        d.self_cond_w = Some(sw);
+        Model::new_with_experts(w, xw, kv, tp, d)
+    }
+
     /// The mixture with Google's own drafter overlaid
     /// (`gemma-4-26B-A4B-it-assistant`). A separate row: whether a head
     /// exists is a fact about the artifact.
@@ -699,6 +722,7 @@ impl Model {
             Dims {
                 tower: None,
                 self_cond: false,
+                self_cond_w: None,
                 draft: false,
                 assistant: false,
                 dflash: None,
@@ -1117,13 +1141,14 @@ impl Model {
             // The dense MLP's shape and cut, under its own names.
             self_cond: d.self_cond.then(|| {
                 let iw = intermediate as u64;
+                let sw = d.self_cond_w.unwrap_or(w);
                 SelfCond {
                     taps: SELF_COND_TAPS,
                     pre_norm: Weight::sym("self_cond.pre_norm", [hidden], dense),
                     norm_eps: d.norm_eps,
-                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], w).packed([iw, iw]),
+                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], sw).packed([iw, iw]),
                     inter: intermediate,
-                    down: Weight::sym("self_cond.down", [hidden, iw], w).rows(),
+                    down: Weight::sym("self_cond.down", [hidden, iw], sw).rows(),
                 }
             }),
             // The block drafter's geometry is its OWN (`drafter::dflash`); it

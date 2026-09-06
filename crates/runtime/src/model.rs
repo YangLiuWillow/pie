@@ -146,6 +146,12 @@ pub const ROWS: &[Row] = &[
         arch: "diffusion_gemma",
     },
     Row {
+        id: "diffusiongemma-26b-a4b-u8g64-u4g64-u4g64-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "diffusion_gemma",
+    },
+    Row {
         id: "diffusiongemma-26b-a4b-bf16-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,

@@ -182,11 +182,39 @@ pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static st
     let mut misses: Vec<(&'static str, String)> = Vec::new();
     for (sku, read) in fits(src, platform) {
         match read {
-            Ok(_) => return Ok(&sku.name),
+            // A row that reads the checkpoint only by quantizing its codes a
+            // second time (an 8-bit conversion under a 4-bit row) is a
+            // choice, never an identification: `--sku` pins it.
+            Ok(contract) => match requantizes(&contract) {
+                None => return Ok(&sku.name),
+                Some(plane) => misses.push((
+                    &sku.name,
+                    format!(
+                        "reads this checkpoint only by re-quantizing `{plane}` from the form \
+                         it is stored in; a second quantization is taken by `--sku`, not by \
+                         identification"
+                    ),
+                )),
+            },
             Err(why) => misses.push((&sku.name, why.to_string())),
         }
     }
     Err(Unmatched { misses })
+}
+
+/// The first plane `contract` publishes quantized out of a stored quantized
+/// form (`checkpoint_dsl`'s `<name>.stored` road), if any. A stored form
+/// decoded to a RAW plane is not one: the values are what the row asked for.
+pub fn requantizes(contract: &checkpoint::contract::ModelContract) -> Option<String> {
+    use checkpoint::types::Encoding;
+    contract.tensors.iter().find_map(|stored| {
+        let name = stored.name.strip_suffix(".stored")?;
+        if !matches!(stored.encoding, Encoding::Quant(_)) {
+            return None;
+        }
+        let published = contract.tensors.iter().find(|t| t.name == name)?;
+        matches!(published.encoding, Encoding::Quant(_)).then(|| name.to_string())
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

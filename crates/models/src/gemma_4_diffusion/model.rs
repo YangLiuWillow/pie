@@ -33,4 +33,12 @@ impl Model {
             trunk: gemma_4::model::Model::a4b_diffusion_experts(w, xw, kv, tp),
         }
     }
+
+    /// The dense weights in `w`, the routed experts in `xw`, the
+    /// self-conditioning block in `sw`.
+    pub fn a4b_experts_self_cond(w: Dtype, xw: Dtype, sw: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model {
+            trunk: gemma_4::model::Model::a4b_diffusion_experts_self_cond(w, xw, sw, kv, tp),
+        }
+    }
 }

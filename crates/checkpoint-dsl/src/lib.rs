@@ -732,6 +732,12 @@ fn planes(
         placed_wants_its_own_order(w, "a self-contained block")?;
         return reencoded_from_block(src, w, &[from]);
     }
+    // A RAW want over MLX affine codes (a quantized conversion's embedding
+    // read by a row that keeps its table dense): the triplet decodes through
+    // its own scales and biases and the values are the plane.
+    if matches!(encoding(w.dtype), Encoding::Raw(_)) && stored_mlx_codes(src, &from)? {
+        return affine_decoded(src, w, from);
+    }
     match w.dtype {
         Dtype::U4g64tiled => tiled_planes(src, w, vec![from]),
         Dtype::U4g64
@@ -980,6 +986,149 @@ fn affine_reencoded(
             grouped(w),
         ),
     ])
+}
+
+/// Whether `name` holds MLX affine codes: raw u32 words under a `.weight`
+/// with a `.scales` companion beside it.
+fn stored_mlx_codes(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
+    let Some(stem) = name.strip_suffix(".weight") else {
+        return Ok(false);
+    };
+    Ok(matches!(stored_encoding(src, name)?, Encoding::Raw(DType::U32))
+        && src.get(&model_dsl::scales_name(stem)).is_some())
+}
+
+/// The decode half of [`affine_reencoded`] for a row that wants the VALUES:
+/// the stored triplet is read under `<name>.stored` (internal), taken to
+/// bf16 by its own scales and biases, and that plane — cast to the declared
+/// raw element if it is not bf16 — is the weight. A dense table over a
+/// quantized checkpoint (DiffusionGemma's embedding, which the
+/// self-conditioning gather reads unquantized) is the case.
+fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec<TensorContract>, Error> {
+    let illegible = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    let stem = from
+        .strip_suffix(".weight")
+        .ok_or_else(|| {
+            illegible(format!(
+                "`{from}` holds MLX affine codes, whose scales and biases \
+                 are named beside a `.weight`, and it does not end in one"
+            ))
+        })?
+        .to_string();
+    // The stored form, read off the file: the bits from the words a row
+    // packs over the declared width, the group from the scales a row holds.
+    // (`stored_affine` answers for a quantized want only.)
+    let last = |name: &str| -> Result<i64, Error> {
+        let tensor = src.get(name).ok_or_else(|| Error::Missing(name.to_string()))?;
+        let extent = *tensor
+            .shape()
+            .last()
+            .ok_or_else(|| illegible(format!("`{name}` is a scalar and a bank has a contracted axis")))?;
+        Ok(i64::try_from(extent).expect("an extent no i64 holds"))
+    };
+    let k = *extents(w)
+        .last()
+        .ok_or_else(|| illegible(format!("`{}` is a scalar and a bank has a contracted axis", w.name)))?;
+    let words = last(&from)?;
+    let scale_groups = last(&model_dsl::scales_name(&stem))?;
+    if words <= 0 || k % words != 0 || 32 % (k / words) != 0 || scale_groups <= 0 || k % scale_groups != 0 {
+        return Err(illegible(format!(
+            "`{from}` packs {words} words and {scale_groups} scale groups a row over a \
+             declared width of {k}; MLX affine codes fill a 32-bit word at 2, 4 or 8 bits"
+        )));
+    }
+    let bits = 32 / (k / words);
+    let group = k / scale_groups;
+    let stored = match (bits, group) {
+        (8, 64) => Dtype::U8g64,
+        (4, 64) => Dtype::U4g64,
+        (4, 32) => Dtype::U4g32,
+        (2, 32) => Dtype::U2g32,
+        (2, 64) => Dtype::U2g64,
+        (2, 128) => Dtype::U2g128,
+        _ => {
+            return Err(illegible(format!(
+                "`{from}` is stored at {bits} bits in groups of {group}, a width \
+                 no affine row here names"
+            )));
+        }
+    };
+    let stored_w = Weight {
+        dtype: stored,
+        ..w.clone()
+    };
+    let stem = stem.as_str();
+    let unpacked = unpacked_extents(src, &stored_w, &from)?;
+    holds_the_declared_rectangle(w, 0, &[unpacked.clone()])?;
+    let codes = Expr::src(from.clone()).transmute(TensorType::new(unpacked, grouped(&stored_w)));
+    let pairing = scaling(&stored_w);
+    let counted = divided(
+        &extents(w),
+        pairing.channel_axis,
+        pairing.group_size,
+        &w.name,
+    );
+    let stored_name = format!("{}.stored", w.name);
+    let stored_scales = format!("{stored_name}.scales");
+    let stored_biases = format!("{stored_name}.biases");
+    let scaled = format!("{stored_name}.scaled");
+    let values = format!("{stored_name}.values");
+    let bf16 = encoding(Dtype::Bf16);
+    let want = encoding(w.dtype);
+    let mut out = vec![
+        TensorContract::inferred(stored_name.clone(), codes, grouped(&stored_w)).internal(),
+        factors(
+            src,
+            stored_scales.clone(),
+            &[model_dsl::scales_name(stem)],
+            counted.clone(),
+            0,
+        )?
+        .internal(),
+        factors(
+            src,
+            stored_biases.clone(),
+            &[model_dsl::biases_name(stem)],
+            counted,
+            0,
+        )?
+        .internal(),
+        TensorContract::new(
+            scaled.clone(),
+            Expr::out(stored_name).scale_per_block(Expr::out(stored_scales)),
+            extents(w),
+            bf16.clone(),
+        )
+        .internal(),
+    ];
+    if want == bf16 {
+        out.push(TensorContract::new(
+            w.name.clone(),
+            Expr::out(scaled).bias_per_block(Expr::out(stored_biases)),
+            extents(w),
+            bf16,
+        ));
+    } else {
+        out.push(
+            TensorContract::new(
+                values.clone(),
+                Expr::out(scaled).bias_per_block(Expr::out(stored_biases)),
+                extents(w),
+                bf16,
+            )
+            .internal(),
+        );
+        out.push(TensorContract::new(
+            w.name.clone(),
+            Expr::out(values).cast(want.clone()),
+            extents(w),
+            want,
+        ));
+    }
+    Ok(out)
 }
 
 /// [`affine_planes`] for a bank stored one row at a time: each row's parts
