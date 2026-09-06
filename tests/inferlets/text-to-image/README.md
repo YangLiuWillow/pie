@@ -22,17 +22,22 @@ The config must bind a generative row (`pie model list` marks one
 job is 4096 latent rows a lane and the frame carries two fires, so the 4096
 default refuses the second fire by name.
 
-It must also set **`[runtime] submit_deadline` to at least `"1s"`** (the
-harnesses run `"10s"`). A denoise frame composes an attention group out of the
-image lane and the context lane, and a group forms only when both are members
-of one step; the scheduler holds the seal for a group still gathering, but the
-leash on that wait is `submit_deadline`, whose default is 50 ms. A flagship's
-context lane comes off a 4B-parameter trunk fire, so at 50 ms it often misses
-the leash — and then the frame seals with the image lane alone, the model
-attends its image rows with NO CAPTION, and the run still succeeds. The
-picture that comes back is a plausible textured field with nothing of the
-prompt in it. Measured on FLUX.2-klein-4B: 50 ms gave 1 of 3 correct on the
-eager path and 4 of 5 bodied; `"10s"` gave 6 of 6, every run bit-identical.
+It does NOT need `[runtime] submit_deadline` touched, and that is worth
+saying because for a while it did. A denoise frame composes an attention group
+out of the image lane and the context lane, and the group forms only when both
+are members of one step; that wait used to be leashed by `submit_deadline`
+(50 ms), and a 1024² job's first submit carries megabytes of seeded `context`
+and `latents` across the guest boundary, so under load the leash fired first
+and the frame sealed with the IMAGE LANE ALONE. The model then attended its
+image rows with no caption and the run still SUCCEEDED, handing back a
+plausible textured field with nothing of the prompt in it — measured here on
+2026-09-06 at 1 of 3 correct on the eager path and 4 of 5 bodied, the wrong
+ones bit-identical per trajectory, which reads exactly like a numerics
+non-determinism and is not one. The runtime now keeps the promise instead (a
+stated cohort fires whole or not at all, `runtime::scheduler::frame`'s
+`group_short`), so this runs at the 50 ms default: 4 of 4 bit-identical and
+correct. If a picture ever comes back as that textured field again, a partial
+group is the first thing to check.
 
 Two exits, and which one a model gets is its own fact.
 
