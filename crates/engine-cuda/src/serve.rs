@@ -618,6 +618,19 @@ pub(crate) struct PortFeedPlan {
     pub(crate) instance: u64,
 }
 
+/// One lane's rows of a port merged straight into a stream, to land in the
+/// merged column: from the port rectangle when the lane fed the port, zeros
+/// when it did not (an arming synthetic).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MergeLand {
+    pub(crate) merge: model_ir::ValueId,
+    pub(crate) seat: crate::inputs::PortSeat,
+    /// The first fire row (or the fire lane, for a lane vector).
+    pub(crate) first: u32,
+    pub(crate) rows: u32,
+    pub(crate) fed: bool,
+}
+
 /// Every host decision one step needs, made — and not one stream touched.
 pub struct Prepared<'a> {
     /// The step this was prepared from.
@@ -652,6 +665,9 @@ pub struct Prepared<'a> {
     packings: Vec<model_exec::fire::Packed>,
     /// The D3 port feeds: one copy per (lane, port) the lane's class reads.
     port_feeds: Vec<PortFeedPlan>,
+    /// The rows of ports merged straight into a stream, landed in the merged
+    /// column after the feeds: one entry per (merge, lane) the arm selects.
+    merge_lands: Vec<MergeLand>,
     /// How many lanes every `[Lanes, ·]` rectangle is carved at this fire:
     /// the fire's own count, or the key's lane ceiling for a bodied fire.
     lane_carve: u32,

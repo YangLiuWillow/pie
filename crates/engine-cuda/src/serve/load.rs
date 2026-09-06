@@ -297,6 +297,16 @@ impl Shell {
         });
         // The float ports and packing selections the plan reads (D2/D3).
         let feeds = Feeds::of(&boot.trace, &compiled);
+        if let Some(value) = feeds.unlanded.first() {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "value {}, a merge over a runtime input this shell cannot land: only a \
+                     float port (latents, lane vector, context, axis positions) under a \
+                     conjunction of facts is landed in a merged column before the walk",
+                    value.0
+                ),
+            });
+        }
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,

@@ -500,6 +500,12 @@ impl Rig {
     /// Load the miniature at these budgets (graphs on, bodies armed, golden
     /// checked — the load's default knobs).
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
+        Rig::load_plan(trace(), weights, max_tokens, buckets)
+    }
+
+    /// [`Rig::load`] over another plan traced under [`NAME`] (its weights
+    /// drawn for it).
+    pub fn load_plan(plan: Trace, weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
         let boot = engine_cuda::DeviceBoot::default();
@@ -507,7 +513,7 @@ impl Rig {
             engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
         let loaded = engine
             .load(LoadRequest {
-                trace: trace(),
+                trace: plan,
                 checkpoint: Checkpoint::Path(path.clone()),
                 budgets: Budgets {
                     max_lanes: 8,

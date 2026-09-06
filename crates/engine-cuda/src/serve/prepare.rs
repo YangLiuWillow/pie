@@ -14,8 +14,8 @@ use crate::store::kv::{self, Seat};
 use crate::window::Windows;
 
 use super::{
-    Enqueued, FireCost, MROPE_COORDS, Media, PATCH_ROUTE_DROP, PortFeedPlan, Prepared, RsFire,
-    Settled, Shell, StepView,
+    Enqueued, FireCost, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, PortFeedPlan, Prepared,
+    RsFire, Settled, Shell, StepView,
 };
 
 /// `prepare`: host-only (gate, ports, compose, lane loop, geometry, windows,
@@ -438,6 +438,34 @@ impl FrameShell for Shell {
             }
             (groups, packings)
         };
+
+        // 1b'. The ports merged straight into a stream: every lane the arm
+        // selects lands its rows in the merged column — from the port when
+        // the lane feeds it, zeros otherwise.
+        let mut merge_lands: Vec<MergeLand> = Vec::new();
+        for (fire_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for merged in &self.feeds.merged {
+                if !merged.select.holds(row.word) {
+                    continue;
+                }
+                let fed = seated
+                    .ports
+                    .iter()
+                    .any(|feed| feed.kind == merged.seat.kind && feed.port == merged.seat.port);
+                merge_lands.push(MergeLand {
+                    merge: merged.merge,
+                    seat: merged.seat,
+                    first: if merged.seat.per_lane() {
+                        fire_lane as u32
+                    } else {
+                        row.row_offset
+                    },
+                    rows: if merged.seat.per_lane() { 1 } else { row.rows },
+                    fed,
+                });
+            }
+        }
 
         // 1c. The D3 port feeds: every port a lane's class reads must be fed
         // from one of its channels, through the instance attached to it (the
@@ -1453,6 +1481,7 @@ impl FrameShell for Shell {
             self_cond_feeds,
             packings,
             port_feeds,
+            merge_lands,
             lane_carve,
             windows,
             seats,

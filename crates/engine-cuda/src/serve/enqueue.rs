@@ -367,6 +367,42 @@ impl FireCtx<'_> {
                 clips: u64::from(p.composition.clips()),
             },
         );
+        // The ports merged straight into a stream land in their merged
+        // column now — after the feeds and the carve, before the walk: the
+        // arm's lanes' rows from the port rectangle, or zeros for a lane
+        // that fed nothing, so the column never reads the last fire's bytes.
+        for land in &p.merge_lands {
+            let Some(column) = slots.0[land.merge.0 as usize] else {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "value {}, a merge over a port, which the carve gave no rectangle",
+                        land.merge.0
+                    ),
+                });
+            };
+            let row_bytes = land.seat.row_bytes();
+            let at = column.ptr + u64::from(land.first) * row_bytes;
+            let bytes = usize::try_from(u64::from(land.rows) * row_bytes).unwrap_or(usize::MAX);
+            if land.fed {
+                let rectangle = self
+                    .inputs
+                    .port(land.seat.kind, land.seat.port, u32::MAX)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "the {:?} port {} rectangle, which this load carved none of",
+                            land.seat.kind, land.seat.port
+                        ),
+                    })?;
+                crate::device::alloc::copy_any(
+                    self.device.stream(),
+                    at,
+                    rectangle.ptr + u64::from(land.first) * row_bytes,
+                    bytes,
+                )?;
+            } else {
+                crate::device::alloc::zero_span_on(self.device.stream(), at, bytes)?;
+            }
+        }
         // The three RS seats: a plain fire binds `Tensor::ABSENT` for all of them.
         let caches = self.pools.table(
             &self

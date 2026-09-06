@@ -917,6 +917,33 @@ fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<
         }
     }
 
+    // A merge with a RUNTIME-INPUT arm (a float port merged straight into a
+    // stream: a context lane's rows beside an embedded image's) has no node
+    // writing that arm's rows: the engine lands them in the merged column
+    // before the walk (design D3). The column is therefore live from the
+    // fire's first instant, so no earlier value may share its bytes.
+    for (id, decl) in trace.values.iter().enumerate() {
+        let Def::Merge(arms) = &decl.def else {
+            continue;
+        };
+        let fed = arms.iter().any(|(arm, _)| {
+            matches!(
+                trace.values.get(arm.0 as usize).map(|decl| &decl.def),
+                Some(Def::Input(_))
+            )
+        });
+        if !fed {
+            continue;
+        }
+        let root = root(placements, ValueId(id as u32));
+        if !placements.get(root.0 as usize).is_some_and(Placement::is_arena) {
+            continue;
+        }
+        spans[root.0 as usize]
+            .get_or_insert(Span { first: 0, last: end })
+            .first = 0;
+    }
+
     // Every rectangle ends up with a span.
     for (id, slot) in placements.iter().enumerate() {
         if slot.is_arena() {

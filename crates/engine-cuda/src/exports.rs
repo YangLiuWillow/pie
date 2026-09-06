@@ -584,6 +584,27 @@ pub(crate) struct Feeds {
     /// reads on its query side — the ones whose groups may hold at most one
     /// reference lane on this shell (the kernel has one tail per group).
     pub(crate) reference_masked: Vec<model_ir::Selection>,
+    /// Every float port merged STRAIGHT into a stream (`Value::merge` with
+    /// the port as an arm): the merged column has no node writing that arm's
+    /// rows, so the fire lands the port's rows in it before the walk — the
+    /// lanes the arm's guard selects, from the port rectangle the feed
+    /// filled (zeros for a lane nothing fed). The compiler keeps such a
+    /// column live from the fire's first instant.
+    pub(crate) merged: Vec<MergedPort>,
+    /// Merges with an input arm this shell cannot land: a non-port input, or
+    /// an arm guard that is not a conjunction of facts. Refused at load.
+    pub(crate) unlanded: Vec<ValueId>,
+}
+
+/// One float port that is a merge's arm.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MergedPort {
+    /// The merged value whose column the rows land in.
+    pub(crate) merge: ValueId,
+    /// Which port.
+    pub(crate) seat: crate::inputs::PortSeat,
+    /// The arm's lanes.
+    pub(crate) select: model_ir::Selection,
 }
 
 impl Feeds {
@@ -653,6 +674,63 @@ impl Feeds {
                     }
                     None => feeds.ports.push((seat, readers)),
                 }
+            }
+        }
+        // The ports merged straight into a stream.
+        for (at, decl) in trace.values.iter().enumerate() {
+            let Def::Merge(arms) = &decl.def else {
+                continue;
+            };
+            for (arm, guard) in arms {
+                let Def::Input(input) = &trace.values[arm.0 as usize].def else {
+                    continue;
+                };
+                let seat = feeds
+                    .ports
+                    .iter()
+                    .find(|(seat, _)| {
+                        let (kind, port) = match *input {
+                            RuntimeInput::Latents { port, .. } => (engine::fire::PortKind::Latents, port),
+                            RuntimeInput::LaneVector { port, .. } => {
+                                (engine::fire::PortKind::LaneVector, port)
+                            }
+                            RuntimeInput::Context { port, .. } => (engine::fire::PortKind::Context, port),
+                            RuntimeInput::AxisPositions { port, .. } => {
+                                (engine::fire::PortKind::AxisPositions, port)
+                            }
+                            _ => return false,
+                        };
+                        seat.kind == kind && seat.port == port
+                    })
+                    .map(|(seat, _)| *seat);
+                let (Some(seat), Some(select)) = (seat, model_ir::Selection::of(guard)) else {
+                    // A non-port input merged, or an arm whose guard is no
+                    // conjunction: nothing lands it. Left to the load's
+                    // refusal (`Shell::load`), which names the value.
+                    feeds.unlanded.push(ValueId(at as u32));
+                    continue;
+                };
+                // The port is read through the merge: the classes whose
+                // window reads the MERGED column, among the arm's own lanes,
+                // are the classes that must feed it.
+                let readers = reader_classes(trace, compiled, ValueId(at as u32));
+                if let Some((_, classes)) = feeds
+                    .ports
+                    .iter_mut()
+                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
+                {
+                    for class in readers.iter() {
+                        let word = compiled.classes.classes[class].word();
+                        if select.holds(word) {
+                            classes.insert(class);
+                        }
+                    }
+                }
+                feeds.merged.push(MergedPort {
+                    merge: ValueId(at as u32),
+                    seat,
+                    select,
+                });
             }
         }
         for node in &trace.nodes {
