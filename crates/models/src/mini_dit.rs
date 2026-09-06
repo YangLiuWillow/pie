@@ -29,6 +29,7 @@ pub const ARCH: &str = "mini_dit";
 /// final entry of `SKUS`), and its import reads a checkpoint of eight dozen
 /// tensors no other family spells.
 pub fn skus() -> Vec<crate::Sku> {
+    let tap = forward::Tap::from_env();
     let mut rows = crate::skus![(
         "mini-dit",
         1,
@@ -37,13 +38,13 @@ pub fn skus() -> Vec<crate::Sku> {
         model_dsl::trace_hybrid,
         template::instruct,
         &tokenizer::CONTRACT,
-        |tp: u32| Model::mini(Dtype::Bf16, tp),
+        |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
     )];
     // The generative facts a guest sizes a job from (design D12). Stated
     // beside the row rather than by the macro, which fills `None` for every
     // family — the `gemma_4_diffusion` precedent for `diffusion`.
     for row in &mut rows {
-        row.generative = Some(forward::generative());
+        row.generative = Some(forward::generative(tap.as_deref()));
     }
     rows
 }

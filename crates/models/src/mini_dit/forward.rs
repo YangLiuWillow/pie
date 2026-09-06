@@ -48,6 +48,41 @@ pub const DENOISE_BIT: u8 = 6;
 /// of `"denoise"` in [`readings`].
 pub const DENOISE_READING: u8 = 0;
 
+/// **THE PARITY HARNESS'S BISECTION KNOB.** A synthetic fixture exists to be
+/// compared with its reference, and a mismatch at the head says nothing
+/// about WHERE the two diverged. `PIE_MINI_DIT_TAP=<dump key>` — one of the
+/// intermediates `scripts/imagegen/mini_dit_ref.py` dumps, spelled the way
+/// the `.npz` spells it — makes [`Model::forward`] plant [`seam::VELOCITY`]
+/// on that rectangle and return there, so the guest's `velocity(width)`
+/// reads the intermediate off its own lane's rows and
+/// `scripts/imagegen/mini_dit_parity.py collect --tap` names it by the key.
+///
+/// This is the one place a family reads the environment, and it is read
+/// once, at catalog time, for a row nothing real is served by. A real
+/// family states its readout in its text and nowhere else.
+pub struct Tap;
+
+impl Tap {
+    /// The environment variable, read at catalog time.
+    pub const ENV: &'static str = "PIE_MINI_DIT_TAP";
+
+    /// The requested tap, or `None` for the model as it is.
+    #[must_use]
+    pub fn from_env() -> Option<String> {
+        std::env::var(Self::ENV).ok().filter(|key| !key.is_empty())
+    }
+
+    /// The width of the rectangle a tap exports: the patch features at the
+    /// head's own two rectangles, the trunk width everywhere else.
+    #[must_use]
+    pub fn width(key: Option<&str>) -> u32 {
+        match key {
+            None | Some("final.tokens") => super::model::PATCH_FEATURES,
+            Some(_) => super::model::HIDDEN,
+        }
+    }
+}
+
 /// This family's generative facts (design D12): what a guest sizes a job
 /// from and what `forward-pass.reading` / `input` resolve against.
 ///
@@ -56,9 +91,9 @@ pub const DENOISE_READING: u8 = 0;
 /// are its latent cells — and its schedule is the rectified flow the
 /// reference's four-step Euler run uses.
 #[must_use]
-pub fn generative() -> Generative {
+pub fn generative(tap: Option<&str>) -> Generative {
     Generative {
-        readings: vec![denoise_reading()],
+        readings: vec![denoise_reading(tap)],
         latent: Some(LatentSpace {
             channels: super::model::CHANNELS,
             patch_t: 1,
@@ -95,7 +130,7 @@ pub fn generative() -> Generative {
 /// vector is read once per lane and every class that modulates needs it,
 /// while the context lane's cell is written and never read (its class runs
 /// one projection and no modulation).
-fn denoise_reading() -> ReadingFact {
+fn denoise_reading(tap: Option<&str>) -> ReadingFact {
     let port = |name, kind, width, streams: &[Stream]| PortFact {
         name,
         kind,
@@ -112,12 +147,32 @@ fn denoise_reading() -> ReadingFact {
         takes_tokens: false,
         streams: vec![Stream::Text, Stream::Image, Stream::Context],
         ports: vec![
-            port("latents", PortKind::Latents, super::model::PATCH_FEATURES, &[Stream::Image]),
-            port("text", PortKind::Context, super::model::TEXT_WIDTH, &[Stream::Text]),
-            port("context", PortKind::Context, super::model::CONTEXT_WIDTH, &[Stream::Context]),
+            port(
+                "latents",
+                PortKind::Latents,
+                super::model::PATCH_FEATURES,
+                &[Stream::Image],
+            ),
+            port(
+                "text",
+                PortKind::Context,
+                super::model::TEXT_WIDTH,
+                &[Stream::Text],
+            ),
+            port(
+                "context",
+                PortKind::Context,
+                super::model::CONTEXT_WIDTH,
+                &[Stream::Context],
+            ),
             // Read once per lane by every class that modulates; the context
             // lane's class runs one projection and no modulation.
-            port("timestep", PortKind::LaneVector, 1, &[Stream::Text, Stream::Image]),
+            port(
+                "timestep",
+                PortKind::LaneVector,
+                1,
+                &[Stream::Text, Stream::Image],
+            ),
             port(
                 "positions",
                 PortKind::AxisPositions,
@@ -126,7 +181,7 @@ fn denoise_reading() -> ReadingFact {
             ),
         ],
         readout: ReadoutKind::Velocity,
-        readout_width: super::model::PATCH_FEATURES,
+        readout_width: Tap::width(tap),
     }
 }
 
@@ -176,6 +231,28 @@ impl Classify for Facts {
     fn word(&self) -> u64 {
         self.stream.word(STREAM_BASE) | (u64::from(self.denoise) << DENOISE_BIT)
     }
+}
+
+/// `tap!(m, "key", &value)`: under [`Tap`] `key`, plant the velocity seam on
+/// `value` and return it as the plan's readout. A no-op otherwise, so the
+/// model's text reads through it unchanged.
+macro_rules! tap {
+    ($m:expr, $key:literal, $v:expr) => {
+        if let Some(v) = tapped($m, "", $key, $v) {
+            return v;
+        }
+    };
+}
+
+/// A helper's tap hit, handed up: `Err(v)` is the exported rectangle, and
+/// `forward` returns it.
+macro_rules! unwrap_tap {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(tapped) => return tapped,
+        }
+    };
 }
 
 impl ForwardHybrid for Model {
@@ -230,13 +307,27 @@ impl ForwardHybrid for Model {
         // ---- the lanes' rows ------------------------------------------
         let txt = txt_in.context(port::TEXT, super::model::TEXT_WIDTH);
         let patches = img_in.latents(port::LATENTS, super::model::PATCH_FEATURES, Dtype::Bf16);
+        // Block 2's context rows, read here with the other ports so every
+        // port the reading declares is in the plan whatever a tap cuts.
+        let ctx_rows = ctx.context(port::CONTEXT, super::model::CONTEXT_WIDTH);
+        // A port read is a binding, not a rectangle, so the probe is a norm
+        // of it (zero in, zero out — it still says whether the rows landed).
+        tap!(
+            m,
+            "in.text",
+            &ops::elemwise::layernorm_no_scale(&txt, LN_EPS)
+        );
         let img = linear(&m.x_embed, &patches);
+        tap!(m, "x_embed", &img);
 
         // ================================================== block 0: single
         // One sequence, one set of weights, one modulation.
         let x = Value::merge(vec![txt, img]);
+        tap!(m, "b0.in", &x);
         let (msa, gate_a, mmlp, gate_m) = adaln6(&linear(&m.single.ada, &temb));
-        let x = attn_sublayer(
+        let x = unwrap_tap!(attn_sublayer(
+            m,
+            "b0",
             &x,
             &m.single.attn,
             &msa,
@@ -245,8 +336,18 @@ impl ForwardHybrid for Model {
             &positions,
             &joint_perm,
             &joint_csr,
-        );
-        let x = mlp_sublayer(&x, &m.single.mlp, &mmlp, &gate_m, &lanes);
+        ));
+        tap!(m, "b0.x_after_attn", &x);
+        let x = unwrap_tap!(mlp_sublayer(
+            m,
+            "b0",
+            &x,
+            &m.single.mlp,
+            &mmlp,
+            &gate_m,
+            &lanes
+        ));
+        tap!(m, "b0.out", &x);
 
         // ================================================== block 1: double
         // The same joint attention, but each stream brings its own
@@ -256,8 +357,24 @@ impl ForwardHybrid for Model {
             adaln6(&linear(&m.double.txt.ada, &temb)),
             adaln6(&linear(&m.double.img.ada, &temb)),
         );
-        let (tq, tk, tv) = qkv(&txt, &m.double.txt, &txt_mod.0, &lanes, &positions);
-        let (iq, ik, iv) = qkv(&img, &m.double.img, &img_mod.0, &lanes, &positions);
+        let (tq, tk, tv) = unwrap_tap!(qkv(
+            m,
+            "b1.txt_",
+            &txt,
+            &m.double.txt,
+            &txt_mod.0,
+            &lanes,
+            &positions
+        ));
+        let (iq, ik, iv) = unwrap_tap!(qkv(
+            m,
+            "b1.img_",
+            &img,
+            &m.double.img,
+            &img_mod.0,
+            &lanes,
+            &positions
+        ));
         let o = joint_attention(
             &Value::merge(vec![tq, iq]),
             &Value::merge(vec![tk, ik]),
@@ -265,30 +382,47 @@ impl ForwardHybrid for Model {
             &joint_perm,
             &joint_csr,
         );
+        tap!(m, "b1.joint_attn_heads", &o);
         let (o_txt, o_img) = o.split(&Facts::text());
-        let txt = ops::elemwise::gated_residual_add(
-            &txt,
-            &txt_mod.1,
-            &linear(&m.double.txt.attn.out, &o_txt),
-            Some(&lanes),
-        );
-        let img = ops::elemwise::gated_residual_add(
-            &img,
-            &img_mod.1,
-            &linear(&m.double.img.attn.out, &o_img),
-            Some(&lanes),
-        );
+        let ta = linear(&m.double.txt.attn.out, &o_txt);
+        tap!(m, "b1.txt_attn_out", &ta);
+        let ia = linear(&m.double.img.attn.out, &o_img);
+        tap!(m, "b1.img_attn_out", &ia);
+        let txt = ops::elemwise::gated_residual_add(&txt, &txt_mod.1, &ta, Some(&lanes));
+        tap!(m, "b1.txt_after_attn", &txt);
+        let img = ops::elemwise::gated_residual_add(&img, &img_mod.1, &ia, Some(&lanes));
+        tap!(m, "b1.img_after_attn", &img);
         // The caption stream ends here: block 2 and the head are image-only.
         // Its MLP is still emitted — the reference computes it, the checkpoint
         // ships its weights, and the class sweep simply never roots it.
-        let _ = mlp_sublayer(&txt, &m.double.txt.mlp, &txt_mod.2, &txt_mod.3, &lanes);
-        let x = mlp_sublayer(&img, &m.double.img.mlp, &img_mod.2, &img_mod.3, &lanes);
+        let txt = unwrap_tap!(mlp_sublayer(
+            m,
+            "b1.txt_",
+            &txt,
+            &m.double.txt.mlp,
+            &txt_mod.2,
+            &txt_mod.3,
+            &lanes
+        ));
+        tap!(m, "b1.out_txt", &txt);
+        let x = unwrap_tap!(mlp_sublayer(
+            m,
+            "b1.img_",
+            &img,
+            &m.double.img.mlp,
+            &img_mod.2,
+            &img_mod.3,
+            &lanes
+        ));
+        tap!(m, "b1.out_img", &x);
 
         // =================================================== block 2: cross
         // Wan's modulation: a learned table plus the timestep projection.
         let mod2 = ops::elemwise::add_bias(&m.cross.mod_table, &linear(&m.cross.ada, &temb));
         let (msa, gate_a, mffn, gate_f) = adaln6(&mod2);
-        let x = attn_sublayer(
+        let x = unwrap_tap!(attn_sublayer(
+            m,
+            "b2",
             &x,
             &m.cross.self_attn,
             &msa,
@@ -297,7 +431,8 @@ impl ForwardHybrid for Model {
             &positions,
             &img_perm,
             &img_csr,
-        );
+        ));
+        tap!(m, "b2.x_after_self", &x);
 
         // Cross-attention: LayerNorm WITH affine, no modulation, no rope, and
         // an UNGATED residual — the Wan contract. The queries are the image
@@ -305,16 +440,15 @@ impl ForwardHybrid for Model {
         // `attention.ragged` is the one op whose operands may come from two
         // arms.
         let hc = ops::elemwise::layernorm(&x, &m.cross.norm, &m.cross.norm_bias, LN_EPS);
+        tap!(m, "b2.cross_norm_out", &hc);
         let cq = ops::elemwise::rmsnorm_per_head(
             &linear(&m.cross.cross.q, &hc),
             &m.cross.cross.q_norm,
             HEAD_DIM,
             RMS_EPS,
         );
-        let (ck, cv) = context_kv(
-            &ctx.context(port::CONTEXT, super::model::CONTEXT_WIDTH),
-            &m.cross.cross,
-        );
+        tap!(m, "b2.cross_q", &cq);
+        let (ck, cv) = context_kv(&ctx_rows, &m.cross.cross);
         let ctx_perm = ctx.row_permutation();
         let ctx_csr = ctx.group_indptr();
         let ca = ops::attn::ragged(
@@ -328,8 +462,21 @@ impl ForwardHybrid for Model {
             RaggedMask::GroupBlockDiagonal,
         );
         let ca = ops::layout::unpack_rows(&ca, &img_perm);
-        let x = ops::elemwise::residual_add(&linear(&m.cross.cross.out, &ca), &x);
-        let x = mlp_sublayer(&x, &m.cross.mlp, &mffn, &gate_f, &lanes);
+        tap!(m, "b2.cross_attn_heads", &ca);
+        let ca = linear(&m.cross.cross.out, &ca);
+        tap!(m, "b2.cross_attn_out", &ca);
+        let x = ops::elemwise::residual_add(&ca, &x);
+        tap!(m, "b2.x_after_cross", &x);
+        let x = unwrap_tap!(mlp_sublayer(
+            m,
+            "b2",
+            &x,
+            &m.cross.mlp,
+            &mffn,
+            &gate_f,
+            &lanes
+        ));
+        tap!(m, "b2.out", &x);
 
         // ========================================================== head
         // LayerNorm-no-affine → scale/shift → Linear back to C·p·p. The
@@ -341,6 +488,7 @@ impl ForwardHybrid for Model {
             Some(&lanes),
             ModulateForm::ScaleShift,
         );
+        tap!(m, "final.norm_out", &hf);
         let velocity = linear(&m.final_proj, &hf);
         seam::at(seam::VELOCITY, &[&velocity]);
         velocity
@@ -371,46 +519,97 @@ fn adaln6(m: &Value) -> (Value, Value, Value, Value) {
 
 /// Modulate, project, QK-norm, rope: the front half of a self-attention
 /// sublayer, up to the three head rectangles.
+///
+/// `stem` is the golden's key prefix for this sublayer (`"b0"`,
+/// `"b1.img_"`, …), for [`Tap`]: a helper that meets its tap plants the seam
+/// and answers `Err(rectangle)`, which `forward` returns.
+#[allow(clippy::too_many_arguments)]
 fn qkv(
+    model: &Model,
+    stem: &str,
     x: &Value,
     side: &Side,
     m: &Value,
     lanes: &Value,
     positions: &Value,
-) -> (Value, Value, Value) {
-    heads(x, &side.attn, m, lanes, positions)
+) -> Result<(Value, Value, Value), Value> {
+    heads(model, stem, x, &side.attn, m, lanes, positions)
 }
 
+/// The rectangle a tap point exports, if this is its key: the seam is
+/// planted and the value handed back for `forward` to return. `None` is the
+/// untapped path. `stem` prefixes `tail` with a dot (`b0.norm1_out`), or
+/// bare when it already ends in the golden's underscore (`b1.img_norm1_out`);
+/// an empty stem is the whole key.
+fn tapped(model: &Model, stem: &str, tail: &str, v: &Value) -> Option<Value> {
+    let key = if stem.is_empty() || stem.ends_with('_') {
+        format!("{stem}{tail}")
+    } else {
+        format!("{stem}.{tail}")
+    };
+    if model.tap.as_deref() == Some(key.as_str()) {
+        seam::at(seam::VELOCITY, &[v]);
+        Some(v.clone())
+    } else {
+        None
+    }
+}
+
+/// `tapped`, as the `?`-able form a helper propagates.
+fn tap_at(model: &Model, stem: &str, tail: &str, v: &Value) -> Result<(), Value> {
+    match tapped(model, stem, tail, v) {
+        Some(v) => Err(v),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn heads(
+    model: &Model,
+    stem: &str,
     x: &Value,
     attn: &SelfAttn,
     m: &Value,
     lanes: &Value,
     positions: &Value,
-) -> (Value, Value, Value) {
+) -> Result<(Value, Value, Value), Value> {
     let h = ops::elemwise::modulate(
         &ops::elemwise::layernorm_no_scale(x, LN_EPS),
         m,
         Some(lanes),
         ModulateForm::ScaleShift,
     );
+    tap_at(model, stem, "norm1_out", &h)?;
     let (q, k, v) = ops::layout::split_qkv(
         &linear(&attn.qkv, &h),
         super::model::HIDDEN,
         super::model::HIDDEN,
     );
-    let turn = |x: &Value, gain: &Weight| {
-        ops::elemwise::rope_axes(
-            &ops::elemwise::rmsnorm_per_head(x, gain, HEAD_DIM, RMS_EPS),
+    // Block 2 spells its self-attention heads `self_q_rope`, `self_v`, ….
+    let hp = if stem == "b2" { "self_" } else { "" };
+    tap_at(model, stem, &format!("{hp}q_raw"), &q)?;
+    tap_at(model, stem, &format!("{hp}k_raw"), &k)?;
+    tap_at(model, stem, &format!("{hp}v"), &v)?;
+    let turn = |x: &Value, gain: &Weight, tail: &str| -> Result<Value, Value> {
+        let n = ops::elemwise::rmsnorm_per_head(x, gain, HEAD_DIM, RMS_EPS);
+        tap_at(model, stem, &format!("{hp}{tail}_qknorm"), &n)?;
+        let r = ops::elemwise::rope_axes(
+            &n,
             positions,
             ROPE_DIMS,
             [ROPE_THETA; 4],
             RopeForm::Interleaved,
             HEAD_DIM,
             HEAD_DIM,
-        )
+        );
+        tap_at(model, stem, &format!("{hp}{tail}_rope"), &r)?;
+        Ok(r)
     };
-    (turn(&q, &attn.q_norm), turn(&k, &attn.k_norm), v)
+    Ok((
+        turn(&q, &attn.q_norm, "q")?,
+        turn(&k, &attn.k_norm, "k")?,
+        v,
+    ))
 }
 
 /// The joint attention itself: pack by the arm's row order, one ragged read
@@ -432,6 +631,8 @@ fn joint_attention(q: &Value, k: &Value, v: &Value, perm: &Value, csr: &Value) -
 /// A whole single-stream attention sublayer: `x += gate · out(attn(mod(x)))`.
 #[allow(clippy::too_many_arguments)]
 fn attn_sublayer(
+    model: &Model,
+    stem: &str,
     x: &Value,
     attn: &SelfAttn,
     m: &Value,
@@ -440,22 +641,49 @@ fn attn_sublayer(
     positions: &Value,
     perm: &Value,
     csr: &Value,
-) -> Value {
-    let (q, k, v) = heads(x, attn, m, lanes, positions);
+) -> Result<Value, Value> {
+    let (q, k, v) = heads(model, stem, x, attn, m, lanes, positions)?;
     let o = joint_attention(&q, &k, &v, perm, csr);
-    ops::elemwise::gated_residual_add(x, gate, &linear(&attn.out, &o), Some(lanes))
+    // Block 2 spells its self-attention keys apart from its cross-attention's.
+    let (heads_key, out_key) = if stem == "b2" {
+        ("self_attn_heads", "self_attn_out")
+    } else {
+        ("attn_heads", "attn_out")
+    };
+    tap_at(model, stem, heads_key, &o)?;
+    let o = linear(&attn.out, &o);
+    tap_at(model, stem, out_key, &o)?;
+    Ok(ops::elemwise::gated_residual_add(x, gate, &o, Some(lanes)))
 }
 
 /// `x += gate · down(swiglu(gate_up(mod(x))))`.
-fn mlp_sublayer(x: &Value, mlp: &Swiglu, m: &Value, gate: &Value, lanes: &Value) -> Value {
+#[allow(clippy::too_many_arguments)]
+fn mlp_sublayer(
+    model: &Model,
+    stem: &str,
+    x: &Value,
+    mlp: &Swiglu,
+    m: &Value,
+    gate: &Value,
+    lanes: &Value,
+) -> Result<Value, Value> {
     let h = ops::elemwise::modulate(
         &ops::elemwise::layernorm_no_scale(x, LN_EPS),
         m,
         Some(lanes),
         ModulateForm::ScaleShift,
     );
+    // Block 2's MLP norm is its third; every other block's is its second.
+    let norm_key = if stem == "b2" {
+        "norm3_out"
+    } else {
+        "norm2_out"
+    };
+    tap_at(model, stem, norm_key, &h)?;
     let h = ops::linear::mlp_swiglu(&linear(&mlp.gate_up, &h), INTER);
-    ops::elemwise::gated_residual_add(x, gate, &linear(&mlp.down, &h), Some(lanes))
+    let y = linear(&mlp.down, &h);
+    tap_at(model, stem, "mlp_out", &y)?;
+    Ok(ops::elemwise::gated_residual_add(x, gate, &y, Some(lanes)))
 }
 
 /// The context lane's keys and values: one packed projection off the wider

@@ -225,6 +225,11 @@ pub struct Model {
     /// order.
     pub final_ada: Linear,
     pub final_proj: Linear,
+    /// The parity harness's bisection knob: the golden dump key of an
+    /// intermediate to plant [`model_dsl::seam::VELOCITY`] on INSTEAD of the
+    /// head's output (`forward::Tap`). `None` is the model; a key is a
+    /// probe, and the readout width follows it.
+    pub tap: Option<String>,
 }
 
 impl Model {
@@ -258,6 +263,15 @@ impl Model {
             },
             final_ada: Linear::at("final.ada", 2 * HIDDEN, HIDDEN, banks),
             final_proj: Linear::at("final.proj", PATCH_FEATURES, HIDDEN, banks),
+            tap: None,
         }
+    }
+
+    /// The same text, with one intermediate exported in the velocity's
+    /// place. See [`super::forward::Tap`].
+    #[must_use]
+    pub fn tapped(mut self, tap: Option<String>) -> Model {
+        self.tap = tap;
+        self
     }
 }
