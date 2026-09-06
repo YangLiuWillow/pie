@@ -669,6 +669,7 @@ impl FrameShell for Shell {
         // order.
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         // One mask entry per lane, seriated with the rest.
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -706,6 +707,9 @@ impl FrameShell for Shell {
             // device-geometry lane states its post-append extent on
             // `kv_len`, and `have` is derived as `extent - rows`.
             let have = match ports.as_ref().filter(|ports| ports.owns_pages()) {
+                // A lane whose reading binds no kv space holds nothing,
+                // whatever the shell counted for its slot.
+                _ if seated.kv_less => 0,
                 Some(ports) => {
                     let after = ports.extent().ok_or_else(|| {
                         Fault::program(
@@ -768,6 +772,7 @@ impl FrameShell for Shell {
                 have,
                 rows: row.rows,
             });
+            kv_less_seats.push(seated.kv_less);
             // Page table from whichever author has one: a device-geometry
             // lane's resolved cell, else the submission's own.
             tables.push(match &device_pages[source] {
@@ -1466,6 +1471,7 @@ impl FrameShell for Shell {
             windows,
             seats,
             tables,
+            kv_less_seats,
             geometries,
             pages,
             fresh,
