@@ -15,6 +15,8 @@ scripts/imagegen/
   zimage_golden.py    M1  Z-Image-Turbo golden + miniature forward
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
+  hy3_golden.py       M6  HunyuanImage 3 miniature: one prefill + one denoise step
+  hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
   golden_common.py        shared tap/hook/manifest plumbing
   compare.py              npz-vs-npz diff with tolerance gates
 ```
@@ -448,6 +450,42 @@ Both on latent `[1,16,5,16,16]` → S = 320 tokens, context `[1,32,64]`.
 | `wan22_mini_nano.safetensors` | 380,704 | `743e316070fbbf918e556b9e43d92b97` |
 | `wan22_mini_d128.safetensors` | 8,914,648 | `5707cde610525dbcec5ca1c95f21ec16` |
 | `wan22_mini_config.json` | 11,474 | `aab5a938c58f7864cbe2a03fe69bf47d` |
+
+---
+
+## 4b. `hy3_golden.py` / `hy3_parity.py` (M6) -> `$PIE_IMAGEGEN_GOLDEN/hy3/`
+
+HunyuanImage 3.0 is an AR-plus-diffusion hybrid: one Hunyuan-A13B MoE trunk
+denoises an image *inside* an LLM token sequence.  `--mini` random-inits a
+two-layer, eight-expert `HunyuanImage3ForCausalMM` from the HF custom code
+(`$HY3_SRC`, default the GitHub package mirror), assembles the T2I sequence by
+hand -- no tokenizer, no pipeline, no flash-attn -- and dumps one causal text
+prefill and one denoise step tapped at the three seams pie reads back.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python hy3_golden.py --mini      # seconds
+# a directory the importer can read: the weights, config.json, tokenizer.json
+pie model import $PIE_IMAGEGEN_GOLDEN/hy3/artifact \
+    --sku hunyuanimage3-mini-bf16-kv-bf16 --out .../hy3-mini.zt
+python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.toml
+```
+
+The config must be the run's OWN (its own `[server] port`), and
+`[engine] max_model_len` at least the sequence.
+
+Measured 2026-09-06 (fp32 golden vs bf16 weights and bf16 activations):
+
+| tensor | shape | cos | max-abs |
+|---|---|---|---|
+| `denoise.hidden.image` | (64, 256) | 0.999996 | 0.0013 |
+| `denoise.hidden.timestep_row` | (256,) | 0.999993 | 0.00046 |
+| `encode.max` | (9,) | 0.999998 | 5.8e-05 |
+
+Not yet compared: the conv image head's two VOXEL arms (`image.in` =
+`patch_embed`, `image.out` = `final_layer`).  The SDK has no channel-fed
+`Voxels` port and no `pixels()` intrinsic, so the case hands pie the golden's
+own `patch_embed` rows and stops before `final_layer` -- the same gap
+`tests/inferlets/text-to-image` records for `z_image`'s `vae.decode`.
 
 ---
 

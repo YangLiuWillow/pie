@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -300,8 +301,51 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
             indent=2,
             default=str,
         )
+    stage(d, path, config)
     tap.save(os.path.join(d, "hy3_mini.npz"))
     npz_keys(tap, limit=64)
+
+
+def stage(d: str, weights: str, config) -> str:
+    """The directory `pie model import` reads: the weights, a `config.json`
+    (the artifact carries it as `model/config`, and boot refuses one without),
+    and the REAL tokenizer (the row's contract pins `<boi>`/`<eoi>`/`<img>` at
+    the checkpoint's own ids, so no borrowed vocabulary will do)."""
+    out = os.path.join(d, "artifact")
+    os.makedirs(out, exist_ok=True)
+    link = os.path.join(out, "model.safetensors")
+    if os.path.islink(link) or os.path.exists(link):
+        os.remove(link)
+    os.symlink(os.path.relpath(weights, out), link)
+    cfg = {k: v for k, v in config.to_dict().items() if k != "auto_map"}
+    cfg["architectures"] = ["HunyuanImage3ForCausalMM"]
+    with open(os.path.join(out, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=1, default=str)
+    src = os.environ.get("HY3_TOKENIZER", tokenizer_dir())
+    copied = []
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        at = os.path.join(src, name) if src else None
+        if at and os.path.exists(at):
+            shutil.copyfile(at, os.path.join(out, name))
+            copied.append(name)
+    print(f"  [artifact] {out} ({', '.join(copied) if copied else 'NO TOKENIZER'})")
+    if not copied:
+        print("    serving needs one: set $HY3_TOKENIZER to a HunyuanImage-3 snapshot")
+    return out
+
+
+def tokenizer_dir() -> str | None:
+    """The base repo's snapshot in the HF cache, if it is there."""
+    root = os.path.expanduser(
+        "~/.cache/huggingface/hub/models--tencent--HunyuanImage-3.0/snapshots"
+    )
+    if not os.path.isdir(root):
+        return None
+    for name in sorted(os.listdir(root)):
+        at = os.path.join(root, name)
+        if os.path.exists(os.path.join(at, "tokenizer.json")):
+            return at
+    return None
 
 
 def main():
