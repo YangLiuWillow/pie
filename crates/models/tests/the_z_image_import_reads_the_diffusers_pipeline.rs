@@ -1,5 +1,5 @@
 //! **THE Z-IMAGE IMPORT READS EVERY `dit.` TENSOR OF THE DIFFUSERS INDEX,
-//! EVERY `te.` TENSOR IT RUNS OVER, NO `vae.` TENSOR YET — AND EVERY PLANE
+//! EVERY `te.` TENSOR IT RUNS OVER, EVERY `vae.` TENSOR — AND EVERY PLANE
 //! IT DECLARES TYPES TO THE EXTENTS THE PLAN STATES.**
 //!
 //! ```text
@@ -14,10 +14,10 @@
 //!
 //! ```text
 //! (a) over a SYNTHETIC source shaped like the snapshot's headers (the 521
-//!     fp32 transformer tensors and the 398 bf16 encoder tensors, in a
-//!     sparse file of no bytes): every `dit.` tensor is read; every `te.`
-//!     tensor but the last layer's and the final norm's is read; nothing is
-//!     read twice;
+//!     fp32 transformer tensors, the 398 bf16 encoder tensors and the 244
+//!     bf16 VAE tensors, in a sparse file of no bytes): every `dit.` tensor
+//!     is read; every `te.` tensor but the last layer's and the final
+//!     norm's is read; every `vae.` tensor is read; nothing is read twice;
 //!     every declared plane type-checks to its declared extents
 //! (b) the miniature reads its own bare `state_dict` AND the same names
 //!     under `dit.`, to the same checks
@@ -141,27 +141,93 @@ fn text_encoder() -> Vec<Named> {
     out
 }
 
-/// A few of the VAE's 244 tensors, enough to prove nothing under `vae.` is
-/// read yet.
+/// `AutoencoderKL`'s `state_dict` (`vae/diffusion_pytorch_model.safetensors`,
+/// 244 bf16 tensors), spelled from `vae/config.json`'s numbers.
 fn vae() -> Vec<Named> {
-    vec![
-        (
-            "decoder.conv_in.weight".into(),
-            vec![512, 16, 3, 3],
-            Leaf::BF16,
-        ),
-        ("decoder.conv_in.bias".into(), vec![512], Leaf::BF16),
-        (
-            "decoder.conv_out.weight".into(),
-            vec![3, 128, 3, 3],
-            Leaf::BF16,
-        ),
-        (
-            "encoder.conv_in.weight".into(),
-            vec![128, 3, 3, 3],
-            Leaf::BF16,
-        ),
-    ]
+    let channels: [u64; 4] = [128, 256, 512, 512];
+    let mut out: Vec<Named> = Vec::new();
+    let mut push = |name: String, shape: Vec<u64>| out.push((name, shape, Leaf::BF16));
+    fn norm(push: &mut impl FnMut(String, Vec<u64>), stem: &str, c: u64) {
+        push(format!("{stem}.weight"), vec![c]);
+        push(format!("{stem}.bias"), vec![c]);
+    }
+    fn conv(push: &mut impl FnMut(String, Vec<u64>), stem: &str, c_out: u64, c_in: u64, k: u64) {
+        push(format!("{stem}.weight"), vec![c_out, c_in, k, k]);
+        push(format!("{stem}.bias"), vec![c_out]);
+    }
+    fn resnet(push: &mut impl FnMut(String, Vec<u64>), stem: &str, c_in: u64, c_out: u64) {
+        norm(push, &format!("{stem}.norm1"), c_in);
+        conv(push, &format!("{stem}.conv1"), c_out, c_in, 3);
+        norm(push, &format!("{stem}.norm2"), c_out);
+        conv(push, &format!("{stem}.conv2"), c_out, c_out, 3);
+        if c_in != c_out {
+            conv(push, &format!("{stem}.conv_shortcut"), c_out, c_in, 1);
+        }
+    }
+    fn mid(push: &mut impl FnMut(String, Vec<u64>), stem: &str, c: u64) {
+        resnet(push, &format!("{stem}.resnets.0"), c, c);
+        norm(push, &format!("{stem}.attentions.0.group_norm"), c);
+        for proj in ["to_q", "to_k", "to_v", "to_out.0"] {
+            push(format!("{stem}.attentions.0.{proj}.weight"), vec![c, c]);
+            push(format!("{stem}.attentions.0.{proj}.bias"), vec![c]);
+        }
+        resnet(push, &format!("{stem}.resnets.1"), c, c);
+    }
+    // The decoder: 16 -> 512, mid, four up blocks of three resnets down
+    // the reversed channel list (an upsampler on all but the last), out.
+    conv(&mut push, "decoder.conv_in", 512, 16, 3);
+    mid(&mut push, "decoder.mid_block", 512);
+    let mut c_prev = 512;
+    for (i, &c) in channels.iter().rev().enumerate() {
+        for r in 0..3 {
+            resnet(
+                &mut push,
+                &format!("decoder.up_blocks.{i}.resnets.{r}"),
+                c_prev,
+                c,
+            );
+            c_prev = c;
+        }
+        if i < 3 {
+            conv(
+                &mut push,
+                &format!("decoder.up_blocks.{i}.upsamplers.0.conv"),
+                c,
+                c,
+                3,
+            );
+        }
+    }
+    norm(&mut push, "decoder.conv_norm_out", 128);
+    conv(&mut push, "decoder.conv_out", 3, 128, 3);
+    // The encoder: 3 -> 128, four down blocks of two resnets up the channel
+    // list (a downsampler on all but the last), mid, out to [mean | logvar].
+    conv(&mut push, "encoder.conv_in", 128, 3, 3);
+    let mut c_prev = 128;
+    for (i, &c) in channels.iter().enumerate() {
+        for r in 0..2 {
+            resnet(
+                &mut push,
+                &format!("encoder.down_blocks.{i}.resnets.{r}"),
+                c_prev,
+                c,
+            );
+            c_prev = c;
+        }
+        if i < 3 {
+            conv(
+                &mut push,
+                &format!("encoder.down_blocks.{i}.downsamplers.0.conv"),
+                c,
+                c,
+                3,
+            );
+        }
+    }
+    mid(&mut push, "encoder.mid_block", 512);
+    norm(&mut push, "encoder.conv_norm_out", 512);
+    conv(&mut push, "encoder.conv_out", 32, 512, 3);
+    out
 }
 
 fn prefixed(prefix: &str, tensors: Vec<Named>) -> Vec<Named> {
@@ -319,11 +385,20 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
     );
     assert_eq!(te_want.len(), 1 + 11 * model::TE_LAYERS as usize);
 
-    // Nothing under `vae.` yet.
+    // Every `vae.` tensor of the index is read, and nothing the index lacks.
+    let vae_index: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("vae.")).collect();
+    let vae_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("vae.")).collect();
+    let unread: Vec<&&String> = vae_index.difference(&vae_read).collect();
     assert!(
-        !counts.keys().any(|n| n.starts_with("vae.")),
-        "the VAE is not declared yet; `import.rs` lists it as a TODO"
+        unread.is_empty(),
+        "`vae.` tensors the import never reads: {unread:?}"
     );
+    let phantom: Vec<&&String> = vae_read.difference(&vae_index).collect();
+    assert!(
+        phantom.is_empty(),
+        "`vae.` names read that the index lacks: {phantom:?}"
+    );
+    assert_eq!(vae_index.len(), 244, "the FLUX VAE is 244 tensors");
 
     // Exactly once, except the seeds.
     let twice: BTreeSet<String> = counts
@@ -374,6 +449,7 @@ fn the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot() {
     let index: BTreeSet<String> = tensors.iter().map(|(name, ..)| name.clone()).collect();
     assert_eq!(index.iter().filter(|n| n.starts_with("dit.")).count(), 521);
     assert_eq!(index.iter().filter(|n| n.starts_with("te.")).count(), 398);
+    assert_eq!(index.iter().filter(|n| n.starts_with("vae.")).count(), 244);
     let src = synthetic(&dir, &tensors);
     check_turbo(&src, &index);
     drop(src);
@@ -474,6 +550,7 @@ fn the_flagship_reads_the_real_snapshot() {
     // for shape, so (a) tests what (c) tests.
     let mut synthesized = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));
     synthesized.extend(prefixed("te.", text_encoder()));
+    synthesized.extend(prefixed("vae.", vae()));
     for (name, shape, _) in &synthesized {
         let real = src
             .get(name)
@@ -481,7 +558,7 @@ fn the_flagship_reads_the_real_snapshot() {
         assert_eq!(real.shape(), shape.as_slice(), "`{name}`");
     }
     let synthesized: BTreeSet<&String> = synthesized.iter().map(|(name, ..)| name).collect();
-    let real: BTreeSet<&String> = index.iter().filter(|n| !n.starts_with("vae.")).collect();
+    let real: BTreeSet<&String> = index.iter().collect();
     assert_eq!(
         synthesized, real,
         "the synthetic index and the snapshot's are one list"

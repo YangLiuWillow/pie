@@ -148,7 +148,8 @@ impl ForwardHybrid for Model {
         // compacts and the tail routes carry a `-1` sentinel.
         if let Some(t) = &towered {
             let (imaged, _) = narrow.split(&Facts::media());
-            narrow = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
+            narrow =
+                ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
         // Streams fan out here from the embedding; they fold back down at the final mixer.
         let mut y = ops::elemwise::hc_expand(&narrow, m.streams);
@@ -186,7 +187,8 @@ impl ForwardHybrid for Model {
         // every later step chains on its own output and argmax, read-only.
         if let Some(mtp) = &m.mtp {
             let (input_mtp, _) = inputs.split(&Facts::drafts());
-            let plan_mtp = ops::attn::plan_prefill(&input_mtp, m.q_heads, m.kv_heads, m.head_dim, None);
+            let plan_mtp =
+                ops::attn::plan_prefill(&input_mtp, m.q_heads, m.kv_heads, m.head_dim, None);
             let (dy, _) = y.split(&Facts::drafts());
             let (dpos, _) = rotation_positions(&inputs, m).split(&Facts::drafts());
             let (dlogits, _) = logits.split(&Facts::drafts());
@@ -201,8 +203,14 @@ impl ForwardHybrid for Model {
             for step in 0..mtp.depth {
                 let e = ops::layout::embed(&token, &m.embed, m.vocab);
                 let e = ops::elemwise::rmsnorm_plus_one(&e, &mtp.norm_embed, mtp.eps);
-                let e = ops::elemwise::hc_expand(&ops::linear::matmul(&e, &mtp.fc_embed), m.streams);
-                let h = ops::elemwise::rmsnorm_grouped_plus_one(&hidden, &mtp.norm_hidden, m.hidden, mtp.eps);
+                let e =
+                    ops::elemwise::hc_expand(&ops::linear::matmul(&e, &mtp.fc_embed), m.streams);
+                let h = ops::elemwise::rmsnorm_grouped_plus_one(
+                    &hidden,
+                    &mtp.norm_hidden,
+                    m.hidden,
+                    mtp.eps,
+                );
                 let routes = ops::linear::group_routes(&h, m.streams);
                 let h = ops::linear::matmul_grouped(&h, &mtp.fc_hidden, &routes, m.streams);
                 let mut r = ops::elemwise::residual_add(&e, &h);
@@ -398,7 +406,10 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     let segments = inputs.patch_segments();
     let grid = inputs.patch_positions();
 
-    let mut y = ops::elemwise::add_bias(&t.patch_embed_bias, &ops::linear::matmul(&x, &t.patch_embed));
+    let mut y = ops::elemwise::add_bias(
+        &t.patch_embed_bias,
+        &ops::linear::matmul(&x, &t.patch_embed),
+    );
     let ids = inputs.patch_embed_rows(t.taps);
     let pos = if t.taps == 1 {
         ops::layout::embed(&ids, &t.pos_embed, t.positions)
@@ -416,7 +427,16 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
             t.hidden,
         );
         // Two axes and no time: a zero section rather than a two-wide stream.
-        let (q, k) = ops::elemwise::rope_mrope(&q, &k, &grid, [0, d / 4, d / 4], MropeForm::Blocked, d, d, t.theta);
+        let (q, k) = ops::elemwise::rope_mrope(
+            &q,
+            &k,
+            &grid,
+            [0, d / 4, d / 4],
+            MropeForm::Blocked,
+            d,
+            d,
+            t.theta,
+        );
         let o = ops::attn::dense(&q, &k, &v, &segments, d, t.sm_scale);
         y = ops::elemwise::residual_add(
             &ops::elemwise::add_bias(&b.proj_bias, &ops::linear::matmul(&o, &b.proj)),
@@ -477,7 +497,9 @@ fn attn_mixer(
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
-        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale),
+        ops::attn::masked(
+            &mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale,
+        ),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
@@ -560,11 +582,8 @@ fn moe(x: &Value, mlp: &Mlp) -> Value {
             inter,
             shared_inter,
         } => {
-            let (routes, weights) = ops::linear::moe_topk_softmax(
-                &ops::linear::matmul(x, router),
-                *experts,
-                *top_k,
-            );
+            let (routes, weights) =
+                ops::linear::moe_topk_softmax(&ops::linear::matmul(x, router), *experts, *top_k);
             // Dense dtypes are the explicit list; every other dtype falls
             // through to the quantized path, so new quantized dtypes need no update here.
             let select = |act: &Value, bank: &model_dsl::Weight| {

@@ -325,58 +325,74 @@ impl Model {
         kv: Dtype,
         tp: u32,
     ) -> Model {
-        Model::new(w, experts, Some(head_experts), true, kv, tp, Model::flash_dims())
+        Model::new(
+            w,
+            experts,
+            Some(head_experts),
+            true,
+            kv,
+            tp,
+            Model::flash_dims(),
+        )
     }
 
     /// [`flash`](Model::flash) with the draft head over it: the checkpoint's
     /// `layers.45` block, its routed experts in `head_experts` (Q4 in
     /// Vontra's conversion, where the trunk's are Q2).
     pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, Some(head_experts), false, kv, tp, Model::flash_dims())
+        Model::new(
+            w,
+            experts,
+            Some(head_experts),
+            false,
+            kv,
+            tp,
+            Model::flash_dims(),
+        )
     }
 
     fn flash_dims() -> Dims {
-            Dims {
-                hidden: 4096,
-                layers: 45,
-                dense_layers: 3,
-                full_attn_every: 4,
-                mla: MlaDims {
-                    heads: 64,
-                    q_lora_rank: 1536,
-                    kv_lora_rank: 512,
-                    qk_nope_head_dim: 256,
-                    qk_rope_head_dim: 0,
-                    v_head_dim: 256,
-                },
-                kda: KdaDims {
-                    heads: 64,
-                    head_dim: 128,
-                    f_rank: 128,
-                    conv_kernel: 4,
-                },
-                index_heads: 32,
-                index_head_dim: 128,
-                index_top_k: 2048,
-                index_kpool: 4,
-                streams: 4,
-                gate_eps: 1e-6,
-                alpha: 2.0,
-                sinkhorn: 20,
-                dense_inter: 12_288,
-                moe: MoeDims {
-                    experts: 288,
-                    top_k: 8,
-                    inter: 2048,
-                    shared_inter: 2048,
-                    renorm: true,
-                    scaling: 2.5,
-                },
-                swiglu_limit: 10.0,
-                theta: 10_000.0,
-                vocab: 154_880,
-                norm_eps: 1e-5,
-            }
+        Dims {
+            hidden: 4096,
+            layers: 45,
+            dense_layers: 3,
+            full_attn_every: 4,
+            mla: MlaDims {
+                heads: 64,
+                q_lora_rank: 1536,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 256,
+                qk_rope_head_dim: 0,
+                v_head_dim: 256,
+            },
+            kda: KdaDims {
+                heads: 64,
+                head_dim: 128,
+                f_rank: 128,
+                conv_kernel: 4,
+            },
+            index_heads: 32,
+            index_head_dim: 128,
+            index_top_k: 2048,
+            index_kpool: 4,
+            streams: 4,
+            gate_eps: 1e-6,
+            alpha: 2.0,
+            sinkhorn: 20,
+            dense_inter: 12_288,
+            moe: MoeDims {
+                experts: 288,
+                top_k: 8,
+                inter: 2048,
+                shared_inter: 2048,
+                renorm: true,
+                scaling: 2.5,
+            },
+            swiglu_limit: 10.0,
+            theta: 10_000.0,
+            vocab: 154_880,
+            norm_eps: 1e-5,
+        }
     }
 
     fn new(
@@ -435,13 +451,11 @@ impl Model {
                 q_a_proj: Weight::sym(n("q_a_proj"), [q_lora, hidden], weights),
                 q_a_norm: norm("q_a_norm", q_lora),
                 q_a_norm_eps: d.norm_eps,
-                q_b_proj: Weight::sym(n("q_b_proj"), [q_b_width, q_lora], weights)
-                    .columns(),
+                q_b_proj: Weight::sym(n("q_b_proj"), [q_b_width, q_lora], weights).columns(),
                 kv_a_proj: Weight::sym(n("kv_a_proj"), [kv_a_width, hidden], weights),
                 kv_a_norm: norm("kv_a_norm", kv_lora),
                 kv_a_norm_eps: d.norm_eps,
-                kv_b_proj: Weight::sym(n("kv_b_proj"), [kv_b_width, kv_lora], weights)
-                    .columns(),
+                kv_b_proj: Weight::sym(n("kv_b_proj"), [kv_b_width, kv_lora], weights).columns(),
                 o_proj: Weight::sym(n("o_proj"), [hidden, v_width], weights).rows(),
                 indexer: Indexer {
                     heads: d.index_heads,
@@ -499,12 +513,8 @@ impl Model {
                     experts,
                 )
                 .bank([iw, iw]),
-                down: Weight::sym(
-                    n("experts_down"),
-                    [m.experts as u64, hidden, iw],
-                    experts,
-                )
-                .rows(),
+                down: Weight::sym(n("experts_down"), [m.experts as u64, hidden, iw], experts)
+                    .rows(),
                 shared: (shared_inter > 0).then(|| Shared {
                     gate_up: Weight::sym(n("shared_gate_up"), [2 * sw, hidden], weights)
                         .packed([sw, sw]),
@@ -546,8 +556,12 @@ impl Model {
                         gate_floor: -5.0,
                         qkv: Weight::sym(n("kda_qkv"), [3 * kda_width, hidden], weights)
                             .packed([kda_width, kda_width, kda_width]),
-                        conv: Weight::sym(n("kda_conv"), [3 * kda_width, k.conv_kernel as u64], dense)
-                            .packed([kda_width, kda_width, kda_width]),
+                        conv: Weight::sym(
+                            n("kda_conv"),
+                            [3 * kda_width, k.conv_kernel as u64],
+                            dense,
+                        )
+                        .packed([kda_width, kda_width, kda_width]),
                         f_a: Weight::sym(n("kda_f_a"), [k.f_rank as u64, hidden], weights),
                         f_b: Weight::sym(n("kda_f_b"), [kda_width, k.f_rank as u64], weights)
                             .columns(),
@@ -609,7 +623,11 @@ impl Model {
             h_proj: Weight::sym("mtp.h_proj", [hidden, hidden], Dtype::Bf16),
             mixer_norm: Weight::sym("mtp.mixer_norm", [hidden], dense),
             mixer_norm_eps: d.norm_eps,
-            attn: mla_at("mtp".to_string(), "kv.mtp".to_string(), "index.mtp".to_string()),
+            attn: mla_at(
+                "mtp".to_string(),
+                "kv.mtp".to_string(),
+                "index.mtp".to_string(),
+            ),
             mlp_norm: Weight::sym("mtp.mlp_norm", [hidden], dense),
             mlp_norm_eps: d.norm_eps,
             mlp: routed_at("mtp".to_string(), head_experts),
@@ -653,7 +671,8 @@ impl Model {
     /// The `glm5_next_vision` tower at the checkpoint's numbers, every plane
     /// bf16 as stored, under `vision.`.
     fn tower(d: &Dims) -> Tower {
-        let (hidden, heads, depth, inter, merger_inter) = (1024u64, 16u32, 24u32, 4096u64, 10240u64);
+        let (hidden, heads, depth, inter, merger_inter) =
+            (1024u64, 16u32, 24u32, 4096u64, 10240u64);
         let (patch, temporal, merge) = (14u64, 2u64, 2u64);
         let out = d.hidden as u64;
         let head_dim = hidden / u64::from(heads);
@@ -664,15 +683,19 @@ impl Model {
                 let n = |s: &str| v(&format!("blocks.{l}.{s}"));
                 TowerBlock {
                     norm1: Weight::sym(n("norm1"), [hidden], bf),
-                    qkv: Weight::sym(n("qkv"), [3 * hidden, hidden], bf).packed([hidden, hidden, hidden]),
-                    qkv_bias: Weight::sym(n("qkv_bias"), [3 * hidden], bf).packed([hidden, hidden, hidden]),
+                    qkv: Weight::sym(n("qkv"), [3 * hidden, hidden], bf)
+                        .packed([hidden, hidden, hidden]),
+                    qkv_bias: Weight::sym(n("qkv_bias"), [3 * hidden], bf)
+                        .packed([hidden, hidden, hidden]),
                     q_norm: Weight::sym(n("q_norm"), [head_dim], bf),
                     k_norm: Weight::sym(n("k_norm"), [head_dim], bf),
                     proj: Weight::sym(n("proj"), [hidden, hidden], bf),
                     proj_bias: Weight::sym(n("proj_bias"), [hidden], bf),
                     norm2: Weight::sym(n("norm2"), [hidden], bf),
-                    gate_up: Weight::sym(n("gate_up"), [2 * inter, hidden], bf).packed([inter, inter]),
-                    gate_up_bias: Weight::sym(n("gate_up_bias"), [2 * inter], bf).packed([inter, inter]),
+                    gate_up: Weight::sym(n("gate_up"), [2 * inter, hidden], bf)
+                        .packed([inter, inter]),
+                    gate_up_bias: Weight::sym(n("gate_up_bias"), [2 * inter], bf)
+                        .packed([inter, inter]),
                     down: Weight::sym(n("down"), [hidden, inter], bf),
                     down_bias: Weight::sym(n("down_bias"), [hidden], bf),
                 }

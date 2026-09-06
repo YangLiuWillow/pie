@@ -281,7 +281,9 @@ pub fn vision_front_end(arch: &str) -> Option<Box<dyn VisionFrontEnd>> {
         // ships qwen3.6/3.8's tower over its own trunk.
         crate::qwen_4::ARCH => Some(Box::new(crate::qwen_3::media::Qwen35Vision::new())),
         crate::gemma_4::media::ARCH => Some(Box::new(crate::gemma_4::media::Gemma4Vision::new())),
-        crate::glm_5_next::media::ARCH => Some(Box::new(crate::glm_5_next::media::Glm5Vision::new())),
+        crate::glm_5_next::media::ARCH => {
+            Some(Box::new(crate::glm_5_next::media::Glm5Vision::new()))
+        }
         _ => None,
     }
 }
@@ -385,20 +387,25 @@ mod tests {
             "Empty"
         );
         assert_eq!(
-            Rgb8::new(2, 2, vec![0; 5]).expect_err("wrong length").name(),
+            Rgb8::new(2, 2, vec![0; 5])
+                .expect_err("wrong length")
+                .name(),
             "Decode"
         );
     }
 
     #[test]
     fn the_two_vision_archs_spell_their_runs_differently() {
-        let qwen = vision_front_end("qwen3_5").expect("qwen has a tower").delimiters();
-        let gemma = vision_front_end("gemma4").expect("gemma has a tower").delimiters();
+        let qwen = vision_front_end("qwen3_5")
+            .expect("qwen has a tower")
+            .delimiters();
+        let gemma = vision_front_end("gemma4")
+            .expect("gemma has a tower")
+            .delimiters();
         assert_eq!(qwen.placeholder, "<|image_pad|>");
         assert_eq!(qwen.prefix, "<|vision_start|>");
         assert_eq!(gemma.placeholder, "<|image|>");
         assert_ne!(qwen.placeholder, gemma.placeholder);
         assert!(vision_front_end("deepseek_v4").is_none());
     }
-
 }

@@ -53,6 +53,7 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
                     models::PortKind::LaneVector => PortKind::LaneVector,
                     models::PortKind::Context => PortKind::Context,
                     models::PortKind::AxisPositions => PortKind::AxisPositions,
+                    models::PortKind::Voxels => PortKind::Voxels,
                 },
                 width: port.width,
                 // Every float port is fed from an f32 channel: the WIT dtype
@@ -65,6 +66,7 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
             models::ReadoutKind::Logits => ReadoutKind::Logits,
             models::ReadoutKind::Velocity => ReadoutKind::Velocity,
             models::ReadoutKind::Hidden => ReadoutKind::Hidden,
+            models::ReadoutKind::Pixels => ReadoutKind::Pixels,
         },
         readout_width: reading.readout_width,
     }

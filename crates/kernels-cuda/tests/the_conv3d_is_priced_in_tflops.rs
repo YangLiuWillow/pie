@@ -74,6 +74,7 @@ fn the_video_decoder_shape() {
             k: [3, 3, 3],
             stride: [1, 1, 1],
             pad: [2, 1, 1],
+            pad_back: [2, 1, 1],
             causal_t: true,
             time_pad: TimePad::Replicate,
         },

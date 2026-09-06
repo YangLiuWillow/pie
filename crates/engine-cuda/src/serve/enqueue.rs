@@ -154,7 +154,13 @@ impl FireCtx<'_> {
         // A session may hold one airborne fire, so the deferred batch is reaped
         // only when a prologue is about to stage.
         if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
-            reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed, "enqueue.prologue")?;
+            reap_guest_fires(
+                self.programs,
+                self.owed,
+                self.airborne,
+                self.guest_landed,
+                "enqueue.prologue",
+            )?;
         }
         for (at, attached) in p.attachments.iter().enumerate() {
             if attached.at != Boundary::Prologue {
@@ -278,11 +284,25 @@ impl FireCtx<'_> {
             // `take` would read this fire.
             for &(first, cells, rows_channel, weights_channel, instance) in &p.self_cond_feeds {
                 let bytes = cells * 4;
-                let (rows_at, weights_at) =
-                    self.programs.self_cond_cells(instance, rows_channel, weights_channel, bytes as u64)?;
+                let (rows_at, weights_at) = self.programs.self_cond_cells(
+                    instance,
+                    rows_channel,
+                    weights_channel,
+                    bytes as u64,
+                )?;
                 let offset = (first * 4) as u64;
-                crate::device::alloc::copy_d2d(self.device.stream(), staged.0.ptr + offset, rows_at, bytes)?;
-                crate::device::alloc::copy_d2d(self.device.stream(), staged.1.ptr + offset, weights_at, bytes)?;
+                crate::device::alloc::copy_d2d(
+                    self.device.stream(),
+                    staged.0.ptr + offset,
+                    rows_at,
+                    bytes,
+                )?;
+                crate::device::alloc::copy_d2d(
+                    self.device.stream(),
+                    staged.1.ptr + offset,
+                    weights_at,
+                    bytes,
+                )?;
             }
             Some(staged)
         };
@@ -343,7 +363,11 @@ impl FireCtx<'_> {
                     carve_rows
                 };
                 self.inputs
-                    .port(seat.kind, seat.port, u32::try_from(rows).unwrap_or(u32::MAX))
+                    .port(
+                        seat.kind,
+                        seat.port,
+                        u32::try_from(rows).unwrap_or(u32::MAX),
+                    )
                     .map(|tensor| crate::run::PortBinding {
                         kind: seat.kind,
                         port: seat.port,
@@ -683,11 +707,10 @@ impl FireCtx<'_> {
         } else {
             // An eager walk under a recording mode is counted.
             if self.graphs.records() {
-                self.cache
-                    .eager_walk(
-                        self.weights.rotating() || self.weights.hosts_experts(),
-                        p.rs.buffered,
-                    );
+                self.cache.eager_walk(
+                    self.weights.rotating() || self.weights.hosts_experts(),
+                    p.rs.buffered,
+                );
             }
             // The rotation rides the eager cursor.
             let mut cursor = Cursor::new(&place);
@@ -735,8 +758,15 @@ impl FireCtx<'_> {
         }
         let slots = &staged.slots;
         // The pixels seam (D8): the plane and its output grid, resolved here
-        // whenever the fire carried clips.
-        let pixels = match self.exports.pixels {
+        // whenever the fire carried clips — the planting of the class the
+        // clips run in (M0: one voxel class a fire).
+        let voxel_class = p
+            .composition
+            .voxel_classes()
+            .present_in_order()
+            .next()
+            .map(|class| class as usize);
+        let pixels = match self.exports.pixels_for(voxel_class) {
             Some((plane, grid)) if p.composition.voxel_rows() > 0 => {
                 let rect = |id: model_ir::ValueId, what: &str| {
                     slots.0[id.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -880,7 +910,13 @@ impl FireCtx<'_> {
             None => None,
         };
         // The previous frame's epilogues are collected here, the latest point a lane must be free.
-        reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed, "enqueue.epilogue")?;
+        reap_guest_fires(
+            self.programs,
+            self.owed,
+            self.airborne,
+            self.guest_landed,
+            "enqueue.epilogue",
+        )?;
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             // The guest's own rows, by index within the lane.

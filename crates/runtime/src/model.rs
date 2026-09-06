@@ -825,14 +825,16 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
             }
         }
         if !reading.takes_tokens
-            && !reading
-                .ports
-                .iter()
-                .any(|port| port.kind == models::PortKind::Latents)
+            && !reading.ports.iter().any(|port| {
+                matches!(
+                    port.kind,
+                    models::PortKind::Latents | models::PortKind::Voxels
+                )
+            })
         {
             return Err(format!(
-                "reading `{}` embeds no tokens and declares no latents port; nothing states \
-                 its lane's row count",
+                "reading `{}` embeds no tokens and declares no latents or voxels port; nothing \
+                 states its lane's row count",
                 reading.name
             ));
         }

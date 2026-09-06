@@ -1157,12 +1157,14 @@ impl Run<'_> {
                     model_ir::RaggedMask::None | model_ir::RaggedMask::GroupBlockDiagonal => {
                         kernels_cuda::attn_ragged::RaggedMask::None
                     }
-                    // The tag tables pack reference lanes last in their group
-                    // (`model_exec::fire::packing`), so the kernel's one tail
-                    // per group is where the query side's tags turn non-negative.
-                    model_ir::RaggedMask::ReferenceSelfOnly { q_tags, .. } => {
-                        kernels_cuda::attn_ragged::RaggedMask::ReferenceSelfOnly {
-                            ref_start: self.reference_start_of(*q_tags),
+                    // The contract's tag form: the two `ReferenceTag` tables,
+                    // fire-wide and indexed by the packed rows the CSRs name,
+                    // so any number of reference lanes in a group each attend
+                    // themselves alone.
+                    model_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
+                        kernels_cuda::attn_ragged::RaggedMask::ReferenceTags {
+                            q_tags: self.fire_wide(*q_tags),
+                            kv_tags: self.fire_wide(*kv_tags),
                         }
                     }
                     // The table is a `[heads, 2·max_len − 1]` plan constant

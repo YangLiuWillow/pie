@@ -8,12 +8,21 @@ Full run (needs ~25 GB VRAM, ~1 min):
 Miniature (CPU or GPU, seconds; no weights needed beyond the repo config):
     python zimage_golden.py --mini
 
+VAE only (the FLUX 16-channel AutoencoderKL in fp32, seconds; needs the
+zimage_golden.npz of a --full run for its latent, else a seeded one):
+    CUDA_VISIBLE_DEVICES=0 python zimage_golden.py --vae
+
 Outputs -> $PIE_IMAGEGEN_GOLDEN/z-image/  (default /root/.cache/pie-imagegen/golden/z-image)
     zimage_golden.npz    prompt embeds (Qwen3 layer -2, unpadded), initial noise,
                          step-0 transformer inputs + velocity, per-step latents, final latent
     zimage_golden.png    decoded 1024x1024 image
     zimage_mini.npz      one random-init forward of a tiny ZImageTransformer2DModel
     zimage_mini.safetensors  the tiny weights (seed 0)
+    zimage_vae.npz       --vae: a 64x64 latent (DiT space) and its fp32 decode
+                         (512x512, [-1, 1]); that image and its posterior mean
+    zimage_vae/*.f32     the same planes as raw little-endian f32 in the
+                         row-per-voxel `[h*w, C]` layout pie's voxel axis reads,
+                         plus shapes.json — what the Rust parity gate loads
 
 Settings are the official Turbo defaults (Z-Image repo `inference.py`): 8 steps,
 guidance 0.0, cfg_normalization False, max_sequence_length 512, shift 3.0 from the
@@ -128,13 +137,77 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     npz_keys(tap)
 
 
+VAE_LATENT = 64  # a 64x64 latent: the 512x512 image the Rust parity gate decodes
+
+
+def run_vae(d: str, device="cuda"):
+    """The VAE alone, fp32 (`force_upcast`), on one 64x64 latent.
+
+    The latent is the centre crop of `--full`'s final latent (a real one, so
+    the decode is a real picture) or, without that file, a seeded normal at
+    the DiT's scale. `vae.decode` takes `latent / scaling_factor +
+    shift_factor`; `vae.encode(...).latent_dist.mean` is what FLUX and
+    Z-Image take (never a sample). Every plane also lands as raw f32 in the
+    `[h*w, C]` row-per-voxel layout pie's voxel axis reads.
+    """
+    from diffusers import AutoencoderKL
+
+    vae = AutoencoderKL.from_pretrained(REPO, subfolder="vae", torch_dtype=torch.float32).to(device).eval()
+    cfg = vae.config
+    full = os.path.join(d, "zimage_golden.npz")
+    n = VAE_LATENT
+    if os.path.exists(full):
+        z = np.load(full)["latent.final"]
+        z = z.reshape(z.shape[-3:])  # [16, H/8, W/8]
+        h0 = (z.shape[1] - n) // 2
+        w0 = (z.shape[2] - n) // 2
+        z = z[:, h0:h0 + n, w0:w0 + n]
+        source = "centre crop of zimage_golden.npz latent.final"
+    else:
+        g = torch.Generator().manual_seed(7)
+        z = torch.randn(16, n, n, generator=g).numpy()
+        source = "seed 7 normal"
+    z = torch.from_numpy(np.ascontiguousarray(z)).to(device=device, dtype=torch.float32)[None]
+    with torch.no_grad():
+        x = vae.decode(z / cfg.scaling_factor + cfg.shift_factor, return_dict=False)[0]  # [1, 3, 8n, 8n]
+        mean = vae.encode(x, return_dict=False)[0].mean  # [1, 16, n, n]
+
+    tap = Tap()
+    tap.put("vae.latent", z[0])
+    tap.put("vae.pixels", x[0])
+    tap.put("vae.mean", mean[0])
+    tap.put("vae.scaling_factor", float(cfg.scaling_factor))
+    tap.put("vae.shift_factor", float(cfg.shift_factor))
+    tap.save(os.path.join(d, "zimage_vae.npz"))
+
+    raw = os.path.join(d, "zimage_vae")
+    os.makedirs(raw, exist_ok=True)
+    shapes = {}
+    for key, t in (("latent", z[0]), ("pixels", x[0]), ("mean", mean[0])):
+        chw = t.detach().float().cpu().numpy()
+        hwc = np.ascontiguousarray(chw.transpose(1, 2, 0)).astype("<f4")  # [h, w, C] -> rows of C
+        hwc.tofile(os.path.join(raw, f"{key}.f32"))
+        shapes[key] = {"t": 1, "h": int(chw.shape[1]), "w": int(chw.shape[2]), "channels": int(chw.shape[0])}
+    shapes["scaling_factor"] = float(cfg.scaling_factor)
+    shapes["shift_factor"] = float(cfg.shift_factor)
+    shapes["source"] = source
+    with open(os.path.join(raw, "shapes.json"), "w") as f:
+        json.dump(shapes, f, indent=2)
+    back = (mean - (z / cfg.scaling_factor + cfg.shift_factor)).abs().max()
+    print(f"  vae: latent {tuple(z.shape)} ({source}) -> pixels {tuple(x.shape)} "
+          f"[{float(x.min()):.3f}, {float(x.max()):.3f}] -> mean {tuple(mean.shape)}; "
+          f"round trip max |mean - decode input| {float(back):.4f}")
+    npz_keys(tap)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
+    ap.add_argument("--vae", action="store_true")
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
-    if not (a.full or a.mini):
+    if not (a.full or a.mini or a.vae):
         a.full = a.mini = True
     d = outdir(MODEL)
     torch.set_grad_enabled(False)
@@ -142,6 +215,8 @@ def main():
         print("== mini =="); run_mini(d, a.device)
     if a.full:
         print("== full =="); run_full(d)
+    if a.vae:
+        print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu")
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED,
                  "steps": STEPS, "guidance": GUIDANCE, "size": SIZE,
                  "mini_config": MINI_CFG})

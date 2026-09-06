@@ -640,6 +640,7 @@ fn writes_cache(op: &Operation) -> bool {
             Spatial::Conv3d { cache, .. } => cache.is_some(),
             Spatial::Grid { .. }
             | Spatial::GroupNorm { .. }
+            | Spatial::Attention { .. }
             | Spatial::UpsampleNearest { .. }
             | Spatial::PixelShuffle { .. }
             | Spatial::PixelUnshuffle { .. }

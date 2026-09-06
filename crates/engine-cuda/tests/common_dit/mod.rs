@@ -285,7 +285,7 @@ pub struct HostRequest {
     pub positions: Vec<[f32; 2]>,
 }
 
-fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
+pub fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
     let mut y = vec![0f32; rows * n];
     for r in 0..rows {
         for c in 0..n {
@@ -299,7 +299,7 @@ fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32
     y
 }
 
-fn matmul_f32(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
+pub fn matmul_f32(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
     let mut y = vec![0f32; rows * n];
     for r in 0..rows {
         for c in 0..n {
@@ -313,7 +313,7 @@ fn matmul_f32(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32>
     y
 }
 
-fn sinusoid(t: f32) -> Vec<f32> {
+pub fn sinusoid(t: f32) -> Vec<f32> {
     let half = (FREQ / 2) as usize;
     let angles: Vec<f32> = (0..half)
         .map(|i| t * (-THETA.ln() * i as f32 / half as f32).exp())
@@ -324,13 +324,13 @@ fn sinusoid(t: f32) -> Vec<f32> {
     row
 }
 
-fn silu(x: &[f32]) -> Vec<f32> {
+pub fn silu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v / (1.0 + (-v).exp())).collect()
 }
 
 /// `layernorm_no_scale` then `modulate` (the fused pair): the normed row in
 /// f32, one bf16 rounding at the modulated store.
-fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
+pub fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
     let w = WIDTH as usize;
     let mut y = vec![0f32; rows * w];
     for r in 0..rows {
@@ -346,7 +346,7 @@ fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
     y
 }
 
-fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
+pub fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
     let hd = HEAD_DIM as usize;
     let block = hd / 2;
     for r in 0..rows {
@@ -366,7 +366,7 @@ fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
 
 /// Non-causal attention over one group's packed rows, f32 softmax, `P`
 /// rounded to bf16 as the tensor core reads it, output rounded once.
-fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
+pub fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
     let hd = HEAD_DIM as usize;
     let mut o = vec![0f32; rows * hd];
     for i in 0..rows {

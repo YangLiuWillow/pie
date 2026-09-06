@@ -1,7 +1,6 @@
 use crate::drafter::dflash::{self, DFlash};
 use model_dsl::{Dtype, Weight};
 
-
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
@@ -146,7 +145,10 @@ pub const QWEN38_27B_DFLASH2: dflash::Head = dflash::Head {
     mask_token: 248_070,
     proposals_from: 1,
     conv: Some(dflash::Conv { taps: 2, group: 16 }),
-    readout: dflash::Readout::Selector { rank: 256, top_k: 16 },
+    readout: dflash::Readout::Selector {
+        rank: 256,
+        top_k: 16,
+    },
     attn_bias: false,
 };
 
@@ -167,7 +169,10 @@ pub const QWEN38_27B_DSPARK: dflash::Head = dflash::Head {
     mask_token: 248_200,
     proposals_from: 0,
     conv: None,
-    readout: dflash::Readout::Markov { rank: 256, top_k: 16 },
+    readout: dflash::Readout::Markov {
+        rank: 256,
+        top_k: 16,
+    },
     attn_bias: false,
 };
 
@@ -176,7 +181,14 @@ pub const QWEN38_27B_DSPARK: dflash::Head = dflash::Head {
 /// hidden 2048, MLP 6144, its own mask id.
 pub const QWEN36_35B_A3B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 6, 11, 16, 22, 27, 32, 37],
-    windows: &[Some(4_096), Some(4_096), Some(4_096), Some(4_096), Some(4_096), None],
+    windows: &[
+        Some(4_096),
+        Some(4_096),
+        Some(4_096),
+        Some(4_096),
+        Some(4_096),
+        None,
+    ],
     q_heads: 32,
     kv_heads: 8,
     head_dim: 128,
@@ -195,7 +207,14 @@ pub const QWEN36_35B_A3B_DFLASH: dflash::Head = dflash::Head {
 /// trunk's hidden 4096 and MLP 12288, the Qwen3.5 mask id.
 pub const QWEN35_9B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 5, 9, 13, 17, 21, 25, 29],
-    windows: &[Some(4_096), Some(4_096), Some(4_096), Some(4_096), Some(4_096), None],
+    windows: &[
+        Some(4_096),
+        Some(4_096),
+        Some(4_096),
+        Some(4_096),
+        Some(4_096),
+        None,
+    ],
     q_heads: 32,
     kv_heads: 8,
     head_dim: 128,
@@ -872,12 +891,7 @@ impl Model {
     /// Tower without the draft head — the pairing the 4-bit artifact
     /// actually ships (tower present, no `mtp.*` planes).
     pub fn d27b_vision_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            kv,
-            tp,
-            Model::d27b_dims(Some(TowerDims::qwen36()), None),
-        )
+        Model::new(w, kv, tp, Model::d27b_dims(Some(TowerDims::qwen36()), None))
     }
 
     fn d27b_dims(tower: Option<TowerDims>, draft: Option<Recipe>) -> Dims {
@@ -1155,7 +1169,9 @@ impl Model {
         // The block drafter's geometry is its OWN (`drafter::dflash`), so it
         // reads nothing off `Dims` but the trunk's widths and element types.
         let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
-            let head = d.dflash_head.expect("a block-drafting recipe names its published head");
+            let head = d
+                .dflash_head
+                .expect("a block-drafting recipe names its published head");
             DFlash::declare(
                 head,
                 recipe.prefix(),
@@ -1237,5 +1253,4 @@ fn dense_mlp(w: Dtype, hidden: u64, inter: u32, prefix: &str) -> Mlp {
     }
 }
 
-impl Model {
- }
+impl Model {}

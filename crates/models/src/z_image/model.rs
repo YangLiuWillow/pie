@@ -13,9 +13,8 @@
 //!
 //! One `Model` carries up to three components under one plan (design D5):
 //! `dit` (always), `te` (the text encoder, `None` on the miniature whose
-//! checkpoint is the transformer alone) and — not yet — the VAE, which
-//! waits on the voxel axis (`IMAGEGEN_CONTRACT.md` §6) being read by a
-//! family text; see [`super::forward`]'s `vae` stub.
+//! checkpoint is the transformer alone) and `vae` (the FLUX VAE on the
+//! voxel axis, [`super::vae`]; `None` on the miniature too).
 //!
 //! # Numerics contract
 //!
@@ -133,6 +132,9 @@ pub mod port {
     pub const TIMESTEP: u8 = 0;
     /// `refine`, `denoise`: the three rotary coordinates per row, `[rows, 3]`.
     pub const POSITIONS: u8 = 0;
+    /// `vae.decode`: the latent clip, `[h·w, CHANNELS]`; `vae.encode`: the
+    /// pixel clip, `[H·W, 3]`. Each reading's only voxel port.
+    pub const VOXELS: u8 = 0;
 }
 
 /// One row's shape, the numbers that differ between the shipped transformer
@@ -199,7 +201,7 @@ pub struct Linear {
 }
 
 impl Linear {
-    fn at(name: &str, out: u32, in_: u32, banks: Dtype) -> Linear {
+    pub(super) fn at(name: &str, out: u32, in_: u32, banks: Dtype) -> Linear {
         Linear {
             w: Weight::sym(name, [u64::from(out), u64::from(in_)], banks),
             bias: Weight::sym(
@@ -398,6 +400,9 @@ pub struct Model {
     /// `None` on the miniature: its checkpoint is the transformer alone and
     /// its captions are random rows, so it declares no `text` reading.
     pub te: Option<TextEncoder>,
+    /// The FLUX VAE ([`super::vae`]), `None` on the miniature: the
+    /// `vae.decode` / `vae.encode` readings exist iff this does.
+    pub vae: Option<super::vae::Vae>,
     /// The Turbo checkpoint's scheduler shift (`scheduler_config.json`).
     pub shift: f32,
 }
@@ -413,6 +418,7 @@ impl Model {
             tp,
             Dims::turbo(),
             Some(TextEncoder::qwen3_4b(banks)),
+            Some(super::vae::Vae::flux(banks)),
             3.0,
         )
     }
@@ -421,10 +427,17 @@ impl Model {
     /// [`Dims::mini`], no encoder. What the parity harness drives.
     #[must_use]
     pub fn mini(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini(), None, 3.0)
+        Model::new(banks, tp, Dims::mini(), None, None, 3.0)
     }
 
-    fn new(banks: Dtype, tp: u32, d: Dims, te: Option<TextEncoder>, shift: f32) -> Model {
+    fn new(
+        banks: Dtype,
+        tp: u32,
+        d: Dims,
+        te: Option<TextEncoder>,
+        vae: Option<super::vae::Vae>,
+        shift: f32,
+    ) -> Model {
         assert_eq!(
             tp, 1,
             "this text ships one-rank rows; tp {tp} is not a world it states"
@@ -468,6 +481,7 @@ impl Model {
             dims: d,
             dit,
             te,
+            vae,
             shift,
         }
     }

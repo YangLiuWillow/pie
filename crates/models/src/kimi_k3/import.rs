@@ -3,8 +3,8 @@ use checkpoint::types::Encoding;
 use model_dsl::{Shard, Weight};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
-use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error};
+use model_dsl::Platform;
 
 const HF_EMBED: &str = "language_model.model.embed_tokens.weight";
 
@@ -36,7 +36,8 @@ impl Model {
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
     ) -> Result<ModelContract, Error> {
         let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, HF_EMBED)?;
@@ -96,7 +97,10 @@ impl Model {
                                 at(l, "block_sparse_moe.shared_expert.up_proj.weight"),
                             ],
                         )?;
-                        b.read(&s.down, at(l, "block_sparse_moe.shared_expert.down_proj.weight"))?;
+                        b.read(
+                            &s.down,
+                            at(l, "block_sparse_moe.shared_expert.down_proj.weight"),
+                        )?;
                     }
                 }
             }
@@ -104,7 +108,11 @@ impl Model {
         Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+    pub fn import_from_gguf(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
         let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, GGUF_EMBED)?;
         b.read(&self.final_norm, "output_norm.weight")?;
@@ -122,7 +130,10 @@ impl Model {
             }
             match &w.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    b.read_concat(gate_up, [blk(l, "ffn_gate.weight"), blk(l, "ffn_up.weight")])?;
+                    b.read_concat(
+                        gate_up,
+                        [blk(l, "ffn_gate.weight"), blk(l, "ffn_up.weight")],
+                    )?;
                     b.read(down, blk(l, "ffn_down.weight"))?;
                 }
                 Mlp::Routed {
@@ -141,7 +152,10 @@ impl Model {
                     if let Some(s) = shared {
                         b.read_concat(
                             &s.gate_up,
-                            [blk(l, "ffn_gate_shexp.weight"), blk(l, "ffn_up_shexp.weight")],
+                            [
+                                blk(l, "ffn_gate_shexp.weight"),
+                                blk(l, "ffn_up_shexp.weight"),
+                            ],
                         )?;
                         b.read(&s.down, blk(l, "ffn_down_shexp.weight"))?;
                     }
@@ -151,12 +165,7 @@ impl Model {
         Ok(b.build())
     }
 
-    fn mla(
-        &self,
-        b: &mut Builder,
-        l: usize,
-        a: &Mla,
-    ) -> Result<(), Error> {
+    fn mla(&self, b: &mut Builder, l: usize, a: &Mla) -> Result<(), Error> {
         b.read(&a.q_a_proj, at(l, "self_attn.q_a_proj.weight"))?;
         b.read(&a.q_a_norm, at(l, "self_attn.q_a_layernorm.weight"))?;
         b.read(&a.q_b_proj, at(l, "self_attn.q_b_proj.weight"))?;
@@ -170,13 +179,7 @@ impl Model {
         Ok(())
     }
 
-    fn kda(
-        &self,
-        src: &ztensor::Source,
-        b: &mut Builder,
-        l: usize,
-        k: &Kda,
-    ) -> Result<(), Error> {
+    fn kda(&self, src: &ztensor::Source, b: &mut Builder, l: usize, k: &Kda) -> Result<(), Error> {
         b.read_concat(
             &k.qkv,
             [
@@ -187,16 +190,19 @@ impl Model {
         )?;
         // HF stores the conv bank as [channels, 1, kernel] (the 1 is `groups`); the declared
         // type is rank-2 [3*kda_width, kernel], so each leg is squeezed before concatenation.
-        b.read_expr(&k.conv, (|| -> Result<Expr, Error> {
-            Ok(Expr::concat(
-                as_axis(cut_axis(&k.conv), &k.conv.name),
-                vec![
-                    squeezed(src, at(l, "self_attn.q_conv1d.weight"))?,
-                    squeezed(src, at(l, "self_attn.k_conv1d.weight"))?,
-                    squeezed(src, at(l, "self_attn.v_conv1d.weight"))?,
-                ],
-            ))
-        })()?)?;
+        b.read_expr(
+            &k.conv,
+            (|| -> Result<Expr, Error> {
+                Ok(Expr::concat(
+                    as_axis(cut_axis(&k.conv), &k.conv.name),
+                    vec![
+                        squeezed(src, at(l, "self_attn.q_conv1d.weight"))?,
+                        squeezed(src, at(l, "self_attn.k_conv1d.weight"))?,
+                        squeezed(src, at(l, "self_attn.v_conv1d.weight"))?,
+                    ],
+                ))
+            })()?,
+        )?;
         b.read(&k.f_a, at(l, "self_attn.f_a_proj.weight"))?;
         b.read(&k.f_b, at(l, "self_attn.f_b_proj.weight"))?;
         b.read(&k.b, at(l, "self_attn.b_proj.weight"))?;
@@ -208,12 +214,7 @@ impl Model {
         Ok(())
     }
 
-    fn gguf_mla(
-        &self,
-        b: &mut Builder,
-        l: usize,
-        a: &Mla,
-    ) -> Result<(), Error> {
+    fn gguf_mla(&self, b: &mut Builder, l: usize, a: &Mla) -> Result<(), Error> {
         b.read(&a.q_a_proj, blk(l, "attn_q_a.weight"))?;
         b.read(&a.q_a_norm, blk(l, "attn_q_a_norm.weight"))?;
         b.read(&a.q_b_proj, blk(l, "attn_q_b.weight"))?;
@@ -227,12 +228,7 @@ impl Model {
         Ok(())
     }
 
-    fn gguf_kda(
-        &self,
-        b: &mut Builder,
-        l: usize,
-        k: &Kda,
-    ) -> Result<(), Error> {
+    fn gguf_kda(&self, b: &mut Builder, l: usize, k: &Kda) -> Result<(), Error> {
         b.read(&k.qkv, blk(l, "ssm_in.weight"))?;
         b.read(&k.conv, blk(l, "ssm_conv1d.weight"))?;
         b.read(&k.f_a, blk(l, "ssm_f_a.weight"))?;

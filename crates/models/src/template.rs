@@ -12,7 +12,9 @@ pub type TemplateRow = (&'static str, fn(Arc<Tokenizer>) -> Arc<dyn Instruct>);
 
 #[must_use]
 pub fn templates() -> Vec<TemplateRow> {
-    crate::skus().map(|sku| (sku.name.as_str(), sku.template)).collect()
+    crate::skus()
+        .map(|sku| (sku.name.as_str(), sku.template))
+        .collect()
 }
 
 #[must_use]

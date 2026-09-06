@@ -3,8 +3,8 @@ use checkpoint::contract::{Expr, ModelContract};
 use super::model::{AttnBanks, Model};
 use checkpoint::contract::TensorType;
 
-use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, extents};
+use model_dsl::Platform;
 
 /// Where a safetensors checkpoint puts its trunk: transformers and `mlx_lm`
 /// spell the same tensors under different path prefixes; everything below
@@ -103,7 +103,8 @@ impl Model {
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
     ) -> Result<ModelContract, Error> {
         self.import_from_safetensors(src, platform, Layout::Transformers)
     }
@@ -112,14 +113,16 @@ impl Model {
     /// self-conditioning block beside it is the diffusion family's to read.
     pub fn import_from_diffusion(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
     ) -> Result<ModelContract, Error> {
         self.import_from_safetensors(src, platform, Layout::Diffusion)
     }
 
     pub(crate) fn import_from_safetensors(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
         let mut b = Builder::new(src, self.tp, platform);
@@ -150,7 +153,10 @@ impl Model {
                 }
             }
             b.read(&w.o_proj, n("self_attn.o_proj.weight"))?;
-            b.read_concat(&w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+            b.read_concat(
+                &w.gate_up,
+                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+            )?;
             b.read(&w.down, n("mlp.down_proj.weight"))?;
 
             // The routed branch, where the checkpoint ships one. The router
@@ -158,10 +164,7 @@ impl Model {
             // into the plane rather than the forward.
             if let Some(x) = &w.moe {
                 let root = (self.hidden as f32).powf(-0.5);
-                b.read_expr(
-                    &x.router_norm,
-                    Expr::src(n("router.scale")).scale(root),
-                )?;
+                b.read_expr(&x.router_norm, Expr::src(n("router.scale")).scale(root))?;
                 b.read(&x.router, n("router.proj.weight"))?;
                 b.read(&x.per_expert_scale, n("router.per_expert_scale"))?;
                 b.read(&x.pre_ffw_norm_2, n("pre_feedforward_layernorm_2.weight"))?;
@@ -212,7 +215,10 @@ impl Model {
             } else {
                 b.read(&ple.model_proj, name)?;
             }
-            b.read(&ple.model_norm, layout.at("per_layer_projection_norm.weight"))?;
+            b.read(
+                &ple.model_norm,
+                layout.at("per_layer_projection_norm.weight"),
+            )?;
             let width = i64::from(ple.dim);
             for (l, p) in ple.per_layer.iter().enumerate() {
                 let n = |leaf: &str| layout.layer(l, leaf);
@@ -236,13 +242,16 @@ impl Model {
         if let Some(t) = &self.tower {
             let v = |s: &str| layout.vision(s);
             b.read(&t.patch_embed, v("patch_embedder.input_proj.weight"))?;
-            b.read_expr(&t.pos_embed, (|| -> Result<Expr, Error> {
-                flattened(
-                    src,
-                    v("patch_embedder.position_embedding_table"),
-                    extents(&t.pos_embed),
-                )
-            })()?)?;
+            b.read_expr(
+                &t.pos_embed,
+                (|| -> Result<Expr, Error> {
+                    flattened(
+                        src,
+                        v("patch_embedder.position_embedding_table"),
+                        extents(&t.pos_embed),
+                    )
+                })()?,
+            )?;
             b.read(&t.projection, layout.embed_vision())?;
             // Applied as `(h - std_bias) * std_scale`, when the tower states one.
             if let Some(std) = &t.std {
@@ -281,9 +290,12 @@ impl Model {
                             (&k.out_lo, "output_min"),
                             (&k.out_hi, "output_max"),
                         ] {
-                            b.read_expr(weight, (|| -> Result<Expr, Error> {
-                                flattened(src, format!("{stem}.{suffix}"), extents(weight))
-                            })()?)?;
+                            b.read_expr(
+                                weight,
+                                (|| -> Result<Expr, Error> {
+                                    flattened(src, format!("{stem}.{suffix}"), extents(weight))
+                                })()?,
+                            )?;
                         }
                     }
                 }
@@ -310,7 +322,10 @@ impl Model {
             // `aux.fc.weight` is `[hidden, 2*hidden]`, embedding half first.
             let half = extents(&a.fc_embed)[1];
             b.read_expr(&a.fc_embed, Expr::src("aux.fc.weight").slice(1, 0, half))?;
-            b.read_expr(&a.fc_hidden, Expr::src("aux.fc.weight").slice(1, half, half))?;
+            b.read_expr(
+                &a.fc_hidden,
+                Expr::src("aux.fc.weight").slice(1, half, half),
+            )?;
             let n = |s: &str| format!("aux.layers.0.{s}");
             for (weight, from) in [
                 (&a.attn_norm, n("input_layernorm.weight")),
@@ -333,7 +348,10 @@ impl Model {
                 )?;
                 b.read(k_norm, n("self_attn.k_norm.weight"))?;
             }
-            b.read_concat(&a.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+            b.read_concat(
+                &a.gate_up,
+                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+            )?;
             b.read(&a.down, n("mlp.down_proj.weight"))?;
         }
 
@@ -349,8 +367,14 @@ impl Model {
                 b.read(&a.pre_hidden, "aux.pre_projection_hidden.weight")?;
             } else {
                 let th = extents(&a.pre_embed)[1];
-                b.read_expr(&a.pre_embed, Expr::src("aux.pre_projection.weight").slice(1, 0, th))?;
-                b.read_expr(&a.pre_hidden, Expr::src("aux.pre_projection.weight").slice(1, th, th))?;
+                b.read_expr(
+                    &a.pre_embed,
+                    Expr::src("aux.pre_projection.weight").slice(1, 0, th),
+                )?;
+                b.read_expr(
+                    &a.pre_hidden,
+                    Expr::src("aux.pre_projection.weight").slice(1, th, th),
+                )?;
             }
             b.read(&a.post, "aux.post_projection.weight")?;
             b.read(&a.embed, "aux.model.embed_tokens.weight")?;
@@ -373,7 +397,10 @@ impl Model {
                 ] {
                     b.read(weight, from)?;
                 }
-                b.read_concat(&w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+                b.read_concat(
+                    &w.gate_up,
+                    [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+                )?;
             }
         }
 
@@ -389,7 +416,11 @@ impl Model {
         Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+    pub fn import_from_gguf(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
         if self.self_cond.is_some() {
             return Err(Error::Illegible {
                 name: "self_conditioning".to_string(),
@@ -433,7 +464,10 @@ impl Model {
 
         for (l, w) in self.layers.iter().enumerate() {
             b.read(&w.attn_norm, format!("blk.{l}.attn_norm.weight"))?;
-            b.read(&w.post_attn_norm, format!("blk.{l}.post_attention_norm.weight"))?;
+            b.read(
+                &w.post_attn_norm,
+                format!("blk.{l}.post_attention_norm.weight"),
+            )?;
             b.read(&w.pre_ffw_norm, format!("blk.{l}.ffn_norm.weight"))?;
             b.read(&w.post_ffw_norm, format!("blk.{l}.post_ffw_norm.weight"))?;
             b.read(&w.attn.q_norm, format!("blk.{l}.attn_q_norm.weight"))?;
@@ -457,7 +491,10 @@ impl Model {
             b.read(&w.o_proj, format!("blk.{l}.attn_output.weight"))?;
             b.read_concat(
                 &w.gate_up,
-                [format!("blk.{l}.ffn_gate.weight"), format!("blk.{l}.ffn_up.weight")],
+                [
+                    format!("blk.{l}.ffn_gate.weight"),
+                    format!("blk.{l}.ffn_up.weight"),
+                ],
             )?;
             b.read(&w.down, format!("blk.{l}.ffn_down.weight"))?;
             // A layer without PLE owns its own scalar; a PLE stack's is read below.

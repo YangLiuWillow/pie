@@ -273,6 +273,8 @@ pub struct Fire<'a> {
     pub live_rows: u32,
     /// `[rows]`: the fire lane of every row, `0` over the carve's padding — `GeomKind::RequestOfToken`, staged by every fire.
     pub lane_of_row: &'a [i32],
+    /// How many lanes every per-lane table is staged at: the fire's own count, or the key's lane ceiling for a bodied fire (whose body reads the tables at that reach). A plan with kv spaces carries the same reach on its padded geometries; a kv-less plan carries it here alone.
+    pub lane_reach: u32,
     /// `[fire lanes]` group ids; empty for a plan that reads no packing table.
     pub group_of_lane: &'a [i32],
     /// One per selection the load carved, in the load's order; empty stages none.
@@ -759,7 +761,11 @@ impl Inputs {
             }
             spelled = Some(count);
         }
-        let space_lanes = spelled.map_or(lanes, |count| count as u32).max(lanes);
+        // The reach every per-lane table is staged at: the widest of the fire's lanes, the kv geometries' (padded to the key's ceiling for a bodied fire), and the reach the fire states — which is how a kv-less plan's bodied fire pads its packing and slot tables to the ceiling its body reads them at, rather than leaving the tail as the last fire's entries.
+        let space_lanes = spelled
+            .map_or(lanes, |count| count as u32)
+            .max(lanes)
+            .max(fire.lane_reach);
         if u64::from(space_lanes) > u64::from(self.max_lanes) {
             return Err(crate::error::Fault::Ceiling {
                 what: "staged kv lanes",
