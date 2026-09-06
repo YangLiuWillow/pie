@@ -26,4 +26,11 @@ impl Model {
             trunk: gemma_4::model::Model::a4b_diffusion(w, kv, tp),
         }
     }
+
+    /// The dense weights in `w`, the routed experts in `xw`.
+    pub fn a4b_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model {
+            trunk: gemma_4::model::Model::a4b_diffusion_experts(w, xw, kv, tp),
+        }
+    }
 }

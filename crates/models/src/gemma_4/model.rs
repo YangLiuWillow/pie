@@ -637,9 +637,15 @@ impl Model {
     /// self-conditioning block beside it, read as a block-diffusion text
     /// (`crate::gemma_4_diffusion`).
     pub fn a4b_diffusion(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::a4b_diffusion_experts(w, w, kv, tp)
+    }
+
+    /// The diffusion text with the routed experts in `xw` and the dense
+    /// weights in `w`.
+    pub fn a4b_diffusion_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
         d.self_cond = true;
-        Model::new(w, kv, tp, d)
+        Model::new_with_experts(w, xw, kv, tp, d)
     }
 
     /// The mixture with Google's own drafter overlaid
@@ -702,6 +708,15 @@ impl Model {
     }
 
     fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+        Model::new_with_experts(w, w, kv, tp, d)
+    }
+
+    /// [`Model::new`] with the routed experts' banks in their own dtype:
+    /// the dense projections in `w`, `experts_gate_up`/`experts_down` in
+    /// `xw`. The diffusion rows use it to price precision where it is
+    /// spent — 4-bit experts triple a denoiser's step count (wiki §23)
+    /// while the dense weights are a tenth of the bytes.
+    fn new_with_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         assert!(
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
@@ -836,13 +851,13 @@ impl Model {
                             gate_up: Weight::sym(
                                 n("experts_gate_up"),
                                 [m.experts as u64, 2 * mi, hidden],
-                                w,
+                                xw,
                             )
                             .bank([mi, mi]),
                             down: Weight::sym(
                                 n("experts_down"),
                                 [m.experts as u64, hidden, mi],
-                                w,
+                                xw,
                             )
                             .rows(),
                             experts: m.experts,
