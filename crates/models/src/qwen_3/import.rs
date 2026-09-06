@@ -1,8 +1,8 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType, UnaryOp};
 
 use super::model::{Head, Mixer, Mlp, Model};
-use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, extents};
+use model_dsl::Platform;
 
 /// Where a safetensors checkpoint of this family puts its trunk. Two
 /// spellings: transformers ships `model.language_model.layers.*` with a bare
@@ -95,9 +95,10 @@ impl Model {
             }
         };
         for layout in [Layout::Transformers, Layout::Mlx] {
-            if let Some(contract) =
-                attempt(layout.spelling(), self.import_from_safetensors(src, platform, layout))
-            {
+            if let Some(contract) = attempt(
+                layout.spelling(),
+                self.import_from_safetensors(src, platform, layout),
+            ) {
                 return Ok(contract);
             }
         }
@@ -117,14 +118,16 @@ impl Model {
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
     ) -> Result<ModelContract, Error> {
         self.import_from_safetensors(src, platform, Layout::Transformers)
     }
 
     fn import_from_safetensors(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
         // Undoes mlx_lm's RMSNorm +1 fold where the layout carries it; see
@@ -164,17 +167,26 @@ impl Model {
                 Mixer::Gdn(g) => {
                     b.read_concat(
                         &g.in_qkvz,
-                        [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")],
+                        [
+                            n("linear_attn.in_proj_qkv.weight"),
+                            n("linear_attn.in_proj_z.weight"),
+                        ],
                     )?;
 
                     b.read_concat(
                         &g.in_ba,
-                        [n("linear_attn.in_proj_b.weight"), n("linear_attn.in_proj_a.weight")],
+                        [
+                            n("linear_attn.in_proj_b.weight"),
+                            n("linear_attn.in_proj_a.weight"),
+                        ],
                     )?;
 
-                    b.read_expr(&g.conv, (|| -> Result<Expr, Error> {
-                        squeezed(src, n("linear_attn.conv1d.weight"))
-                    })()?)?;
+                    b.read_expr(
+                        &g.conv,
+                        (|| -> Result<Expr, Error> {
+                            squeezed(src, n("linear_attn.conv1d.weight"))
+                        })()?,
+                    )?;
 
                     b.read(&g.dt_bias, n("linear_attn.dt_bias"))?;
                     b.read(&g.a_log, n("linear_attn.A_log"))?;
@@ -244,19 +256,22 @@ impl Model {
             let v = |s: &str| layout.tower(s);
             const CHANNELS: i64 = 3;
             let want = extents(&t.patch_embed);
-            b.read_expr(&t.patch_embed, (|| -> Result<Expr, Error> {
-                let flat = flattened(src, v("patch_embed.proj.weight"), want.clone())?;
-                Ok(match layout {
-                    Layout::Transformers => flat,
-                    Layout::Mlx => {
-                        let per = want[1] / CHANNELS;
-                        let indices = (0..CHANNELS)
-                            .flat_map(|c| (0..per).map(move |j| j * CHANNELS + c))
-                            .collect();
-                        flat.gather(1, indices)
-                    }
-                })
-            })()?)?;
+            b.read_expr(
+                &t.patch_embed,
+                (|| -> Result<Expr, Error> {
+                    let flat = flattened(src, v("patch_embed.proj.weight"), want.clone())?;
+                    Ok(match layout {
+                        Layout::Transformers => flat,
+                        Layout::Mlx => {
+                            let per = want[1] / CHANNELS;
+                            let indices = (0..CHANNELS)
+                                .flat_map(|c| (0..per).map(move |j| j * CHANNELS + c))
+                                .collect();
+                            flat.gather(1, indices)
+                        }
+                    })
+                })()?,
+            )?;
             b.read(&t.patch_embed_bias, v("patch_embed.proj.bias"))?;
             b.read(&t.pos_embed, v("pos_embed.weight"))?;
             for (l, blk) in t.blocks.iter().enumerate() {
@@ -300,11 +315,12 @@ impl Model {
             // head alone, `fc.*` and `layers.0.*` at its root) rides in by
             // `--aux`, which prefixes it `aux.`; a checkpoint that carries
             // the head names it by the recipe's own prefix.
-            let p: String = if src.get("aux.fc.weight").is_some() || src.get("aux.fc_embed.weight").is_some() {
-                "aux".to_string()
-            } else {
-                mtp.recipe.prefix().to_string()
-            };
+            let p: String =
+                if src.get("aux.fc.weight").is_some() || src.get("aux.fc_embed.weight").is_some() {
+                    "aux".to_string()
+                } else {
+                    mtp.recipe.prefix().to_string()
+                };
             let n = |s: &str| format!("{p}.layers.0.{s}");
             if let Some(pre) = &mtp.pre_fc {
                 b.read(&pre.embedding, format!("{p}.pre_fc_norm_embedding.weight"))?;
@@ -337,7 +353,10 @@ impl Model {
             b.read(&mtp.mlp_norm, n("post_attention_layernorm.weight"))?;
             match &mtp.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    b.read_concat(gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+                    b.read_concat(
+                        gate_up,
+                        [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+                    )?;
                     b.read(down, n("mlp.down_proj.weight"))?;
                 }
                 Mlp::Routed { .. } => {
@@ -362,7 +381,11 @@ impl Model {
         Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+    pub fn import_from_gguf(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
         // GGUF has no settled spelling for a vision tower or a draft head;
         // refuse explicitly rather than publish a contract that silently
         // half-loads.
@@ -500,7 +523,10 @@ impl Model {
                 } => {
                     b.read(router, n("ffn_gate_inp.weight"))?;
 
-                    b.read_concat(gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])?;
+                    b.read_concat(
+                        gate_up,
+                        [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")],
+                    )?;
                     b.read(down, n("ffn_down_exps.weight"))?;
                     b.read_concat(
                         shared_gate_up,
@@ -538,7 +564,11 @@ pub(crate) fn spelled<const N: usize>(
 /// matmul bank it already is. `[hidden, C, T, P, P]` and `[hidden, C*T*P^2]`
 /// are the same bytes in the same order, so this is a transmute: it checks
 /// the element count and re-states the type.
-pub(crate) fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
+pub(crate) fn flattened(
+    src: &ztensor::Source,
+    from: String,
+    want: Vec<i64>,
+) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));
     };

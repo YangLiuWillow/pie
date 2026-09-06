@@ -2,8 +2,8 @@ use checkpoint::contract::{Expr, ModelContract, TensorType};
 use model_dsl::{Dtype, Weight};
 
 use super::model::{Gate, GateUp, Layer, Mlp, Model};
-use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, encoding};
+use model_dsl::Platform;
 
 impl Model {
     pub fn import(
@@ -15,8 +15,14 @@ impl Model {
         // arm must run before huggingface, since the flash artifact is otherwise
         // huggingface-named.
         let mut refusals: Vec<String> = Vec::new();
-        let arms: [(&str, fn(&Self, &ztensor::Source, Platform) -> Result<ModelContract, Error>); 4] = [
-            ("an artifact with an `--aux` overlay", Self::import_from_own_with_aux),
+        let arms: [(
+            &str,
+            fn(&Self, &ztensor::Source, Platform) -> Result<ModelContract, Error>,
+        ); 4] = [
+            (
+                "an artifact with an `--aux` overlay",
+                Self::import_from_own_with_aux,
+            ),
             ("flash mlx", Self::import_from_mlx),
             ("huggingface", Self::import_from_huggingface),
             ("gguf", Self::import_from_gguf),
@@ -88,7 +94,11 @@ impl Model {
 
     /// Reads the flash artifact's own names (mlx-community DeepSeek-V4-Flash). This read list also drives
     /// [`Model::mlx_source_names`], so the two cannot drift apart.
-    pub fn import_from_mlx(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+    pub fn import_from_mlx(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
         let mut b = Builder::new(src, self.tp, platform);
         for read in self.mlx_reads() {
             match read {
@@ -176,7 +186,11 @@ impl Model {
                     .map(|_| "aux.h_proj.weight".to_string())
                     .collect(),
             ));
-            layer_reads(&mtp.block, &|s: &str| format!("aux.decoder.{s}"), &mut reads);
+            layer_reads(
+                &mtp.block,
+                &|s: &str| format!("aux.decoder.{s}"),
+                &mut reads,
+            );
             reads.push(Read::One(&mtp.hc_head.base, "aux.hc_head.base".into()));
             reads.push(Read::One(&mtp.hc_head.dynamic, "aux.hc_head.fn".into()));
             reads.push(Read::One(&mtp.hc_head.scale, "aux.hc_head.scale".into()));
@@ -187,7 +201,8 @@ impl Model {
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
     ) -> Result<ModelContract, Error> {
         if self.mtp.is_some() {
             return Err(Error::Illegible {
@@ -222,7 +237,10 @@ impl Model {
 
             match &w.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    b.read_concat(gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+                    b.read_concat(
+                        gate_up,
+                        [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+                    )?;
                     b.read(down, n("mlp.down_proj.weight"))?;
                 }
                 Mlp::Routed {
@@ -277,7 +295,11 @@ impl Model {
         Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+    pub fn import_from_gguf(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
         if self.mtp.is_some() {
             return Err(Error::Illegible {
                 name: "mtp".to_string(),
@@ -324,7 +346,10 @@ impl Model {
 
                     b.read(bias, n("exp_probs_b.bias"))?;
 
-                    b.read_concat(gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])?;
+                    b.read_concat(
+                        gate_up,
+                        [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")],
+                    )?;
 
                     b.read(down, n("ffn_down_exps.weight"))?;
                 }
@@ -361,119 +386,118 @@ enum Read<'w> {
 /// One flash block's reads, at the names `n` spells: the trunk's layers and
 /// the draft head's block are the same list under different prefixes.
 fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Read<'w>>) {
+    for (mix, tag) in [(&w.attn_mix, "attn_hc"), (&w.mlp_mix, "ffn_hc")] {
+        reads.push(Read::One(&mix.scale, n(&format!("{tag}.scale"))));
+        reads.push(Read::One(&mix.base, n(&format!("{tag}.base"))));
+        if let Some(dynamic) = &mix.dynamic {
+            reads.push(Read::One(dynamic, n(&format!("{tag}.fn"))));
+        }
+    }
+    if let Some(norm) = &w.attn_norm {
+        reads.push(Read::One(norm, n("attn_norm.weight")));
+    }
+    if let Some(norm) = &w.mlp_norm {
+        reads.push(Read::One(norm, n("ffn_norm.weight")));
+    }
 
-        for (mix, tag) in [(&w.attn_mix, "attn_hc"), (&w.mlp_mix, "ffn_hc")] {
-            reads.push(Read::One(&mix.scale, n(&format!("{tag}.scale"))));
-            reads.push(Read::One(&mix.base, n(&format!("{tag}.base"))));
-            if let Some(dynamic) = &mix.dynamic {
-                reads.push(Read::One(dynamic, n(&format!("{tag}.fn"))));
-            }
+    let at = &w.attn;
+    reads.push(Read::One(&at.q_down, n("attn.wq_a.weight")));
+    reads.push(Read::One(&at.q_norm, n("attn.q_norm.weight")));
+    reads.push(Read::One(&at.q_up, n("attn.wq_b.weight")));
+    reads.push(Read::One(&at.kv_down, n("attn.wkv.weight")));
+    reads.push(Read::One(&at.kv_norm, n("attn.kv_norm.weight")));
+    reads.push(Read::One(&at.o_down, n("attn.wo_a.weight")));
+    reads.push(Read::One(&at.o_up, n("attn.wo_b.weight")));
+    reads.push(Read::One(&at.sink, n("attn.attn_sink")));
+    if let Some(pool) = &at.pool {
+        if let Some(c) = &pool.compressor {
+            reads.push(Read::One(&c.wkv, n("attn.compressor.wkv.weight")));
+            reads.push(Read::One(&c.wgate, n("attn.compressor.wgate.weight")));
+            reads.push(Read::One(&c.ape, n("attn.compressor.ape")));
+            reads.push(Read::One(&c.norm, n("attn.compressor.norm.weight")));
         }
-        if let Some(norm) = &w.attn_norm {
-            reads.push(Read::One(norm, n("attn_norm.weight")));
-        }
-        if let Some(norm) = &w.mlp_norm {
-            reads.push(Read::One(norm, n("ffn_norm.weight")));
-        }
+    }
+    if let Some(ix) = &at.indexer {
+        reads.push(Read::One(&ix.wq_b, n("attn.indexer.wq_b.weight")));
+        reads.push(Read::One(
+            &ix.weights_proj,
+            n("attn.indexer.weights_proj.weight"),
+        ));
+        reads.push(Read::One(
+            &ix.compressor.wkv,
+            n("attn.indexer.compressor.wkv.weight"),
+        ));
+        reads.push(Read::One(
+            &ix.compressor.wgate,
+            n("attn.indexer.compressor.wgate.weight"),
+        ));
+        reads.push(Read::One(
+            &ix.compressor.ape,
+            n("attn.indexer.compressor.ape"),
+        ));
+        reads.push(Read::One(
+            &ix.compressor.norm,
+            n("attn.indexer.compressor.norm.weight"),
+        ));
+    }
 
-        let at = &w.attn;
-        reads.push(Read::One(&at.q_down, n("attn.wq_a.weight")));
-        reads.push(Read::One(&at.q_norm, n("attn.q_norm.weight")));
-        reads.push(Read::One(&at.q_up, n("attn.wq_b.weight")));
-        reads.push(Read::One(&at.kv_down, n("attn.wkv.weight")));
-        reads.push(Read::One(&at.kv_norm, n("attn.kv_norm.weight")));
-        reads.push(Read::One(&at.o_down, n("attn.wo_a.weight")));
-        reads.push(Read::One(&at.o_up, n("attn.wo_b.weight")));
-        reads.push(Read::One(&at.sink, n("attn.attn_sink")));
-        if let Some(pool) = &at.pool {
-            if let Some(c) = &pool.compressor {
-                reads.push(Read::One(&c.wkv, n("attn.compressor.wkv.weight")));
-                reads.push(Read::One(&c.wgate, n("attn.compressor.wgate.weight")));
-                reads.push(Read::One(&c.ape, n("attn.compressor.ape")));
-                reads.push(Read::One(&c.norm, n("attn.compressor.norm.weight")));
+    if let Mlp::MoeFlash {
+        router,
+        gate,
+        gate_up,
+        down,
+        shared_gate_up,
+        shared_down,
+        ..
+    } = &w.mlp
+    {
+        match gate {
+            // Hash-routed layers score their gate too (the choice is the table's, the weights the
+            // scores' — the official `Gate.forward`), so the router plane is read, not merely named.
+            Gate::Hash { tid2eid } => {
+                reads.push(Read::One(router, n("ffn.gate.weight")));
+                reads.push(Read::One(tid2eid, n("ffn.gate.tid2eid")));
+            }
+            Gate::Bias { bias } => {
+                reads.push(Read::One(router, n("ffn.gate.weight")));
+                reads.push(Read::One(bias, n("ffn.gate.e_score_correction_bias")));
             }
         }
-        if let Some(ix) = &at.indexer {
-            reads.push(Read::One(&ix.wq_b, n("attn.indexer.wq_b.weight")));
-            reads.push(Read::One(
-                &ix.weights_proj,
-                n("attn.indexer.weights_proj.weight"),
-            ));
-            reads.push(Read::One(
-                &ix.compressor.wkv,
-                n("attn.indexer.compressor.wkv.weight"),
-            ));
-            reads.push(Read::One(
-                &ix.compressor.wgate,
-                n("attn.indexer.compressor.wgate.weight"),
-            ));
-            reads.push(Read::One(&ix.compressor.ape, n("attn.indexer.compressor.ape")));
-            reads.push(Read::One(
-                &ix.compressor.norm,
-                n("attn.indexer.compressor.norm.weight"),
-            ));
-        }
-
-        if let Mlp::MoeFlash {
-            router,
-            gate,
-            gate_up,
-            down,
-            shared_gate_up,
-            shared_down,
-            ..
-        } = &w.mlp
-        {
-            match gate {
-                // Hash-routed layers score their gate too (the choice is the table's, the weights the
-                // scores' — the official `Gate.forward`), so the router plane is read, not merely named.
-                Gate::Hash { tid2eid } => {
-                    reads.push(Read::One(router, n("ffn.gate.weight")));
-                    reads.push(Read::One(tid2eid, n("ffn.gate.tid2eid")));
-                }
-                Gate::Bias { bias } => {
-                    reads.push(Read::One(router, n("ffn.gate.weight")));
-                    reads.push(Read::One(bias, n("ffn.gate.e_score_correction_bias")));
-                }
-            }
-            match gate_up {
-                GateUp::Fused(bank) => reads.push(Read::Concat(
-                    bank,
-                    1,
-                    vec![
-                        n("ffn.switch_mlp.gate_proj.weight"),
-                        n("ffn.switch_mlp.up_proj.weight"),
-                    ],
-                )),
-                // Split form: two plain reads, each at its own affine point.
-                GateUp::Split { gate, up } => {
-                    reads.push(Read::One(gate, n("ffn.switch_mlp.gate_proj.weight")));
-                    reads.push(Read::One(up, n("ffn.switch_mlp.up_proj.weight")));
-                }
-            }
-            reads.push(Read::One(down, n("ffn.switch_mlp.down_proj.weight")));
-            reads.push(Read::Concat(
-                shared_gate_up,
-                0,
+        match gate_up {
+            GateUp::Fused(bank) => reads.push(Read::Concat(
+                bank,
+                1,
                 vec![
-                    n("ffn.shared_experts.gate_proj.weight"),
-                    n("ffn.shared_experts.up_proj.weight"),
+                    n("ffn.switch_mlp.gate_proj.weight"),
+                    n("ffn.switch_mlp.up_proj.weight"),
                 ],
-            ));
-            reads.push(Read::One(shared_down, n("ffn.shared_experts.down_proj.weight")));
+            )),
+            // Split form: two plain reads, each at its own affine point.
+            GateUp::Split { gate, up } => {
+                reads.push(Read::One(gate, n("ffn.switch_mlp.gate_proj.weight")));
+                reads.push(Read::One(up, n("ffn.switch_mlp.up_proj.weight")));
+            }
         }
-    
+        reads.push(Read::One(down, n("ffn.switch_mlp.down_proj.weight")));
+        reads.push(Read::Concat(
+            shared_gate_up,
+            0,
+            vec![
+                n("ffn.shared_experts.gate_proj.weight"),
+                n("ffn.shared_experts.up_proj.weight"),
+            ],
+        ));
+        reads.push(Read::One(
+            shared_down,
+            n("ffn.shared_experts.down_proj.weight"),
+        ));
+    }
 }
 
 fn affine(dtype: Dtype) -> bool {
     matches!(
         dtype,
-        Dtype::U4g64
-            | Dtype::U8g64
-            | Dtype::U4g32
-            | Dtype::U2g32
-            | Dtype::U2g64
-            | Dtype::U2g128
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 | Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128
     )
 }
 

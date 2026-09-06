@@ -102,6 +102,7 @@ fn engine_port_kind(kind: models::PortKind) -> ::engine::fire::PortKind {
         models::PortKind::LaneVector => PortKind::LaneVector,
         models::PortKind::Context => PortKind::Context,
         models::PortKind::AxisPositions => PortKind::AxisPositions,
+        models::PortKind::Voxels => PortKind::Voxels,
     }
 }
 
@@ -138,6 +139,18 @@ pub(crate) fn validate_port_channel(
                 )),
             }
         }
+        // A voxel port's channel IS the clip: its shape is the box.
+        models::PortKind::Voxels => match shape {
+            [h, w, width] if *width == port.width && *h > 0 && *w > 0 => Ok(Some(h * w)),
+            [t, h, w, width] if *width == port.width && *t > 0 && *h > 0 && *w > 0 => {
+                Ok(Some(t * h * w))
+            }
+            _ => Err(format!(
+                "port `{}` reads one clip `[h, w, {}]` (or `[t, h, w, {}]`) f32 on the voxel \
+                 axis; this channel is {shape:?}",
+                port.name, port.width, port.width
+            )),
+        },
     }
 }
 
@@ -2566,7 +2579,12 @@ mod tests {
     use eta_ir::types::Dtype;
 
     fn port(name: &'static str, kind: models::PortKind, width: u32) -> models::PortFact {
-        models::PortFact { name, kind, width, streams: Vec::new() }
+        models::PortFact {
+            name,
+            kind,
+            width,
+            streams: Vec::new(),
+        }
     }
 
     fn bound(name: &str, kind: ::engine::fire::PortKind, rows: Option<u32>) -> PortBinding {

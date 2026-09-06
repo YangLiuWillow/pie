@@ -105,7 +105,11 @@ impl ForwardHybrid for Model {
                 mtp.attn.kv.clone(),
                 [self.kv_lora_rank as u64, mtp.attn.qk_rope_head_dim as u64],
             );
-            c.kv(index, mtp.attn.indexer.keys.clone(), [mtp.attn.indexer.head_dim as u64]);
+            c.kv(
+                index,
+                mtp.attn.indexer.keys.clone(),
+                [mtp.attn.indexer.head_dim as u64],
+            );
         }
         c
     }
@@ -133,7 +137,8 @@ impl ForwardHybrid for Model {
         // `-1` sentinel.
         if let Some(t) = &towered {
             let (imaged, _) = narrow.split(&Facts::media());
-            narrow = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
+            narrow =
+                ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
         let mut streams = ops::elemwise::hc_expand(&narrow, hy.streams);
 
@@ -269,7 +274,9 @@ fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper)
     let (px, _, _) = gate(streams, &next.mlp_mix, hy);
     let px = ops::elemwise::rmsnorm(&px, &next.mlp_norm, next.mlp_norm_eps);
     let logits = ops::linear::matmul(&px, router);
-    Some(ops::linear::moe_predict_route(&logits, bias, *experts, PREDICT_K))
+    Some(ops::linear::moe_predict_route(
+        &logits, bias, *experts, PREDICT_K,
+    ))
 }
 
 fn mlp(x: &Value, mlp: &Mlp, hint: Option<&Value>) -> Value {
@@ -524,7 +531,15 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
         {
             let mixed = ops::attn::ssm_causal_conv1d(&qkv_d, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_step(
-                &mixed, &f_d, &b_d, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps,
+                &mixed,
+                &f_d,
+                &b_d,
+                &k.dt_bias,
+                &k.a_log,
+                delta,
+                k.heads,
+                k.head_dim,
+                k.norm_eps,
                 k.gate_floor,
             )
         },
@@ -532,7 +547,15 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
             // Chunked: the prefill's conv reads its own rows, not the state.
             let mixed = ops::attn::ssm_causal_conv1d_chunked(&qkv_p, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_chunked(
-                &mixed, &f_p, &b_p, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps,
+                &mixed,
+                &f_p,
+                &b_p,
+                &k.dt_bias,
+                &k.a_log,
+                delta,
+                k.heads,
+                k.head_dim,
+                k.norm_eps,
                 k.gate_floor,
             )
         },
@@ -554,7 +577,10 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();
     let grid = inputs.patch_positions();
-    let mut y = ops::elemwise::add_bias(&t.patch_embed_bias, &ops::linear::matmul(&x, &t.patch_embed));
+    let mut y = ops::elemwise::add_bias(
+        &t.patch_embed_bias,
+        &ops::linear::matmul(&x, &t.patch_embed),
+    );
     for b in &t.blocks {
         let n = ops::elemwise::rmsnorm(&y, &b.norm1, t.norm_eps);
         let (q, k, v) = ops::layout::split_qkv(
@@ -594,7 +620,10 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     // The 2×2 downsample conv: one merge block's rows side by side, times
     // the kernel laid out in the same `(kh, kw, c)` order.
     let folded = ops::layout::merge_rows(&y, t.merge);
-    let y = ops::elemwise::add_bias(&t.downsample_bias, &ops::linear::matmul(&folded, &t.downsample));
+    let y = ops::elemwise::add_bias(
+        &t.downsample_bias,
+        &ops::linear::matmul(&folded, &t.downsample),
+    );
     let m = &t.merger;
     let p = ops::linear::matmul(&y, &m.proj);
     let n = ops::elemwise::layernorm(&p, &m.norm, &m.norm_bias, t.norm_eps);

@@ -110,12 +110,16 @@ interface model {
     // `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
     // scale. `context`: `[rows, width]`, an encoder's output, the rows of a
     // `context` lane. `axis-positions`: `[rows, width]` with `width` the
-    // axis count (1..=4), the per-row RoPE coordinates.
+    // axis count (1..=4), the per-row RoPE coordinates. `voxels`: a VAE's
+    // tile on the voxel axis (design D8) — the channel is `[h, w, width]`
+    // for a still or `[t, h, w, width]` for a clip, one clip per pass, its
+    // shape being the clip's box.
     enum port-kind {
         latents,
         lane-vector,
         context,
         axis-positions,
+        voxels,
     }
 
     // One float input port a reading declares. `dtype` is the CHANNEL's
@@ -134,11 +138,14 @@ interface model {
     }
 
     // Which export seam a reading's epilogue reads: `logits()` for a text
-    // head, `velocity()` for a denoiser, `hidden()` for an encoder.
+    // head, `velocity()` for a denoiser, `hidden()` for an encoder,
+    // `pixels` for a VAE reading on the voxel axis (one row per output
+    // voxel of the pass's clip, `readout-width` wide).
     enum readout-kind {
         logits,
         velocity,
         hidden,
+        pixels,
     }
 
     // One reading of the bound model: the arm a pass runs when it names

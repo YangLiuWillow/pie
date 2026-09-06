@@ -112,12 +112,32 @@ fn denoise_reading() -> ReadingFact {
         takes_tokens: false,
         streams: vec![Stream::Text, Stream::Image, Stream::Context],
         ports: vec![
-            port("latents", PortKind::Latents, super::model::PATCH_FEATURES, &[Stream::Image]),
-            port("text", PortKind::Context, super::model::TEXT_WIDTH, &[Stream::Text]),
-            port("context", PortKind::Context, super::model::CONTEXT_WIDTH, &[Stream::Context]),
+            port(
+                "latents",
+                PortKind::Latents,
+                super::model::PATCH_FEATURES,
+                &[Stream::Image],
+            ),
+            port(
+                "text",
+                PortKind::Context,
+                super::model::TEXT_WIDTH,
+                &[Stream::Text],
+            ),
+            port(
+                "context",
+                PortKind::Context,
+                super::model::CONTEXT_WIDTH,
+                &[Stream::Context],
+            ),
             // Read once per lane by every class that modulates; the context
             // lane's class runs one projection and no modulation.
-            port("timestep", PortKind::LaneVector, 1, &[Stream::Text, Stream::Image]),
+            port(
+                "timestep",
+                PortKind::LaneVector,
+                1,
+                &[Stream::Text, Stream::Image],
+            ),
             port(
                 "positions",
                 PortKind::AxisPositions,

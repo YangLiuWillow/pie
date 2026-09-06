@@ -2,8 +2,8 @@ use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::types::Encoding;
 
 use super::model::{Mlp, Model};
-use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, encoding};
+use model_dsl::Platform;
 
 impl Model {
     pub fn import(
@@ -17,7 +17,8 @@ impl Model {
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source, platform: Platform,
+        src: &ztensor::Source,
+        platform: Platform,
     ) -> Result<ModelContract, Error> {
         let hidden = i64::from(self.hidden);
         let mut b = Builder::new(src, self.tp, platform);
@@ -39,7 +40,10 @@ impl Model {
             b.read(&attn.o_proj, at("self_attn.o_proj.weight"))?;
             b.read(&index.q_proj, at("self_attn.indexer.wq_b.weight"))?;
             b.read(&index.k_proj, at("self_attn.indexer.wk.weight"))?;
-            b.read(&index.weights_proj, at("self_attn.indexer.weights_proj.weight"))?;
+            b.read(
+                &index.weights_proj,
+                at("self_attn.indexer.weights_proj.weight"),
+            )?;
             b.read(&index.k_norm, at("self_attn.indexer.k_norm.weight"))?;
             b.read(&index.k_norm_bias, at("self_attn.indexer.k_norm.bias"))?;
             match &layer.mlp {

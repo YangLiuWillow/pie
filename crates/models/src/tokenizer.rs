@@ -6,7 +6,9 @@ pub type ContractRow = (&'static str, &'static Contract);
 
 #[must_use]
 pub fn contracts() -> Vec<ContractRow> {
-    crate::skus().map(|sku| (sku.name.as_str(), sku.tokenizer)).collect()
+    crate::skus()
+        .map(|sku| (sku.name.as_str(), sku.tokenizer))
+        .collect()
 }
 
 #[must_use]

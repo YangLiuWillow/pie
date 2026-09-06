@@ -238,12 +238,8 @@ impl Model {
             .map(|l| {
                 let n = |s: &str| format!("layer.{l}.{s}");
                 let norm = |s: &str, cols: u64| Weight::sym(n(s), [cols], dense);
-                let (lora_a, lora_b) = crate::adapter::banks(
-                    &format!("layer.{l}"),
-                    ADAPTERS,
-                    hidden,
-                    dense,
-                );
+                let (lora_a, lora_b) =
+                    crate::adapter::banks(&format!("layer.{l}"), ADAPTERS, hidden, dense);
                 Layer {
                     attn: Attn {
                         reading: if sliding_window_on(l) {
@@ -331,5 +327,4 @@ impl Model {
 /// fact; changing it requires a re-trace.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-impl Model {
- }
+impl Model {}

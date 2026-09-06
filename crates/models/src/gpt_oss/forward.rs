@@ -38,7 +38,9 @@ impl Classify for Facts {
     }
 
     fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1) | (u64::from(self.block_draft) << 2)
+        u64::from(self.qo_one)
+            | (u64::from(self.has_adapter) << 1)
+            | (u64::from(self.block_draft) << 2)
     }
 }
 

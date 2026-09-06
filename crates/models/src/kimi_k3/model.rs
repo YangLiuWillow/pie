@@ -1,6 +1,5 @@
 use model_dsl::{Dtype, Weight};
 
-
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
@@ -351,8 +350,12 @@ impl Model {
                         up_cap: d.situ_cap,
                     }
                 };
-                let (lora_a, lora_b) =
-                    crate::adapter::banks(&format!("layer.{l}"), ADAPTERS, hidden, crate::dense(weights));
+                let (lora_a, lora_b) = crate::adapter::banks(
+                    &format!("layer.{l}"),
+                    ADAPTERS,
+                    hidden,
+                    crate::dense(weights),
+                );
                 Layer {
                     res_blend: blend_at(l).then(|| ResBlend {
                         norm: norm("res_norm", hidden),
@@ -391,5 +394,4 @@ impl Model {
 /// Deployment ceiling for adapter slots/rank (not a checkpoint fact); change and re-trace to grow it.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-impl Model {
- }
+impl Model {}
