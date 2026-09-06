@@ -85,6 +85,80 @@ impl Run<'_> {
                     }
                 None => self.row_major_lm_head(act, w, y),
             },
+            // ---- the epilogue-fused projections (`model_ir::fuse::gemm_epilogues`) ----
+            //
+            // A dense bf16 weight at decode width takes the skinny kernel,
+            // which lands the epilogue off the accumulator and never writes
+            // the packed/raw value; anything else is the two traced launches.
+            Linear::MatmulGeglu {
+                act,
+                w,
+                intermediate,
+                packed,
+                y,
+            } => {
+                let a = self.tensor(*act);
+                let weight = self.tensor(*w);
+                let out = self.tensor(*y);
+                let (m, k) = (a.rows as i32, a.width as i32);
+                let i = i32::try_from(*intermediate).unwrap_or(0);
+                if self.dense_weight(*w)
+                    && weight.rows == 2 * *intermediate
+                    && linear::skinny::covers(m, i, k, linear::skinny::Epilogue::Geglu)
+                {
+                    return linear::skinny::skinny_bf16(
+                        self.ctx(),
+                        weight.ptr,
+                        a.ptr,
+                        out.ptr,
+                        m,
+                        i,
+                        k,
+                        linear::skinny::Epilogue::Geglu,
+                    );
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpGegluTanhPacked {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *y,
+                })
+            }
+            Linear::LmHeadSoftcap {
+                act,
+                w,
+                cap,
+                y,
+                y_out: _,
+            } => {
+                let a = self.tensor(*act);
+                let weight = self.tensor(*w);
+                let out = self.tensor(*y);
+                let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
+                let epilogue = linear::skinny::Epilogue::Softcap(*cap);
+                if self.dense_weight(*w) && linear::skinny::covers(m, n, k, epilogue) {
+                    return linear::skinny::skinny_bf16(
+                        self.ctx(),
+                        weight.ptr,
+                        a.ptr,
+                        out.ptr,
+                        m,
+                        n,
+                        k,
+                        epilogue,
+                    );
+                }
+                self.linear(&Linear::LmHead {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
+            }
             // ---- mlp ----
             Linear::MlpSwiglu {
                 packed,
@@ -522,6 +596,14 @@ impl Run<'_> {
     /// The row-major roads: a projection whose planes the checkpoint landed
     /// in declared order, a weight seated as one stored quantization block,
     /// and the dense bf16 rectangle beside them.
+    /// A plain bf16 weight: no affine planes, no stored block, no tiled
+    /// repack — the dense GEMM road.
+    fn dense_weight(&mut self, w: ValueId) -> bool {
+        self.maybe_tiled_planes(w).is_none()
+            && self.maybe_planes(w).is_none()
+            && self.maybe_stored(w).is_none()
+    }
+
     fn row_major_matmul(
         &mut self,
         act: &ValueId,

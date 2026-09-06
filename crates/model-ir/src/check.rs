@@ -479,6 +479,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }
+            | Linear::MatmulGeglu { .. }
+            | Linear::LmHeadSoftcap { .. }
             | Linear::MlpSitu { .. }
             | Linear::MoeSigmoidGateAdd { .. } => &[],
         },
