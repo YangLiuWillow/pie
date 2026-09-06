@@ -4,7 +4,7 @@
 //! stream is touched here.
 
 use engine::fire::{Boundary, FoldLen, Masking, RsReset, RsVerb};
-use engine::frame::{Demand, Shell as FrameShell, Supply};
+use engine::frame::{Demand, Shell as FrameShell};
 use model_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes};
 
 use crate::error::{Fault, Result};
@@ -783,6 +783,7 @@ impl FrameShell for Shell {
         // that carries none (an encode lane, an arming synthetic) — so the
         // input is bound whichever class runs.
         let taps = self.self_cond_taps as usize;
+        let mut self_cond_feeds: Vec<(usize, usize, u64, u64, u64)> = Vec::new();
         let (mut self_cond_rows, mut self_cond_weights) = if taps == 0 {
             (Vec::new(), Vec::new())
         } else {
@@ -792,6 +793,31 @@ impl FrameShell for Shell {
                 let seated = &lanes[row.source as usize];
                 let cells = row.rows as usize * taps;
                 match seated.self_cond {
+                    Some(sc) if sc.channels.is_some() => {
+                        let (rows_channel, weights_channel) = sc.channels.unwrap_or_default();
+                        let instance = attachments
+                            .iter()
+                            .find(|attached| attached.lane == row.source)
+                            .map(|attached| attached.instance)
+                            .ok_or_else(|| {
+                                Fault::program(
+                                    "serve::prepare",
+                                    format!(
+                                        "lane {} reads its self-conditioning taps off channels but attaches no instance",
+                                        row.source
+                                    ),
+                                )
+                            })?;
+                        if sc.taps as usize != taps {
+                            return Err(Fault::program(
+                                "serve::prepare",
+                                format!("lane {} states {} taps and this plan reads {taps}", row.source, sc.taps),
+                            ));
+                        }
+                        self_cond_feeds.push((ids.len(), cells, rows_channel, weights_channel, instance));
+                        ids.extend(std::iter::repeat_n(0, cells));
+                        ws.extend(std::iter::repeat_n(0.0, cells));
+                    }
                     Some(sc) => {
                         if sc.taps as usize != taps
                             || sc.rows.len() != cells
@@ -854,7 +880,22 @@ impl FrameShell for Shell {
                 .unwrap_or(0),
             workspace: 0,
         };
-        Supply::commit(&mut self.pools, demand)?;
+        // The kv planes are backed under the pages these seats address —
+        // a slot's run for a shell-owned block, each tabled id for a
+        // runtime-tabled one — not under every page below the watermark.
+        let mut kv_ranges: Vec<(u64, u64)> = Vec::new();
+        for (seat, table) in seats.iter().zip(&tables) {
+            let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
+            let pages = after.div_ceil(page_size).max(1);
+            if table.is_empty() {
+                kv_ranges.push((self.pools.paging().base(seat.slot), pages));
+            } else {
+                for &page in table.iter().take(pages as usize) {
+                    kv_ranges.push((u64::from(page), 1));
+                }
+            }
+        }
+        self.pools.commit_frame(demand, &kv_ranges)?;
 
         // 3. Page arithmetic, once per kv space.
         let indptr_host = kv::indptr(&seats)?;
@@ -1105,6 +1146,7 @@ impl FrameShell for Shell {
             mrope_positions,
             self_cond_rows,
             self_cond_weights,
+            self_cond_feeds,
             windows,
             seats,
             tables,

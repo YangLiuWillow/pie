@@ -935,6 +935,16 @@ fn stamp_denoise(
                 u64::from(u32::MAX),
             )));
         }
+        if let Some(payload) = &payload
+            && let Some((rows_channel, weights_channel)) = payload.channels
+        {
+            lane.self_cond = Some(::engine::fire::SelfCondInput::from_channels(
+                payload.taps,
+                rows_channel,
+                weights_channel,
+            ));
+            continue;
+        }
         if let Some(payload) = &payload {
             let cells = lane.tokens.len() * payload.taps as usize;
             let end = cursor + cells;
@@ -1434,7 +1444,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         {
             let pass = ctx.resources().get_mut(&fwd)?;
             if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
-                let payload = pass.bindings.self_cond.take();
+                // A channel binding stays on the pass; a staged payload is
+                // consumed by this fire.
+                let payload = if pass.bindings.self_cond.as_ref().is_some_and(|p| p.channels.is_some()) {
+                    pass.bindings.self_cond.clone()
+                } else {
+                    pass.bindings.self_cond.take()
+                };
                 if let Err(error) = stamp_denoise(&mut req, payload) {
                     return Ok(Err(format!("pipeline: self-conditioning: {error}")));
                 }
@@ -2864,7 +2880,13 @@ async fn fire_device_geometry<C: FireContext>(
     {
         let pass = ctx.resources().get_mut(&fwd)?;
         if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
-            let payload = pass.bindings.self_cond.take();
+            // A channel binding stays on the pass; a staged payload is
+            // consumed by this fire.
+            let payload = if pass.bindings.self_cond.as_ref().is_some_and(|p| p.channels.is_some()) {
+                pass.bindings.self_cond.clone()
+            } else {
+                pass.bindings.self_cond.take()
+            };
             if let Err(error) = stamp_denoise(&mut req, payload) {
                 reclaim_pending_device_grant(ctx, &fwd);
                 let reason = format!("pipeline: self-conditioning: {error}");

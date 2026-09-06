@@ -569,6 +569,10 @@ pub struct Prepared<'a> {
     /// unless the plan declares them.
     self_cond_rows: Vec<i32>,
     self_cond_weights: Vec<f32>,
+    /// Lanes whose taps come off their own channels: `(first cell, cells,
+    /// rows channel, weights channel, instance)`, copied device to device
+    /// over the zeros staged for them, after `stage_self_cond`.
+    self_cond_feeds: Vec<(usize, usize, u64, u64, u64)>,
     /// Every region's rows and lanes, bound to a device address only in `enqueue`.
     windows: Windows,
     /// One per lane, in fire (seriated) order.

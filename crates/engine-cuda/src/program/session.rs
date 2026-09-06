@@ -196,6 +196,19 @@ impl Session {
 
     /// Channel `channel`'s cursors, as the two owners have them right now.
     #[must_use]
+    /// The device address of channel `channel`'s cell at `sequence`, and the
+    /// cell's byte width — the ring's own arithmetic, for a reader outside
+    /// the guest program (the self-conditioning feed).
+    ///
+    /// # Errors
+    ///
+    /// The ring's own, for a channel past the table.
+    pub fn cell(&self, channel: usize, sequence: u64) -> Result<(u64, u64)> {
+        let address = self.rings.cell_address(channel, sequence)?;
+        let bytes = self.rings.shape_of(channel)?.cell_bytes() as u64;
+        Ok((address, bytes))
+    }
+
     pub fn cursor(&self, channel: u32) -> Option<Cursor> {
         let channel = channel as usize;
         let prediction = self.cursors.get(channel).copied()?;

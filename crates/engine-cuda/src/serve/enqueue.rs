@@ -246,11 +246,23 @@ impl FireCtx<'_> {
         let self_cond = if p.self_cond_rows.is_empty() {
             None
         } else {
-            Some(self.inputs.stage_self_cond(
+            let staged = self.inputs.stage_self_cond(
                 self.device.stream(),
                 &p.self_cond_rows,
                 &p.self_cond_weights,
-            )?)
+            )?;
+            // Lanes fed off their own channels: their taps land over the
+            // zeros just staged, device to device, from the cells their own
+            // `take` would read this fire.
+            for &(first, cells, rows_channel, weights_channel, instance) in &p.self_cond_feeds {
+                let bytes = cells * 4;
+                let (rows_at, weights_at) =
+                    self.programs.self_cond_cells(instance, rows_channel, weights_channel, bytes as u64)?;
+                let offset = (first * 4) as u64;
+                crate::device::alloc::copy_d2d(self.device.stream(), staged.0.ptr + offset, rows_at, bytes)?;
+                crate::device::alloc::copy_d2d(self.device.stream(), staged.1.ptr + offset, weights_at, bytes)?;
+            }
+            Some(staged)
         };
 
         // A bodied fire carves both columns at the key's bucket, so a replay's

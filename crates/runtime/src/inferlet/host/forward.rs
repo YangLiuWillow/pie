@@ -681,6 +681,68 @@ impl ProcessCtx {
             taps: shape.self_cond_taps,
             rows,
             weights,
+            channels: None,
+        });
+        Ok(Ok(()))
+    }
+
+    /// The self-conditioning taps read off two of the pass's own channels at
+    /// every submit — the ids `[canvas, taps]` u32, the weights `[canvas,
+    /// taps]` f32 — so a denoiser's epilogue can hand its next step the
+    /// signal without a host round trip. A persistent binding: set once,
+    /// before the loop; the committed cell of each channel at submit is the
+    /// signal, so the epilogue keeps them loop-carried (`take` then `put`)
+    /// and seeds them with zeros for the first step.
+    async fn core_self_conditioning_from(
+        &mut self,
+        this: Resource<ForwardPass>,
+        rows: Resource<Channel>,
+        weights: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
+        let Some(shape) = crate::model::model().diffusion() else {
+            return Ok(Err(
+                "self-conditioning is a diffusion model's input; this model states no canvas"
+                    .to_string(),
+            ));
+        };
+        let want = vec![shape.canvas, shape.self_cond_taps];
+        let mut ids = [0u64; 2];
+        for (slot, (channel, dtype, what)) in [
+            (&rows, eta_ir::types::Dtype::U32, "ids"),
+            (&weights, eta_ir::types::Dtype::F32, "weights"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resource = self.ctx().table.get(channel)?;
+            let cell = resource.cell.lock().unwrap();
+            if cell.shape != want || cell.dtype != dtype {
+                return Ok(Err(format!(
+                    "self-conditioning {what} channel must be `[{}, {}]` {dtype:?}; this one is {:?} {:?}",
+                    shape.canvas, shape.self_cond_taps, cell.shape, cell.dtype
+                )));
+            }
+            ids[slot] = cell.global_id;
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.bindings.canvas != Some(CanvasMode::Denoise) {
+            return Ok(Err(
+                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first".to_string(),
+            ));
+        }
+        if pass.bindings.self_cond.is_some() {
+            return Ok(Err(
+                "a self-conditioning payload or binding is already on this pass".to_string(),
+            ));
+        }
+        pass.bindings.self_cond = Some(crate::pipeline::instance::SelfCondPayload {
+            taps: shape.self_cond_taps,
+            rows: Vec::new(),
+            weights: Vec::new(),
+            channels: Some((ids[0], ids[1])),
         });
         Ok(Ok(()))
     }
@@ -1781,6 +1843,15 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
         weights: Vec<f32>,
     ) -> Anyhow<Result<(), String>> {
         self.core_self_conditioning(this, rows, weights).await
+    }
+
+    async fn self_conditioning_from(
+        &mut self,
+        this: Resource<ForwardPass>,
+        rows: Resource<Channel>,
+        weights: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_self_conditioning_from(this, rows, weights).await
     }
 
     /// The reading: the one call the other three interfaces do not have.

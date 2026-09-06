@@ -1718,6 +1718,13 @@ impl Pass<wit_diffusion::ForwardPass> {
         wit_diffusion::ForwardPass::self_conditioning(&self.wit, rows, weights)
     }
 
+    /// `pie:inferlet/forward-diffusion.self-conditioning-from`: the taps read
+    /// off two of this pass's channels at every submit (ids `[length, taps]`
+    /// u32, weights `[length, taps]` f32) — a persistent binding.
+    pub fn self_conditioning_from(&self, rows: &Channel, weights: &Channel) -> Result<(), String> {
+        wit_diffusion::ForwardPass::self_conditioning_from(&self.wit, &rows.wit(), &weights.wit())
+    }
+
     /// `pie:inferlet/forward-diffusion.media` — the attention pass's `media`.
     pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
         wit_diffusion::ForwardPass::media(&self.wit, spans)

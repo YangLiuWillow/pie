@@ -122,6 +122,19 @@ interface forward-diffusion {
             weights: list<f32>,
         ) -> result<_, error>;
 
+        /// The same taps, read off two of this pass's own channels at every
+        /// submit instead of staged from the host: `rows` a `[length, taps]`
+        /// u32 channel of ids, `weights` a `[length, taps]` f32 channel. A
+        /// persistent binding, set once before the loop; each submit reads
+        /// the channels' COMMITTED cells, so an epilogue that writes the
+        /// next step's taps keeps them loop-carried (`take` then `put`) and
+        /// the guest seeds them with zeros for the first step. The whole
+        /// denoising loop then runs without a host copy a step.
+        self-conditioning-from: func(
+            rows: borrow<channel>,
+            weights: borrow<channel>,
+        ) -> result<_, error>;
+
         /// Bind embedding token ids and CSR row indptr. Both are channels.
         /// On a `denoise` pass the tokens are the canvas — random ids on the
         /// first step, whatever the guest's sampler wrote after.

@@ -321,7 +321,10 @@ impl Lane {
         }
         if let Some(sc) = &self.self_cond {
             let cells = self.rows() as usize * sc.taps as usize;
-            if sc.taps == 0 || sc.rows.len() != cells || sc.weight_bits.len() != cells {
+            // Channel-fed taps carry no ids here: the engine reads them off
+            // the lane's channels at submit.
+            let fed = sc.channels.is_some() && sc.rows.is_empty() && sc.weight_bits.is_empty();
+            if sc.taps == 0 || (!fed && (sc.rows.len() != cells || sc.weight_bits.len() != cells)) {
                 return Err(Error::Invalid(format!(
                     "lane in slot {} states a self-conditioning input of {} taps as {} ids and \
                      {} weights for its {} rows",
@@ -408,9 +411,30 @@ pub struct SelfCondInput {
     pub rows: Vec<u32>,
     /// `rows() * taps` weights, as `f32::to_bits`.
     pub weight_bits: Vec<u32>,
+    /// The taps read off two of the lane's own channels instead — the
+    /// engine-registered ids of a `[rows, taps]` u32 ids channel and a
+    /// `[rows, taps]` f32 weights channel, whose COMMITTED cells at
+    /// submit are the signal. `rows`/`weight_bits` are empty then. A
+    /// denoiser whose epilogue writes its taps to loop-carried channels
+    /// feeds itself without a host round trip a step; served by an engine
+    /// declaring [`bidirectional_attention`](crate::Capabilities::bidirectional_attention)
+    /// on CUDA, refused by name elsewhere.
+    #[serde(default)]
+    pub channels: Option<(u64, u64)>,
 }
 
 impl SelfCondInput {
+    /// The taps read off `rows`' and `weights`' committed cells at submit.
+    #[must_use]
+    pub fn from_channels(taps: u32, rows: u64, weights: u64) -> Self {
+        Self {
+            taps,
+            rows: Vec::new(),
+            weight_bits: Vec::new(),
+            channels: Some((rows, weights)),
+        }
+    }
+
     /// The taps from ids and weights, row major.
     #[must_use]
     pub fn new(taps: u32, rows: Vec<u32>, weights: &[f32]) -> SelfCondInput {
@@ -418,6 +442,7 @@ impl SelfCondInput {
             taps,
             rows,
             weight_bits: weights.iter().map(|w| w.to_bits()).collect(),
+            channels: None,
         }
     }
 

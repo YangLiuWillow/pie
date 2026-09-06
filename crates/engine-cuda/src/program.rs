@@ -99,6 +99,50 @@ impl Program {
     }
 }
 
+impl Plane {
+    /// The committed cells the self-conditioning feed of `instance` reads at
+    /// this submit: the device addresses of the `rows` and `weights`
+    /// channels' cells at their consumer heads (what the instance's own
+    /// `take` would read), each at least `bytes` wide.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unbound instance, a channel the instance
+    /// does not carry, or a cell narrower than the taps.
+    pub fn self_cond_cells(
+        &self,
+        instance: u64,
+        rows: u64,
+        weights: u64,
+        bytes: u64,
+    ) -> Result<(u64, u64)> {
+        let bound = self.instances.get(&instance).ok_or_else(|| {
+            Fault::program("program::plane", format!("self-conditioning feed of unbound instance {instance}"))
+        })?;
+        let mut out = [0u64; 2];
+        for (slot, id) in [rows, weights].into_iter().enumerate() {
+            let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("self-conditioning feed names channel {id}, which instance {instance} does not carry"),
+                )
+            })?;
+            let cursor = bound.session.cursor(dense as u32).ok_or_else(|| {
+                Fault::program("program::plane", format!("channel {dense} has no cursor"))
+            })?;
+            let (address, width) = bound.session.cell(dense, cursor.head)?;
+            if width < bytes {
+                return Err(Fault::program(
+                    "program::plane",
+                    format!("self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"),
+                ));
+            }
+            out[slot] = address;
+        }
+        Ok((out[0], out[1]))
+    }
+}
+
 /// The shell's guest-program plane: the compile cache, the registered
 /// programs, and the bound instances.
 ///

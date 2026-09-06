@@ -178,6 +178,10 @@ pub struct SelfCondPayload {
     pub taps: u32,
     pub rows: Vec<u32>,
     pub weights: Vec<f32>,
+    /// The taps read off two of the pass's own channels at every submit
+    /// (their engine ids): a persistent binding rather than a payload,
+    /// `rows`/`weights` empty. See `forward-diffusion.self-conditioning-from`.
+    pub channels: Option<(u64, u64)>,
 }
 
 /// Where a fire's folded boundary lands — host mirror of WIT
