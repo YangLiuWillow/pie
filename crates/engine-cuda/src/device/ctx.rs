@@ -8,6 +8,30 @@ use kernels_cuda::{Ctx, Slabs};
 
 use crate::error::{Fault, Result};
 
+/// How many CUDA devices the runtime sees, `0` with none or no runtime — a
+/// gate's door for a test that needs a group's worth of them.
+#[must_use]
+pub fn count() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        if !present() {
+            return 0;
+        }
+        let mut count: i32 = 0;
+        // SAFETY: a live local; the runtime is loaded (`present` said so).
+        let status = unsafe { cudarc::runtime::sys::cudaGetDeviceCount(&raw mut count) };
+        if status == cudarc::runtime::sys::cudaError::cudaSuccess {
+            usize::try_from(count).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// Whether a CUDA device is present. Must survive both a missing runtime
 /// library (cudarc's fallback-dynamic-loading panics on a missing
 /// `libcudart` rather than returning a code) and a library with no device.
@@ -144,7 +168,11 @@ impl Context {
                 let ctx = Ctx::on(stream).with_cublas(cublas).with_slabs(slabs);
                 // SAFETY: `comm` is the rank's live communicator (or null),
                 // owned by the boot for as long as this shell fires on it.
-                let ctx = if comm.is_null() { ctx } else { ctx.with_comm(comm) };
+                let ctx = if comm.is_null() {
+                    ctx
+                } else {
+                    ctx.with_comm(comm)
+                };
                 // a failed probe isn't a failed load: builders take the fallback as data.
                 let device = Device::probe(&ctx).unwrap_or(Device::L40S);
                 Ok(Context {
@@ -224,11 +252,7 @@ impl Context {
             // SAFETY: carried is a live leaked allocation, reclaimed exactly
             // once — here on the failure path, or by the trampoline.
             let code = unsafe {
-                rt::cudaLaunchHostFunc(
-                    self.notify.cast(),
-                    Some(host_fn_trampoline),
-                    carried.cast(),
-                )
+                rt::cudaLaunchHostFunc(self.notify.cast(), Some(host_fn_trampoline), carried.cast())
             };
             if code != rt::cudaError::cudaSuccess {
                 // SAFETY: the launch failed, so nothing else will ever see
@@ -616,10 +640,7 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
 
 /// One runtime status, as a shell fault.
 #[cfg(feature = "cuda")]
-pub(crate) fn check(
-    call: &'static str,
-    status: cudarc::runtime::sys::cudaError,
-) -> Result<()> {
+pub(crate) fn check(call: &'static str, status: cudarc::runtime::sys::cudaError) -> Result<()> {
     if status == cudarc::runtime::sys::cudaError::cudaSuccess {
         Ok(())
     } else {

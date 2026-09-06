@@ -771,6 +771,42 @@ impl Model {
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
+        // **The `tp` convention (design D14).** This text cuts BY HEADS and
+        // by the intermediate: `qkv` at its three seams, `o_proj` and `down`
+        // by rows (their partial products meet in the plan's `all_reduce`),
+        // `gate_up` at its gate/up seam, and every routed expert bank by its
+        // own intermediate. Norms, the embedding, the PLE planes and the
+        // vision tower are replicated.
+        //
+        // So `tp` must DIVIDE every count it cuts. It is checked here rather
+        // than left to integer division, which lands a zero-width band
+        // silently — a `[512, 0, 0]` `qkv` cut, weights that read as
+        // present, and a rank that attends to nothing. The KV heads are the
+        // binding count: E4B is 8 query heads over 2 KV heads, so it cuts at
+        // one and two ranks and REFUSES four. A 4-rank row for a GQA text
+        // this narrow needs a convention this tree does not have — a strided
+        // query-head cut with the KV planes replicated, or a band index that
+        // repeats across a group of ranks. See `.wiki/tp-verification.md`.
+        for (count, what) in [
+            (d.q_heads, "query heads"),
+            (d.kv_heads, "sliding KV heads"),
+            (d.global_kv_heads, "global KV heads"),
+            (d.intermediate, "the intermediate"),
+        ] {
+            assert!(
+                count.is_multiple_of(tp),
+                "tp {tp} does not divide this text's {count} {what}; a gemma-4 \
+                 row is cut by heads and by the intermediate, and every count \
+                 it cuts must divide the rank count"
+            );
+        }
+        if let Some(moe) = d.moe {
+            assert!(
+                moe.inter.is_multiple_of(tp),
+                "tp {tp} does not divide the routed experts' {} intermediate",
+                moe.inter
+            );
+        }
         // Everything declared here that is not a matmul bank: norms and the
         // per-layer scalar. See `crate::dense`.
         let dense = crate::dense(w);
