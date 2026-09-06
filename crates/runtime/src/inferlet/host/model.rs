@@ -34,6 +34,17 @@ pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> models::Strea
     }
 }
 
+/// One catalog axis role as the facts spell it.
+fn axis_role(role: models::AxisRole) -> pie::inferlet::model::AxisRole {
+    use pie::inferlet::model::AxisRole;
+    match role {
+        models::AxisRole::Time => AxisRole::Time,
+        models::AxisRole::Height => AxisRole::Height,
+        models::AxisRole::Width => AxisRole::Width,
+        models::AxisRole::Index => AxisRole::Index,
+    }
+}
+
 /// One catalog reading as `model.readings()` answers it.
 fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingFact {
     use pie::inferlet::model::{PortKind, ReadoutKind};
@@ -62,6 +73,14 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
                 streams: port.streams.iter().copied().map(lane_stream).collect(),
             })
             .collect(),
+        positions: reading.positions.as_ref().map(|convention| {
+            pie::inferlet::model::PositionConvention {
+                axes: convention.axes.iter().copied().map(axis_role).collect(),
+                text_axis: convention.text_axis,
+                text_origin: convention.text_origin,
+                image_follows_text: convention.image_follows_text,
+            }
+        }),
         readout: match reading.readout {
             models::ReadoutKind::Logits => ReadoutKind::Logits,
             models::ReadoutKind::Velocity => ReadoutKind::Velocity,
