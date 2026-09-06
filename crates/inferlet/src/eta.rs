@@ -1066,9 +1066,9 @@ impl<W: PassWit> Pass<W> {
     /// Bind `ch` to the reading's float port `port` (`reading-fact.ports`),
     /// read at every submit from the channel's committed cell. The host
     /// checks the channel's shape against the port; this side makes sure
-    /// the program declares the channel (a prologue read) and, for the
-    /// latents port, sizes the read-out (`velocity()` / `hidden()`) to
-    /// its rows.
+    /// the program declares the channel (a prologue read) and, for a row
+    /// port (latents, or a context lane's rows), sizes the read-out
+    /// (`velocity()` / `hidden()`) to its rows.
     pub fn input(&self, port: &str, ch: &Channel) -> Result<(), String> {
         {
             let inner = self.inner.borrow();
@@ -1081,14 +1081,20 @@ impl<W: PassWit> Pass<W> {
         }
         let wit = ch.wit();
         self.wit.input(port, wit.as_ref())?;
-        let latents = crate::model::readings().iter().any(|reading| {
-            reading
-                .ports
-                .iter()
-                .any(|fact| fact.name == port && fact.kind == crate::model::PortKind::Latents)
+        // A ROW port — latents, or the context rows a caption/context lane
+        // is made of — states the lane's row count; the two never disagree
+        // on one lane, so whichever binds sizes the read-out.
+        let row_port = crate::model::readings().iter().any(|reading| {
+            reading.ports.iter().any(|fact| {
+                fact.name == port
+                    && matches!(
+                        fact.kind,
+                        crate::model::PortKind::Latents | crate::model::PortKind::Context
+                    )
+            })
         });
         let mut inner = self.inner.borrow_mut();
-        if latents && let Some(&rows) = ch.shape().dims().first() {
+        if row_port && let Some(&rows) = ch.shape().dims().first() {
             inner.latent_rows = Some(rows);
         }
         inner.port_inputs.push((port.to_string(), ch.dsl()));
