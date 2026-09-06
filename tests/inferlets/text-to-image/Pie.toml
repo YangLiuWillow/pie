@@ -10,9 +10,9 @@ core = "^0.2.0"
 [parameters]
 prompt = {type = "string", optional = true, description = "What to draw"}
 negative_prompt = {type = "string", optional = true, description = "What to steer away from; needs guidance > 1 and a model with no guidance port (a batch-of-2 CFG run)"}
-width = {type = "integer", optional = true, description = "Pixel width, rounded down to the model's latent/patch grid (default 1024)"}
-height = {type = "integer", optional = true, description = "Pixel height, same rounding (default 1024)"}
-steps = {type = "integer", optional = true, description = "Denoise steps (default: the pinned sigma count when the schedule has one, else 8)"}
-seed = {type = "integer", optional = true, description = "Seed of the keyed Normal draw the latent starts from"}
-guidance = {type = "number", optional = true, description = "Guidance scale: the `guidance` port's value where the model has one, else the CFG scale"}
+width = {type = "int", optional = true, description = "Pixel width, rounded down to the model's latent/patch grid (default 1024)"}
+height = {type = "int", optional = true, description = "Pixel height, same rounding (default 1024)"}
+steps = {type = "int", optional = true, description = "Denoise steps (default: the pinned sigma count when the schedule has one, else 8)"}
+seed = {type = "int", optional = true, description = "Seed of the keyed Normal draw the latent starts from"}
+guidance = {type = "float", optional = true, description = "Guidance scale: the `guidance` port's value where the model has one, else the CFG scale"}
 out = {type = "string", optional = true, description = "Suggested output name (default `image`)"}
