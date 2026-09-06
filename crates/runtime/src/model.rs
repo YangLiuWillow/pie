@@ -592,6 +592,15 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "mini_dit",
     },
+    // The same text four ranks wide (design D14's bring-up row): one head
+    // per rank. `layers`/`vocab`/`arch` do not shard, so they are the
+    // one-rank row's.
+    Row {
+        id: "mini-dit-bf16-kv-bf16-tp4",
+        layers: 3,
+        vocab: 0,
+        arch: "mini_dit",
+    },
 ];
 
 /// The row with this id, or `None` if this build ships no such model.
