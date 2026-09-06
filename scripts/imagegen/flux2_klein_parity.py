@@ -38,9 +38,28 @@ Three readings, in the order the golden was made, every one gated on cosine
                  are checked against `text.input_ids` exactly.
   dit.step0.out  one `denoise` step over the golden's own step-0 inputs
                  (its prompt embeds folded, its noise, sigma 1, its ids).
+  probe.step0..3 the same one-fire step from the REFERENCE's own latent at
+                 every sigma (`dit.step{k}.in.hidden_states`), so each
+                 step's velocity is read under the reference's state
+                 instead of pie's drifting one. This is the model check.
   sched.x1..x4   the latent after every Euler step, `latent.final` = x4:
                  the four pinned sigmas, `euler_step` in the image lane's
-                 epilogue.
+                 epilogue. REPORTED, NOT GATED -- see NUMERICS.
+
+NUMERICS: WHY THE TRAJECTORY IS NOT GATED
+-----------------------------------------
+klein-4B is distilled to four steps, and its last one takes sigma 0.767 to
+0, so the trajectory amplifies a velocity difference by ~6x. bf16 alone
+moves the step-0 velocity by 4e-4 in cosine: running the SAME diffusers
+transformer in fp32 and comparing to the bf16 golden reads
+
+    velocity  fp32 vs golden bf16   cos 0.999618
+    latent x4 fp32 vs golden bf16   cos 0.997510
+
+so no bf16 engine reaches 0.999 on the final latent against this dump --
+an exact fp32 computation does not either. The per-step velocities are
+gated at 0.999 instead, and the final latent is reported beside the fp32
+number above and checked as PSNR after the VAE decode.
 
 Then `decode` writes `golden.png` / `pie.png` (both final latents through
 the same VAE) and reports PSNR between them, plus PSNR of `golden.png`
@@ -50,6 +69,19 @@ With `--native` the guest also runs the trajectory over pie's OWN text rows
 (unpadded, `L` rows: the reference's DiT saw 512 rows, pads included, so
 this is a different conditioning and is reported, not gated):
 `native.latent.final`, decoded as `native.png`.
+
+THE CONFIG NEEDS A LONGER SUBMIT DEADLINE
+----------------------------------------
+The two lanes of a denoise group compose into one fire only while the
+scheduler's cohort gate holds the boundary, and that gate is leashed by
+`[runtime] submit_deadline` (50 ms by default). A 1024^2 job's first submit
+carries a 6 MB seeded `context` channel and a 2 MB `latents` one across the
+guest boundary, which under load takes longer than that: the leash then
+seals the group's first frame with the IMAGE lane alone and the velocity
+comes back UNCONDITIONED (cos ~0.535 against the golden, and cos 0.9999
+against a reference run with no text at all). Set `submit_deadline = "10s"`
+and `silence_timeout = "300s"` under `[runtime]`; `run` refuses a config
+that does not.
 
 THE CASE CROSSES AS FILES
 -------------------------
@@ -89,8 +121,11 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 
 TOLERANCES = ["--cos-tol", "0.999"]
 
-GOLDEN_KEYS = ["text.hidden", "dit.step0.out", "sched.x1", "sched.x2", "sched.x3", "sched.x4",
-               "latent.final"]
+# What `compare` gates at `--cos-tol`. The trajectory keys are written to
+# their own npz pair and reported, for the reason NUMERICS states.
+GATED_KEYS = ["text.hidden", "dit.step0.out", "probe.step0.out", "probe.step1.out",
+              "probe.step2.out", "probe.step3.out"]
+TRAJECTORY_KEYS = ["sched.x1", "sched.x2", "sched.x3", "sched.x4", "latent.final"]
 
 
 def snapshot(args) -> str:
@@ -154,9 +189,12 @@ def case(args) -> None:
         np.ascontiguousarray(arr, dtype=np.float32).tofile(os.path.join(args.out, name))
         return name
 
+    probe = np.stack([dump[f"dit.step{k}.in.hidden_states"][0]
+                      for k in range(len(sigmas) - 1)])
     doc = {
         "prompt": prompt,
         "context_file": raw("context.f32", ctx),
+        "probe_latents_file": raw("probe.f32", probe),
         "text_rows": int(ctx.shape[0]),
         "context_width": int(ctx.shape[1]),
         "latents_file": raw("noise.f32", noise),
@@ -213,7 +251,24 @@ def scratch_base(config: str) -> str:
     if not base:
         raise SystemExit(f"{config}: set `[sandbox] fs_scratch_dir` to a directory of its own")
     os.makedirs(base, exist_ok=True)
+    # The cohort leash, see the module doc: a 50 ms deadline seals a denoise
+    # group's first frame with one lane and the answer is silently
+    # unconditioned.
+    deadline = cfg.get("runtime", {}).get("submit_deadline")
+    if not deadline or not _seconds(deadline) >= 1.0:
+        raise SystemExit(
+            f"{config}: set `[runtime] submit_deadline` to at least \"1s\" (\"10s\" is what this "
+            f"harness runs) and `silence_timeout` to at least that; at the 50 ms default the "
+            f"denoise group's first frame seals with the image lane alone")
     return base
+
+
+def _seconds(text: str) -> float:
+    """A `[runtime]` duration (`"50ms"`, `"10s"`, `"5m"`) in seconds."""
+    m = re.fullmatch(r"\s*([0-9.]+)\s*(ms|s|m|h)?\s*", str(text))
+    if not m:
+        return 0.0
+    return float(m.group(1)) * {"ms": 1e-3, None: 1.0, "s": 1.0, "m": 60.0, "h": 3600.0}[m.group(2)]
 
 
 def run(args) -> None:
@@ -234,6 +289,8 @@ def run(args) -> None:
         doc = json.load(f)
     payload = ["case.json", doc["context_file"], doc["latents_file"],
                doc["text_positions_file"], doc["image_positions_file"]]
+    if doc.get("probe_latents_file"):
+        payload.append(doc["probe_latents_file"])
 
     cmd = [pie, "--config", os.path.expanduser(args.config), "run", "--path", binary,
            "--manifest", manifest, "-o", files_dir, "--", "--case_file", "case.json",
@@ -314,6 +371,8 @@ def collect(args) -> None:
         elif (m := re.fullmatch(r"latent(\d+)\.f32", name)):
             mine[f"sched.x{m.group(1)}"] = arr
             steps = max(steps, int(m.group(1)))
+        elif (m := re.fullmatch(r"probe_velocity(\d+)\.f32", name)):
+            mine[f"probe.step{m.group(1)}.out"] = arr
         elif name == "native_velocity0.f32":
             native["native.dit.step0.out"] = arr
         elif (m := re.fullmatch(r"native_latent(\d+)\.f32", name)):
@@ -337,12 +396,24 @@ def collect(args) -> None:
               "latent.final": dump["latent.final"][0]}
     for k in range(1, steps + 1):
         theirs[f"sched.x{k}"] = dump[f"sched.x{k}"][0]
+    for k in range(steps):
+        if f"probe.step{k}.out" in mine:
+            theirs[f"probe.step{k}.out"] = dump[f"dit.step{k}.out"][0]
 
+    # Two pairs: the gated readings and the trajectory, which NUMERICS says
+    # is reported rather than gated.
     pie_npz = os.path.join(args.out, "flux2_klein_pie.npz")
     target_npz = os.path.join(args.out, "flux2_klein_target.npz")
-    np.savez(pie_npz, **{k: v.astype(np.float32) for k, v in mine.items()})
-    np.savez(target_npz, **{k: v.astype(np.float32) for k, v in theirs.items()})
-    print(f"[collect] {sorted(mine)} -> {pie_npz}; golden rows -> {target_npz}")
+    traj_npz = os.path.join(args.out, "flux2_klein_pie_trajectory.npz")
+    traj_target_npz = os.path.join(args.out, "flux2_klein_target_trajectory.npz")
+    gated = [k for k in GATED_KEYS if k in mine]
+    np.savez(pie_npz, **{k: mine[k].astype(np.float32) for k in gated})
+    np.savez(target_npz, **{k: theirs[k].astype(np.float32) for k in gated})
+    traj = [k for k in TRAJECTORY_KEYS if k in mine]
+    np.savez(traj_npz, **{k: mine[k].astype(np.float32) for k in traj})
+    np.savez(traj_target_npz, **{k: theirs[k].astype(np.float32) for k in traj})
+    print(f"[collect] gated {gated} -> {pie_npz}; golden rows -> {target_npz}")
+    print(f"[collect] trajectory {traj} -> {traj_npz}")
     if native:
         native_npz = os.path.join(args.out, "flux2_klein_native.npz")
         np.savez(native_npz, **{k: v.astype(np.float32) for k, v in native.items()})
@@ -374,14 +445,25 @@ def compare(args) -> int:
     cmd = [sys.executable, os.path.join(HERE, "compare.py"), mine, theirs, "--sort-by", "key", *TOLERANCES]
     print(f"[compare] {' '.join(cmd)}")
     status = subprocess.call(cmd) or status
+    walk = os.path.join(args.out, "flux2_klein_pie_trajectory.npz")
+    walk_target = os.path.join(args.out, "flux2_klein_target_trajectory.npz")
+    if os.path.exists(walk):
+        print("[compare] the Euler trajectory (reported, not gated -- see NUMERICS):")
+        a, b = np.load(walk), np.load(walk_target)
+        for key in TRAJECTORY_KEYS:
+            if key in a.files:
+                print(f"  {key:<16} cos {cosine(a[key], b[key]):.6f}")
+        print("  for scale: an fp32 diffusers run of the same model reads cos 0.997510 on "
+              "`latent.final` against this bf16 golden")
     native = os.path.join(args.out, "flux2_klein_native.npz")
     if os.path.exists(native):
         n = np.load(native)
-        t = np.load(theirs)
+        dump = np.load(os.path.join(args.golden, "flux2_golden.npz"))
         print("[compare] native trajectory (pie's own text rows, unpadded; reported, not gated):")
-        for key in ("native.dit.step0.out", "native.latent.final"):
-            golden = t[key.removeprefix("native.")]
-            print(f"  {key:<28} cos {cosine(n[key], golden):.6f} vs the golden's")
+        for key, golden in (("native.dit.step0.out", dump["dit.step0.out"][0]),
+                            ("native.latent.final", dump["latent.final"][0])):
+            if key in n.files:
+                print(f"  {key:<28} cos {cosine(n[key], golden):.6f} vs the golden's")
     return status
 
 
@@ -428,7 +510,7 @@ def decode(args) -> None:
         return np.asarray(pil)
 
     golden_png = to_png(dump["latent.final"][0], "golden.png")
-    mine = np.load(os.path.join(args.out, "flux2_klein_pie.npz"))
+    mine = np.load(os.path.join(args.out, "flux2_klein_pie_trajectory.npz"))
     pie_png = to_png(mine["latent.final"], "pie.png")
     ref = np.asarray(Image.open(os.path.join(args.golden, "flux2_golden.png")).convert("RGB"))
     print(f"[decode] PSNR(golden.png, flux2_golden.png) = {psnr(golden_png, ref):.2f} dB  (the decode path itself)")

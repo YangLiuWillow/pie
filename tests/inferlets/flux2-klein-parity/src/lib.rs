@@ -11,6 +11,10 @@
 //! 2. **one `denoise` step** — the golden's own step-0 inputs (its prompt
 //!    embeds folded, its noise, `σ₀ = 1`, its ids), the velocity on the
 //!    image lane.
+//! 2b. **one independent step per sigma** (`probe_latents_file`) — the
+//!    same one-fire denoise from the reference's OWN latent at every step,
+//!    so each step's velocity is checked under the reference's state
+//!    rather than under pie's drifting one.
 //! 3. **four steps** — the golden's sigmas, Euler in the image lane's
 //!    epilogue (`euler_step`), the latent after every step. With `native`,
 //!    the same trajectory again over pie's OWN text rows from (1): the
@@ -65,6 +69,15 @@ struct Case {
     image_positions_file: String,
     /// Descending, without the trailing zero.
     sigmas: Vec<f32>,
+    /// `[sigmas.len(), image_rows, channels]` f32 LE: the reference's OWN
+    /// input latent at every step. Given, the guest also runs one
+    /// independent one-fire denoise per step off these — the velocity a
+    /// step predicts under the reference's own state, which is the model
+    /// check the four-step trajectory cannot be (a distilled four-step
+    /// schedule amplifies a bf16-floor velocity difference into the final
+    /// latent; see the harness's `NUMERICS` note).
+    #[serde(default)]
+    probe_latents_file: Option<String>,
     /// Also run the trajectory over pie's own text rows.
     #[serde(default)]
     native: bool,
@@ -400,12 +413,18 @@ async fn main(input: Input) -> Result<Output> {
         &case.text_positions_file,
         (case.text_rows * ports.axes) as usize,
     )?;
-    let golden = Text {
+    // A SEEDED CHANNEL BINDS TO ONE PASS, so every trajectory below builds
+    // its own copy of the conditioning off the same host rows: sharing one
+    // `Text` across two trajectories is "seeded but no seed was put before
+    // the first fire" on the second one's text pass.
+    let conditioning = |tag: &str| Text {
         rows: case.text_rows,
-        context: Channel::from_shaped([case.text_rows, case.context_width], context)
-            .named("context"),
-        positions: Channel::from_shaped([case.text_rows, ports.axes], txt_pos).named("txt_pos"),
+        context: Channel::from_shaped([case.text_rows, case.context_width], context.clone())
+            .named(&format!("context_{tag}")),
+        positions: Channel::from_shaped([case.text_rows, ports.axes], txt_pos.clone())
+            .named(&format!("txt_pos_{tag}")),
     };
+    let golden = conditioning("walk");
     let (velocity0, latents) = trajectory(
         &golden,
         &noise,
@@ -424,12 +443,40 @@ async fn main(input: Input) -> Result<Output> {
         send_f32(&mut files, &format!("latent{}.f32", i + 1), x);
     }
 
+    // One independent fire per step, from the reference's own state.
+    if let Some(name) = &case.probe_latents_file {
+        let steps = case.sigmas.len();
+        let stack = read_f32(name, steps * (rows * width) as usize)?;
+        let stride = (rows * width) as usize;
+        for (k, sigma) in case.sigmas.iter().enumerate() {
+            let (velocity, _) = trajectory(
+                &conditioning(&format!("probe{k}")),
+                &stack[k * stride..(k + 1) * stride],
+                &img_pos,
+                rows,
+                width,
+                &[*sigma],
+                &ports,
+                &denoise.name,
+                2 + k as u32,
+                case.image_first,
+            )
+            .await
+            .with_context(|| format!("probe step {k}"))?;
+            send_f32(&mut files, &format!("probe_velocity{k}.f32"), &velocity);
+        }
+    }
+
     // The same trajectory over pie's own text rows: `(0, 0, 0, j)`.
     if case.native {
         let mut pos = Vec::with_capacity((len * ports.axes) as usize);
         for j in 0..len {
             for axis in 0..ports.axes {
-                pos.push(if axis + 1 == ports.axes { j as f32 } else { 0.0 });
+                pos.push(if axis + 1 == ports.axes {
+                    j as f32
+                } else {
+                    0.0
+                });
             }
         }
         let native = Text {
