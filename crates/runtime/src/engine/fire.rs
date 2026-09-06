@@ -64,8 +64,9 @@ pub struct FireRequest {
     /// A group composes only when its passes are members of ONE step, and
     /// the wait-all gate cannot await a pipeline it has never seen — so the
     /// scheduler holds this request's lanes out of every seal until this
-    /// many lanes of the group have arrived for their first frame. `None`
-    /// for a pass in no group.
+    /// many lanes of the group have arrived for that frame. `None` for a
+    /// pass in no group. Counted by `pipeline::instance::cohort_of`, which
+    /// says why the HOST counts this rather than the guest stating it.
     ///
     /// A stated cohort is a PROMISE: the runtime fires the group whole or
     /// not at all, and a cohort that never completes ends the process with a

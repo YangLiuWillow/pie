@@ -168,19 +168,29 @@ impl RowExpr {
 
     /// Does a windowed reader see only its own classes' rows? `Const` and
     /// `*Plus` variants reach past their own class, so cannot share.
+    ///
+    /// **`Lanes` does NOT cut.** A lane-shaped rectangle — a timestep
+    /// vector's chain — is computed at the fire's LANE carve and launched
+    /// WITHOUT the staged seat (`IMAGEGEN_CONTRACT.md` §7,
+    /// `engine_cuda::Run::unseated`), so its writer covers every lane of the
+    /// fire and not just its own class's. Two lane vectors of one shape in
+    /// two classes would otherwise be placed at one offset as "two row
+    /// windows of one column" and clobber each other — which is what a
+    /// dual-stream text with a modulation chain per stream (`models::ltx_2`)
+    /// hands the arena.
     #[must_use]
     pub fn cut_per_class(self) -> bool {
         match self {
             // `Patches` cuts for `Tokens`' reason, one axis over.
             RowExpr::Tokens
             | RowExpr::TokensTimes(_)
-            | RowExpr::Lanes
             | RowExpr::Patches
             | RowExpr::Images
             | RowExpr::Voxels
             | RowExpr::VoxelsTimes(_)
             | RowExpr::Clips => true,
-            RowExpr::Const(_)
+            RowExpr::Lanes
+            | RowExpr::Const(_)
             | RowExpr::LanesPlus(_)
             | RowExpr::ImagesPlus(_)
             | RowExpr::ClipsPlus(_) => false,

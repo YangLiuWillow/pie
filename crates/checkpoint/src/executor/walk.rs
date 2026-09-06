@@ -1118,7 +1118,16 @@ impl Walk<'_, '_> {
             // GGUF blocks); `Cast` preserves element count, not byte count.
             // Every other kind must move the same byte count it read.
             if kind == TileMapKind::Cast {
-                require_same_element_count(source_stride, &dest.stride)?;
+                // What a cast must fill is the DESTINATION's bytes, and the
+                // conversion above has already produced them. Comparing the
+                // two extents' dim products instead holds only while the
+                // SOURCE extent is element-shaped: a source the walk
+                // collapsed into RUNS — a gather or a concatenation that
+                // reads one contiguous block of its source more than once,
+                // which is how a family states `[x | x]` — carries its
+                // elements in `element_bytes` and not in `dims`.
+                let _ = source_stride;
+                require_cast_output_fits(output.len(), &dest.stride)?;
             } else if transform.scale_blocks.is_empty()
                 && kind != TileMapKind::Decode
                 && kind != TileMapKind::Repack
@@ -2305,20 +2314,20 @@ fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> 
     Ok(())
 }
 
-/// A cast is well-formed when the two sides hold the same number of
-/// *elements*; the widths differ by exactly the representations' ratio.
-fn require_same_element_count(source: &Extent, dest: &Extent) -> Result<(), Error> {
-    let count = |extent: &Extent| -> Option<i64> {
-        extent
-            .dims
-            .iter()
-            .try_fold(1i64, |acc, dim| acc.checked_mul(dim.count))
-    };
-    let (source_count, dest_count) = (count(source), count(dest));
-    if source_count.is_none() || source_count != dest_count {
+/// A cast is well-formed when what it produced fills the destination
+/// exactly: the element counts agree on both sides and the widths differ by
+/// the representations' ratio, which is the same statement in BYTES — and
+/// the only one that holds however the source extent was shaped.
+fn require_cast_output_fits(produced: usize, dest: &Extent) -> Result<(), Error> {
+    let wanted = dest
+        .dims
+        .iter()
+        .try_fold(i64::from(dest.element_bytes), |acc, dim| {
+            acc.checked_mul(dim.count)
+        });
+    if wanted != i64::try_from(produced).ok() {
         return Err(invalid(format!(
-            "cast source holds {source_count:?} elements but the destination holds \
-             {dest_count:?}"
+            "the cast produced {produced} bytes and the destination holds {wanted:?}"
         )));
     }
     Ok(())

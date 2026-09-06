@@ -472,6 +472,19 @@ impl Run<'_> {
                 let fan = self.plane_fan(self.tensor(*x).rows);
                 elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), fan, &mut self.tensor(*x))
             }
+            Elementwise::GateSigmoidMulHeads {
+                x,
+                gate,
+                head_dim,
+                scale,
+                x_out: _,
+            } => elemwise::gate::sigmoid_mul_heads(
+                self.ctx(),
+                self.tensor(*gate),
+                *head_dim,
+                *scale,
+                &mut self.tensor(*x),
+            ),
             // hc
             Elementwise::RmsnormGroupedPlusOne {
                 x,
@@ -725,6 +738,7 @@ impl Run<'_> {
                     RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
                     RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
                     RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
+                    RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
                 },
                 *rotary_dim,
                 *head_dim,

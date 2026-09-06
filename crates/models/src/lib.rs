@@ -9,6 +9,7 @@ pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod hunyuan_image_3;
 pub mod kimi_k3;
+pub mod ltx_2;
 pub mod media;
 pub mod mini_dit;
 pub mod minimax_h3;
@@ -421,6 +422,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         z_image::skus(),
         wan_2::skus(),
         minimax_h3::skus(),
+        ltx_2::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

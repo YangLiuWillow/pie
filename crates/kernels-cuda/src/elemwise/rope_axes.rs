@@ -35,9 +35,16 @@ pub enum RopeForm {
     /// reference; MiniMax H3.
     Neox,
     /// Rotate-half WITHIN the axis' own block of `2s` channels: angle `i`
-    /// turns `(x[b + i], x[b + s + i])`. `MropeForm::Split` — Gemma's tower,
-    /// LTX's `[x1 | x2]` halves.
+    /// turns `(x[b + i], x[b + s + i])`. `MropeForm::Split` — Gemma's tower.
     Split,
+    /// ONE frequency ladder across the whole row, the axes handed out
+    /// round-robin along it and `pad` identity slots in front — LTX-2's.
+    /// `dims[a]` counts the ROW's channels for axis `a` (`F_a = dims[a]/2`
+    /// frequencies), `pad = (heads·rotary_dim − Σ dims)/2`, and angle `f` of
+    /// axis `a` turns at `thetas[a]^(f/(F_a − 1))` — the positive,
+    /// endpoint-inclusive `linspace(0, 1, F_a)` ladder, not the usual
+    /// negative one. Pairing is rotate-half within a head.
+    SplitLadder,
 }
 
 impl RopeForm {
@@ -46,6 +53,7 @@ impl RopeForm {
             RopeForm::Interleaved => "0",
             RopeForm::Neox => "1",
             RopeForm::Split => "2",
+            RopeForm::SplitLadder => "3",
         }
     }
 }
@@ -80,7 +88,9 @@ pub fn rope_axes(
     o: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_axes";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    // The dtype refusal is this door's, even though the stamp it makes is
+    // read at the launch below (`fire`).
+    dtype_dispatch!(OP, x.dtype, { Bf16 => (), F16 => () });
     debug_assert!(
         x.rows == o.rows && x.width == o.width && x.dtype == o.dtype,
         "`{OP}` writes the rectangle it reads"
@@ -137,6 +147,38 @@ pub fn rope_axes(
             ),
         ));
     }
+    if form == RopeForm::SplitLadder {
+        // The ladder spans the ROW, not the head: the axes' channel counts
+        // sum to at most the whole rotated rectangle, the leftover being the
+        // identity pad in front of it.
+        if rotary_dim != head_dim {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the ladder pairs (i, i + head_dim/2) and turns the whole head, and this \
+                     call rotates {rotary_dim} of {head_dim}"
+                ),
+            ));
+        }
+        let span: u32 = dims[..axes].iter().sum();
+        let row = heads * rotary_dim;
+        if span == 0 || span > row || !(row - span).is_multiple_of(2) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the ladder's axes own {span} channels of a {row}-wide rotated row, which \
+                     leaves no whole identity pad"
+                ),
+            ));
+        }
+        if dims[..axes].iter().any(|d| *d != dims[0]) {
+            return Err(refuse(
+                OP,
+                format!("one ladder hands its axes out round-robin, and {dims:?} is not flat"),
+            ));
+        }
+        return fire(ctx, x, positions, form, dims, thetas, rotary_dim, head_dim, heads, rows, o);
+    }
     let mut spanned = 0u32;
     for (a, &d) in dims.iter().enumerate() {
         if a >= axes {
@@ -169,6 +211,28 @@ pub fn rope_axes(
         ));
     }
 
+    fire(
+        ctx, x, positions, form, dims, thetas, rotary_dim, head_dim, heads, rows, o,
+    )
+}
+
+/// The launch itself, once every form's own statute has held.
+#[allow(clippy::too_many_arguments)]
+fn fire(
+    ctx: &Ctx,
+    x: Tensor,
+    positions: Tensor,
+    form: RopeForm,
+    dims: [u32; MAX_AXES],
+    thetas: [f32; MAX_AXES],
+    rotary_dim: u32,
+    head_dim: u32,
+    heads: u32,
+    rows: u32,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rope_axes";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ctx.fire(
         OP,
         Fire::at(

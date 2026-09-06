@@ -553,6 +553,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::Scale { .. }
             | Elementwise::ResBlend { .. }
             | Elementwise::GateSigmoidMul { .. }
+            | Elementwise::GateSigmoidMulHeads { .. }
             | Elementwise::HcExpand { .. }
             | Elementwise::HcFold { .. }
             | Elementwise::RmsnormGroupedPlusOne { .. }
