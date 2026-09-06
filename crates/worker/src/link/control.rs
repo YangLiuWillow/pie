@@ -22,7 +22,15 @@ use super::partner::PartnerLinkManager;
 /// timeout so a few dropped beats never trip a false eviction.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// Coarse-load report cadence; the controller coalesces these per epoch.
+/// This is the longest a gateway can go without hearing from a quiet
+/// worker; a change of load is reported as soon as [`REPORT_POLL`] sees it.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the load is sampled for a change worth reporting early. A
+/// parked ask that cleared, or a lane that finished, used to stay invisible
+/// to every gateway for a whole [`REPORT_INTERVAL`] (sep-4 §7.15: a launch
+/// refused at the door on a stale "saturated"); the sample is two atomic
+/// loads and a pool census, so it is cheap to take often.
+const REPORT_POLL: Duration = Duration::from_millis(100);
 /// How often the dial-in links are checked for death when the roster is quiet.
 /// Cheap (a `JoinHandle::is_finished` per link) and only ever leads to work
 /// when a link has actually ended, so this can be brisk.
@@ -149,12 +157,28 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     }
 }
 
+/// What a gateway routes and admits on, coarsened to the steps it acts on:
+/// the saturation line (240), the pressure pin (224), sixteenths of the
+/// pool below that, and whether the worker is idle. A report is sent early
+/// when this changes; a change within a band waits for the interval.
+fn report_band(status: &WorkerStatus) -> (u8, bool) {
+    let bucket = status.kv_pressure_bucket;
+    let band = if bucket >= 240 {
+        u8::MAX
+    } else if bucket >= 224 {
+        u8::MAX - 1
+    } else {
+        bucket / 16
+    };
+    (band, status.inflight == 0)
+}
+
 /// Spawn the worker's three control-plane loops against `ctrl` and return
 /// their join handles.
 ///
 /// - heartbeat every [`HEARTBEAT_INTERVAL`]; [`Ack::ReRegister`] is fatal since
 ///   gateway/partner state is keyed by the old worker id.
-/// - report coarse load every [`REPORT_INTERVAL`].
+/// - report coarse load every [`REPORT_INTERVAL`], or as soon as it changes band.
 /// - watch the neighbor view and reconcile the [`GatewayLinkManager`]'s
 ///   dial-in links against each update.
 pub fn spawn_control_tasks<C: ControlLink>(
@@ -190,7 +214,8 @@ pub fn spawn_control_tasks<C: ControlLink>(
 
     let report_ctrl = ctrl.clone();
     let report_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REPORT_INTERVAL);
+        let mut ticker = tokio::time::interval(REPORT_POLL);
+        let mut last: Option<(WorkerStatus, Instant)> = None;
         loop {
             ticker.tick().await;
             let status = WorkerStatus {
@@ -199,6 +224,16 @@ pub fn spawn_control_tasks<C: ControlLink>(
                     .len()
                     .min(u32::MAX as usize) as u32,
             };
+            let due = match &last {
+                None => true,
+                Some((sent, at)) => {
+                    at.elapsed() >= REPORT_INTERVAL || report_band(sent) != report_band(&status)
+                }
+            };
+            if !due {
+                continue;
+            }
+            last = Some((status, Instant::now()));
             if runtime::planner::trace_enabled() {
                 println!(
                     "[report] kv_bucket={} inflight={} queue=[{}]",
