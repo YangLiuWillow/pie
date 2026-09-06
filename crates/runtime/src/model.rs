@@ -547,6 +547,23 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // Z-Image (M1). `layers` is the encoder's depth the plan runs (its
+    // `hidden` tap is addressed by layer, at 34); `vocab` is the encoder's
+    // embedding width, which the `text` reading embeds by — nothing samples
+    // from it, since no reading of this family has logits.
+    Row {
+        id: "z-image-turbo-bf16-kv-bf16",
+        layers: 35,
+        vocab: 151_936,
+        arch: "z_image",
+    },
+    // The miniature: no encoder, so no vocabulary; six DiT blocks.
+    Row {
+        id: "z-image-mini-bf16-kv-bf16",
+        layers: 6,
+        vocab: 0,
+        arch: "z_image",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes

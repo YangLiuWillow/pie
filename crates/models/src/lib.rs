@@ -13,6 +13,7 @@ pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
 pub mod template;
+pub mod z_image;
 pub mod tokenizer;
 
 use std::sync::LazyLock;
@@ -333,6 +334,9 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         kimi_k3::skus(),
         qwen_3::skus(),
         qwen_4::skus(),
+        // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row
+        // spells, so the generative rows identify nothing above them.
+        z_image::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),
