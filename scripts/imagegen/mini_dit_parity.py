@@ -11,9 +11,9 @@ script is the other half: it turns the golden's *inputs* into the case JSON the
     python mini_dit_parity.py case  --out /tmp/mini-dit-parity
     python mini_dit_parity.py case  --out /tmp/mini-dit-parity --euler
 
-    # 2. run it (needs the imported artifact and a serving pie)
-    python mini_dit_parity.py run   --out /tmp/mini-dit-parity \
-        --inferlet tests/inferlets/mini-dit-parity
+    # 2. run it (the config's `[model] model` is the imported artifact; the
+    #    case files must be reachable as /scratch/<name> inside the sandbox)
+    python mini_dit_parity.py run   --out /tmp/mini-dit-parity --config ~/.pie/config.toml
 
     # 3. the pie-side npz, then the diff
     python mini_dit_parity.py collect --out /tmp/mini-dit-parity
@@ -145,6 +145,36 @@ def cases(args) -> list[str]:
 # run
 # ----------------------------------------------------------------------------
 
+def wasm(inferlet: str) -> str:
+    """The newest `.wasm` a build left for `inferlet`, building one first.
+
+    Newest wins, not first, for `tests/inferlets/conftest.py`'s reason: a
+    release artifact built once by hand would otherwise shadow every debug
+    rebuild afterwards, silently.
+    """
+    name = os.path.basename(os.path.normpath(inferlet))
+    stem = name.replace("-", "_")
+    workspace = os.path.dirname(os.path.normpath(inferlet))
+    if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
+        done = subprocess.run(
+            ["cargo", "build", "-p", name, "--target", "wasm32-wasip2"],
+            cwd=workspace, capture_output=True, text=True,
+        )
+        if done.returncode != 0:
+            sys.stderr.write(done.stderr)
+            raise SystemExit(f"building {name} for wasm32-wasip2 failed")
+    candidates = [
+        os.path.join(workspace, "target/wasm32-wasip2/release", f"{stem}.wasm"),
+        os.path.join(workspace, "target/wasm32-wasip2/debug", f"{stem}.wasm"),
+        os.path.join(inferlet, "target/wasm32-wasip2/release", f"{stem}.wasm"),
+        os.path.join(inferlet, "target/wasm32-wasip2/debug", f"{stem}.wasm"),
+    ]
+    present = [path for path in candidates if os.path.exists(path)]
+    if not present:
+        raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
+    return max(present, key=os.path.getmtime)
+
+
 def run(args) -> None:
     paths = sorted(
         os.path.join(args.out, name)
@@ -159,11 +189,20 @@ def run(args) -> None:
             f"{pie}: no pie binary. Build one with "
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
+    binary = wasm(args.inferlet)
+    manifest = os.path.join(args.inferlet, "Pie.toml")
+    # `pie run` takes no `--model`: the row it serves comes from the config,
+    # which has to point `[model] model` at the artifact this row imported
+    # (`pie model import ... --sku mini-dit-bf16-kv-bf16`). The sandbox needs
+    # `allow_fs` and a scratch dir holding the case files, since a case is
+    # far past one command-line argument.
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie{'_euler' if args.euler else ''}_{b}.json")
-        cmd = [
-            pie, "run", args.inferlet,
-            "--model", args.model,
+        cmd = [pie]
+        if args.config:
+            cmd += ["--config", args.config]
+        cmd += [
+            "run", "--path", binary, "--manifest", manifest,
             "--", "--case_file", os.path.basename(case),
         ]
         if args.euler:
@@ -280,7 +319,9 @@ def main() -> int:
     ap.add_argument("--euler", action="store_true",
                     help="the four-step schedule instead of one step")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/mini-dit-parity"))
-    ap.add_argument("--model", default=DEFAULT_SKU)
+    ap.add_argument("--config", default=None,
+                    help=f"the serving config; its `[model] model` must be the artifact "
+                         f"`{DEFAULT_SKU}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--keys", action="append", default=None)
     args = ap.parse_args()
