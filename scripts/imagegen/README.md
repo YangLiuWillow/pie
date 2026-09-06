@@ -387,6 +387,29 @@ Runs 64 target tokens + **2 references of 64 tokens** at RoPE `T = 10` and `T = 
 | `flux2_mini.safetensors` | 26,422,928 | `c8127a7a22a40e2c863e48a45ed80b62` |
 | `flux2_mini_config.json` | 4,530 | `0a80cb07bd98017049c77edcd9e2f79e` |
 
+#### The pie side — `flux2_parity.py`
+
+`tests/inferlets/flux2-parity` is the `flux2-mini` row's guest: one denoise
+step over three lanes of one group — the text lane (`context` port, the raw
+`[32, 192]` stack), the target lane (`latents`, 64 rows) and ONE reference
+lane (`latents` again, both references' 128 rows, at their own `T`
+offsets) — every lane binding `timestep` (`σ·1000`, i.e. 500) and
+`guidance` (4.0, raw), the target lane alone reading out `velocity()`.
+`flux2_parity.py` turns `flux2_mini.npz`'s inputs into the case, runs it,
+and diffs pie's `[1, 64, 128]` against `mini.out.0[:, :64]` (the reference
+discards the reference rows' predictions; pie never computes them).
+
+```bash
+# the artifact: the golden dir needs a `config.json` and a tokenizer
+# beside the weights (the snapshot's `tokenizer/{tokenizer,tokenizer_config}.json`)
+pie model import "$PIE_IMAGEGEN_GOLDEN/flux2/" --sku flux2-mini-bf16-kv-bf16 \
+    --out ~/.cache/pie-imagegen/flux2-mini.zt
+python flux2_parity.py all --out /tmp/flux2-parity --config ~/.pie/config.flux2-mini.toml
+```
+
+Measured (bf16 pie vs the fp32 golden): max-abs 0.0059, rel 0.0044, cos
+0.99999 — under the mini-dit gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`).
+
 ### `wan22_golden.py` → `/root/.cache/pie-imagegen/golden/wan22/`
 
 `WanPipeline` on TI2V-5B, 480x832, **17 frames**, **8 steps**, seed 0, bf16 DiT with

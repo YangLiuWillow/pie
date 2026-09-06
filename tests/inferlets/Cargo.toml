@@ -43,6 +43,7 @@ members = [
     "diffusion-parity",
     "latent-probe",
     "mini-dit-parity",
+    "flux2-parity",
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",
