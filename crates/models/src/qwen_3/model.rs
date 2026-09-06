@@ -726,6 +726,72 @@ impl Model {
         )
     }
 
+    /// Qwen3.5-2B (`mlx-community/Qwen3.5-2B-4bit`): the 0.8B's layout at
+    /// hidden 2048 — 8 query heads over 2 kv, 16 × 128 for both GDN sides,
+    /// MLP 6144, tied embeddings.
+    pub fn d2b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 2048,
+                layers: 24,
+                attn_every: 4,
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 16,
+                v_heads: 16,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 6144 },
+                vocab: 248_320,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
+    /// Qwen3.5-9B (`mlx-community/Qwen3.5-9B-4bit`): 32 layers at hidden
+    /// 4096, 16 query heads over 4 kv, GDN 16 key × 32 value heads of 128,
+    /// MLP 12288, its own `lm_head`.
+    pub fn d9b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 4096,
+                layers: 32,
+                attn_every: 4,
+                q_heads: 16,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 16,
+                v_heads: 32,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 12288 },
+                vocab: 248_320,
+                tied: false,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
     /// Qwen3.6-27B: a SKU of this family, not a separate one —
     /// `config.json` names itself `qwen3_5`. `attn_every = 4` (3 linear : 1
     /// full attention), `q_proj` is gated (`attn_output_gate`), `rotary_dim
