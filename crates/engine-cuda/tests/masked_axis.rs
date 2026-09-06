@@ -128,7 +128,19 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     // attention rows, and those rows carry the mask predicate qwen35 does.
     // DiffusionGemma is the gemma4 26B-A4B trunk under a second reading;
     // its attention rows carry the same mask predicate.
-    const DECLARE: [&str; 5] = ["gemma4-", "diffusiongemma-", "qwen35-", "qwen36-", "qwen38-"];
+    // HunyuanImage 3 is the image half of the same story: its denoise reading
+    // states one mask per layer — the guest's slab, a causal text prefix
+    // joined to a canvas whose rows all see each other — so the arm it takes
+    // is `attention.masked{causal: false}`, the reading the diffusion axis
+    // was built for.
+    const DECLARE: [&str; 6] = [
+        "gemma4-",
+        "diffusiongemma-",
+        "hunyuanimage3-",
+        "qwen35-",
+        "qwen36-",
+        "qwen38-",
+    ];
     // And the four whose OWN attention text has a written reason it cannot
     // state the arm. Their trunk rows must stay maskless; a row of theirs that
     // wears a drafter head is reading a second text and is judged as such.
