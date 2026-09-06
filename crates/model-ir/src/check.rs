@@ -243,6 +243,13 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     // A guarded fold clobbers only the lanes it is admitted on, so the rule
     // asks whether every lane the READER serves lies inside them: two arms of
     // one split fold one rectangle on disjoint rows, and are no fault.
+    //
+    // NODE READERS ONLY. A seam runs at plan end and so reads through every
+    // fold after it — but an observation seam is deliberately planted on a
+    // value the next op folds (`attn.out` names the merge that
+    // `gate_sigmoid_mul` then gates), and that is an exactness question about
+    // what a probe hands out, not a wrong answer in the plan. Faulting it here
+    // would refuse half the text catalog for a debug knob.
     if folded.iter().any(Option::is_some) {
         for (k, node) in trace.nodes.iter().enumerate() {
             ins.clear();
@@ -252,7 +259,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                     continue; // already an OutOfRange fault above
                 }
                 seen.clear();
-                intact(trace, &folded, id, id, k, node, &mut seen, &mut faults);
+                intact(trace, &folded, id, id, k, &mut seen, &mut faults);
             }
         }
     }
@@ -373,21 +380,23 @@ fn available(
 /// arm the merge may select is a rectangle the reader may be handed.
 fn intact(
     trace: &Trace, folded: &[Option<(usize, &'static str)>], root: ValueId, id: ValueId,
-    at: usize, by: &crate::Node, seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
+    at: usize, seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
 ) {
-    if let Some((fold, fold_op)) = folded[id.0 as usize] {
-        if fold < at && by.guard.implies(&trace.nodes[fold].guard) {
-            faults.push(Fault::FoldThenRead {
-                fold, fold_op, input: id,
-                node: at, op: by.op.name(),
-                arm: (id != root).then_some(root),
-            });
-        }
+    let by = &trace.nodes[at];
+    if let Some((fold, fold_op)) = folded[id.0 as usize]
+        && fold < at
+        && by.guard.implies(&trace.nodes[fold].guard)
+    {
+        faults.push(Fault::FoldThenRead {
+            fold, fold_op, input: id,
+            node: at, op: by.op.name(),
+            arm: (id != root).then_some(root),
+        });
     }
     if let Def::Merge(arms) = &trace.values[id.0 as usize].def {
         for &(arm, _) in arms {
             if (arm.0 as usize) < trace.values.len() && seen.insert(arm.0) {
-                intact(trace, folded, root, arm, at, by, seen, faults);
+                intact(trace, folded, root, arm, at, seen, faults);
             }
         }
     }

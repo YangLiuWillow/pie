@@ -117,6 +117,16 @@ both. `lane_of_row` is `request_of_token()` (`[Tokens] i32`) for a `[Lanes, ·]`
 - `Elementwise::Silu { x }`, `Gelu { x, tanh: bool }`, `Tanh { x }`: in place (`x_out`
   aliases `x`). `Mul { x, y } -> z`, `Add { x, y } -> z`: fresh, same type on all three.
   DSL: `elemwise::{modulate, gated_residual_add, sinusoid, silu, gelu, tanh, mul, add}`.
+- **AN IN-PLACE FOLD IS THE LAST READ OF ITS OPERAND.** Every `aliases()` pair `(out, in)`
+  is folded onto `in`'s rectangle unconditionally (`model_compiler::arena::fold_in_place`) —
+  no copy is minted for an operand something else still reads. So a value read twice may be
+  folded over at most once, and the second reader gets a copy: `elemwise::copy(v)` (`2v·½`,
+  exact, one fresh rectangle). This is the shape adaLN keeps walking into — one timestep
+  projection a fire, a `scale_shift_table` per block, `add_bias` folding the projection
+  itself so block `n+1` reads the sum of every table before it (exact at one block, drifting
+  with depth, invisible to a two-block miniature). `check` refuses it as `FoldThenRead`,
+  guard-aware: only a reader whose lanes all lie inside the fold's is a fault, so two arms of
+  one split folding one rectangle on disjoint rows still pass.
 
 ## 4. RoPE over guest positions (D7)
 
