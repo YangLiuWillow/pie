@@ -672,6 +672,54 @@ impl Model {
         )
     }
 
+    /// **`a3b_micro`'S SIBLING WITH A BANK TOO BIG TO CACHE.** Not a catalog
+    /// row either — no checkpoint ships it.
+    ///
+    /// `a3b_micro`'s whole expert bank is a few megabytes, which sits inside
+    /// a serving card's last-level cache, so a per-route re-read of it never
+    /// reaches memory. That is the case that flatters the per-route GEMV
+    /// most, and measuring the grouped routed matmul against it understates
+    /// what grouping is worth by the width of the cache.
+    ///
+    /// This one's gate/up bank is `32 * 2 * 512 * 2048` bf16 — 134 MiB, past
+    /// the 48 MiB an L40S carries — so a re-read is a fetch. One layer,
+    /// because the bank is the whole point and four of them would be four
+    /// times the fixture on disk for no more signal.
+    pub fn a3b_uncached_bank(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 2048,
+                layers: 1,
+                attn_every: 1,
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 64,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 8,
+                v_heads: 8,
+                k_dim: 64,
+                v_dim: 64,
+                conv_kernel: 4,
+                mlp: MlpDims::Routed(MoeDims {
+                    experts: 32,
+                    top_k: 4,
+                    inter: 512,
+                    shared_inter: 512,
+                }),
+                vocab: 2048,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
     pub fn d0_8b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d0_8b_dims(None, None))
     }
