@@ -110,11 +110,16 @@ fn check(
         u32::try_from(k).unwrap(),
         Dtype::Bf16,
     );
-    // `[experts, N, K]` as the engine flattens it: `experts * N` rows of K.
+    // **THE RECTANGLE THE SHELL ACTUALLY HANDS.** A routed bank arrives one
+    // row per expert, each row that expert's whole `N x K` plane — the
+    // `[experts, N, K]` declaration flattened on its last two axes. Building
+    // it as `experts * N` rows of K would be the same bytes and would pass
+    // the GEMV (which reads a pointer and a stated stride), while telling the
+    // grouped leg's dispatch a shape no fire ever carries.
     let bank = Tensor::new(
         bank_at,
-        u32::try_from(experts * n).unwrap(),
-        u32::try_from(k).unwrap(),
+        u32::try_from(experts).unwrap(),
+        u32::try_from(n * k).unwrap(),
         Dtype::Bf16,
     );
     let routes_t = Tensor::new(

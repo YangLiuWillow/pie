@@ -81,7 +81,8 @@ fn price(experts: usize, top_k: usize, n: usize, k: usize, by_token: bool, label
 
     let ctx = gpu.ctx();
     let x_t = Tensor::new(x_at, act_rows as u32, k as u32, Dtype::Bf16);
-    let bank_t = Tensor::new(bank_at, (experts * n) as u32, k as u32, Dtype::Bf16);
+    // One row per expert, the row its whole plane — see the correctness test.
+    let bank_t = Tensor::new(bank_at, experts as u32, (n * k) as u32, Dtype::Bf16);
     let routes_t = Tensor::new(routes_at, tokens() as u32, top_k as u32, Dtype::I32);
     let mut y_t = Tensor::new(y_at, (tokens() * top_k) as u32, n as u32, Dtype::Bf16);
 

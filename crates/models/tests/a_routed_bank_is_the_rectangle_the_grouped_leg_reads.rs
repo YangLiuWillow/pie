@@ -2,11 +2,19 @@
 //! DECLARED.**
 //!
 //! `kernels_cuda::linear::moe::matmul_select` groups a wide fire by expert
-//! instead of firing one GEMV per route, and it recovers the expert count
-//! from the shapes alone: the bank arrives flattened to `rows x width`, and
-//! the entry reads `experts = bank.rows / y.width` after checking that
-//! `bank.width` is the activation's. A bank declared any other way fails
-//! that check and the entry falls back to the per-route GEMV.
+//! instead of firing one GEMV per route, and it checks the bank it was
+//! handed before it does: the shell flattens a `[experts, N, K]` declaration
+//! on its LAST TWO axes, so a routed bank arrives as `[experts, N * K]` —
+//! one row per expert, each row that expert's whole plane. The entry takes
+//! `bank.rows` for the expert count and requires `bank.width` to be
+//! `x.width * y.width`. A bank declared any other way fails that and the
+//! entry falls back to the per-route GEMV.
+//!
+//! That the flattening is on the last two axes and not the first is not a
+//! detail: reading it the other way makes the check reject every real fire,
+//! and the optimisation is then dead in the engine while every kernel test
+//! still passes. It was, until `engine-cuda`'s
+//! `a_prefill_past_the_gemvs_grid_is_served` fired one and found out.
 //!
 //! That fallback is silent, and it is meant to be — a wrong guess about a
 //! bank's layout must not be a wrong answer. But silence is also how a
@@ -66,17 +74,19 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
                 continue;
             };
             checked += 1;
-            // `[experts, N, K]`, which flattens to the `experts * N` rows of
-            // `K` the shell hands the entry.
+            // `[experts, N, K]`, which the shell flattens to the `experts`
+            // rows of `N * K` the entry is handed.
             match bank_shape.as_slice() {
                 [experts, bank_n, bank_k] => {
                     if *bank_n != n || *bank_k != k {
                         faults.push(format!(
                             "`{}`: a routed bank of {bank_shape:?} against a {k}-wide \
                              activation and a {n}-wide result. The grouped leg wants \
-                             `[experts, {n}, {k}]`; this one falls back to the GEMV and \
-                             the family keeps the per-route read",
+                             `[experts, {n}, {k}]`, which reaches it as rows of \
+                             {}; this one falls back to the GEMV and the family \
+                             keeps the per-route read",
                             row.name,
+                            n * k,
                         ));
                     } else if *experts == 0 {
                         faults.push(format!("`{}`: a routed bank of no experts", row.name));

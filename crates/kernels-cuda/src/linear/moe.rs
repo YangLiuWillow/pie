@@ -539,13 +539,17 @@ fn grouped_worth(
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
         return None;
     }
-    // The bank is `[experts, N, K]` flattened to rows x width, so its rows
-    // are `experts * N` and its width is the activation's.
-    if y.width == 0 || bank.width != x.width || !bank.rows.is_multiple_of(y.width) {
+    // **ONE ROW PER EXPERT, AND THE ROW IS THE WHOLE PLANE.** The shell hands
+    // a routed bank as `[experts, N * K]` — the `[experts, N, K]` declaration
+    // flattened on its LAST TWO axes, not its first two — which is why the
+    // GEMV is handed `n * k` as its expert stride rather than reading one off
+    // the rectangle. So the expert count is the row count, and the width is
+    // the plane the stride steps over.
+    let count = bank.rows;
+    if count == 0 || count > MAX_EXPERTS {
         return None;
     }
-    let count = bank.rows / y.width;
-    if count == 0 || count > MAX_EXPERTS {
+    if u64::from(bank.width) != u64::from(x.width) * u64::from(y.width) {
         return None;
     }
     let per_expert = fan.route_count.div_ceil(count);
