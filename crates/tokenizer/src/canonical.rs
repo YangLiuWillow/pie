@@ -235,6 +235,18 @@ impl Tokenizer {
 
 fn describe_pipeline(pipeline: &Pipeline) -> PipelineDescriptor {
     match pipeline {
+        // **NOT SERIALIZED YET, and refused rather than approximated.** A
+        // Unigram model's scores are a plane of their own — one f32 per
+        // piece — and `pie.tokenizer/1` states five objects, none of which
+        // holds them (`MERGE_TABLE` is empty for a Unigram and reusing it
+        // would be exactly the reinterpretation this format exists to rule
+        // out). Loading one from `tokenizer.json` works; baking one into a
+        // `.zt` needs a sixth object and the three readers of `OBJECTS`
+        // updated with it.
+        Pipeline::Unigram { .. } => panic!(
+            "a Unigram tokenizer does not serialize into `pie.tokenizer/1` yet: its \
+             per-piece scores have no object in the format"
+        ),
         Pipeline::ByteLevelRegex {
             nfc,
             splitters,

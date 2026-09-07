@@ -80,8 +80,166 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
 
 /// Load a tokenizer from raw HF `tokenizer.json` bytes.
 pub fn from_slice(json: &[u8]) -> Result<Tokenizer> {
+    // The model type decides the SHAPE of `model.vocab`, so it is read
+    // before anything is deserialized into a typed record: BPE's vocab is
+    // `{piece: id}` and Unigram's is `[[piece, score], …]`, and `HfModel`
+    // can only hold the first.
+    let probe: serde_json::Value =
+        serde_json::from_slice(json).context("parsing tokenizer JSON")?;
+    if probe.get("model").and_then(|m| m.get("type")).and_then(serde_json::Value::as_str)
+        == Some("Unigram")
+    {
+        return unigram_from_value(&probe);
+    }
     let hf: HfTokenizerJson = serde_json::from_slice(json).context("parsing tokenizer JSON")?;
     from_hf(hf)
+}
+
+/// **SENTENCEPIECE UNIGRAM** (umT5, and every T5 relative), read off the same
+/// `tokenizer.json` a BPE model uses and nothing else — no `spiece.model`
+/// protobuf, which is the other door and one this does not need.
+///
+/// Refuses by name, rather than approximating, anything this does not serve:
+/// byte fallback, a normalizer that is not the space-run collapse, a
+/// pre-tokenizer that is not Metaspace, or a post-processor that appends
+/// anything but one special token.
+fn unigram_from_value(root: &serde_json::Value) -> Result<Tokenizer> {
+    use std::collections::HashMap;
+
+    let model = root.get("model").context("tokenizer JSON states no model")?;
+    ensure!(
+        model.get("byte_fallback").and_then(serde_json::Value::as_bool) != Some(true),
+        "a Unigram with byte fallback is unsupported: a character outside the vocabulary \
+         would have to spell as `<0xNN>` pieces, and this reads it as `unk`"
+    );
+    let unk_id = model
+        .get("unk_id")
+        .and_then(serde_json::Value::as_u64)
+        .context("a Unigram states `unk_id`; without one it cannot spell every string")?;
+    let unk_id = u32::try_from(unk_id).context("`unk_id` is outside the u32 range")?;
+
+    let entries = model
+        .get("vocab")
+        .and_then(serde_json::Value::as_array)
+        .context("a Unigram's `vocab` is an array of `[piece, score]`")?;
+    let mut pieces: Vec<(String, f32)> = Vec::with_capacity(entries.len());
+    let mut vocab: HashMap<String, u32> = HashMap::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let pair = entry
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .with_context(|| format!("vocab entry {index} is not a `[piece, score]` pair"))?;
+        let piece = pair[0]
+            .as_str()
+            .with_context(|| format!("vocab entry {index}'s piece is not a string"))?;
+        let score = pair[1]
+            .as_f64()
+            .with_context(|| format!("vocab entry {index}'s score is not a number"))?;
+        let id = u32::try_from(index).context("Unigram vocabulary is too large")?;
+        pieces.push((piece.to_string(), score as f32));
+        // First writer wins, matching the score table: a duplicate piece
+        // later in the list is unreachable in both.
+        vocab.entry(piece.to_string()).or_insert(id);
+    }
+
+    let replacement = unigram_metaspace(root)?;
+    let eos_id = unigram_template_tail(root, &vocab)?;
+    let scores = crate::unigram::UnigramScores::new(&pieces, unk_id)?;
+
+    // The symbol table is the SAME one BPE uses — id to bytes and back — so
+    // decode, the grammar vocabulary and the special-token walk all keep
+    // working with no Unigram of their own. There are no merges.
+    let bpe = BpeTable::from_vocab_and_merges(&vocab, &[], false)?;
+    let added_tokens = added_tokens_of(root)?;
+    Tokenizer::new(
+        bpe,
+        Pipeline::Unigram {
+            scores,
+            replacement,
+            prepend_always: true,
+            eos_id,
+        },
+        added_tokens,
+    )
+}
+
+/// The Metaspace marker, and the refusal for every other pre-tokenizer.
+fn unigram_metaspace(root: &serde_json::Value) -> Result<String> {
+    let pre = root
+        .get("pre_tokenizer")
+        .context("a Unigram tokenizer states a Metaspace pre-tokenizer")?;
+    ensure!(
+        pre.get("type").and_then(serde_json::Value::as_str) == Some("Metaspace"),
+        "unsupported Unigram pre-tokenizer: {}",
+        pre.get("type").and_then(serde_json::Value::as_str).unwrap_or("(none)")
+    );
+    ensure!(
+        pre.get("prepend_scheme").and_then(serde_json::Value::as_str) == Some("always"),
+        "only `prepend_scheme = \"always\"` is served; this states {:?}",
+        pre.get("prepend_scheme")
+    );
+    Ok(pre
+        .get("replacement")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("\u{2581}")
+        .to_string())
+}
+
+/// The `TemplateProcessing` tail: the ONE special token every encode ends
+/// with, resolved to its id. `None` for a tokenizer that appends nothing.
+fn unigram_template_tail(
+    root: &serde_json::Value,
+    vocab: &std::collections::HashMap<String, u32>,
+) -> Result<Option<u32>> {
+    let Some(post) = root.get("post_processor") else {
+        return Ok(None);
+    };
+    ensure!(
+        post.get("type").and_then(serde_json::Value::as_str) == Some("TemplateProcessing"),
+        "unsupported post-processor: {:?}",
+        post.get("type")
+    );
+    let single = post
+        .get("single")
+        .and_then(serde_json::Value::as_array)
+        .context("a TemplateProcessing states a `single` template")?;
+    // `[Sequence A, SpecialToken X]` and nothing else: a template that
+    // prefixes, or appends more than one, is refused rather than half-read.
+    ensure!(
+        single.len() == 2 && single[0].get("Sequence").is_some(),
+        "only a `[sequence, special]` template is served; this states {} piece(s)",
+        single.len()
+    );
+    let name = single[1]
+        .get("SpecialToken")
+        .and_then(|t| t.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .context("the template's trailing piece is not a special token")?;
+    let id = vocab
+        .get(name)
+        .copied()
+        .with_context(|| format!("the template appends {name:?}, which the vocabulary has no id for"))?;
+    Ok(Some(id))
+}
+
+/// The `added_tokens` list, in the shape [`Tokenizer::new`] takes.
+fn added_tokens_of(root: &serde_json::Value) -> Result<Vec<AddedToken>> {
+    let Some(list) = root.get("added_tokens").and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for entry in list {
+        let hf: HfAddedToken =
+            serde_json::from_value(entry.clone()).context("parsing an added token")?;
+        out.push(AddedToken {
+            id: hf.id,
+            content: hf.content,
+            special: hf.special,
+            lstrip: hf.lstrip,
+            rstrip: hf.rstrip,
+        });
+    }
+    Ok(out)
 }
 
 fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {

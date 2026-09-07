@@ -231,3 +231,76 @@ pub fn gemma_json() -> Value {
         }
     })
 }
+
+/// **A SENTENCEPIECE UNIGRAM**, in the shape umT5's `tokenizer.json` states
+/// it: an ordered `[[piece, score], …]` vocabulary (index IS id), a Metaspace
+/// pre-tokenizer and decoder at `prepend_scheme = "always"`, the space-run
+/// collapse normalizer, and a `TemplateProcessing` that ends every encode
+/// with `</s>`.
+///
+/// Small on purpose — the point is the WALK and the wrapping, both of which
+/// are the same at four pieces as at 256 300, and `tokenizers` is the judge
+/// either way.
+pub fn unigram_json() -> Value {
+    // Scores chosen so the walk cannot be greedy and pass: `ab` is worse than
+    // `a` + `b`, and `▁re` is better than `▁` + `re`.
+    let vocab = json!([
+        ["<pad>", 0.0],
+        ["</s>", 0.0],
+        ["<s>", 0.0],
+        ["<unk>", 0.0],
+        ["\u{2581}", -2.0],
+        ["a", -1.0],
+        ["b", -1.0],
+        ["ab", -9.0],
+        ["re", -3.0],
+        ["\u{2581}re", -2.5],
+        ["d", -1.5],
+        ["\u{2581}a", -1.5]
+    ]);
+    json!({
+        "version": "1.0",
+        "added_tokens": [
+            {"id": 0, "content": "<pad>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true},
+            {"id": 1, "content": "</s>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true},
+            {"id": 2, "content": "<s>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true},
+            {"id": 3, "content": "<unk>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true}
+        ],
+        "normalizer": {
+            "type": "Sequence",
+            "normalizers": [{"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "}]
+        },
+        "pre_tokenizer": {
+            "type": "Metaspace", "replacement": "\u{2581}",
+            "prepend_scheme": "always", "split": true
+        },
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "</s>", "type_id": 0}}
+            ],
+            "pair": [
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "</s>", "type_id": 0}}
+            ],
+            "special_tokens": {
+                "</s>": {"id": "</s>", "ids": [1], "tokens": ["</s>"]}
+            }
+        },
+        "decoder": {
+            "type": "Metaspace", "replacement": "\u{2581}",
+            "prepend_scheme": "always", "split": true
+        },
+        "model": {
+            "type": "Unigram",
+            "unk_id": 3,
+            "vocab": vocab,
+            "byte_fallback": false
+        }
+    })
+}

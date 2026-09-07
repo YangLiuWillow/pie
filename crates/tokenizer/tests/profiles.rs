@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{MergeFormat, byte_level_json, gemma_json};
+use common::{MergeFormat, byte_level_json, gemma_json, unigram_json};
 use serde_json::json;
 use tokenizer::Tokenizer;
 use tokenizers::Tokenizer as HfTokenizer;
@@ -135,4 +135,50 @@ fn grammar_bytes_are_decoder_aware_and_exclude_specials() {
     let gemma: Tokenizer = gemma_json().to_string().parse().unwrap();
     assert_eq!(gemma.decoded_token_bytes(4), Some(&b"a "[..]));
     assert_eq!(gemma.decoded_token_bytes(6 + 0xE5), Some(&[0xE5][..]));
+}
+
+/// **THE UNIGRAM WALK AND ITS WRAPPING, AGAINST HUGGING FACE ITSELF.**
+///
+/// `assert_exact` is the judge: pie's ids must equal `tokenizers`' ids and
+/// both decodes must agree, for every string. What each string is for:
+///
+/// - `"ab"` — the walk must not be greedy. `ab` is one piece and matches
+///   further, and it scores worse than `a` + `b`.
+/// - `"a red"` and `"red"` — `prepend_scheme = "always"` means a leading word
+///   and an interior one take the SAME piece, which is the whole point of the
+///   scheme and the thing a `FirstSegment` prefix would get wrong.
+/// - `"a  b"` — the normalizer collapses the run of spaces before anything
+///   else sees it.
+/// - `""` — a template post-processor still appends its tail; the answer is
+///   `[</s>]` and not nothing.
+/// - `"aQb"` — `Q` is in no piece, so it is one `unk` and the walk carries on
+///   past it. Byte fallback is off, so it is not a run of `<0xNN>`.
+///
+/// Compared against `tokenizers` WITH special tokens, unlike `assert_exact`'s
+/// other callers. That is not a loosening: a `TemplateProcessing` post-
+/// processor is part of what the model reads, and umT5's answer for any
+/// string ends with `</s>`. The BPE families here have no post-processor —
+/// their specials arrive as chat-template TEXT — which is why the shared
+/// helper asks for none.
+#[test]
+fn a_unigram_walks_and_wraps_exactly_as_hugging_face_does() {
+    let json = unigram_json();
+    let bytes = serde_json::to_vec(&json).unwrap();
+    let pie = std::str::from_utf8(&bytes)
+        .unwrap()
+        .parse::<Tokenizer>()
+        .unwrap();
+    let hf = HfTokenizer::from_bytes(&bytes).unwrap();
+    assert_eq!(pie.vocab_size(), hf.get_vocab_size(true));
+
+    for text in ["ab", "a red", "red", "a  b", "", "aQb", "abab", "d"] {
+        let ids = pie.encode(text);
+        let hf_ids = hf.encode(text, true).unwrap().get_ids().to_vec();
+        assert_eq!(ids, hf_ids, "encoding {text:?}");
+        assert_eq!(
+            pie.decode(&ids, true),
+            hf.decode(&ids, true).unwrap(),
+            "decoding {text:?}"
+        );
+    }
 }

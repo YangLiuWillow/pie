@@ -7,6 +7,7 @@
 //! pipelines. Unsupported legacy combinations are rejected at load time.
 
 mod bpe;
+mod unigram;
 pub mod canonical;
 pub mod contract;
 pub mod loader;
@@ -71,6 +72,29 @@ pub(crate) struct Splitter {
     pub(crate) keep_gaps: bool,
 }
 
+/// umT5's one normalizer: `Replace { pattern: Regex " {2,}", content: " " }`.
+/// Written out rather than run as a regex — the pattern is a run of spaces and
+/// nothing else, and a scan is cheaper than a match on every prompt.
+fn collapse_space_runs(text: &str) -> Cow<'_, str> {
+    if !text.contains("  ") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch == ' ' {
+            if !in_run {
+                out.push(' ');
+            }
+            in_run = true;
+        } else {
+            in_run = false;
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Compiled tokenizer behavior for the modern model families supported by Pie.
 #[derive(Debug)]
 pub(crate) enum Pipeline {
@@ -91,6 +115,25 @@ pub(crate) enum Pipeline {
         /// undoing the dummy prefix.
         strip_decoder_marker: bool,
     },
+    /// **SentencePiece Unigram** (umT5, and every T5 relative): a Metaspace
+    /// pre-tokenizer, a Viterbi walk over the piece scores, and a template
+    /// post-processor that ends every encode with one token.
+    ///
+    /// No merges and no ranks — see [`crate::unigram`] for why none of the
+    /// BPE machinery applies to the search, and why the symbol table still
+    /// does.
+    Unigram {
+        scores: crate::unigram::UnigramScores,
+        /// The Metaspace marker (`▁`) spaces become and decode back into.
+        replacement: String,
+        /// `prepend_scheme = "always"`: every segment gets a leading marker,
+        /// which is what makes a leading word and an interior one the same
+        /// piece.
+        prepend_always: bool,
+        /// The template post-processor's trailing token (`</s>` for umT5).
+        /// `None` for a template that appends nothing.
+        eos_id: Option<u32>,
+    },
     /// Minimal char-level path used by grammar fixtures and `from_vocab`.
     RawChar,
 }
@@ -99,6 +142,12 @@ impl Pipeline {
     fn grammar_token_bytes(&self, raw: Arc<[u8]>) -> Arc<[u8]> {
         match self {
             Self::ByteLevelRegex { .. } | Self::RawChar => raw,
+            // A Unigram piece is a string with the Metaspace marker where a
+            // space was; the grammar wants the string a reader would see.
+            // No byte fallback to undo — this vocabulary states none.
+            Self::Unigram { replacement, .. } => {
+                replace_bytes(raw.as_ref(), replacement.as_bytes(), b" ").into()
+            }
             Self::ByteFallbackReplace {
                 normalizer_from,
                 normalizer_to,
@@ -257,10 +306,14 @@ impl Tokenizer {
     /// Append encoded token IDs to an existing output buffer.
     pub fn encode_into(&self, text: &str, ids: &mut Vec<u32>) {
         if text.is_empty() {
+            // Not nothing: a template post-processor still appends its tail,
+            // and the reference tokenizer answers `[</s>]` for "".
+            self.append_template_tail(ids);
             return;
         }
         let Some(matcher) = &self.added_token_matcher else {
             self.encode_text(text, true, ids);
+            self.append_template_tail(ids);
             return;
         };
 
@@ -286,6 +339,16 @@ impl Tokenizer {
         if last_end < text.len() {
             self.encode_text(&text[last_end..], last_end == 0, ids);
         }
+        self.append_template_tail(ids);
+    }
+
+    /// The `TemplateProcessing` post-processor's trailing token, appended once
+    /// per encode — never per segment, which is why it lives here and not in
+    /// `encode_text`. Only a pipeline that states one has one.
+    fn append_template_tail(&self, ids: &mut Vec<u32>) {
+        if let Pipeline::Unigram { eos_id: Some(id), .. } = &self.pipeline {
+            ids.push(*id);
+        }
     }
 
     /// Encode a single piece of text using the appropriate BPE atom mode.
@@ -306,6 +369,7 @@ impl Tokenizer {
             Pipeline::ByteFallbackReplace { unk_token_id, .. } => {
                 bpe::bpe_encode_chars(piece, &self.bpe, false, true, *unk_token_id, ids)
             }
+            Pipeline::Unigram { scores, .. } => scores.encode(piece, ids),
             Pipeline::RawChar => bpe::bpe_encode_chars(piece, &self.bpe, true, false, None, ids),
         }
     }
@@ -346,6 +410,30 @@ impl Tokenizer {
                 } else {
                     self.encode_piece(&text, ids);
                 }
+            }
+            // METASPACE, at `prepend_scheme = "always"`. The normalizer
+            // collapses runs of two or more spaces to one (umT5's only
+            // normalizer), spaces become the marker, and one marker goes in
+            // front of EVERY segment — which is what makes a word the same
+            // piece whether it starts the string or sits inside it.
+            Pipeline::Unigram {
+                replacement,
+                prepend_always,
+                ..
+            } => {
+                let collapsed = collapse_space_runs(text);
+                let mut piece = String::with_capacity(replacement.len() + collapsed.len());
+                if *prepend_always {
+                    piece.push_str(replacement);
+                }
+                for ch in collapsed.chars() {
+                    if ch == ' ' {
+                        piece.push_str(replacement);
+                    } else {
+                        piece.push(ch);
+                    }
+                }
+                self.encode_piece(&piece, ids);
             }
             Pipeline::RawChar => self.encode_piece(text, ids),
         }
@@ -435,6 +523,14 @@ impl Tokenizer {
                     normalizer_from.as_bytes(),
                     strip_prefix,
                 )
+            }
+            // The Metaspace decoder, and nothing else: `prepend_scheme =
+            // "always"` put one marker at the front, so one leading space
+            // comes off.
+            Pipeline::Unigram { replacement, .. } => {
+                let text = self.decode_raw(ids, skip_special);
+                let text = text.replace(replacement.as_str(), " ");
+                text.strip_prefix(' ').map_or(text.clone(), str::to_string)
             }
             Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar => {
                 self.decode_raw(ids, skip_special)
@@ -629,7 +725,10 @@ impl TokenizerDecoder {
     pub fn feed(&mut self, ids: &[u32]) -> String {
         let mut output = Vec::with_capacity(ids.len() * 4);
         match &self.tokenizer.pipeline {
-            Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar => {
+            // A Unigram piece is whole UTF-8 with the Metaspace marker where
+            // a space was, so it drains like the raw path; the marker comes
+            // off the drained text, never off a partial code point.
+            Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar | Pipeline::Unigram { .. } => {
                 for &id in ids {
                     if self.skip_special
                         && self.tokenizer.special_token_ids.binary_search(&id).is_ok()
@@ -694,7 +793,7 @@ impl TokenizerDecoder {
     pub fn finish(&mut self) -> String {
         let mut output = Vec::new();
         match &self.tokenizer.pipeline {
-            Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar => {
+            Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar | Pipeline::Unigram { .. } => {
                 drain_utf8(&mut self.pending_utf8, &mut output, true);
             }
             Pipeline::ByteFallbackReplace { .. } => {
