@@ -358,7 +358,12 @@ impl Run<'_> {
                 // (`store::kv::probe`); the dispatch takes its geometry from
                 // the pool the store already shaped.
                 kv_heads: _,
-                causal,
+                // Dropped, not forgotten: `attention.masked` reads its
+                // causality out of the MASK BITS, and the flag is
+                // `attention.prefill`'s reading of the same word (see the
+                // `PlanPrefill` arm above, which says so). Named and bound
+                // to `_` so the arm still shows what it was handed.
+                causal: _,
                 q,
                 plan,
                 mask,

@@ -24,11 +24,13 @@ pub struct KeepAlive {
 
 /// How long after the last enqueue the spinner keeps going: the gap between
 /// one token's fire and the next is host turnaround (well under this).
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const LINGER_MS: u64 = 250;
 
 /// The spinner's inner loop count, tuned so one dispatch is a few hundred
 /// microseconds — short enough that the real fire's next command buffer is
 /// never far behind it. `diagnostics = "keepalive-iters=<n>"` moves it.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const DEFAULT_ITERS: u32 = 20_000;
 
 impl KeepAlive {

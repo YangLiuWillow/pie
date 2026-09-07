@@ -29,8 +29,12 @@ const ROUTE_FILE: &str = "linear/moe_route.metal";
 /// The file the routed tiled points live in.
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 
-/// Threadgroup of the tiled point: `WM * WN * SIMD_SIZE` lanes.
-const QMM_GROUP: [u32; 3] = [32, 2, 2];
+// No `QMM_GROUP` here. It used to state `[32, 2, 2]` as the tiled point's
+// threadgroup, and it was BOTH unused and stale: the shader derives its own
+// `qmm_tgp()` from the row tile now (`quant_qmm_t.metal`, whose comment says
+// the flat literal "was correct for exactly the rungs that predate the 8"),
+// and the launch takes its grid from `quant::qmm_grid`. A constant that
+// documents an obsolete shape is worse than no constant.
 
 /// The contraction step the tiled points walk.
 const QMM_BK: u32 = 32;

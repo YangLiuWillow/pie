@@ -33,12 +33,15 @@ const KERNEL_FUSED: KernelKind = KernelKind::Fused;
 /// Fallback launch width when `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`
 /// cannot be read: 256 is a power of two and inside every device's limit, so
 /// a failed query still launches.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const DEFAULT_BLOCK_THREADS: u32 = 256;
 
 /// The warp width, and the floor a rounded-down launch width may not cross.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const WARP: u32 = 32;
 
 /// The largest block CUDA permits.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const MAX_BLOCK_THREADS: u32 = 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +442,7 @@ fn launch_width(function: cudarc::driver::sys::CUfunction) -> u32 {
 
 /// `max_threads` rounded down to a power of two inside `[WARP, 1024]`. Split
 /// out of the query so the arithmetic is testable with no GPU in the room.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn round_down_to_power_of_two(max_threads: i32) -> u32 {
     // Below one warp the attribute is not believable; fall back rather than
     // launch a partial warp.

@@ -36,6 +36,7 @@ pub struct Transfer {
 /// The chunk list, shared read-only across worker threads.
 ///
 /// SAFETY: built before the scope opens and never mutated inside it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct Cargo(Vec<Transfer>);
 
 // SAFETY: read-only list of addresses for the scope's lifetime.
@@ -46,10 +47,13 @@ unsafe impl Send for Cargo {}
 /// One lane: a stream, and the pinned double buffer it feeds.
 #[derive(Debug)]
 struct Lane {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stream: *mut c_void,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pinned: [Pinned; 2],
     /// Recorded after the H2D that reads `pinned[i]`. A lane waits on it
     /// before overwriting that buffer.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     done: [Event; 2],
 }
 
@@ -64,9 +68,11 @@ unsafe impl Send for Lane {}
 #[derive(Debug)]
 pub struct Lanes {
     lanes: Vec<Lane>,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     buf_bytes: usize,
     /// The ordinal every worker thread binds: `cudaSetDevice` is per-thread
     /// and does not travel with a spawn.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     device: i32,
 }
 

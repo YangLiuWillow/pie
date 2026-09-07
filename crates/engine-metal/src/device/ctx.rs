@@ -454,6 +454,7 @@ impl Frame {
     /// compute pass is closed for the blit; the caller reopens one with
     /// [`Frame::next_pass`].
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
@@ -486,6 +487,7 @@ impl Frame {
         }
     }
 
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     pub(crate) fn copy(
         &mut self,
         source: &super::alloc::Slab,

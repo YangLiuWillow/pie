@@ -14,7 +14,10 @@
 
 use std::cell::RefCell;
 
-use kernels_metal::{ArgValue, Encode, Error, Fire, Tensor};
+use kernels_metal::{ArgValue, Encode, Error, Fire};
+#[cfg(target_vendor = "apple")]
+use kernels_metal::Tensor;
+#[cfg(target_vendor = "apple")]
 use model_exec::fire::MaskSpan;
 use model_ir::ValueId;
 
@@ -416,6 +419,7 @@ fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
     format!("{entrypoint} [{}]", scalars.join(","))
 }
 
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn record_kernel(name: &str, seconds: f64) {
     let ns = (seconds * 1e9).max(0.0) as u64;
     let mut table = KERNEL_PROFILE

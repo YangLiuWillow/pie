@@ -110,9 +110,21 @@ impl Handles {
         let binding = self.get(handle).ok_or_else(|| Fault::Unbound {
             what: format!("handle {handle}, which no row answers"),
         })?;
-        let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        // The buffer only exists on Apple, and so does the copy into it: off
+        // Apple this function is a refusal and nothing is allocated. Split
+        // rather than allocated-then-discarded, which is what left `out`
+        // unused, `mut` needless and the tail unreachable — four warnings
+        // for one shape.
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (binding, len);
+            Err(Fault::Unbound {
+                what: "a buffer read on a platform with no Metal buffers".to_string(),
+            })
+        }
         #[cfg(target_vendor = "apple")]
         {
+            let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
             use objc2_metal::MTLBuffer as _;
             let have = binding.slab().length() as u64;
             if binding.offset().saturating_add(len) > have {
@@ -132,15 +144,8 @@ impl Handles {
                     out.len(),
                 );
             }
+            Ok(out)
         }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            let _ = binding;
-            return Err(Fault::Unbound {
-                what: "a buffer read on a platform with no Metal buffers".to_string(),
-            });
-        }
-        Ok(out)
     }
 
     /// Mint a handle `skip` bytes further into whatever `handle` names.

@@ -75,6 +75,7 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 /// pages, `committed` is mapped pages; the budget charges their sum.
 #[derive(Debug)]
 pub struct PhysicalPool {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     device: i32,
     /// `cuMemGetAllocationGranularity(CU_MEM_ALLOC_GRANULARITY_MINIMUM)`.
     granularity: u64,

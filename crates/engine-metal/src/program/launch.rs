@@ -681,6 +681,7 @@ fn scratch_zeroing_skipped() -> bool {
 /// are idempotent, so this prices a dispatch; `streamed-limit=k` runs only the
 /// first k steps, which breaks the program and times what ran.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct StreamedKnobs {
     max_groups: u32,
     repeat: usize,
@@ -690,6 +691,7 @@ struct StreamedKnobs {
 
 /// The boot's word list, in this module's own vocabulary. `StepKind` is
 /// private here, so the mapping from the typed word lives here too.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn streamed_knobs() -> StreamedKnobs {
     let diag = crate::diag::on();
     StreamedKnobs {
@@ -714,17 +716,20 @@ fn streamed_knobs() -> StreamedKnobs {
 /// loop itself a third of the latter. Sixty-four blocks of a few hundred
 /// threads fill the device once; each thread then strides a handful of
 /// elements.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const STREAMED_MAX_GROUPS: u32 = 64;
 
 /// Level-`l + 1` chunks one threadgroup of a reduce dispatch folds; the
 /// runtime's `M4_REDUCE_CHUNKS_PER_GROUP`. A dispatch at level `l` covers
 /// `32 × this` level-`l` chunks per group.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const REDUCE_CHUNKS_PER_GROUP: u32 = 4;
 
 /// The threadgroup a streamed region is dispatched with: the pipeline's
 /// widest, capped at the region ceiling, rounded down to a power of two of
 /// at least 32 — the reductions fold across SIMD groups and divide the
 /// group into rounds, so its width must divide evenly.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(super) fn streamed_threads(max_total: usize) -> usize {
     let capped = max_total.clamp(1, REGION_THREADS as usize);
     let pow2 = 1usize << (usize::BITS - 1 - capped.leading_zeros());
@@ -736,6 +741,7 @@ pub(super) fn streamed_threads(max_total: usize) -> usize {
 /// its result's length; `Single` one group; `Reduce` one per tree level, each
 /// over that level's chunks; `Argmax` a partial pass over the row and a final
 /// pass over the partials.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn streamed_dispatches(
     steps: &[StreamedStep],
     descriptors: &[ValueDesc],

@@ -161,6 +161,7 @@ pub fn embed_vocab_shard(
 ///
 /// [`Error::Refused`] for a `y` that is not `world` shards wide, or a launch
 /// the runtime refused.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn gather_width_concat(
     ctx: &Ctx,
     src: u64,

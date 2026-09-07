@@ -95,6 +95,7 @@ pub struct Context {
     /// One `cudaEvent_t` per `model_compiler::EventId`, created once at load.
     events: Vec<crate::device::graph::Event>,
     /// This context's own scratch slabs, not shared with any other context.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     slabs: Slabs,
     device: Device,
     toggles: Toggles,
@@ -535,6 +536,7 @@ impl std::fmt::Debug for Context {
 /// This device's compute capability, or `(0, 0)` if it cannot be read —
 /// which becomes `sm_00` and is refused by NVRTC by name, rather than
 /// silently building for the wrong part.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn capability(ordinal: i32) -> (i32, i32) {
     #[cfg(feature = "cuda")]
     {

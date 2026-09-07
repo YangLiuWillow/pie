@@ -369,6 +369,7 @@ impl Drop for GraphExec {
 /// dependency edge between launches, not a runtime synchronization.
 #[derive(Debug)]
 pub struct Event {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     raw: *mut c_void,
 }
 
