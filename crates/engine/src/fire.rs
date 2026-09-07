@@ -246,6 +246,15 @@ pub struct Lane {
     /// `None` is a group of its own (every lane today).
     #[serde(default)]
     pub group: Option<u32>,
+    /// The OTHER attention group whose same-stream lane this lane's
+    /// epilogue reads as `IntrinsicId::PeerVelocity` — what classifier-free
+    /// guidance combines against. Another group, not another lane of this
+    /// one: guidance's two branches are independent denoisings and must not
+    /// attend each other. `None` is no peer; a program reading a peer
+    /// velocity with none stated is refused by name rather than reading its
+    /// own rows twice.
+    #[serde(default)]
+    pub peer: Option<u32>,
     /// Which of the family's declared readings (arms) this lane runs
     /// (`Request::in_reading`); 0 is the family's default arm.
     #[serde(default)]

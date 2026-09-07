@@ -238,6 +238,8 @@ def run(args) -> None:
                 cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
         if args.euler:
             cmd += ["--euler", "true"]
+        if getattr(args, "cfg", False):
+            cmd += ["--cfg", "true", "--cfg_scale", str(args.cfg_scale)]
         print(f"[run] {' '.join(cmd)}")
         done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
         if done.returncode != 0:
@@ -269,6 +271,94 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
+
+
+def guidance(args) -> int:
+    """CLASSIFIER-FREE GUIDANCE, ON THE DEVICE — does it run, and is it right?
+
+    Six lanes, two attention groups, one fire: group 0 holds the case's
+    context, group 1 a zeroed one, and group 0's image lane names group 1 as
+    its peer, so its epilogue holds BOTH branches' velocities and combines
+    them. That combine is what every guest did on the host until now.
+
+    Checked with three claims, all WITHIN one fire's own answers and needing
+    no golden. Same-fire matters: a six-lane fire and a three-lane one give
+    the same lane slightly different bf16 answers (measured: rel 0.0056),
+    because the composition differs and so does the accumulation order — so
+    an identity that compares across the two is not an identity at all, and
+    an earlier version of this check failed intermittently for exactly that
+    reason.
+
+      s = 0  ->  the combine IS the unconditional branch, exactly. That
+                 branch publishes its own velocity from the SAME fire, so
+                 this is bit-for-bit. It is the claim that proves the peer
+                 bind pointed at the OTHER group and not at its own rows —
+                 the one failure a plausible-looking picture would hide.
+      s = 1 vs 0  ->  the two must differ by a real margin. Without this the
+                 other two claims hold trivially: a lane guided by itself
+                 answers the same thing at every scale.
+      s = 2  ->  the combine is AFFINE in s: `g(2) = 2 g(1) - g(0)`, since
+                 `g(s) = u + s(c - u)`. Proves the arithmetic, and every
+                 term comes from a fire of the same shape.
+    """
+    bad = 0
+    answers = {}
+    for scale in (0.0, 1.0, 2.0):
+        run_args = argparse.Namespace(**vars(args))
+        run_args.cfg = True
+        run_args.cfg_scale = scale
+        run_args.euler = False
+        run_args.out = os.path.join(args.out, f"s{scale:g}")
+        cases(run_args)
+        run(run_args)
+        answers[scale] = [document(path) for path in numbered(run_args.out, "pie", False)]
+
+    batches = len(answers[0.0])
+    if not batches:
+        print("[guidance] FAIL the guest published nothing")
+        return 1
+
+    for at in range(batches):
+        g0 = np.asarray(answers[0.0][at]["cfg_guided"], dtype=np.float32)
+        g1 = np.asarray(answers[1.0][at]["cfg_guided"], dtype=np.float32)
+        g2 = np.asarray(answers[2.0][at]["cfg_guided"], dtype=np.float32)
+        unc = np.asarray(answers[0.0][at]["cfg_uncond"], dtype=np.float32)
+        if min(g0.size, g1.size, g2.size, unc.size) == 0:
+            print(f"[guidance] batch {at}: FAIL the guest published no velocities")
+            bad += 1
+            continue
+
+        # 1. The peer bind points at the OTHER group's rows.
+        if np.array_equal(g0, unc):
+            print(f"[guidance] batch {at}: PASS s=0 the combine is the unconditional "
+                  f"branch, exactly — the peer is the other group")
+        else:
+            off = float(np.linalg.norm(g0 - unc)) / max(float(np.linalg.norm(unc)), 1e-30)
+            print(f"[guidance] batch {at}: FAIL s=0 the combine differs from the "
+                  f"unconditional branch of its OWN fire by rel {off:.3g}")
+            bad += 1
+
+        # 2. Guidance actually moves the answer.
+        spread = float(np.linalg.norm(g1 - g0)) / max(float(np.linalg.norm(g0)), 1e-30)
+        if spread > 1e-3:
+            print(f"[guidance] batch {at}: PASS guidance moves the velocity by rel "
+                  f"{spread:.4f} between s=0 and s=1")
+        else:
+            print(f"[guidance] batch {at}: FAIL s=0 and s=1 agree to rel {spread:.3g}; "
+                  f"the branches never conditioned separately, so every other claim "
+                  f"here holds trivially")
+            bad += 1
+
+        # 3. The combine is affine in s.
+        want = 2.0 * g1 - g0
+        off = float(np.linalg.norm(g2 - want)) / max(float(np.linalg.norm(want)), 1e-30)
+        if off < 1e-5:
+            print(f"[guidance] batch {at}: PASS s=2 is 2*s1 - s0 to rel {off:.3g} — "
+                  f"the combine is affine in the scale")
+        else:
+            print(f"[guidance] batch {at}: FAIL s=2 is not 2*s1 - s0: rel {off:.3g}")
+            bad += 1
+    return 1 if bad else 0
 
 
 def collect(args) -> str:
@@ -348,7 +438,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
+    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all", "guidance"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/mini-dit-parity")
     ap.add_argument("--policy", choices=["bf16", "fp32"], default="bf16",
@@ -364,8 +454,14 @@ def main() -> int:
     ap.add_argument("--keys", action="append", default=None)
     ap.add_argument("--tap", default=None,
                     help="the dump key the artifact was imported to export (PIE_MINI_DIT_TAP)")
+    ap.add_argument("--cfg", action="store_true",
+                    help="classifier-free guidance ON THE DEVICE: six lanes, two "
+                         "attention groups, one fire, combined in the epilogue")
+    ap.add_argument("--cfg-scale", dest="cfg_scale", type=float, default=1.0)
     args = ap.parse_args()
 
+    if args.cmd == "guidance":
+        return guidance(args)
     if args.cmd == "case":
         cases(args)
     elif args.cmd == "run":

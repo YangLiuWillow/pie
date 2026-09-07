@@ -57,6 +57,10 @@ pub struct Seated<'a> {
     pub stream: u8,
     /// The attention group this lane joins; `None` is a group of its own.
     pub group: Option<u32>,
+    /// Which OTHER attention group's same-stream lane this lane's epilogue
+    /// reads `IntrinsicId::PeerVelocity` off; `None` is no peer. What
+    /// guidance combines against.
+    pub peer: Option<u32>,
     /// The float ports this lane feeds from its channels' committed cells
     /// (design D3); empty for a lane of a plan that reads none.
     pub ports: &'a [PortFeed],
@@ -83,6 +87,7 @@ impl<'a> Seated<'a> {
             readout: None,
             stream: 0,
             group: None,
+            peer: None,
             ports: &[],
         }
     }

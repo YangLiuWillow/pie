@@ -177,6 +177,11 @@ pub struct ForwardBindings {
     pub stream: Option<models::Stream>,
     /// `forward-pass.group`: the attention group this pass's lanes join.
     pub group: Option<u32>,
+    /// `forward-pass.peer`: which OTHER attention group holds the lane this
+    /// pass's epilogue reads `intrinsics::peer_velocity` off — its guidance
+    /// branch. `None` is no peer, and a program that reads a peer velocity
+    /// without one is refused.
+    pub peer: Option<u32>,
     /// `forward-pass.input`: the reading's float ports, each bound to a
     /// channel whose committed cell feeds it at every submit.
     pub ports: Vec<PortBinding>,
@@ -227,6 +232,7 @@ pub struct LaneFacts {
     pub reading: u8,
     pub stream: ::engine::fire::LaneStream,
     pub group: Option<u32>,
+    pub peer: Option<u32>,
     pub ports: Vec<::engine::fire::PortFeed>,
 }
 
@@ -237,6 +243,7 @@ impl LaneFacts {
             lane.reading = self.reading;
             lane.stream = self.stream;
             lane.group = self.group;
+            lane.peer = self.peer;
             lane.ports = self.ports.clone();
         }
     }
@@ -272,18 +279,39 @@ impl LaneFacts {
 /// **build every pass of a group before submitting any of them**, and let
 /// every one of them submit into the group's frame. `latent::DenoiseLoop`
 /// does both by construction (`fire(&[..])` takes the whole group).
+/// A guidance pair is ONE cohort. When a pass names a peer group, its lanes
+/// and that group's must be members of one fire — the peer's velocity is
+/// read off the fire-wide velocity plane, and a peer in another fire is not
+/// on that plane at all. So the count spans both groups, and both groups'
+/// passes must name each other so that both arrive at the same number.
+/// A pass naming a peer that never names it back fires short and is refused
+/// by name at readback rather than reading rows that are not there.
 #[must_use]
 pub fn cohort_of(
     table: &mut wasmtime::component::ResourceTable,
     group: Option<u32>,
+    peer: Option<u32>,
 ) -> Option<u32> {
     let group = group?;
     let members = table
         .iter_mut()
         .filter_map(|entry| entry.downcast_ref::<ForwardPass>())
-        .filter(|pass| pass.bindings.group == Some(group))
+        .filter(|pass| {
+            pass.bindings.group == Some(group) || (peer.is_some() && pass.bindings.group == peer)
+        })
         .count();
     Some(u32::try_from(members).unwrap_or(u32::MAX).max(1))
+}
+
+/// The key a cohort gathers under: the group itself, or — for a guidance
+/// pair — the lower of the two group ids, so both branches gather under one
+/// key and the seal waits for all of them.
+#[must_use]
+pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
+    match (group, peer) {
+        (Some(group), Some(peer)) => Some(group.min(peer)),
+        (group, _) => group,
+    }
 }
 
 /// A catalog stream as the engine's lane stream (codes agree).

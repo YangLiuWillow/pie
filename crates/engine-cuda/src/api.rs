@@ -1434,6 +1434,7 @@ impl Cuda {
                     // and the shell builds the packing tables off the pair.
                     stream: lane.stream as u8,
                     group: lane.group,
+                    peer: lane.peer,
                     ports: &lane.ports,
                 })
             })

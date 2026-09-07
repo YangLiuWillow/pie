@@ -311,6 +311,30 @@ def plain(text: str) -> str:
     return worst_cos(text)
 
 
+def guidance_readout(text: str) -> str:
+    """`mini_dit_parity.py guidance`: the three claims, worst case each."""
+    def verdict(pattern: str, label: str) -> str | None:
+        hits = re.findall(pattern, text)
+        if not hits:
+            return None
+        ok = all(v == "PASS" for v in hits)
+        return f"{label} {'pass' if ok else 'FAIL'}"
+
+    bits = []
+    for pattern, label in (
+        (r"(PASS|FAIL) s=0 the combine (?:is|differs)", "peer is the other group:"),
+        (r"(PASS|FAIL) guidance moves|(PASS|FAIL) s=0 and s=1 agree", "guidance moves:"),
+        (r"(PASS|FAIL) s=2 is", "affine in s:"),
+    ):
+        got = verdict(pattern.replace("|(PASS|FAIL)", "|"), label)
+        if got:
+            bits.append(got)
+    moved = re.search(r"moves the velocity by rel ([0-9.]+)", text)
+    if moved:
+        bits.append(f"moves {moved.group(1)}")
+    return "  ".join(bits) or "no guidance lines"
+
+
 def zimage_turbo_readout(text: str) -> str:
     bits = [sectioned_cos(text)]
     for _, value in psnrs(text, keep="golden latent decode"):
@@ -480,6 +504,26 @@ def roster() -> list[Gate]:
                    ("four Euler steps", harness("mini_dit_parity.py", "all", "--euler",
                                                 "--out", "{out}", "--config", "{config}"))],
             readout=plain,
+            timeout=1800,
+        ),
+        Gate(
+            name="guidance",
+            wraps="mini_dit_parity.py guidance",
+            expected="s=0 IS the unconditional branch of its own fire, guidance "
+                     "moves the answer, and the combine is affine in s",
+            note="classifier-free guidance ON THE DEVICE: six lanes, two attention "
+                 "groups, one fire, combined in the epilogue off "
+                 "`intrinsics::peer_velocity`. Needs no golden: every claim is "
+                 "checked WITHIN one fire's own answers, because a six-lane fire "
+                 "and a three-lane one give the same lane different bf16 answers "
+                 "(rel 0.0056) and a cross-fire identity is not one.",
+            needs=[(a("mini-dit.zt"),
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"--out {a('mini-dit.zt')}")],
+            config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
+            steps=[("two scales", harness("mini_dit_parity.py", "guidance", "--out", "{out}",
+                                          "--config", "{config}"))],
+            readout=guidance_readout,
             timeout=1800,
         ),
         Gate(

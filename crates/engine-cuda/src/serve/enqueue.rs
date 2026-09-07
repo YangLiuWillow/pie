@@ -40,6 +40,71 @@ pub(super) struct GuestBatch {
     seq: u64,
 }
 
+/// Which fire lane a `peer` names: the lane of attention group `want` that
+/// carries the SAME STREAM as the asking lane.
+///
+/// Guidance names a group rather than a lane because its two branches must
+/// not attend each other — they are two independent denoisings of one
+/// canvas, one holding the prompt and one the negative one, and one
+/// attention group would make each see the other's rows. So they are two
+/// groups of one fire, and the stream picks the branch's own rectangle out
+/// of the group (a group also seats its context lane, which predicts no
+/// velocity).
+///
+/// Refused, never guessed, in three cases a guest can write: a peer group
+/// this fire seats no same-stream lane of, one it seats several of, and the
+/// asking lane's own group. The last matters most — it is guidance quietly
+/// becoming `u + s(u − u)`, a picture that looks fine and is unguided.
+fn seating(lanes: &[super::Seated<'_>]) -> String {
+    let mut out = String::new();
+    for (at, lane) in lanes.iter().enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        match lane.group {
+            Some(group) => out.push_str(&format!("lane {at} group {group} stream {}", lane.stream)),
+            None => out.push_str(&format!("lane {at} ungrouped stream {}", lane.stream)),
+        }
+    }
+    out
+}
+
+fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize> {
+    if lanes[at].group == Some(want) {
+        return Err(Fault::program(
+            "serve::readback",
+            format!(
+                "lane {at} names attention group {want} as its peer and is itself a \
+                 lane of {want}; guidance combines two independent denoisings"
+            ),
+        ));
+    }
+    let stream = lanes[at].stream;
+    let mut found: Vec<usize> = (0..lanes.len())
+        .filter(|other| lanes[*other].group == Some(want) && lanes[*other].stream == stream)
+        .collect();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(Fault::program(
+            "serve::readback",
+            format!(
+                "lane {at} names attention group {want} as its peer, and this fire \
+                 seats no lane of {want} on stream {stream} for it to read; this \
+                 fire seats {}",
+                seating(lanes)
+            ),
+        )),
+        many => Err(Fault::program(
+            "serve::readback",
+            format!(
+                "lane {at} names attention group {want} as its peer, and this fire \
+                 seats {many} lanes of {want} on stream {stream}; which one is the \
+                 peer is not the shell's to guess"
+            ),
+        )),
+    }
+}
+
 impl Shell {
     /// `enqueue`'s body — see the wrapper for what it does not do.
     ///
@@ -1077,6 +1142,26 @@ impl FireCtx<'_> {
                     plane.width,
                     first_row[lane],
                 )?;
+                // GUIDANCE. A lane that named a peer reads that lane's rows
+                // off the SAME plane at the SAME stride — only the first row
+                // differs. There is no ordering to arrange: this rectangle
+                // was written by the forward walk, on this stream, before any
+                // epilogue block started. (A cross-lane CHANNEL read is the
+                // other question, and it is not this one: a put lands in
+                // `pending_cell` and commits at `Wave::land`, after every
+                // lane's regions, and two lanes are two CTAs of one launch.)
+                if let Some(peer_group) = p.lanes[lane].peer {
+                    let peer = peer_lane(p.lanes, lane, peer_group)?;
+                    self.programs.bind_intrinsic(
+                        attached.instance,
+                        eta_ir::op::IntrinsicId::PeerVelocity,
+                        plane.ptr,
+                        storage_of(plane),
+                        plane.width,
+                        plane.width,
+                        first_row[peer],
+                    )?;
+                }
             }
             if let Some(plane) = hidden {
                 self.programs.bind_intrinsic(

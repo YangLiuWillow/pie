@@ -39,7 +39,11 @@ const PINNED: &[(&str, u16, u64)] = &[
     // and the emitted preamble's per-intrinsic side tables are pitched by
     // `IntrinsicId::SLOTS` -- so every emitted kernel's bytes move, not only
     // those of a program that reads the new one.
-    ("cuda", 38, 0xeed7_a136_c421_b1fa),
+    // 38 -> 39: `IntrinsicId::PeerVelocity` joined the intrinsic set (the
+    // guidance read: another lane of one's own attention group's velocity),
+    // so `IntrinsicId::SLOTS` moved 10 -> 11 and every emitted kernel's
+    // per-intrinsic side tables re-pitch -- for the same reason 37 -> 38 did.
+    ("cuda", 39, 0xf839_541b_764d_fe20),
     // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
     // emitted kernel) grew the threadgroup-partitioned op walk, then the
     // partitioned selections, then the streamed form's level reductions and

@@ -688,6 +688,13 @@ pub trait PassWit: Sized + 'static {
                 .to_string(),
         )
     }
+    fn peer(&self, _ordinal: u32) -> Result<(), String> {
+        Err(
+            "this pass interface carries no peers; `peer` is a \
+             `forward-diffusion` verb, and a peer is a velocity to guide with"
+                .to_string(),
+        )
+    }
 }
 
 impl PassWit for wit_attention::ForwardPass {
@@ -729,6 +736,9 @@ impl PassWit for wit_attention::ForwardPass {
     fn group(&self, id: u32) -> Result<(), String> {
         wit_attention::ForwardPass::group(self, id)
     }
+    fn peer(&self, ordinal: u32) -> Result<(), String> {
+        wit_attention::ForwardPass::peer(self, ordinal)
+    }
 }
 
 impl PassWit for wit_diffusion::ForwardPass {
@@ -768,6 +778,9 @@ impl PassWit for wit_diffusion::ForwardPass {
     }
     fn group(&self, id: u32) -> Result<(), String> {
         wit_diffusion::ForwardPass::group(self, id)
+    }
+    fn peer(&self, ordinal: u32) -> Result<(), String> {
+        wit_diffusion::ForwardPass::peer(self, ordinal)
     }
 }
 
@@ -1135,6 +1148,18 @@ impl<W: PassWit> Pass<W> {
             return Err("forward pass program is already attached".to_string());
         }
         self.wit.group(id)
+    }
+
+    /// Name another lane of this pass's own attention group as its peer, by
+    /// ordinal in the group's packed order, so the epilogue can read that
+    /// lane's prediction with `intrinsics::peer_velocity(width)`. The
+    /// guidance verb: `u + s(c - u)` is two lanes of one fire, and this is
+    /// how one of them names the other. Call `group` first.
+    pub fn peer(&self, ordinal: u32) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.wit.peer(ordinal)
     }
 
     fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {

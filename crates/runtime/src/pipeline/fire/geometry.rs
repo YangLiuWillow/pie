@@ -605,6 +605,9 @@ impl ReqGeometry {
                     },
                     stream: engine::fire::LaneStream::Text,
                     group: None,
+                    // Placeholders, as `stream`/`group` are: `LaneFacts::stamp`
+                    // writes what the pass stated before the fire is sealed.
+                    peer: None,
                     reading: 0,
                     ports: Vec::new(),
                     kv_less: false,

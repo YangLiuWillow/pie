@@ -211,13 +211,18 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
             // The score rectangle is a column of its own, bound at its own
             // base, so reading it does not set `needs_logits`.
             Some(IntrinsicId::AttnScore) => plan.needs_attn_scores = true,
-            _ => {
+            // Everything else this boundary has no wiring for. Named, not
+            // listed: the list went stale the first time an intrinsic was
+            // added (`velocity` fell here without being mentioned), and a
+            // refusal that names the wrong thing is worse than one that
+            // names nothing.
+            Some(other) => {
                 plan.executable = false;
-                plan.reject_reason = Some(
-                    "program reads an unsupported model intrinsic \
-                     (hidden/query/value-head/layer; Metal forward not wired)"
-                        .to_string(),
-                );
+                plan.reject_reason = Some(format!(
+                    "program reads the `{}` intrinsic, which this boundary does not \
+                     wire (Metal forward)",
+                    other.name()
+                ));
             }
         }
     }

@@ -90,6 +90,32 @@ pub fn velocity(width: u32) -> Tensor {
         activation_type,
     )
 }
+/// `intrinsics::peer_velocity(width)` — the velocity of the PEER LANE this
+/// pass declared (`ForwardPass::peer`), `[rows, width]` F32 at the epilogue.
+/// Same plane, same width, same row count as [`velocity`]; only the rows
+/// differ.
+///
+/// This is what classifier-free guidance is made of. `u + s(c − u)` needs
+/// one lane's epilogue to hold another lane's prediction, and it can:
+/// the velocity plane is written by the forward walk, on the same stream,
+/// before any epilogue block starts, and every lane's rows already sit in
+/// one fire-wide rectangle at one stride. So a peer read is the same read
+/// as [`velocity`] at a different row offset — no publication, no barrier,
+/// no host round trip. (A cross-lane CHANNEL read is a different question
+/// with a different answer; see `.wiki/imagegen/prototype.md` §1.1.)
+///
+/// Refused at bind when the pass declared no peer, so a program cannot
+/// silently read its own rows twice and call it guidance. The peer must be
+/// a lane of this lane's own attention group, and the group's cohort makes
+/// the runtime fire them together or not at all.
+pub fn peer_velocity(width: u32) -> Tensor {
+    let rows = current_rows().max(1);
+    intrinsic_val(
+        IntrinsicId::PeerVelocity,
+        Shape::matrix(rows, width.max(1)),
+        activation_type,
+    )
+}
 /// `intrinsics::pixels(width)` — the pixels a VAE reading lands (design
 /// D8), `[rows, width]` F32 at the epilogue: one row per OUTPUT voxel of
 /// the lane's clip in `(t, h, w)` order — `8h·8w` rows of RGB in `[-1, 1]`

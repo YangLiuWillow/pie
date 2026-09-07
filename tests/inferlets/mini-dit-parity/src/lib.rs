@@ -76,6 +76,20 @@ struct Input {
     /// the caption lane out as well, into `text_tap`.
     #[serde(default)]
     tap_text: bool,
+    /// Classifier-free guidance, ON THE DEVICE. Runs the step as SIX lanes
+    /// in one fire — two attention groups of three, group 0 holding the
+    /// case's context and group 1 holding a zeroed one — and combines the
+    /// two branches' velocities inside group 0's epilogue with
+    /// `intrinsics::peer_velocity`. Reports the combine at `cfg_scale`
+    /// alongside each branch's own answer, so the caller can check the two
+    /// identities that need no golden: at `s = 1` the combine IS the
+    /// conditional branch, at `s = 0` it IS the unconditional one.
+    #[serde(default)]
+    cfg: bool,
+    /// The guidance scale the `cfg` combine runs at. Default 1.0, the
+    /// identity on the conditional branch.
+    #[serde(default)]
+    cfg_scale: Option<f32>,
 }
 
 /// One batch element of the reference's fixed inputs, flattened row-major.
@@ -131,6 +145,20 @@ struct Output {
     text_tap: Vec<f32>,
     #[serde(default)]
     text_rows: u32,
+    /// `--cfg`: the guided velocity group 0's epilogue computed on the
+    /// device, `[image_rows, patch_features]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cfg_guided: Vec<f32>,
+    /// `--cfg`: the conditional branch's own velocity (group 0), for the
+    /// `s = 1` identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cfg_cond: Vec<f32>,
+    /// `--cfg`: the unconditional branch's own velocity (group 1), for the
+    /// `s = 0` identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cfg_uncond: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cfg_scale: Option<f32>,
 }
 
 /// The port names this family's `denoise` reading declares. Read off
@@ -187,6 +215,150 @@ impl Pipes {
         self.context.close();
         self.image.close();
     }
+}
+
+/// One BRANCH of a guided step: the three lanes of one attention group,
+/// built like `step`'s but with the group's own context rows. Returns the
+/// three passes and the channel the image lane's epilogue publishes into —
+/// `None` for a branch whose velocity is only ever read by its peer, which
+/// needs no epilogue of its own.
+#[allow(clippy::too_many_arguments)]
+fn branch(
+    case: &Case,
+    ports: &Ports,
+    reading: &str,
+    group: u32,
+    context: &[f32],
+    latents: &[f32],
+    timestep: f32,
+    other: u32,
+    guide: Option<(u32, f32, bool)>,
+) -> Result<(ForwardPass, ForwardPass, ForwardPass, Channel)> {
+    let tag = |what: &str| format!("{what}_b{group}");
+    let rows = case.image_rows;
+    let width = ports.velocity_width;
+
+    // GUIDANCE IS MUTUAL. Every lane of a branch names the other branch, so
+    // the two groups gather under one cohort key and seal into ONE fire — a
+    // peer in another fire is not on this fire's velocity plane at all. Only
+    // the guided lane READS its peer; naming is what makes them one step.
+    let partner = other;
+    let caption = ForwardPass::new();
+    caption.reading(reading)?;
+    caption.stream(LaneStream::Text)?;
+    caption.group(group)?;
+    caption.peer(partner)?;
+    let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
+        .named(&tag("text"));
+    let txt_pos =
+        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
+            .named(&tag("txt_pos"));
+    let t_txt = Channel::from([timestep]).named(&tag("t_txt"));
+    caption.input(&ports.text, &txt)?;
+    caption.input(&ports.positions, &txt_pos)?;
+    caption.input(&ports.timestep, &t_txt)?;
+
+    // The branch's own context: the case's rows for the conditional branch,
+    // zeros for the unconditional one. This is the ONLY difference between
+    // the two branches, which is what makes the guidance real rather than a
+    // combine of one answer with itself.
+    let ctx_pass = ForwardPass::new();
+    ctx_pass.reading(reading)?;
+    ctx_pass.stream(LaneStream::Context)?;
+    ctx_pass.group(group)?;
+    ctx_pass.peer(partner)?;
+    let ctx =
+        Channel::from_shaped([case.context_rows, case.context_width], context).named(&tag("ctx"));
+    ctx_pass.input(&ports.context, &ctx)?;
+
+    let image = ForwardPass::new();
+    image.reading(reading)?;
+    image.stream(LaneStream::Image)?;
+    image.group(group)?;
+    image.peer(partner)?;
+    let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
+    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+        .named(&tag("img_pos"));
+    let t_img = Channel::from([timestep]).named(&tag("t_img"));
+    image.input(&ports.latents, &x)?;
+    image.input(&ports.positions, &img_pos)?;
+    image.input(&ports.timestep, &t_img)?;
+    let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
+    let readback = out.clone();
+    match guide {
+        // The guided branch: its epilogue holds BOTH predictions — its own
+        // off `velocity()`, its peer's off `peer_velocity()` — and publishes
+        // the combine. No host round trip, no second fire.
+        Some((_, scale, conditional)) => image.epilogue(move || {
+            readback.put(&guided_velocity(width, scale, conditional));
+        }),
+        None => image.epilogue(move || {
+            readback.put(intrinsics::velocity(width));
+        }),
+    }
+    Ok((caption, ctx_pass, image, out))
+}
+
+/// One guided denoise step: SIX lanes, two attention groups, ONE fire.
+///
+/// Group 0 carries the case's context, group 1 a zeroed one, and group 0's
+/// image lane names group 1 as its peer — so its epilogue reads both
+/// branches' velocities off the fire-wide velocity plane and combines them
+/// at `scale`. The two groups do not attend each other, which is what makes
+/// them two independent denoisings rather than one wider one.
+///
+/// Also publishes each branch's own velocity, so the caller can check the
+/// two identities that need no golden: `s = 1` is the conditional branch
+/// exactly, `s = 0` is the unconditional one exactly.
+async fn guided_step(
+    case: &Case,
+    ports: &Ports,
+    reading: &str,
+    scale: f32,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let zeros = vec![0.0f32; case.context.len()];
+    let (c_txt, c_ctx, c_img, guided) = branch(
+        case,
+        ports,
+        reading,
+        0,
+        case.context.as_slice(),
+        &case.latents,
+        case.timestep,
+        1,
+        Some((1, scale, true)),
+    )?;
+    let (u_txt, u_ctx, u_img, uncond) = branch(
+        case,
+        ports,
+        reading,
+        1,
+        zeros.as_slice(),
+        &case.latents,
+        case.timestep,
+        0,
+        None,
+    )?;
+    // A seventh lane would be cheaper, but the conditional branch's own
+    // velocity is not readable beside its combine — one epilogue publishes
+    // one thing. So the unguided answer comes from `step`, which is the
+    // same three lanes at the same timestep, and the identity it proves is
+    // the stronger one for it.
+    let pipes: Vec<Pipeline> = (0..6).map(|_| Pipeline::new()).collect();
+    // ONE PIPELINE PER LANE, all six submitted before any fires: a pipeline
+    // is serial, and the frame seals when every live one has submitted.
+    c_txt.submit(&pipes[0]).context("cond caption")?;
+    c_ctx.submit(&pipes[1]).context("cond context")?;
+    c_img.submit(&pipes[2]).context("cond image")?;
+    u_txt.submit(&pipes[3]).context("uncond caption")?;
+    u_ctx.submit(&pipes[4]).context("uncond context")?;
+    u_img.submit(&pipes[5]).context("uncond image")?;
+    let guided = guided.take_host::<Vec<f32>>().await?;
+    let uncond = uncond.take_host::<Vec<f32>>().await?;
+    for pipe in &pipes {
+        pipe.close();
+    }
+    Ok((guided, Vec::new(), uncond))
 }
 
 /// One denoise step: three lanes, one group, one fire, one velocity.
@@ -350,7 +522,42 @@ async fn main(input: Input) -> Result<Output> {
         euler_x: Vec::new(),
         text_tap: Vec::new(),
         text_rows: case.text_rows,
+        cfg_guided: Vec::new(),
+        cfg_cond: Vec::new(),
+        cfg_uncond: Vec::new(),
+        cfg_scale: None,
     };
+
+    // Guidance runs one step, six lanes, two groups — never a schedule.
+    if input.cfg {
+        let scale = input.cfg_scale.unwrap_or(1.0);
+        // The conditional branch alone FIRST, as the unguided three-lane
+        // step: the same rows at the same timestep with the same context.
+        // Before the guided step, and with its pipelines closed, because a
+        // frame seals over the pipelines that are LIVE — three idle ones
+        // would seal a six-lane fire down to whichever group was ready, and
+        // the peer would not be in it.
+        let mut text_tap = Vec::new();
+        let cond = step(
+            &case,
+            &ports,
+            &reading.name,
+            &pipes,
+            0,
+            &case.latents,
+            case.timestep,
+            input.tap_text.then_some(&mut text_tap),
+        )
+        .await?;
+        pipes.close();
+        let (guided, _, uncond) = guided_step(&case, &ports, &reading.name, scale).await?;
+        out.velocity = cond.clone();
+        out.cfg_guided = guided;
+        out.cfg_cond = cond;
+        out.cfg_uncond = uncond;
+        out.cfg_scale = Some(scale);
+        return Ok(out);
+    }
 
     if !input.euler {
         let mut text_tap = Vec::new();

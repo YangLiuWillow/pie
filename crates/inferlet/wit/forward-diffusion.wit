@@ -118,6 +118,36 @@ interface forward-diffusion {
         /// lanes join within a frame.
         group: func(id: u32) -> result<_, error>;
 
+        /// Name the attention group whose same-stream lane is this lane's
+        /// PEER: the lane whose velocity this one's epilogue reads with
+        /// `intrinsics::peer_velocity(width)`.
+        ///
+        /// This is the classifier-free guidance verb, and it names a group
+        /// rather than a lane of one's own because guidance's two branches
+        /// must NOT attend each other — they are two independent denoisings
+        /// of the same canvas, one holding the prompt and one the negative
+        /// one, and putting them in one attention group would make each see
+        /// the other's rows. So they are two groups of ONE fire, and this
+        /// says which of them is the other.
+        ///
+        /// The peer is the lane of that group carrying THIS pass's stream;
+        /// a group seating no such lane, or more than one, is refused by
+        /// name at submit rather than guessed at. Naming one's own group is
+        /// refused too: a lane is not its own peer, and `u + s(u - u)` is a
+        /// picture that looks fine and is not guided.
+        ///
+        /// It costs a row offset and nothing else. The velocity plane is
+        /// fire-wide and written by the forward walk before any epilogue
+        /// block runs, so both branches' predictions are already sitting in
+        /// one rectangle by the time either epilogue reads. A pass that
+        /// reads `peer_velocity` without naming a peer is refused, so
+        /// guidance cannot silently degrade into a lane reading its own
+        /// rows twice.
+        ///
+        /// Set before `program`, and after `group`. A model that predicts
+        /// no velocity refuses the whole program at bind.
+        peer: func(group: u32) -> result<_, error>;
+
         /// The reading. REQUIRED: a diffusion pass with no mode is not
         /// submittable, because neither reading is a default the host may
         /// pick for the guest. Set before `program`; a pass keeps one mode

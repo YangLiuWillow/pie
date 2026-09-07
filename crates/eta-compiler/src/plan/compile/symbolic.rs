@@ -377,6 +377,7 @@ pub(crate) fn symbolic_intrinsic_type(
         | IntrinsicId::MtpDrafts
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
+        | IntrinsicId::PeerVelocity
         | IntrinsicId::Pixels
         | IntrinsicId::Query
         | IntrinsicId::ValueHead

@@ -343,6 +343,7 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
         | IntrinsicId::MtpLogits
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
+        | IntrinsicId::PeerVelocity
         | IntrinsicId::Pixels
         | IntrinsicId::ValueHead => &[Stage::Epilogue],
         IntrinsicId::MtpDrafts => &[Stage::Epilogue],
@@ -364,7 +365,12 @@ pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
         IntrinsicId::MtpDrafts => profile.mtp_depth > 0,
         IntrinsicId::ValueHead => profile.has_value_head,
         IntrinsicId::AttnScore => profile.has_attn_score,
-        IntrinsicId::Velocity => profile.has_velocity,
+        // A peer's velocity is the same plane as this lane's, so the model
+        // fact that gates one gates the other. Whether a peer EXISTS is a
+        // fire fact, not a model fact, and is checked where the lane is
+        // seated — a program that reads a peer nobody declared is refused
+        // by name there rather than reading its own rows twice.
+        IntrinsicId::Velocity | IntrinsicId::PeerVelocity => profile.has_velocity,
         IntrinsicId::Pixels => profile.has_pixels,
         IntrinsicId::Logits | IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => true,
     }

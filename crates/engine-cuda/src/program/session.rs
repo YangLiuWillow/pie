@@ -568,6 +568,28 @@ impl Session {
             ));
         }
 
+        // The peer velocity (guidance) needs the same guard, and it is the
+        // one that matters most to get loud: a lane that reads a peer it
+        // never named would otherwise dereference the side table's zero, and
+        // — worse, if the zero ever read as this lane's own base — quietly
+        // compute `u + s(u - u)`, which is a picture that looks fine and is
+        // not guided at all. `readback` binds this only for a lane whose
+        // `Seated::peer` names a real other lane of its own group.
+        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::PeerVelocity as u32)) == 0
+            && plan
+                .package
+                .values
+                .iter()
+                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::PeerVelocity))
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `peer_velocity` intrinsic and no buffer has \
+                 been bound to it; the pass named no peer group (`forward-pass.peer`), \
+                 so there is no second denoising in this fire to guide with",
+            ));
+        }
+
         // First failing channel wins, matching `eta_exec::step`'s ordering.
         if let Some(blocked) = self.blocked_channel(plan) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));

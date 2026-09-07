@@ -1039,6 +1039,43 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
+    /// `forward-pass.peer`: which OTHER attention group holds this lane's
+    /// guidance peer. Set once, before `program`, and only on a pass that
+    /// named a group of its own — guidance is two groups of ONE fire, and a
+    /// lane with no group has nothing to be the other of.
+    async fn core_peer(
+        &mut self,
+        this: Resource<ForwardPass>,
+        group: u32,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this, None)? {
+            return Ok(Err(error));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.peer.is_some() {
+            return Ok(Err("forward pass peer is already set".to_string()));
+        }
+        let Some(own) = pass.bindings.group else {
+            return Ok(Err(
+                "a peer is a lane of ANOTHER attention group, and this pass names \
+                 no group of its own: call `group` first"
+                    .to_string(),
+            ));
+        };
+        if own == group {
+            return Ok(Err(format!(
+                "this pass names attention group {group} as its own peer group; \
+                 guidance combines two INDEPENDENT denoisings, and a lane guided \
+                 by itself is not guided"
+            )));
+        }
+        pass.bindings.peer = Some(group);
+        Ok(Ok(()))
+    }
+
     /// `forward-diffusion.canvas`: which reading the pass runs. Set once,
     /// before `program`; a pass keeps one mode for its life.
     async fn core_canvas(
@@ -1543,6 +1580,7 @@ impl ProcessCtx {
                 reading: reading.map_or(0, |reading| reading.index),
                 stream: lane_stream_of(stream),
                 group: pass.bindings.group,
+                peer: pass.bindings.peer,
                 ports: port_bindings.iter().map(PortBinding::feed).collect(),
             };
             (
@@ -2426,6 +2464,16 @@ macro_rules! forward_pass_readings {
             id: u32,
         ) -> Anyhow<Result<(), String>> {
             self.core_group(this, id).await
+        }
+
+        /// The guidance verb, beside `group` for the same reason: a peer is
+        /// a fact about a lane, not about an interface.
+        async fn peer(
+            &mut self,
+            this: Resource<ForwardPass>,
+            group: u32,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_peer(this, group).await
         }
     };
 }

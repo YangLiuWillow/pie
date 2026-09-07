@@ -758,7 +758,9 @@ fn intrinsic_type_ok(
         // velocity row's channel count is a model fact — so a declaration
         // that disagrees is refused here rather than carried into the plan's
         // extents.
-        IntrinsicId::Velocity => {
+        // A peer's rows come off the same plane at the same width, so they
+        // are typed identically; only the row offset the host binds differs.
+        IntrinsicId::Velocity | IntrinsicId::PeerVelocity => {
             dtype == Dtype::F32
                 && shape.rank() == 2
                 && shape.dims()[0] >= 1

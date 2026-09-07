@@ -823,6 +823,7 @@ impl Shell {
                 // stand as the load left them: zeros, or the last fire's).
                 stream: lane.stream,
                 group: None,
+                peer: None,
                 ports: &[],
             })
             .collect();

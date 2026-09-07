@@ -292,6 +292,11 @@ pub struct PassInputs {
     /// by [`IntrinsicId::Velocity`] in the epilogue; `None` unless the model
     /// predicts one.
     pub velocity: Option<Value>,
+    /// Another lane of this lane's attention group's velocity, same shape and
+    /// same plane, read by [`IntrinsicId::PeerVelocity`] in the epilogue;
+    /// `None` unless the lane declared a peer. What classifier-free guidance
+    /// combines against.
+    pub peer_velocity: Option<Value>,
     /// A VAE reading's pixels, `[n_out, C]` F32, read by
     /// [`IntrinsicId::Pixels`] in the epilogue; `None` unless the model
     /// lands some.

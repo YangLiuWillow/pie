@@ -3068,11 +3068,18 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
+                        // A guidance pair gathers under ONE key (the lower
+                        // of the two group ids), so the seal waits for both
+                        // branches rather than firing whichever filled first
+                        // — a peer in another fire is not on this fire's
+                        // velocity plane at all.
                         let cohort = launch
                             .request
                             .lanes
                             .first()
-                            .and_then(|lane| lane.group)
+                            .and_then(|lane| {
+                                crate::pipeline::instance::cohort_key(lane.group, lane.peer)
+                            })
                             .zip(launch.request.cohort);
                         frame_policy.on_fire_enqueued(
                             stamp,

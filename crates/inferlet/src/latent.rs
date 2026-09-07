@@ -42,8 +42,8 @@ use eta_dsl::Tensor;
 pub mod prelude {
     pub use super::{
         DenoiseLoop, FlowMatchEuler, LaneClock, LaneRows, apg, at, cfg_combine, dynamic_shift,
-        encode_ids, encode_ids_rows, encode_text, euler_step, noise, positions_for, positions_grid,
-        rng_state, seed_or_step,
+        encode_ids, encode_ids_rows, encode_text, euler_step, guided_velocity, noise,
+        positions_for, positions_grid, rng_state, seed_or_step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -260,9 +260,54 @@ pub fn euler_step(x: &Tensor, v: &Tensor, dt: &Tensor) -> Tensor {
 /// Classifier-free guidance: `uncond + s · (cond − uncond)`. `cond` and
 /// `uncond` are the two lanes' velocity rows (`[rows, width]` each); `s`
 /// is a scalar tensor or constant.
+///
+/// Both rows are readable inside one epilogue: the lane reads its own with
+/// [`intrinsics::velocity`] and the other lane's with
+/// [`intrinsics::peer_velocity`], after naming it with `ForwardPass::peer`.
+/// The two lanes must share an attention group, and the group's cohort is
+/// what makes them one fire. See [`guided_velocity`] for the whole shape.
 pub fn cfg_combine(cond: &Tensor, uncond: &Tensor, s: &Tensor) -> Tensor {
     let shape = cond.shape();
     uncond + &(&(cond - uncond) * &broadcast(s, shape))
+}
+
+/// The guided velocity of a lane that named a peer: this lane's own
+/// prediction combined with its peer's at guidance `s`, all on the device,
+/// inside one epilogue.
+///
+/// Which of the two lanes is `cond` and which is `uncond` is the guest's to
+/// say, because only the guest knows which context it fed each lane:
+/// `conditional = true` means THIS lane took the prompt and its peer took
+/// the negative one. At `s == 1.0` the combine is the identity on this
+/// lane's own rows, which is what makes a distilled row's guidance-1 path
+/// exactly its ungated one — a useful thing to be able to check.
+///
+/// The two branches are two attention GROUPS of one fire, not two lanes of
+/// one group: they are independent denoisings and must not attend each
+/// other's rows. Each group carries its own context lane — the prompt for
+/// one, the negative prompt for the other — and its own image lane.
+///
+/// ```ignore
+/// // Group 0 is the conditional branch, group 1 the unconditional one.
+/// cond_image.group(0)?;
+/// cond_image.peer(1)?;                   // the branch to guide against
+/// cond_image.epilogue(move || {
+///     let v = guided_velocity(width, guidance, true);
+///     seed_or_step(&k, &x, &v, &dts, &rng, shape, Some(&out));
+/// });
+/// // The uncond image lane needs no epilogue of its own: its velocity is
+/// // read by its peer, off the plane the forward walk already wrote.
+/// ```
+#[must_use]
+pub fn guided_velocity(width: u32, s: f32, conditional: bool) -> Tensor {
+    let own = intrinsics::velocity(width);
+    let peer = intrinsics::peer_velocity(width);
+    let scale = Tensor::constant([s]);
+    if conditional {
+        cfg_combine(&own, &peer, &scale)
+    } else {
+        cfg_combine(&peer, &own, &scale)
+    }
 }
 
 /// Adaptive projected guidance (Sadat et al., 2410.02416): the guidance

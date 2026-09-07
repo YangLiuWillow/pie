@@ -100,6 +100,19 @@ declare_intrinsics! {
     /// [`ModelProfile::pixels_width`](crate::registry::ModelProfile::pixels_width)
     /// when the model states one width for every pixels planting.
     Pixels = 9, PIXELS, "pixels";
+    /// `[n_out, C]` F32 — epilogue only; model-gated, and gated again on the
+    /// lane having declared a peer. The velocity of ANOTHER lane of this
+    /// lane's own attention group: the quantity classifier-free guidance
+    /// combines, `u + s(c − u)`, where `c` and `u` are two lanes of one fire.
+    ///
+    /// This is a read, never a write, and it carries no ordering hazard: the
+    /// velocity plane is written by the FORWARD WALK, on the same stream,
+    /// before any epilogue block starts, and every lane's rows already live
+    /// in one fire-wide rectangle at one stride. Binding a peer is therefore
+    /// the same bind as [`Velocity`](Self::Velocity) with the PEER's first
+    /// row instead of this lane's — no publication, no barrier, no copy.
+    /// Which lane the peer is, the pass states (`forward-diffusion.peer`).
+    PeerVelocity = 10, PEER_VELOCITY, "peer_velocity";
 }
 
 /// An ETA stage-body op. Docs here give meaning only; wire tags live on the
