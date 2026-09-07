@@ -662,6 +662,9 @@ pub struct Prepared {
     descriptors: Buffer,
     /// One lane's descriptor row, kept so a grow can repeat it.
     descriptor_row: Vec<u8>,
+    /// [`descriptor_row`](Prepared::descriptor_row) repeated per lane, kept
+    /// because the copy that stages it is asynchronous.
+    descriptors_host: Vec<u8>,
     params: Buffer,
     offsets: Buffer,
     scratch: Buffer,
@@ -1134,6 +1137,7 @@ impl Prepared {
         shapes: &[ChannelShape],
         extents: Extents,
         lanes: u32,
+        stream: *mut core::ffi::c_void,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -1210,6 +1214,7 @@ impl Prepared {
             table_host: Vec::new(),
             descriptors: Buffer::zeroed(0)?,
             descriptor_row: descriptors.iter().flat_map(record_bytes).collect(),
+            descriptors_host: Vec::new(),
             params,
             offsets,
             scratch: Buffer::zeroed(0)?,
@@ -1234,7 +1239,7 @@ impl Prepared {
             filled: 0,
             bindings: plan.channel_bindings.clone(),
         };
-        prepared.grow(extents, lanes.max(1))?;
+        prepared.grow(extents, lanes.max(1), stream)?;
         Ok(prepared)
     }
 
@@ -1246,10 +1251,23 @@ impl Prepared {
     ///
     /// [`Fault::Program`] when the lane table or the scratch outgrows what
     /// [`eta_exec::layout`] permits, and whatever the allocations said.
-    fn grow(&mut self, extents: Extents, lanes: u32) -> Result<()> {
+    fn grow(&mut self, extents: Extents, lanes: u32, stream: *mut core::ffi::c_void) -> Result<()> {
         if lanes <= self.lanes {
             return Ok(());
         }
+        // **GROWTH IS GEOMETRIC, BECAUSE EVERY STEP REALLOCATES THE SCRATCH.**
+        // The buffers below are `cudaMalloc` + `cudaMemset`, both synchronous
+        // and both proportional to the lane count; sizing them to exactly the
+        // lanes this boundary carries meant a boundary sequence of 4, 7, 9,
+        // 15, 19, 31, 44, 64 lanes paid that eight times over, 30-80 ms a
+        // step on a program whose scratch stride is wide. Rounding to the
+        // next power of two makes it a handful of steps whatever order the
+        // lane counts arrive in, and the ceiling is still the scratch cap's.
+        let lanes = lanes
+            .checked_next_power_of_two()
+            .unwrap_or(lanes)
+            .min(self.lane_ceiling())
+            .max(lanes);
         // The scratch ceiling is a wave's, not a lane's; a named refusal the
         // caller can retry with a smaller batch.
         let total = u64::from(self.scratch_stride) * u64::from(lanes);
@@ -1306,24 +1324,28 @@ impl Prepared {
         }
         // The header and records above are freshly written; channel slots
         // are rewritten by every `stage_lane`.
-        let mut table = Buffer::zeroed(table_bytes)?;
-        table.write(0, &table_host)?;
+        // Zeroed on the stream and NOT filled here: `commit_lanes` stages
+        // the whole of `table_host` on that stream before any kernel of this
+        // boundary reads it, and a boundary that stages no lane launches
+        // kernels that read the zeroed header's `lane_count` of 0 and return.
+        let table = Buffer::zeroed_on(stream, table_bytes)?;
         self.retired.push(std::mem::replace(&mut self.table, table));
         self.table_host = table_host;
 
         // Every lane's descriptor row is the same row, so this is the one
         // write it ever needs.
         let row = self.descriptor_row.len().max(1);
-        let mut descriptors = Buffer::zeroed(row * lanes as usize)?;
+        let mut descriptors = Buffer::zeroed_on(stream, row * lanes as usize)?;
         if !self.descriptor_row.is_empty() {
-            let repeated: Vec<u8> = self
+            // Held rather than dropped: the copy below is asynchronous.
+            self.descriptors_host = self
                 .descriptor_row
                 .iter()
                 .copied()
                 .cycle()
                 .take(self.descriptor_row.len() * lanes as usize)
                 .collect();
-            descriptors.write(0, &repeated)?;
+            descriptors.stage(stream, 0, &self.descriptors_host)?;
         }
         self.retired
             .push(std::mem::replace(&mut self.descriptors, descriptors));
@@ -1332,13 +1354,16 @@ impl Prepared {
             .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
         self.retired.push(std::mem::replace(
             &mut self.scratch,
-            Buffer::zeroed(scratch_bytes)?,
+            Buffer::zeroed_on(stream, scratch_bytes)?,
         ));
         // One byte per channel per lane, indexed as the channel slots are:
         // zero means a take reads the committed cell.
         self.retired.push(std::mem::replace(
             &mut self.pending,
-            Buffer::zeroed((self.channel_count as usize * lanes as usize).max(1))?,
+            Buffer::zeroed_on(
+                stream,
+                (self.channel_count as usize * lanes as usize).max(1),
+            )?,
         ));
 
         let words = INTRINSIC_SLOTS * lanes as usize;
@@ -1355,7 +1380,7 @@ impl Prepared {
             (&mut self.intrinsic_offsets, words * size_of::<u32>()),
         ] {
             self.retired
-                .push(std::mem::replace(slot, Buffer::zeroed(bytes)?));
+                .push(std::mem::replace(slot, Buffer::zeroed_on(stream, bytes)?));
         }
         self.lanes = lanes;
         Ok(())
@@ -1368,9 +1393,14 @@ impl Prepared {
     /// # Errors
     ///
     /// As [`Prepared::grow`].
-    pub fn begin(&mut self, extents: Extents, lanes: u32) -> Result<()> {
+    pub fn begin(
+        &mut self,
+        extents: Extents,
+        lanes: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
         self.filled = 0;
-        self.grow(extents, lanes)
+        self.grow(extents, lanes, stream)
     }
 
     /// Take the next lane of this boundary, pointing its channel slots at

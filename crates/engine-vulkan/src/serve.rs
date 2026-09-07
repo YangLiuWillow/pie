@@ -597,6 +597,7 @@ impl Shell {
                     images: u64::from(budgets.max_images()),
                     voxels: u64::from(budgets.max_voxels()),
                     clips: u64::from(budgets.max_clips()),
+                    readouts: u64::from(boot.budget.max_tokens),
                 },
             )?;
             let logits = carved.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -1818,6 +1819,7 @@ impl Shell {
                 images: u64::from(composition.images()),
                 voxels: u64::from(composition.voxel_rows()),
                 clips: u64::from(composition.clips()),
+                readouts: u64::from(lane_count),
             },
         )?;
         let caches = self.pools.table(

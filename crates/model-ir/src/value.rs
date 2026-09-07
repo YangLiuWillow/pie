@@ -35,6 +35,12 @@ pub enum Dim {
     Lanes,
     /// Indptr-shaped: lanes + 1.
     LanesPlus(u32),
+    /// The rows whose logits a reader takes: one per lane by default, more
+    /// where a lane states a multi-row readout (`Port::Readout`). A subset
+    /// of the token rectangle, gathered out of it by `layout.gather_rows`,
+    /// so the head runs over the rows somebody reads rather than every row
+    /// the fire carries — a prefill's head is then the size of a decode's.
+    Readouts,
     /// This fire's patch count — the rows of the vision tower's window,
     /// concatenated over every image every lane submitted. Not a subset of
     /// the token rectangle: the patch axis gets its own seriation, bucket
@@ -183,7 +189,7 @@ impl Dim {
     pub fn axis(self) -> Option<RowAxis> {
         match self {
             Dim::Const(_) => None,
-            Dim::Tokens | Dim::TokensTimes(_) | Dim::Lanes | Dim::LanesPlus(_) => {
+            Dim::Tokens | Dim::TokensTimes(_) | Dim::Lanes | Dim::LanesPlus(_) | Dim::Readouts => {
                 Some(RowAxis::Tokens)
             }
             Dim::Patches | Dim::Images | Dim::ImagesPlus(_) => Some(RowAxis::Patches),
@@ -336,6 +342,11 @@ pub enum RuntimeInput {
     /// One geometry vector of a cache space; `space` matches the group the
     /// caches declare (`CacheRow::Kv::space`).
     Geometry { space: u32, kind: GeomKind },
+    /// Which row of the token rectangle each readout row gathers:
+    /// `[Dim::Readouts]` `i32`, absolute row indices in fire order, read by
+    /// `layout.gather_rows`. One entry per lane by default (its last row),
+    /// more where a lane states a multi-row readout.
+    ReadoutRows,
     /// Which adapter bank each token row routes to; read by
     /// `linear.lora_correct`. `i32`, one entry per token row, `-1` for the
     /// base model. Bare (not keyed): an adapter is a property of the

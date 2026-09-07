@@ -18,6 +18,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     write_page: &Value,
     write_offset: &Value,
     theta: f32,
+    rotary_dim: u32,
     positions: &Value,
 ) -> Value {
     let r = packed.rec();
@@ -37,6 +38,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             kv_heads,
             head_dim,
             theta,
+            rotary_dim,
             q: q.id(),
         },
         &[packed, positions, write_page, write_offset],

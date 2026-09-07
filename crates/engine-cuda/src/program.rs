@@ -66,7 +66,12 @@ impl Program {
     /// [`Fault::Program`] when a value's shape does not resolve against
     /// `extents` or the scratch does not fit, and whatever the allocations
     /// said.
-    fn batch(&mut self, extents: Extents, lanes: u32) -> Result<&mut Batch> {
+    fn batch(
+        &mut self,
+        extents: Extents,
+        lanes: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<&mut Batch> {
         if let Some(at) = self
             .batches
             .iter()
@@ -89,7 +94,7 @@ impl Program {
                 .get(index)
                 .is_some_and(|stage| !stage.regions.is_empty());
             stages.push(if launches {
-                Some(Prepared::build(stage_plan, &shapes, extents, lanes)?)
+                Some(Prepared::build(stage_plan, &shapes, extents, lanes, stream)?)
             } else {
                 None
             });
@@ -338,6 +343,7 @@ impl Plane {
         geometry: GeometryClass,
         adopted: &[Option<std::sync::Arc<Endpoint>>],
         ids: &[u64],
+        stream: *mut core::ffi::c_void,
     ) -> Result<u64> {
         let program = self
             .programs
@@ -346,7 +352,7 @@ impl Plane {
         // Fire-path buffers are cut here at bind, against these extents, so
         // a shape that doesn't resolve refuses at the door rather than
         // zero-filling silently at the first fire.
-        program.batch(extents, 1)?;
+        program.batch(extents, 1, stream)?;
         let program = &*program;
         let endpoints = endpoints_for(&program.plan, adopted)?;
         let held = endpoints.clone();
@@ -687,7 +693,7 @@ impl Plane {
             // A group that doesn't fit the wave's scratch ceiling is split
             // into chunks, not refused.
             let ceiling = program
-                .batch(extents, 1)?
+                .batch(extents, 1, stream)?
                 .stages
                 .iter()
                 .flatten()
@@ -720,9 +726,9 @@ impl Plane {
                 )
             })?;
             let lanes = u32::try_from(members.len()).unwrap_or(u32::MAX);
-            let batch = program.batch(extents, lanes)?;
+            let batch = program.batch(extents, lanes, stream)?;
             for prepared in batch.stages.iter_mut().flatten() {
-                prepared.begin(extents, lanes)?;
+                prepared.begin(extents, lanes, stream)?;
             }
             for instance in members {
                 let bound = instances.get_mut(instance).ok_or_else(|| {

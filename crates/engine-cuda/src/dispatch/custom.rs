@@ -30,6 +30,7 @@ impl Run<'_> {
                 kv_heads,
                 head_dim,
                 theta,
+                rotary_dim,
                 q,
             } => custom::qkv_fused_qknorm_rope_vnorm_write(
                 self.ctx(),
@@ -45,6 +46,7 @@ impl Run<'_> {
                 *kv_heads,
                 *head_dim,
                 *theta,
+                *rotary_dim,
                 &mut self.tensor(*q),
             ),
         }

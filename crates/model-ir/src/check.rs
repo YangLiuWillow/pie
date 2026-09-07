@@ -651,6 +651,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
         },
         Operation::Layout(op) => match op {
             Layout::Embed { .. } | Layout::EmbedConcat { .. } => &[(In(0), I32)],
+            // The readout gather's row indices are the usual i32 index vector.
+            Layout::GatherRows { .. } => &[(In(1), I32)],
             // The interpolating gather pins BOTH its geometry ports: the taps
             // are i32 like every index vector here, and the weights are f32
             // because they are the preprocessor's arithmetic and not the
@@ -764,6 +766,7 @@ impl Display for D {
             Dim::TokensTimes(k) => write!(f, "tokens*{k}"),
             Dim::Lanes => f.write_str("lanes"),
             Dim::LanesPlus(k) => write!(f, "lanes+{k}"),
+            Dim::Readouts => f.write_str("readouts"),
             Dim::Patches => f.write_str("patches"),
             Dim::Images => f.write_str("images"),
             Dim::ImagesPlus(k) => write!(f, "images+{k}"),

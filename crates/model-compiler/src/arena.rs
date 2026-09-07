@@ -13,8 +13,8 @@ use model_ir::{
     ValueId,
 };
 
-use crate::compiled::Region;
 use crate::budget::Budgets;
+use crate::compiled::Region;
 use crate::error::{Error, Share, Unrectangled};
 
 /// Who reads an export after the graph has run — whose rows stay spoken for.
@@ -107,6 +107,10 @@ pub enum RowExpr {
     Lanes,
     /// `lanes + k` — indptr-shaped.
     LanesPlus(u32),
+    /// One row per readout this fire takes — the rows the trunk head runs
+    /// over. A gathered subset of the token rectangle, so it belongs to the
+    /// token axis but is not cut by a class window.
+    Readouts,
     /// One row per patch this fire carries — the second row axis
     /// (`RowAxis::Patches`), never a co-tenant of a token rectangle.
     Patches,
@@ -135,6 +139,7 @@ impl RowExpr {
             Dim::TokensTimes(k) => RowExpr::TokensTimes(k),
             Dim::Lanes => RowExpr::Lanes,
             Dim::LanesPlus(k) => RowExpr::LanesPlus(k),
+            Dim::Readouts => RowExpr::Readouts,
             Dim::Patches => RowExpr::Patches,
             Dim::Images => RowExpr::Images,
             Dim::ImagesPlus(k) => RowExpr::ImagesPlus(k),
@@ -150,7 +155,11 @@ impl RowExpr {
     pub fn axis(self) -> Option<RowAxis> {
         match self {
             RowExpr::Const(_) => None,
-            RowExpr::Tokens | RowExpr::TokensTimes(_) | RowExpr::Lanes | RowExpr::LanesPlus(_) => {
+            RowExpr::Tokens
+            | RowExpr::TokensTimes(_)
+            | RowExpr::Lanes
+            | RowExpr::LanesPlus(_)
+            | RowExpr::Readouts => {
                 Some(RowAxis::Tokens)
             }
             RowExpr::Patches | RowExpr::Images | RowExpr::ImagesPlus(_) => Some(RowAxis::Patches),
@@ -189,11 +198,14 @@ impl RowExpr {
             | RowExpr::Voxels
             | RowExpr::VoxelsTimes(_)
             | RowExpr::Clips => true,
+            // A readout rectangle is gathered across every lane, so a
+            // window over one class's rows names the wrong ones.
             RowExpr::Lanes
             | RowExpr::Const(_)
             | RowExpr::LanesPlus(_)
             | RowExpr::ImagesPlus(_)
-            | RowExpr::ClipsPlus(_) => false,
+            | RowExpr::ClipsPlus(_)
+            | RowExpr::Readouts => false,
         }
     }
 
@@ -206,6 +218,7 @@ impl RowExpr {
             RowExpr::TokensTimes(k) => fire.tokens.saturating_mul(u64::from(k)),
             RowExpr::Lanes => fire.lanes,
             RowExpr::LanesPlus(k) => fire.lanes.saturating_add(u64::from(k)),
+            RowExpr::Readouts => fire.readouts,
             RowExpr::Patches => fire.patches,
             RowExpr::Images => fire.images,
             RowExpr::ImagesPlus(k) => fire.images.saturating_add(u64::from(k)),
@@ -233,6 +246,8 @@ pub struct FireRows {
     pub voxels: u64,
     /// Clips this fire carries.
     pub clips: u64,
+    /// Readout rows this fire takes — the rows the trunk head runs over.
+    pub readouts: u64,
 }
 
 impl FireRows {
@@ -246,6 +261,7 @@ impl FireRows {
             images: 0,
             voxels: 0,
             clips: 0,
+            readouts: lanes,
         }
     }
 
@@ -259,6 +275,9 @@ impl FireRows {
             images: u64::from(budgets.max_images()),
             voxels: u64::from(budgets.max_voxels()),
             clips: u64::from(budgets.max_clips()),
+            // A readout names a row the lane has, so the ceiling is the
+            // token rectangle's: a fire may read every row it carries.
+            readouts: u64::from(budgets.tokens.max_tokens),
         }
     }
 }
@@ -699,7 +718,8 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
             | Dim::Voxels
             | Dim::VoxelsTimes(_)
             | Dim::Clips
-            | Dim::ClipsPlus(_) => {
+            | Dim::ClipsPlus(_)
+            | Dim::Readouts => {
                 return Err(Unrectangled::SymbolicWidth);
             }
         }

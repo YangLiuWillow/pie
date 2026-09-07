@@ -9,6 +9,7 @@ use model_exec::store::check::{self, rebase};
 use model_exec::store::kv::Geometry;
 use model_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
 
+use crate::device::Handles;
 use crate::device::handles::NIL;
 use crate::device::Handles;
 use crate::error::{Fault, Result};
@@ -202,6 +203,7 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
                     // Window-free: handed over whole, gathered or not.
                     Some(Dim::Const(_)) | None => true,
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                    Some(Dim::Readouts) => false,
                     // Patch/image rows are a different row space; a token-row map can't cut them.
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                     // The voxel axis: its own row space too.

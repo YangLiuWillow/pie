@@ -231,6 +231,12 @@ impl Run<'_> {
                 }
                 Ok(())
             }
+            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*rows),
+                &mut self.tensor(*y),
+            ),
             Layout::Select {
                 table,
                 layer,

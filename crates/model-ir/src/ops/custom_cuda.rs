@@ -27,6 +27,9 @@ pub enum CustomCuda {
         kv_heads: u32,
         head_dim: u32,
         theta: f32,
+        /// The rotated width of each head: `head_dim` for a full rope, less
+        /// for a partial one (the rest of the head is normed, not rotated).
+        rotary_dim: u32,
         q: ValueId,
     },
 }

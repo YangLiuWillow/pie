@@ -460,6 +460,50 @@ impl FrameShell for Shell {
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
+        // **THE ROWS A READER TAKES.** The trunk head runs over these and
+        // no others (`layout.gather_rows` compacts them out of the token
+        // rectangle), so a prefill's head is the size of a decode's rather
+        // than the size of its prompt. Laid out in FIRE row order, which
+        // makes the gather a monotone read; each submitted lane's run is
+        // recorded so the readback can turn a lane into a row of the
+        // gathered logits.
+        let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
+        let mut readout_first = vec![0u32; lanes.len()];
+        let mut readout_count = vec![0u32; lanes.len()];
+        {
+            let mut placed: Vec<(u32, usize)> = composition
+                .lanes()
+                .iter()
+                .map(|row| (row.row_offset, row.source as usize))
+                .collect();
+            placed.sort_unstable();
+            for (row_offset, source) in placed {
+                let owned = composition
+                    .lanes()
+                    .iter()
+                    .find(|row| row.source as usize == source)
+                    .map_or(0, |row| row.rows);
+                let stated = lanes.get(source).and_then(|seated| seated.readout);
+                let wanted: Vec<u32> = match stated {
+                    Some(rows) if !rows.is_empty() => rows.to_vec(),
+                    // The default readout, and the one every decode lane
+                    // takes: the lane's last row.
+                    _ => vec![owned.saturating_sub(1)],
+                };
+                readout_first[source] = readout_rows.len() as u32;
+                readout_count[source] = wanted.len() as u32;
+                for row in wanted {
+                    if row >= owned {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: u64::from(row) + 1,
+                            have: u64::from(owned),
+                        });
+                    }
+                    readout_rows.push(i32::try_from(row_offset + row).unwrap_or(0));
+                }
+            }
+        }
         let descriptor = FireDescriptor::of(&composition);
 
         // 1b. The D2 packing tables: which group each fire lane joins, and
@@ -1501,6 +1545,17 @@ impl FrameShell for Shell {
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
         super::btrace::mark("cuttable");
+        // **A BODY BAKES ITS READOUT GRID, SO THE COUNT MUST BE THE KEY'S.**
+        // The readout rectangle is carved and gridded at the lane ceiling —
+        // the same number the key already carries — and padded with row
+        // zero, which the gather reads and the readback never names. A fire
+        // wanting more readouts than that ceiling (a multi-row readout on
+        // many lanes) is not one a body can serve, so it walks.
+        let readout_ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes);
+        let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
+        if bodied {
+            readout_rows.resize(readout_ceiling as usize, 0);
+        }
 
         // Arming pins the key a synthetic fire landed on
         // (`Shell::arm_bodies`).
@@ -1592,6 +1647,7 @@ impl FrameShell for Shell {
                 tokens: &tokens,
                 positions: &positions,
                 windows: &boundaries,
+                readout_rows: &readout_rows,
                 // Padded to the bucket (step 4d); empty (no H2D) for an
                 // unbodied fire.
                 qo_absolute: &qo_absolute,
@@ -1650,6 +1706,9 @@ impl FrameShell for Shell {
             lanes,
             attachments,
             composition,
+            readout_rows,
+            readout_first,
+            readout_count,
             descriptor,
             patch_payload,
             voxel_tables,

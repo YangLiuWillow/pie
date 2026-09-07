@@ -43,6 +43,15 @@ pub enum Layout {
         left: ValueId,
         right: ValueId,
     },
+    /// The readout gather: `y[i] = x[rows[i]]`, `y` being
+    /// `[Dim::Readouts, width]` and `rows` the `[Dim::Readouts]` i32 row
+    /// indices ([`RuntimeInput::ReadoutRows`](crate::RuntimeInput::ReadoutRows)).
+    /// What puts the trunk head on the rows a reader takes.
+    GatherRows {
+        x: ValueId,
+        rows: ValueId,
+        y: ValueId,
+    },
     /// Views layer `layer`'s `width`-wide slice of a stacked table.
     Select {
         table: ValueId,
@@ -170,6 +179,7 @@ impl Operands for Layout {
             Self::SplitQkv { packed, .. } => sink.push(*packed),
             Self::SplitQGate { packed, .. } => sink.push(*packed),
             Self::SplitRows { x, .. } => sink.push(*x),
+            Self::GatherRows { x, rows, .. } => sink.extend([*x, *rows]),
             Self::Select { table, .. } => sink.push(*table),
             Self::ScatterRows { src, routes, y, .. } => sink.extend([*src, *routes, *y]),
             Self::PoolRows { x, .. } => sink.push(*x),
@@ -189,6 +199,7 @@ impl Operands for Layout {
             Self::SplitQkv { q, k, v, .. } => sink.extend([*q, *k, *v]),
             Self::SplitQGate { q, gate, .. } => sink.extend([*q, *gate]),
             Self::SplitRows { left, right, .. } => sink.extend([*left, *right]),
+            Self::GatherRows { y, .. } => sink.push(*y),
             Self::Select { y, .. } => sink.push(*y),
             Self::ScatterRows { y_out, .. } => sink.push(*y_out),
             Self::PoolRows { y, .. } => sink.push(*y),
@@ -212,6 +223,7 @@ impl Operands for Layout {
             | Self::SplitQkv { .. }
             | Self::SplitQGate { .. }
             | Self::SplitRows { .. }
+            | Self::GatherRows { .. }
             | Self::Select { .. }
             // The pool writes a fresh rectangle, not `x` narrowed in place.
             | Self::PoolRows { .. }
@@ -234,6 +246,7 @@ impl Operands for Layout {
             Self::SplitQkv { .. } => "layout.split_qkv",
             Self::SplitQGate { .. } => "layout.split_q_gate",
             Self::SplitRows { .. } => "layout.split_rows",
+            Self::GatherRows { .. } => "layout.gather_rows",
             Self::Select { .. } => "layout.select",
             Self::ScatterRows { .. } => "layout.scatter_rows",
             Self::PoolRows { .. } => "layout.pool_rows",
