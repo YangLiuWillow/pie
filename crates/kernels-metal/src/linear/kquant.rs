@@ -45,12 +45,13 @@ const LANES: u32 = 32;
 
 /// The family ascending by super-block width: `(bytes, tag, on_metal)`. `tag`
 /// spells the `kquant.metal` entry and the GGUF name; `on_metal` marks the
-/// points that have a shader yet (PR2: q4_k, q6_k).
+/// points that have a shader (all five now; the flag stays for a width that is
+/// recognized but not yet stamped).
 const FAMILY: [(u32, &str, bool); 5] = [
-    (Q2K_BYTES, "q2k", false),
-    (Q3K_BYTES, "q3k", false),
+    (Q2K_BYTES, "q2k", true),
+    (Q3K_BYTES, "q3k", true),
     (Q4K_BYTES, "q4k", true),
-    (Q5K_BYTES, "q5k", false),
+    (Q5K_BYTES, "q5k", true),
     (Q6K_BYTES, "q6k", true),
 ];
 
@@ -65,9 +66,8 @@ fn scheme(op: &'static str, k: u32, row_bytes: u32) -> Result<&'static str, Erro
                 return Err(refuse(
                     op,
                     format!(
-                        "{tag} is a K-quant Metal does not decode yet \
-                         (PR2 lands q4_k and q6_k): a {row_bytes}-byte row over \
-                         {blocks} super-blocks"
+                        "{tag} is a K-quant width Metal recognizes but has no \
+                         shader for: a {row_bytes}-byte row over {blocks} super-blocks"
                     ),
                 ));
             }

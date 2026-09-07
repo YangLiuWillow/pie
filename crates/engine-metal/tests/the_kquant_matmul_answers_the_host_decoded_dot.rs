@@ -36,7 +36,10 @@ const DMIN: f32 = 0.03125; // 2^-5
 const D_LE: [u8; 2] = [0x00, 0x2C];
 const DMIN_LE: [u8; 2] = [0x00, 0x28];
 
+const Q2K_BYTES: usize = 84;
+const Q3K_BYTES: usize = 110;
 const Q4K_BYTES: usize = 144;
+const Q5K_BYTES: usize = 176;
 const Q6K_BYTES: usize = 210;
 const SUPER: usize = 256;
 
@@ -110,6 +113,98 @@ fn decode_q6k(blk: &[u8], out: &mut [f32; SUPER]) {
     }
 }
 
+/// Reference decode of one Q5_K super-block (mirrors `decode_gguf_q5_k_block_into`).
+fn decode_q5k(blk: &[u8], out: &mut [f32; SUPER]) {
+    let scales = &blk[4..16];
+    let plane = &blk[16..48];
+    let qs = &blk[48..176];
+    for pair in 0..4 {
+        let (sc_lo, m_lo) = q4k_scale_min(pair * 2, scales);
+        let (sc_hi, m_hi) = q4k_scale_min(pair * 2 + 1, scales);
+        let (d_lo, min_lo) = (D * f32::from(sc_lo), DMIN * f32::from(m_lo));
+        let (d_hi, min_hi) = (D * f32::from(sc_hi), DMIN * f32::from(m_hi));
+        let packed = &qs[pair * 32..pair * 32 + 32];
+        let (bit_lo, bit_hi) = (1u8 << (pair * 2), 1u8 << (pair * 2 + 1));
+        let o = pair * 64;
+        for i in 0..32 {
+            let fifth_lo = u8::from(plane[i] & bit_lo != 0) << 4;
+            let fifth_hi = u8::from(plane[i] & bit_hi != 0) << 4;
+            out[o + i] = d_lo * f32::from((packed[i] & 0x0f) + fifth_lo) - min_lo;
+            out[o + 32 + i] = d_hi * f32::from((packed[i] >> 4) + fifth_hi) - min_hi;
+        }
+    }
+}
+
+/// Reference decode of one Q2_K super-block (mirrors `decode_gguf_q2_k_block_into`).
+fn decode_q2k(blk: &[u8], out: &mut [f32; SUPER]) {
+    let scales = &blk[0..16];
+    let qs = &blk[16..80];
+    let mut o = 0;
+    let mut sub = 0;
+    for window in 0..2 {
+        let q = &qs[window * 32..window * 32 + 32];
+        for step in 0..4 {
+            let shift = 2 * step;
+            for hh in 0..2 {
+                let packed = scales[sub];
+                sub += 1;
+                let dl = D * f32::from(packed & 0x0f);
+                let ml = DMIN * f32::from(packed >> 4);
+                for l in 0..16 {
+                    out[o] = dl * f32::from((q[hh * 16 + l] >> shift) & 3) - ml;
+                    o += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Q3_K's sixteen scales (mirrors `gguf_q3_k_scales`), biased by 32.
+fn q3k_scales(raw: &[u8]) -> [i32; 16] {
+    let word = |i: usize| u32::from_le_bytes([raw[4 * i], raw[4 * i + 1], raw[4 * i + 2], raw[4 * i + 3]]);
+    let (a, b, top) = (word(0), word(1), word(2));
+    const LOW: u32 = 0x0f0f_0f0f;
+    const PAIRS: u32 = 0x0303_0303;
+    let aux = [
+        (a & LOW) | ((top & PAIRS) << 4),
+        (b & LOW) | (((top >> 2) & PAIRS) << 4),
+        ((a >> 4) & LOW) | (((top >> 4) & PAIRS) << 4),
+        ((b >> 4) & LOW) | (((top >> 6) & PAIRS) << 4),
+    ];
+    let mut s = [0i32; 16];
+    for (i, slot) in s.iter_mut().enumerate() {
+        *slot = i32::from(aux[i / 4].to_le_bytes()[i % 4] as i8);
+    }
+    s
+}
+
+/// Reference decode of one Q3_K super-block (mirrors `decode_gguf_q3_k_block_into`).
+fn decode_q3k(blk: &[u8], out: &mut [f32; SUPER]) {
+    let hmask = &blk[0..32];
+    let qs = &blk[32..96];
+    let scales = q3k_scales(&blk[96..108]);
+    let mut o = 0;
+    let mut sub = 0;
+    let mut selector = 1u8;
+    for window in 0..2 {
+        let q = &qs[window * 32..window * 32 + 32];
+        for step in 0..4 {
+            let shift = 2 * step;
+            for hh in 0..2 {
+                let dl = D * (scales[sub] - 32) as f32;
+                sub += 1;
+                for l in 0..16 {
+                    let at = hh * 16 + l;
+                    let borrow = if hmask[at] & selector == 0 { 4 } else { 0 };
+                    out[o] = dl * (i32::from((q[at] >> shift) & 3) - borrow) as f32;
+                    o += 1;
+                }
+            }
+            selector <<= 1;
+        }
+    }
+}
+
 /// Build a stored weight `[n, k]` and its host-decoded f32 twin. `block_bytes`
 /// and `decode` pick the scheme; the super-scale bytes are stamped exact, the
 /// rest filled from the LCG.
@@ -117,7 +212,8 @@ fn build_weight(
     n: usize,
     k: usize,
     block_bytes: usize,
-    is_q6k: bool,
+    d_off: usize,
+    dmin_off: Option<usize>,
     decode: fn(&[u8], &mut [f32; SUPER]),
 ) -> (Vec<u8>, Vec<f32>) {
     let blocks = k / SUPER;
@@ -132,15 +228,14 @@ fn build_weight(
             for b in blk.iter_mut() {
                 *b = lcg.byte();
             }
-            // Stamp the exact super-scales over the random fill.
-            if is_q6k {
-                blk[208] = D_LE[0];
-                blk[209] = D_LE[1];
-            } else {
-                blk[0] = D_LE[0];
-                blk[1] = D_LE[1];
-                blk[2] = DMIN_LE[0];
-                blk[3] = DMIN_LE[1];
+            // Stamp the exact super-scales over the random fill, at this
+            // scheme's byte offsets (Q2_K closes with them; Q3_K/Q6_K are
+            // symmetric so carry no dmin).
+            blk[d_off] = D_LE[0];
+            blk[d_off + 1] = D_LE[1];
+            if let Some(mo) = dmin_off {
+                blk[mo] = DMIN_LE[0];
+                blk[mo + 1] = DMIN_LE[1];
             }
             let mut vals = [0f32; SUPER];
             decode(blk, &mut vals);
@@ -153,7 +248,13 @@ fn build_weight(
 }
 
 /// One scheme, end to end: fire the kernel, read it against the host-decoded dot.
-fn check(scheme: &str, block_bytes: usize, is_q6k: bool, decode: fn(&[u8], &mut [f32; SUPER])) {
+fn check(
+    scheme: &str,
+    block_bytes: usize,
+    d_off: usize,
+    dmin_off: Option<usize>,
+    decode: fn(&[u8], &mut [f32; SUPER]),
+) {
     let Ok(device) = Context::bind() else {
         eprintln!("skip {scheme}: no Metal device");
         return;
@@ -166,7 +267,7 @@ fn check(scheme: &str, block_bytes: usize, is_q6k: bool, decode: fn(&[u8], &mut 
     let k = 2048usize; // 8 super-blocks per row -> the lane super-block stride runs
     let m = 5usize;
 
-    let (w_bytes, w_ref) = build_weight(n, k, block_bytes, is_q6k, decode);
+    let (w_bytes, w_ref) = build_weight(n, k, block_bytes, d_off, dmin_off, decode);
 
     // Activations: small deterministic bf16 values; the reference reads the same
     // bf16-rounded numbers the kernel does.
@@ -225,11 +326,26 @@ fn check(scheme: &str, block_bytes: usize, is_q6k: bool, decode: fn(&[u8], &mut 
 }
 
 #[test]
+fn q2_k_matmul_answers_the_host_decoded_dot() {
+    check("q2_k", Q2K_BYTES, 80, Some(82), decode_q2k);
+}
+
+#[test]
+fn q3_k_matmul_answers_the_host_decoded_dot() {
+    check("q3_k", Q3K_BYTES, 108, None, decode_q3k);
+}
+
+#[test]
 fn q4_k_matmul_answers_the_host_decoded_dot() {
-    check("q4_k", Q4K_BYTES, false, decode_q4k);
+    check("q4_k", Q4K_BYTES, 0, Some(2), decode_q4k);
+}
+
+#[test]
+fn q5_k_matmul_answers_the_host_decoded_dot() {
+    check("q5_k", Q5K_BYTES, 0, Some(2), decode_q5k);
 }
 
 #[test]
 fn q6_k_matmul_answers_the_host_decoded_dot() {
-    check("q6_k", Q6K_BYTES, true, decode_q6k);
+    check("q6_k", Q6K_BYTES, 208, None, decode_q6k);
 }
