@@ -42,6 +42,29 @@ fn serialized() -> MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A variable set for the length of a scope, **restored even if the scope
+/// unwinds**. Restoring it on the happy path only is how a failing arm
+/// leaves its setting behind for every test after it: an assertion inside
+/// `check_fp32_form` used to skip the removal, and the tensor-core arms
+/// that ran next took the fp32 kernel and failed for a reason that was not
+/// theirs. That is a mutation test reporting six failures for one defect.
+struct Env(&'static str);
+
+impl Env {
+    fn set(name: &'static str) -> Env {
+        // SAFETY: every caller holds `serialized`, so no other arm reads it.
+        unsafe { std::env::set_var(name, "1") };
+        Env(name)
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        // SAFETY: as `set`.
+        unsafe { std::env::remove_var(self.0) };
+    }
+}
+
 const EXPERTS: usize = 8;
 const TOP_K: usize = 4;
 
@@ -84,6 +107,16 @@ fn routes_of(tokens: usize) -> Vec<i32> {
 /// One shape, both arms, compared.
 fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     let _one = serialized();
+    check_held(tokens, n, k, by_token, biased);
+}
+
+/// [`check`]'s body, with the serialisation already taken. Split out
+/// because `check_fp32_form` has to set its variable INSIDE the lock: it
+/// used to set it and then block on the mutex, so whichever test held the
+/// lock ran the fp32 kernel while claiming to test the tensor-core one —
+/// which a mutation of the fp32 decode found by failing tests that should
+/// not have noticed it.
+fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     assert_eq!(k % BLOCK, 0, "K is whole mxfp4 blocks");
     let groups = k / BLOCK;
     let routes = routes_of(tokens);
@@ -96,9 +129,13 @@ fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
         .chunks(2)
         .map(|p| to_bf16((f32::from(p[0]) / 128.0 - 1.0) * 0.5))
         .collect();
+    // **BIG ENOUGH TO SEE.** The dots here land around ±280 and `close` is a
+    // 3 % relative check, so a bias of ±0.25 hides inside the tolerance: an
+    // epilogue that dropped it entirely still passed. Scaled to the same
+    // order as the result, dropping it fails.
     let bias: Vec<u16> = bytes(0x44, EXPERTS * n)
         .into_iter()
-        .map(|b| to_bf16((f32::from(b) / 128.0 - 1.0) * 0.25))
+        .map(|b| to_bf16((f32::from(b) / 128.0 - 1.0) * 120.0))
         .collect();
 
     let mut gpu = Gpu::open();
@@ -137,11 +174,10 @@ fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
         .expect("the mxfp4 select fires");
     };
     fire(grouped_at);
-    // SAFETY: one test, one thread; the variable is read at fire time by
-    // `linear::moe::matmul_select_quant` and nowhere else.
-    unsafe { std::env::set_var("PIE_NO_MXFP4_GROUP", "1") };
-    fire(per_route_at);
-    unsafe { std::env::remove_var("PIE_NO_MXFP4_GROUP") };
+    {
+        let _bare = Env::set("PIE_NO_MXFP4_GROUP");
+        fire(per_route_at);
+    }
     gpu.sync();
 
     let grouped: Vec<u16> = gpu.down(grouped_at, route_count * n);
@@ -259,10 +295,10 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
         t0.elapsed().as_secs_f64() * 1e3 / REPS as f64
     };
     let grouped_ms = run();
-    // SAFETY: one test, one thread — and `--test-threads=1` is the note.
-    unsafe { std::env::set_var("PIE_NO_MXFP4_GROUP", "1") };
-    let per_route_ms = run();
-    unsafe { std::env::remove_var("PIE_NO_MXFP4_GROUP") };
+    let per_route_ms = {
+        let _bare = Env::set("PIE_NO_MXFP4_GROUP");
+        run()
+    };
 
     let flop = 2.0 * route_count as f64 * n as f64 * k as f64;
     eprintln!(
@@ -283,4 +319,26 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
 fn the_gpt_oss_legs_are_priced() {
     price(5760, 2880, true, "gate/up");
     price(2880, 2880, false, "down");
+}
+
+/// **THE fp32 FORM, WHICH NOTHING ELSE REACHES.** With a bf16 activation
+/// the dispatch always takes the tensor-core kernel, so the fp32 grouped
+/// one — the first form written, and the one an f16 row would take — would
+/// ship having never run. `PIE_MXFP4_NO_WMMA` is what makes it reachable,
+/// and this is what makes it checked: the same four shapes, same reference.
+fn check_fp32_form(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
+    let _one = serialized();
+    let _fp32 = Env::set("PIE_MXFP4_NO_WMMA");
+    check_held(tokens, n, k, by_token, biased);
+}
+
+#[test]
+fn the_fp32_form_agrees_at_both_readings() {
+    check_fp32_form(64, 256, 256, true, true);
+    check_fp32_form(64, 256, 256, false, false);
+}
+
+#[test]
+fn the_fp32_form_agrees_on_a_ragged_rectangle() {
+    check_fp32_form(48, 200, 160, true, true);
 }
