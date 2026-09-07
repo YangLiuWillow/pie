@@ -494,6 +494,76 @@ pub fn pixel_unshuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
     (y, y_grid)
 }
 
+/// `AvgDown3D` by `factor = [ft, fh, fw]`, the widened channel averaged in
+/// contiguous runs of `group`: the time axis zero-padded IN FRONT to a
+/// multiple of `ft`, a CHANNEL-MAJOR space-to-depth
+/// ([`pixel_unshuffle`]'s own `(c, it, ih, iw)` order), then the mean of
+/// each `group` consecutive widened channels. `[rows, C]` in, `[rows',
+/// C·ft·fh·fw / group]` out; returns `(y, y_grid)`.
+///
+/// `group = fh·fw` is a spatial average pool that keeps the time block as
+/// extra channels — Wan 2.2's every shortcut. `group = ft·fh·fw` is the
+/// plain average pool over the whole block. `y` keeps `x`'s row dim and
+/// over-allocates; the grid says which rows are live.
+#[must_use]
+pub fn avg_down(x: &Value, grid: &Value, factor: [u32; 3], group: u32) -> (Value, Value) {
+    expect_voxels("`spatial::avg_down`'s input", x);
+    expect_grid("`spatial::avg_down`'s grid", grid);
+    let vol = volume(factor);
+    assert!(vol > 0, "an avg-down block of {factor:?} is empty");
+    let widened = x.width() * u64::from(vol);
+    assert!(
+        group > 0 && widened % u64::from(group) == 0,
+        "{widened} widened channels do not fold into groups of {group}"
+    );
+    let rule = GridRule::AvgDown { factor };
+    let rec = x.rec();
+    let y_grid = self::grid(grid, rule);
+    let y = rec.fresh(tensor(x.rows(), widened / u64::from(group), x.dtype()));
+    rec.push(
+        Spatial::AvgDown {
+            x: x.id(),
+            grid: grid.id(),
+            factor,
+            group,
+            y_grid: y_grid.id(),
+            y: y.id(),
+        },
+        &[x, grid, &y_grid],
+    );
+    (y, y_grid)
+}
+
+/// Write this tile's last `frames` frames of `x` into each lane's slot of
+/// the causal frame cache `cache` (an `Input::state` slab) and hand `x`
+/// back — the store half of [`conv3d`]'s cache with no convolution around
+/// it.
+///
+/// Wan 2.2's encoder head is the caller: its `downsample3d` resampler does
+/// not convolve on the first chunk at all, it only remembers the frames
+/// the NEXT chunk's convolution will pad with. The answer aliases `x`, so
+/// a text writes `let x = spatial::store_frames(&x, &g, cache, 1);` and the
+/// node sits on the dataflow where the reference's assignment sits.
+#[must_use]
+pub fn store_frames(x: &Value, grid: &Value, cache: ValueId, frames: u32) -> Value {
+    expect_voxels("`spatial::store_frames`'s input", x);
+    expect_grid("`spatial::store_frames`'s grid", grid);
+    assert!(frames > 0, "a cache of no frames is no cache");
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Spatial::CacheStore {
+            x: x.id(),
+            grid: grid.id(),
+            frames,
+            cache,
+            x_out: x_out.id(),
+        },
+        &[x, grid],
+    );
+    x_out
+}
+
 /// Voxels to patch tokens: `[rows, C]` over `grid` into `[Tokens,
 /// C·pt·ph·pw]`, the token side laid out by `tgrid`
 /// (`Input::token_grid(p)`). The one op that leaves the voxel axis.

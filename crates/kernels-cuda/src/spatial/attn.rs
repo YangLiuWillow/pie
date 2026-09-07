@@ -30,9 +30,14 @@ const BLOCK: u32 = 128;
 /// it is stamped with: a warp lane holds `C / 32` channels of every one of
 /// its queries twice over (the pre-scaled query and the accumulator), so
 /// `QPW · C / 32` is the register state either side and the product is held
-/// at 32 — four queries a warp at 256 channels, one at 1024. A wider group
-/// at 1024 spills to local memory and runs several times slower.
-const WIDTHS: [(u32, u32); 3] = [(256, 4), (512, 2), (1024, 1)];
+/// at 32 or below — four queries a warp at 256 channels, one at 1024. A
+/// wider group at 1024 spills to local memory and runs several times
+/// slower.
+///
+/// 640 is Wan 2.2's ENCODER mid block. Its per-lane slice is 20 channels,
+/// which is neither a whole number of 16-byte words nor aligned, so that
+/// instantiation moves bf16 scalars; the other three keep the vector path.
+const WIDTHS: [(u32, u32); 4] = [(256, 4), (512, 2), (640, 1), (1024, 1)];
 
 /// Which rows of a lane one query attends — the kernel's half of
 /// `model_ir::VoxelSegment`.
@@ -61,8 +66,8 @@ impl Segment {
 /// `y = softmax(q·kᵀ · sm_scale) · v` per block of `grid`, the block being
 /// a whole lane or a run of its frames ([`Segment`]).
 ///
-/// `q`, `k`, `v`: `[rows, C]` bf16 at one shape, `C` one of 256/512/1024,
-/// 16-byte aligned; `grid`: `[lanes, 4]` i32; `o`: `[rows, C]` bf16. Rows
+/// `q`, `k`, `v`: `[rows, C]` bf16 at one shape, `C` one of
+/// 256/512/640/1024, 16-byte aligned; `grid`: `[lanes, 4]` i32; `o`: `[rows, C]` bf16. Rows
 /// no lane claims land zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(

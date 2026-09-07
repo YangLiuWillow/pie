@@ -21,7 +21,9 @@ pub use attn::{Segment, attention};
 pub use cache::{cache_gather, cache_rows, cache_store};
 pub use conv::{Conv3d, ConvPath, TimePad, conv_weight_taps_major, conv3d, conv3d_on};
 pub use norm::group_norm;
-pub use resample::{patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest};
+pub use resample::{
+    avg_down, patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest,
+};
 pub use rule::{GridRule, derive_grid};
 
 use crate::error::Error;

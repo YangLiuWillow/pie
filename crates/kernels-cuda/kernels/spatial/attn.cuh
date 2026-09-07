@@ -24,8 +24,15 @@
 //
 // **REGISTERS.** `qreg` and `acc` are `QPW · C/32` fp32 each, so the caller
 // picks `QPW` against `C`: four queries a warp at C 256, two at 512, one at
-// 1024 — 64 registers of state either way, which is what keeps the 1024-wide
-// head (Wan's) off the local-memory spill path.
+// 640 and 1024 — at most 64 registers of state either way, which is what
+// keeps the 1024-wide head (Wan's decoder) off the local-memory spill path.
+//
+// **THE VECTOR PATH AND THE SCALAR ONE.** A lane reads its `CPL = C/32`
+// channels as 16-byte words when `CPL` divides by 8 (C 256, 512, 1024).
+// Wan 2.2's ENCODER mid block is 640 wide: `CPL` is 20, so a lane's slice
+// is neither a whole number of words nor 16-byte aligned, and that
+// instantiation reads and writes bf16 scalars instead. The arithmetic is
+// the same and the fast widths keep the same instructions they had.
 
 #include "prelude/device.cuh"
 #include "spatial/grid.cuh"
@@ -52,9 +59,10 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 }  // namespace detail
 
-/// `C` channels per row (`C % 256 == 0` so every lane's `CPL = C / 32`
-/// channels are whole 16-byte words); `QPW` queries per warp; four warps
-/// a block. `scale_log2` is `sm_scale · log2(e)`.
+/// `C` channels per row (`C % 32 == 0`; a lane's `CPL = C / 32` channels
+/// move as 16-byte words when `CPL % 8 == 0` and as scalars otherwise);
+/// `QPW` queries per warp; four warps a block. `scale_log2` is
+/// `sm_scale · log2(e)`.
 template <int C, int QPW>
 __global__ __launch_bounds__(128) void attention(
     const bf16* __restrict__ q,
@@ -68,8 +76,27 @@ __global__ __launch_bounds__(128) void attention(
     float scale_log2)
 {
     constexpr int CPL = C / 32;
+    constexpr bool VEC = (CPL % 8 == 0);
     constexpr int WORDS = CPL / 8;
-    static_assert(C % 256 == 0, "every lane holds whole 16-byte words of the row");
+    static_assert(C % 32 == 0, "every lane holds a whole slice of the row");
+
+    // One row's `CPL` channels into fp32, vector or scalar.
+    auto read_slice = [](const bf16* __restrict__ base, int row, int col, float (&out)[CPL]) {
+        const bf16* at = base + static_cast<size_t>(row) * C + col;
+        if constexpr (VEC) {
+            const uint4* src = reinterpret_cast<const uint4*>(at);
+#pragma unroll
+            for (int w = 0; w < WORDS; ++w) {
+                float tmp[8];
+                detail::unpack8(__ldg(src + w), tmp);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) out[w * 8 + e] = tmp[e];
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) out[e] = bf16_to_f32(ldg(at + e));
+        }
+    };
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -91,14 +118,9 @@ __global__ __launch_bounds__(128) void attention(
         seg_end[i] = 0;
         if (owner[i] >= 0) {
             segment_of(box[i], r - box[i].off, seg_frames, seg_begin[i], seg_end[i]);
-            const uint4* src = reinterpret_cast<const uint4*>(q + static_cast<size_t>(r) * C + col);
+            read_slice(q, r, col, qreg[i]);
 #pragma unroll
-            for (int w = 0; w < WORDS; ++w) {
-                float tmp[8];
-                detail::unpack8(__ldg(src + w), tmp);
-#pragma unroll
-                for (int e = 0; e < 8; ++e) qreg[i][w * 8 + e] = tmp[e] * scale_log2;
-            }
+            for (int e = 0; e < CPL; ++e) qreg[i][e] *= scale_log2;
         } else {
 #pragma unroll
             for (int c = 0; c < CPL; ++c) qreg[i][c] = 0.f;
@@ -135,19 +157,15 @@ __global__ __launch_bounds__(128) void attention(
         const int begin = who;
         const int end = seg_end[pick];
         for (int j = begin; j < end; ++j) {
-            const uint4* kp = reinterpret_cast<const uint4*>(k + static_cast<size_t>(j) * C + col);
+            float kk[CPL];
+            read_slice(k, j, col, kk);
             float s[QPW];
 #pragma unroll
             for (int i = 0; i < QPW; ++i) s[i] = 0.f;
 #pragma unroll
-            for (int w = 0; w < WORDS; ++w) {
-                float kk[8];
-                detail::unpack8(__ldg(kp + w), kk);
+            for (int e = 0; e < CPL; ++e) {
 #pragma unroll
-                for (int i = 0; i < QPW; ++i) {
-#pragma unroll
-                    for (int e = 0; e < 8; ++e) s[i] = fmaf(qreg[i][w * 8 + e], kk[e], s[i]);
-                }
+                for (int i = 0; i < QPW; ++i) s[i] = fmaf(qreg[i][e], kk[e], s[i]);
             }
             float p[QPW];
 #pragma unroll
@@ -165,16 +183,12 @@ __global__ __launch_bounds__(128) void attention(
                     p[i] = 0.f;
                 }
             }
-            const uint4* vp = reinterpret_cast<const uint4*>(v + static_cast<size_t>(j) * C + col);
+            float vv[CPL];
+            read_slice(v, j, col, vv);
 #pragma unroll
-            for (int w = 0; w < WORDS; ++w) {
-                float vv[8];
-                detail::unpack8(__ldg(vp + w), vv);
+            for (int e = 0; e < CPL; ++e) {
 #pragma unroll
-                for (int i = 0; i < QPW; ++i) {
-#pragma unroll
-                    for (int e = 0; e < 8; ++e) acc[i][w * 8 + e] = fmaf(p[i], vv[e], acc[i][w * 8 + e]);
-                }
+                for (int i = 0; i < QPW; ++i) acc[i][e] = fmaf(p[i], vv[e], acc[i][e]);
             }
         }
     }
@@ -186,15 +200,21 @@ __global__ __launch_bounds__(128) void attention(
         const int r = first + i;
         if (r >= rows) continue;
         const float inv = owner[i] >= 0 && l[i] > 0.f ? 1.f / l[i] : 0.f;
-        uint4* dst = reinterpret_cast<uint4*>(y + static_cast<size_t>(r) * C + col);
+        bf16* at = y + static_cast<size_t>(r) * C + col;
+        if constexpr (VEC) {
+            uint4* dst = reinterpret_cast<uint4*>(at);
 #pragma unroll
-        for (int w = 0; w < WORDS; ++w) {
-            uint4 word;
-            word.x = pack_bf16x2(acc[i][w * 8 + 0] * inv, acc[i][w * 8 + 1] * inv);
-            word.y = pack_bf16x2(acc[i][w * 8 + 2] * inv, acc[i][w * 8 + 3] * inv);
-            word.z = pack_bf16x2(acc[i][w * 8 + 4] * inv, acc[i][w * 8 + 5] * inv);
-            word.w = pack_bf16x2(acc[i][w * 8 + 6] * inv, acc[i][w * 8 + 7] * inv);
-            dst[w] = word;
+            for (int w = 0; w < WORDS; ++w) {
+                uint4 word;
+                word.x = pack_bf16x2(acc[i][w * 8 + 0] * inv, acc[i][w * 8 + 1] * inv);
+                word.y = pack_bf16x2(acc[i][w * 8 + 2] * inv, acc[i][w * 8 + 3] * inv);
+                word.z = pack_bf16x2(acc[i][w * 8 + 4] * inv, acc[i][w * 8 + 5] * inv);
+                word.w = pack_bf16x2(acc[i][w * 8 + 6] * inv, acc[i][w * 8 + 7] * inv);
+                dst[w] = word;
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) at[e] = f32_to_bf16(acc[i][e] * inv);
         }
     }
 }

@@ -700,8 +700,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Spatial::UpsampleNearest { .. }
             | Spatial::PixelShuffle { .. }
             | Spatial::PixelUnshuffle { .. }
+            | Spatial::AvgDown { .. }
             | Spatial::Patchify { .. }
             | Spatial::Unpatchify { .. } => &[(In(1), I32), (In(2), I32)],
+            // The store's third input is the slab it writes, whose kind
+            // the `Def::Cache` states; only the grid is pinned here.
+            Spatial::CacheStore { .. } => &[(In(1), I32)],
         },
     }
 }

@@ -241,6 +241,64 @@ pub fn pixel_shuffle_ref(
 
 /// The inverse: `[rows, c]` over boxes into `[rows / vol, c * vol]` over
 /// the boxes divided by `r`.
+/// `AvgDown3D` in f32, written the way the diffusers module is: zero-pad
+/// the time axis IN FRONT to a multiple of `r[0]`, `view` + `permute(0, 1,
+/// 3, 5, 7, 2, 4, 6)` into `C·r1·r2·r3` channels, then
+/// `view(.., out_c, group, ..).mean(dim=2)`.
+pub fn avg_down_ref(
+    x: &[f32],
+    boxes: &[Box3],
+    c: usize,
+    r: [usize; 3],
+    group: usize,
+) -> (Vec<f32>, Vec<Box3>) {
+    let vol = r[0] * r[1] * r[2];
+    let c_out = c * vol / group;
+    let outs: Vec<Box3> = boxes
+        .iter()
+        .map(|b| Box3::new(b.t.div_ceil(r[0]), b.h / r[1], b.w / r[2]))
+        .collect();
+    let rows_out: usize = outs.iter().map(|b| b.voxels()).sum();
+    let mut y = vec![0f32; rows_out * c_out];
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+    for (l, b) in boxes.iter().enumerate() {
+        let ob = outs[l];
+        let pad_t = (r[0] - b.t % r[0]) % r[0];
+        for to in 0..ob.t {
+            for ho in 0..ob.h {
+                for wo in 0..ob.w {
+                    let m = out_off + (to * ob.h + ho) * ob.w + wo;
+                    for n in 0..c_out {
+                        let mut acc = 0f32;
+                        for j in 0..group {
+                            let q = n * group + j;
+                            let ch = q / vol;
+                            let block = q % vol;
+                            let i1 = block / (r[1] * r[2]);
+                            let i2 = (block / r[2]) % r[1];
+                            let i3 = block % r[2];
+                            let ti = (to * r[0] + i1) as i64 - pad_t as i64;
+                            if ti < 0 {
+                                continue;
+                            }
+                            let src = in_off
+                                + ((ti as usize) * b.h + ho * r[1] + i2) * b.w
+                                + wo * r[2]
+                                + i3;
+                            acc += x[src * c + ch];
+                        }
+                        y[m * c_out + n] = acc / group as f32;
+                    }
+                }
+            }
+        }
+        in_off += b.voxels();
+        out_off += ob.voxels();
+    }
+    (y, outs)
+}
+
 pub fn pixel_unshuffle_ref(
     x: &[f32],
     boxes: &[Box3],

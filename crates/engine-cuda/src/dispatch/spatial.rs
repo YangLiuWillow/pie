@@ -57,6 +57,7 @@ fn rule(rule: GridRule) -> spatial::GridRule {
         },
         GridRule::Shuffle { r, trim_t } => spatial::GridRule::Shuffle { r, trim_t },
         GridRule::Unshuffle { r } => spatial::GridRule::Unshuffle { r },
+        GridRule::AvgDown { factor } => spatial::GridRule::AvgDown { factor },
     }
 }
 
@@ -249,6 +250,61 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),
+            Spatial::AvgDown {
+                x,
+                grid,
+                factor,
+                group,
+                y_grid,
+                y,
+            } => spatial::avg_down(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*grid),
+                *factor,
+                *group,
+                &mut self.tensor(*y),
+                self.tensor(*y_grid),
+            ),
+            // The store half of a causal convolution's cache with no
+            // convolution around it: this tile's last `frames` frames into
+            // each lane's slot, the answer aliasing the input.
+            Spatial::CacheStore {
+                x,
+                grid,
+                frames,
+                cache,
+                x_out: _,
+            } => {
+                let x = self.tensor(*x);
+                let grid = self.tensor(*grid);
+                let pool = self.recurrent(*cache);
+                let slot_ids = self
+                    .clip_slots()
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: "spatial.cache_store",
+                        detail:
+                            "a frame-cache store needs the fire's clip slot table, which no lane                              of it staged"
+                                .to_string(),
+                    })?;
+                let mut slab = pool.slab;
+                // `cache_store` reads its second rectangle only where a clip
+                // is SHORTER than the cache — the frames it cannot take from
+                // this tile it takes from the gathered old one. Nothing
+                // gathered an old cache here (there is no convolution to
+                // gather for), so the input stands in for it; the one caller
+                // stores ONE frame of a clip that has at least one, so that
+                // arm is never taken.
+                spatial::cache_store(
+                    self.ctx(),
+                    x,
+                    x,
+                    slot_ids,
+                    grid,
+                    *frames,
+                    &mut slab,
+                )
+            }
             Spatial::Patchify {
                 x,
                 grid,

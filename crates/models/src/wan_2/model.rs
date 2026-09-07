@@ -123,6 +123,19 @@ pub const VAE_PATCH: u32 = 2;
 pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 1024, 1024, 512, 256];
 pub const VAE_RESNETS: u32 = 3;
 pub const VAE_TEMPORAL_UP: [bool; 4] = [true, true, false, false];
+/// `dims = [160·1, 160·1, 160·2, 160·4, 160·4]`: the ENCODER's widths
+/// (`base_dim` 160 under the same `dim_mult`), in to out. The encoder is
+/// narrower than the decoder — `decoder_base_dim` is 256 and `base_dim`
+/// 160 — so its mid block attends a 640-wide row where the decoder's
+/// attends 1024.
+pub const VAE_ENCODER_DIMS: [u32; 5] = [160, 160, 320, 640, 640];
+/// `num_res_blocks`: two resnets per `WanResidualDownBlock` (the decoder's
+/// up blocks run `num_res_blocks + 1`).
+pub const VAE_ENC_RESNETS: u32 = 2;
+/// `temperal_downsample`, as the encoder reads it: down block `i` halves
+/// time iff this says so, and the LAST block downsamples neither time nor
+/// space (`down_flag = i != len(dim_mult) - 1`).
+pub const VAE_TEMPORAL_DOWN: [bool; 4] = [false, true, true, false];
 /// `F.normalize` clamps the norm at 1e-12; the RMS form adds it to the mean
 /// square, which is the same number for any live activation.
 pub const VAE_EPS: f32 = 1e-12;
@@ -176,6 +189,12 @@ pub mod port {
     /// (`z·std + mean`, [`super::VAE_LATENTS_STD`]) itself, so the guest
     /// hands over exactly the rows the denoise reading answered.
     pub const VOXELS: u8 = 0;
+    /// `vae.encode.head` / `vae.encode`: a PIXEL chunk's voxels,
+    /// `[t·H·W, 3]` bf16 in `[-1, 1]`. Voxel index ONE, because the engine
+    /// seats one rectangle per `(kind, index)` for the whole plan and the
+    /// decode arms' latent clip is 48 wide at index 0 (`z_image`'s
+    /// `vae.encode` states its own for the same reason).
+    pub const PIXEL_VOXELS: u8 = 1;
 }
 
 /// One row's transformer shape.
@@ -478,14 +497,22 @@ impl TextEncoder {
 /// One convolution of the VAE: the kernel as the checkpoint stores it
 /// (`[C_out, C_in·kt·kh·kw]`, declared tap-major), its f32 bias, and — for
 /// a causal 3-D kernel with `kt > 1` — the `CacheRow::State` slab holding
-/// the clip's last `kt − 1` input frames between tiles (`[2·plane, C_in]`
-/// bf16 per slot, `plane` the widest `h·w` this conv sees).
+/// the clip's last [`front`](Conv::front) input frames between tiles
+/// (`[front·plane, C_in]` bf16 per slot, `plane` the widest `h·w` this
+/// conv sees).
 pub struct Conv {
     pub w: Weight,
     pub bias: Weight,
     pub c_in: u32,
     pub c_out: u32,
     pub k: [u32; 3],
+    /// How many frames of the previous tile this convolution pads with —
+    /// its causal FRONT PAD, and so the height of its cache slab. `kt − 1`
+    /// for a `same`-padded causal convolution (`WanCausalConv3d(.., 3,
+    /// padding=1)` pads `2·padding = 2` frames in front), and ONE for the
+    /// encoder's `downsample3d` time convolution, which pads nothing of
+    /// its own and is handed `cat([last frame, x])` instead.
+    pub front: u32,
     /// The frame cache's state row, `Some` iff `k[0] > 1`.
     pub cache: Option<String>,
     pub plane: u64,
@@ -505,15 +532,25 @@ impl Conv {
             c_in,
             c_out,
             k,
+            front: k[0].saturating_sub(1),
             cache: (k[0] > 1).then(|| format!("{name}.frames")),
             plane,
         }
     }
 
-    /// The slab one slot of this conv's cache holds: `[(kt − 1)·plane, C_in]`.
+    /// The same convolution padding `front` frames in front instead of
+    /// `kt − 1` — the encoder's stride-2 time convolution, which keeps one
+    /// frame of history and no padding.
+    #[must_use]
+    fn fronting(mut self, front: u32) -> Conv {
+        self.front = front;
+        self
+    }
+
+    /// The slab one slot of this conv's cache holds: `[front·plane, C_in]`.
     #[must_use]
     pub fn slab(&self) -> [u64; 2] {
-        [u64::from(self.k[0] - 1) * self.plane, u64::from(self.c_in)]
+        [u64::from(self.front) * self.plane, u64::from(self.c_in)]
     }
 }
 
@@ -609,8 +646,203 @@ pub struct UpBlock {
     pub shortcut: Option<Shortcut>,
 }
 
+/// `AvgDown3D(in_dim, out_dim, factor_t, factor_s)`, the residual shortcut
+/// of a `WanResidualDownBlock`, as `spatial::avg_down` states it: the
+/// block `factor` and the size of the contiguous run of widened channels
+/// the mean folds. `group_size = in·factor / out` is the reference's own
+/// formula, and on every Wan block it comes out `factor_s²` — a 2×2
+/// spatial average pool that keeps the time block as `factor_t` channels
+/// per input channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvgDown {
+    pub factor: [u32; 3],
+    pub group: u32,
+}
+
+impl AvgDown {
+    /// The shortcut a block with these widths and factors states.
+    #[must_use]
+    pub fn at(c_in: u32, c_out: u32, factor_t: u32, factor_s: u32) -> AvgDown {
+        let factor = [factor_t, factor_s, factor_s];
+        let volume = factor_t * factor_s * factor_s;
+        assert_eq!(
+            c_in * volume % c_out,
+            0,
+            "an AvgDown3D's widened channels must fold into whole groups"
+        );
+        AvgDown {
+            factor,
+            group: c_in * volume / c_out,
+        }
+    }
+}
+
+/// `WanResample("downsample2d" | "downsample3d")`: a per-frame 3×3
+/// stride-2 convolution behind `nn.ZeroPad2d((0, 1, 0, 1))`, and — for the
+/// 3-D kind — a causal `(3, 1, 1)` STRIDE-2 time convolution after it.
+///
+/// That time convolution is not a `same`-padded causal one: the reference
+/// gives it `padding=0` and hands it `cat([the previous chunk's last
+/// frame, x])`, so it pads ONE frame and halves the frame count. On the
+/// FIRST chunk it does not run at all — the reference only stores the
+/// frames (`forward::vae_encode`'s `first` arm, `spatial::store_frames`).
+pub struct Downsampler {
+    pub resample: Conv,
+    pub time_conv: Option<Conv>,
+}
+
+/// One `WanResidualDownBlock`: two resnets, an optional resampler, and the
+/// `AvgDown3D` shortcut added to the result — `x_out = f(x) +
+/// avg_shortcut(x)`, the shortcut reading the block's INPUT.
+pub struct DownBlock {
+    pub resnets: Vec<Resnet>,
+    pub downsampler: Option<Downsampler>,
+    pub shortcut: AvgDown,
+}
+
+/// The Wan 2.2 VAE ENCODER: the 2×2 space-to-depth, `conv_in`, four
+/// residual down blocks, the mid block, the head, `quant_conv`, and the
+/// normalisation into the denoiser's latent space.
+pub struct VaeEncoder {
+    pub conv_in: Conv,
+    pub down: Vec<DownBlock>,
+    pub mid_res0: Resnet,
+    pub mid_attn: MidAttention,
+    pub mid_res1: Resnet,
+    pub norm_out: Weight,
+    /// `640 → 2·z_dim`: `DiagonalGaussianDistribution`'s
+    /// `[mean | logvar]`, both halves, because `quant_conv` mixes all 96
+    /// channels before the mean is taken.
+    pub conv_out: Conv,
+    /// `quant_conv` `96 → 96`, imported as its FIRST 48 output rows alone:
+    /// the posterior mean is all this arm answers and the logvar's rows
+    /// are never computed.
+    pub quant: Conv,
+    /// `mean` and `1/std` as `[48]` rows: the `(z − bias)·scale` form of
+    /// `(z_vae − mean)/std`, which is what the denoise reading takes. The
+    /// mirror of the decoder's [`Vae::denorm_bias`]/[`Vae::denorm_scale`],
+    /// so a guest hands `vae.encode`'s answer straight to `denoise`.
+    pub norm_bias: Weight,
+    pub norm_scale: Weight,
+}
+
+impl VaeEncoder {
+    fn wan22(banks: Dtype) -> VaeEncoder {
+        let dense = crate::dense(banks);
+        let dims = VAE_ENCODER_DIMS;
+        // The encoder's planes go the other way from the decoder's: the
+        // patchified pixel clip is 8× the latent plane on each axis, and
+        // every down block quarters it.
+        let p0 = VAE_MAX_LATENT_PLANE;
+        let mut plane = 64 * p0;
+        let mut down = Vec::new();
+        for i in 0..4 {
+            let (c_in, c_out) = (dims[i], dims[i + 1]);
+            let prefix = format!("vae.enc.down.{i}");
+            let resnets = (0..VAE_ENC_RESNETS)
+                .map(|r| {
+                    Resnet::at(
+                        &format!("{prefix}.res.{r}"),
+                        if r == 0 { c_in } else { c_out },
+                        c_out,
+                        plane,
+                        banks,
+                    )
+                })
+                .collect();
+            let down_flag = i != 3;
+            let temporal = VAE_TEMPORAL_DOWN[i];
+            let downsampler = down_flag.then(|| Downsampler {
+                resample: Conv::at(
+                    &format!("{prefix}.resample"),
+                    c_out,
+                    c_out,
+                    [1, 3, 3],
+                    plane,
+                    banks,
+                ),
+                // The time convolution sees the RESAMPLED plane, a quarter
+                // of the block's, and keeps ONE frame of history.
+                time_conv: temporal.then(|| {
+                    Conv::at(
+                        &format!("{prefix}.time_conv"),
+                        c_out,
+                        c_out,
+                        [3, 1, 1],
+                        plane / 4,
+                        banks,
+                    )
+                    .fronting(1)
+                }),
+            });
+            down.push(DownBlock {
+                resnets,
+                downsampler,
+                shortcut: AvgDown::at(
+                    c_in,
+                    c_out,
+                    if temporal { 2 } else { 1 },
+                    if down_flag { 2 } else { 1 },
+                ),
+            });
+            if down_flag {
+                plane /= 4;
+            }
+        }
+        let top = dims[4];
+        VaeEncoder {
+            conv_in: Conv::at(
+                "vae.enc.conv_in",
+                dims[0],
+                VAE_PIX_CHANNELS,
+                [3, 3, 3],
+                64 * p0,
+                banks,
+            ),
+            down,
+            mid_res0: Resnet::at("vae.enc.mid.res.0", top, top, plane, banks),
+            mid_attn: MidAttention {
+                norm: Weight::sym("vae.enc.mid.attn.norm", [u64::from(top)], dense),
+                qkv: Linear::at("vae.enc.mid.attn.qkv", 3 * top, top, banks),
+                proj: Linear::at("vae.enc.mid.attn.proj", top, top, banks),
+            },
+            mid_res1: Resnet::at("vae.enc.mid.res.1", top, top, plane, banks),
+            norm_out: Weight::sym("vae.enc.norm_out", [u64::from(top)], dense),
+            conv_out: Conv::at("vae.enc.conv_out", 2 * VAE_Z, top, [3, 3, 3], plane, banks),
+            quant: Conv::at("vae.enc.quant", VAE_Z, 2 * VAE_Z, [1, 1, 1], plane, banks),
+            norm_bias: Weight::sym("vae.enc.norm_bias", [u64::from(VAE_Z)], dense),
+            norm_scale: Weight::sym("vae.enc.norm_scale", [u64::from(VAE_Z)], dense),
+        }
+    }
+
+    /// Every conv with a frame cache, in trace order.
+    pub fn cached_convs(&self) -> impl Iterator<Item = &Conv> + '_ {
+        let mut out: Vec<&Conv> = vec![&self.conv_in];
+        for block in &self.down {
+            for r in &block.resnets {
+                out.push(&r.conv1);
+                out.push(&r.conv2);
+            }
+            if let Some(Downsampler {
+                time_conv: Some(tc),
+                ..
+            }) = &block.downsampler
+            {
+                out.push(tc);
+            }
+        }
+        for r in [&self.mid_res0, &self.mid_res1] {
+            out.push(&r.conv1);
+            out.push(&r.conv2);
+        }
+        out.push(&self.conv_out);
+        out.into_iter().filter(|c| c.cache.is_some())
+    }
+}
+
 /// The Wan 2.2 VAE decoder: `post_quant_conv`, `conv_in`, the mid block,
-/// four up blocks, the head, and the 2×2 depth-to-space at the end.
+/// four up blocks, the head, and the 2×2 depth-to-space at the end — with
+/// the [`encoder`](Vae::enc) beside it.
 pub struct Vae {
     /// `−mean/std` and `std` as `[48]` rows in the trunk's dtype: the
     /// `(z − bias)·scale` form of `z·std + mean`, which is what
@@ -627,6 +859,8 @@ pub struct Vae {
     pub up: Vec<UpBlock>,
     pub norm_out: Weight,
     pub conv_out: Conv,
+    /// The encoder side: `vae.encode.head` / `vae.encode`.
+    pub enc: VaeEncoder,
 }
 
 impl Vae {
@@ -713,6 +947,7 @@ impl Vae {
                 plane,
                 banks,
             ),
+            enc: VaeEncoder::wan22(banks),
         }
     }
 

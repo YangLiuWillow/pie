@@ -662,12 +662,16 @@ fn writes_cache(op: &Operation) -> bool {
         // must keep whatever it does with `y`.
         Operation::Spatial(op) => match op {
             Spatial::Conv3d { cache, .. } => cache.is_some(),
+            // The store IS the effect: it writes the slab and answers its
+            // own input.
+            Spatial::CacheStore { .. } => true,
             Spatial::Grid { .. }
             | Spatial::GroupNorm { .. }
             | Spatial::Attention { .. }
             | Spatial::UpsampleNearest { .. }
             | Spatial::PixelShuffle { .. }
             | Spatial::PixelUnshuffle { .. }
+            | Spatial::AvgDown { .. }
             | Spatial::Patchify { .. }
             | Spatial::Unpatchify { .. } => false,
         },

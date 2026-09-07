@@ -1,13 +1,17 @@
-//! The voxel-axis reshapes: nearest upsample, pixel (un)shuffle, and the
-//! patchify pair the DiT boundary names them by. Pure index arithmetic,
-//! one thread per output element, any 16-bit element.
+//! The voxel-axis reshapes: nearest upsample, pixel (un)shuffle, the
+//! patchify pair the DiT boundary names them by, and the averaging
+//! down-shuffle Wan 2.2's encoder shortcut is. Index arithmetic, one thread
+//! per output element, any 16-bit element; only [`avg_down`] does any
+//! arithmetic, and that is a mean in fp32.
 //!
 //! **CHANNEL ORDER.** The shuffles follow einops
 //! `'b (c r1 r2 r3) t h w -> b c (t r1) (h r2) (w r3)'` — `torch.pixel_shuffle`
 //! in two dimensions, and the transformer patchify
 //! `'b c (t pt) (h ph) (w pw) -> b (t h w) (c pt ph pw)'` inverted: within a
 //! block the offsets `(i1, i2, i3)` are the fast index under the channel,
-//! `c_in = c * r1*r2*r3 + (i1 * r2 + i2) * r3 + i3`.
+//! `c_in = c * r1*r2*r3 + (i1 * r2 + i2) * r3 + i3`. [`avg_down`] widens
+//! the row the same way and then folds runs of it, so the two agree on
+//! which elements a group holds.
 
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
@@ -192,6 +196,66 @@ pub fn pixel_unshuffle(
             r[0].arg(),
             r[1].arg(),
             r[2].arg(),
+            total.arg(),
+        ],
+    )
+}
+
+/// `AvgDown3D`: the time axis zero-padded IN FRONT to a multiple of `r[0]`,
+/// a channel-major space-to-depth by `r` ([`pixel_unshuffle`]'s ordering),
+/// then the MEAN of each `group` consecutive widened channels.
+///
+/// `x`: `[rows, C]`; `o`: `[rows_out, C*r1*r2*r3/group]` at `x`'s dtype,
+/// `o_grid` stating the `(ceil(t/r1), h/r2, w/r3)` boxes. `group == r1*r2*r3`
+/// is the plain average pool over the block; `group == r2*r3` is a spatial
+/// pool that keeps the time block as extra channels (Wan 2.2's every
+/// shortcut). fp32 accumulation, one rounding at the store.
+#[allow(clippy::too_many_arguments)]
+pub fn avg_down(
+    ctx: &Ctx,
+    x: Tensor,
+    grid: Tensor,
+    r: [u32; 3],
+    group: u32,
+    o: &mut Tensor,
+    o_grid: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "spatial.avg_down";
+    let t = element(OP, x.dtype)?;
+    debug_assert_eq!(o.dtype, x.dtype, "`{OP}` keeps the element");
+    let lanes = lane_pair(OP, grid, o_grid)?;
+    let (r, volume) = block_of(OP, r)?;
+    let widened = x.width.saturating_mul(volume);
+    if group == 0 || !widened.is_multiple_of(group) || o.width != widened / group {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} channels widen to {widened} and do not fold into {} groups of {group}",
+                x.width, o.width
+            ),
+        ));
+    }
+    let c = count(OP, "the input channel count", x.width)?;
+    let g = count(OP, "the group size", group)?;
+    let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            crate::jit::symbol(&format!("::pie::spatial::avg_down<{t}>")),
+        )
+        .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        &[
+            x.arg(),
+            grid.arg(),
+            o.arg(),
+            o_grid.arg(),
+            c.arg(),
+            lanes.arg(),
+            r[0].arg(),
+            r[1].arg(),
+            r[2].arg(),
+            g.arg(),
             total.arg(),
         ],
     )

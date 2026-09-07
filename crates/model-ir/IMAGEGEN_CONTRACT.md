@@ -225,11 +225,15 @@ clip table below carries the offsets.
   over token-axis CSRs, and a VAE's head is its whole channel row); fp32
   scores, online softmax and accumulation, one rounding at the store; kernel
   `spatial::attention(ctx, q, k, v, grid, segment, sm_scale, &mut y)`
-  (`kernels/spatial/attn.cuh`, `C ∈ {256, 512, 1024}` with the queries per
-  warp stamped against it — 4 / 2 / 1, holding `QPW·C/32` fp32 of query and
-  of accumulator at 32 registers each, which is what keeps the 1024-wide head
-  off the local-memory spill path — an online-softmax walk over the block's
-  keys, no flash tiling: a VAE attends at its lowest resolution); DSL
+  (`kernels/spatial/attn.cuh`, `C ∈ {256, 512, 640, 1024}` with the queries
+  per warp stamped against it — 4 / 2 / 1 / 1, holding `QPW·C/32` fp32 of
+  query and of accumulator at 32 registers or fewer, which is what keeps the
+  1024-wide head off the local-memory spill path — an online-softmax walk
+  over the block's keys, no flash tiling: a VAE attends at its lowest
+  resolution. A lane moves its `C/32` channels as 16-byte words where that
+  divides by 8 and as bf16 SCALARS where it does not, which today is 640
+  alone — Wan 2.2's ENCODER mid block, whose 20-channel slice is neither
+  whole words nor aligned); DSL
   `spatial::attention(q, k, v, grid, sm_scale)` and
   `spatial::attention_over(q, k, v, grid, segment, sm_scale)`.
   **THE VOXEL AXIS'S SEGMENT TABLE** is `VoxelSegment::{Clip, Frames(n)}`,
@@ -247,17 +251,38 @@ clip table below carries the offsets.
   `UpsampleNearest { x, grid, factor, keep_first_frame, y_grid, y }`;
   `PixelShuffle { x, grid, r, trim_t, y_grid, y }` /
   `PixelUnshuffle { x, grid, r, y_grid, y }` (einops
-  `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'`); `Patchify { x, grid, p,
+  `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'`);
+  `AvgDown { x, grid, factor, group, y_grid, y }` — `AvgDown3D`, Wan 2.2's
+  encoder residual shortcut: the TIME axis zero-padded IN FRONT to a multiple
+  of `factor[0]` (`pad_t = (ft - t % ft) % ft`, which is why an `Unshuffle`,
+  demanding a box that divides, cannot stand in), then the same channel-major
+  space-to-depth, then the MEAN of each `group` consecutive widened channels
+  — a reduction over the WIDTH, which on this axis is the channels, and never
+  over the grid. `[rows, C] → [rows', C·ft·fh·fw/group]` under
+  `GridRule::AvgDown { factor }` (`ceil(t/ft), h/fh, w/fw`); `group = fh·fw`
+  is a spatial average pool that keeps the time block as extra channels
+  (Wan's every case), `group = ft·fh·fw` the plain pool over the block; fp32
+  accumulation, one rounding;
+  `CacheStore { x, grid, frames, cache, x_out }` — the store half of a causal
+  conv's frame cache with no convolution around it, `x_out` ALIASING `x`
+  (the one aliasing member here). Wan 2.2's encoder head is the caller: its
+  `downsample3d` resampler does not run its time convolution on the first
+  chunk at all, it only remembers the frames the next chunk pads with, and
+  that convolution over a one-frame box has no output box to hang a `Conv3d`
+  on. `check::classes::writes_cache` roots it;
+  `Patchify { x, grid, p,
   tgrid, y }` → `[Tokens, C·p³]`; `Unpatchify { x, tgrid, p, grid, y }` →
-  `[Voxels, C]`. Every member lands a fresh rectangle (a conv reads its
+  `[Voxels, C]`. Every other member lands a fresh rectangle (a conv reads its
   neighbours). DSL: `spatial::conv3d(x, grid, w, bias, Conv, cache) -> (y,
   y_grid)`, `group_norm(..) -> y`, `upsample_nearest(..) -> (y, y_grid)`,
   `pixel_shuffle/pixel_shuffle_trimming/pixel_unshuffle(..) -> (y, y_grid)`,
+  `avg_down(x, grid, factor, group) -> (y, y_grid)`,
+  `store_frames(x, grid, cache, frames) -> x`,
   `patchify(x, grid, p,
   tgrid) -> y`, `unpatchify(x, tgrid, p, grid) -> y`, `Conv::{conv2d, conv3d,
   same3, causal(TimePad)}`. Shape rules: conv/norm keep rows; upsample and
   shuffle grow `Voxels → VoxelsTimes(vol)`; unshuffle divides a carried
-  factor out or keeps the dim.
+  factor out or keeps the dim; avg-down keeps the dim and over-allocates.
 - **Conv weights.** Declared as the checkpoint stores them (`[C_out,
   C_in·kt·kh·kw]`, `weight.reshape(C_out, -1)`) with
   `Weight::conv_taps_major(c_in, taps)`, interned as
@@ -267,12 +292,14 @@ clip table below carries the offsets.
   refuses a weight declared natural.
 - **Causal time and the frame cache.** `Conv::same3().causal(TimePad::Zero)`
   pads `kt-1` frames in front only. With `cache: Some(Input::state(name))` —
-  a `CacheRow::State` slab the text declares per causal conv, `[(kt-1)·
-  max_plane, C_in]` per slot — the CUDA arm gathers each clip's slot into a
+  a `CacheRow::State` slab the text declares per causal conv, `[front·
+  max_plane, C_in]` per slot, `front` being the conv's causal FRONT PAD
+  (`kt-1` for a `same`-padded one, and 1 for Wan's encoder `downsample3d`
+  time conv, which pads nothing of its own and is handed one cached frame) — the CUDA arm gathers each clip's slot into a
   `[Σ frames·h·w, C_in]` scratch rectangle (`spatial::cache_gather`,
-  `kernels/spatial/cache.cuh`), convolves, and stores this tile's last `kt-1`
-  input frames back (`spatial::cache_store`), keyed by the fire's `[Clips]`
-  slot table. `Shell::open(slot)` (the `RsReset` path) zeroes every state row
+  `kernels/spatial/cache.cuh`), convolves, and stores this tile's last
+  `front` input frames back (`spatial::cache_store`; the arm reads `front`
+  off `pad[0]`), keyed by the fire's `[Clips]` slot table. `Shell::open(slot)` (the `RsReset` path) zeroes every state row
   of the slot, which is the zero-padded first tile; `TimePad::Replicate` is
   for the cacheless single-tile case. WITHOUT `causal_t`, `TimePad::Replicate`
   (DSL `Conv::same3().replicate_time()`) pads BOTH ends of the clip with its

@@ -19,6 +19,9 @@ Outputs -> $PIE_IMAGEGEN_GOLDEN/wan22/
                        little-endian f32 in the row-per-voxel `(t, h, w)` layout pie's
                        voxel axis reads, PLUS the per-chunk boundaries the decoder's own
                        frame-by-frame loop produces (`shapes.json`)
+    wan22_vae_encode/  --vae: that decode back IN through `_encode`, chunk by chunk --
+      *.f32            the pixels, the posterior MEAN, and the mean normalised into the
+                       denoiser's latent space (what pie's `vae.encode` arm answers)
 
 TI2V-5B specifics: VAE stride (4,16,16), z=48, in/out channels 48, expand_timesteps=True,
 single backbone (boundary_ratio null), UniPCMultistepScheduler.
@@ -241,6 +244,55 @@ def run_vae(d: str, device="cuda"):
         Image.fromarray(u8.astype("uint8")).save(os.path.join(raw, f"frame{k:03d}.png"))
     print(f"  vae: latent {tuple(z.shape)} -> pixels {tuple(x.shape)} "
           f"[{float(x.min()):.3f}, {float(x.max()):.3f}]; chunks {shapes['chunks']}")
+
+    run_vae_encode(d, vae, x, mean, std)
+
+
+def run_vae_encode(d, vae, x, mean, std):
+    """The same clip back IN: `AutoencoderKLWan._encode` over the decoded pixels.
+
+    The encoder is the decoder's loop mirrored. `_encode` clears the caches,
+    2x2 space-to-depths the pixels, then runs the encoder once per CHUNK --
+    the first chunk being pixel frame 0 alone and every later one four frames
+    -- and finishes with `quant_conv` over the concatenation. So `4T - 3`
+    pixel frames land `T` latent frames, chunk `k` landing latent frame `k`.
+
+    Three planes are dumped, all in pie's row-per-voxel `(t, h, w)` layout:
+    `pixels.f32` (the encoder's input, `[F*H*W, 3]` in [-1, 1]), `mean.f32`
+    (`quant_conv`'s first 48 channels -- `DiagonalGaussianDistribution`'s
+    MEAN, which is what an image-to-video guest takes, never a sample), and
+    `latent.f32`, the same rows NORMALISED into the denoiser's own space
+    (`(mean - latents_mean)/latents_std`), which is what pie's `vae.encode`
+    arm answers.
+    """
+    with torch.no_grad():
+        enc = vae._encode(x)                          # [1, 2*z, T, h, w]
+    post = enc[:, : vae.config.z_dim]
+    normalised = (post - mean) / std
+
+    frames = int(x.shape[2])
+    t_lat = int(post.shape[2])
+    assert frames == 4 * t_lat - 3, f"{frames} frames should encode to {(frames + 3) // 4}"
+
+    raw = os.path.join(d, "wan22_vae_encode")
+    os.makedirs(raw, exist_ok=True)
+    shapes = {}
+    for key, t in (("pixels", x[0]), ("mean", post[0]), ("latent", normalised[0])):
+        cthw = t.detach().float().cpu().numpy()               # [C, T, H, W]
+        rows = np.ascontiguousarray(cthw.transpose(1, 2, 3, 0)).astype("<f4")
+        rows.tofile(os.path.join(raw, f"{key}.f32"))
+        shapes[key] = {"t": int(cthw.shape[1]), "h": int(cthw.shape[2]),
+                       "w": int(cthw.shape[3]), "channels": int(cthw.shape[0])}
+    # Chunk `k` of the encode loop takes pixel frames `[chunks[k],
+    # chunks[k+1])` and lands latent frame `k`: one frame, then four.
+    shapes["chunks"] = [0] + [1 + 4 * k for k in range(t_lat)]
+    shapes["patch_size"] = int(vae.config.patch_size or 1)
+    shapes["source"] = "the fp32 decode of latent.final, back through the encoder"
+    with open(os.path.join(raw, "shapes.json"), "w") as f:
+        json.dump(shapes, f, indent=2)
+    print(f"  vae encode: pixels {tuple(x.shape)} -> mean {tuple(post.shape)} "
+          f"[{float(post.min()):.3f}, {float(post.max()):.3f}]; "
+          f"normalised [{float(normalised.min()):.3f}, {float(normalised.max()):.3f}]")
 
 
 def main():

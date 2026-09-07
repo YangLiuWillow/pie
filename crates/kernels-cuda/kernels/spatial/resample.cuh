@@ -1,9 +1,11 @@
 #pragma once
 
-// **THE VOXEL-AXIS RESHAPES: NO ARITHMETIC, ONLY ADDRESSES.** Each kernel
-// is one thread per output element: find the output row's lane in the
-// output table, unravel its `(t, h, w)`, name the input voxel and channel
-// under the input table, copy. A row no lane claims lands zero.
+// **THE VOXEL-AXIS RESHAPES: ADDRESSES, AND ONE MEAN.** Each kernel is one
+// thread per output element: find the output row's lane in the output
+// table, unravel its `(t, h, w)`, name the input voxel and channel under
+// the input table, copy. A row no lane claims lands zero. `avg_down` is
+// the one member that computes rather than copies: it widens the row the
+// way `pixel_unshuffle` does and averages runs of it in fp32.
 //
 // **CHANNEL ORDER OF THE SHUFFLES** is einops
 // `'b (c r1 r2 r3) t h w -> b c (t r1) (h r2) (w r3)'`, which is
@@ -127,6 +129,65 @@ __global__ __launch_bounds__(256) void pixel_unshuffle(
     const int i3 = block % r3;
     const int src = ravel(ig, o.t * r1 + i1, o.h * r2 + i2, o.w * r3 + i3);
     y[e] = x[static_cast<long long>(src) * c + cin];
+}
+
+/// `AvgDown3D` (Wan 2.2's encoder residual shortcut): the time axis
+/// zero-padded IN FRONT to a multiple of `r1`, a channel-major space to
+/// depth by `(r1, r2, r3)`, then the MEAN of each `group` consecutive
+/// widened channels. `[rows, c]` in, `[rows_out, c * r1*r2*r3 / group]`
+/// out; `c` is the INPUT width, `o_grid` the `(ceil(t/r1), h/r2, w/r3)`
+/// boxes.
+///
+/// One thread per output element. Output channel `n` covers widened
+/// channels `[n*group, (n+1)*group)`, and widened channel `q` is
+/// `(c_in, i1, i2, i3)` read the way `pixel_unshuffle` reads it. The FRONT
+/// pad is what makes `i1` skippable: the padded frame index is
+/// `o.t * r1 + i1 - pad_t` and a negative one contributes a zero to the
+/// mean, exactly as `F.pad(x, (0,0,0,0,pad_t,0))` before the reshape does.
+/// fp32 accumulation, one rounding at the store.
+template <class T>
+__global__ __launch_bounds__(256) void avg_down(
+    const T* __restrict__ x,
+    const int* __restrict__ grid,
+    T* __restrict__ y,
+    const int* __restrict__ o_grid,
+    int c,
+    int lanes,
+    int r1,
+    int r2,
+    int r3,
+    int group,
+    long long total)
+{
+    const int r = r1 * r2 * r3;
+    const int c_out = c * r / group;
+    const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (e >= total) return;
+    const int row = static_cast<int>(e / c_out);
+    const int n = static_cast<int>(e - static_cast<long long>(row) * c_out);
+    Lane og;
+    const int l = lane_of(o_grid, lanes, row, og);
+    if (l < 0) {
+        y[e] = T{static_cast<unsigned short>(0)};
+        return;
+    }
+    const Lane ig = lane_at(grid, l);
+    const Voxel o = unravel(og, row - og.off);
+    const int pad_t = (r1 - ig.t % r1) % r1;
+    float acc = 0.f;
+    for (int j = 0; j < group; ++j) {
+        const int q = n * group + j;
+        const int cin = q / r;
+        const int block = q - cin * r;
+        const int i1 = block / (r2 * r3);
+        const int i2 = (block / r3) % r2;
+        const int i3 = block % r3;
+        const int ti = o.t * r1 + i1 - pad_t;
+        if (ti < 0) continue;                 // a front-padded frame is zero
+        const int src = ravel(ig, ti, o.h * r2 + i2, o.w * r3 + i3);
+        acc += Elem<T>::to_f32(x[static_cast<long long>(src) * c + cin]);
+    }
+    y[e] = Elem<T>::from_f32(acc / static_cast<float>(group));
 }
 
 }

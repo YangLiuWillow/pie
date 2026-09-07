@@ -566,6 +566,35 @@ Both on latent `[1,16,5,16,16]` → S = 320 tokens, context `[1,32,64]`.
 | `wan22_mini_d128.safetensors` | 8,914,648 | `5707cde610525dbcec5ca1c95f21ec16` |
 | `wan22_mini_config.json` | 11,474 | `aab5a938c58f7864cbe2a03fe69bf47d` |
 
+#### `--vae` — the autoencoder alone, both directions
+
+`--vae` runs the fp32 `AutoencoderKLWan` over `latent.final` and writes two
+directories of raw little-endian f32 in pie's row-per-voxel `(t, h, w)`
+layout, each with a `shapes.json` naming the boxes and the CHUNK boundaries
+the reference's own loop produces:
+
+- `wan22_vae/` — the DECODE. `latent.f32` (`[T·30·52, 48]`, the denoiser's
+  space), `denorm.f32` (the same times `latents_std` plus `latents_mean`,
+  which is what the reference hands its decoder) and `pixels.f32`
+  (`[(4T−3)·480·832, 3]` in `[−1, 1]`). Chunk `k` is latent frame `k` and
+  lands output frames `[chunks[k], chunks[k+1])`.
+- `wan22_vae_encode/` — that decode back IN. `pixels.f32` (the encoder's
+  input, the same plane), `mean.f32` (`quant_conv`'s first 48 channels —
+  `DiagonalGaussianDistribution`'s MEAN, never a sample) and `latent.f32`,
+  the same rows normalised into the denoiser's space, which is what pie's
+  `vae.encode` arms answer. Chunk `k` takes pixel frames
+  `[chunks[k], chunks[k+1])` — one frame, then four — and lands latent
+  frame `k`.
+
+```
+CUDA_VISIBLE_DEVICES=3 python wan22_golden.py --vae     # needs `--full` to have run
+```
+
+| direction | shape | cos | mean \|err\| | gate |
+|---|---|---:|---:|---|
+| decode | 5×30×52 → 17×480×832 | 0.999986 | 0.00244 | `the_wan_2_vae_answers_the_reference` |
+| encode | 17×480×832 → 5×30×52 | 0.999988 | 0.00492 | `the_wan_2_vae_encodes_the_reference` |
+
 ### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/`
 
 **No `--full`.** The flagship needs the 201 GB snapshot and sglang's serving

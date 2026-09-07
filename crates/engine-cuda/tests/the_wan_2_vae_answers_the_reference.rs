@@ -47,9 +47,10 @@
 //!    lands four frames, not one; that is not a parity claim, it is the
 //!    claim that the two arms are actually two arms.
 //!
-//! Nothing here claims the ENCODER (untraced, `AvgDown3D` has no `Spatial`
-//! member) or a T > 5 clip (the golden's own length). Skipped by name
-//! without a device, the artifact or the golden.
+//! Nothing here claims the ENCODER — that is
+//! `the_wan_2_vae_encodes_the_reference`, its own gate over its own arms —
+//! or a T > 5 clip (the golden's own length). Skipped by name without a
+//! device, the artifact or the golden.
 
 #![cfg(feature = "cuda")]
 
@@ -87,10 +88,14 @@ impl ForwardHybrid for VaeOnly {
             .as_ref()
             .expect("the flagship carries the VAE");
         let codes = self.model.readings();
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
+        let (top, bot) = inputs.split(&Facts::reading_top());
+        let (t_hi, t_lo) = top.split(&Facts::reading_hi());
+        let (b_hi, b_lo) = bot.split(&Facts::reading_hi());
+        let (c7, c6) = t_hi.split(&Facts::reading_lo());
+        let (c5, c4) = t_lo.split(&Facts::reading_lo());
+        let (c3, c2) = b_hi.split(&Facts::reading_lo());
+        let (c1, c0) = b_lo.split(&Facts::reading_lo());
+        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
         let head = codes.vae_decode_head.expect("the head arm's code");
         let rest = codes.vae_decode.expect("the later-frames arm's code");
         let _ = models::wan_2::forward::vae_decode(&arms[usize::from(head)], vae, true);

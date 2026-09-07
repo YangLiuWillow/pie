@@ -151,6 +151,12 @@ pub enum GridRule {
     Shuffle { r: [u32; 3], trim_t: u32 },
     /// Space to depth: `(t/r1, h/r2, w/r3)`; every box must divide.
     Unshuffle { r: [u32; 3] },
+    /// [`AvgDown`](Spatial::AvgDown)'s box: the same space-to-depth with
+    /// the TIME axis zero-padded IN FRONT to a multiple of `factor[0]`
+    /// first, so `t` lands `ceil(t / ft)` rather than needing to divide
+    /// (`AvgDown3D`'s `pad_t = (ft - t % ft) % ft`, padded at the front
+    /// because the encoder is causal). `h` and `w` must still divide.
+    AvgDown { factor: [u32; 3] },
 }
 
 impl GridRule {
@@ -203,6 +209,12 @@ impl GridRule {
                 }
                 Some([t / r[0], h / r[1], w / r[2]])
             }
+            GridRule::AvgDown { factor } => {
+                if factor.iter().any(|&x| x == 0) || h % factor[1] != 0 || w % factor[2] != 0 {
+                    return None;
+                }
+                Some([t.div_ceil(factor[0]), h / factor[1], w / factor[2]])
+            }
         }
     }
 
@@ -211,7 +223,9 @@ impl GridRule {
     #[must_use]
     pub fn growth(self) -> u32 {
         match self {
-            GridRule::Conv { .. } | GridRule::Unshuffle { .. } => 1,
+            GridRule::Conv { .. }
+            | GridRule::Unshuffle { .. }
+            | GridRule::AvgDown { .. } => 1,
             GridRule::Upsample { factor, .. } => factor[0] * factor[1] * factor[2],
             // The trim only removes rows, so the block volume still bounds
             // the growth: a trimmed shuffle lands inside the rectangle a
@@ -349,6 +363,62 @@ pub enum Spatial {
         y_grid: ValueId,
         y: ValueId,
     },
+    /// `AvgDown3D` (Wan 2.2's encoder residual shortcut): a space-to-depth
+    /// by `factor = [ft, fh, fw]` whose widened channel is then AVERAGED in
+    /// contiguous runs of `group`.
+    ///
+    /// Three statements in one node, because the middle one is not a value
+    /// any text would want:
+    ///
+    /// 1. The TIME axis is zero-padded IN FRONT to a multiple of `ft`
+    ///    (`pad_t = (ft - t % ft) % ft`) — the causal encoder's answer to a
+    ///    chunk whose frame count does not fill a block, and why
+    ///    [`PixelUnshuffle`](Spatial::PixelUnshuffle), which demands a box
+    ///    that divides, cannot stand in.
+    /// 2. Space to depth by `factor`, CHANNEL-MAJOR: the widened channel
+    ///    runs `(c, it, ih, iw)`, exactly
+    ///    [`PixelUnshuffle`](Spatial::PixelUnshuffle)'s order and exactly
+    ///    the reference's `permute(0, 1, 3, 5, 7, 2, 4, 6)`.
+    /// 3. `y[.., n]` is the MEAN of the widened channels
+    ///    `[n·group, (n+1)·group)`, so `[rows, C]` lands `[rows',
+    ///    C·ft·fh·fw / group]`. The reduction is over the WIDTH — a row's
+    ///    width is its channels on this axis — and never over the grid,
+    ///    which is why this is not an upsample's or a shuffle's shape of
+    ///    op. `group = fh·fw` (Wan's every case) makes it a spatial average
+    ///    pool that keeps the time block as extra channels.
+    ///
+    /// `y_grid` is `Grid { rule: AvgDown { factor } }` of `grid`; `y` keeps
+    /// `x`'s row dim and over-allocates, the grid saying which rows are
+    /// live. fp32 accumulation, one rounding at the store.
+    AvgDown {
+        x: ValueId,
+        grid: ValueId,
+        factor: [u32; 3],
+        group: u32,
+        y_grid: ValueId,
+        y: ValueId,
+    },
+    /// SEED A CAUSAL CONVOLUTION'S FRAME CACHE WITHOUT CONVOLVING: write
+    /// this tile's last `frames` frames of `x` into each lane's slot of
+    /// `cache` and hand `x` back unchanged (`x_out` aliases `x`).
+    ///
+    /// The one arm that needs it is Wan 2.2's ENCODER head: its
+    /// `downsample3d` resampler SKIPS its time convolution on the first
+    /// chunk entirely (`feat_cache[idx] is None` — the reference stores
+    /// `x.clone()` and passes the frames through) and the NEXT chunk's
+    /// convolution then reads that stored frame. A `Conv3d` cannot express
+    /// it: the same convolution over a one-frame box has no output box at
+    /// all, and only [`Conv3d`](Spatial::Conv3d) otherwise writes a slab.
+    /// So the store is named on its own, and the identity output is what
+    /// keeps the node on the trace's dataflow rather than needing a
+    /// side-effect rule.
+    CacheStore {
+        x: ValueId,
+        grid: ValueId,
+        frames: u32,
+        cache: ValueId,
+        x_out: ValueId,
+    },
     /// Voxels to patch tokens: `[rows, C]` over `(t, h, w)` into
     /// `[Tokens, C·pt·ph·pw]` — the DiT boundary's name for an unshuffle by
     /// the patch `p`, landing on the TOKEN axis. `tgrid` is
@@ -407,7 +477,11 @@ impl Operands for Spatial {
             }
             | Self::PixelUnshuffle {
                 x, grid, y_grid, ..
+            }
+            | Self::AvgDown {
+                x, grid, y_grid, ..
             } => sink.extend([*x, *grid, *y_grid]),
+            Self::CacheStore { x, grid, cache, .. } => sink.extend([*x, *grid, *cache]),
             Self::Patchify { x, grid, tgrid, .. } => sink.extend([*x, *grid, *tgrid]),
             Self::Unpatchify { x, tgrid, grid, .. } => sink.extend([*x, *tgrid, *grid]),
         }
@@ -421,11 +495,13 @@ impl Operands for Spatial {
             | Self::UpsampleNearest { y, .. }
             | Self::PixelShuffle { y, .. }
             | Self::PixelUnshuffle { y, .. }
+            | Self::AvgDown { y, .. }
             | Self::Patchify { y, .. }
             | Self::Unpatchify { y, .. } => sink.push(*y),
+            Self::CacheStore { x_out, .. } => sink.push(*x_out),
         }
     }
-    fn aliases(&self, _sink: &mut Vec<(ValueId, ValueId)>) {
+    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
         match self {
             // Every member lands a fresh rectangle: a convolution reads
             // every neighbour of a row, so in place would be a race.
@@ -436,8 +512,12 @@ impl Operands for Spatial {
             | Self::UpsampleNearest { .. }
             | Self::PixelShuffle { .. }
             | Self::PixelUnshuffle { .. }
+            | Self::AvgDown { .. }
             | Self::Patchify { .. }
             | Self::Unpatchify { .. } => {}
+            // The cache store moves nothing: its answer IS its input, and
+            // the alias is what says so.
+            Self::CacheStore { x_out, x, .. } => sink.push((*x_out, *x)),
         }
     }
     fn name(&self) -> &'static str {
@@ -449,6 +529,8 @@ impl Operands for Spatial {
             Self::UpsampleNearest { .. } => "spatial.upsample_nearest",
             Self::PixelShuffle { .. } => "spatial.pixel_shuffle",
             Self::PixelUnshuffle { .. } => "spatial.pixel_unshuffle",
+            Self::AvgDown { .. } => "spatial.avg_down",
+            Self::CacheStore { .. } => "spatial.cache_store",
             Self::Patchify { .. } => "spatial.patchify",
             Self::Unpatchify { .. } => "spatial.unpatchify",
         }
@@ -536,6 +618,34 @@ mod tests {
             .out_extent([1, 2, 2]),
             None
         );
+    }
+
+    /// `AvgDown3D`'s box: the time axis is zero-padded IN FRONT to a
+    /// multiple of the block, so a one-frame chunk still maps under a
+    /// `factor_t` of 2 — which is the whole reason it is not an
+    /// `Unshuffle`. `h` and `w` still have to divide.
+    #[test]
+    fn an_avg_down_pads_its_time_axis_to_the_block() {
+        let two = GridRule::AvgDown { factor: [2, 2, 2] };
+        assert_eq!(two.out_extent([4, 8, 12]), Some([2, 4, 6]));
+        // One frame under a factor-2 time block: `pad_t = 1`, one output
+        // frame. `Unshuffle` maps nothing here.
+        assert_eq!(two.out_extent([1, 8, 12]), Some([1, 4, 6]));
+        assert_eq!(GridRule::Unshuffle { r: [2, 2, 2] }.out_extent([1, 8, 12]), None);
+        assert_eq!(two.out_extent([3, 8, 12]), Some([2, 4, 6]));
+        // A spatial block that does not divide is still no box.
+        assert_eq!(two.out_extent([2, 7, 12]), None);
+        // `factor_s` alone is a plain spatial pool; `[1, 1, 1]` is identity.
+        assert_eq!(
+            GridRule::AvgDown { factor: [1, 2, 2] }.out_extent([5, 8, 12]),
+            Some([5, 4, 6])
+        );
+        assert_eq!(
+            GridRule::AvgDown { factor: [1, 1, 1] }.out_extent([5, 8, 12]),
+            Some([5, 8, 12])
+        );
+        assert_eq!(two.growth(), 1);
+        assert_eq!(two.apply(&[1, 2, 2, 0, 4, 2, 2, 1]), Some(vec![1, 1, 1, 0, 2, 1, 1, 1]));
     }
 
     /// The two regular blocks a spatial attention segments by, read off a

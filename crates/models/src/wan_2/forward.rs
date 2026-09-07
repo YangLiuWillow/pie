@@ -6,6 +6,7 @@
 //! | `text` | one, `Text` | `embed(ids)` — NO `attention`: umT5 is bidirectional and cacheless | `hidden` `[L, 4096]`: `last_hidden_state` after `final_layer_norm` |
 //! | `denoise` | one or two `Video` + one `Context`, one group | video: `latents` `[N, C·4]`, `positions` `[N, 3]`, `timestep`; context: `context` `[512, 4096]` | `velocity` `[N, C·4]` on every video lane |
 //! | `vae.decode.head`, `vae.decode` (see the chunking contract below) | one, `Video` | `latent` `[h·w, 48]` + the clip's box | `pixels` `[16·h·16·w, 3]` (later frames: `4×` that) |
+//! | `vae.encode.head`, `vae.encode` | one, `Video` | `pixels` `[t·H·W, 3]` on voxel index 1 (`t` 1 then 4) | `[H/16·W/16, 48]`: the posterior MEAN, normalised into the denoiser's space |
 //!
 //! **The timestep is per lane, and TI2V's per-token timestep is two
 //! lanes.** The reference's TI2V path (`expand_timesteps`) hands the
@@ -95,9 +96,31 @@
 //! not serve it (stamped at head widths 64/128/256, and its CSR is a
 //! token-axis table).
 //!
-//! The ENCODER is not traced: its `AvgDown3D` mean over a `(2, 2, 2)`
-//! window has no `Spatial` member, so `vae.encode` is refused by absence
-//! and an image-to-video row would need that op first.
+//! # THE `vae.encode` CHUNKING CONTRACT
+//!
+//! The same shape of contract, mirrored. `AutoencoderKLWan._encode` clears
+//! its caches, 2×2 space-to-depths the pixels, and then runs the encoder
+//! once per chunk — the FIRST chunk being frame 0 alone and every later
+//! one four frames — before `quant_conv` over the concatenation (a
+//! `(1, 1, 1)` kernel, so per chunk is the same numbers).
+//!
+//! | arm | takes | lands | `downsample3d` time convs |
+//! |---|---|---|---|
+//! | `vae.encode.head` | pixel frame 0, `[H·W, 3]` | `[1 × H/16 × W/16, 48]` | not run; the frames are STORED for the next chunk (`spatial::store_frames`) |
+//! | `vae.encode` | the next FOUR pixel frames, `[4·H·W, 3]` | `[1 × H/16 × W/16, 48]` | run, each over `cat([the stored frame, x])` |
+//!
+//! So a clip of `4·T − 3` pixel frames encodes to `T` latent frames down
+//! one slot, head arm first — the decode contract read backwards. The
+//! pixels come in on VOXEL INDEX ONE (`port::PIXEL_VOXELS`) because they
+//! are 3 wide where the decode arms' latent clip is 48, and the arm hands
+//! back `(z_vae − mean)/std`, the denoise reading's own space.
+//!
+//! `AvgDown3D` — the residual shortcut of every down block, which is what
+//! kept this reading unwritten — is `spatial::avg_down`: a channel-major
+//! space-to-depth whose widened channels are then averaged in contiguous
+//! runs, with the TIME axis zero-padded IN FRONT where a chunk is shorter
+//! than the block. That front pad is why the head chunk needs no arm of
+//! its own for the shortcuts, only for the time convolutions.
 
 use model_dsl::ops::spatial;
 use model_dsl::{
@@ -116,19 +139,23 @@ use super::model::{
     PATCH_H, PATCH_T, PATCH_W, ROPE_AXES, ROPE_THETA, Resnet, Shortcut, T_FLIP_SIN_COS,
     T_MAX_PERIOD, T_SCALE, TE_BUCKETS, TE_EPS, TE_HEAD_DIM, TE_HIDDEN, TE_MAX_DISTANCE,
     TE_MAX_TOKENS, TE_VOCAB, TRAIN_STEPS, TextEncoder, VAE_EPS, VAE_PATCH, VAE_RGB,
-    VAE_SPATIAL_COMPRESSION, VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, port,
+    VAE_SPATIAL_COMPRESSION, VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, VaeEncoder, port,
 };
 
 /// The bit the one-hot stream facts start at (D2): bits 0..6 are the six
 /// streams, of which this text names Text, Video and Context.
 pub const STREAM_BASE: u8 = 0;
 
-/// The two bits the reading index lives in, as a plain binary code: bit
-/// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Four codes:
-/// `text`, `denoise`, `vae.decode.head`, `vae.decode`; a `vae.encode`
-/// or a second backbone (`denoise.low`, D9) is a third bit away.
+/// The three bits the reading index lives in, as a plain binary code: bit
+/// [`READING_LO`] is its low bit, then [`READING_HI`], then
+/// [`READING_TOP`]. Six codes: `text`, `denoise`, `vae.decode.head`,
+/// `vae.decode`, `vae.encode.head`, `vae.encode`; the two spare codes are
+/// where a second backbone (`denoise.low`, D9) would go.
 pub const READING_LO: u8 = 6;
 pub const READING_HI: u8 = 7;
+pub const READING_TOP: u8 = 8;
+/// The mask the three bits cover.
+const READING_MASK: u8 = 7;
 
 /// Which reading code means what, per row: the flagship runs `text` at 0,
 /// the miniatures (no encoder) run `denoise` at 0.
@@ -140,6 +167,10 @@ pub struct Readings {
     pub vae_decode_head: Option<u8>,
     /// The later-frames decoder arm.
     pub vae_decode: Option<u8>,
+    /// The first-chunk encoder arm (ONE pixel frame).
+    pub vae_encode_head: Option<u8>,
+    /// The later-chunks encoder arm (FOUR pixel frames).
+    pub vae_encode: Option<u8>,
 }
 
 impl Model {
@@ -157,11 +188,15 @@ impl Model {
         let denoise = take();
         let vae_decode_head = self.vae.as_ref().map(|_| take());
         let vae_decode = self.vae.as_ref().map(|_| take());
+        let vae_encode_head = self.vae.as_ref().map(|_| take());
+        let vae_encode = self.vae.as_ref().map(|_| take());
         Readings {
             text,
             denoise,
             vae_decode_head,
             vae_decode,
+            vae_encode_head,
+            vae_encode,
         }
     }
 
@@ -243,6 +278,9 @@ impl Model {
                 text_axis: 0,
                 text_origin: 0,
                 image_follows_text: false,
+                // No `Reference` stream on this row: an i2v condition rides
+                // the video lane's own channels, not a lane of its own.
+                reference_stride: None,
             }),
             readout: ReadoutKind::Velocity,
             readout_width: d.patch_out(),
@@ -269,6 +307,37 @@ impl Model {
                     positions: None,
                     readout: ReadoutKind::Pixels,
                     readout_width: VAE_RGB,
+                });
+            }
+        }
+        // The two encoder arms. Their clip is PIXELS, 3 wide, so they take
+        // it on voxel index ONE (`port::PIXEL_VOXELS`): the engine seats
+        // one rectangle per `(kind, index)` for the whole plan and the
+        // decode arms hold index 0 at 48.
+        if let (Some(head), Some(rest), Some(_)) =
+            (codes.vae_encode_head, codes.vae_encode, &self.vae)
+        {
+            for (name, index) in [("vae.encode.head", head), ("vae.encode", rest)] {
+                readings.push(ReadingFact {
+                    name,
+                    index,
+                    has_kv: false,
+                    takes_tokens: false,
+                    streams: vec![Stream::Video],
+                    ports: vec![PortFact {
+                        name: "pixels",
+                        kind: PortKind::Voxels,
+                        width: VAE_RGB,
+                        streams: vec![Stream::Video],
+                        at: Some(port::PIXEL_VOXELS),
+                        rows: None,
+                    }],
+                    positions: None,
+                    // The answer is a LATENT clip, `[t·h·w, 48]`, in the
+                    // denoiser's own space; `ReadoutKind::Pixels` is the
+                    // voxel axis's readout whatever the rows mean.
+                    readout: ReadoutKind::Pixels,
+                    readout_width: VAE_Z,
                 });
             }
         }
@@ -308,7 +377,7 @@ impl Model {
 /// its pass runs.
 pub struct Facts {
     pub stream: Stream,
-    /// The reading index, `0..4` (a wider index is truncated to two bits).
+    /// The reading index, `0..8` (a wider index is truncated to three bits).
     pub reading: u8,
 }
 
@@ -337,18 +406,23 @@ impl Facts {
     pub fn reading_hi() -> Predicate {
         Predicate::fact(READING_HI)
     }
+
+    #[must_use]
+    pub fn reading_top() -> Predicate {
+        Predicate::fact(READING_TOP)
+    }
 }
 
 impl Classify for Facts {
     fn of(r: &Request) -> Facts {
         Facts {
             stream: r.stream(),
-            reading: r.reading() & 3,
+            reading: r.reading() & READING_MASK,
         }
     }
 
     fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 3) << READING_LO)
+        self.stream.word(STREAM_BASE) | (u64::from(self.reading & READING_MASK) << READING_LO)
     }
 }
 
@@ -361,7 +435,7 @@ impl ForwardHybrid for Model {
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         if let Some(vae) = &self.vae {
-            for conv in vae.cached_convs() {
+            for conv in vae.cached_convs().chain(vae.enc.cached_convs()) {
                 let name = conv.cache.as_ref().expect("a cached conv names its slab");
                 c.state(name.clone(), conv.slab(), Dtype::Bf16);
             }
@@ -371,12 +445,17 @@ impl ForwardHybrid for Model {
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let codes = self.readings();
-        // Four arms by reading code, each a conjunction of the two reading
-        // literals (so every arm names a `Selection` the host can pack).
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
+        // Eight arms by reading code, each a conjunction of the three
+        // reading literals (so every arm names a `Selection` the host can
+        // pack). Six are traced; the two spare codes trace nothing.
+        let (top, bot) = inputs.split(&Facts::reading_top());
+        let (t_hi, t_lo) = top.split(&Facts::reading_hi());
+        let (b_hi, b_lo) = bot.split(&Facts::reading_hi());
+        let (c7, c6) = t_hi.split(&Facts::reading_lo());
+        let (c5, c4) = t_lo.split(&Facts::reading_lo());
+        let (c3, c2) = b_hi.split(&Facts::reading_lo());
+        let (c1, c0) = b_lo.split(&Facts::reading_lo());
+        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
         let arm = |code: u8| &arms[usize::from(code)];
 
         if let (Some(code), Some(te)) = (codes.text, &self.te) {
@@ -388,6 +467,12 @@ impl ForwardHybrid for Model {
         {
             let _ = vae_decode(arm(head), vae, true);
             let _ = vae_decode(arm(rest), vae, false);
+        }
+        if let (Some(head), Some(rest), Some(vae)) =
+            (codes.vae_encode_head, codes.vae_encode, &self.vae)
+        {
+            let _ = vae_encode(arm(head), &vae.enc, true);
+            let _ = vae_encode(arm(rest), &vae.enc, false);
         }
         velocity
     }
@@ -775,4 +860,105 @@ pub fn vae_decode(arm: &Input<Facts>, vae: &Vae, first: bool) -> Value {
     let pixels = ops::elemwise::clamp(&pixels, -1.0, 1.0);
     seam::at(seam::PIXELS, &[&pixels, &gp]);
     pixels
+}
+
+/// `WanResample`'s spatial half, both kinds: `nn.ZeroPad2d((0, 1, 0, 1))`
+/// then a 3×3 stride-2 convolution with no padding of its own, per frame.
+/// The back pad is what makes an odd box round up, as `F.pad` does.
+fn downsample2d(x: &Value, g: &Value, c: &Conv) -> (Value, Value) {
+    let shape = spatial::Conv::conv2d([3, 3], [2, 2], [0, 0]).pad_back([0, 1, 1]);
+    spatial::conv3d(x, g, &c.w, Some(&c.bias), shape, None)
+}
+
+/// `WanResample("downsample3d")`'s time half: `WanCausalConv3d(C, C,
+/// (3, 1, 1), stride=(2, 1, 1), padding=0)` over
+/// `cat([the previous chunk's last frame, x])`.
+///
+/// ONE front frame, not `kt − 1`. The reference's `padding=0` means the
+/// convolution pads nothing of its own and the resampler splices exactly
+/// one cached frame in front by hand, so the front pad here is 1 and the
+/// slab is one frame tall ([`Conv::front`](super::model::Conv::front)).
+/// A `t`-frame chunk lands `(t − 1) / 2` frames — 4 into 2, 2 into 1.
+fn downsample_time(x: &Value, g: &Value, c: &Conv, arm: &Input<Facts>) -> (Value, Value) {
+    let name = c.cache.as_ref().expect("the time conv keeps a frame cache");
+    let shape = spatial::Conv {
+        k: c.k,
+        stride: [2, 1, 1],
+        pad: [c.front, 0, 0],
+        pad_back: [0, 0, 0],
+        causal_t: true,
+        time_pad: TimePad::Zero,
+    };
+    spatial::conv3d(x, g, &c.w, Some(&c.bias), shape, Some(arm.state(name)))
+}
+
+/// A `vae.encode` arm over ONE pixel chunk: the 2×2 space-to-depth, then
+/// `conv_in` → four residual down blocks → the mid block → `norm_out`,
+/// SiLU, `conv_out` → `quant_conv`'s mean rows → `(z − mean)/std` →
+/// `pixels`. `first` is the one-frame head arm.
+///
+/// **What `first` changes, and what it does not.** Only the `downsample3d`
+/// resamplers: the reference runs their time convolution from the SECOND
+/// chunk on and merely remembers the frames on the first
+/// (`feat_cache[idx] = x.clone()`), so the head arm stores and passes
+/// through where the later arm convolves. The `AvgDown3D` shortcuts need
+/// no arm of their own — their front zero pad already handles a chunk
+/// shorter than the time block, which is exactly the head chunk.
+///
+/// Public so a host-fed parity harness can trace the two arms alone
+/// (`engine-cuda`'s `the_wan_2_vae_answers_the_reference`).
+pub fn vae_encode(arm: &Input<Facts>, e: &VaeEncoder, first: bool) -> Value {
+    let g0 = arm.grid();
+    let px = arm.voxels(port::PIXEL_VOXELS, VAE_RGB, Dtype::Bf16);
+    // `patchify(x, 2)`: the 2×2 space-to-depth the VAE wraps its conv stack
+    // in, RGB into 12 channels. `conv_in`'s INPUT channels are permuted at
+    // import from the checkpoint's `(c, pw, ph)` into the unshuffle's own
+    // `(c, ph, pw)` — the mirror of what `conv_out`'s ROWS get on the
+    // decode side.
+    let (x, g) = spatial::pixel_unshuffle(&px, &g0, [1, VAE_PATCH, VAE_PATCH]);
+    let (mut x, mut g) = conv(&x, &g, &e.conv_in, arm);
+
+    for block in &e.down {
+        let (x_in, g_in) = (x.clone(), g.clone());
+        for r in &block.resnets {
+            x = resnet(&x, &g, r, arm);
+        }
+        if let Some(d) = &block.downsampler {
+            let (y, gy) = downsample2d(&x, &g, &d.resample);
+            x = y;
+            g = gy;
+            if let Some(tc) = &d.time_conv {
+                if first {
+                    // The reference does not convolve the first chunk at
+                    // all: it stores the frames the NEXT chunk will pad
+                    // with and hands `x` on untouched.
+                    let name = tc.cache.as_ref().expect("the time conv keeps a cache");
+                    x = spatial::store_frames(&x, &g, arm.state(name), tc.front);
+                } else {
+                    let (y, gy) = downsample_time(&x, &g, tc, arm);
+                    x = y;
+                    g = gy;
+                }
+            }
+        }
+        let (s, _) = spatial::avg_down(&x_in, &g_in, block.shortcut.factor, block.shortcut.group);
+        x = ops::elemwise::add(&x, &s);
+    }
+
+    x = resnet(&x, &g, &e.mid_res0, arm);
+    x = mid_attention(&x, &g, &e.mid_attn);
+    x = resnet(&x, &g, &e.mid_res1, arm);
+
+    let x = norm_silu(&x, &e.norm_out);
+    let (h, gh) = conv(&x, &g, &e.conv_out, arm);
+    // `quant_conv` over the whole `[mean | logvar]` row, of which the plan
+    // holds the mean's 48 output rows alone: the logvar's rows are never
+    // computed, and neither is a sample (`DiagonalGaussianDistribution`'s
+    // MODE is what an image-to-video guest wants).
+    let (z, gz) = conv(&h, &gh, &e.quant, arm);
+    // `(z − mean)/std`: the denoiser's space, the exact inverse of what
+    // `vae_decode` undoes, so a guest hands this straight to `denoise`.
+    let z = ops::elemwise::standardize(&z, &e.norm_bias, &e.norm_scale);
+    seam::at(seam::PIXELS, &[&z, &gz]);
+    z
 }

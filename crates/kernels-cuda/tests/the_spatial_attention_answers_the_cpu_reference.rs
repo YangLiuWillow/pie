@@ -1,6 +1,7 @@
 //! **`spatial::attention` LANDS ONE SOFTMAX ATTENTION PER LANE, THE HEAD AS
-//! WIDE AS THE ROW** — at 256, 512 and **1024** channels (Wan 2.2's mid
-//! block is 1024 wide), over two lanes of boxes whose voxel counts do not
+//! WIDE AS THE ROW** — at 256, 512, **640** (Wan 2.2's ENCODER mid block,
+//! the scalar-slice instantiation) and **1024** channels (its DECODER's),
+//! over two lanes of boxes whose voxel counts do not
 //! divide the warp's query group (so a group straddles the lane boundary),
 //! with padded rows past the last lane landing zeros; against an f64 host
 //! reference to bf16 tolerance.
@@ -117,4 +118,13 @@ fn the_attention_answers_the_reference_at_256_512_and_1024_channels() {
     check(256);
     check(512);
     check(1024);
+}
+
+/// 640 is Wan 2.2's ENCODER mid block, and the one stamped width whose
+/// per-lane slice (20 channels) is neither a whole number of 16-byte words
+/// nor 16-byte aligned: that instantiation moves bf16 scalars instead, and
+/// has to answer the same reference the vector path does.
+#[test]
+fn the_attention_answers_the_reference_at_the_scalar_640_width() {
+    check(640);
 }

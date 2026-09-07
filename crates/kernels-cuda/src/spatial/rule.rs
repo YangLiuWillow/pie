@@ -39,6 +39,10 @@ pub enum GridRule {
     Shuffle { r: [u32; 3], trim_t: u32 },
     /// `(t/r1, h/r2, w/r3)`; a box that does not divide lands no rows.
     Unshuffle { r: [u32; 3] },
+    /// `AvgDown3D`'s box: `(ceil(t/ft), h/fh, w/fw)` — the unshuffle with
+    /// the time axis zero-padded IN FRONT to a multiple of `ft`, so a
+    /// chunk shorter than the block still maps. `h`/`w` must divide.
+    AvgDown { factor: [u32; 3] },
 }
 
 /// `RuleGeom` in `spatial/rule.cuh`, field for field.
@@ -111,6 +115,15 @@ pub fn derive_grid(
         GridRule::Unshuffle { r } => Geom {
             kind: 3,
             a: triple(OP, r)?,
+            b: [0; 3],
+            c: [0; 3],
+            d: [0; 3],
+            flag: 0,
+            lanes,
+        },
+        GridRule::AvgDown { factor } => Geom {
+            kind: 4,
+            a: triple(OP, factor)?,
             b: [0; 3],
             c: [0; 3],
             d: [0; 3],

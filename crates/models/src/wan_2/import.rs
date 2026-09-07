@@ -39,18 +39,24 @@
 //!   read them; conv biases are cast to f32; the RMS gains `[C, 1, 1, 1]`
 //!   are read as `[C]`;
 //! * the transformer and VAE ship fp32 and every bank is declared bf16, so
-//!   those reads are casts.
+//!   those reads are casts;
+//! * the encoder's `conv_in` has its INPUT channels permuted from the
+//!   checkpoint's `(c, pw, ph)` patchify order into the `(c, ph, pw)` a
+//!   `spatial.pixel_unshuffle` lands — the mirror of `conv_out`'s row
+//!   gather on the decode side, on axis 1 because a conv's input channels
+//!   are its second axis; and `quant_conv` is read as its FIRST 48 output
+//!   rows alone, the posterior mean's, the logvar's never being computed.
 //!
-//! Not read at all: `vae.encoder.*` and `vae.quant_conv.*` (no encode
-//! arm — `forward.rs`).
+//! Every plane of the checkpoint is read: the decoder's, the encoder's,
+//! `post_quant_conv` and `quant_conv`.
 
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
 use model_dsl::{Platform, Weight};
 
 use super::model::{
-    Block, Conv, Dims, Dit, HEAD_SLICES, Linear, MOD_SLICES, Model, Resnet, TextEncoder,
-    VAE_LATENTS_MEAN, VAE_LATENTS_STD, VAE_PATCH, VAE_RGB, Vae,
+    Block, Conv, Dims, Dit, Downsampler, HEAD_SLICES, Linear, MOD_SLICES, Model, Resnet,
+    TextEncoder, VAE_LATENTS_MEAN, VAE_LATENTS_STD, VAE_PATCH, VAE_RGB, VAE_Z, Vae, VaeEncoder,
 };
 
 /// Where a checkpoint puts the components.
@@ -308,7 +314,98 @@ fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Resul
         &v.conv_out,
         &at("decoder.conv_out")?,
         Some(conv_out_rows()),
-    )
+    )?;
+    encoder(b, src, &v.enc, layout)
+}
+
+/// The VAE encoder side, `WanEncoder3d`'s own names under `vae.encoder.`,
+/// plus `vae.quant_conv`.
+fn encoder(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    e: &VaeEncoder,
+    layout: Layout,
+) -> Result<(), Error> {
+    let at = |tail: &str| layout.component("vae.", tail);
+
+    // The mirror of the decoder's stated rows: `mean` and `1/std`, so the
+    // arm lands `(z − mean)/std` — the denoise reading's own space.
+    row_of(b, src, &e.norm_bias, &at("quant_conv.bias")?, |i| {
+        VAE_LATENTS_MEAN[i]
+    })?;
+    row_of(b, src, &e.norm_scale, &at("quant_conv.bias")?, |i| {
+        1.0 / VAE_LATENTS_STD[i]
+    })?;
+
+    // `patchify`'s `(c, pw, ph)` feature order into the `(c, ph, pw)` a
+    // `pixel_unshuffle` lands, on the kernel's INPUT-channel axis.
+    conv_over_channels(b, src, &e.conv_in, &at("encoder.conv_in")?, conv_out_rows())?;
+
+    for (i, block) in e.down.iter().enumerate() {
+        for (r, res) in block.resnets.iter().enumerate() {
+            resnet(
+                b,
+                src,
+                res,
+                &at(&format!("encoder.down_blocks.{i}.resnets.{r}"))?,
+            )?;
+        }
+        if let Some(Downsampler {
+            resample,
+            time_conv,
+        }) = &block.downsampler
+        {
+            let stem = at(&format!("encoder.down_blocks.{i}.downsampler"))?;
+            conv(b, src, resample, &format!("{stem}.resample.1"), None)?;
+            if let Some(tc) = time_conv {
+                conv(b, src, tc, &format!("{stem}.time_conv"), None)?;
+            }
+        }
+    }
+
+    resnet(b, src, &e.mid_res0, &at("encoder.mid_block.resnets.0")?)?;
+    let attn = at("encoder.mid_block.attentions.0")?;
+    gamma(b, src, &e.mid_attn.norm, &format!("{attn}.norm.gamma"))?;
+    transmuted(b, src, &e.mid_attn.qkv.w, &format!("{attn}.to_qkv.weight"))?;
+    b.read(&e.mid_attn.qkv.bias, format!("{attn}.to_qkv.bias"))?;
+    transmuted(b, src, &e.mid_attn.proj.w, &format!("{attn}.proj.weight"))?;
+    b.read(&e.mid_attn.proj.bias, format!("{attn}.proj.bias"))?;
+    resnet(b, src, &e.mid_res1, &at("encoder.mid_block.resnets.1")?)?;
+
+    gamma(b, src, &e.norm_out, &at("encoder.norm_out.gamma")?)?;
+    conv(b, src, &e.conv_out, &at("encoder.conv_out")?, None)?;
+    // `quant_conv`'s first `z_dim` output rows: the posterior MEAN's. A
+    // LEADING run, so it is a slice and not a gather (the contract checker
+    // refuses the gather that spells the same thing).
+    let quant = at("quant_conv")?;
+    let name = format!("{quant}.weight");
+    let stored = stored_encoding(src, &name)?;
+    let shape = TensorType::new(extents(&e.quant.w), stored);
+    let rows = i64::from(VAE_Z);
+    b.read_over(&e.quant.w, name, move |x| {
+        x.slice(0, 0, rows).transmute(shape)
+    })?;
+    b.read_over(&e.quant.bias, format!("{quant}.bias"), move |x| {
+        x.slice(0, 0, rows)
+    })
+}
+
+/// A conv whose INPUT channels are permuted: the stored `[C_out, C_in, kt,
+/// kh, kw]` kernel gathered along AXIS 1 (a conv's input-channel axis) and
+/// then transmuted to the declared `[C_out, C_in·taps]`. The bias is read
+/// straight through — it is per output channel and nothing moved there.
+fn conv_over_channels(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    c: &Conv,
+    stem: &str,
+    cols: Vec<i64>,
+) -> Result<(), Error> {
+    let name = format!("{stem}.weight");
+    let stored = stored_encoding(src, &name)?;
+    let shape = TensorType::new(extents(&c.w), stored);
+    b.read_over(&c.w, name, move |e| e.gather(1, cols).transmute(shape))?;
+    b.read(&c.bias, format!("{stem}.bias"))
 }
 
 /// A `nn.Linear`: `<stem>.weight` and `<stem>.bias`.
@@ -383,8 +480,10 @@ fn time_conv_rows(c: u32) -> Vec<i64> {
     (0..c).flat_map(|ch| [ch, c + ch]).collect()
 }
 
-/// `conv_out`'s 12 rows in `(c, ph, pw)` order: the checkpoint's
-/// `unpatchify` reads channel `c·4 + pw·2 + ph`.
+/// The 12 patchify channels in `(c, ph, pw)` order: the checkpoint's
+/// `patchify`/`unpatchify` pair reads channel `c·4 + pw·2 + ph`. The
+/// decoder gathers `conv_out`'s ROWS by it; the encoder gathers
+/// `conv_in`'s input CHANNELS by it.
 fn conv_out_rows() -> Vec<i64> {
     let p = i64::from(VAE_PATCH);
     let mut rows = Vec::new();
