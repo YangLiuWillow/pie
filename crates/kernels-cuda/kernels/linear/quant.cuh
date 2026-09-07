@@ -1035,6 +1035,170 @@ __global__ void moe_matmul_select_mlxu4_grouped(
     }
 }
 
+// **THE GROUPED mxfp4 SELECT** — `moe_matmul_select_mlxu4_grouped` above,
+// with the affine decode swapped for mxfp4's.
+//
+// The per-route mxfp4 select (`moe_matmul_select_mxfp4`) reads a whole
+// expert plane for every route that names it and does its arithmetic one
+// route at a time: on an L40S at gpt-oss's shapes that is 4.8 TFLOP/s where
+// the affine grouped select gets 34 on the same card. The gap is not the
+// re-read — at those shapes the L2 already serves most of it — it is that a
+// route at a time leaves the FMAs nothing to reuse. This block is one
+// expert × 128 bank rows: it decodes each K chunk of the plane ONCE into
+// shared memory and applies it to sixteen routes.
+//
+// Two things differ from the affine twin. mxfp4 ships two planes, not
+// three: codes at `expert * n * (k/2)` bytes and one e8m0 block scale per
+// 32 codes at `expert * n * (k/32)`, with no zero points, so the decode is
+// `unpack * scale` and not `code * scale + zero`. And its bias is an OUTPUT
+// bias — the gate/up leg's, one per (expert, row) in the activation dtype —
+// where the affine kernel's `biases` are zero points inside the decode. So
+// it is read once per row pair and added at the write.
+template <class T>
+__global__ void moe_matmul_select_mxfp4_grouped(
+    const T* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const T* __restrict__ bias,
+    T* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits)
+{
+    constexpr int kTileN = 128;
+    // **HALF THE AFFINE TWIN'S K TILE, BECAUSE 128 DOES NOT FIT.** A
+    // `float w_tile[128][129]` is 66 KiB and a block gets 48; the affine
+    // kernel above declares the same array and would not compile either,
+    // which is a thing nobody found because the bf16 rows take its
+    // tensor-core twin and no shipped row takes this one. At 64 the tile is
+    // 33 KiB and the staged activations 4, which fits with room over.
+    constexpr int kTileK = 64;
+    constexpr int kBatch = 16;
+    constexpr int kSlots = 4;
+    constexpr int kRowsPerThread = 2;
+    constexpr int kRoutesPerThread = kBatch / kSlots;
+    // mxfp4: eight e2m1 codes to a 32-bit word, one block scale per 32.
+    constexpr int kPerWord = 8;
+    constexpr int kBlock = 32;
+    constexpr int kWordsPerTileK = kTileK / kPerWord;
+    static_assert(kTileK % kBlock == 0, "a K tile is whole mxfp4 blocks");
+    static_assert(kTileN / kRowsPerThread * kSlots == 256, "one thread per (row pair, slot)");
+
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+    const int row0 = blockIdx.y * kTileN;
+    if (row0 >= n) return;
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    if (begin >= end) return;
+    // The streamed seat counts routed rows: this expert's, once.
+    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
+        atomicAdd(group_hits, static_cast<unsigned>(end - begin));
+
+    const int groups_per_row = k / kBlock;
+    const int words_per_row = k / kPerWord;
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+    }
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(
+        codes_at + static_cast<long long>(expert) * n * (k / 2));
+    const u8* s8 = scales_at + static_cast<long long>(expert) * n * groups_per_row;
+
+    __shared__ float w_tile[kTileN][kTileK + 1];
+    __shared__ float x_tile[kBatch][kTileK];
+    const int tid = threadIdx.x;
+    const int pair = tid % (kTileN / kRowsPerThread);
+    const int slot = tid / (kTileN / kRowsPerThread);
+    const int row_a = pair * kRowsPerThread;
+    const int row_b = row_a + 1;
+
+    // The output bias, once: it moves with neither the batch nor the chunk.
+    const T* b = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    float bias_a = 0.f;
+    float bias_b = 0.f;
+    if (b != nullptr) {
+        if (row0 + row_a < n) bias_a = Elem<T>::to_f32(b[row0 + row_a]);
+        if (row0 + row_b < n) bias_b = Elem<T>::to_f32(b[row0 + row_b]);
+    }
+
+    for (int b0 = begin; b0 < end; b0 += kBatch) {
+        const int batch = min(kBatch, end - b0);
+        float acc[kRowsPerThread][kRoutesPerThread];
+#pragma unroll
+        for (int i = 0; i < kRowsPerThread; ++i)
+#pragma unroll
+            for (int j = 0; j < kRoutesPerThread; ++j) acc[i][j] = 0.f;
+        for (int k0 = 0; k0 < k; k0 += kTileK) {
+            // The chunk's weights, decoded: `unpack(code) * block scale`.
+            for (int idx = tid; idx < kTileN * kWordsPerTileK; idx += blockDim.x) {
+                const int r = idx / kWordsPerTileK;
+                const int wq = idx % kWordsPerTileK;
+                const int kk = k0 + wq * kPerWord;
+                if (kk < k) {
+                    const int rr = min(row0 + r, n - 1);
+                    const float sc = mxfp4_block_scale(
+                        s8[static_cast<long long>(rr) * groups_per_row + kk / kBlock]);
+                    __half2 qd[4];
+                    mxfp4_unpack8(
+                        w32[static_cast<long long>(rr) * words_per_row + kk / kPerWord], qd);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f = __half22float2(qd[j]);
+                        w_tile[r][wq * kPerWord + 2 * j] = f.x * sc;
+                        w_tile[r][wq * kPerWord + 2 * j + 1] = f.y * sc;
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < kPerWord; ++j) w_tile[r][wq * kPerWord + j] = 0.f;
+                }
+            }
+            // The batch's activations for this chunk.
+            for (int idx = tid; idx < batch * kTileK; idx += blockDim.x) {
+                const int t = idx / kTileK;
+                const int kk = idx % kTileK;
+                const int plane_route = order[b0 + t];
+                const T* x = act + static_cast<long long>(plane_route / act_div) * k;
+                x_tile[t][kk] = k0 + kk < k ? Elem<T>::to_f32(x[k0 + kk]) : 0.f;
+            }
+            __syncthreads();
+            // Routes past `batch` read a stale activation row and are never
+            // written back, so the inner loop stays branch-free.
+#pragma unroll 4
+            for (int kk = 0; kk < kTileK; ++kk) {
+                const float wa = w_tile[row_a][kk];
+                const float wb = w_tile[row_b][kk];
+#pragma unroll
+                for (int j = 0; j < kRoutesPerThread; ++j) {
+                    const float xv = x_tile[slot + kSlots * j][kk];
+                    acc[0][j] = fmaf(wa, xv, acc[0][j]);
+                    acc[1][j] = fmaf(wb, xv, acc[1][j]);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int j = 0; j < kRoutesPerThread; ++j) {
+            const int t = slot + kSlots * j;
+            if (t < batch) {
+                const int plane_route = order[b0 + t];
+                T* o = out + static_cast<long long>(plane_route) * n + row0;
+                if (row0 + row_a < n) o[row_a] = Elem<T>::from_f32(acc[0][j] + bias_a);
+                if (row0 + row_b < n) o[row_b] = Elem<T>::from_f32(acc[1][j] + bias_b);
+            }
+        }
+    }
+}
+
+
 // **THE GROUPED AFFINE SELECT ON TENSOR CORES** — the grouped kernel
 // above with the arithmetic on `mma.sync` (bf16 × bf16 → fp32) through the
 // plane's own wmma shim (`prelude/mma.cuh`, the one `moe.cuh`'s bf16
