@@ -11,7 +11,6 @@ use model_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Tra
 
 use crate::device::Handles;
 use crate::device::handles::NIL;
-use crate::device::Handles;
 use crate::error::{Fault, Result};
 
 /// One window, and its own rebased qo boundaries.

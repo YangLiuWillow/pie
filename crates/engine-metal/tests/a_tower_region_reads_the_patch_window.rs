@@ -327,6 +327,10 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
             // tower is token rows and patch rows, and states neither.
             voxels: 0,
             clips: 0,
+            // The trunk head runs over the rows a reader takes, and this
+            // trace's readout is the lane's last row — the natural run, which
+            // states no separate readout count.
+            readouts: 0,
         },
     )
     .expect("the patch input is carved");

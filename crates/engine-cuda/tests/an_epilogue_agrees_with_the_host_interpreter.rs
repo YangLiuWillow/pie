@@ -167,7 +167,17 @@ fn device_outputs(
     let count = bound.container.channels.len();
     let ids: Vec<u64> = (1..=count as u64).collect();
     let instance = plane
-        .bind(program, &wire_seeds, extents, GeometryClass::Host, &vec![None; count], &ids)
+        .bind(
+            program,
+            &wire_seeds,
+            extents,
+            GeometryClass::Host,
+            &vec![None; count],
+            &ids,
+            // `bind` cuts the fire-path buffers here, and it cuts them ON THE
+            // STREAM now: the same one this test fires on.
+            context.stream(),
+        )
         .expect("the instance binds");
     let _plane_buffer = logits.map(|plane_values| {
         let mut buffer = Buffer::zeroed(plane_values.len() * 4).expect("a logits plane");
