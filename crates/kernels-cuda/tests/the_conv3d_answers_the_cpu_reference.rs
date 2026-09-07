@@ -1,7 +1,8 @@
 //! **`spatial::conv3d` LANDS WHAT `torch.nn.functional.conv3d` LANDS**, on
 //! both device kernels, for k=3 at stride 1 and 2 with pad 1, symmetric and
-//! causal time, causal time with a frame cache and with replicated first
-//! frames, `C_in != C_out`, one and two lanes of different boxes, `kt = 1`
+//! causal time, symmetric time replicating the clip's end frames (a
+//! one-frame clip included), causal time with a frame cache and with
+//! replicated first frames, `C_in != C_out`, one and two lanes of different boxes, `kt = 1`
 //! (conv2d) with a three-channel input, with and without a bias — the
 //! weight arriving in the checkpoint's own order through
 //! `conv_weight_taps_major`, and the rows a bucketed fire pads past the last
@@ -163,6 +164,17 @@ fn cases() -> Vec<Case> {
             conv: k3(2, [1, 1, 1], false, TimePad::Zero),
             cache: false,
             bias: false,
+        },
+        Case {
+            // LTX-2.5's non-causal decoder: the clip's first frame stands
+            // in front of it and its last frame behind it.
+            name: "symmetric replicating the first and last frames",
+            boxes: vec![Box3::new(3, 5, 5), Box3::new(1, 4, 6)],
+            c_in: 16,
+            c_out: 16,
+            conv: k3(1, [1, 1, 1], false, TimePad::Replicate),
+            cache: false,
+            bias: true,
         },
         Case {
             name: "causal zero-padded, no cache",

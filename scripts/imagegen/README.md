@@ -16,7 +16,8 @@ scripts/imagegen/
   zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
-  ltx2_golden.py      M4  LTX-2.5 miniature: one joint video+audio step
+  ltx2_golden.py      M4  LTX-2.5 miniature: one joint video+audio step; `--vae`
+                          dumps the REAL video VAE decoder over a fixed latent
   ltx2_parity.py      M4  drives pie's `ltx25-mini` row against it
   vendor/ltx_2/       M4  the LTX-2.5 reference, transcribed (see its header)
   h3_golden.py        M5  MiniMax H3 miniature forward (vendored reference)
@@ -631,8 +632,45 @@ Measured (bf16 pie vs the fp32 golden), under the mini-dit gate
 The FLAGSHIP row's import is checked against the real 201 GB snapshot:
 `pie model import <snapshot> --sku ltx25-bf16-kv-bf16 --dry-run` lands every
 plane the flagship declares (13.0 GiB decoded — the reordered tables and the
-doubled head projection — and 28.3 GiB copied through). Nothing runs it yet:
-the arm has no `text` reading and no VAE.
+doubled head projection — and 28.3 GiB copied through). Nothing runs the
+DiT yet: the arm has no `text` reading. The VIDEO VAE DECODER runs, below.
+
+#### The video VAE — `ltx2_golden.py --vae` → `ltx25/ltx2_vae/`
+
+The real thing, not a miniature: diffusers 0.40's `AutoencoderKLLTX2Video`
+over the snapshot's `vae/` (1.4 GB, bf16), run in fp32 over a fixed random
+DiT-space latent (`torch.randn(1, 128, 3, 8, 12)` at seed 7, denormalised by
+`latents_std`/`latents_mean` the way `_denormalize_latents` does) and decoded
+in ONE call — the decoder is non-causal, so there is no per-frame loop and no
+cache. Dumps `latent.f32` (`[T·h·w, 128]`, DiT space), `denorm.f32`,
+`pixels.f32` (`[(8T−7)·32h·32w, 3]`, UNCLAMPED, rows in `(t, h, w)` order)
+and `shapes.json`; `--vae-shape T,H,W` writes another size beside it as
+`ltx2_vae_TxHxW/`.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python ltx2_golden.py --vae
+CUDA_VISIBLE_DEVICES=1 cargo test -p engine-cuda --features cuda \
+    --test the_ltx_2_vae_answers_the_reference -- --nocapture
+# or, through the roster:
+CUDA_VISIBLE_DEVICES=1 python gates.py --only ltx2-vae
+```
+
+The gate (`crates/engine-cuda/tests/the_ltx_2_vae_answers_the_reference.rs`)
+reads the decoder's 86 planes straight out of the snapshot through
+`models::ltx_2::Model::import_vae` — no artifact — fires the whole clip once
+through `vae.decode`, and asserts `cos ≥ 0.9999`, `mean |err| ≤ 0.005` over
+the clip AND per output frame (the end frames are where the replicate time
+padding and the anchor-frame drop act). Measured, bf16 banks and activations
+against the fp32 reference:
+
+| clip | pixels | cos | mean abs err | max abs err | fire |
+|---|---|---|---:|---:|---:|
+| 3×8×12 (the gate's) | 17 × 256 × 384 | 0.999985 | 0.0019 | 0.034 | 0.19 s |
+| 4×17×30 (`--vae-shape 4,17,30`, `PIE_LTX2_VAE_GOLDEN=ltx2_vae_4x17x30`) | 25 × 544 × 960 | 0.999985 | 0.0020 | 0.048 | 1.39 s |
+
+Every frame of both clips sits between 0.999980 and 0.999989 — the same
+distance Wan's (0.999986) and FLUX.2's (0.999994) decoders read, i.e. the
+bf16 floor. What is NOT covered: the encoder, the audio VAE, the vocoder.
 
 `matters` is the claim a parity gate cannot make on its own: **every
 conditioning stream moves the answer.** It perturbs each in turn and demands

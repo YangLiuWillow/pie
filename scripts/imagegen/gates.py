@@ -698,6 +698,25 @@ def roster() -> list[Gate]:
             timeout=2400,
         ),
         Gate(
+            name="ltx2-vae",
+            wraps="cargo test -p engine-cuda --test the_ltx_2_vae_answers_the_reference",
+            expected="decode cos >= 0.9999 per frame and clip (landed 0.999985, mean |err| 0.0019)",
+            # The snapshot's `vae/` folder is read directly (no artifact): the
+            # decoder's 86 planes and one stated zero row, none of the 19 B
+            # transformer beside them.
+            needs=[(g("ltx25", "ltx2_vae", "shapes.json"),
+                    "CUDA_VISIBLE_DEVICES=<n> python scripts/imagegen/ltx2_golden.py --vae"),
+                   (os.path.expanduser("~/.cache/huggingface/hub/models--Lightricks--LTX-2.5-Diffusers/"
+                                       "snapshots/*/vae/diffusion_pytorch_model.safetensors"),
+                    "huggingface-cli download Lightricks/LTX-2.5-Diffusers --include 'vae/*'")],
+            config=None,
+            steps=[("host gate", cargo_test("the_ltx_2_vae_answers_the_reference"))],
+            readout=rust_cos_readout,
+            timeout=1800,
+            note=("one fire for the whole clip: the decoder is non-causal (replicate time "
+                  "padding, no cache, no head arm), so there is no chunk loop to score"),
+        ),
+        Gate(
             name="wan-video",
             wraps=("the_wan_2_vae_answers_the_reference, then the model-agnostic "
                    "text-to-video guest on wan22-ti2v-5b.zt"),

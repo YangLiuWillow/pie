@@ -14,7 +14,10 @@
 //! (channels `kt*kh*kw` apart) would turn into two-byte strided loads on
 //! every weight tile.
 //!
-//! **TIME.** `causal_t = false`: `pad[0]` zero frames on both sides.
+//! **TIME.** `causal_t = false`: `pad[0]` frames on both sides — zeros
+//! ([`TimePad::Zero`]), or the clip's own first frame in front and its
+//! last frame behind ([`TimePad::Replicate`]: LTX-2.5's non-causal
+//! decoder, `torch.cat([x[:, :, :1], x, x[:, :, -1:]], dim=2)`).
 //! `causal_t = true`: `pad[0]` frames in front and none behind, the frames
 //! before the clip read from `cache` when one is given — the previous
 //! tile's last `pad[0]` frames, `[sum over lanes of pad[0]*h*w, C_in]` in
@@ -54,13 +57,15 @@ const MMA_BLOCK: u32 = 256;
 
 const MMA_SMEM: u32 = MMA_STAGES * (MMA_TILE[0] + MMA_TILE[1]) * (32 + 8) * 2;
 
-/// What a frame before the clip reads under `causal_t` when no cache is
-/// given.
+/// What a padded frame reads: the frames before the clip under `causal_t`
+/// when no cache is given, and the frames on both sides of it otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimePad {
-    /// Zeros — the first tile of a zero-padded causal convolution.
+    /// Zeros — the first tile of a zero-padded causal convolution, or a
+    /// plain zero-padded symmetric one.
     Zero,
-    /// The clip's own first frame, repeated.
+    /// The clip's own end frames, repeated: frame 0 in front and, for a
+    /// symmetric convolution, the last frame behind.
     Replicate,
 }
 
@@ -81,7 +86,8 @@ pub struct Conv3d {
     pub pad_back: [u32; 3],
     /// Time is padded in front only, from the cache when one is given.
     pub causal_t: bool,
-    /// What the front frames read under `causal_t` without a cache.
+    /// What a padded frame reads: the front frames under `causal_t` without
+    /// a cache, both ends of a symmetric convolution.
     pub time_pad: TimePad,
 }
 

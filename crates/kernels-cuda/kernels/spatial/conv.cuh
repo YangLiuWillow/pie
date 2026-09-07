@@ -21,11 +21,13 @@
 // two-byte gather, which is what `conv_weight_taps_major` exists to undo
 // once at load.
 //
-// **TIME.** Symmetric: `pt` zero frames each side. Causal: `pt` frames in
-// front and none behind; a frame before the clip reads `cache` (the previous
-// tile's last `pt` frames, per lane `[pt * h * w, C_in]` rows in lane order)
-// when one is given, else frame 0 (`replicate`) or zero. `h`/`w` are always
-// symmetric zero padding. Output rows no lane claims land zeros.
+// **TIME.** Symmetric: `pt` frames each side, zeros or — under `replicate`
+// — the clip's own first frame in front and its last frame behind (LTX-2.5's
+// non-causal decoder pads that way). Causal: `pt` frames in front and none
+// behind; a frame before the clip reads `cache` (the previous tile's last
+// `pt` frames, per lane `[pt * h * w, C_in]` rows in lane order) when one is
+// given, else frame 0 (`replicate`) or zero. `h`/`w` are always symmetric
+// zero padding. Output rows no lane claims land zeros.
 //
 // Numerics: bf16 in, fp32 accumulate over all of K, bias added in fp32, one
 // rounding at the store. The two kernels sum K in different orders and agree
@@ -56,7 +58,9 @@ struct ConvGeom {
     int pw;
     /// 1: time pad in front only; `cache` frames stand in for it.
     int causal;
-    /// 1: with no cache, a frame before the clip reads frame 0.
+    /// 1: a padded frame reads the clip's own end frame instead of zeros —
+    /// frame 0 in front (with no cache), and, when not causal, the last
+    /// frame behind.
     int replicate;
     int lanes;
     int rows_out;
@@ -112,15 +116,20 @@ __device__ __forceinline__ int tap_row(
     if (hi < 0 || hi >= r.in.h || wi < 0 || wi >= r.in.w) return -1;
     int ti = r.o.t * g.st - g.pt + it;
     if (ti < 0) {
-        if (!g.causal) return -1;
-        if (has_cache) {
+        if (g.causal && has_cache) {
             from_cache = true;
             return r.cache_base + ((ti + g.pt) * r.in.h + hi) * r.in.w + wi;
         }
         if (!g.replicate) return -1;
         ti = 0;
     }
-    if (ti >= r.in.t) return -1;
+    if (ti >= r.in.t) {
+        // Behind the clip: a symmetric replicating convolution reads the
+        // last frame; a causal one never pads behind, and a zero-padded
+        // symmetric one reads zeros.
+        if (g.causal || !g.replicate) return -1;
+        ti = r.in.t - 1;
+    }
     return ravel(r.in, ti, hi, wi);
 }
 

@@ -88,7 +88,9 @@ pub struct Conv {
     pub pad_back: [u32; 3],
     /// Time padded in front only (from the cache when one is given).
     pub causal_t: bool,
-    /// What the front frames read under `causal_t` with no cache.
+    /// What a padded frame reads: the front frames under `causal_t` with
+    /// no cache, both ends of a symmetric convolution
+    /// ([`Conv::replicate_time`]).
     pub time_pad: TimePad,
 }
 
@@ -141,6 +143,17 @@ impl Conv {
         self.pad[0] = self.k[0] - 1;
         self.pad_back[0] = 0;
         self.time_pad = time_pad;
+        self
+    }
+
+    /// The same symmetric shape with its time padding read from the clip's
+    /// own end frames instead of zeros — the first frame in front, the last
+    /// behind. LTX-2.5's NON-causal decoder does this before every
+    /// convolution (`torch.cat([x[:, :, :1], x, x[:, :, -1:]], dim=2)`),
+    /// so a whole clip is one cacheless fire. `h`/`w` stay zero-padded.
+    #[must_use]
+    pub const fn replicate_time(mut self) -> Conv {
+        self.time_pad = TimePad::Replicate;
         self
     }
 

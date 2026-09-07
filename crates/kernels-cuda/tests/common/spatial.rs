@@ -92,15 +92,13 @@ pub fn conv3d_ref(
                         for it in 0..kt {
                             let mut ti = (to * st) as i64 - pt + it as i64;
                             let mut frame: Option<&[f32]> = None;
+                            let replicate = conv.time_pad == TimePad::Replicate;
                             if ti < 0 {
-                                if !conv.causal_t {
-                                    continue;
-                                }
-                                if let Some(cache) = cache {
+                                if let (true, Some(cache)) = (conv.causal_t, cache) {
                                     let f = (ti + pt) as usize;
                                     let start = cache_off + f * b.plane();
                                     frame = Some(&cache[start * c_in..(start + b.plane()) * c_in]);
-                                } else if conv.time_pad == TimePad::Replicate {
+                                } else if replicate {
                                     ti = 0;
                                 } else {
                                     continue;
@@ -108,7 +106,13 @@ pub fn conv3d_ref(
                             }
                             if frame.is_none() {
                                 if ti as usize >= b.t {
-                                    continue;
+                                    // Behind the clip: only a symmetric
+                                    // replicating convolution reads a frame
+                                    // there (the last one).
+                                    if conv.causal_t || !replicate {
+                                        continue;
+                                    }
+                                    ti = b.t as i64 - 1;
                                 }
                                 let start = in_off + ti as usize * b.plane();
                                 frame = Some(&x[start * c_in..(start + b.plane()) * c_in]);

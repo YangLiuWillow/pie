@@ -1,13 +1,14 @@
 //! The `ltx_2` declaration: every dimension a Rust constant or a [`Dims`]
 //! field, every weight named in the plan's own scheme.
 //!
-//! Two components under one plan (design D5): the two text connectors
-//! ([`Connector`], `connectors.`) and the audio-video transformer
-//! ([`Dit`], `dit.`). The numbers are `Lightricks/LTX-2.5-Diffusers`'s
-//! `transformer/config.json` and `connectors/config.json`, read off the
-//! snapshot and restated here because a family's dims are Rust constants
-//! and a `config.json` is carried, never read (study
-//! `.wiki/imagegen/study/ltx25.md` §C, §D.1).
+//! Three components under one plan (design D5): the two text connectors
+//! ([`Connector`], `connectors.`), the audio-video transformer
+//! ([`Dit`], `dit.`), and — on the flagship — the video VAE's decoder
+//! ([`Vae`], `vae.`). The numbers are `Lightricks/LTX-2.5-Diffusers`'s
+//! `transformer/config.json`, `connectors/config.json` and
+//! `vae/config.json`, read off the snapshot and restated here because a
+//! family's dims are Rust constants and a `config.json` is carried, never
+//! read (study `.wiki/imagegen/study/ltx25.md` §C, §D.1).
 //!
 //! The miniature is `scripts/imagegen/ltx2_golden.py --mini`'s: two blocks,
 //! two heads a side, the REAL head widths (video 128, audio 64 —
@@ -28,25 +29,48 @@
 //!   concat) is the natural follow-up and needs no new op: it would hand
 //!   `[L, cross_dim + audio_cross_dim]` back on one `hidden` seam and the
 //!   `refine` readings would split it.
-//! * The **video and audio VAE decoders**. Two things stopped them the
-//!   pass this text was written in, and NEITHER STOPS THEM NOW:
-//!   `vae/config.json` had not arrived in the snapshot (it has), and the
-//!   video decoder's temporal upsampler drops the first `s_t − 1` frames
-//!   after its pixel shuffle as the causal anchor, which no `Spatial`
-//!   member stated — `GridRule::Shuffle` now carries `trim_t` and
-//!   `spatial::pixel_shuffle_trimming` writes it (`Upsample
-//!   { keep_first_frame }` produces the same `1 + (t−1)·s_t` extent by
-//!   REPLICATION, not by shuffling, which is why the trim had to be its
-//!   own statement). What is left is the text itself: four up blocks of
-//!   `[2, 4, 6, 4]` resnets over channels `[1024, 512, 512, 256]`, whose
-//!   `PerChannelRMSNorm` is `elemwise::rmsnorm_no_scale(x, C, 1e-8)` on a
-//!   voxel row (a row IS a location and its width IS the channels, so the
-//!   reference's RMS across the channel dim is a row norm, not a
-//!   `Spatial::GroupNorm`) and whose channel-change shortcut is
-//!   `elemwise::layernorm_no_scale` plus its affine. The audio side maps
-//!   cleanly onto the voxel axis otherwise (time on the grid's `t` and
-//!   causal, mel on its `h`, `w = 1`, `[voxels, 8]` in), and is the
-//!   smaller of the two.
+//! * The **audio VAE decoder** and the **video VAE encoder**. The VIDEO
+//!   DECODER is declared now ([`Vae`], `forward::vae_decode`, gated by
+//!   `engine-cuda/tests/the_ltx_2_vae_answers_the_reference`); what the
+//!   pass before this one wrote about it here was right in three places
+//!   and wrong in two, and the record is kept rather than overwritten:
+//!   - RIGHT: `PerChannelRMSNorm` is `elemwise::rmsnorm_no_scale(x, C,
+//!     1e-8)` on a voxel row (a row IS a location and its width IS the
+//!     channels, so the reference's RMS across the channel dim is a row
+//!     norm, not a `Spatial::GroupNorm`). The eps IS 1e-8 —
+//!     `PerChannelRMSNorm()` is built with no argument in every resnet and
+//!     at `norm_out`, and the config's `resnet_norm_eps: 1e-6` reaches only
+//!     the `nn.LayerNorm` of a channel-changing shortcut, which this
+//!     decoder never builds (every resnet keeps its width).
+//!   - RIGHT: the temporal upsamplers drop the first `s_t − 1` frames after
+//!     their shuffle (`hidden_states[:, :, stride[0] − 1:]`), and they do
+//!     so UNCONDITIONALLY — `decoder_causal: False` does not switch the
+//!     trim off, it only changes the convolutions' time padding. So
+//!     `spatial::pixel_shuffle_trimming` is the right statement and a
+//!     `T`-frame latent lands `8·(T − 1) + 1` frames.
+//!   - RIGHT: the upsampler runs BEFORE its block's resnets (`conv_in`
+//!     → `upsamplers` → `resnets`), which is what the checkpoint's channel
+//!     ladder says too (`up_blocks.0`'s resnets are 512 wide, its
+//!     upsampler reads 1024).
+//!   - WRONG: "whose channel-change shortcut is `layernorm_no_scale` plus
+//!     its affine". No up block changes width across a resnet — the width
+//!     changes INSIDE the upsampler's shuffle — so there is no shortcut,
+//!     no `norm3`, and no LayerNorm anywhere in the decoder.
+//!   - WRONG BY OMISSION: the decoder is NON-causal (`decoder_causal:
+//!     False`) and pads every convolution's time axis with the clip's own
+//!     first and last frames (`torch.cat([x[:, :, :1], x, x[:, :, -1:]])`),
+//!     not zeros and not a cache. That is `Conv::same3().replicate_time()`
+//!     — `TimePad::Replicate` had been documented for the causal
+//!     cacheless case only, and the conv kernel now honours it on both
+//!     ends of a symmetric convolution. A whole clip is therefore ONE fire
+//!     with no state and no head arm, unlike `wan_2`'s frame-by-frame
+//!     chunking.
+//!   - STILL NOT TRACED: the audio side, which maps onto the voxel axis
+//!     (time on the grid's `t` and causal, mel on its `h`, `w = 1`,
+//!     `[voxels, 8]` in) and is the smaller of the two; and the video
+//!     ENCODER, whose `LTX2VideoDownsampler3d` averages `group_size`
+//!     channel groups after a space-to-depth, which no `Spatial` member
+//!     states.
 //! * The **diffusion decoder**, the **latent upsampler**, the **duration
 //!   head** and the **48 kHz vocoder**. The vocoder is the only one blocked
 //!   by the op vocabulary rather than by time: its BigVGAN stack is DILATED
@@ -98,6 +122,30 @@ pub const VAE_SPATIAL_COMPRESSION: u32 = 32;
 pub const VAE_TEMPORAL_COMPRESSION: u32 = 8;
 /// `latent_channels` of the video VAE: the width of one latent row.
 pub const VAE_Z: u32 = 128;
+
+/// `AutoencoderKLLTX2Video`'s decoder (`vae/config.json`): `out_channels`
+/// 3 behind a `patch_size` 4 space-to-depth, so `conv_out` lands `3·16`
+/// channels and the decoder ends in a `(1, 4, 4)` depth-to-space.
+pub const VAE_RGB: u32 = 3;
+pub const VAE_PATCH: u32 = 4;
+/// `PerChannelRMSNorm`'s eps. NOT the config's `resnet_norm_eps` (1e-6):
+/// that number reaches only the `nn.LayerNorm` of a width-changing
+/// shortcut, which this decoder never builds; every norm it does build is
+/// `PerChannelRMSNorm()` at its default 1e-8.
+pub const VAE_EPS: f32 = 1e-8;
+/// The decoder's widths, in to out: `conv_in` lands
+/// `decoder_block_out_channels[-1]` = 1024, and each up block's shuffle
+/// lands `block_out_channels[i] / upsample_factor[i]` (the reference's
+/// `output_channel = block_out_channels[i] // upsample_factor[i]` over the
+/// REVERSED `[1024, 512, 512, 256]` and `[2, 1, 2, 2]`).
+pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 512, 512, 256, 128];
+/// `decoder_layers_per_block` reversed: the mid block's count first, then
+/// one per up block.
+pub const VAE_MID_RESNETS: u32 = 2;
+pub const VAE_UP_RESNETS: [u32; 4] = [2, 4, 6, 4];
+/// `upsample_type` in decoder order (NOT reversed — the reference indexes
+/// it as written): `spatiotemporal, spatiotemporal, temporal, spatial`.
+pub const VAE_UP_STRIDES: [[u32; 3]; 4] = [[2, 2, 2], [2, 2, 2], [2, 1, 1], [1, 2, 2]];
 
 /// The sinusoidal timestep embedding: sglang's `timestep_embedding(t, 256,
 /// max_period=10000)` concatenates `[cos | sin]` at `downscale_freq_shift =
@@ -218,6 +266,11 @@ pub mod port {
     /// `denoise`: the audio rows' one normalised coordinate, and
     /// `refine.*`: the text rows' one.
     pub const TIME_POSITIONS: u8 = 1;
+    /// `vae.decode`: ONE WHOLE CLIP's latent voxels, `[t·h·w, 128]` bf16
+    /// in `(t, h, w)` order, in the DENOISER's space — the arm
+    /// denormalises (`z·latents_std + latents_mean`) itself, so a guest
+    /// hands over exactly the rows the denoise reading answered.
+    pub const VOXELS: u8 = 0;
 }
 
 /// One row's transformer shape. The audio side is a second, narrower set of
@@ -741,6 +794,145 @@ impl Connector {
     }
 }
 
+/// One `LTX2VideoCausalConv3d` of the decoder: the `3×3×3` kernel as the
+/// checkpoint stores it (`[C_out, C_in·27]`, declared tap-major) and its
+/// f32 bias. No frame cache: the decoder is non-causal and a clip is one
+/// fire, every conv reading the clip's own end frames as its time padding
+/// (`forward::conv`).
+pub struct VaeConv {
+    pub w: Weight,
+    pub bias: Weight,
+    pub c_in: u32,
+    pub c_out: u32,
+}
+
+impl VaeConv {
+    fn at(name: &str, c_out: u32, c_in: u32, banks: Dtype) -> VaeConv {
+        let taps = 27;
+        VaeConv {
+            w: Weight::sym(
+                name,
+                [u64::from(c_out), u64::from(c_in) * u64::from(taps)],
+                banks,
+            )
+            .conv_taps_major(c_in, taps),
+            bias: Weight::sym(format!("{name}.bias"), [u64::from(c_out)], Dtype::F32),
+            c_in,
+            c_out,
+        }
+    }
+}
+
+/// `LTX2VideoResnetBlock3d` at one width: `norm → silu → conv1 → norm →
+/// silu → conv2`, added to the input. The norms are scale-free
+/// (`PerChannelRMSNorm`, [`VAE_EPS`]) so the block holds two convs and
+/// nothing else; the width never changes, so there is no shortcut.
+pub struct VaeResnet {
+    pub conv1: VaeConv,
+    pub conv2: VaeConv,
+}
+
+impl VaeResnet {
+    fn at(prefix: &str, c: u32, banks: Dtype) -> VaeResnet {
+        VaeResnet {
+            conv1: VaeConv::at(&format!("{prefix}.conv1"), c, c, banks),
+            conv2: VaeConv::at(&format!("{prefix}.conv2"), c, c, banks),
+        }
+    }
+}
+
+/// One `LTX2VideoUpBlock3d`: the `LTX2VideoUpsampler3d` FIRST — a conv from
+/// `c_in` to `c_out·s_t·s_h·s_w` channels, then the `(s_t, s_h, s_w)`
+/// depth-to-space that trims the first `s_t − 1` frames — and the resnets
+/// at `c_out` after it. `upsample_residual` is off on every block, so the
+/// upsampler is that conv and that shuffle alone.
+pub struct VaeUpBlock {
+    pub upsampler: VaeConv,
+    pub stride: [u32; 3],
+    pub resnets: Vec<VaeResnet>,
+}
+
+/// The LTX-2.5 video VAE decoder: the denormalisation, `conv_in`, the
+/// mid block's two resnets, four up blocks, `norm_out` → SiLU →
+/// `conv_out`, and the `4×4` depth-to-space. `timestep_conditioning` and
+/// `inject_noise` are off on this row, so there is no `temb` path and no
+/// noise.
+pub struct Vae {
+    /// `latents_mean` / `latents_std` `[128]`, the checkpoint's own bf16
+    /// buffers as stored: the decoder's input is `z·std + mean`.
+    pub latents_mean: Weight,
+    pub latents_std: Weight,
+    /// A `[128]` zero row, so the multiply by `latents_std` can be the
+    /// `(z − 0)·std` of `elementwise.standardize` (this IR has no
+    /// per-column multiply of its own); derived at import.
+    pub zero: Weight,
+    pub conv_in: VaeConv,
+    pub mid: Vec<VaeResnet>,
+    pub up: Vec<VaeUpBlock>,
+    pub conv_out: VaeConv,
+}
+
+impl Vae {
+    fn ltx_2_5(banks: Dtype) -> Vae {
+        let dims = VAE_DECODER_DIMS;
+        let top = dims[0];
+        let up = (0..4)
+            .map(|i| {
+                let (c_in, c_out) = (dims[i], dims[i + 1]);
+                let stride = VAE_UP_STRIDES[i];
+                let prefix = format!("vae.up.{i}");
+                VaeUpBlock {
+                    upsampler: VaeConv::at(
+                        &format!("{prefix}.upsampler"),
+                        c_out * stride[0] * stride[1] * stride[2],
+                        c_in,
+                        banks,
+                    ),
+                    stride,
+                    resnets: (0..VAE_UP_RESNETS[i])
+                        .map(|r| VaeResnet::at(&format!("{prefix}.res.{r}"), c_out, banks))
+                        .collect(),
+                }
+            })
+            .collect();
+        let last = dims[4];
+        // The three `[128]` rows ride the activation's element
+        // (`elementwise.standardize` and `add_bias` read their planes at
+        // the rows' dtype): bf16, which is what the checkpoint stores.
+        let dense = crate::dense(banks);
+        let row = |name: &str| Weight::sym(name, [u64::from(VAE_Z)], dense);
+        Vae {
+            latents_mean: row("vae.latents_mean"),
+            latents_std: row("vae.latents_std"),
+            zero: row("vae.zero"),
+            conv_in: VaeConv::at("vae.conv_in", top, VAE_Z, banks),
+            mid: (0..VAE_MID_RESNETS)
+                .map(|r| VaeResnet::at(&format!("vae.mid.res.{r}"), top, banks))
+                .collect(),
+            up,
+            conv_out: VaeConv::at("vae.conv_out", VAE_RGB * VAE_PATCH * VAE_PATCH, last, banks),
+        }
+    }
+
+    /// Every convolution, in trace order.
+    pub fn convs(&self) -> impl Iterator<Item = &VaeConv> + '_ {
+        let mut out: Vec<&VaeConv> = vec![&self.conv_in];
+        for r in &self.mid {
+            out.push(&r.conv1);
+            out.push(&r.conv2);
+        }
+        for block in &self.up {
+            out.push(&block.upsampler);
+            for r in &block.resnets {
+                out.push(&r.conv1);
+                out.push(&r.conv2);
+            }
+        }
+        out.push(&self.conv_out);
+        out.into_iter()
+    }
+}
+
 /// The whole text.
 pub struct Model {
     pub tp: u32,
@@ -750,6 +942,10 @@ pub struct Model {
     pub dit: Dit,
     /// The video connector and the audio connector, in that order.
     pub connectors: (Connector, Connector),
+    /// The video VAE decoder, `None` on the miniature: its checkpoint is
+    /// the transformer and connectors alone, so it declares no
+    /// `vae.decode`.
+    pub vae: Option<Vae>,
 }
 
 impl Model {
@@ -757,17 +953,17 @@ impl Model {
     /// the 3.2 B connectors.
     #[must_use]
     pub fn ltx_2_5(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::ltx_2_5())
+        Model::new(banks, tp, Dims::ltx_2_5(), Some(Vae::ltx_2_5(banks)))
     }
 
     /// The miniature `ltx2_golden.py --mini` writes. What the parity
     /// harness drives.
     #[must_use]
     pub fn mini(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini())
+        Model::new(banks, tp, Dims::mini(), None)
     }
 
-    fn new(banks: Dtype, tp: u32, d: Dims) -> Model {
+    fn new(banks: Dtype, tp: u32, d: Dims, vae: Option<Vae>) -> Model {
         assert_eq!(
             tp, 1,
             "this text ships one-rank rows; tp {tp} is not a world it states"
@@ -797,11 +993,15 @@ impl Model {
                 .map(|i| Block::at(&format!("dit.block.{i}"), &d, banks))
                 .collect(),
         };
+        if vae.is_some() {
+            assert_eq!(d.channels, VAE_Z, "the latent is the VAE's");
+        }
         Model {
             tp,
             banks,
             dims: d,
             dit,
+            vae,
             connectors: (
                 Connector::at(
                     "connectors.video",

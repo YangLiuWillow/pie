@@ -1,11 +1,42 @@
-//! LTX-2.5's traced arithmetic: three arms of one plan, selected per lane by
-//! the reading bits of the fact word (design D1, D5).
+//! LTX-2.5's traced arithmetic: four arms of one plan (three on the
+//! miniature), selected per lane by the reading bits of the fact word
+//! (design D1, D5).
 //!
 //! | reading | lanes (stream) | binds | reads back |
 //! |---|---|---|---|
 //! | `denoise` | `Video` + `Audio` + `Context` + `Reference`, one group | video: `latents` `[S, 128]`, `positions` `[S, 3]`, `timestep`; audio: `latents` `[L, 128]`, `audio_positions` `[L, 1]`, `timestep`; context: `context` `[1024, 4096]`, `timestep`; reference: `audio_context` `[1024, 2048]`, `timestep` | `velocity` `[S + L, 128]` on the video AND audio lanes |
 //! | `refine.video` | one, `Text` | `text` `[1024, caption·49]`, `text_positions` `[1024, 1]` | `hidden` `[1024, 4096]` |
 //! | `refine.audio` | one, `Text` | the same two ports | `hidden` `[1024, 2048]` |
+//! | `vae.decode` (flagship only; see the contract below) | one, `Video` | `latent` `[t·h·w, 128]` + the clip's box | `pixels` `[(8t−7)·32h·32w, 3]` |
+//!
+//! # THE `vae.decode` CONTRACT
+//!
+//! **A decode fire is ONE WHOLE CLIP, and there is no head arm.** The
+//! decoder is non-causal (`decoder_causal: False`): every convolution pads
+//! its time axis with the clip's own first and last frames
+//! (`Conv::same3().replicate_time()`), so a later frame's pixels depend on
+//! the frames after it and no frame-by-frame chunking reproduces the
+//! reference. `wan_2`'s two-arm, cache-carrying loop is that family's
+//! contract and not this one's: here the arm holds no state and a slot
+//! carries nothing between fires.
+//!
+//! **`F` output frames need `(F − 1) % 8 == 0`.** Each of the three
+//! temporal upsamplers doubles the frame count and drops the first frame
+//! of the result (`hidden_states[:, :, s_t − 1:]`, unconditionally — the
+//! non-causal decoder keeps the anchor drop), so `T` latent frames land
+//! `8·(T − 1) + 1` frames: 1, 9, 17, ..., 121. `LatentSpace::temporal_compression`
+//! (8) states the same rule from the other side.
+//!
+//! **The denormalisation is the arm's.** The denoiser works in
+//! `(z − latents_mean)/latents_std` and the reference pipeline undoes that
+//! before `vae.decode` (`_denormalize_latents`); `vae_decode` reads the two
+//! `[128]` buffers off the checkpoint and undoes it itself, so a
+//! family-blind guest hands the arm the rows the denoise reading answered.
+//!
+//! **What is not clamped.** `AutoencoderKLLTX2Video.decode` hands back the
+//! decoder's raw output and the pipeline's video processor clips it to
+//! `[-1, 1]` later; this arm plants the raw output too, so its `pixels`
+//! are the reference's `decode(...)` to the number.
 //!
 //! # FOUR STREAMS, SIX ATTENTIONS, ONE FIRE
 //!
@@ -105,6 +136,7 @@
 //!
 //! [`RopeForm::SplitLadder`]: model_dsl::RopeForm::SplitLadder
 
+use model_dsl::ops::spatial;
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
     Request, RopeForm, Stream, Value, Weight, ops, seam,
@@ -119,7 +151,8 @@ use super::model::{
     AV_GATE_TIMESTEP_SCALE, AV_SS_SLICES, AdaLn, Attn, Block, Connector, DISTILLED_SIGMAS, Dims,
     Dit, Ffn, GATE_SCALE, Linear, MOD_SLICES, Model, NORM_EPS, PATCH_H, PATCH_T, PATCH_W,
     ROPE_AXES, ROPE_THETA, Side, Stream as StreamHeads, T_FLIP_SIN_COS, T_FREQ_DIM, T_MAX_PERIOD,
-    T_SCALE, TEXT_LEN, TRAIN_STEPS, VAE_SPATIAL_COMPRESSION, VAE_TEMPORAL_COMPRESSION, port,
+    T_SCALE, TEXT_LEN, TRAIN_STEPS, VAE_EPS, VAE_PATCH, VAE_RGB, VAE_SPATIAL_COMPRESSION,
+    VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, VaeConv, VaeResnet, port,
 };
 
 /// The bit the one-hot stream facts start at (D2): bits 0..6 are the six
@@ -128,17 +161,19 @@ use super::model::{
 pub const STREAM_BASE: u8 = 0;
 
 /// The two bits the reading index lives in, as a plain binary code: bit
-/// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Three codes
-/// are used of the four — `denoise`, `refine.video`, `refine.audio`; the
-/// fourth is where `vae.decode` lands when the decoders do.
+/// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Four codes
+/// — `denoise`, `refine.video`, `refine.audio`, `vae.decode` — of which the
+/// miniature (no VAE) uses the first three.
 pub const READING_LO: u8 = 6;
 pub const READING_HI: u8 = 7;
 
 /// Which reading code means what. Every row of this family carries both
-/// connectors, so the codes are the same on all of them.
+/// connectors, so the codes are the same on all of them; `vae.decode` is
+/// declared only where a row carries the VAE ([`Model::vae`]).
 pub const DENOISE: u8 = 0;
 pub const REFINE_VIDEO: u8 = 1;
 pub const REFINE_AUDIO: u8 = 2;
+pub const VAE_DECODE: u8 = 3;
 
 impl Model {
     /// This row's generative facts (design D12).
@@ -173,7 +208,7 @@ impl Model {
                 ),
             ]
         };
-        let readings = vec![
+        let mut readings = vec![
             ReadingFact {
                 name: "denoise",
                 index: DENOISE,
@@ -258,6 +293,28 @@ impl Model {
                 readout_width: d.audio_cross_dim,
             },
         ];
+        if self.vae.is_some() {
+            // One whole clip on one voxel port (module doc). A VAE tile is
+            // a box on the voxel axis, not rows in a rotary space: it takes
+            // no positions and states no convention.
+            readings.push(ReadingFact {
+                name: "vae.decode",
+                index: VAE_DECODE,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Video],
+                ports: vec![port(
+                    "latent",
+                    PortKind::Voxels,
+                    VAE_Z,
+                    &[Stream::Video],
+                    Some(port::VOXELS),
+                )],
+                positions: None,
+                readout: ReadoutKind::Pixels,
+                readout_width: VAE_RGB,
+            });
+        }
         Generative {
             readings,
             // One token is one latent cell: patch (1, 1, 1) at 128 channels,
@@ -392,6 +449,11 @@ impl ForwardHybrid for Model {
             text_in,
             self.connectors.1.rescale(caption),
         );
+        if let Some(vae) = &self.vae {
+            // The arm plants its own `pixels` seam; the trace hands back
+            // the velocity as the plan's one value.
+            let _ = vae_decode(arm(VAE_DECODE), vae);
+        }
         velocity
     }
 }
@@ -856,4 +918,87 @@ fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32, rescale: f32) {
     }
     let out = rms(&h);
     seam::at(seam::HIDDEN, &[&out]);
+}
+
+/// One convolution of the decoder: `3×3×3`, stride 1, `same` spatial
+/// padding, and the NON-causal time padding of `LTX2VideoCausalConv3d`
+/// under `causal=False` — one frame each side, read from the clip's own
+/// first and last frames (`torch.cat([x[:, :, :1], x, x[:, :, -1:]])`).
+/// No cache: the decoder holds nothing between fires.
+fn conv(x: &Value, g: &Value, c: &VaeConv) -> (Value, Value) {
+    spatial::conv3d(
+        x,
+        g,
+        &c.w,
+        Some(&c.bias),
+        spatial::Conv::same3().replicate_time(),
+        None,
+    )
+}
+
+/// `PerChannelRMSNorm → SiLU`: the scale-free RMS over the row (a voxel
+/// row's width IS the channel dim the reference reduces over), then SiLU
+/// in place on the fresh rows.
+fn norm_silu(x: &Value) -> Value {
+    let width = u32::try_from(x.width()).expect("a VAE row is narrower than 2^32");
+    ops::elemwise::silu(&ops::elemwise::rmsnorm_no_scale(x, width, VAE_EPS))
+}
+
+/// `LTX2VideoResnetBlock3d`, box-keeping and width-keeping: the grid in
+/// is the grid out, and the input is the residual as it is.
+fn resnet(x: &Value, g: &Value, r: &VaeResnet) -> Value {
+    let (h, _) = conv(&norm_silu(x), g, &r.conv1);
+    let (h, _) = conv(&norm_silu(&h), g, &r.conv2);
+    ops::elemwise::add(x, &h)
+}
+
+/// The `vae.decode` arm over ONE WHOLE CLIP: the denormalisation, then
+/// `conv_in` → the mid block → four up blocks (each an upsampler conv, its
+/// trimming depth-to-space, then its resnets) → `norm_out`, SiLU,
+/// `conv_out` → the `(1, 4, 4)` depth-to-space → `pixels`, unclamped.
+///
+/// Public so a host-fed parity harness can trace the arm alone
+/// (`engine-cuda`'s `the_ltx_2_vae_answers_the_reference`) instead of
+/// loading the whole row to exercise 1.4 GB of it.
+pub fn vae_decode(arm: &Input<Facts>, vae: &Vae) -> Value {
+    let mut g = arm.grid();
+    let z = arm.voxels(port::VOXELS, VAE_Z, Dtype::Bf16);
+    // `z·latents_std + latents_mean`, the reference pipeline's step before
+    // `vae.decode`. `add` is the one fresh copy of a port rectangle this IR
+    // has (`2z`); the halving, the `(z − 0)·std` and the `+ mean` after it
+    // run in place on the copy, never on the port's own cell.
+    let z = ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(&z, &z));
+    let z = ops::elemwise::standardize(&z, &vae.zero, &vae.latents_std);
+    let z = ops::elemwise::add_bias(&vae.latents_mean, &z);
+
+    let (mut x, _) = conv(&z, &g, &vae.conv_in);
+    for r in &vae.mid {
+        x = resnet(&x, &g, r);
+    }
+    for up in &vae.up {
+        // `LTX2VideoUpsampler3d`: the conv lands `c_out·s_t·s_h·s_w`
+        // channels in the reference's own `(c, s_t, s_h, s_w)` order —
+        // `reshape(B, -1, s_t, s_h, s_w, T, H, W)` — which is the
+        // shuffle's `(c, r1, r2, r3)`, so no row permutation is needed;
+        // then the first `s_t − 1` frames of the result are dropped
+        // (`hidden_states[:, :, s_t − 1:]`), causal or not.
+        let (y, gy) = conv(&x, &g, &up.upsampler);
+        let (y, gy) = spatial::pixel_shuffle_trimming(&y, &gy, up.stride, up.stride[0] - 1);
+        x = y;
+        g = gy;
+        for r in &up.resnets {
+            x = resnet(&x, &g, r);
+        }
+    }
+
+    let x = norm_silu(&x);
+    let (y, gy) = conv(&x, &g, &vae.conv_out);
+    // The 4×4 space-to-depth the VAE wraps its conv stack in, undone:
+    // `conv_out`'s rows are permuted at import into the shuffle's
+    // `(c, ph, pw)` order (the reference's un-patchify reads the checkpoint's
+    // channel `c·16 + pw·4 + ph`: its `permute(0, 1, 5, 2, 6, 4, 7, 3)` puts
+    // the LAST `p` of `reshape(.., p_t, p, p, ..)` on the height).
+    let (pixels, gp) = spatial::pixel_shuffle(&y, &gy, [1, VAE_PATCH, VAE_PATCH]);
+    seam::at(seam::PIXELS, &[&pixels, &gp]);
+    pixels
 }

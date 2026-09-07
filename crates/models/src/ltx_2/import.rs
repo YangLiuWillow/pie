@@ -34,22 +34,36 @@
 //! * the connectors' `*_text_proj_in` banks absorb the `sqrt(dim /
 //!   caption_channels)` the reference multiplies their INPUT by (the bias
 //!   is left alone — `W·(s·x) + b`);
-//! * every table is declared f32 and read from its stored bf16 with a cast.
+//! * every table is declared f32 and read from its stored bf16 with a cast;
+//! * the video VAE decoder (`vae/` → `vae.`, 84 bf16 tensors plus the two
+//!   `latents_mean`/`latents_std` buffers; the flagship only): every conv
+//!   kernel `[C_out, C_in, 3, 3, 3]` is read as the `[C_out, C_in·27]`
+//!   rectangle `Weight::conv_taps_major` declares (a transmute; the shell
+//!   relabels at load), conv biases and the two buffers are cast to f32,
+//!   `conv_out`'s 48 rows are permuted from the checkpoint's `(c, pw, ph)`
+//!   to the shuffle's `(c, ph, pw)` ([`conv_out_rows`]), and the
+//!   upsamplers' rows are NOT permuted (the reference's
+//!   `reshape(B, -1, s_t, s_h, s_w, ..)` is already the shuffle's order).
+//!   One `[128]` zero row is stated for the denormalisation's
+//!   `standardize` ([`zero_row`]).
 //!
 //! Not read at all: `keyframes_abs_pos_embedding` (allocated upstream,
 //! zero-initialised, and never consumed by the denoising forward), the
 //! connectors' `learnable_registers` (the substitution is not traced —
-//! `forward.rs`), and every component this text does not declare
-//! (`text_encoder/`, `vae/`, `audio_vae/`, `diffusion_decoder/`,
-//! `latent_upsampler/`, `duration_head/`, `vocoder/`, `prompt_enhancer/`).
+//! `forward.rs`), `vae.encoder.*` (no encode arm — `model.rs`), and every
+//! component this text does not declare (`text_encoder/`, `audio_vae/`,
+//! `diffusion_decoder/`, `latent_upsampler/`, `duration_head/`, `vocoder/`,
+//! `prompt_enhancer/`).
 
-use checkpoint::contract::{Expr, ModelContract, TensorType};
+use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
+use checkpoint::types::Encoding;
 use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
 use model_dsl::{Platform, Weight};
 
 use super::model::{
     AV_GATE_SLICES, AV_SS_SLICES, AdaLn, Attn, Block, Connector, Dims, Dit, Ffn, HEAD_SLICES,
-    Linear, MOD_SLICES, Model, PROMPT_SLICES, Side, Stream,
+    Linear, MOD_SLICES, Model, PROMPT_SLICES, Side, Stream, VAE_PATCH, VAE_RGB, Vae, VaeConv,
+    VaeResnet,
 };
 
 impl Model {
@@ -62,8 +76,140 @@ impl Model {
         dit(&mut b, src, &self.dit, &self.dims)?;
         connector(&mut b, &self.connectors.0, "video", self.dims.caption)?;
         connector(&mut b, &self.connectors.1, "audio", self.dims.caption)?;
+        if let Some(v) = &self.vae {
+            vae(&mut b, src, v)?;
+        }
         Ok(b.build())
     }
+
+    /// The VAE decoder's planes alone, for a harness that loads one arm out
+    /// of the snapshot (`engine-cuda`'s
+    /// `the_ltx_2_vae_answers_the_reference`) without touching the 19 B
+    /// transformer beside it.
+    pub fn import_vae(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        let v = self.vae.as_ref().ok_or_else(|| Error::Illegible {
+            name: "vae".to_string(),
+            detail: "this row declares no VAE".to_string(),
+        })?;
+        let mut b = Builder::new(src, self.tp, platform);
+        vae(&mut b, src, v)?;
+        Ok(b.build())
+    }
+}
+
+/// The video VAE's decoder side: `AutoencoderKLLTX2Video`'s own names
+/// under `vae.` — `latents_mean`/`latents_std`, `decoder.conv_in`, the mid
+/// block's resnets, the four up blocks (upsampler first, then resnets),
+/// `decoder.conv_out`. Every conv is `<stem>.conv.weight`/`.bias`
+/// (`LTX2VideoCausalConv3d` wraps an `nn.Conv3d` called `conv`).
+fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae) -> Result<(), Error> {
+    let at = |tail: &str| format!("vae.{tail}");
+    b.read(&v.latents_mean, at("latents_mean"))?;
+    b.read(&v.latents_std, at("latents_std"))?;
+    zero_row(b, &v.zero)?;
+
+    vae_conv(b, src, &v.conv_in, &at("decoder.conv_in"), None)?;
+    for (r, res) in v.mid.iter().enumerate() {
+        vae_resnet(b, src, res, &at(&format!("decoder.mid_block.resnets.{r}")))?;
+    }
+    for (i, up) in v.up.iter().enumerate() {
+        let stem = at(&format!("decoder.up_blocks.{i}"));
+        // `LTX2VideoUpsampler3d.conv` is itself an `LTX2VideoCausalConv3d`, so the
+        // kernel sits one `.conv` deeper than a resnet's.
+        vae_conv(b, src, &up.upsampler, &format!("{stem}.upsamplers.0.conv"), None)?;
+        for (r, res) in up.resnets.iter().enumerate() {
+            vae_resnet(b, src, res, &format!("{stem}.resnets.{r}"))?;
+        }
+    }
+    vae_conv(
+        b,
+        src,
+        &v.conv_out,
+        &at("decoder.conv_out"),
+        Some(conv_out_rows()),
+    )
+}
+
+fn vae_resnet(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    r: &VaeResnet,
+    stem: &str,
+) -> Result<(), Error> {
+    vae_conv(b, src, &r.conv1, &format!("{stem}.conv1"), None)?;
+    vae_conv(b, src, &r.conv2, &format!("{stem}.conv2"), None)
+}
+
+/// A decoder conv: the kernel `[C_out, C_in, 3, 3, 3]` transmuted to the
+/// declared `[C_out, C_in·27]` (rows gathered first where `rows` says so),
+/// and its bias (gathered the same way, cast to f32 by the read).
+fn vae_conv(
+    b: &mut Builder,
+    src: &ztensor::Source,
+    c: &VaeConv,
+    stem: &str,
+    rows: Option<Vec<i64>>,
+) -> Result<(), Error> {
+    let name = format!("{stem}.conv.weight");
+    let stored = stored_encoding(src, &name)?;
+    let shape = TensorType::new(extents(&c.w), stored);
+    let gathered = rows.clone();
+    b.read_over(&c.w, name, move |e| {
+        let kernel = match gathered {
+            Some(rows) => e.gather(0, rows),
+            None => e,
+        };
+        kernel.transmute(shape)
+    })?;
+    let bias = format!("{stem}.conv.bias");
+    match rows {
+        Some(rows) => b.read_over(&c.bias, bias, move |e| e.gather(0, rows)),
+        None => b.read(&c.bias, bias),
+    }
+}
+
+/// `conv_out`'s 48 rows in the shuffle's `(c, ph, pw)` order. The
+/// reference's un-patchify is `reshape(B, -1, p_t, p, p, T, H, W)` then
+/// `permute(0, 1, 5, 2, 6, 4, 7, 3)`: the LAST `p` (dim 4) lands beside `H`
+/// and the first (dim 3) beside `W`, so checkpoint channel `c·16 + a·4 + b`
+/// is `(c, pw = a, ph = b)`, and plan row `(c, ph, pw)` is checkpoint row
+/// `c·16 + pw·4 + ph`.
+fn conv_out_rows() -> Vec<i64> {
+    let p = i64::from(VAE_PATCH);
+    let mut rows = Vec::with_capacity((VAE_RGB * VAE_PATCH * VAE_PATCH) as usize);
+    for c in 0..i64::from(VAE_RGB) {
+        for ph in 0..p {
+            for pw in 0..p {
+                rows.push(c * p * p + pw * p + ph);
+            }
+        }
+    }
+    rows
+}
+
+/// A `[n]` row of zeros at the declared dtype, stated rather than read: the decoder's
+/// `(z − 0)·latents_std` needs a bias plane and the checkpoint has none to
+/// offer. A `Fill` is one storage instruction on every serving backend
+/// (`z_image`'s `vae.shift` row is built the same way and loads on CUDA).
+fn zero_row(b: &mut Builder, w: &Weight) -> Result<(), Error> {
+    let want = checkpoint_dsl::encoding(w.dtype);
+    let Encoding::Raw(dtype) = want.clone() else {
+        return Err(Error::Illegible {
+            name: w.name.clone(),
+            detail: format!("declared {want:?}; a stated zero row wants a raw dtype"),
+        });
+    };
+    b.push(TensorContract::new(
+        w.name.clone(),
+        Expr::fill(0.0, TensorType::raw(extents(w), dtype)),
+        extents(w),
+        want,
+    ));
+    Ok(())
 }
 
 fn dit(b: &mut Builder, src: &ztensor::Source, m: &Dit, d: &Dims) -> Result<(), Error> {

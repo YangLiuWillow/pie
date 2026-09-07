@@ -17,8 +17,10 @@
 //!
 //! ```text
 //! (a) every row traces on every platform, holding no kv space and no state
-//! (b) the seams are one `velocity` (merged over the two modalities) and
-//!     two `hidden` (one per connector), and never `out`
+//!     (the flagship's non-causal VAE decoder included: a clip is one fire)
+//! (b) the seams are one `velocity` (merged over the two modalities), two
+//!     `hidden` (one per connector), one `pixels` on the flagship alone, and
+//!     never `out`
 //! (c) the ports the trace reads are the ports the facts declare, at the
 //!     facts' widths and kind-relative indices, and the named ports resolve
 //!     to `model::port`
@@ -32,9 +34,11 @@
 //!     axes over `dim/6` frequencies each with a two-slot identity pad, the
 //!     audio rows' and the cross-modal pair's one axis with none; the text
 //!     cross-attentions turn nothing
-//! (g) every row bakes on every platform
-//! (h) the generative facts: three readings dense from 0, the latent space
-//!     (128, 1x1x1, /32, /8), and the eight pinned distilled sigmas
+//! (g) every row bakes on every platform under a voxel ladder, the flagship
+//!     alone a voxel plan, and the flagship refuses to bake without one
+//! (h) the generative facts: three readings dense from 0 (four on the
+//!     flagship, `vae.decode` last), the latent space (128, 1x1x1, /32, /8),
+//!     and the eight pinned distilled sigmas
 //! (i) the modulation is a per-lane f32 vector over a bf16 trunk — twelve
 //!     scale-shift sites a block and one per head — every gated fold aliases
 //!     its residual, and every attention ends in a per-head sigmoid gate
@@ -48,7 +52,7 @@ use model_dsl::{
     Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
     RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
-use models::ltx_2::forward::{DENOISE, Facts, REFINE_AUDIO, REFINE_VIDEO};
+use models::ltx_2::forward::{DENOISE, Facts, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
 use models::ltx_2::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 
@@ -117,12 +121,17 @@ fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
                 !seams.contains_key(seam::OUT.name),
                 "{sku}: a denoiser has no logits, and `out` was planted anyway"
             );
-            assert!(
-                !seams.contains_key(seam::PIXELS.name),
-                "{sku}: this text declares no VAE arm yet"
+            assert_eq!(
+                seams.get(seam::PIXELS.name),
+                is_flagship(sku).then_some(&1),
+                "{sku}: one `pixels` planting iff the row carries the VAE decoder"
             );
         }
     }
+}
+
+fn is_flagship(sku: &str) -> bool {
+    sku == FLAGSHIP
 }
 
 fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
@@ -135,6 +144,7 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
             Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
                 ("AxisPositions", *port, u32::from(*axes))
             }
+            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
             _ => continue,
         };
         traced.insert((kind.to_string(), port, width));
@@ -287,8 +297,13 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             seen.len(),
             "{sku}: two lanes share a class: {seen:?}"
         );
-        // Four denoise lanes and one text lane per connector.
-        assert_eq!(seen.len(), 6, "{sku}: the lanes the facts list");
+        // Four denoise lanes, one text lane per connector, and the
+        // flagship's one decode lane.
+        assert_eq!(
+            seen.len(),
+            6 + usize::from(is_flagship(sku)),
+            "{sku}: the lanes the facts list"
+        );
     }
 }
 
@@ -470,9 +485,14 @@ fn every_row_bakes_on_every_platform() {
     for platform in PLATFORMS {
         for sku in ROWS {
             let plan = trace(sku, platform);
-            let compiled = model_compiler::compile(
+            // The flagship's decode arm grows a latent clip by 8192 voxels
+            // per latent voxel (three `(2, 2, 2)`/`(2, 1, 1)`/`(1, 2, 2)`
+            // shuffles and the 4x4 un-patchify), so its ladder is small.
+            let budgets = model_compiler::Budgets::of(budget())
+                .with_voxels(model_compiler::VoxelLadder::new(256, 2));
+            let compiled = model_compiler::compile_axes(
                 &plan,
-                &budget(),
+                &budgets,
                 &model_compiler::DeviceProfile::default(),
             )
             .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
@@ -482,8 +502,22 @@ fn every_row_bakes_on_every_platform() {
                 plan.nodes.len(),
                 "{platform:?} `{sku}`: the regions tile the node list once"
             );
+            assert_eq!(
+                compiled.voxels.is_some(),
+                is_flagship(sku),
+                "{platform:?} `{sku}`: a voxel plan iff the row carries the VAE"
+            );
         }
     }
+    let refused = model_compiler::compile(
+        &trace(FLAGSHIP, Platform::Cuda),
+        &budget(),
+        &model_compiler::DeviceProfile::default(),
+    );
+    assert!(
+        matches!(refused, Err(model_compiler::Error::Unsized { .. })),
+        "the flagship bakes against no voxel ladder: {refused:?}"
+    );
 }
 
 /// (h)
@@ -504,10 +538,15 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             );
         }
         let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
-        assert_eq!(names, vec!["denoise", "refine.video", "refine.audio"]);
+        let mut want = vec!["denoise", "refine.video", "refine.audio"];
+        if is_flagship(sku) {
+            want.push("vae.decode");
+        }
+        assert_eq!(names, want, "{sku}: the decode reading iff the row carries the VAE");
         assert_eq!(usize::from(DENOISE), 0);
         assert_eq!(usize::from(REFINE_VIDEO), 1);
         assert_eq!(usize::from(REFINE_AUDIO), 2);
+        assert_eq!(usize::from(VAE_DECODE), 3);
         let latent = facts.latent.expect("a latent space");
         assert_eq!(
             (
@@ -547,8 +586,8 @@ fn validate(facts: &models::Generative) {
                 reading
                     .ports
                     .iter()
-                    .any(|port| port.kind == PortKind::Latents),
-                "a token-less reading states its rows through a latents port"
+                    .any(|port| matches!(port.kind, PortKind::Latents | PortKind::Voxels)),
+                "a token-less reading states its rows through a latents or voxels port"
             );
         }
     }

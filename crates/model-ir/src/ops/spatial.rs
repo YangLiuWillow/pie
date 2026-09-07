@@ -40,19 +40,25 @@
 //! back after it, so a chunked decode carries state across fires. A slot
 //! opened fresh is zero (`RsReset` zeroes every state row of the slot), which
 //! is the zero-padded first tile; [`TimePad::Replicate`] is for the
-//! cacheless single-tile case.
+//! cacheless single-tile case. WITHOUT `causal_t` the same flag pads BOTH
+//! ends of the clip with its own end frames — LTX-2.5's non-causal decoder
+//! (`torch.cat([x[:, :, :1], x, x[:, :, -1:]], dim=2)` before every conv),
+//! which decodes a whole clip in one fire and carries no cache.
 
 use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// What the frames before a clip read under `causal_t` with no cache.
+/// What a padded frame reads: the frames before a clip under `causal_t`
+/// with no cache, and the frames on both sides of it otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimePad {
-    /// Zeros — the zero-padded causal convolution.
+    /// Zeros — the zero-padded causal convolution, or a plain zero-padded
+    /// symmetric one.
     Zero,
-    /// The clip's own first frame, repeated.
+    /// The clip's own end frames, repeated: frame 0 in front and — for a
+    /// symmetric convolution — the last frame behind.
     Replicate,
 }
 

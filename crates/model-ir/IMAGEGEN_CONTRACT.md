@@ -274,7 +274,11 @@ clip table below carries the offsets.
   input frames back (`spatial::cache_store`), keyed by the fire's `[Clips]`
   slot table. `Shell::open(slot)` (the `RsReset` path) zeroes every state row
   of the slot, which is the zero-padded first tile; `TimePad::Replicate` is
-  for the cacheless single-tile case. `check::classes::writes_cache` roots a
+  for the cacheless single-tile case. WITHOUT `causal_t`, `TimePad::Replicate`
+  (DSL `Conv::same3().replicate_time()`) pads BOTH ends of the clip with its
+  own end frames — LTX-2.5's non-causal decoder, which decodes a whole clip
+  in one fire and carries no cache; `TimePad::Zero` there is the plain
+  zero-padded symmetric convolution. `check::classes::writes_cache` roots a
   conv with a cache.
 - **Compiler.** `Budgets.voxels: Option<VoxelLadder { max_voxels, buckets,
   max_clips }>` (`Budgets::with_voxels`, `ladder(RowAxis::Voxels)`,
