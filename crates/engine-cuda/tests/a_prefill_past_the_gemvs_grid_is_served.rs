@@ -28,6 +28,7 @@
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Graphs, Lane, Shell};
@@ -39,6 +40,19 @@ use model_ir::{ParamSource, Trace};
 /// the GEMV's grid ceiling: `16_400 * 4 = 65_600`, and the ceiling is 65535.
 const TOP_K: u32 = 4;
 const WIDE: u32 = 16_400;
+
+/// A width BOTH legs serve, for the arms that compare them: 32768 routes is
+/// under the GEMV's ceiling, and 1024 routes per expert is well over the
+/// four the grouped leg asks for.
+const BOTH: u32 = 8_192;
+
+/// One shell at a time per process: `kernels-cuda`'s scratch slabs are
+/// process-global, and these tests set `PIE_NO_MOE_GROUP` around a fire.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn serialized() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 const PAGE: u32 = 16;
 /// Room for the whole prefill, rounded to a whole page.
@@ -186,8 +200,9 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
         profile: None,
         page_size: PAGE,
         context: CONTEXT,
-        slots: 1,
-        pages: CONTEXT / PAGE,
+        // Two: one seat warms the fire's width, the other is the one timed.
+        slots: 2,
+        pages: 2 * (CONTEXT / PAGE),
         ordinal: 0,
         // The grouped leg declines under a body's staged geometry, and a
         // prefill this wide would never be captured anyway; off, so that the
@@ -205,20 +220,45 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
     })
 }
 
-/// One prefill of `WIDE` tokens on a fresh shell.
-fn wide_fire(fixture: &Fixture) -> engine_cuda::Result<Vec<Vec<f32>>> {
+/// One prefill of `tokens` on a fresh shell, and what it cost.
+fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
     let mut shell = load(fixture)?;
     shell.open(0).expect("slot 0 opens");
-    let prompt: Vec<u32> = (0..WIDE).map(|t| (t * 7 + 11) % 2048).collect();
-    shell.fire(&[Lane {
-        slot: 0,
-        word: word(WIDE),
-        tokens: &prompt,
-    }])
+    shell.open(1).expect("slot 1 opens");
+    let prompt: Vec<u32> = (0..tokens).map(|t| (t * 7 + 11) % 2048).collect();
+    fn lane(slot: u32, tokens: &[u32]) -> Lane<'_> {
+        Lane {
+            slot,
+            word: word(tokens.len() as u32),
+            tokens,
+        }
+    }
+    // **WARM AT THE WIDTH THAT IS TIMED.** A narrow warm fire is a GEMV
+    // fire: it takes none of the grouped leg's scratch slabs, so their first
+    // allocation would land inside the measurement.
+    shell.fire(&[lane(0, &prompt)])?;
+    let start = std::time::Instant::now();
+    let rows = shell.fire(&[lane(1, &prompt)])?;
+    Ok((rows, start.elapsed().as_secs_f64() * 1e3))
+}
+
+/// The same, with the grouped leg declined.
+///
+/// SAFETY: the caller holds [`serialized`], and the variable is read at fire
+/// time by `linear::moe::matmul_select` and nowhere else.
+fn fire_at_ungrouped(
+    fixture: &Fixture,
+    tokens: u32,
+) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
+    unsafe { std::env::set_var("PIE_NO_MOE_GROUP", "1") };
+    let answer = fire_at(fixture, tokens);
+    unsafe { std::env::remove_var("PIE_NO_MOE_GROUP") };
+    answer
 }
 
 #[test]
 fn a_prefill_past_the_gemvs_grid_is_served() {
+    let _one = serialized();
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
@@ -231,7 +271,7 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
     );
 
     // (1) The grouped leg serves it.
-    let logits = wide_fire(&fixture).expect(
+    let (logits, _) = fire_at(&fixture, WIDE).expect(
         "a prefill of 65600 routes fires — if this refused, the engine never reached the \
          grouped leg and the routed matmul is still one GEMV per route",
     );
@@ -241,13 +281,7 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
     // what makes (1) a statement about the grouped leg rather than about
     // some narrower width the GEMV would have served anyway.
     //
-    // SAFETY: one test, one thread, and the variable is read at fire time by
-    // `linear::moe::matmul_select` and nowhere else.
-    unsafe { std::env::set_var("PIE_NO_MOE_GROUP", "1") };
-    let refused = wide_fire(&fixture);
-    unsafe { std::env::remove_var("PIE_NO_MOE_GROUP") };
-
-    let why = refused
+    let why = fire_at_ungrouped(&fixture, WIDE)
         .err()
         .expect("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
         .to_string();
@@ -255,5 +289,94 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         why.contains("65600") || why.contains("65535"),
         "the refusal should be the GEMV's, naming the route run against the grid it does \
          not fit; it said: {why}"
+    );
+}
+
+/// **THE TWO LEGS ANSWER THE SAME MODEL**, read through the whole stack
+/// rather than at the entry.
+///
+/// `kernels-cuda` checks the grouped leg's arithmetic against a host dot on
+/// one op. This checks it where it actually lives: four layers, a router
+/// that picks the experts, both legs of the MLP, and a readout — the same
+/// prompt through the same weights, once each way.
+///
+/// They do not agree bit for bit and must not be asked to: a batched GEMM
+/// accumulates in a different order from a per-route GEMV, and the logits
+/// carry that. The tolerance below is on the SPREAD of the logits, so it
+/// does not quietly pass a rectangle of noise.
+///
+/// It prints both prices too. One synthetic four-layer text is not a serving
+/// number and is not offered as one; what it is good for is noticing if the
+/// grouped leg ever becomes the slower way to answer.
+#[test]
+fn the_two_legs_answer_the_same_model() {
+    let _one = serialized();
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let fixture = fixture();
+
+    let (grouped, grouped_ms) = fire_at(&fixture, BOTH).expect("the grouped leg fires");
+    let (gemv, gemv_ms) = fire_at_ungrouped(&fixture, BOTH).expect("the per-route GEMV fires");
+    finite(&grouped[0], "grouped");
+    finite(&gemv[0], "gemv");
+
+    assert_eq!(
+        grouped[0].len(),
+        gemv[0].len(),
+        "the two legs read out different vocabularies"
+    );
+    let spread = gemv[0].iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        - gemv[0].iter().copied().fold(f32::INFINITY, f32::min);
+    let worst = grouped[0]
+        .iter()
+        .zip(&gemv[0])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    let mut gaps: Vec<f32> = grouped[0]
+        .iter()
+        .zip(&gemv[0])
+        .map(|(a, b)| (a - b).abs())
+        .collect();
+    gaps.sort_by(f32::total_cmp);
+    let median = gaps[gaps.len() / 2];
+    let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
+    let pick = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (at, v)| {
+                if *v > best.1 { (at, *v) } else { best }
+            })
+            .0
+    };
+    eprintln!(
+        "{BOTH} tokens, {} routes: grouped {grouped_ms:.1} ms, gemv {gemv_ms:.1} ms \
+         ({:.2}x); gap worst {worst:.4} mean {mean:.4} median {median:.4} over a spread \
+         of {spread:.2}; argmax {} vs {}",
+        BOTH * TOP_K,
+        gemv_ms / grouped_ms,
+        pick(&grouped[0]),
+        pick(&gemv[0]),
+    );
+    // **WHAT A REORDERED SUM LOOKS LIKE**, and what it does not. A batched
+    // GEMM accumulates in a different order from a per-route GEMV, so the
+    // logits differ — but the difference is spread over the whole vocabulary
+    // rather than sitting in one place: the mean and the median land on top
+    // of each other, and the worst is a small multiple of them. A leg that
+    // dropped a route, read a bank at the wrong stride or landed a block in
+    // the wrong rows would move the mean, not just the tail, so that is what
+    // is bounded tightest here. The worst gets the looser bound because one
+    // near-tie rounding the other way is not a fault.
+    assert!(
+        mean <= 0.01 * spread,
+        "the two legs answer differently in the MEAN: {mean} over a spread of {spread}. \
+         A reordered sum moves the tail, not the middle"
+    );
+    assert!(
+        worst <= 0.05 * spread,
+        "one logit differs by {worst} over a spread of {spread}, which is more than a \
+         near-tie rounding the other way"
     );
 }
