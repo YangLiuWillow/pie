@@ -408,12 +408,24 @@ def wan_video_readout(text: str) -> str:
     cold = re.search(r"cacheless frame \d+: cos ([0-9.]+)", text)
     if cold:
         bits.append(f"cacheless {float(cold.group(1)):.4f}")
-    clip = re.search(r"\[gates\] clip: (\S+)", text)
+    clips = re.findall(r"\[gates\] clip: (\S+)", text)
     size = re.search(r"\[gates\] (\d+)x(\d+) mp4, (\d+) frames", text)
     if size:
         bits.append(f"{size.group(1)}x{size.group(2)}x{size.group(3)} mp4")
-    if clip:
-        bits.append(clip.group(1))
+    # The ungated run and the guided one, in step order. Guidance must MOVE
+    # the latent, or the second branch conditioned nothing: `s = 5` on an
+    # undistilled row widens the distribution, and a std that did not budge
+    # is a guided run that was not guided.
+    stds = [float(v) for v in re.findall(r'"std":([0-9.]+)', text)]
+    guided = re.findall(r'"cfg":(true|false)', text)
+    if len(stds) >= 2 and guided[:2] == ["false", "true"]:
+        moved = abs(stds[1] - stds[0]) / max(stds[0], 1e-9)
+        verdict = "pass" if moved > 0.05 else "FAIL"
+        bits.append(f"guided std {stds[0]:.3f} -> {stds[1]:.3f} ({verdict})")
+    elif guided:
+        bits.append(f"cfg runs {','.join(guided)}")
+    if clips:
+        bits.append(clips[-1])
     return "  ".join(bits) or "no clip"
 
 
@@ -460,16 +472,22 @@ def cargo_test(name):
     return build
 
 
-def t2v_step(prompt_ids, width, height, frames, steps, seed):
+def t2v_step(prompt_ids, width, height, frames, steps, seed,
+             negative_ids=None, guidance=None, out_name="clip"):
     def build(ctx, gate):
-        out = os.path.join(ctx.out, gate.name, "clip")
+        out = os.path.join(ctx.out, gate.name, out_name)
         os.makedirs(out, exist_ok=True)
-        return ([ctx.python, os.path.join(HERE, "gates.py"), "--text-to-video",
-                 "--config", ctx.configs[gate.name], "--out", out,
-                 "--pie", ctx.pie, "--prompt-ids", prompt_ids,
-                 "--width", str(width), "--height", str(height),
-                 "--frames", str(frames), "--steps", str(steps),
-                 "--seed", str(seed)], REPO)
+        argv = [ctx.python, os.path.join(HERE, "gates.py"), "--text-to-video",
+                "--config", ctx.configs[gate.name], "--out", out,
+                "--pie", ctx.pie, "--prompt-ids", prompt_ids,
+                "--width", str(width), "--height", str(height),
+                "--frames", str(frames), "--steps", str(steps),
+                "--seed", str(seed)]
+        if negative_ids is not None:
+            argv += ["--negative-ids", negative_ids]
+        if guidance is not None:
+            argv += ["--guidance", str(guidance)]
+        return (argv, REPO)
     return build
 
 
@@ -683,7 +701,8 @@ def roster() -> list[Gate]:
             name="wan-video",
             wraps=("the_wan_2_vae_answers_the_reference, then the model-agnostic "
                    "text-to-video guest on wan22-ti2v-5b.zt"),
-            expected="decode cos >= 0.999 per chunk and clip (landed 0.999986); a real mp4",
+            expected="decode cos >= 0.999 per chunk and clip (landed 0.999986); a real mp4, "
+                     "and guidance at 5.0 must MOVE the latent",
             needs=[(g("wan22", "wan22_vae", "shapes.json"),
                     "python scripts/imagegen/wan22_golden.py --vae"),
                    (a("wan22-ti2v-5b.zt"),
@@ -703,7 +722,18 @@ def roster() -> list[Gate]:
                    # own prompt.
                    ("prompt -> clip",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
-                             832, 480, 17, 20, 0))],
+                             832, 480, 17, 20, 0)),
+                   # THE SAME CLIP, GUIDED. Four lanes — two attention
+                   # groups of a context and a video lane — in one fire,
+                   # combining `u + s(c - u)` in the epilogue off
+                   # `intrinsics::peer_velocity`. This is the undistilled
+                   # row, so guidance is the setting the reference actually
+                   # uses; the readout reports both latents' std, and they
+                   # must differ or the second branch changed nothing.
+                   ("the same prompt, guided at 5.0",
+                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                             832, 480, 17, 20, 0,
+                             negative_ids="1", guidance=5.0, out_name="guided"))],
             readout=wan_video_readout,
             timeout=5400,
             note=("the prompt goes in as IDS: umT5's SentencePiece Unigram tokenizer does not "
@@ -860,6 +890,16 @@ def text_to_video(args) -> int:
            "--prompt-ids", args.prompt_ids, "--width", str(args.width),
            "--height", str(args.height), "--frames", str(args.frames),
            "--steps", str(args.steps), "--seed", str(args.seed), "--out", "clip"]
+    # Real guidance: a negative prompt at a scale above 1 runs the second
+    # lane pair and the combine happens in the epilogue.
+    if args.guidance is not None:
+        cmd += ["--guidance", str(args.guidance)]
+    if args.negative_ids:
+        # The guest names this one `negative_prompt_ids`, and takes it as a
+        # comma-separated STRING. A single id needs a trailing comma, or the
+        # argv parser hands it over as a JSON integer and the guest refuses.
+        ids = args.negative_ids if "," in args.negative_ids else f"{args.negative_ids},"
+        cmd += ["--negative_prompt_ids", ids]
     print("$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     sys.stdout.write(done.stdout)
@@ -969,6 +1009,8 @@ def main() -> int:
     ap.add_argument("--config", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--prompt", default="", help=argparse.SUPPRESS)
     ap.add_argument("--prompt-ids", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--negative-ids", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--guidance", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--width", type=int, default=1024, help=argparse.SUPPRESS)
     ap.add_argument("--height", type=int, default=1024, help=argparse.SUPPRESS)
     ap.add_argument("--frames", type=int, default=17, help=argparse.SUPPRESS)

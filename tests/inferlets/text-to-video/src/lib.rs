@@ -63,17 +63,22 @@
 //! is 81 MB of f32 through the boundary and 20 MB of RGB8 back) and the fix
 //! is a seam that appends rather than replaces, not a change here.
 //!
-//! # CFG IS THE SHAPE OF A LOOP, NOT A VERIFIED ONE
+//! # CFG
 //!
 //! A model with no `guidance` port takes a negative prompt as a second lane
-//! PAIR whose velocity the HOST combines (an epilogue reads its own lane's
-//! `velocity()` only, so the device form would need one lane's epilogue to
-//! see another's within one fire, which the channel contract does not
-//! promise). That path is written here and DOES NOT RUN: four lanes on
-//! `wan22-ti2v-5b` refuse with "no cell available" at the first readback —
-//! the two branches' `out` channels are taken in the same turn and one of
-//! them has no committed cell yet. Measured 2026-09-06; the single-branch
-//! path at `guidance: 1.0` is what has produced a clip.
+//! PAIR, and the two velocities combine `u + s(c - u)` ON THE DEVICE. The
+//! branches are two attention GROUPS of one fire — they must not attend
+//! each other — and each names the other with `ForwardPass::peer`, which is
+//! also what gathers them into one cohort so they seal into one fire. BOTH
+//! video lanes compute the same combine from their own side (the
+//! conditional one reads `(own = c, peer = u)`, the other
+//! `(own = u, peer = c)`), so both latents step in lockstep and neither
+//! crosses the host between fires.
+//!
+//! This path used to fail at the first readback with "no cell available",
+//! because the host combine took both branches' `out` cells in one turn and
+//! one had none committed yet. Moving the combine onto the device removed
+//! the turn, and with it the failure.
 //!
 //! # THE PROMPT, AND THE ROW WHOSE TOKENIZER PIE CANNOT SPELL
 //!
@@ -337,6 +342,11 @@ fn lane(
     ports: &Ports,
     stream: model::LaneStream,
     group: u32,
+    // The OTHER guidance branch's group, on the CFG path. Named by EVERY
+    // lane of both branches, not only the ones that read: naming is what
+    // gathers the two groups into one cohort, and a peer in another fire is
+    // not on this fire's velocity plane at all.
+    peer: Option<u32>,
     rows: u32,
     latents: Option<&Channel>,
     context: Option<&Channel>,
@@ -349,6 +359,9 @@ fn lane(
     pass.reading(&reading.name)?;
     pass.stream(stream)?;
     pass.group(group)?;
+    if let Some(peer) = peer {
+        pass.peer(peer)?;
+    }
     let mut held = Vec::new();
     let mut latents_bound = false;
     let mut context_bound = false;
@@ -573,7 +586,6 @@ fn ids_of(text: &str) -> Result<Vec<u32>> {
 struct Branch {
     context: Lane,
     image: Lane,
-    latent: Channel,
     out: Channel,
 }
 
@@ -749,6 +761,7 @@ async fn main(input: Input) -> Result<Output> {
             &ports,
             ports.context_stream,
             group,
+            cfg.then(|| 1 - group),
             ctx_rows,
             None,
             Some(ctx),
@@ -763,6 +776,7 @@ async fn main(input: Input) -> Result<Output> {
             &ports,
             ports.video_stream,
             group,
+            cfg.then(|| 1 - group),
             rows,
             Some(&latent),
             None,
@@ -775,47 +789,36 @@ async fn main(input: Input) -> Result<Output> {
             .capacity(channel_capacity() as u32)
             .named(&format!("{tag}_out"));
         text_clock.drive(&context_lane.pass, |_| {});
-        if cfg {
-            let readback = out.clone();
-            image_clock.drive(&image_lane.pass, move |_| {
-                readback.put(intrinsics::velocity(velocity_width));
-            });
-        } else {
-            let dts = loops.dts(tag);
-            let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
-            let x = latent.clone();
-            let readback = out.clone();
-            image_clock.drive(&image_lane.pass, move |k| {
-                seed_or_step(
-                    k,
-                    &x,
-                    &intrinsics::velocity(velocity_width),
-                    &dts,
-                    &rng,
-                    shape,
-                    Some(&readback),
-                );
-            });
-        }
+        let dts = loops.dts(tag);
+        let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
+        let x = latent.clone();
+        let readback = out.clone();
+        image_clock.drive(&image_lane.pass, move |k| {
+            // On the CFG path BOTH branches step with the SAME combine, each
+            // computed from its own side: the conditional lane reads
+            // `(own = c, peer = u)` and the unconditional one
+            // `(own = u, peer = c)`, and `u + s(c - u)` is the same number
+            // either way. So the two latents stay in step without either one
+            // crossing the host between fires.
+            let v = if cfg {
+                guided_velocity(velocity_width, guidance, group == 0)
+            } else {
+                intrinsics::velocity(velocity_width)
+            };
+            seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback));
+        });
         branches.push(Branch {
             context: context_lane,
             image: image_lane,
-            latent,
             out,
         });
     }
 
-    let mut x: Vec<f32> = if cfg {
-        host_normal(seed, cells)
-    } else {
-        Vec::new()
-    };
-    if cfg {
-        for branch in &branches {
-            branch.latent.set(x.as_slice())?;
-        }
-    }
-
+    // Both paths are the same loop now: the device seeds its own latent and
+    // integrates its own Euler step, guided or not. The guided branches read
+    // each other's velocity off the fire's own plane, so nothing crosses the
+    // host between steps — which is also why the four-lane path runs at all
+    // now: it no longer takes two branches' cells in one turn.
     let mut last: Vec<f32> = Vec::new();
     for fire in 0..loops.fires() {
         let passes: Vec<&ForwardPass> = branches
@@ -825,26 +828,16 @@ async fn main(input: Input) -> Result<Output> {
         loops
             .fire(&passes)
             .with_context(|| format!("fire {fire}"))?;
+        // The conditional branch's latent is the answer; the unconditional
+        // one steps in lockstep with it (same combine, computed from its own
+        // side) and is read only to keep its channel's cursor moving.
+        last = branches[0]
+            .out
+            .take_host::<Vec<f32>>()
+            .await
+            .with_context(|| format!("readback after fire {fire}"))?;
         if cfg {
-            let cond = branches[0].out.take_host::<Vec<f32>>().await?;
-            let anti = branches[1].out.take_host::<Vec<f32>>().await?;
-            if fire > 0 {
-                let v = cfg_combine_host(&cond, &anti, guidance);
-                let dt = sched.dt(fire - 1);
-                for (xi, vi) in x.iter_mut().zip(&v) {
-                    *xi += dt * vi;
-                }
-                for branch in &branches {
-                    branch.latent.set(x.as_slice())?;
-                }
-            }
-            last = x.clone();
-        } else {
-            last = branches[0]
-                .out
-                .take_host::<Vec<f32>>()
-                .await
-                .with_context(|| format!("readback after fire {fire}"))?;
+            let _ = branches[1].out.take_host::<Vec<f32>>().await?;
         }
     }
     loops.close();
@@ -980,36 +973,3 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// `uncond + s.(cond - uncond)`, on the host: the twin of the device
-/// `latent::cfg_combine`.
-fn cfg_combine_host(cond: &[f32], uncond: &[f32], s: f32) -> Vec<f32> {
-    cond.iter()
-        .zip(uncond)
-        .map(|(c, u)| u + s * (c - u))
-        .collect()
-}
-
-/// `n` standard-normal values from `seed`, for the CFG path alone (the
-/// device draw `latent::noise` is what a normal run seeds with, and the two
-/// do not agree — said here rather than discovered later).
-fn host_normal(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(seed);
-    let mut next = || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
-    };
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let u1 = next().max(1e-12);
-        let u2 = next();
-        let r = (-2.0 * u1.ln()).sqrt();
-        out.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
-        if out.len() < n {
-            out.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
-        }
-    }
-    out
-}
