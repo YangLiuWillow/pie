@@ -119,10 +119,11 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 .count();
             let kvs = plan.caches.len() - states;
             assert_eq!(kvs, 0, "{sku} {platform:?}: no kv space anywhere");
-            let want = if is_flagship(sku) { 32 } else { 0 };
+            // 32 causal convs in the decoder, 24 in the encoder.
+            let want = if is_flagship(sku) { 32 + 24 } else { 0 };
             assert_eq!(
                 states, want,
-                "{sku} {platform:?}: one frame cache per causal conv of the decoder"
+                "{sku} {platform:?}: one frame cache per causal conv of the VAE"
             );
             let seams: BTreeMap<&str, usize> =
                 plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
@@ -142,8 +143,8 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 assert_eq!(seams.get(seam::HIDDEN.name), Some(&1), "{sku}: one hidden");
                 assert_eq!(
                     seams.get(seam::PIXELS.name),
-                    Some(&2),
-                    "{sku}: pixels on both decoder arms"
+                    Some(&4),
+                    "{sku}: the voxel-axis readout on all four VAE arms"
                 );
             } else {
                 // Of the float readouts, the velocity alone (the `in` seam
@@ -274,10 +275,13 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             .iter()
             .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
             .count();
+        // TWO voxel ports on the flagship: the decode arms' 48-wide latent
+        // clip at index 0 and the encode arms' 3-wide pixel clip at index 1
+        // (the engine seats one rectangle per `(kind, index)`).
         assert_eq!(
             voxels,
-            usize::from(is_flagship(sku)),
-            "{sku}: the voxel port iff the row carries a VAE"
+            if is_flagship(sku) { 2 } else { 0 },
+            "{sku}: a voxel port per VAE clip width, and none without a VAE"
         );
     }
 }
@@ -312,8 +316,8 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             "{sku}: two lanes share a class: {seen:?}"
         );
         // text/Text, denoise/Video, denoise/Context, and one Video lane
-        // for each decoder arm.
-        let want = if is_flagship(sku) { 5 } else { 2 };
+        // for each of the two decoder and two encoder arms.
+        let want = if is_flagship(sku) { 7 } else { 2 };
         assert_eq!(seen.len(), want, "{sku}: the lanes the facts list");
     }
 }
@@ -531,7 +535,14 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         if is_flagship(sku) {
             assert_eq!(
                 names,
-                vec!["text", "denoise", "vae.decode.head", "vae.decode"]
+                vec![
+                    "text",
+                    "denoise",
+                    "vae.decode.head",
+                    "vae.decode",
+                    "vae.encode.head",
+                    "vae.encode"
+                ]
             );
             let text = &facts.readings[0];
             assert!(
@@ -663,8 +674,11 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
             .count();
         // The decoder's 38 convs: `post_quant`, `conv_in`, four in the mid
         // block, twenty-four in the twelve resnets plus two shortcuts,
-        // two time convs, three resamples, `conv_out`.
-        const VAE_CONV_BIASES: usize = 38;
+        // two time convs, three resamples, `conv_out`. And the encoder's
+        // 30: `conv_in`, sixteen in the eight resnets plus two shortcuts,
+        // three resamples, two time convs, four in the mid block,
+        // `conv_out`, `quant`.
+        const VAE_CONV_BIASES: usize = 38 + 30;
         assert_eq!(
             f32_tables,
             d.layers as usize + 1 + if is_flagship(sku) { VAE_CONV_BIASES } else { 0 },

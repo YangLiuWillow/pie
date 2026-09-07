@@ -1421,6 +1421,15 @@ def run_gate(ctx, gate, log) -> tuple[str, str, str]:
         return SKIP, measured, why.group(1) if why else "the host gate skipped itself"
     if code == 124:
         return ERROR, measured, f"timed out after {gate.timeout}s"
+    # A READOUT'S OWN VERDICT COUNTS. Several readouts compare a gate's
+    # steps against each other — img2img's two identities, wan-video's
+    # guided move, the reference claims, the step-cache rules — and report
+    # `pass`/`FAIL` in the measured column. Those claims cannot be a step's
+    # exit code, because no single step knows about the others. Reading only
+    # `code` let a gate say `pass` with a FAIL written in its own row, which
+    # is how `strength 1.0 IS txt2img (FAIL)` sat unread for a whole roster.
+    if code == 0 and FAIL in measured:
+        return FAIL, measured, gate.note
     return (PASS if code == 0 else FAIL), measured, gate.note
 
 

@@ -20,10 +20,10 @@
 //!     extents and lowers to a load plan; the same under `dit.`
 //! (b) over the REAL `Wan-AI/Wan2.2-TI2V-5B-Diffusers` snapshot, when the
 //!     HuggingFace cache holds one: every `dit.` tensor is read at the
-//!     counts the cuts imply; every `te.` tensor once; `vae.decoder.*` and
-//!     `vae.post_quant_conv.*` once and `vae.encoder.*`, `vae.quant_conv.*`
-//!     never; the contract types and lowers; identification lands on the
-//!     flagship
+//!     counts the cuts imply; every `te.` tensor once; EVERY `vae.` tensor
+//!     once — decoder, encoder, `post_quant_conv` and `quant_conv`, both
+//!     readings being declared; the contract types and lowers;
+//!     identification lands on the flagship
 //! (c) over the goldens' own `wan22_mini_{d128,nano}.safetensors`, when
 //!     present: each miniature reads its file and types
 //! ```
@@ -142,8 +142,8 @@ fn text_encoder() -> Vec<Named> {
     out
 }
 
-/// The VAE's decoder side as `AutoencoderKLWan` spells it, plus a few
-/// encoder tensors to prove nothing under them is read.
+/// The VAE's decoder side as `AutoencoderKLWan` spells it, plus the
+/// encoder's first conv and the quant conv, which the encode arms read.
 fn vae() -> Vec<Named> {
     let dims = model::VAE_DECODER_DIMS;
     let mut out: Vec<Named> = Vec::new();
@@ -241,7 +241,8 @@ fn vae() -> Vec<Named> {
         dims[4],
         [3, 3, 3],
     );
-    // Unread: the encoder's first conv and the quant conv.
+    // The encoder's own first conv (its input channels permuted at import)
+    // and the quant conv (its first 48 output rows).
     conv(&mut push, "encoder.conv_in", 160, 12, [3, 3, 3]);
     conv(&mut push, "quant_conv", 96, 96, [1, 1, 1]);
     out
@@ -525,14 +526,11 @@ fn the_flagship_reads_the_real_snapshot() {
     let te_want: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("te.")).collect();
     assert_eq!(te_read, te_want, "every encoder plane is read");
 
-    // The VAE: the decoder side and the post-quant conv; nothing of the
-    // encoder or the quant conv.
+    // The VAE, whole: both readings are declared, so the decoder, the
+    // encoder and the two 1x1 convs between them are all read.
     let vae_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("vae.")).collect();
-    let vae_want: BTreeSet<&String> = index
-        .iter()
-        .filter(|n| n.starts_with("vae.decoder.") || n.starts_with("vae.post_quant_conv."))
-        .collect();
-    assert_eq!(vae_read, vae_want, "the VAE planes read are the decoder's");
+    let vae_want: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("vae.")).collect();
+    assert_eq!(vae_read, vae_want, "every VAE plane is read");
 
     // Every other tensor exactly once — the row-permuted VAE convs
     // included. A `time_conv` `(r1, c)` → `(c, r1)` and `conv_out`'s
