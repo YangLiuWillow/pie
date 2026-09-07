@@ -467,7 +467,321 @@ pub fn matmul_select(
     y: &mut Tensor,
     experts: ExpertTable,
 ) -> Result<(), Error> {
-    select_gemv(ctx, "linear.moe_matmul_select", x, bank, routes, y, experts)
+    const OP: &str = "linear.moe_matmul_select";
+
+    // A fire wide enough to name each expert many times reads the same bank
+    // back once per route under the GEMV; grouping reads it once per block.
+    // Everything narrower — decode above all — keeps the GEMV, which is
+    // already the right shape there. See [`grouped_worth`].
+    #[cfg(feature = "cuda")]
+    {
+        let fan = selected(OP, x, routes, y)?;
+        if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
+            return select_grouped(ctx, OP, x, bank, routes, y, count);
+        }
+    }
+    select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// Rows one aligned block carries, chosen per fire: wide enough that most
+/// experts fill exactly one block — the bank is re-read once per block that
+/// names it, so blocks are what the traffic is counted in — and narrow
+/// enough that the padded tail the GEMM computes and nobody reads stays
+/// inside a factor of two.
+#[cfg(feature = "cuda")]
+const fn block_rows(per_expert: u32) -> u32 {
+    let want = per_expert.next_power_of_two();
+    if want < 16 {
+        16
+    } else if want > 128 {
+        128
+    } else {
+        want
+    }
+}
+
+/// Routes per expert at or above which grouping pays for its alignment.
+/// Below it each expert is named about once, so the GEMV already reads each
+/// bank about once and the sort, gather and reorder would buy nothing —
+/// which is exactly the decode case this must never fire on.
+#[cfg(feature = "cuda")]
+const GROUP_AT: u32 = 4;
+
+/// The aligned workspace the grouped leg will stage before it declines.
+/// Scratch slabs are monotone in the widest fire that ever asked, so one
+/// outsized prefill would hold the arena at its width for the life of the
+/// process; past this the GEMV is the cheaper answer overall.
+#[cfg(feature = "cuda")]
+const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
+
+/// Is this fire wide enough, and plain enough, for the grouped leg? Answers
+/// the bank's expert count when it is.
+///
+/// Two indirections the GEMV carries and the grouped leg does not: a bank
+/// whose experts stream in behind a table, and the staged geometry a
+/// captured body arms. Both belong to decode-shaped fires, which are below
+/// the width threshold anyway, so declining them costs nothing.
+#[cfg(feature = "cuda")]
+fn grouped_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    y: &Tensor,
+    fan: &Selected,
+    experts: ExpertTable,
+) -> Option<u32> {
+    if std::env::var_os("PIE_NO_MOE_GROUP").is_some() {
+        return None;
+    }
+    if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
+        return None;
+    }
+    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
+        return None;
+    }
+    // The bank is `[experts, N, K]` flattened to rows x width, so its rows
+    // are `experts * N` and its width is the activation's.
+    if y.width == 0 || bank.width != x.width || !bank.rows.is_multiple_of(y.width) {
+        return None;
+    }
+    let count = bank.rows / y.width;
+    if count == 0 || count > MAX_EXPERTS {
+        return None;
+    }
+    let per_expert = fan.route_count.div_ceil(count);
+    if per_expert < GROUP_AT {
+        return None;
+    }
+    // The same arithmetic `select_grouped` does, ahead of taking any slab.
+    let block = block_rows(per_expert);
+    let blocks = u64::from(count) + u64::from(fan.route_count.div_ceil(block));
+    let rows = blocks * u64::from(block);
+    let staged = rows
+        .checked_mul(u64::from(x.width) + u64::from(y.width))?
+        .checked_mul(x.dtype.bytes_ceil())?;
+    (staged <= GROUP_WORKSPACE_CAP).then_some(count)
+}
+
+/// The routed matmul as one grouped GEMM per expert block, instead of one
+/// GEMV per route.
+///
+/// The GEMV re-reads a whole expert bank for every route that names it, so
+/// its weight traffic is `routes * N * K` where the work needs
+/// `experts * N * K`. At a prefill's fan-out that ratio is the gap: an
+/// order of magnitude of bandwidth spent reading the same planes back.
+/// Grouping sorts the routes by expert into fixed-width blocks, gathers the
+/// activations behind that permutation, and hands cuBLAS one batched GEMM
+/// in which every block reads its bank exactly once.
+///
+/// The batch count is the PADDED block count, not the live one: cuBLAS
+/// takes `batchCount` by value on the host, and reading the live count off
+/// the device would be the D2H this pipeline refuses. The blocks the
+/// alignment left unused read expert 0's bank against the zeroed rows the
+/// gather wrote, and land in an output region the reorder never reads.
+#[cfg(feature = "cuda")]
+fn select_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: u32,
+) -> Result<(), Error> {
+    use cudarc::cublas::sys::{
+        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx,
+        cublasHandle_t, cublasOperation_t, cublasStatus_t, cudaDataType,
+    };
+
+    let (t, scalar) = match x.dtype {
+        Dtype::Bf16 => ("::pie::bf16", cudaDataType::CUDA_R_16BF),
+        Dtype::F16 => ("::pie::f16", cudaDataType::CUDA_R_16F),
+        other => {
+            return Err(refuse(
+                op,
+                format!("the grouped leg hands cuBLAS a 16-bit bank and this one is {other:?}"),
+            ));
+        }
+    };
+    let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
+
+    let fan = selected(op, x, routes, y)?;
+    let per_expert = fan.route_count.div_ceil(experts);
+    let block = block_rows(per_expert);
+    let blocks = experts + fan.route_count.div_ceil(block);
+    let rows = blocks
+        .checked_mul(block)
+        .ok_or_else(|| refuse(op, format!("{blocks} blocks of {block} rows overflow the fire")))?;
+
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let route_count = stated(op, fan.route_count)?;
+    let aligned_rows = stated(op, rows)?;
+    let block_size = stated(op, block)?;
+    let max_blocks = stated(op, blocks)?;
+    let expert_count = stated(op, experts)?;
+
+    let elem = x.dtype.bytes_ceil();
+    let slab = |name: &'static str, bytes: u64| -> Result<u64, Error> {
+        usize::try_from(bytes)
+            .map_err(|_| refuse(op, format!("{name} wants {bytes} bytes, past this host's usize")))
+            .and_then(|bytes| ctx.scratch(op, name, bytes))
+            .map(|ptr| ptr as usize as u64)
+    };
+    let sorted = slab("linear.moe_group_sorted", u64::from(rows) * 4)?;
+    let expert_ids = slab("linear.moe_group_experts", u64::from(blocks) * 4)?;
+    let staged_in = slab(
+        "linear.moe_group_in",
+        u64::from(rows) * u64::from(x.width) * elem,
+    )?;
+    let staged_out = slab(
+        "linear.moe_group_out",
+        u64::from(rows) * u64::from(y.width) * elem,
+    )?;
+    // One slab, three arrays: the batched GEMM's weight, activation and
+    // output bases, in that order.
+    let ptrs = slab("linear.moe_group_ptrs", u64::from(blocks) * 3 * 8)?;
+    let w_ptrs = ptrs;
+    let act_ptrs = ptrs + u64::from(blocks) * 8;
+    let out_ptrs = ptrs + u64::from(blocks) * 16;
+
+    // Sort the routes into per-expert blocks. `route_to_aligned_row` and the
+    // live padded count are both left unasked: the reorder below walks
+    // `sorted_route_ids`, and the batch count is the padded one by design.
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>").apply(
+            Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4),
+        ),
+        &[
+            routes.arg(),
+            ArgValue::Ptr(sorted),
+            ArgValue::Ptr(expert_ids),
+            ArgValue::ABSENT,
+            route_count.arg(),
+            expert_count.arg(),
+            block_size.arg(),
+            max_blocks.arg(),
+            ArgValue::ABSENT,
+        ],
+    )?;
+
+    // Gather the activations behind that permutation. The up leg reads one
+    // row per token, so the gather divides the route by the fan-out; the
+    // down leg already has one row per route, which is the same walk at a
+    // fan-out of one.
+    let gather_fan = if fan.by_token { fan.top_k } else { 1 };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::gather_moe_aligned_inputs<{t}>")),
+        )
+        .apply(Launch::grid(
+            [rows, x.width.div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(sorted),
+            ArgValue::Ptr(staged_in),
+            route_count.arg(),
+            aligned_rows.arg(),
+            gather_fan.arg(),
+            k.arg(),
+            (-1i32).arg(), // no shared expert rides this leg
+            stated(op, x.rows)?.arg(),
+        ],
+    )?;
+
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::build_moe_leg_ptrs<{t}>")),
+        )
+        .apply(Launch::flat(blocks, BLOCK)),
+        &[
+            ArgValue::Ptr(expert_ids),
+            bank.arg(),
+            ArgValue::Ptr(staged_in),
+            ArgValue::Ptr(staged_out),
+            ArgValue::Ptr(w_ptrs),
+            ArgValue::Ptr(act_ptrs),
+            ArgValue::Ptr(out_ptrs),
+            max_blocks.arg(),
+            block_size.arg(),
+            k.arg(),
+            n.arg(),
+        ],
+    )?;
+
+    // `y[m,n] = act[m,k] @ w[n,k]^T`, per block — the same transposition
+    // `linear::dense` states, with pointer arrays in place of one base.
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    // SAFETY: `handle` is this context's live cuBLAS handle, already bound
+    // to its stream by the shell. The three pointer arrays hold `blocks`
+    // entries each, written by the launch above into slabs this context
+    // owns and holds for the fire's life.
+    let status = unsafe {
+        cublasGemmBatchedEx(
+            handle,
+            cublasOperation_t::CUBLAS_OP_T,
+            cublasOperation_t::CUBLAS_OP_N,
+            n,
+            block_size,
+            k,
+            std::ptr::from_ref(&alpha).cast(),
+            w_ptrs as usize as *const *const std::ffi::c_void,
+            scalar,
+            k,
+            act_ptrs as usize as *const *const std::ffi::c_void,
+            scalar,
+            k,
+            std::ptr::from_ref(&beta).cast(),
+            out_ptrs as usize as *const *mut std::ffi::c_void,
+            scalar,
+            n,
+            max_blocks,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    };
+    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        return Err(refuse(
+            op,
+            format!(
+                "`cublasGemmBatchedEx` answered {status:?} at {max_blocks} blocks of \
+                 M={block_size} N={n} K={k}"
+            ),
+        ));
+    }
+
+    // Undo the permutation: every aligned row lands at the route it was
+    // sorted from, and the padding rows name no route and are dropped.
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::reorder_moe_aligned_output<{t}>")),
+        )
+        .apply(Launch::grid(
+            [rows, y.width.div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(staged_out),
+            ArgValue::Ptr(sorted),
+            y.arg(),
+            route_count.arg(),
+            aligned_rows.arg(),
+            n.arg(),
+            (-1i32).arg(),
+            0i32.arg(),
+            ArgValue::ABSENT,
+        ],
+    )
 }
 
 /// The routed dense GEMV itself, under the caller's own op name. LoRA's

@@ -1634,4 +1634,43 @@ __global__ void reorder_moe_aligned_output(
     route_out[static_cast<long long>(route) * hidden + h] = v;
 }
 
+
+/// The batched GEMM's three pointer arrays for ONE grouped MoE leg.
+///
+/// `build_moe_ptrs_aligned` is the fused twin: it lays out the gate/up and
+/// down legs together because the fused MLP shares one alignment between
+/// them. A leg fired on its own — which is how the IR spells a routed
+/// select — shares nothing, so it wants only its own triple.
+///
+/// A block the alignment left unused answers `expert_ids[b] < 0`. It still
+/// needs a readable weight base, so it borrows expert 0's; the rows under
+/// it are the zeros `gather_moe_aligned_inputs` wrote for the padding, so
+/// it lands zeros in a region `reorder_moe_aligned_output` never reads
+/// back. Launching the padded block count rather than the live one is what
+/// keeps the batch size off the host: cuBLAS takes `batchCount` by value,
+/// and reading the live count would be the D2H this pipeline does not do.
+template <class T>
+__global__ void build_moe_leg_ptrs(
+    const i32* __restrict__ expert_ids,
+    const T* __restrict__ bank_base,
+    const T* __restrict__ aligned_in,
+    T* __restrict__ aligned_out,
+    const T** __restrict__ w_ptrs,
+    const T** __restrict__ act_ptrs,
+    T** __restrict__ out_ptrs,
+    int max_blocks,
+    int block_size,
+    int K,
+    int N)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= max_blocks) return;
+    const int e = expert_ids[b];
+    const long long row = static_cast<long long>(b) * block_size;
+    w_ptrs[b] = bank_base + static_cast<long long>(e < 0 ? 0 : e)
+                * static_cast<long long>(N) * static_cast<long long>(K);
+    act_ptrs[b] = aligned_in + row * static_cast<long long>(K);
+    out_ptrs[b] = aligned_out + row * static_cast<long long>(N);
+}
+
 }

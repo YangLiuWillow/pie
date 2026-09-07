@@ -12,6 +12,7 @@
 
 use core::ffi::c_void;
 
+use kernels_cuda::cudarc::cublas::sys as blas;
 use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::jit::Ctx;
 
@@ -29,6 +30,10 @@ fn check(code: rt::cudaError, call: &str) {
 pub struct Gpu {
     stream: rt::cudaStream_t,
     device: Vec<*mut c_void>,
+    /// Bound to `stream` at open, for the entries that hand their shape to
+    /// cuBLAS rather than fire a kernel this tree wrote. A context built by
+    /// `Ctx::on` alone carries a null handle and those entries refuse.
+    cublas: blas::cublasHandle_t,
 }
 
 /// **THE CACHE ROOT A TEST RUN STATES**, so that nineteen test binaries do not
@@ -58,9 +63,21 @@ impl Gpu {
             check(rt::cudaSetDevice(0), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
             check(rt::cudaStreamCreate(&raw mut stream), "cudaStreamCreate");
+            let mut cublas: blas::cublasHandle_t = core::ptr::null_mut();
+            assert_eq!(
+                blas::cublasCreate_v2(&raw mut cublas),
+                blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "`cublasCreate_v2` did not answer a handle"
+            );
+            assert_eq!(
+                blas::cublasSetStream_v2(cublas, stream.cast()),
+                blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "`cublasSetStream_v2` did not bind the test's stream"
+            );
             Self {
                 stream,
                 device: Vec::new(),
+                cublas,
             }
         }
     }
@@ -70,7 +87,7 @@ impl Gpu {
     pub fn ctx(&self) -> Ctx {
         // SAFETY: the stream outlives every fire in a test, and `Gpu`'s drop
         // synchronizes before destroying it.
-        unsafe { Ctx::on(self.stream.cast()) }
+        unsafe { Ctx::on(self.stream.cast()).with_cublas(self.cublas.cast()) }
     }
 
     /// `bytes` of zeroed device memory.
@@ -137,6 +154,7 @@ impl Drop for Gpu {
             for at in self.device.drain(..) {
                 rt::cudaFree(at);
             }
+            blas::cublasDestroy_v2(self.cublas);
             rt::cudaStreamDestroy(self.stream);
         }
     }
