@@ -279,6 +279,20 @@ impl Channel {
             .map_err(|why| format!("{}: {why}", self.host_label("take-frames")))
     }
 
+    /// The inverse of [`take_frames`](Self::take_frames): SEED this cell
+    /// from a picture the host holds, without the pixels entering linear
+    /// memory. `[-1, 1]` f32, one row per voxel in `(t, h, w)` order —
+    /// what a `vae.encode` reading's pixel port reads.
+    ///
+    /// The put is `put`'s — the SEED a channel takes before its first fire —
+    /// so this is a channel a pass binds as an INPUT, never one an epilogue
+    /// writes, and it is seeded exactly once.
+    pub fn set_frames(&self, pixels: &crate::pie::inferlet::frames::Frames) -> Result<(), String> {
+        pixels
+            .to_channel(&self.wit())
+            .map_err(|why| format!("{}: {why}", self.host_label("set-frames")))
+    }
+
     /// Peek a cell on the host (leaves it full). Same as
     /// [`take_host`](Self::take_host) otherwise.
     pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {

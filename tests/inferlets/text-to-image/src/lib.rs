@@ -116,6 +116,46 @@ struct Input {
     guidance: Option<f32>,
     #[serde(default)]
     out: Option<String>,
+    /// IMG2IMG: a picture to start from, base64 of an encoded still (PNG,
+    /// JPEG, GIF, WebP). It is run through the family's `vae.encode`
+    /// reading, noised to the schedule's `strength` point, and the sampler
+    /// integrates from there — so the output keeps the input's composition
+    /// and takes the prompt's content.
+    #[serde(default)]
+    init_image: Option<String>,
+    /// The same picture in PIECES: `init_image_0`, `init_image_1`, ...
+    /// concatenated in index order. An encoded still is hundreds of
+    /// kilobytes and one argv argument is capped far below that
+    /// (`MAX_ARG_STRLEN`), so a caller driving this over a command line
+    /// splits it; a client with a real request body uses `init_image`.
+    ///
+    /// The sandbox scratch is NOT the door: `/scratch` is mounted per
+    /// PROCESS (`<base>/<process id>`, removed at teardown), so nothing
+    /// outside can place a file there for the guest to find.
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, inferlet::serde_json::Value>,
+    /// How much of the schedule to run over the encoded picture, in
+    /// `(0, 1]`. `1.0` is every step, which is text-to-image from noise;
+    /// `0.6` keeps the first 40% of the trajectory as the picture's own.
+    /// Only read when `init_image` is given.
+    #[serde(default)]
+    strength: Option<f32>,
+}
+
+impl Input {
+    /// The `init_image_<n>` pieces, in `n` order, concatenated.
+    fn image_pieces(&self) -> String {
+        let mut found: Vec<(u64, &str)> = self
+            .rest
+            .iter()
+            .filter_map(|(name, value)| {
+                let n = name.strip_prefix("init_image_")?.parse::<u64>().ok()?;
+                Some((n, value.as_str()?))
+            })
+            .collect();
+        found.sort_unstable_by_key(|(n, _)| *n);
+        found.into_iter().map(|(_, text)| text).collect()
+    }
 }
 
 /// The report, which doubles as the SIDECAR of the raw-latent exit: every
@@ -169,6 +209,7 @@ struct Roles {
     text: model::ReadingFact,
     denoise: model::ReadingFact,
     decode: Option<model::ReadingFact>,
+    encode: Option<model::ReadingFact>,
 }
 
 fn roles() -> Result<Roles> {
@@ -215,10 +256,22 @@ fn roles() -> Result<Roles> {
                 || (r.readout == model::ReadoutKind::Pixels && r.name != "vae.encode")
         })
         .cloned();
+    // And the ENCODER: the reading whose pixels are its INPUT, which is
+    // what a voxel port beside a non-pixels readout says. img2img comes in
+    // through it.
+    let encode = readings
+        .iter()
+        .find(|r| {
+            r.name == "vae.encode"
+                || (r.readout != model::ReadoutKind::Pixels
+                    && r.ports.iter().any(|p| p.kind == model::PortKind::Voxels))
+        })
+        .cloned();
     Ok(Roles {
         text,
         denoise,
         decode,
+        encode,
     })
 }
 
@@ -452,6 +505,126 @@ fn unpatchify(
     out
 }
 
+/// Standard base64 (`+/`, `=` padded) into the bytes it spells. The one
+/// thing that travels this way is an init image: argv is text, an encoded
+/// still is not, and a scratch-file door would make the picture a path
+/// rather than a value.
+fn b64_decode(text: &str) -> Result<Vec<u8>> {
+    let code = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let text = text.trim().trim_end_matches('=').as_bytes();
+    let mut bytes = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for (i, &c) in text.iter().enumerate() {
+        let six = code(c).ok_or_else(|| format!("the init image: byte {i} is not base64"))?;
+        acc = (acc << 6) | six;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(bytes)
+}
+
+/// The inverse: a `[h, w, C]` clip back into the `[rows, C.ph.pw]` rows a
+/// denoise reading's latent port takes, in `(c, ph, pw)` feature order.
+///
+/// The pair to [`unpatchify`], and here for the same reason: img2img starts
+/// from a picture, so the clip a `vae.encode` reading LANDS has to become
+/// the rows the sampler steps, and the guest is the only place both halves
+/// of the index algebra are visible.
+fn patchify(
+    clip: &[f32],
+    grid_h: u32,
+    grid_w: u32,
+    patch_h: u32,
+    patch_w: u32,
+    channels: u32,
+) -> Vec<f32> {
+    let (gh, gw) = (grid_h as usize, grid_w as usize);
+    let (ph, pw) = (patch_h as usize, patch_w as usize);
+    let c = channels as usize;
+    let w = gw * pw;
+    let row_width = c * ph * pw;
+    let mut out = vec![0f32; gh * gw * row_width];
+    for a in 0..gh {
+        for b in 0..gw {
+            let row = (a * gw + b) * row_width;
+            for ci in 0..c {
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let dst = row + ci * ph * pw + y * pw + x;
+                        let src = (((a * ph + y) * w) + (b * pw + x)) * c + ci;
+                        out[dst] = clip[src];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fire the family's `vae.encode` reading over one picture and hand back the
+/// latent clip it lands: the mirror of [`decode_to_frames`], and the door
+/// img2img comes in through.
+///
+/// The picture goes in as the port's CHANNEL, seeded straight from the
+/// host's `frames` handle (`Channel::set_frames`) so the pixels never enter
+/// this module's address space, and the answer comes back on the same
+/// `pixels` seam a decode uses — for an encoder that seam carries the
+/// POSTERIOR MEAN, `[clip rows, latent channels]`, which is what the
+/// reference pipeline's `retrieve_latents` takes when it samples nothing.
+async fn encode_from_frames(
+    reading: &model::ReadingFact,
+    picture: &inferlet::frames::Frames,
+    pixel_h: u32,
+    pixel_w: u32,
+    clip_h: u32,
+    clip_w: u32,
+    pipe: &Pipeline,
+) -> Result<Vec<f32>> {
+    let port = reading
+        .ports
+        .iter()
+        .find(|p| p.kind == model::PortKind::Voxels)
+        .ok_or_else(|| {
+            format!(
+                "reading `{}` takes pixels but declares no voxel port; there is no \
+                 picture to hand it",
+                reading.name
+            )
+        })?;
+    let rows = clip_h * clip_w;
+    let width = reading.readout_width;
+    let pass = ForwardPass::new();
+    pass.reading(&reading.name)?;
+    pass.stream(model::LaneStream::Image)?;
+    // Empty, and SEEDED from the picture below: the pixels are the host's
+    // and never enter linear memory, which is the whole point of the
+    // `frames` handle.
+    let clip =
+        Channel::seeded([pixel_h, pixel_w, port.width], dtype::f32).named("vae_pixels_in");
+    pass.input(&port.name, &clip)?;
+    let out = Channel::new([rows, width], dtype::f32).named("vae_latent_out");
+    let readback = out.clone();
+    pass.epilogue(move || {
+        readback.put(intrinsics::pixels(rows, width));
+    });
+    // THE PICTURE, seeded straight from the host's handle.
+    clip.set_frames(picture)?;
+    pass.submit(pipe).context("the vae.encode lane")?;
+    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+}
+
 /// Fire the family's `vae.decode` reading over one clip and hand the pixels
 /// straight to the host's encoders (design D8 into D11).
 ///
@@ -559,7 +732,36 @@ async fn main(input: Input) -> Result<Output> {
         }
         None => 8,
     };
-    let sched = FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?;
+    let full = FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?;
+
+    // ---- img2img: a picture, encoded, and a schedule cut to `strength` ----
+    //
+    // The picture comes in as an encoded still and goes out to the host's
+    // decoder without entering this module's address space: `Frames::decode`
+    // holds it, `Channel::set_frames` seeds the pixel port from it, and the
+    // encode lane's epilogue lands the posterior mean. `strength` is the
+    // FRACTION OF THE TRAJECTORY still to run, so the schedule is truncated
+    // to its tail and the picture is noised to that tail's first sigma.
+    let strength = input.strength.unwrap_or(0.6);
+    let has_init = input.init_image.is_some() || !input.image_pieces().is_empty();
+    if has_init && !(0.0 < strength && strength <= 1.0) {
+        return Err(format!("`strength` is {strength}; it is a fraction in (0, 1]").into());
+    }
+    let cut = if has_init {
+        // `steps - round(steps * strength)`: the number of steps SKIPPED.
+        // Clamped to leave at least one, since a schedule of no steps is a
+        // picture handed straight back.
+        let run = ((steps as f32 * strength).round() as u32).clamp(1, steps);
+        (steps - run) as usize
+    } else {
+        0
+    };
+    let sched = if cut == 0 {
+        full.clone()
+    } else {
+        FlowMatchEuler::from_sigmas(full.sigmas[cut..].to_vec(), full.train_steps)
+    };
+    let sigma0 = *sched.sigmas.first().unwrap_or(&1.0);
 
     // ---- guidance: a port, or a second lane pair --------------------------
     let guidance = input.guidance.unwrap_or(1.0);
@@ -591,6 +793,61 @@ async fn main(input: Input) -> Result<Output> {
     let uncond = match &negative {
         Some(text) if cfg => Some(encode_text(text, &roles.text.name).await?),
         _ => None,
+    };
+
+    // ---- the picture, encoded -------------------------------------------
+    //
+    // Before the loop, on a pipeline of its own that closes: the encode lane
+    // holds a seat and the denoise lanes need it back.
+    let pieced = input.image_pieces();
+    let init_bytes: Option<Vec<u8>> = match (&input.init_image, pieced.is_empty()) {
+        (Some(_), false) => {
+            return Err("pass `init_image` whole or as `init_image_<n>` pieces, not both".into());
+        }
+        (Some(b64), true) => Some(b64_decode(b64)?),
+        (None, false) => Some(b64_decode(&pieced)?),
+        (None, true) => None,
+    };
+    let init_latent: Option<Vec<f32>> = match &init_bytes {
+        None => None,
+        Some(bytes) => {
+            let reading = roles.encode.as_ref().ok_or_else(|| {
+                "this model declares no `vae.encode` reading, so it has no door a picture                  comes in through"
+                    .to_string()
+            })?;
+            let picture = inferlet::frames::Frames::decode(bytes)
+                .map_err(|why| format!("the init image does not decode: {why}"))?;
+            let (pw, ph) = (picture.width(), picture.height());
+            if pw != width || ph != height {
+                return Err(format!(
+                    "the init image is {pw}x{ph} and this run is {width}x{height}; resize it                      before handing it over — a guest has no resampler and a silent one                      would be the wrong one"
+                )
+                .into());
+            }
+            let pipe = Pipeline::new();
+            let clip = encode_from_frames(
+                reading,
+                &picture,
+                ph,
+                pw,
+                grid_h * space.patch_h.max(1),
+                grid_w * space.patch_w.max(1),
+                &pipe,
+            )
+            .await?;
+            pipe.close();
+            // The clip the encoder lands is `[h, w, C]`; the sampler steps
+            // `[rows, C.ph.pw]`, so it is patchified the way the trunk's own
+            // embed would.
+            Some(patchify(
+                &clip,
+                grid_h,
+                grid_w,
+                space.patch_h.max(1),
+                space.patch_w.max(1),
+                space.channels,
+            ))
+        }
     };
 
     // ---- the loop ---------------------------------------------------------
@@ -657,6 +914,12 @@ async fn main(input: Input) -> Result<Output> {
         let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
         let x = latent.clone();
         let readback = out.clone();
+        // IMG2IMG: the encoded picture, seeded once, read by every fire and
+        // used by fire 0. Its own channel per branch, since a seeded channel
+        // attaches to one pass (the runtime's channel-role rule).
+        let init = init_latent.as_ref().map(|rows| {
+            Channel::from_shaped(shape, rows.as_slice()).named(&format!("{tag}_init"))
+        });
         image_clock.drive(&image_lane.pass, move |k| {
             // On the CFG path BOTH branches step with the SAME combine, each
             // computed from its own side: the conditional lane reads
@@ -670,7 +933,16 @@ async fn main(input: Input) -> Result<Output> {
             } else {
                 intrinsics::velocity(velocity_width)
             };
-            seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback));
+            // Fire 0 either draws the latent from the keyed RNG, or —
+            // img2img — takes the encoded picture noised to the truncated
+            // schedule's first sigma. Every later fire is the same Euler
+            // step either way.
+            match &init {
+                None => seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback)),
+                Some(init) => {
+                    resume_or_step(k, &x, init, sigma0, &v, &dts, &rng, shape, Some(&readback))
+                }
+            }
         });
         branches.push(Branch {
             context: context_lane,

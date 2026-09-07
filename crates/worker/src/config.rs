@@ -553,6 +553,23 @@ pub struct ModelConfig {
     /// Omit it, as above; the default is derived from `max_patches`.
     #[serde(default)]
     pub max_images: Option<u32>,
+    /// The most PORT voxel rows one fire may carry on the third row axis
+    /// (design D8): the pixels a `vae.encode` reading takes in, the latents
+    /// a `vae.decode` reading takes in. Omit it and the shell derives a
+    /// ceiling from the loaded text — 65 536, which is the 256x256 picture
+    /// an encoder can swallow and no more, so a deployment that encodes a
+    /// 1024^2 picture (1 048 576 pixel voxels) or decodes a long clip has
+    /// to say so.
+    ///
+    /// It is a PORT count, not an output count: a decode of a 64x64 latent
+    /// lands a million pixels and is bounded by its 4 096 rows in, which is
+    /// why decoding at 1024^2 needs nothing stated and encoding does.
+    #[serde(default)]
+    pub max_voxels: Option<u32>,
+    /// The most clips one fire may carry, over every lane. Omit it and one
+    /// is derived from the lane ceiling.
+    #[serde(default)]
+    pub max_clips: Option<u32>,
     /// How many adapter seats this deployment intends to use, and which
     /// adapters to write into them at boot. Absent means zero seats.
     #[serde(default)]
@@ -676,6 +693,14 @@ impl ModelConfig {
     #[must_use]
     pub fn patch_ceilings(&self) -> (Option<u32>, Option<u32>) {
         (self.max_patches, self.max_images)
+    }
+
+    /// The THIRD row axis's two ceilings, in the same form. Both absent
+    /// derives a ladder from the loaded text when the plan states a voxel
+    /// axis.
+    #[must_use]
+    pub fn voxel_ceilings(&self) -> (Option<u32>, Option<u32>) {
+        (self.max_voxels, self.max_clips)
     }
 
     /// Resolve `[model] drafter` into `[model] sku` through the published

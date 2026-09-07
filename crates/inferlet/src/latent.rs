@@ -43,7 +43,7 @@ pub mod prelude {
     pub use super::{
         DenoiseLoop, FlowMatchEuler, LaneClock, LaneRows, apg, at, cfg_combine, dynamic_shift,
         encode_ids, encode_ids_rows, encode_text, euler_step, guided_velocity, noise,
-        positions_for, positions_grid, rng_state, seed_or_step,
+        positions_for, positions_grid, resume_or_step, rng_state, seed_or_step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -642,6 +642,55 @@ pub fn seed_or_step(
     let fresh = noise(shape, &state);
     let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
     let next = select(&first, &fresh, &stepped);
+    x.put(&next);
+    if let Some(out) = out {
+        out.put(&next);
+    }
+    rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+
+/// The img2img seed: the same loop body as [`seed_or_step`], except that
+/// fire 0 does not start from noise alone. It starts from a latent the
+/// guest already has — a picture run through the family's `vae.encode`
+/// reading — noised to `sigma0`, which for a rectified flow is
+/// `(1 - sigma0)*x0 + sigma0*eps`.
+///
+/// `init` is a SEEDED channel holding `x0` at the latent's own shape; the
+/// guest sets it once, before the first fire, and the loop never writes it.
+/// `sigma0` is the schedule's first sigma, so the caller's schedule must be
+/// the TRUNCATED one — `FlowMatchEuler::from_sigmas(sigmas[k0..])` — or the
+/// picture is noised to one sigma and integrated from another.
+///
+/// `sigma0 == 1.0` is exactly [`seed_or_step`]: the init washes out and the
+/// seed is the keyed draw. That is the identity a caller can check.
+pub fn resume_or_step(
+    k: &Tensor,
+    x: &Channel,
+    init: &Channel,
+    sigma0: f32,
+    velocity: &Tensor,
+    dts: &Channel,
+    rng: &Channel,
+    shape: [u32; 2],
+    out: Option<&Channel>,
+) {
+    let current = x.take();
+    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
+    let state = rng.take();
+    let eps = noise(shape, &state);
+    // `read`, not `take`: the init cell is the guest's own seed and every
+    // fire of the loop must be able to see it, though only fire 0 uses it.
+    let x0 = init.read();
+    // BROADCAST, not a bare `[1]` constant: `x0` and `eps` are
+    // `[rows, width]`, and a scalar tensor multiplied against a rectangle
+    // has to be spread over it the way `cfg_combine` spreads its scale.
+    // Without this the trace refuses and the lane never reaches the
+    // runtime, which reads downstream as a group that never composed.
+    let a = broadcast(Tensor::constant([1.0 - sigma0]), shape);
+    let b = broadcast(Tensor::constant([sigma0]), shape);
+    let noised = &(&x0 * &a) + &(&eps * &b);
+    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
+    let next = select(&first, &noised, &stepped);
     x.put(&next);
     if let Some(out) = out {
         out.put(&next);

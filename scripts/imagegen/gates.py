@@ -47,6 +47,7 @@ list, for a CI step that wants to read it.
 from __future__ import annotations
 
 import argparse
+import base64
 import glob
 import json
 import os
@@ -111,6 +112,7 @@ verbose = false
 [model]
 name = "gates-{name}"
 model = "{model}"
+{voxels}
 
 [engine]
 graphs = "{graphs}"
@@ -163,6 +165,11 @@ def write_config(ctx, gate) -> str:
         mem=spec.pop("mem", 0.90),
         rows=spec.pop("rows", 32768),
         timeout=spec.pop("timeout", "600s"),
+        # `[model] max_voxels`: the third row axis's PORT ceiling. Stated
+        # only by a gate that needs more than the derived 65 536 — a
+        # `vae.encode` of a 1024^2 picture takes 1 048 576 pixel voxels in.
+        voxels=("max_voxels = {}".format(spec.pop("voxels"))
+                if "voxels" in spec else ""),
     )
     assert not spec, f"{gate.name}: unknown config keys {sorted(spec)}"
     path = os.path.join(ctx.config_dir, f"config.gates-{gate.name}.toml")
@@ -430,13 +437,48 @@ def wan_video_readout(text: str) -> str:
 
 
 def t2i_readout(text: str) -> str:
-    png = re.search(r"\[gates\] picture: (\S+)", text)
+    """The picture, and — when the img2img steps ran — the two claims.
+
+    The pictures are compared HERE rather than in the guest because only
+    the harness sees all four of them. Both claims are identities, not
+    thresholds:
+
+      strength 1.0 noises the init all the way, so it must land the SAME
+      image as the run with no init at all — bit for bit, since the seed
+      and the schedule are the same and `(1 - 1)*x0 + 1*eps` is `eps`.
+
+      strength 0.4 must land NEARER the input than either of those, or the
+      encoded picture reached the sampler and changed nothing.
+    """
+    pngs = re.findall(r"\[gates\] picture: (\S+)", text)
     size = re.search(r"\[gates\] (\d+)x(\d+) PNG", text)
     bits = []
     if size:
         bits.append(f"{size.group(1)}x{size.group(2)} PNG")
-    if png:
-        bits.append(png.group(1))
+    named = {}
+    for path in pngs:
+        named[os.path.basename(os.path.dirname(path))] = path
+    if {"small", "i2i", "i2i-washed", "txt2img"} <= named.keys():
+        try:
+            import numpy as np
+            from PIL import Image
+
+            def px(p):
+                return np.asarray(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
+
+            init = px(named["small"])
+            near = float(np.abs(px(named["i2i"]) - init).mean())
+            washed = px(named["i2i-washed"])
+            plain = px(named["txt2img"])
+            same = bool(np.array_equal(washed, plain))
+            far = float(np.abs(plain - init).mean())
+            bits.append(f"i2i 0.4 is {near:.4f} from the input, txt2img {far:.4f} "
+                        f"({'pass' if near < far else 'FAIL'})")
+            bits.append(f"strength 1.0 IS txt2img ({'pass' if same else 'FAIL'})")
+        except Exception as why:  # noqa: BLE001 — a readout never fails the gate silently
+            bits.append(f"img2img claims unread: {why}")
+    if pngs:
+        bits.append(named.get("picture", pngs[0]))
     return "  ".join(bits) or "no picture"
 
 
@@ -472,6 +514,10 @@ def cargo_test(name):
     return build
 
 
+# Well under `MAX_ARG_STRLEN` (128 KiB), with room for the flag beside it.
+PIECE = 96 * 1024
+
+
 def t2v_step(prompt_ids, width, height, frames, steps, seed,
              negative_ids=None, guidance=None, out_name="clip"):
     def build(ctx, gate):
@@ -491,15 +537,21 @@ def t2v_step(prompt_ids, width, height, frames, steps, seed,
     return build
 
 
-def t2i_step(prompt, width, height, steps, seed):
+def t2i_step(prompt, width, height, steps, seed,
+             init_from=None, strength=None, out_name="picture"):
     def build(ctx, gate):
-        out = os.path.join(ctx.out, gate.name, "picture")
+        out = os.path.join(ctx.out, gate.name, out_name)
         os.makedirs(out, exist_ok=True)
-        return ([ctx.python, os.path.join(HERE, "gates.py"), "--text-to-image",
-                 "--config", ctx.configs[gate.name], "--out", out,
-                 "--pie", ctx.pie, "--prompt", prompt,
-                 "--width", str(width), "--height", str(height),
-                 "--steps", str(steps), "--seed", str(seed)], REPO)
+        argv = [ctx.python, os.path.join(HERE, "gates.py"), "--text-to-image",
+                "--config", ctx.configs[gate.name], "--out", out,
+                "--pie", ctx.pie, "--prompt", prompt,
+                "--width", str(width), "--height", str(height),
+                "--steps", str(steps), "--seed", str(seed)]
+        if init_from is not None:
+            # The picture an earlier step of this same gate wrote.
+            argv += ["--init-image", os.path.join(ctx.out, gate.name, init_from, "image.png"),
+                     "--strength", str(strength)]
+        return (argv, REPO)
     return build
 
 
@@ -762,14 +814,51 @@ def roster() -> list[Gate]:
         ),
         Gate(
             name="text-to-image",
-            wraps="the model-agnostic guest on flux2-klein-4b.zt, 4 steps at 1024^2",
-            expected="a real PNG",
+            wraps="the model-agnostic guest on flux2-klein-4b.zt, 4 steps at 1024^2, "
+                  "then the same picture back in through `vae.encode`",
+            expected="a real PNG; img2img at 0.4 lands nearer the input than txt2img, "
+                     "and at 1.0 IS txt2img",
+            note="img2img is the guest driving the family's `vae.encode` reading: the "
+                 "picture crosses as a `frames` handle (`frames.decode` in, "
+                 "`frames.to-channel` onto the pixel port) and never enters the "
+                 "guest's linear memory. Both claims are identities, so neither needs "
+                 "a golden.",
             needs=[(a("flux2-klein-4b.zt"),
                     f"{IMPORT} <FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
+            # No `voxels` here, and the reason is worth stating: the img2img
+            # steps encode at 256^2, which is 65 536 pixel voxels — exactly
+            # the derived ceiling. Raising it to a 1024^2 picture's
+            # 1 048 576 asks for a 343 GiB arena on this box, because a
+            # ladder is PROVISIONED and not merely capped. Encoding a large
+            # picture wants a tiled encode, which nothing has written.
             config=dict(port=8611, model=a("flux2-klein-4b.zt"), rows=32768, mem=0.90),
             steps=[("prompt -> picture",
-                    t2i_step("a red bicycle leaning on a blue wall", 1024, 1024, 4, 0))],
+                    t2i_step("a red bicycle leaning on a blue wall", 1024, 1024, 4, 0)),
+                   # IMG2IMG, twice. The picture the step above wrote goes
+                   # back in through `vae.encode`, is noised to the strength
+                   # point and integrated from there. `strength = 1.0` noises
+                   # it all the way, which washes the picture out entirely —
+                   # so that run must land the SAME image as the one with no
+                   # init at all, and the 0.4 run must land nearer the input
+                   # than either. Two claims that cannot both hold by
+                   # accident, and neither needs a golden.
+                   # The img2img trio runs at 256^2 — 65 536 pixel voxels,
+                   # exactly what a `vae.encode` port carries at the derived
+                   # ceiling. All three share a size so the readout can
+                   # compare them pixel for pixel.
+                   ("a 256^2 picture to start from",
+                    t2i_step("a red bicycle leaning on a blue wall", 256, 256, 4, 0,
+                             out_name="small")),
+                   ("that picture back in at 0.4",
+                    t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
+                             init_from="small", strength=0.4, out_name="i2i")),
+                   ("and at 1.0, which is no init at all",
+                    t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
+                             init_from="small", strength=1.0, out_name="i2i-washed")),
+                   ("the same prompt with no init",
+                    t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
+                             out_name="txt2img"))],
             readout=t2i_readout,
             timeout=3600,
         ),
@@ -811,6 +900,30 @@ def text_to_image(args) -> int:
            "--prompt", args.prompt, "--width", str(args.width),
            "--height", str(args.height), "--steps", str(args.steps),
            "--seed", str(args.seed), "--out", "image"]
+    # IMG2IMG: the picture goes as base64 in PIECES. One argv argument is
+    # capped at `MAX_ARG_STRLEN` (128 KiB on Linux) and an encoded still is
+    # bigger, so it is split the way a parity case is. The sandbox scratch is
+    # not a door for this: it is mounted per PROCESS and removed at teardown,
+    # so nothing outside can place a file there.
+    if args.init_image:
+        # Re-encoded to JPEG first: a 1024^2 PNG is 2.3 MB, and base64 of it
+        # is past `ARG_MAX` (2 MiB TOTAL, whatever the per-argument cap).
+        # The guest sniffs the format, so the transport is the harness's to
+        # pick; JPEG at 92 is a third of the bytes and visually transparent,
+        # and an init image is a STARTING POINT, not a reference the output
+        # is scored against.
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.open(args.init_image).convert("RGB").save(buf, "JPEG", quality=92)
+        text = base64.b64encode(buf.getvalue()).decode("ascii")
+        n = max(1, -(-len(text) // PIECE))
+        step = -(-len(text) // n)
+        for i in range(n):
+            cmd += [f"--init_image_{i}", text[i * step:(i + 1) * step]]
+        cmd += ["--strength", str(args.strength)]
     print("$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     sys.stdout.write(done.stdout)
@@ -1029,6 +1142,8 @@ def main() -> int:
     ap.add_argument("--prompt", default="", help=argparse.SUPPRESS)
     ap.add_argument("--prompt-ids", default="", help=argparse.SUPPRESS)
     ap.add_argument("--negative-ids", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--init-image", dest="init_image", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--strength", type=float, default=0.6, help=argparse.SUPPRESS)
     ap.add_argument("--guidance", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--width", type=int, default=1024, help=argparse.SUPPRESS)
     ap.add_argument("--height", type=int, default=1024, help=argparse.SUPPRESS)

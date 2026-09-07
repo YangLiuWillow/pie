@@ -115,6 +115,35 @@ impl Frames {
         }
     }
 
+    /// **THE WAY IN**: an encoded still becomes a one-frame handle, extent
+    /// and all read off the picture. The pair to [`Frames::encode`], and
+    /// what lets a guest hand a picture to a `vae.encode` reading.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let (rgb, width, height) = still::decode(bytes)?;
+        Ok(Frames {
+            store: FrameStore::Host(rgb),
+            width,
+            height,
+            // A still is one frame at no rate, the same shape `from-rgb8`
+            // gives a caller who states `count = 1, fps = 0`.
+            count: 1,
+            fps: 0.0,
+        })
+    }
+
+    /// These pixels as the f32 plane a `pixels` port reads: `[-1, 1]`, one
+    /// row per voxel in `(t, h, w)` order with `w` fastest. Exactly undoes
+    /// [`Frames::from_pixels`]'s `(x + 1) / 2`, so a handle that made the
+    /// round trip through a channel comes back to the bytes it started as
+    /// (up to the 8-bit quantisation the store holds).
+    pub fn to_pixels(&self) -> Result<Vec<f32>, String> {
+        Ok(self
+            .rgb8()?
+            .iter()
+            .map(|b| f32::from(*b) / 255.0 * 2.0 - 1.0)
+            .collect())
+    }
+
     /// Build a handle from raw interleaved RGB8, checking the one invariant
     /// every encoder below depends on.
     pub fn from_rgb8(
@@ -360,6 +389,44 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
             Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
             Err(e) => Ok(Err(e)),
         }
+    }
+
+    /// The way in, sniffed: PNG / JPEG / GIF / WebP to a one-frame handle.
+    async fn decode(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Frames>, String>> {
+        match Frames::decode(&bytes) {
+            Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
+            Err(why) => Ok(Err(why)),
+        }
+    }
+
+    /// The VAE road run backwards: these pixels into `ch`'s cell as the f32
+    /// plane a pixel port reads, without the bytes entering linear memory.
+    /// The put is `channel.set`'s, so the cell is SEEDED and the channel
+    /// must be one a pass binds as an input.
+    async fn to_channel(
+        &mut self,
+        this: Resource<Frames>,
+        ch: Resource<super::forward::Channel>,
+    ) -> Result<Result<(), String>> {
+        let values = match self.ctx().table.get(&this)?.to_pixels() {
+            Ok(values) => values,
+            Err(why) => return Ok(Err(why)),
+        };
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        // `put`, not `set`: a picture handed to a `vae.encode` port has to be
+        // there for the FIRST fire, and `set` rewrites a cell already in the
+        // ring — a channel has no ring until a fire has run. `put` before the
+        // first fire is the seed.
+        let cell = self.ctx().table.get(&ch)?.cell.clone();
+        let result = cell
+            .lock()
+            .unwrap()
+            .put_ref(&bytes)
+            .map_err(|error| format!("frames.to-channel: {error}"));
+        Ok(result)
     }
 
     async fn width(&mut self, this: Resource<Frames>) -> Result<u32> {

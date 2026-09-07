@@ -837,6 +837,8 @@ fn create_engine_group(
                 m.residency(),
                 // [model] max_patches / max_images; both absent derives from the model text.
                 m.patch_ceilings(),
+                // [model] max_voxels / max_clips, the third axis's pair.
+                m.voxel_ceilings(),
                 // [model] sku, or None to auto-identify one.
                 m.sku.as_deref(),
             )
@@ -872,6 +874,7 @@ fn create_engine_group(
         &m.adapters,
         m.residency(),
         m.patch_ceilings(),
+        m.voxel_ceilings(),
         m.sku.as_deref(),
     )
     .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))

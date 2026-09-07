@@ -32,6 +32,28 @@ pub fn jpeg(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// **THE WAY IN**: any still format the `image` crate reads, to 8-bit RGB
+/// and its extent. The format is SNIFFED from the bytes, not stated — a
+/// caller holding a file holds its magic too, and a stated format that
+/// disagreed with the bytes would be a second thing to get wrong.
+///
+/// The encoders above are the way out; this is the pair to them, and it is
+/// what lets a guest hand a picture to a `vae.encode` reading (img2img,
+/// inpainting, a reference lane) rather than only take one out.
+///
+/// Refuses by name, with the byte count, rather than returning an empty
+/// frame: a picture that did not decode is not a black picture.
+pub fn decode(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| format!("still decode failed on {} bytes: {e}", bytes.len()))?;
+    let rgb = img.to_rgb8();
+    let (width, height) = (rgb.width(), rgb.height());
+    if width == 0 || height == 0 {
+        return Err(format!("the decoded picture is {width}x{height}"));
+    }
+    Ok((rgb.into_raw(), width, height))
+}
+
 /// Lossless WebP (VP8L). `image`'s encoder has no lossy path; a caller who
 /// wanted "small" wants [`jpeg`].
 pub fn webp(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
@@ -45,6 +67,28 @@ pub fn webp(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PNG is lossless, so what goes in comes out — bytes, extent and all.
+    /// A gradient is the input for the reason stated below: a flat fill
+    /// survives a transposed or mis-strided codec on either side.
+    #[test]
+    fn a_png_decodes_back_to_the_pixels_it_encoded() {
+        let (w, h) = (7u32, 5u32);
+        let rgb = gradient(w, h);
+        let bytes = png(&rgb, w, h).expect("a gradient encodes");
+        let (back, dw, dh) = decode(&bytes).expect("its own png decodes");
+        assert_eq!((dw, dh), (w, h), "the extent survives the round trip");
+        assert_eq!(back, rgb, "and so does every byte");
+    }
+
+    /// A decoded picture is not a black one: bytes that are not an image
+    /// must be refused, and the refusal must say how many there were.
+    #[test]
+    fn bytes_that_are_no_picture_are_refused_by_name() {
+        let why = decode(b"not a picture, just some bytes").expect_err("no magic");
+        assert!(why.contains("still decode failed"), "{why}");
+        assert!(why.contains("30 bytes"), "the refusal counts them: {why}");
+    }
 
     /// A gradient rather than a flat fill: a flat fill survives a transposed
     /// or mis-strided encoder, and a gradient does not.

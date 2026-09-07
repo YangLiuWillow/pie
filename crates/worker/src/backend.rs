@@ -110,6 +110,7 @@ fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
     adapter_seats: u32,
     patch_ceilings: (Option<u32>, Option<u32>),
+    voxel_ceilings: (Option<u32>, Option<u32>),
 ) -> engine::Budgets {
     let page_size = opts.kv_page_size.unwrap_or(16).max(1);
     // `max_model_len` when stated (a zero means unstated); else the
@@ -140,8 +141,12 @@ fn cuda_budgets(
         // Both absent: the shell derives a ladder from the loaded text.
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
-        max_voxels: None,
-        max_clips: None,
+        // And the third axis's pair, which used to be unsettable: the knob
+        // was on `Budgets` and nothing could turn it, so every deployment
+        // took the derived 65 536 and a `vae.encode` of a 1024^2 picture
+        // (1 048 576 pixel voxels) was refused with no way to say otherwise.
+        max_voxels: voxel_ceilings.0,
+        max_clips: voxel_ceilings.1,
     }
 }
 
@@ -357,6 +362,8 @@ pub(crate) fn create_engine_backend_group(
     residency: engine::Residency,
     // `[model] max_patches` / `[model] max_images`, or both `None` to derive them.
     patch_ceilings: (Option<u32>, Option<u32>),
+    // `[model] max_voxels` / `[model] max_clips`, the same way.
+    voxel_ceilings: (Option<u32>, Option<u32>),
     // `[model] sku`, or `None` to identify one — see `land`.
     sku: Option<&str>,
 ) -> Result<GroupEngine> {
@@ -424,7 +431,7 @@ pub(crate) fn create_engine_backend_group(
     let loaded = land(
         &mut backend,
         snapshot_dir,
-        cuda_budgets(opts, adapters.seats(), patch_ceilings),
+        cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
         residency,
         model_ir::Platform::Cuda,
         component,
@@ -467,6 +474,8 @@ pub(crate) fn create_engine_backend(
     residency: engine::Residency,
     // `[model] max_patches` / `[model] max_images`, or both `None` to derive them.
     patch_ceilings: (Option<u32>, Option<u32>),
+    // `[model] max_voxels` / `[model] max_clips`, the same way.
+    voxel_ceilings: (Option<u32>, Option<u32>),
     // `[model] sku`, or `None` to identify one — see `land`.
     sku: Option<&str>,
 ) -> Result<GroupEngine> {
@@ -496,7 +505,7 @@ pub(crate) fn create_engine_backend(
             let backend = runtime::engine::backend::open::cuda(boot)?;
             (
                 backend,
-                cuda_budgets(opts, adapters.seats(), patch_ceilings),
+                cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
                 model_ir::Platform::Cuda,
             )
         }
@@ -700,6 +709,27 @@ pub(crate) fn create_engine_backend(
 mod tests {
     use super::*;
 
+    /// **THE THIRD AXIS'S CEILINGS REACH THE ENGINE.** Both were hard-coded
+    /// `None` here, so `Budgets::max_voxels` and `max_clips` were knobs
+    /// nothing could turn: every deployment took the shell's derived
+    /// ceiling and a `vae.encode` of a picture larger than it was refused
+    /// with no way to say otherwise.
+    #[test]
+    fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {
+        let opts = CudaNativeEngineOptions::default();
+        let derived = cuda_budgets(&opts, 0, (None, None), (None, None));
+        assert_eq!(derived.max_voxels, None, "unstated derives a ladder");
+        assert_eq!(derived.max_clips, None);
+
+        let stated = cuda_budgets(&opts, 0, (None, None), (Some(65_536), Some(4)));
+        assert_eq!(
+            stated.max_voxels,
+            Some(65_536),
+            "`[model] max_voxels` is the port ceiling the engine cuts against"
+        );
+        assert_eq!(stated.max_clips, Some(4));
+    }
+
     /// The seat count is `max_state_slots`, not the page pool.
     #[test]
     fn the_pool_budget_seats_by_state_slots_not_pages() {
@@ -708,21 +738,21 @@ mod tests {
             max_total_pages: Some(1024),
             ..Default::default()
         };
-        let budgets = cuda_budgets(&opts, 0, (None, None));
+        let budgets = cuda_budgets(&opts, 0, (None, None), (None, None));
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
         // No seat count stated: the contract's own default, whatever the pool.
         assert_eq!(budgets.slots, 256);
         assert_eq!(budgets.pages, 1024);
         opts.max_total_pages = None;
-        assert_eq!(cuda_budgets(&opts, 0, (None, None)).pages, 65536);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).pages, 65536);
 
         opts.max_state_slots = Some(4);
-        assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 4);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);
 
         // Zero still seats one.
         opts.max_state_slots = Some(0);
-        assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 1);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 1);
     }
 
     /// What an engine may be handed: an artifact, or a snapshot directory.
