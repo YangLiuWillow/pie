@@ -256,27 +256,28 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
         // The five ggml K-quants: `kernels_cuda::linear::kquant`,
-        // `kernels_vulkan::linear::kquant` and `kernels_wgpu::linear::kquant`
-        // all read the super-block row as one byte plane, decoding inside
-        // the dot. Not the 32-element blocks (q4_0/q4_1/q5_0/q5_1/q8_0,
-        // gguf mxfp4), whose CUDA point reads a leaf-per-plane operand
-        // instead, and not the IQ lattices, which no backend signs.
+        // `kernels_vulkan::linear::kquant`, `kernels_wgpu::linear::kquant`
+        // and `kernels_metal::linear::kquant` all read the super-block row
+        // as one byte plane, decoding inside the dot. Not the 32-element
+        // blocks (q4_0/q4_1/q5_0/q5_1/q8_0, gguf mxfp4), whose point reads
+        // a leaf-per-plane operand instead, and not the IQ lattices, which
+        // no backend signs.
         //
         // Reading them as stored is what keeps a GGUF the size it was: the
         // alternative is decoding to the activation dtype at import, which
         // inflates a K-quant checkpoint four- to eightfold.
-        BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Wgpu => matches!(
-            scheme,
-            QuantScheme::GgufQ2K
-                | QuantScheme::GgufQ3K
-                | QuantScheme::GgufQ4K
-                | QuantScheme::GgufQ5K
-                | QuantScheme::GgufQ6K
-        ),
-        // Metal has no stored-block point and decodes to the activation
-        // dtype before the dot. `Unknown` never reaches here (the host arm
-        // above returns first).
-        BackendKind::Metal | BackendKind::Unknown => false,
+        BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Wgpu | BackendKind::Metal => {
+            matches!(
+                scheme,
+                QuantScheme::GgufQ2K
+                    | QuantScheme::GgufQ3K
+                    | QuantScheme::GgufQ4K
+                    | QuantScheme::GgufQ5K
+                    | QuantScheme::GgufQ6K
+            )
+        }
+        // `Unknown` never reaches here (the host arm above returns first).
+        BackendKind::Unknown => false,
     }
 }
 
@@ -461,7 +462,8 @@ mod tests {
     use crate::types::{BackendKind, QuantScheme};
 
     /// The five K-quants carry their scales inside the payload, so a backend
-    /// either has a stored-block point or the plan must decode them. Three do.
+    /// either has a stored-block point or the plan must decode them. Cuda,
+    /// Vulkan, Wgpu and now Metal (`kernels_metal::linear::kquant`) all do.
     #[test]
     fn the_k_quants_bind_on_every_backend_with_a_stored_block_point() {
         let k_quants = [
@@ -472,16 +474,17 @@ mod tests {
             QuantScheme::GgufQ6K,
         ];
         for scheme in k_quants {
-            for backend in [BackendKind::Cuda, BackendKind::Vulkan, BackendKind::Wgpu] {
+            for backend in [
+                BackendKind::Cuda,
+                BackendKind::Vulkan,
+                BackendKind::Wgpu,
+                BackendKind::Metal,
+            ] {
                 assert!(
                     binds_block(backend, scheme),
                     "{backend:?} has a {scheme:?} point and should bind it as stored"
                 );
             }
-            assert!(
-                !binds_block(BackendKind::Metal, scheme),
-                "Metal has no stored-block point and must decode {scheme:?}"
-            );
         }
     }
 

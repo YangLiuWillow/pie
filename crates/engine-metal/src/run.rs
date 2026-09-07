@@ -762,6 +762,44 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// A weight seated as one stored quantization block, re-badged as the byte
+    /// rectangle `kernels_metal::linear::kquant` reads — `Some` for a
+    /// [`WeightRow::Dense`] whose declared dtype is a ggml K-quant super-block,
+    /// `None` for a plain dense weight or a split-plane bank. Returns `U8`:
+    /// `rows` weight rows of `width` bytes. Mirrors `engine_cuda::Run::maybe_stored`.
+    pub(crate) fn maybe_stored(&self, id: ValueId) -> Option<Tensor> {
+        let at = id.0 as usize;
+        let Def::Weight(w) = &self.values[at].def else {
+            return None;
+        };
+        let Some(WeightRow::Dense(handle)) = self.weights.0.get(*w as usize).copied().flatten()
+        else {
+            return None;
+        };
+        // A stored super-block carries its scales inside one plane. The affine
+        // families are not here — their factors ride companion planes and
+        // resolve through `banked` instead.
+        if !matches!(
+            handle.dtype,
+            model_ir::Dtype::U2g16k
+                | model_ir::Dtype::I3g16k
+                | model_ir::Dtype::U4g32k
+                | model_ir::Dtype::U5g32k
+                | model_ir::Dtype::I6g16k
+        ) {
+            return None;
+        }
+        // A weight's leading dim is `Dim::Const`, so `cut` hands the rectangle
+        // back whole; the re-badge to `U8` is what the decode-in-dot entry reads.
+        let seated = self.cut(id, handle);
+        Some(Tensor::new(
+            seated.buf,
+            seated.rows,
+            seated.width,
+            model_ir::Dtype::U8,
+        ))
+    }
+
     /// How many experts the router that wrote `routes` declared; resolved once at load into a
     /// table indexed by `routes`. `0` if no router in this artifact wrote it.
     pub(crate) fn experts(&self, routes: ValueId) -> u32 {

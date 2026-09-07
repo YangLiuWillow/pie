@@ -33,12 +33,22 @@ impl Run<'_> {
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
-                None => linear::gemm::matmul(
-                    self.ctx(),
-                    self.tensor(*act),
-                    self.tensor(*w),
-                    self.tensor(*y),
-                ),
+                // Not a split-plane bank: a stored K-quant super-block decodes
+                // in-dot via `kquant`; a plain dense weight takes the gemm road.
+                None => match self.maybe_stored(*w) {
+                    Some(block) => linear::kquant::matmul(
+                        self.ctx(),
+                        self.tensor(*act),
+                        block,
+                        self.tensor(*y),
+                    ),
+                    None => linear::gemm::matmul(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*y),
+                    ),
+                },
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
@@ -52,12 +62,22 @@ impl Run<'_> {
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
-                None => linear::gemm::lm_head(
-                    self.ctx(),
-                    self.tensor(*act),
-                    self.tensor(*w),
-                    self.tensor(*y),
-                ),
+                // The head's own stored-block arm: a Q4_K_M mix stores
+                // `output.weight` at q6_k, so the head is a busy consumer here.
+                None => match self.maybe_stored(*w) {
+                    Some(block) => linear::kquant::lm_head(
+                        self.ctx(),
+                        self.tensor(*act),
+                        block,
+                        self.tensor(*y),
+                    ),
+                    None => linear::gemm::lm_head(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*y),
+                    ),
+                },
             },
 
             // The absorbed `mlp` family, calling into kernels_metal::linear::mlp.
