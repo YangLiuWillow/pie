@@ -388,11 +388,15 @@ __global__ void split_qkv(
     i32 q_dim, i32 kv_dim,
     const u32* __restrict__ win)
 {
-    const int n = static_cast<int>(blockIdx.y);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): the rows ride
-    // `blockIdx.y` here, and a replay carved at a bucket retires its padded
-    // ones off the LIVE-ROWS word the fire staged — one word, not
-    // `split_qkv_devwin`'s `(start, count)` pair below.
+    // ROWS RIDE `blockIdx.x`. They used to ride `y`, which caps at 65535 and
+    // silently truncated any fire taller than that; `split_rows` was moved
+    // for the same reason and this one was not. The width tiles took `y`
+    // instead, and a width needs far fewer blocks than a video fire needs
+    // rows.
+    const int n = static_cast<int>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay carved at a
+    // bucket retires its padded rows off the LIVE-ROWS word the fire staged
+    // — one word, not `split_qkv_devwin`'s `(start, count)` pair below.
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     // And `win[1]` is where those live rows START: `src` and the three
     // destinations are row planes handed at their base and move together.
@@ -401,18 +405,18 @@ __global__ void split_qkv(
     const int stride = q_dim + 2 * kv_dim;
     const T* src_row = src + static_cast<long long>(row) * stride;
 
-    for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < q_dim;
-         j += static_cast<int>(blockDim.x * gridDim.x)) {
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < q_dim;
+         j += static_cast<int>(blockDim.x * gridDim.y)) {
         q_out[static_cast<long long>(row) * q_dim + j] = src_row[j];
     }
 
-    for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < kv_dim;
-         j += static_cast<int>(blockDim.x * gridDim.x)) {
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
+         j += static_cast<int>(blockDim.x * gridDim.y)) {
         k_out[static_cast<long long>(row) * kv_dim + j] = src_row[q_dim + j];
     }
 
-    for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < kv_dim;
-         j += static_cast<int>(blockDim.x * gridDim.x)) {
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
+         j += static_cast<int>(blockDim.x * gridDim.y)) {
         v_out[static_cast<long long>(row) * kv_dim + j] = src_row[q_dim + kv_dim + j];
     }
 }
@@ -426,7 +430,8 @@ __global__ void split_qkv_devwin(
     const u32* __restrict__ devwin,
     i32 q_dim, i32 kv_dim)
 {
-    const int n = static_cast<int>(blockIdx.y);
+    // Rows on `blockIdx.x`, as in `split_qkv` above and for its reason.
+    const int n = static_cast<int>(blockIdx.x);
     // `devwin` is the pre-staged device window pair, `(start, count)`:
     // word 0 is a START. The staged-geometry seat's `win` is `(count,
     // start)` — same pointer shape, opposite word order, and the rename
@@ -436,16 +441,16 @@ __global__ void split_qkv_devwin(
     if (n < w0 || n >= w0 + w1) return;
     const int stride = q_dim + 2 * kv_dim;
     const T* src_row = src + static_cast<long long>(n) * stride;
-    for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < q_dim;
-         j += static_cast<int>(blockDim.x * gridDim.x)) {
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < q_dim;
+         j += static_cast<int>(blockDim.x * gridDim.y)) {
         q_out[static_cast<long long>(n) * q_dim + j] = src_row[j];
     }
-    for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < kv_dim;
-         j += static_cast<int>(blockDim.x * gridDim.x)) {
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
+         j += static_cast<int>(blockDim.x * gridDim.y)) {
         k_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + j];
     }
-    for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < kv_dim;
-         j += static_cast<int>(blockDim.x * gridDim.x)) {
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
+         j += static_cast<int>(blockDim.x * gridDim.y)) {
         v_out[static_cast<long long>(n) * kv_dim + j] =
             src_row[q_dim + kv_dim + j];
     }

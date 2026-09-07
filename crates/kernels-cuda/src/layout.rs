@@ -356,8 +356,11 @@ pub fn split_qkv(
     let width = q.width.max(k.width);
     ctx.fire(
         OP,
+        // Rows on `grid.x`, width tiles on `grid.y`: `y` caps at 65535 and a
+        // video fire is taller than that (`split_rows` was moved for this
+        // reason and this one was not).
         Fire::at(FILE, "::pie::layout::split_qkv<::pie::bf16>").apply(Launch::grid(
-            [width.div_ceil(BLOCK), q.rows, 1],
+            [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
         &[
