@@ -65,6 +65,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("layout/ple_combine.metal", include_str!(concat!(source_root!(), "/layout/ple_combine.metal"))),
     ("layout/row_gather.metal", include_str!(concat!(source_root!(), "/layout/row_gather.metal"))),
     ("linear/gemm_dense.metal", include_str!(concat!(source_root!(), "/linear/gemm_dense.metal"))),
+    ("linear/kquant.metal", include_str!(concat!(source_root!(), "/linear/kquant.metal"))),
     ("linear/lora.metal", include_str!(concat!(source_root!(), "/linear/lora.metal"))),
     ("linear/mlp_gated.metal", include_str!(concat!(source_root!(), "/linear/mlp_gated.metal"))),
     ("linear/mlp_packed.metal", include_str!(concat!(source_root!(), "/linear/mlp_packed.metal"))),
