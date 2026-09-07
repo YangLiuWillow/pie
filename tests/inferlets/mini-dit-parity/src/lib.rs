@@ -5,9 +5,17 @@
 //! predicts, as JSON `scripts/imagegen/mini_dit_parity.py` turns into an
 //! `.npz` under the golden's own key names.
 //!
-//! Two modes: one step against `mini_dit_dump_bf16.npz`'s `velocity`, and
-//! the four-step Euler schedule against `mini_dit_euler_bf16.npz`'s
+//! Two parity modes: one step against `mini_dit_dump_bf16.npz`'s `velocity`,
+//! and the four-step Euler schedule against `mini_dit_euler_bf16.npz`'s
 //! `euler.v{0..3}` / `euler.x{1..4}`.
+//!
+//! And two modes that need no golden because every claim they make is
+//! WITHIN one fire's own answers: `--cfg` (classifier-free guidance on the
+//! device, six lanes and two groups in one fire — `prototype.md` §1.1) and
+//! `--cache` (step caching on the device, the whole Euler schedule as fires
+//! with the cache decision carried in a channel from one fire to the next —
+//! `.wiki/imagegen/conditional-fire.md`). Their harnesses are
+//! `mini_dit_parity.py guidance` and `mini_dit_cache.py`.
 //!
 //! # THREE LANES, ONE GROUP, ONE FIRE
 //!
@@ -90,6 +98,25 @@ struct Input {
     /// identity on the conditional branch.
     #[serde(default)]
     cfg_scale: Option<f32>,
+    /// STEP CACHING, ON THE DEVICE (`.wiki/imagegen/conditional-fire.md`).
+    /// Runs the whole Euler loop on the device — one fire per step, nothing
+    /// per step across the host — with the cache decision and the reuse in
+    /// the image lane's epilogue. `cache_threshold` absent is the PLAIN
+    /// loop (no cache ops in the trace at all), which is the trajectory
+    /// every cached run is compared against.
+    #[serde(default)]
+    cache: bool,
+    /// The relative-change threshold a step must fall under to be skipped.
+    /// Absent means "no cache path" — the baseline, not "threshold 0".
+    #[serde(default)]
+    cache_threshold: Option<f32>,
+    /// How many Euler steps (fires are `steps + 1`; fire 0 seeds).
+    #[serde(default)]
+    cache_steps: Option<u32>,
+    /// The keyed-RNG seed the device draw starts from, so the baseline and
+    /// every cached run start from the same latent.
+    #[serde(default)]
+    cache_seed: Option<u32>,
 }
 
 /// One batch element of the reference's fixed inputs, flattened row-major.
@@ -159,6 +186,26 @@ struct Output {
     cfg_uncond: Vec<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cfg_scale: Option<f32>,
+    /// `--cache`: the latent after every fire, fire 0 (the seed) first.
+    /// `[fires][rows * patch_features]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_x: Vec<Vec<f32>>,
+    /// `--cache`: per fire, the relative change the epilogue measured —
+    /// the metric it decides the NEXT fire on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_rel: Vec<f32>,
+    /// `--cache`: per fire, 1.0 if THIS fire reused the cached velocity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_did: Vec<f32>,
+    /// `--cache`: the running skip count the DEVICE kept, after every fire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_count: Vec<f32>,
+    /// `--cache`: fire `k`'s Euler `dt` (0 on the seed fire), so the host can
+    /// recover each step's used velocity from the trajectory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_dts: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_rows: Option<u32>,
 }
 
 /// The port names this family's `denoise` reading declares. Read off
@@ -361,6 +408,221 @@ async fn guided_step(
     Ok((guided, Vec::new(), uncond))
 }
 
+/// **STEP CACHING, ON THE DEVICE** — the proof of
+/// `.wiki/imagegen/conditional-fire.md` §9.
+///
+/// The whole Euler loop runs on the device: `steps + 1` fires down three
+/// pipelines, and nothing per step crosses the host except the readback the
+/// harness wants. What is new is five lines inside the image lane's epilogue:
+///
+/// ```text
+/// skip_now = skip.take()                       // decided by the LAST fire
+/// v_use    = select(skip_now, cache, velocity())
+/// x        = x + dt(k) * v_use                 // the step, unchanged
+/// cache.put(v_use)                             // the cache holds what was USED
+/// skip.put(and(k >= 1, rel(v_use, cache) < threshold))   // decided FOR the NEXT fire
+/// ```
+///
+/// **The decision is made a fire early on purpose.** A predicate that is to
+/// gate a fire has to be written before that fire is armed, so it is computed
+/// in the previous fire's epilogue and carried in a channel. That channel is
+/// exactly the artifact a conditional fire would fan out into a per-lane byte
+/// plane and a `graph::set_conditional_byte` would read (design §6.2/§6.3) —
+/// so **this guest does not change when the engine half lands**.
+///
+/// **The cache is a CHANNEL, never the velocity plane.** A skipped fire's
+/// plane holds whatever the last fire left there, at row offsets that belong
+/// to whichever lanes that fire seated — the stale-rectangle failure
+/// `graph/conditional.cuh` already paid for once. Reading `velocity()` and
+/// then discarding it under `select` is what makes the arithmetic independent
+/// of whether the trunk actually ran.
+///
+/// `threshold` absent installs no cache ops at all: the plain device loop,
+/// which is the trajectory a cached run is compared against bit for bit.
+async fn cached_loop(
+    case: &Case,
+    ports: &Ports,
+    reading: &str,
+    steps: u32,
+    seed: u32,
+    threshold: Option<f32>,
+) -> Result<(Vec<Vec<f32>>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let rows = case.image_rows;
+    let feats = case.patch_features;
+    let width = ports.velocity_width;
+    if width != feats {
+        return Err(format!(
+            "the cached loop integrates the latent it predicts: the model reads a {width}-wide \
+             velocity and the case carries {feats}-wide patch rows"
+        )
+        .into());
+    }
+    let shape = [rows, feats];
+    let cells = (rows * feats) as usize;
+
+    let sched = match model::schedule() {
+        Some(fact) => FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?,
+        None if !case.sigmas.is_empty() => {
+            FlowMatchEuler::from_sigmas(case.sigmas.clone(), case.t_scale.max(1.0) as u32)
+        }
+        None => return Err("this model states no schedule; nothing here denoises".into()),
+    };
+    let mut loops = DenoiseLoop::new(&sched);
+    // Lane order is submit order: caption, context, image.
+    let caption_clock = loops.lane("cache_txt");
+    let _context_clock = loops.lane("cache_ctx");
+    let image_clock = loops.lane("cache_img");
+    let dts = loops.dts("cache_img");
+    let fires = loops.fires();
+
+    // The caption lane. It modulates, so it carries a timestep of its own —
+    // one seeded cell per pass is the channel-role rule — and therefore its
+    // own clock, whose epilogue body does nothing but advance it.
+    let caption = ForwardPass::new();
+    caption.reading(reading)?;
+    caption.stream(LaneStream::Text)?;
+    caption.group(0)?;
+    let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
+        .named("cache_text");
+    let txt_pos =
+        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
+            .named("cache_txt_pos");
+    caption.input(&ports.text, &txt)?;
+    caption.input(&ports.positions, &txt_pos)?;
+    caption.input(&ports.timestep, &caption_clock.timestep)?;
+
+    // The context lane: block 2's cross-attention keys. No timestep, no
+    // positions, no epilogue — nothing about it advances.
+    let context = ForwardPass::new();
+    context.reading(reading)?;
+    context.stream(LaneStream::Context)?;
+    context.group(0)?;
+    let ctx = Channel::from_shaped(
+        [case.context_rows, case.context_width],
+        case.context.as_slice(),
+    )
+    .named("cache_ctx_rows");
+    context.input(&ports.context, &ctx)?;
+
+    // The image lane. `x` is bound as the latents port AND loop-carried by
+    // the epilogue: the port feed reads the committed cell, the epilogue
+    // takes it and puts the next one.
+    let image = ForwardPass::new();
+    image.reading(reading)?;
+    image.stream(LaneStream::Image)?;
+    image.group(0)?;
+    let x = Channel::from_shaped(shape, vec![0f32; cells]).named("cache_latents");
+    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+        .named("cache_img_pos");
+    image.input(&ports.latents, &x)?;
+    image.input(&ports.positions, &img_pos)?;
+    image.input(&ports.timestep, &image_clock.timestep)?;
+
+    let rng = Channel::from(rng_state(seed)).named("cache_rng");
+    let out = Channel::new(shape, dtype::f32)
+        .capacity(channel_capacity() as u32)
+        .named("cache_out");
+    // `[rel this fire, did this fire skip, the device's running skip count]`.
+    // One channel rather than three: a probe is one row of three numbers.
+    // `new`, not `from`: a seeded channel is USED at construction and
+    // `.capacity()` must come first.
+    let probe = Channel::new([3u32], dtype::f32)
+        .capacity(channel_capacity() as u32)
+        .named("cache_probe");
+
+    caption_clock.drive(&caption, |_| {});
+
+    match threshold {
+        // ── THE CACHED LOOP ────────────────────────────────────────────────
+        Some(thr) => {
+            let cache = Channel::from_shaped(shape, vec![0f32; cells]).named("cache_velocity");
+            let skip = Channel::from([0f32]).named("cache_skip");
+            let count = Channel::from([0f32]).named("cache_count");
+            image_clock.drive(&image, move |k| {
+                let v_now = intrinsics::velocity(width);
+                let v_prev = cache.take();
+                // The flag THIS fire acts on was written by the last one.
+                let skipping = gt(&skip.take(), 0.5f32);
+                let take_cache = broadcast(reshape(&skipping, [1, 1]), shape);
+                let v_use = select(&take_cache, &v_prev, &v_now);
+
+                // `seed_or_step`'s arithmetic, unchanged, over `v_use`.
+                let current = x.take();
+                let stepped = euler_step(&current, &v_use, &at(&dts.read(), k));
+                let state = rng.take();
+                let fresh = noise(shape, &state);
+                let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
+                let next = select(&first, &fresh, &stepped);
+                x.put(&next);
+                out.put(&next);
+                rng.put(&state + &Tensor::constant([0u32, 1u32]));
+                // The cache holds what was USED, not what the trunk answered:
+                // a run of skips must reuse ONE velocity, not chase the plane.
+                cache.put(&v_use);
+
+                // The metric, and the decision for the NEXT fire. `k >= 1`
+                // because fire 0 seeds and fire 1 has no cache to compare to.
+                let flat = |t: &Tensor| reshape(t, [1, rows * feats]);
+                let num = reduce_sum(flat(&abs(&(&v_use - &v_prev))));
+                let den = max_elem(reduce_sum(flat(&abs(&v_prev))), 1e-12f32);
+                let one = Tensor::constant([1.0f32]);
+                let zero = Tensor::constant([0.0f32]);
+                // Fire 0's cache is the seeded zero cell, so the ratio there
+                // is `|v| / 1e-12` — a number, and a meaningless one. It
+                // feeds no decision (`k >= 1` is false), so report 0 rather
+                // than publish 1e15 into a series a reader has to squint at.
+                let rel = select(&eq(k, 0u32), &zero, &(&num / &den));
+                let ahead = and(ge(k, 1u32), lt(&rel, thr));
+                skip.put(&select(&ahead, &one, &zero));
+
+                let did = select(&skipping, &one, &zero);
+                let total = &count.take() + &did;
+                count.put(&total);
+                let mut row = broadcast(&zero, [3]);
+                row = scatter_set(&row, &Tensor::constant([0u32]), &rel);
+                row = scatter_set(&row, &Tensor::constant([1u32]), &did);
+                row = scatter_set(&row, &Tensor::constant([2u32]), &total);
+                probe.put(&row);
+            });
+        }
+        // ── THE BASELINE ───────────────────────────────────────────────────
+        // No cache ops in the trace at all. `seed_or_step` itself, so what a
+        // threshold-0 run is compared against is the SHIPPED loop body and
+        // not a rearrangement of it.
+        None => {
+            image_clock.drive(&image, move |k| {
+                seed_or_step(k, &x, &intrinsics::velocity(width), &dts, &rng, shape, Some(&out));
+                let zero = Tensor::constant([0.0f32]);
+                probe.put(&broadcast(&zero, [3]));
+            });
+        }
+    }
+
+    let mut trace: Vec<Vec<f32>> = Vec::with_capacity(fires as usize);
+    let mut rel: Vec<f32> = Vec::with_capacity(fires as usize);
+    let mut did: Vec<f32> = Vec::with_capacity(fires as usize);
+    let mut count: Vec<f32> = Vec::with_capacity(fires as usize);
+    for fire in 0..fires {
+        loops
+            .fire(&[&caption, &context, &image])
+            .map_err(|why| format!("cached fire {fire}: {why}"))?;
+        trace.push(
+            out.take_host::<Vec<f32>>()
+                .await
+                .map_err(|why| format!("latent readback after cached fire {fire}: {why}"))?,
+        );
+        let row = probe
+            .take_host::<Vec<f32>>()
+            .await
+            .map_err(|why| format!("probe readback after cached fire {fire}: {why}"))?;
+        rel.push(row.first().copied().unwrap_or(0.0));
+        did.push(row.get(1).copied().unwrap_or(0.0));
+        count.push(row.get(2).copied().unwrap_or(0.0));
+    }
+    loops.close();
+    Ok((trace, rel, did, count, sched.dts()))
+}
+
 /// One denoise step: three lanes, one group, one fire, one velocity.
 async fn step(
     case: &Case,
@@ -526,7 +788,40 @@ async fn main(input: Input) -> Result<Output> {
         cfg_cond: Vec::new(),
         cfg_uncond: Vec::new(),
         cfg_scale: None,
+        cache_x: Vec::new(),
+        cache_rel: Vec::new(),
+        cache_did: Vec::new(),
+        cache_count: Vec::new(),
+        cache_dts: Vec::new(),
+        cache_rows: None,
     };
+
+    // Step caching runs the whole schedule on the device — never one step.
+    if input.cache {
+        let steps = input.cache_steps.or(Some(case.steps)).unwrap_or(0).max(1);
+        let seed = input.cache_seed.unwrap_or(7);
+        let (trace, rel, did, count, dts) = cached_loop(
+            &case,
+            &ports,
+            &reading.name,
+            steps,
+            seed,
+            input.cache_threshold,
+        )
+        .await?;
+        // Fire `k` integrates `dts[k]`: 0 on the seed fire.
+        let mut fire_dts = vec![0.0f32];
+        fire_dts.extend(dts);
+        out.velocity = trace.last().cloned().unwrap_or_default();
+        out.cache_x = trace;
+        out.cache_rel = rel;
+        out.cache_did = did;
+        out.cache_count = count;
+        out.cache_dts = fire_dts;
+        out.cache_rows = Some(case.image_rows);
+        pipes.close();
+        return Ok(out);
+    }
 
     // Guidance runs one step, six lanes, two groups — never a schedule.
     if input.cfg {
