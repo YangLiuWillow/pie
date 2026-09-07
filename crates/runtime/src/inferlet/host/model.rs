@@ -80,6 +80,7 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
                 text_axis: convention.text_axis,
                 text_origin: convention.text_origin,
                 image_follows_text: convention.image_follows_text,
+                reference_stride: convention.reference_stride,
             }
         }),
         readout: match reading.readout {

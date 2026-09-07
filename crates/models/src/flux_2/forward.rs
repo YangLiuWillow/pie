@@ -32,7 +32,10 @@
 //! **Positions** (`AxisPositions`, `[rows, 4]` f32, `(T, H, W, L)`): text
 //! row `j` is `(0, 0, 0, j)`; target token `(h, w)` is `(0, h, w, 0)`;
 //! reference `i`'s token `(h, w)` is `(10·(i+1), h, w, 0)` — `_prepare_
-//! {text,latent,image}_ids`.
+//! {text,latent,image}_ids`. All three are STATED, the reference's 10 as
+//! `PositionConvention::reference_stride` ([`model::REFERENCE_TIME_STRIDE`]),
+//! so a family-blind guest can bind a reference lane without spelling this
+//! family's number — which is what `tests/inferlets/text-to-image` does.
 //!
 //! **Timestep and guidance.** The `timestep` port takes the SCHEDULER
 //! timestep `σ·1000` (the reference's `timestep · 1000`); `guidance` takes
@@ -70,9 +73,9 @@ use crate::{
 
 use super::model::{
     Attn, DOUBLE_MOD_SLICES, Dit, Embedder, GUIDANCE_SCALE, HEAD_DIM, IN_CHANNELS, Model, NORM_EPS,
-    ROPE_AXES, ROPE_DIMS, ROPE_THETA, SINGLE_MOD_SLICES, SM_SCALE, Swiglu, T_FLIP_SIN_COS,
-    T_FREQ_DIM, T_MAX_PERIOD, T_SCALE, TE_LAYERS, TE_MAX_TOKENS, TE_TAPS, TOKEN_COMPRESSION,
-    TRAIN_STEPS, TextEncoder, port,
+    REFERENCE_TIME_STRIDE, ROPE_AXES, ROPE_DIMS, ROPE_THETA, SINGLE_MOD_SLICES, SM_SCALE, Swiglu,
+    T_FLIP_SIN_COS, T_FREQ_DIM, T_MAX_PERIOD, T_SCALE, TE_LAYERS, TE_MAX_TOKENS, TE_TAPS,
+    TOKEN_COMPRESSION, TRAIN_STEPS, TextEncoder, port,
 };
 
 /// The bit the one-hot stream facts start at (D2): bits 0..6 are the six
@@ -186,9 +189,10 @@ impl Model {
             streams: every.to_vec(),
             ports,
             // `(T, H, W, L)`: the target grid on `(h, w)` at `T = 0`, a
-            // text row `j` at `(0, 0, 0, j)` — `_prepare_{text,latent}_ids`.
-            // (A reference lane's `T = 10·(i + 1)` is the family's, not the
-            // convention's; a guest that binds references states it.)
+            // text row `j` at `(0, 0, 0, j)` — `_prepare_{text,latent}_ids`
+            // — and reference `i`'s grid at `T = 10·(i + 1)`, which is
+            // `_prepare_image_ids` and is STATED here so a family-blind
+            // guest can bind a reference lane without spelling the 10.
             positions: Some(PositionConvention {
                 axes: vec![
                     AxisRole::Time,
@@ -199,6 +203,7 @@ impl Model {
                 text_axis: 3,
                 text_origin: 0,
                 image_follows_text: false,
+                reference_stride: Some(REFERENCE_TIME_STRIDE),
             }),
             readout: ReadoutKind::Velocity,
             readout_width: IN_CHANNELS,

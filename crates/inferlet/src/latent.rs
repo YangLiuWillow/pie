@@ -404,6 +404,16 @@ pub enum LaneRows {
     /// family may put something else on that axis (FLUX.2's reference
     /// index).
     Volume { t: u32, h: u32, w: u32 },
+    /// **REFERENCE `index`'s `h × w` GRID**, for a lane on the `Reference`
+    /// stream: the same picture grid as [`LaneRows::Grid`], moved along the
+    /// `Time` axis to the reference's own rotary neighbourhood —
+    /// `reference_stride · (index + 1)`, the stride being the family's
+    /// (`PositionConvention::reference_stride`), never the guest's.
+    ///
+    /// A lane carrying several references concatenated (FLUX.2's
+    /// `cat(refs)`) is this builder run once per reference, in the order
+    /// the lane's rows are packed, and the pieces joined.
+    Reference { index: u32, h: u32, w: u32 },
 }
 
 /// The `[rows, axes]` f32 grid one lane binds to a reading's
@@ -419,7 +429,15 @@ pub enum LaneRows {
 /// `text_origin + j` on `text_axis` and 0 elsewhere; `Grid`/`Volume` put
 /// `i` on the `Time` axis, `a` on the `Height` axis, `b` on the `Width`
 /// axis, the image's caption offset on `text_axis` WHEN the family stacks
-/// the image behind the caption, and 0 on everything else.
+/// the image behind the caption, and 0 on everything else; `Reference` is
+/// `Grid` with the family's own `reference_stride · (index + 1)` on the
+/// `Time` axis instead of 0.
+///
+/// **A `Reference` lane on a family that states no `reference_stride` gets
+/// `Grid`'s answer** — every reference at `T = 0`, on top of the target —
+/// because this builder cannot refuse. A guest checks the fact before it
+/// builds a reference lane and refuses there, where the message can say
+/// which model it is talking about.
 ///
 /// `text_axis` only overrides a role under `image_follows_text` — a video
 /// family numbers its frames on the `Time` axis and has no caption offset
@@ -431,6 +449,10 @@ pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows:
     let axes = convention.axes.len();
     let text_axis = convention.text_axis as usize;
     let origin = convention.text_origin as f32;
+    // The `Time` coordinate every row of this lane carries, over and above
+    // its own `i`: 0 for a target grid or a video volume, and the
+    // reference's own offset for a reference grid.
+    let mut time_offset = 0f32;
     let (t, h, w) = match lane {
         LaneRows::Sequence(rows) => {
             let mut grid = vec![0f32; rows as usize * axes];
@@ -443,6 +465,10 @@ pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows:
         }
         LaneRows::Grid { h, w } => (1, h, w),
         LaneRows::Volume { t, h, w } => (t, h, w),
+        LaneRows::Reference { index, h, w } => {
+            time_offset = (convention.reference_stride.unwrap_or(0) * (index + 1)) as f32;
+            (1, h, w)
+        }
     };
     let follow = origin + text_rows as f32;
     let mut grid = Vec::with_capacity((t * h * w) as usize * axes);
@@ -454,7 +480,7 @@ pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows:
                         follow
                     } else {
                         match role {
-                            AxisRole::Time => i as f32,
+                            AxisRole::Time => time_offset + i as f32,
                             AxisRole::Height => a as f32,
                             AxisRole::Width => b as f32,
                             AxisRole::Index => 0.0,
@@ -925,6 +951,7 @@ mod tests {
             text_axis: 3,
             text_origin: 0,
             image_follows_text: false,
+            reference_stride: Some(10),
         };
         assert_eq!(
             positions_for(&flux, LaneRows::Sequence(2), 2),
@@ -950,6 +977,7 @@ mod tests {
             text_axis: 0,
             text_origin: 1,
             image_follows_text: true,
+            reference_stride: None,
         };
         assert_eq!(
             positions_for(&z, LaneRows::Sequence(2), 2),
@@ -958,6 +986,75 @@ mod tests {
         assert_eq!(
             positions_for(&z, LaneRows::Grid { h: 1, w: 2 }, 32),
             vec![33.0, 0.0, 0.0, 33.0, 0.0, 1.0]
+        );
+    }
+
+    /// FLUX.2's reference lanes: reference `i`'s grid rides `(h, w)` like
+    /// the target's, at `T = 10·(i + 1)` — the stride the FAMILY states, so
+    /// the builder never spells a 10 of its own. A convention that states
+    /// no stride puts a reference on top of the target, which is why a
+    /// guest checks the fact before it builds one.
+    #[test]
+    fn a_reference_grid_rides_its_own_time_offset() {
+        let flux = PositionConvention {
+            axes: vec![
+                AxisRole::Time,
+                AxisRole::Height,
+                AxisRole::Width,
+                AxisRole::Index,
+            ],
+            text_axis: 3,
+            text_origin: 0,
+            image_follows_text: false,
+            reference_stride: Some(10),
+        };
+        assert_eq!(
+            positions_for(
+                &flux,
+                LaneRows::Reference {
+                    index: 0,
+                    h: 1,
+                    w: 2
+                },
+                7
+            ),
+            vec![
+                10.0, 0.0, 0.0, 0.0, //
+                10.0, 0.0, 1.0, 0.0,
+            ]
+        );
+        assert_eq!(
+            positions_for(
+                &flux,
+                LaneRows::Reference {
+                    index: 1,
+                    h: 1,
+                    w: 2
+                },
+                7
+            ),
+            vec![
+                20.0, 0.0, 0.0, 0.0, //
+                20.0, 0.0, 1.0, 0.0,
+            ]
+        );
+        // Reference 0 of a family that states no stride IS the target grid,
+        // and that is the answer a guest must never bind.
+        let silent = PositionConvention {
+            reference_stride: None,
+            ..flux.clone()
+        };
+        assert_eq!(
+            positions_for(
+                &silent,
+                LaneRows::Reference {
+                    index: 0,
+                    h: 1,
+                    w: 2
+                },
+                7
+            ),
+            positions_for(&silent, LaneRows::Grid { h: 1, w: 2 }, 7)
         );
     }
 
@@ -970,6 +1067,7 @@ mod tests {
             text_axis: 0,
             text_origin: 0,
             image_follows_text: false,
+            reference_stride: None,
         };
         assert_eq!(
             positions_for(&mini, LaneRows::Sequence(2), 2),

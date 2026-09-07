@@ -183,6 +183,8 @@ impl Model {
                 text_axis: 0,
                 text_origin: 1,
                 image_follows_text: false,
+                // No `Reference` stream on this row.
+                reference_stride: None,
             }),
             readout: ReadoutKind::Hidden,
             readout_width: d.dim,
@@ -228,6 +230,8 @@ impl Model {
                 text_axis: 0,
                 text_origin: 1,
                 image_follows_text: true,
+                // No `Reference` stream on this row.
+                reference_stride: None,
             }),
             readout: ReadoutKind::Velocity,
             readout_width: Tap::width(Tap::from_env().as_deref(), d),

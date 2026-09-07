@@ -130,6 +130,39 @@ interface frames {
                                   count: u32,
                                   fps: f32) -> result<frames, error>;
 
+        // **THE WAY IN**: decode an encoded still (PNG / JPEG / GIF / WebP)
+        // into a handle. The format is SNIFFED from the bytes — a caller
+        // holding a file holds its magic too, and a stated format that
+        // disagreed with the bytes would be one more thing to get wrong.
+        //
+        // This is `encode`'s pair, and it is what lets a guest hand a
+        // PICTURE to a `vae.encode` reading: img2img, inpainting, a
+        // reference lane. `media.image` is the other door and the wrong one
+        // here — it patchifies for a vision tower and answers TOKENS, and a
+        // diffusion model has no vision front-end for it to ask.
+        //
+        // Errors, by name and with the byte count, when the bytes decode to
+        // nothing. A picture that did not decode is not a black picture.
+        decode: static func(bytes: blob) -> result<frames, error>;
+
+        // **THE VAE ROAD, RUN BACKWARDS**: put these pixels into `ch`'s
+        // cell, the inverse of `from-channel` and to the same statute — the
+        // bytes do not enter linear memory.
+        //
+        // The cell is written as `count * height * width * 3` f32 in the
+        // model's own range, [-1, 1], one row per voxel in `(t, h, w)`
+        // order with `w` fastest, which is what a `vae.encode` reading's
+        // pixel port reads. RGB8 maps by `2 * (x / 255) - 1`, exactly
+        // undoing `from-channel`'s `(x + 1) / 2`.
+        //
+        // The put is `channel.put`'s — the SEED a channel takes before its
+        // first fire, not `set`'s rewrite of a cell already in the ring
+        // (a channel has no ring until a fire has run). So this is a
+        // channel a pass binds as an INPUT, seeded exactly once, and not
+        // one an epilogue writes. A channel whose declared shape is not
+        // this many f32 is refused by name with both figures.
+        to-channel: func(ch: borrow<channel>) -> result<_, error>;
+
         // Frame width in pixels.
         width: func() -> u32;
 

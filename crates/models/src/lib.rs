@@ -274,10 +274,14 @@ pub enum AxisRole {
 ///   `b` on the `Width` axis; on `text_axis` it sits at `text_origin +
 ///   text_rows` when `image_follows_text`, else 0; on every remaining
 ///   axis, 0.
+/// - a `Reference` lane's patch `(a, b)` of reference `i` sits where the
+///   image lane's would, except on the `Time` axis, where it sits at
+///   `reference_stride · (i + 1)` — the offset that keeps each reference
+///   picture in a rotary neighbourhood of its own, away from the target
+///   grid at 0.
 ///
 /// `axes` has exactly the port's `width` entries. A family whose positions
-/// do not fit this shape states `None` and its guests build their own — a
-/// reference lane's `T` stride, for one, is not stated here.
+/// do not fit this shape states `None` and its guests build their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionConvention {
     /// One role per axis of the positions port, in the port's own order.
@@ -289,6 +293,17 @@ pub struct PositionConvention {
     /// The image lane's coordinate on `text_axis` is `text_origin +
     /// text_rows` (Z-Image) rather than 0 (FLUX.2, mini-dit).
     pub image_follows_text: bool,
+    /// **WHERE REFERENCE `i` SITS ON THE `Time` AXIS**: at
+    /// `reference_stride · (i + 1)`, so the first reference clears the
+    /// target grid's `T = 0` and each further one clears the last
+    /// (FLUX.2's `10·(i + 1)`, `_prepare_image_ids`).
+    ///
+    /// `None` — the answer for every family that declares no `Reference`
+    /// stream — means this row states no reference convention, and a guest
+    /// that would bind a reference lane must refuse rather than invent an
+    /// offset. It is the one number a reference lane needs that the target
+    /// grid's rules do not already give.
+    pub reference_stride: Option<u32>,
 }
 
 /// Which export seam a reading's epilogue reads.

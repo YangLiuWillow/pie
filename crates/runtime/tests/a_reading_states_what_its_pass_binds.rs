@@ -82,6 +82,7 @@ fn convention() -> PositionConvention {
         text_axis: 0,
         text_origin: 0,
         image_follows_text: false,
+        reference_stride: None,
     }
 }
 

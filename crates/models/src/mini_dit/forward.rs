@@ -192,6 +192,9 @@ fn denoise_reading(tap: Option<&str>) -> ReadingFact {
             text_axis: 0,
             text_origin: 0,
             image_follows_text: false,
+            // No `Reference` stream on this fixture: no reference lane to
+            // place, and so no stride to state.
+            reference_stride: None,
         }),
         readout: ReadoutKind::Velocity,
         readout_width: Tap::width(tap),

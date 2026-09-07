@@ -36,6 +36,14 @@ pub const HEAD_DIM: u32 = 128;
 pub const ROPE_DIMS: [u32; 4] = [32, 32, 32, 32];
 pub const ROPE_THETA: f32 = 2000.0;
 pub const ROPE_AXES: u8 = 4;
+/// **THE REFERENCE LANE'S ROTARY STRIDE ON `T`**: reference `i`'s tokens
+/// sit at `T = REFERENCE_TIME_STRIDE·(i + 1)`, so the first reference
+/// clears the target grid's `T = 0` and each further one clears the last
+/// (`_prepare_image_ids`, which offsets by `10*(i+1)`). Published to
+/// guests as `PositionConvention::reference_stride`, which is the only way
+/// a family-blind guest can place a reference lane without spelling this
+/// family's number.
+pub const REFERENCE_TIME_STRIDE: u32 = 10;
 
 /// The sinusoidal timestep/guidance embedding's width
 /// (`timestep_guidance_channels`), `max_period` and layout: diffusers'
