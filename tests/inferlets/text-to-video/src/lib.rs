@@ -16,7 +16,8 @@
 //! |---|---|
 //! | text encoder | `takes_tokens && readout == Hidden` |
 //! | denoiser | `!takes_tokens && readout == Velocity` |
-//! | VAE decode | `readout == Pixels`, name `vae.decode*`, not `vae.encode` |
+//! | VAE decode | `readout == Pixels`, a name that is not `vae.encode*` |
+//! | VAE encode | `readout == Pixels`, a name that IS `vae.encode*` |
 //!
 //! # THE FRAME ARITHMETIC IS THE FAMILY'S, AND IT REFUSES BY NAME
 //!
@@ -62,6 +63,52 @@
 //! ONE handle with `frames.from-rgb8`. The cost is real (a 480x832x17 clip
 //! is 81 MB of f32 through the boundary and 20 MB of RGB8 back) and the fix
 //! is a seam that appends rather than replaces, not a change here.
+//!
+//! # VIDEO2VIDEO
+//!
+//! The video half of img2img, and the same three moves: a clip in through
+//! the family's `vae.encode` reading, noised to the schedule's `strength`
+//! point, integrated from there. What differs is the ENCODE, and it differs
+//! exactly the way the decode does.
+//!
+//! A causal video VAE encodes ONE chunk at a time through the same per-conv
+//! frame caches, and treats the FIRST apart: output frame 0 of each
+//! `downsample3d` time convolution is the IDENTITY, not a convolution, so no
+//! single strided conv over a whole clip can produce it. So the head arm
+//! takes ONE pixel frame and every later chunk takes `temporal-compression`
+//! of them, each landing one latent frame, down ONE pipeline in order — the
+//! decode loop above read backwards, and refused by the same lattice
+//! (`1 + tc*(T - 1)` pixel frames, no other length).
+//!
+//! Two things this does NOT do, and both are the family's own statement
+//! rather than this program's:
+//!
+//! * It does not rescale. `vae.encode` lands `(mean - latents_mean)/std` —
+//!   the exact inverse of what `vae.decode` undoes — so the encoded clip is
+//!   already the DENOISER's own space and goes straight into the sampler.
+//!   `the_wan_2_vae_encodes_the_reference` is where that is proved: the same
+//!   rows fit the RAW posterior mean materially worse.
+//! * It does not resize, in space or in time. An init clip that is not this
+//!   run's `width x height x frames` is REFUSED by name; a guest has no
+//!   resampler and a silent one would be the wrong one.
+//!
+//! # THE INIT CLIP CROSSES, AND SO DOES THE OUTPUT
+//!
+//! A clip comes in as `init_frame_<f>_<n>`: frame `f`'s encoded still, piece
+//! `n`. Two indices because a clip is a LIST of pictures and one argv
+//! argument is capped at `MAX_ARG_STRLEN` far below one still, so both
+//! dimensions have to be spelled. The sandbox scratch is not the door:
+//! `/scratch` is mounted per PROCESS and removed at teardown, so nothing
+//! outside can place a file there for a guest to find.
+//!
+//! `frames.decode` sniffs ONE still and lands a one-frame handle, and there
+//! is no host-side verb that concatenates handles — but a `vae.encode` chunk
+//! is FOUR frames on one voxel port, one box. So each still is decoded
+//! host-side, read back as raw RGB8 (`encode(raw-rgb8)`), concatenated in the
+//! guest, and handed over as one `frames.from-rgb8` handle per chunk, seeded
+//! onto the pixel port with `Channel::set_frames`. The pixels cross linear
+//! memory once on the way in, exactly as they cross once on the way out, and
+//! the fix for both is the same seam that appends rather than replaces.
 //!
 //! # CFG
 //!
@@ -125,6 +172,58 @@ struct Input {
     format: Option<String>,
     #[serde(default)]
     out: Option<String>,
+    /// VIDEO2VIDEO: how much of the schedule to run over the encoded clip,
+    /// in `(0, 1]`. `1.0` is every step, which is text-to-video from noise:
+    /// `(1 - 1)*x0 + 1*eps` IS the keyed draw, so the init washes out
+    /// entirely and the run is the one with no init at all. `0.6` keeps the
+    /// first 40% of the trajectory as the clip's own. Only read when an init
+    /// clip is given.
+    ///
+    /// That identity is exact in the arithmetic and only NEARLY exact in the
+    /// file, because a `pie run` of this row is not bit-reproducible: two
+    /// identical runs land clips a few ten-thousandths apart. What the gate
+    /// claims is the shape that survives it — see `gates.py`'s
+    /// `v2v_claims`.
+    #[serde(default)]
+    strength: Option<f32>,
+    /// THE INIT CLIP, frame by frame: `init_frame_<f>_<n>` is frame `f`'s
+    /// base64-encoded still (PNG, JPEG, GIF, WebP), piece `n`. Two indices
+    /// because a clip is a LIST of pictures and one argv argument is capped
+    /// at `MAX_ARG_STRLEN` well below a single still. A frame small enough
+    /// to travel whole may be `init_frame_<f>` with no piece index.
+    ///
+    /// The clip must be this run's own `width x height x frames`: a guest
+    /// has no resampler, in space or in time.
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, inferlet::serde_json::Value>,
+}
+
+impl Input {
+    /// **THE INIT CLIP'S FRAMES, IN FRAME ORDER**, each frame's pieces
+    /// concatenated in piece order. The `f`s are taken in sorted order and
+    /// renumbered densely: what matters is which frame is first, not the
+    /// label the caller gave it.
+    fn init_frames(&self) -> Vec<String> {
+        let mut found: std::collections::BTreeMap<u64, std::collections::BTreeMap<u64, &str>> =
+            std::collections::BTreeMap::new();
+        for (name, value) in &self.rest {
+            let Some(rest) = name.strip_prefix("init_frame_") else {
+                continue;
+            };
+            // `<f>_<n>`, or a bare `<f>` for a frame that travelled whole.
+            let (frame, piece) = rest.split_once('_').unwrap_or((rest, "0"));
+            let (Ok(frame), Ok(piece), Some(text)) =
+                (frame.parse::<u64>(), piece.parse::<u64>(), value.as_str())
+            else {
+                continue;
+            };
+            found.entry(frame).or_default().insert(piece, text);
+        }
+        found
+            .into_values()
+            .map(|pieces| pieces.into_values().collect())
+            .collect()
+    }
 }
 
 #[derive(Serialize)]
@@ -156,6 +255,20 @@ struct Output {
     latent_frames: u32,
     decode_fires: u32,
     decode_readings: Vec<String>,
+    /// VIDEO2VIDEO: the init clip's frames (0 when none was passed), the
+    /// `vae.encode` fires that took them and the arms those fires used, and
+    /// the fraction of the schedule that was run. `strength` reads 1.0 with
+    /// no init, which is what the schedule then is.
+    init_frames: u32,
+    encode_fires: u32,
+    encode_readings: Vec<String>,
+    strength: f32,
+    /// The encoded clip's own moments, before a step runs over it. Here
+    /// because they are the only view a caller has of what `vae.encode`
+    /// landed: a run whose init clip came back as garbage says so here and
+    /// nowhere else. Both read 0 with no init.
+    init_mean: f32,
+    init_std: f32,
     steps: u32,
     seed: u32,
     guidance: f32,
@@ -183,6 +296,13 @@ struct Roles {
     head: Option<model::ReadingFact>,
     /// The arm every later latent frame goes through, or the only arm.
     decode: model::ReadingFact,
+    /// VIDEO2VIDEO's door in. The first-chunk arm, when the family splits
+    /// its causal encoder in two (`vae.encode.head`); `None` for a one-arm
+    /// encoder, and `None` for both when the family declares no encoder at
+    /// all — this program only refuses that when an init clip is passed.
+    encode_head: Option<model::ReadingFact>,
+    /// The arm every later pixel chunk goes through, or the only arm.
+    encode: Option<model::ReadingFact>,
 }
 
 fn roles() -> Result<Roles> {
@@ -214,13 +334,22 @@ fn roles() -> Result<Roles> {
     // A decode arm lands PIXELS. The encoder lands pixels too — its pixels
     // are its INPUT — and the name is what separates them, in the design's
     // own reading vocabulary and not a family's.
+    //
+    // `starts_with`, not `!= "vae.encode"`: a causal video encoder is TWO
+    // arms and the head one is `vae.encode.head`, which ends in `.head` like
+    // a decode head does. Matched on the exact name alone, the encoder's
+    // head arm was picked up as the DECODER's, and the first thing that
+    // would have said so is a clip of noise.
     let pixels: Vec<model::ReadingFact> = readings
         .iter()
-        .filter(|r| r.readout == model::ReadoutKind::Pixels && r.name != "vae.encode")
+        .filter(|r| r.readout == model::ReadoutKind::Pixels)
         .cloned()
         .collect();
-    let head = pixels.iter().find(|r| r.name.ends_with(".head")).cloned();
-    let decode = pixels
+    let (encoders, decoders): (Vec<_>, Vec<_>) = pixels
+        .into_iter()
+        .partition(|r| r.name.starts_with("vae.encode"));
+    let head = decoders.iter().find(|r| r.name.ends_with(".head")).cloned();
+    let decode = decoders
         .iter()
         .find(|r| !r.name.ends_with(".head"))
         .cloned()
@@ -228,11 +357,18 @@ fn roles() -> Result<Roles> {
             "this model declares no `vae.decode` reading, so there is no way to turn its \
              latent into frames from inside pie",
         )?;
+    let encode_head = encoders.iter().find(|r| r.name.ends_with(".head")).cloned();
+    let encode = encoders
+        .iter()
+        .find(|r| !r.name.ends_with(".head"))
+        .cloned();
     Ok(Roles {
         text,
         denoise,
         head,
         decode,
+        encode_head,
+        encode,
     })
 }
 
@@ -449,6 +585,143 @@ fn unpatchify(rows: &[f32], grid: [u32; 3], patch: [u32; 3], channels: u32) -> V
         }
     }
     out
+}
+
+/// The inverse of [`unpatchify`]: the `[t, h, w, C]` latent clip a
+/// `vae.encode` reading LANDS, back into the `[rows, C*pt*ph*pw]` rows a
+/// denoise reading's latent port takes, in `(c, pt, ph, pw)` feature order.
+///
+/// Here for the same reason its pair is: the trunk states the patch and the
+/// VAE states the clip, and the guest is the only place both halves of the
+/// index algebra are visible.
+fn patchify(clip: &[f32], grid: [u32; 3], patch: [u32; 3], channels: u32) -> Vec<f32> {
+    let (gt, gh, gw) = (grid[0] as usize, grid[1] as usize, grid[2] as usize);
+    let (pt, ph, pw) = (patch[0] as usize, patch[1] as usize, patch[2] as usize);
+    let c = channels as usize;
+    let (h, w) = (gh * ph, gw * pw);
+    let row_width = c * pt * ph * pw;
+    let mut out = vec![0f32; gt * gh * gw * row_width];
+    for a in 0..gt {
+        for b in 0..gh {
+            for d in 0..gw {
+                let row = ((a * gh + b) * gw + d) * row_width;
+                for ci in 0..c {
+                    for z in 0..pt {
+                        for y in 0..ph {
+                            for x in 0..pw {
+                                let dst = row + ((ci * pt + z) * ph + y) * pw + x;
+                                let src =
+                                    (((a * pt + z) * h + (b * ph + y)) * w + (d * pw + x)) * c + ci;
+                                out[dst] = clip[src];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Standard base64 (`+/`, `=` padded) into the bytes it spells. The one
+/// thing that travels this way is an init clip's frames: argv is text, an
+/// encoded still is not, and a scratch-file door would make the clip a path
+/// rather than a value — and the sandbox's `/scratch` is per PROCESS, so
+/// nothing outside could put a file there anyway.
+fn b64_decode(text: &str) -> Result<Vec<u8>> {
+    let code = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let text = text.trim().trim_end_matches('=').as_bytes();
+    let mut bytes = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for (i, &c) in text.iter().enumerate() {
+        let six = code(c).ok_or_else(|| format!("an init frame: byte {i} is not base64"))?;
+        acc = (acc << 6) | six;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(bytes)
+}
+
+/// Fire ONE encode arm over ONE PIXEL CHUNK and take the latent frame it
+/// lands: the mirror of [`decode_frame`], and the door video2video comes in
+/// through.
+///
+/// The chunk goes in as the port's CHANNEL, seeded straight from a host-held
+/// `frames` handle (`Channel::set_frames`, which is a `put` and so must
+/// happen after the pass has bound the port — a channel has no ring before
+/// that). Its shape IS the clip's box, `[t, H, W, 3]`, so the geometry the
+/// voxel axis needs travels with the numbers.
+///
+/// The answer comes back on the same `pixels` seam a decode uses. For an
+/// encoder that seam carries ONE LATENT FRAME — the posterior MEAN, already
+/// normalised into the denoiser's own space — whatever the number of pixel
+/// frames that went in.
+async fn encode_chunk(
+    reading: &model::ReadingFact,
+    chunk: &Frames,
+    chunk_frames: u32,
+    pixel_h: u32,
+    pixel_w: u32,
+    clip_h: u32,
+    clip_w: u32,
+    pipe: &Pipeline,
+) -> Result<Vec<f32>> {
+    let port = reading
+        .ports
+        .iter()
+        .find(|p| p.kind == model::PortKind::Voxels)
+        .ok_or_else(|| {
+            format!(
+                "reading `{}` takes pixels but declares no voxel port; there is no chunk to \
+                 hand it",
+                reading.name
+            )
+        })?;
+    let rows = clip_h * clip_w;
+    let width = reading.readout_width;
+    let pass = ForwardPass::new();
+    pass.reading(&reading.name)?;
+    pass.stream(model::LaneStream::Video)?;
+    // Empty, and SEEDED from the chunk below: the pixels are the host's, and
+    // the eta trace tracks readiness STATICALLY — a channel the host seeds
+    // has to be declared `seeded`, or the trace refuses it as consumed but
+    // never produced.
+    let cell = Channel::seeded([chunk_frames, pixel_h, pixel_w, port.width], dtype::f32)
+        .named("vae_pixels_in");
+    pass.input(&port.name, &cell)?;
+    let out = Channel::new([rows, width], dtype::f32).named("vae_latent_out");
+    let readback = out.clone();
+    pass.epilogue(move || {
+        readback.put(intrinsics::pixels(rows, width));
+    });
+    // THE PIXELS, seeded straight from the host's handle, after the bind.
+    cell.set_frames(chunk)?;
+    pass.submit(pipe)
+        .with_context(|| format!("the `{}` fire", reading.name))?;
+    let landed = out.take_host::<Vec<f32>>().await?;
+    let want = (rows * width) as usize;
+    if landed.len() != want {
+        return Err(format!(
+            "reading `{}` landed {} numbers over a {chunk_frames}-frame chunk and one latent \
+             frame is {clip_h}x{clip_w}x{width} = {want}",
+            reading.name,
+            landed.len()
+        )
+        .into());
+    }
+    Ok(landed)
 }
 
 /// Fire ONE decode arm over ONE latent frame and take its pixels back.
@@ -682,7 +955,35 @@ async fn main(input: Input) -> Result<Output> {
     // bending by 1950 rows would put nineteen of twenty steps above sigma
     // 0.58 and leave the last one to do the denoising. `None` takes the
     // stated shift as the fixed one it is.
-    let sched = FlowMatchEuler::from_schedule(&fact, steps, None)?;
+    let full = FlowMatchEuler::from_schedule(&fact, steps, None)?;
+
+    // VIDEO2VIDEO: `strength` is the FRACTION OF THE TRAJECTORY still to
+    // run, so the schedule is truncated to its tail and the encoded clip is
+    // noised to that tail's first sigma. `1.0` truncates nothing, which
+    // makes `(1 - 1)*x0 + 1*eps` the keyed draw and the run identical to one
+    // with no init at all — the identity a caller can check.
+    let init_b64 = input.init_frames();
+    let has_init = !init_b64.is_empty();
+    let strength = input.strength.unwrap_or(0.6);
+    if has_init && !(0.0 < strength && strength <= 1.0) {
+        return Err(format!("`strength` is {strength}; it is a fraction in (0, 1]").into());
+    }
+    let cut = if has_init {
+        // `steps - round(steps * strength)`: the number of steps SKIPPED.
+        // Clamped to leave at least one, since a schedule of no steps is a
+        // clip handed straight back.
+        let run = ((steps as f32 * strength).round() as u32).clamp(1, steps);
+        (steps - run) as usize
+    } else {
+        0
+    };
+    let sched = if cut == 0 {
+        full.clone()
+    } else {
+        FlowMatchEuler::from_sigmas(full.sigmas[cut..].to_vec(), full.train_steps)
+    };
+    let sigma0 = *sched.sigmas.first().unwrap_or(&1.0);
+    let fps = input.fps.unwrap_or(24.0);
 
     // ---- the prompt, through whichever door the caller opened -------------
     let guidance = input.guidance.unwrap_or(1.0);
@@ -732,6 +1033,146 @@ async fn main(input: Input) -> Result<Output> {
     }
     let cfg = negative.is_some() && guidance > 1.0;
     let uncond = if cfg { negative } else { None };
+
+    // ---- video2video: the clip, encoded chunk by chunk --------------------
+    //
+    // Before the loop, on a pipeline of its own that closes: each encode
+    // pass holds a seat and the denoise lanes need it back.
+    //
+    // The chunk lattice is the DECODE's read backwards. A family with a head
+    // arm takes pixel frame 0 alone and then `tc` frames at a time; a
+    // one-arm encoder takes `tc` every time. Either way each chunk lands one
+    // latent frame, and the count must come out at `latent_frames` — the
+    // same arithmetic that sized the run, so a mismatch here is this
+    // program disagreeing with itself and says so.
+    let mut encode_used: Vec<String> = Vec::new();
+    let init_latent: Option<Vec<f32>> = if !has_init {
+        None
+    } else {
+        let body = roles.encode.as_ref().ok_or(
+            "this model declares no `vae.encode` reading, so an init clip has no door to \
+             come in through",
+        )?;
+        if init_b64.len() as u32 != frames {
+            return Err(format!(
+                "the init clip is {} frames and this run is {frames}; a guest has no \
+                 resampler in time and a silent one would be the wrong one",
+                init_b64.len()
+            )
+            .into());
+        }
+        // Every frame decoded host-side, then read back as raw RGB8 so the
+        // guest can concatenate them: a `vae.encode` chunk is FOUR frames on
+        // ONE voxel port, and there is no host-side verb that joins handles.
+        let mut rgb: Vec<Vec<u8>> = Vec::with_capacity(init_b64.len());
+        for (f, b64) in init_b64.iter().enumerate() {
+            let bytes = b64_decode(b64)?;
+            let picture = Frames::decode(&bytes)
+                .map_err(|why| format!("init frame {f} does not decode: {why}"))?;
+            if picture.width() != width || picture.height() != height {
+                return Err(format!(
+                    "init frame {f} is {}x{} and this run is {width}x{height}; resize the \
+                     clip before handing it over — a guest has no resampler and a silent \
+                     one would be the wrong one",
+                    picture.width(),
+                    picture.height()
+                )
+                .into());
+            }
+            if picture.count() != 1 {
+                return Err(format!(
+                    "init frame {f} decoded to {} frames; `frames.decode` sniffs a STILL and \
+                     a clip comes in one still per frame",
+                    picture.count()
+                )
+                .into());
+            }
+            rgb.push(
+                picture
+                    .encode(ImageFormat::RawRgb8)
+                    .map_err(|why| format!("init frame {f} does not read back as RGB8: {why}"))?,
+            );
+        }
+        let mut chunks: Vec<u32> = Vec::new();
+        if roles.encode_head.is_some() {
+            chunks.push(1);
+        }
+        while chunks.iter().sum::<u32>() < frames {
+            chunks.push(tc);
+        }
+        if chunks.iter().sum::<u32>() != frames || chunks.len() as u32 != latent_frames {
+            return Err(format!(
+                "a {frames}-frame clip does not chunk into {latent_frames} encode fires at \
+                 tc = {tc}{}",
+                if roles.encode_head.is_some() {
+                    " with a head arm"
+                } else {
+                    ""
+                }
+            )
+            .into());
+        }
+        let clip_h = grid_h * ph;
+        let clip_w = grid_w * pw;
+        let plane = (clip_h * clip_w * space.channels) as usize;
+        let mut clip: Vec<f32> = Vec::with_capacity(latent_frames as usize * plane);
+        // ONE pipeline for the whole encode, and each arm's pass closed
+        // before the next opens: the causal convolutions' `CacheRow::State`
+        // slabs make these fires a sequence, exactly as the decode's are.
+        let enc_pipe = Pipeline::new();
+        let mut at = 0usize;
+        for (k, take) in chunks.iter().copied().enumerate() {
+            let reading = match (k, roles.encode_head.as_ref()) {
+                (0, Some(head)) => head,
+                _ => body,
+            };
+            let mut payload: Vec<u8> =
+                Vec::with_capacity(take as usize * (height * width * 3) as usize);
+            for f in at..at + take as usize {
+                payload.extend_from_slice(&rgb[f]);
+            }
+            at += take as usize;
+            let handle = Frames::from_rgb8(&payload, width, height, take, fps)
+                .map_err(|why| format!("encode chunk {k}: frames.from-rgb8: {why}"))?;
+            let landed = encode_chunk(
+                reading, &handle, take, height, width, clip_h, clip_w, &enc_pipe,
+            )
+            .await
+            .with_context(|| format!("encoding chunk {k}"))?;
+            clip.extend_from_slice(&landed);
+            // The arms this clip actually used, in first-use order: a
+            // one-arm encoder names one, a split one names both, and a
+            // single-frame clip on a split encoder names only the head.
+            if !encode_used.iter().any(|name| name == &reading.name) {
+                encode_used.push(reading.name.clone());
+            }
+        }
+        enc_pipe.close();
+        // NO RESCALE. `vae.encode` lands `(mean - latents_mean)/std`, the
+        // exact inverse of what `vae.decode` undoes, so these rows are the
+        // denoise reading's own space already. All that is left is the
+        // trunk's patchify, which the guest owns because only the guest sees
+        // both the family's patch and the family's clip.
+        Some(patchify(
+            &clip,
+            [grid_t, grid_h, grid_w],
+            [pt, ph, pw],
+            space.channels,
+        ))
+    };
+
+    let (init_mean, init_std) = match &init_latent {
+        None => (0.0, 0.0),
+        Some(rows) => {
+            let n = rows.len().max(1) as f32;
+            let mean = rows.iter().sum::<f32>() / n;
+            let var = rows.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+            if rows.iter().any(|v| !v.is_finite()) {
+                return Err("the encoded init clip holds non-finite values".into());
+            }
+            (mean, var.sqrt())
+        }
+    };
 
     // ---- the loop ---------------------------------------------------------
     let mut loops = DenoiseLoop::new(&sched);
@@ -793,6 +1234,12 @@ async fn main(input: Input) -> Result<Output> {
         let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
         let x = latent.clone();
         let readback = out.clone();
+        // VIDEO2VIDEO: the encoded clip, seeded once, read by every fire and
+        // used by fire 0. Its own channel per branch, since a seeded channel
+        // attaches to one pass (the runtime's channel-role rule).
+        let init = init_latent
+            .as_ref()
+            .map(|rows| Channel::from_shaped(shape, rows.as_slice()).named(&format!("{tag}_init")));
         image_clock.drive(&image_lane.pass, move |k| {
             // On the CFG path BOTH branches step with the SAME combine, each
             // computed from its own side: the conditional lane reads
@@ -805,7 +1252,16 @@ async fn main(input: Input) -> Result<Output> {
             } else {
                 intrinsics::velocity(velocity_width)
             };
-            seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback));
+            // Fire 0 either draws the latent from the keyed RNG, or —
+            // video2video — takes the encoded clip noised to the truncated
+            // schedule's first sigma. Every later fire is the same Euler
+            // step either way.
+            match &init {
+                None => seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback)),
+                Some(init) => {
+                    resume_or_step(k, &x, init, sigma0, &v, &dts, &rng, shape, Some(&readback))
+                }
+            }
         });
         branches.push(Branch {
             context: context_lane,
@@ -920,13 +1376,24 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     // ---- the way out ------------------------------------------------------
-    let fps = input.fps.unwrap_or(24.0);
-    let name = input.out.unwrap_or_else(|| "video".to_string());
+    let name = input.out.clone().unwrap_or_else(|| "video".to_string());
     let asked_format = input.format.as_deref().unwrap_or("mp4");
+    // `rgb8` is the PARITY format — exactly the bytes the handle holds,
+    // `count*height*width*3`, no header, no codec. A claim that two runs
+    // landed the SAME clip is a claim about pixels, and an H.264 file is a
+    // claim about an encoder as well.
     let (format, ext) = match asked_format {
         "mp4" | "mp4-h264" => (ImageFormat::Mp4H264, "mp4"),
         "y4m" => (ImageFormat::Y4m, "y4m"),
-        other => return Err(format!("unknown video format {other:?}; try 'mp4' or 'y4m'").into()),
+        // `.rgb`, not `.rgb8`: the host names a file by the FORMAT's own
+        // extension (`image_extension`), and a suggested name that disagrees
+        // gets that one appended to it.
+        "rgb8" | "raw-rgb8" => (ImageFormat::RawRgb8, "rgb"),
+        other => {
+            return Err(
+                format!("unknown video format {other:?}; try 'mp4', 'y4m' or 'rgb8'").into(),
+            );
+        }
     };
     let handle = Frames::from_rgb8(&rgb8(&pixels), width, height, frames, fps)
         .map_err(|why| format!("frames.from-rgb8: {why}"))?;
@@ -958,6 +1425,12 @@ async fn main(input: Input) -> Result<Output> {
         latent_frames,
         decode_fires: latent_frames,
         decode_readings: used,
+        init_mean,
+        init_std,
+        init_frames: init_b64.len() as u32,
+        encode_fires: if has_init { latent_frames } else { 0 },
+        encode_readings: encode_used,
+        strength: if has_init { strength } else { 1.0 },
         steps: sched.steps(),
         seed,
         guidance,

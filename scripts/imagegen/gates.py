@@ -467,17 +467,32 @@ def v2v_claims(text: str) -> list[str]:
     """VIDEO2VIDEO's two identities, measured on the decoded pixels.
 
     The clips are compared HERE rather than in the guest because only the
-    harness sees all four, and they are compared as `raw-rgb8` — the parity
-    format, exactly the bytes the handle held — because a claim that two runs
-    landed the SAME clip must not also be a claim about H.264.
+    harness sees all of them, and they are compared as `raw-rgb8` -- the
+    parity format, exactly the bytes the handle held -- because a claim that
+    two runs landed the SAME clip must not also be a claim about H.264.
+
+    **THIS ROW IS NOT BIT-REPRODUCIBLE RUN TO RUN.** Two `pie run`s of the
+    same prompt, seed and schedule land clips 0.0004 to 0.0007 apart in mean
+    absolute [0, 1] channels -- against 0.19 between two different seeds --
+    and they DO come out byte-identical maybe a third of the time. So
+    neither claim below may be spelled `array_equal`, and neither may be
+    spelled against a hard-coded tolerance either. Both are spelled against
+    a number this gate MEASURES, by running the unseeded clip TWICE.
 
       strength 1.0 noises the init all the way, so it must land the SAME clip
-      as the run with no init at all -- bit for bit, since the seed and the
-      schedule are the same and `(1 - 1)*x0 + 1*eps` IS the keyed draw. This
-      is what says the encoded clip reached the sampler's fire-0 seed.
+      as the run with no init at all: `(1 - 1)*x0 + 1*eps` IS the keyed draw.
+      Gated as a CLUSTER: `v2v-washed`, `txt2vid` and `txt2vid-rep` are three
+      draws of one computation, so the widest gap inside that trio must be
+      smaller than the distance from any of them to any other clip this gate
+      made. Measured, that is 0.0007 against 0.157 -- a factor of 200, and no
+      constant anywhere in the test. This is what says the encoded clip
+      reached the sampler's fire-0 seed rather than some other latent.
 
-      strength 0.4 must land NEARER the input clip than that unseeded run
-      does, or the encoded clip reached the sampler and changed nothing.
+      A LOWER strength must land NEARER the input clip, in order: 0.2 nearer
+      than 0.4, and 0.4 nearer than the unseeded run, each gap wider than
+      that same measured spread. A ladder rather than one comparison, because
+      one comparison at one strength could fall the right way on a lane that
+      changed nothing.
 
     The input clip is a run of its own at a DIFFERENT SEED, which is what
     makes "nearer" mean anything: at the same seed and prompt the unseeded
@@ -486,24 +501,33 @@ def v2v_claims(text: str) -> list[str]:
     found = {}
     for path in re.findall(r"\[gates\] rgb8: (\S+)", text):
         found[os.path.basename(os.path.dirname(path))] = path
-    want = {"v2v-src", "v2v", "v2v-washed", "txt2vid"}
-    if not want <= found.keys():
+    same_run = ["v2v-washed", "txt2vid", "txt2vid-rep"]
+    others = ["v2v-src", "v2v-02", "v2v-04"]
+    if not set(same_run + others) <= found.keys():
         return []
     try:
+        import itertools
+
         import numpy as np
 
-        def clip(path):
-            return np.fromfile(path, dtype=np.uint8).astype(np.float32) / 255.0
+        clips = {name: np.fromfile(found[name], dtype=np.uint8).astype(np.float32) / 255.0
+                 for name in same_run + others}
 
-        src = clip(found["v2v-src"])
-        near = float(np.abs(clip(found["v2v"]) - src).mean())
-        washed = np.fromfile(found["v2v-washed"], dtype=np.uint8)
-        plain = np.fromfile(found["txt2vid"], dtype=np.uint8)
-        far = float(np.abs(plain.astype(np.float32) / 255.0 - src).mean())
-        same = bool(np.array_equal(washed, plain))
-        return [f"v2v 0.4 is {near:.4f} from the input, txt2vid {far:.4f} "
-                f"({'pass' if near < far else 'FAIL'})",
-                f"strength 1.0 IS txt2vid ({'pass' if same else 'FAIL'})"]
+        def apart(a, b):
+            return float(np.abs(clips[a] - clips[b]).mean())
+
+        # The three runs that OUGHT to be one clip, and how far the row's own
+        # irreproducibility actually spreads them.
+        spread = max(apart(a, b) for a, b in itertools.combinations(same_run, 2))
+        nearest = min(apart(a, b) for a in same_run for b in others)
+        lo, hi = apart("v2v-02", "v2v-src"), apart("v2v-04", "v2v-src")
+        none = apart("txt2vid", "v2v-src")
+        ladder = (hi - lo) > spread and (none - hi) > spread
+        return [f"v2v from the input: 0.2 {lo:.4f} < 0.4 {hi:.4f} < none {none:.4f} "
+                f"({'pass' if ladder else 'FAIL'})",
+                f"strength 1.0 IS txt2vid: the trio spans {spread:.5f}, the nearest "
+                f"other clip is {nearest:.4f} "
+                f"({'pass' if spread < nearest else 'FAIL'})"]
     except Exception as why:  # noqa: BLE001 — a readout never fails the gate silently
         return [f"video2video claims unread: {why}"]
 
@@ -954,8 +978,9 @@ def roster() -> list[Gate]:
                    "text-to-video guest on wan22-ti2v-5b.zt"),
             expected="decode cos >= 0.999 per chunk and clip (landed 0.999986), encode the "
                      "same (landed 0.999988, cacheless 0.9409); a real mp4, "
-                     "guidance at 5.0 must MOVE the latent, and video2video at 1.0 IS "
-                     "text-to-video while 0.4 lands nearer the input clip",
+                     "guidance at 5.0 must MOVE the latent; video2video at 1.0 lands "
+                     "text-to-video's own clip to within the row's run-to-run floor, "
+                     "while 0.2 and 0.4 land nearer the input clip, in that order",
             needs=[(g("wan22", "wan22_vae", "shapes.json"),
                     "python scripts/imagegen/wan22_golden.py --vae"),
                    (g("wan22", "wan22_vae_encode", "shapes.json"),
@@ -1004,37 +1029,63 @@ def roster() -> list[Gate]:
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              832, 480, 17, 20, 0,
                              negative_ids="1", guidance=5.0, out_name="guided")),
-                   # VIDEO2VIDEO, four runs at 128^2. A `vae.encode` port
-                   # carries one row per PIXEL and the derived ceiling is
-                   # 65 536, so a 4-frame chunk fits at 128^2 EXACTLY
-                   # (4*128*128) and at nothing larger: 480x832 would be
-                   # 1.6 M rows, and a ladder is PROVISIONED rather than
-                   # merely capped, so raising `[model] max_voxels` to it
-                   # asks for an arena this box does not have. A tiled
-                   # encode is what a full-size video2video wants, and
-                   # nothing has written one.
+                   # VIDEO2VIDEO, five runs at 64^2. Two claims, and
+                   # neither needs a golden.
+                   #
+                   # WHY 64^2 AND NOT MORE. A `vae.encode` port carries one
+                   # row per PIXEL, so a 4-frame chunk is `4*h*w` port
+                   # voxels: 16 384 here, against the derived ceiling of
+                   # 65 536, which 128^2 would hit exactly. 128^2 is not the
+                   # size that fires, though — the ceiling that bites first
+                   # is the STATE watermark, not the voxel ladder. This
+                   # row's `vae.encode` fire is charged 1 384 120 320 bytes
+                   # of elastic device memory for the encoder's 24 frame
+                   # caches and the load reserves 671 088 640 for them, so
+                   # 128^2 is refused by name ("this fire wants ... and the
+                   # load reserved ..."). It is the same state-accounting
+                   # hole this gate's `mem = 0.95` already answers
+                   # (prototype.md section 3), and 480x832 -- 1 597 440
+                   # voxels a chunk -- is far past both ceilings: a
+                   # full-size video2video wants a TILED encode, which
+                   # nothing has written.
                    #
                    # 8 steps, not 20: both claims are IDENTITIES and neither
                    # asks the clip to be good.
-                   ("a 128^2 clip to start from",
+                   ("a 64^2 clip to start from",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
-                             128, 128, 17, 8, 1, out_name="v2v-src", fmt="rgb8")),
+                             64, 64, 17, 8, 1, out_name="v2v-src", fmt="rgb8")),
                    # The SAME prompt at a DIFFERENT seed from here on, which
                    # is what makes "nearer the input" mean anything: at the
                    # source's own seed the unseeded run would BE the source.
-                   ("that clip back in at 0.4",
+                   # Two strengths, so the claim is a LADDER -- lower
+                   # strength, nearer the input -- and not one comparison
+                   # that could fall either way.
+                   ("that clip back in at 0.2",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
-                             128, 128, 17, 8, 2, out_name="v2v", fmt="rgb8",
+                             64, 64, 17, 8, 2, out_name="v2v-02", fmt="rgb8",
+                             init_from="v2v-src", strength=0.2)),
+                   ("and at 0.4",
+                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                             64, 64, 17, 8, 2, out_name="v2v-04", fmt="rgb8",
                              init_from="v2v-src", strength=0.4)),
                    # `(1 - 1)*x0 + 1*eps` IS the keyed draw, so this must
                    # land the same clip as the run below, bit for bit.
                    ("and at 1.0, which is no init at all",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
-                             128, 128, 17, 8, 2, out_name="v2v-washed", fmt="rgb8",
+                             64, 64, 17, 8, 2, out_name="v2v-washed", fmt="rgb8",
                              init_from="v2v-src", strength=1.0)),
                    ("the same prompt and seed with no init",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
-                             128, 128, 17, 8, 2, out_name="txt2vid", fmt="rgb8"))],
+                             64, 64, 17, 8, 2, out_name="txt2vid", fmt="rgb8")),
+                   # THE YARDSTICK. This row is not bit-reproducible run to
+                   # run, so "the same clip" is not `array_equal` and the
+                   # gate must not pretend it is: the SAME run again is what
+                   # says how far apart two clips that ought to be identical
+                   # actually land, and every claim above is read against
+                   # that number rather than against zero.
+                   ("and once more, which is what the floor is",
+                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                             64, 64, 17, 8, 2, out_name="txt2vid-rep", fmt="rgb8"))],
             readout=wan_video_readout,
             timeout=5400,
             note=("the prompt goes in as IDS: umT5's SentencePiece Unigram tokenizer does not "
