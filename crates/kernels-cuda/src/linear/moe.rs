@@ -965,33 +965,49 @@ fn matmul_select_mxfp4(
         ],
     )?;
     if fan.route_count >= GROUPED_FROM && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none() {
+        // bf16 activations take the tensor-core form, f16 the fp32 one —
+        // the affine twin's rule, and for its reason: `mma.sync` here is
+        // `bf16 x bf16 -> f32`.
+        // `PIE_MXFP4_NO_WMMA` takes the fp32 form on a bf16 activation. It
+        // is the only way to reach that kernel on a card whose rows all
+        // carry bf16 — without it the form would ship having never run,
+        // which is how the affine fp32 twin came to declare a shared array
+        // too big to compile.
+        let wmma = x.dtype == Dtype::Bf16 && std::env::var_os("PIE_MXFP4_NO_WMMA").is_none();
+        let entry = if wmma {
+            "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
+        } else {
+            format!("::pie::linear::moe_matmul_select_mxfp4_grouped<{t}>")
+        };
+        // The tensor-core form walks the work list — one item per (expert,
+        // 32-route slice) — where the fp32 one takes an expert a block.
+        let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
+        if wmma {
+            args.push(ArgValue::Ptr(work));
+        }
+        args.extend([
+            codes.arg(),
+            scales.arg(),
+            bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
+        ]);
         return ctx.fire(
             op,
-            Fire::at(
-                "linear/quant.cuh",
-                symbol(&format!(
-                    "::pie::linear::moe_matmul_select_mxfp4_grouped<{t}>"
-                )),
-            )
-            .apply(Launch::grid(
-                [experts, y.width.div_ceil(GROUPED_TILE_N), 1],
+            Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
+                [
+                    if wmma { work_cap } else { experts },
+                    y.width.div_ceil(GROUPED_TILE_N),
+                    1,
+                ],
                 [GROUPED_BLOCK, 1, 1],
             )),
-            &[
-                x.arg(),
-                ArgValue::Ptr(order),
-                ArgValue::Ptr(offsets),
-                codes.arg(),
-                scales.arg(),
-                bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
-                y.arg(),
-                act_div.arg(),
-                n.arg(),
-                k.arg(),
-                stated(op, experts)?.arg(),
-                ArgValue::Ptr(seat.cell),
-                ArgValue::Ptr(seat.hits),
-            ],
+            &args,
         );
     }
     ctx.fire(
