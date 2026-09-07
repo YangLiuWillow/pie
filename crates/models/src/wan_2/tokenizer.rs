@@ -19,18 +19,16 @@
 //! is the reference's own vector and the one `gates.py` feeds this row as
 //! `--prompt-ids`.
 //!
-//! **What is still not done: BAKING it into a `.zt`.** The canonical form
-//! (`pie.tokenizer/1`) states five objects and none of them holds a per-piece
-//! score — `MERGE_TABLE` is empty for a Unigram and reusing it would be
-//! exactly the reinterpretation that format exists to rule out. So
-//! `tokenizer::canonical` refuses a Unigram BY NAME, `pie model import`
-//! still cannot carry umT5's vocabulary into an artifact, and this row still
-//! borrows the smallest contract the build ships (`qwen_3`'s) as `mini_dit`
-//! does. Closing it is a sixth object plus the three readers of
-//! `canonical::OBJECTS` (`worker::weights`, `runtime::model`, and the
-//! format's own test).
+//! **And it BAKES now too.** `pie.tokenizer/1` grew a sixth object,
+//! `tokenizer/unigram_scores` — one `f32` a token id — which is OPTIONAL:
+//! a BPE tokenizer writes none, and that absence is what says "not a
+//! Unigram", so every artifact written before this keeps loading unchanged.
+//! Round-tripped on the real 256 300-piece vocabulary: bake, read back, and
+//! the ids are identical.
 //!
-//! Until then the `text` reading's ids come from outside (the goldens carry
-//! the reference's prompt embeds, so `denoise` parity needs no tokenizer).
+//! This row still borrows `qwen_3`'s contract, because a CONTRACT is a list
+//! of markers a serving row needs pinned and umT5's has not been written.
+//! Once it is, `pie model import` carries umT5's own vocabulary and the
+//! guests can pass `--prompt` instead of `--prompt-ids`.
 
 pub use crate::qwen_3::tokenizer::CONTRACT;

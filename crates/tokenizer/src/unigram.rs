@@ -72,6 +72,31 @@ impl UnigramScores {
         })
     }
 
+    /// The scores by id, for the canonical form: `[f32; vocab]` where index
+    /// IS the token id. A piece the vocabulary never named (an id no entry
+    /// reached) scores `0.0`, which the walk never consults because no piece
+    /// spells it.
+    pub(crate) fn scores_by_id(&self, vocab: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; vocab];
+        for (id, score) in self.pieces.values() {
+            if let Some(cell) = out.get_mut(*id as usize) {
+                *cell = *score;
+            }
+        }
+        out
+    }
+
+    /// What an unreachable character becomes.
+    pub(crate) fn unk_id(&self) -> u32 {
+        self.unk_id
+    }
+
+    /// Rebuild from the canonical form: the pieces are the vocabulary's own
+    /// bytes, in id order, paired with `scores[id]`.
+    pub(crate) fn from_scores(pieces: &[(String, f32)], unk_id: u32) -> anyhow::Result<Self> {
+        Self::new(pieces, unk_id)
+    }
+
     /// The best segmentation of `text`, appended to `ids`.
     ///
     /// Exact: every position keeps the best score reaching it, so a long piece

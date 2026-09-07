@@ -64,13 +64,24 @@ impl Model {
             )
         })?;
 
-        let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
+        let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len() + 1);
         for name in tokenizer::canonical::OBJECTS {
             let Some(bytes) = read_meta(&checkpoint, name)? else {
                 tokenizer.clear();
                 break;
             };
             tokenizer.push((name.to_string(), bytes));
+        }
+        // The optional planes come after, and only if the required ones were
+        // all there: a Unigram's score plane is absent from every artifact
+        // written before Unigram was read, and its absence is a FACT about
+        // which kind of tokenizer this is, not a missing object.
+        if !tokenizer.is_empty() {
+            for name in tokenizer::canonical::OPTIONAL_OBJECTS {
+                if let Some(bytes) = read_meta(&checkpoint, name)? {
+                    tokenizer.push((name.to_string(), bytes));
+                }
+            }
         }
         Ok(ModelMetadata {
             tokenizer: (!tokenizer.is_empty()).then_some(tokenizer),

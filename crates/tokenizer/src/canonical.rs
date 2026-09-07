@@ -20,8 +20,15 @@ pub const VOCAB_OFFSETS: &str = "tokenizer/vocab_offsets";
 pub const MERGE_TABLE: &str = "tokenizer/merge_table";
 pub const BYTE_FALLBACK: &str = "tokenizer/byte_fallback";
 pub const DESCRIPTOR: &str = "tokenizer/descriptor";
+/// **SENTENCEPIECE UNIGRAM ONLY**: one `f32` a token id, little endian, the
+/// score its Viterbi walk maximises. A BPE tokenizer writes no such object,
+/// and its ABSENCE is what says "this is not a Unigram" — which is why it is
+/// [`OPTIONAL_OBJECTS`] and not a sixth entry of [`OBJECTS`]. Every artifact
+/// written before Unigram was read lacks it, and must keep loading.
+pub const UNIGRAM_SCORES: &str = "tokenizer/unigram_scores";
 
-/// Every object of a serialized tokenizer, in the order they are written.
+/// Every object a serialized tokenizer MUST carry, in the order they are
+/// written. A reader that finds one missing has no tokenizer at all.
 pub const OBJECTS: [&str; 5] = [
     BYTE_FALLBACK,
     DESCRIPTOR,
@@ -30,6 +37,10 @@ pub const OBJECTS: [&str; 5] = [
     VOCAB_OFFSETS,
 ];
 
+/// Objects only some tokenizers carry. Missing is not an error; missing is a
+/// fact about which kind of tokenizer this is.
+pub const OPTIONAL_OBJECTS: [&str; 1] = [UNIGRAM_SCORES];
+
 /// A compiled tokenizer, serialized. Field order matches [`OBJECTS`]
 /// (ascending by name), required by canonical `.zt` form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,33 +48,55 @@ pub struct CanonicalTokenizer {
     pub byte_fallback: Vec<u8>,
     pub descriptor: Vec<u8>,
     pub merge_table: Vec<u8>,
+    /// Present for a Unigram and absent for everything else; see
+    /// [`UNIGRAM_SCORES`]. Sorts between `merge_table` and `vocab_bytes`,
+    /// which is where [`CanonicalTokenizer::objects`] puts it.
+    pub unigram_scores: Option<Vec<u8>>,
     pub vocab_bytes: Vec<u8>,
     pub vocab_offsets: Vec<u8>,
 }
 
 impl CanonicalTokenizer {
     /// The objects to write, paired with their names, in ascending name order.
-    pub fn objects(&self) -> [(&'static str, &[u8]); 5] {
-        [
+    /// A `Vec`, not an array, because the Unigram scores are there only for a
+    /// Unigram — and canonical `.zt` form requires ascending names, which is
+    /// why `unigram_scores` sits between `merge_table` and `vocab_bytes`
+    /// rather than at the end.
+    pub fn objects(&self) -> Vec<(&'static str, &[u8])> {
+        let mut out: Vec<(&'static str, &[u8])> = vec![
             (BYTE_FALLBACK, &self.byte_fallback),
             (DESCRIPTOR, &self.descriptor),
             (MERGE_TABLE, &self.merge_table),
-            (VOCAB_BYTES, &self.vocab_bytes),
-            (VOCAB_OFFSETS, &self.vocab_offsets),
-        ]
+        ];
+        if let Some(scores) = &self.unigram_scores {
+            out.push((UNIGRAM_SCORES, scores));
+        }
+        out.push((VOCAB_BYTES, &self.vocab_bytes));
+        out.push((VOCAB_OFFSETS, &self.vocab_offsets));
+        out
     }
 
-    /// Collects the objects back from whatever holds them. A missing object
-    /// is a hard error rather than an empty-default guess.
+    /// Collects the objects back from whatever holds them. A missing REQUIRED
+    /// object is a hard error rather than an empty-default guess; a missing
+    /// optional one is a fact, and the fact it states is "not a Unigram" —
+    /// which is what lets every artifact written before Unigram was read keep
+    /// loading unchanged.
     pub fn from_objects(mut read: impl FnMut(&str) -> Option<Vec<u8>>) -> Result<Self> {
-        let mut fetch =
-            |name: &str| read(name).with_context(|| format!("the artifact has no '{name}' object"));
+        let mut fetch = |name: &str| -> Result<Vec<u8>> {
+            read(name).with_context(|| format!("the artifact has no '{name}' object"))
+        };
+        let byte_fallback = fetch(BYTE_FALLBACK)?;
+        let descriptor = fetch(DESCRIPTOR)?;
+        let merge_table = fetch(MERGE_TABLE)?;
+        let vocab_bytes = fetch(VOCAB_BYTES)?;
+        let vocab_offsets = fetch(VOCAB_OFFSETS)?;
         Ok(Self {
-            byte_fallback: fetch(BYTE_FALLBACK)?,
-            descriptor: fetch(DESCRIPTOR)?,
-            merge_table: fetch(MERGE_TABLE)?,
-            vocab_bytes: fetch(VOCAB_BYTES)?,
-            vocab_offsets: fetch(VOCAB_OFFSETS)?,
+            byte_fallback,
+            descriptor,
+            merge_table,
+            unigram_scores: read(UNIGRAM_SCORES),
+            vocab_bytes,
+            vocab_offsets,
         })
     }
 
@@ -140,6 +173,12 @@ enum PipelineDescriptor {
         #[serde(default)]
         strip_decoder_marker: bool,
     },
+    Unigram {
+        replacement: String,
+        prepend_always: bool,
+        eos_id: Option<u32>,
+        unk_id: u32,
+    },
     RawChar,
 }
 
@@ -204,10 +243,25 @@ impl Tokenizer {
         };
         let descriptor = serde_json::to_vec(&descriptor).context("encoding the descriptor")?;
 
+        // A Unigram's scores, one f32 a token id, little endian. `None` for
+        // everything else, which is what the reader keys on.
+        let unigram_scores = match &self.pipeline {
+            Pipeline::Unigram { scores, .. } => {
+                let by_id = scores.scores_by_id(decode.len());
+                let mut bytes = Vec::with_capacity(by_id.len() * 4);
+                for score in by_id {
+                    bytes.extend_from_slice(&score.to_le_bytes());
+                }
+                Some(bytes)
+            }
+            _ => None,
+        };
+
         Ok(CanonicalTokenizer {
             byte_fallback,
             descriptor,
             merge_table,
+            unigram_scores,
             vocab_bytes,
             vocab_offsets,
         })
@@ -235,18 +289,20 @@ impl Tokenizer {
 
 fn describe_pipeline(pipeline: &Pipeline) -> PipelineDescriptor {
     match pipeline {
-        // **NOT SERIALIZED YET, and refused rather than approximated.** A
-        // Unigram model's scores are a plane of their own — one f32 per
-        // piece — and `pie.tokenizer/1` states five objects, none of which
-        // holds them (`MERGE_TABLE` is empty for a Unigram and reusing it
-        // would be exactly the reinterpretation this format exists to rule
-        // out). Loading one from `tokenizer.json` works; baking one into a
-        // `.zt` needs a sixth object and the three readers of `OBJECTS`
-        // updated with it.
-        Pipeline::Unigram { .. } => panic!(
-            "a Unigram tokenizer does not serialize into `pie.tokenizer/1` yet: its \
-             per-piece scores have no object in the format"
-        ),
+        // The scores themselves ride their OWN object (`UNIGRAM_SCORES`), one
+        // f32 a token id: a descriptor is a description, and 256 300 floats
+        // in one are not a description.
+        Pipeline::Unigram {
+            replacement,
+            prepend_always,
+            eos_id,
+            scores,
+        } => PipelineDescriptor::Unigram {
+            replacement: replacement.clone(),
+            prepend_always: *prepend_always,
+            eos_id: *eos_id,
+            unk_id: scores.unk_id(),
+        },
         Pipeline::ByteLevelRegex {
             nfc,
             splitters,
@@ -356,8 +412,11 @@ impl Tokenizer {
             byte_fallback_ids[byte] = (id != NO_TOKEN).then_some(id);
         }
 
+        // The pipeline is rebuilt BEFORE the table takes the vocabulary: a
+        // Unigram's walk needs the piece strings, and the table consumes
+        // them.
+        let pipeline = rebuild_pipeline(descriptor.pipeline, &vocab, &objects.unigram_scores)?;
         let bpe = BpeTable::from_canonical(vocab, &merges, byte_fallback_ids)?;
-        let pipeline = rebuild_pipeline(descriptor.pipeline)?;
         let added_tokens = descriptor
             .added_tokens
             .into_iter()
@@ -373,8 +432,50 @@ impl Tokenizer {
     }
 }
 
-fn rebuild_pipeline(descriptor: PipelineDescriptor) -> Result<Pipeline> {
+/// `vocab` and `scores` are the two objects only a Unigram reads: its walk
+/// needs the piece STRINGS beside their scores, and both are already decoded
+/// here for the symbol table.
+fn rebuild_pipeline(
+    descriptor: PipelineDescriptor,
+    vocab: &[Vec<u8>],
+    scores: &Option<Vec<u8>>,
+) -> Result<Pipeline> {
     Ok(match descriptor {
+        PipelineDescriptor::Unigram {
+            replacement,
+            prepend_always,
+            eos_id,
+            unk_id,
+        } => {
+            let raw = scores.as_deref().context(
+                "this artifact's tokenizer is a Unigram and carries no                  `tokenizer/unigram_scores` object; re-import it with                  `pie model import --force`",
+            )?;
+            ensure!(
+                raw.len() == vocab.len() * 4,
+                "the score plane holds {} bytes and the vocabulary is {} pieces",
+                raw.len(),
+                vocab.len()
+            );
+            let pieces: Vec<(String, f32)> = vocab
+                .iter()
+                .zip(raw.chunks_exact(4))
+                .map(|(piece, word)| {
+                    // A piece that is not UTF-8 cannot be a Unigram piece —
+                    // this vocabulary is strings, not bytes.
+                    let piece = std::str::from_utf8(piece)
+                        .context("a Unigram piece is not UTF-8")?
+                        .to_string();
+                    let score = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                    Ok((piece, score))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Pipeline::Unigram {
+                scores: crate::unigram::UnigramScores::from_scores(&pieces, unk_id)?,
+                replacement,
+                prepend_always,
+                eos_id,
+            }
+        }
         PipelineDescriptor::ByteLevelRegex {
             nfc,
             splitters,

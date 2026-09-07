@@ -182,3 +182,56 @@ fn a_unigram_walks_and_wraps_exactly_as_hugging_face_does() {
         );
     }
 }
+
+/// **A UNIGRAM SURVIVES THE CANONICAL FORM.** Loading one from
+/// `tokenizer.json` is one thing; carrying it into a `.zt` and back is what
+/// `pie model import` does, and it needs a sixth object — the per-piece
+/// scores — that no BPE tokenizer writes.
+///
+/// The claim is the round trip, on the same eight strings: bake, rebuild,
+/// and the rebuilt tokenizer must spell every one of them identically. A
+/// score plane that was written in the wrong order, or truncated, or read
+/// back as the wrong type, changes the WALK and therefore the ids.
+#[test]
+fn a_unigram_survives_being_baked_and_read_back() {
+    let bytes = serde_json::to_vec(&unigram_json()).unwrap();
+    let pie = std::str::from_utf8(&bytes)
+        .unwrap()
+        .parse::<Tokenizer>()
+        .unwrap();
+
+    let baked = pie.to_canonical().expect("a Unigram bakes");
+    assert!(
+        baked.unigram_scores.is_some(),
+        "a Unigram writes its score plane; without it the walk cannot be rebuilt"
+    );
+    // And the plane is one f32 a token id, which is what the reader checks.
+    assert_eq!(baked.unigram_scores.as_ref().unwrap().len(), 12 * 4);
+
+    let names: Vec<&str> = baked.objects().iter().map(|(name, _)| *name).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "canonical `.zt` form requires ascending names");
+
+    let back = Tokenizer::from_canonical(&baked).expect("and reads back");
+    for text in ["ab", "a red", "red", "a  b", "", "aQb", "abab", "d"] {
+        assert_eq!(back.encode(text), pie.encode(text), "encoding {text:?}");
+        let ids = pie.encode(text);
+        assert_eq!(back.decode(&ids, true), pie.decode(&ids, true), "decoding {text:?}");
+    }
+}
+
+/// A BPE tokenizer writes NO score plane, and that absence is what says it is
+/// not a Unigram. Every artifact written before Unigram was read depends on
+/// this staying true.
+#[test]
+fn a_bpe_tokenizer_writes_no_score_plane() {
+    let bytes = serde_json::to_vec(&gemma_json()).unwrap();
+    let pie = std::str::from_utf8(&bytes)
+        .unwrap()
+        .parse::<Tokenizer>()
+        .unwrap();
+    let baked = pie.to_canonical().expect("a BPE bakes");
+    assert!(baked.unigram_scores.is_none());
+    assert_eq!(baked.objects().len(), tokenizer::canonical::OBJECTS.len());
+}
